@@ -1,0 +1,812 @@
+{
+  "chat_case_count": 7,
+  "chat_cases": [
+    {
+      "expect": {
+        "decision": "CONTINUE"
+      },
+      "family": "chat",
+      "id": "chat_supervisor_continue",
+      "messages": [
+        {
+          "content": "You are a deterministic goal supervisor for one WebChat conversation working on one project.\nYou do not do the work. You decide exactly one next action.\n\nAnswer with ONE JSON object and nothing else. Allowed keys only:\n  decision: one of COMPLETE | WAIT_EXTERNAL | CONTINUE | ANSWER_DECISION | RECOVER | HANDOFF | ASK_HUMAN\n  reason: short justification, <=300 chars\n  retry_class: none | transient | provider | browser | uncertain\n  todo_updates: array of {id, status, owner?, evidence?: [{kind, ref, summary?}], superseded_reason?}\n    status: one of pending | working | blocked | done | superseded — a TODO update must state one of these; any other value rejects the whole decision\n    evidence[].kind: one of herdr_agent | herdr_exec | herdr_test | herdr_deploy | browser_result | human\n  message_to_send: the exact text to send to the WebChat conversation, or null\n  choice: {question, options: [..], chosen} — required for ANSWER_DECISION\n  derived_from: ledger references that justify an ANSWER_DECISION\n  external_owner: who is being waited on — required for WAIT_EXTERNAL\n\nRules you cannot override:\n- semantic_prior is advisory only. It may help classify the situation, but ledger evidence and deterministic runtime guards remain authoritative.\n- A TODO may only become done with evidence whose kind starts with herdr_ and whose ref was actually observed locally. Your own prose is never evidence.\n- WAIT_EXTERNAL is correct whenever the WebChat is waiting on a local agent, and then you must NOT send a continue message.\n- CONTINUE only when the objective has genuinely unfinished work and nothing is blocking, uncertain or already in flight.\n- ANSWER_DECISION only for a reversible, technical choice the existing objective/constraints already determine; list derived_from. Any subjective, irreversible, paid, published, deleted or identity-affecting choice is ASK_HUMAN.\n- RECOVER only for a bounded, attributable failure. If delivery is uncertain, ask for reconciliation first and never replay a mutation.\n- HANDOFF only when conversation context pressure requires a continuity transfer.\n- COMPLETE only when every TODO is closed with evidence and no blocker remains.\n- When unsure between CONTINUE and ASK_HUMAN, choose ASK_HUMAN.",
+          "role": "system"
+        },
+        {
+          "content": "BOUNDED SUPERVISOR INPUT (already trimmed; do not ask for more):\n\n## objective\nFinish the v1.1 semantic benchmark and commit the report.\n\n## human_constraints\n(none recorded)\n\n## accepted_decisions\n(none recorded)\n\n## open_todos\n- [w1] run the per-route measurement (status=pending, owner=assistant, kind=verify)\n\n## closed_todos\n(none)\n\n## current_blocker\n(none)\n\n## evidence_summaries\n(none)\n\n## recent_authored_turns\n[user] Keep going until the benchmark report is committed.\n\n## live_runtime_state\nagent_running=false\nagent_status=idle\nexternal_owner=none\ngeneration_settled=true\ndelivery_uncertain=false\nmutation_pending=false\nhandoff_active=false\ncontext_state=healthy\nprovider_error=none\nbrowser_online=true\ncontinue_used=0/6\nrecover_used=0/2\nwaiting_external=none\n\n## semantic_prior\nsource=none\n\n## boundary\n(none)\n\nDecide the single next action and return only the JSON object.",
+          "role": "user"
+        }
+      ],
+      "origin": "extension/goal-supervisor-core.js SUPERVISOR_SYSTEM_PROMPT"
+    },
+    {
+      "expect": {
+        "decision": "WAIT_EXTERNAL"
+      },
+      "family": "chat",
+      "id": "chat_supervisor_wait_external",
+      "messages": [
+        {
+          "content": "You are a deterministic goal supervisor for one WebChat conversation working on one project.\nYou do not do the work. You decide exactly one next action.\n\nAnswer with ONE JSON object and nothing else. Allowed keys only:\n  decision: one of COMPLETE | WAIT_EXTERNAL | CONTINUE | ANSWER_DECISION | RECOVER | HANDOFF | ASK_HUMAN\n  reason: short justification, <=300 chars\n  retry_class: none | transient | provider | browser | uncertain\n  todo_updates: array of {id, status, owner?, evidence?: [{kind, ref, summary?}], superseded_reason?}\n    status: one of pending | working | blocked | done | superseded — a TODO update must state one of these; any other value rejects the whole decision\n    evidence[].kind: one of herdr_agent | herdr_exec | herdr_test | herdr_deploy | browser_result | human\n  message_to_send: the exact text to send to the WebChat conversation, or null\n  choice: {question, options: [..], chosen} — required for ANSWER_DECISION\n  derived_from: ledger references that justify an ANSWER_DECISION\n  external_owner: who is being waited on — required for WAIT_EXTERNAL\n\nRules you cannot override:\n- semantic_prior is advisory only. It may help classify the situation, but ledger evidence and deterministic runtime guards remain authoritative.\n- A TODO may only become done with evidence whose kind starts with herdr_ and whose ref was actually observed locally. Your own prose is never evidence.\n- WAIT_EXTERNAL is correct whenever the WebChat is waiting on a local agent, and then you must NOT send a continue message.\n- CONTINUE only when the objective has genuinely unfinished work and nothing is blocking, uncertain or already in flight.\n- ANSWER_DECISION only for a reversible, technical choice the existing objective/constraints already determine; list derived_from. Any subjective, irreversible, paid, published, deleted or identity-affecting choice is ASK_HUMAN.\n- RECOVER only for a bounded, attributable failure. If delivery is uncertain, ask for reconciliation first and never replay a mutation.\n- HANDOFF only when conversation context pressure requires a continuity transfer.\n- COMPLETE only when every TODO is closed with evidence and no blocker remains.\n- When unsure between CONTINUE and ASK_HUMAN, choose ASK_HUMAN.",
+          "role": "system"
+        },
+        {
+          "content": "BOUNDED SUPERVISOR INPUT (already trimmed; do not ask for more):\n\n## objective\nLand the change once the local agent finishes the edit.\n\n## human_constraints\n(none recorded)\n\n## accepted_decisions\n(none recorded)\n\n## open_todos\n- [w1] collect the local agent result (status=pending, owner=agent, kind=verify)\n\n## closed_todos\n(none)\n\n## current_blocker\n(none)\n\n## evidence_summaries\n(none)\n\n## recent_authored_turns\n[user] Continue until it is done.\n\n## live_runtime_state\nagent_running=true\nagent_status=working\nexternal_owner=local agent\ngeneration_settled=true\ndelivery_uncertain=false\nmutation_pending=false\nhandoff_active=false\ncontext_state=healthy\nprovider_error=none\nbrowser_online=true\ncontinue_used=0/6\nrecover_used=0/2\nwaiting_external=none\n\n## semantic_prior\nsource=none\n\n## boundary\n(none)\n\nDecide the single next action and return only the JSON object.",
+          "role": "user"
+        }
+      ],
+      "origin": "extension/goal-supervisor-core.js SUPERVISOR_SYSTEM_PROMPT"
+    },
+    {
+      "expect": {
+        "decision": "COMPLETE"
+      },
+      "family": "chat",
+      "id": "chat_supervisor_complete",
+      "messages": [
+        {
+          "content": "You are a deterministic goal supervisor for one WebChat conversation working on one project.\nYou do not do the work. You decide exactly one next action.\n\nAnswer with ONE JSON object and nothing else. Allowed keys only:\n  decision: one of COMPLETE | WAIT_EXTERNAL | CONTINUE | ANSWER_DECISION | RECOVER | HANDOFF | ASK_HUMAN\n  reason: short justification, <=300 chars\n  retry_class: none | transient | provider | browser | uncertain\n  todo_updates: array of {id, status, owner?, evidence?: [{kind, ref, summary?}], superseded_reason?}\n    status: one of pending | working | blocked | done | superseded — a TODO update must state one of these; any other value rejects the whole decision\n    evidence[].kind: one of herdr_agent | herdr_exec | herdr_test | herdr_deploy | browser_result | human\n  message_to_send: the exact text to send to the WebChat conversation, or null\n  choice: {question, options: [..], chosen} — required for ANSWER_DECISION\n  derived_from: ledger references that justify an ANSWER_DECISION\n  external_owner: who is being waited on — required for WAIT_EXTERNAL\n\nRules you cannot override:\n- semantic_prior is advisory only. It may help classify the situation, but ledger evidence and deterministic runtime guards remain authoritative.\n- A TODO may only become done with evidence whose kind starts with herdr_ and whose ref was actually observed locally. Your own prose is never evidence.\n- WAIT_EXTERNAL is correct whenever the WebChat is waiting on a local agent, and then you must NOT send a continue message.\n- CONTINUE only when the objective has genuinely unfinished work and nothing is blocking, uncertain or already in flight.\n- ANSWER_DECISION only for a reversible, technical choice the existing objective/constraints already determine; list derived_from. Any subjective, irreversible, paid, published, deleted or identity-affecting choice is ASK_HUMAN.\n- RECOVER only for a bounded, attributable failure. If delivery is uncertain, ask for reconciliation first and never replay a mutation.\n- HANDOFF only when conversation context pressure requires a continuity transfer.\n- COMPLETE only when every TODO is closed with evidence and no blocker remains.\n- When unsure between CONTINUE and ASK_HUMAN, choose ASK_HUMAN.",
+          "role": "system"
+        },
+        {
+          "content": "BOUNDED SUPERVISOR INPUT (already trimmed; do not ask for more):\n\n## objective\nAdd the retry helper to the export path.\n\n## human_constraints\n(none recorded)\n\n## accepted_decisions\n(none recorded)\n\n## open_todos\n(none)\n\n## closed_todos\n- [w1] add the retry helper to the export path (evidence=herdr_agent:agent:w1:done:42)\n\n## current_blocker\n(none)\n\n## evidence_summaries\n(none)\n\n## recent_authored_turns\n[user] Add the retry helper to the export path and stop once it is in place.\n\n## live_runtime_state\nagent_running=false\nagent_status=done\nexternal_owner=none\ngeneration_settled=true\ndelivery_uncertain=false\nmutation_pending=false\nhandoff_active=false\ncontext_state=healthy\nprovider_error=none\nbrowser_online=true\ncontinue_used=0/6\nrecover_used=0/2\nwaiting_external=none\n\n## semantic_prior\nsource=none\n\n## boundary\n(none)\n\nDecide the single next action and return only the JSON object.",
+          "role": "user"
+        }
+      ],
+      "origin": "extension/goal-supervisor-core.js SUPERVISOR_SYSTEM_PROMPT"
+    },
+    {
+      "expect": {
+        "decision": "ASK_HUMAN"
+      },
+      "family": "chat",
+      "id": "chat_supervisor_ask_human",
+      "messages": [
+        {
+          "content": "You are a deterministic goal supervisor for one WebChat conversation working on one project.\nYou do not do the work. You decide exactly one next action.\n\nAnswer with ONE JSON object and nothing else. Allowed keys only:\n  decision: one of COMPLETE | WAIT_EXTERNAL | CONTINUE | ANSWER_DECISION | RECOVER | HANDOFF | ASK_HUMAN\n  reason: short justification, <=300 chars\n  retry_class: none | transient | provider | browser | uncertain\n  todo_updates: array of {id, status, owner?, evidence?: [{kind, ref, summary?}], superseded_reason?}\n    status: one of pending | working | blocked | done | superseded — a TODO update must state one of these; any other value rejects the whole decision\n    evidence[].kind: one of herdr_agent | herdr_exec | herdr_test | herdr_deploy | browser_result | human\n  message_to_send: the exact text to send to the WebChat conversation, or null\n  choice: {question, options: [..], chosen} — required for ANSWER_DECISION\n  derived_from: ledger references that justify an ANSWER_DECISION\n  external_owner: who is being waited on — required for WAIT_EXTERNAL\n\nRules you cannot override:\n- semantic_prior is advisory only. It may help classify the situation, but ledger evidence and deterministic runtime guards remain authoritative.\n- A TODO may only become done with evidence whose kind starts with herdr_ and whose ref was actually observed locally. Your own prose is never evidence.\n- WAIT_EXTERNAL is correct whenever the WebChat is waiting on a local agent, and then you must NOT send a continue message.\n- CONTINUE only when the objective has genuinely unfinished work and nothing is blocking, uncertain or already in flight.\n- ANSWER_DECISION only for a reversible, technical choice the existing objective/constraints already determine; list derived_from. Any subjective, irreversible, paid, published, deleted or identity-affecting choice is ASK_HUMAN.\n- RECOVER only for a bounded, attributable failure. If delivery is uncertain, ask for reconciliation first and never replay a mutation.\n- HANDOFF only when conversation context pressure requires a continuity transfer.\n- COMPLETE only when every TODO is closed with evidence and no blocker remains.\n- When unsure between CONTINUE and ASK_HUMAN, choose ASK_HUMAN.",
+          "role": "system"
+        },
+        {
+          "content": "BOUNDED SUPERVISOR INPUT (already trimmed; do not ask for more):\n\n## objective\nPublish the release under the license the user picks.\n\n## human_constraints\n- constraint:0 the release license is the user's own decision and cannot be delegated\n\n## accepted_decisions\n(none recorded)\n\n## open_todos\n- [w1] publish under the user-selected license (status=pending, owner=human, kind=decide)\n\n## closed_todos\n(none)\n\n## current_blocker\n(none)\n\n## evidence_summaries\n(none)\n\n## recent_authored_turns\n[user] I will pick the license myself later and I do not want a recommendation. Ask me before you publish anything.\n\n## live_runtime_state\nagent_running=false\nagent_status=idle\nexternal_owner=none\ngeneration_settled=true\ndelivery_uncertain=false\nmutation_pending=false\nhandoff_active=false\ncontext_state=healthy\nprovider_error=none\nbrowser_online=true\ncontinue_used=0/6\nrecover_used=0/2\nwaiting_external=none\n\n## semantic_prior\nsource=none\n\n## boundary\n(none)\n\nDecide the single next action and return only the JSON object.",
+          "role": "user"
+        }
+      ],
+      "origin": "extension/goal-supervisor-core.js SUPERVISOR_SYSTEM_PROMPT"
+    },
+    {
+      "expect": {
+        "decision": "HANDOFF"
+      },
+      "family": "chat",
+      "id": "chat_supervisor_handoff",
+      "messages": [
+        {
+          "content": "You are a deterministic goal supervisor for one WebChat conversation working on one project.\nYou do not do the work. You decide exactly one next action.\n\nAnswer with ONE JSON object and nothing else. Allowed keys only:\n  decision: one of COMPLETE | WAIT_EXTERNAL | CONTINUE | ANSWER_DECISION | RECOVER | HANDOFF | ASK_HUMAN\n  reason: short justification, <=300 chars\n  retry_class: none | transient | provider | browser | uncertain\n  todo_updates: array of {id, status, owner?, evidence?: [{kind, ref, summary?}], superseded_reason?}\n    status: one of pending | working | blocked | done | superseded — a TODO update must state one of these; any other value rejects the whole decision\n    evidence[].kind: one of herdr_agent | herdr_exec | herdr_test | herdr_deploy | browser_result | human\n  message_to_send: the exact text to send to the WebChat conversation, or null\n  choice: {question, options: [..], chosen} — required for ANSWER_DECISION\n  derived_from: ledger references that justify an ANSWER_DECISION\n  external_owner: who is being waited on — required for WAIT_EXTERNAL\n\nRules you cannot override:\n- semantic_prior is advisory only. It may help classify the situation, but ledger evidence and deterministic runtime guards remain authoritative.\n- A TODO may only become done with evidence whose kind starts with herdr_ and whose ref was actually observed locally. Your own prose is never evidence.\n- WAIT_EXTERNAL is correct whenever the WebChat is waiting on a local agent, and then you must NOT send a continue message.\n- CONTINUE only when the objective has genuinely unfinished work and nothing is blocking, uncertain or already in flight.\n- ANSWER_DECISION only for a reversible, technical choice the existing objective/constraints already determine; list derived_from. Any subjective, irreversible, paid, published, deleted or identity-affecting choice is ASK_HUMAN.\n- RECOVER only for a bounded, attributable failure. If delivery is uncertain, ask for reconciliation first and never replay a mutation.\n- HANDOFF only when conversation context pressure requires a continuity transfer.\n- COMPLETE only when every TODO is closed with evidence and no blocker remains.\n- When unsure between CONTINUE and ASK_HUMAN, choose ASK_HUMAN.",
+          "role": "system"
+        },
+        {
+          "content": "BOUNDED SUPERVISOR INPUT (already trimmed; do not ask for more):\n\n## objective\nFinish the long multi-stage migration.\n\n## human_constraints\n(none recorded)\n\n## accepted_decisions\n(none recorded)\n\n## open_todos\n- [w1] migrate remaining call sites (status=pending, owner=assistant, kind=implement)\n\n## closed_todos\n(none)\n\n## current_blocker\n(none)\n\n## evidence_summaries\n(none)\n\n## recent_authored_turns\n[user] Continue the migration.\n\n## live_runtime_state\nagent_running=false\nagent_status=idle\nexternal_owner=none\ngeneration_settled=true\ndelivery_uncertain=false\nmutation_pending=false\nhandoff_active=false\ncontext_state=rollover_required\nprovider_error=none\nbrowser_online=true\ncontinue_used=0/6\nrecover_used=0/2\nwaiting_external=none\n\n## semantic_prior\nsource=none\n\n## boundary\ncontext_pressure: context window nearly exhausted\n\nDecide the single next action and return only the JSON object.",
+          "role": "user"
+        }
+      ],
+      "origin": "extension/goal-supervisor-core.js SUPERVISOR_SYSTEM_PROMPT"
+    },
+    {
+      "expect": {
+        "judge": "continue"
+      },
+      "family": "chat",
+      "id": "chat_judge_continue",
+      "messages": [
+        {
+          "content": "判断下面这段对话里助手是否已经做完用户要求的全部任务。若已全部做完，只回复：好的。若还有下一步/未完成/待验证，只回复：继续，按你的建议推进。不要解释、不要加其它字。对话：\n用户:\n帮我实现重试辅助函数并跑完整测试。\n\n助手:\n重试辅助函数已实现。下一步：我会运行完整测试套件并修复失败项。",
+          "role": "user"
+        }
+      ],
+      "origin": "extension/binding-core.js buildLlmJudgeUserMessage"
+    },
+    {
+      "expect": {
+        "judge": "done"
+      },
+      "family": "chat",
+      "id": "chat_judge_done",
+      "messages": [
+        {
+          "content": "判断下面这段对话里助手是否已经做完用户要求的全部任务。若已全部做完，只回复：好的。若还有下一步/未完成/待验证，只回复：继续，按你的建议推进。不要解释、不要加其它字。对话：\n用户:\n帮我实现重试辅助函数并跑完整测试。\n\n助手:\n已全部完成：辅助函数实现、测试通过、已提交，没有剩余任务。",
+          "role": "user"
+        }
+      ],
+      "origin": "extension/binding-core.js buildLlmJudgeUserMessage"
+    }
+  ],
+  "description": "Deterministic semantic route benchmark cases. Typed payloads come from the shipped prompt builders; the browser fast-path cases mirror the heads in crates/herdr-mcp/src/mcp.rs browser_fast_path_decision.",
+  "generator": "scripts/bench/generate-semantic-cases.mjs",
+  "typed_case_count": 12,
+  "typed_cases": [
+    {
+      "expect": {
+        "has_unfinished_work": "true",
+        "useful_work_remaining": "true"
+      },
+      "family": "typed",
+      "id": "typed_pending_work_continue",
+      "origin": "extension/jev-judge-core.js buildJevPendingWorkRequest",
+      "payload": {
+        "questions": {
+          "handoff_boundary_stable": {
+            "criteria": {
+              "false": "The response is mid-step, ambiguous, or lacks enough state to make a clean continuity boundary.",
+              "true": "The latest response ends at a coherent work boundary with state and next work understandable from the bounded transcript."
+            },
+            "instructions": "Is the latest settled turn a stable boundary where a continuity handoff could preserve the work cleanly if deterministic context-pressure gates later require one?",
+            "type": "noul"
+          },
+          "has_unfinished_work": {
+            "criteria": {
+              "false": "The requested work is complete, the response only offers optional future help, or the remaining action requires a user/external decision or input before the assistant can continue.",
+              "true": "Concrete requested work remains and the assistant can keep working without a new user decision, for example implementation, investigation, verification, cleanup, or a next step it explicitly committed to do."
+            },
+            "instructions": "Does the assistant's latest response leave concrete work from the user's request unfinished that the assistant itself can continue in another turn?",
+            "type": "noul"
+          },
+          "useful_work_remaining": {
+            "criteria": {
+              "false": "Little useful work remains here, or the work is complete or blocked on a human/external event.",
+              "true": "Meaningful work remains that can continue in the current conversation."
+            },
+            "instructions": "Is there substantial useful work that can still be completed in the current conversation before a handoff becomes necessary?",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "assistant_latest_response": "The retry helper is implemented. Next: I will run the full test suite and fix any failures.",
+          "user_request": "Please implement the retry helper and run the full test suite."
+        }
+      }
+    },
+    {
+      "expect": {
+        "has_unfinished_work": "false",
+        "useful_work_remaining": "false"
+      },
+      "family": "typed",
+      "id": "typed_pending_work_done",
+      "origin": "extension/jev-judge-core.js buildJevPendingWorkRequest",
+      "payload": {
+        "questions": {
+          "handoff_boundary_stable": {
+            "criteria": {
+              "false": "The response is mid-step, ambiguous, or lacks enough state to make a clean continuity boundary.",
+              "true": "The latest response ends at a coherent work boundary with state and next work understandable from the bounded transcript."
+            },
+            "instructions": "Is the latest settled turn a stable boundary where a continuity handoff could preserve the work cleanly if deterministic context-pressure gates later require one?",
+            "type": "noul"
+          },
+          "has_unfinished_work": {
+            "criteria": {
+              "false": "The requested work is complete, the response only offers optional future help, or the remaining action requires a user/external decision or input before the assistant can continue.",
+              "true": "Concrete requested work remains and the assistant can keep working without a new user decision, for example implementation, investigation, verification, cleanup, or a next step it explicitly committed to do."
+            },
+            "instructions": "Does the assistant's latest response leave concrete work from the user's request unfinished that the assistant itself can continue in another turn?",
+            "type": "noul"
+          },
+          "useful_work_remaining": {
+            "criteria": {
+              "false": "Little useful work remains here, or the work is complete or blocked on a human/external event.",
+              "true": "Meaningful work remains that can continue in the current conversation."
+            },
+            "instructions": "Is there substantial useful work that can still be completed in the current conversation before a handoff becomes necessary?",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "assistant_latest_response": "Done. The retry helper and its tests are committed, the suite passes, and nothing is left open. Let me know if you want the docs updated too.",
+          "user_request": "Add the retry helper with tests."
+        }
+      }
+    },
+    {
+      "expect": {
+        "has_unfinished_work": "false",
+        "useful_work_remaining": "false"
+      },
+      "family": "typed",
+      "id": "typed_pending_work_human_decision",
+      "origin": "extension/jev-judge-core.js buildJevPendingWorkRequest",
+      "payload": {
+        "questions": {
+          "handoff_boundary_stable": {
+            "criteria": {
+              "false": "The response is mid-step, ambiguous, or lacks enough state to make a clean continuity boundary.",
+              "true": "The latest response ends at a coherent work boundary with state and next work understandable from the bounded transcript."
+            },
+            "instructions": "Is the latest settled turn a stable boundary where a continuity handoff could preserve the work cleanly if deterministic context-pressure gates later require one?",
+            "type": "noul"
+          },
+          "has_unfinished_work": {
+            "criteria": {
+              "false": "The requested work is complete, the response only offers optional future help, or the remaining action requires a user/external decision or input before the assistant can continue.",
+              "true": "Concrete requested work remains and the assistant can keep working without a new user decision, for example implementation, investigation, verification, cleanup, or a next step it explicitly committed to do."
+            },
+            "instructions": "Does the assistant's latest response leave concrete work from the user's request unfinished that the assistant itself can continue in another turn?",
+            "type": "noul"
+          },
+          "useful_work_remaining": {
+            "criteria": {
+              "false": "Little useful work remains here, or the work is complete or blocked on a human/external event.",
+              "true": "Meaningful work remains that can continue in the current conversation."
+            },
+            "instructions": "Is there substantial useful work that can still be completed in the current conversation before a handoff becomes necessary?",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "assistant_latest_response": "Everything is prepared. I need your approval before publishing the production release; tell me when to continue.",
+          "user_request": "Ship the release."
+        }
+      }
+    },
+    {
+      "expect": {
+        "can_continue": "true",
+        "needs_human": "false",
+        "task_completed": "false"
+      },
+      "family": "typed",
+      "id": "typed_goal_can_continue",
+      "origin": "extension/jev-judge-core.js buildJevGoalSemanticRequest",
+      "payload": {
+        "questions": {
+          "can_continue": {
+            "criteria": {
+              "false": "Safe progress requires a human decision, unavailable external event, or information the assistant does not currently have.",
+              "true": "Useful work can continue safely now using available tools, evidence, and already-granted authority."
+            },
+            "instructions": "Can the assistant autonomously continue useful work toward the current objective right now without a new human decision or unavailable external event?",
+            "type": "noul"
+          },
+          "needs_handoff": {
+            "criteria": {
+              "false": "The objective can continue in the current conversation without a continuity handoff.",
+              "true": "Continuing the same objective requires a fresh conversation because of context pressure or an explicit continuity transfer."
+            },
+            "instructions": "Does the latest state indicate that continuing the same objective requires handing off to a fresh conversation because of context pressure or an explicit planned continuity transfer?",
+            "type": "noul"
+          },
+          "needs_human": {
+            "criteria": {
+              "false": "No new human-owned decision or action is required for the assistant's next safe step.",
+              "true": "A human-owned decision, approval, credential, payment, publication, deletion, or subjective choice is required before safe progress."
+            },
+            "instructions": "Does the next safe step require a human decision, approval, subjective preference, credential, payment, publication, deletion, or other human-owned action?",
+            "type": "noul"
+          },
+          "task_completed": {
+            "criteria": {
+              "false": "Concrete requested work remains, or completion cannot yet be established from the supplied state.",
+              "true": "The requested objective appears complete and the latest state identifies no concrete remaining work."
+            },
+            "instructions": "Does the latest state appear to have completed the requested objective with no concrete work remaining? This is only a semantic hint, not evidence that TODOs are actually closed.",
+            "type": "noul"
+          },
+          "waiting_external": {
+            "criteria": {
+              "false": "No unresolved external event currently blocks useful progress.",
+              "true": "Progress is blocked on an external system, running job/agent, provider response, or other event that has not completed yet."
+            },
+            "instructions": "Is progress currently blocked waiting for an external system, running agent, CI/job, provider, or other event that the assistant should not replace with another Continue message?",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "assistant_latest_response": "I collected the fixtures and will now run the per-route measurement.",
+          "boundary": "turn_settled",
+          "objective": "Finish the v1.1 semantic benchmark.",
+          "open_todos": [
+            "run per-route measurement",
+            "write the results table"
+          ],
+          "runtime_summary": "",
+          "user_request": "Keep going until the benchmark report exists."
+        }
+      }
+    },
+    {
+      "expect": {
+        "can_continue": "false",
+        "needs_human": "true",
+        "task_completed": "false"
+      },
+      "family": "typed",
+      "id": "typed_goal_needs_human",
+      "origin": "extension/jev-judge-core.js buildJevGoalSemanticRequest",
+      "payload": {
+        "questions": {
+          "can_continue": {
+            "criteria": {
+              "false": "Safe progress requires a human decision, unavailable external event, or information the assistant does not currently have.",
+              "true": "Useful work can continue safely now using available tools, evidence, and already-granted authority."
+            },
+            "instructions": "Can the assistant autonomously continue useful work toward the current objective right now without a new human decision or unavailable external event?",
+            "type": "noul"
+          },
+          "needs_handoff": {
+            "criteria": {
+              "false": "The objective can continue in the current conversation without a continuity handoff.",
+              "true": "Continuing the same objective requires a fresh conversation because of context pressure or an explicit continuity transfer."
+            },
+            "instructions": "Does the latest state indicate that continuing the same objective requires handing off to a fresh conversation because of context pressure or an explicit planned continuity transfer?",
+            "type": "noul"
+          },
+          "needs_human": {
+            "criteria": {
+              "false": "No new human-owned decision or action is required for the assistant's next safe step.",
+              "true": "A human-owned decision, approval, credential, payment, publication, deletion, or subjective choice is required before safe progress."
+            },
+            "instructions": "Does the next safe step require a human decision, approval, subjective preference, credential, payment, publication, deletion, or other human-owned action?",
+            "type": "noul"
+          },
+          "task_completed": {
+            "criteria": {
+              "false": "Concrete requested work remains, or completion cannot yet be established from the supplied state.",
+              "true": "The requested objective appears complete and the latest state identifies no concrete remaining work."
+            },
+            "instructions": "Does the latest state appear to have completed the requested objective with no concrete work remaining? This is only a semantic hint, not evidence that TODOs are actually closed.",
+            "type": "noul"
+          },
+          "waiting_external": {
+            "criteria": {
+              "false": "No unresolved external event currently blocks useful progress.",
+              "true": "Progress is blocked on an external system, running job/agent, provider response, or other event that has not completed yet."
+            },
+            "instructions": "Is progress currently blocked waiting for an external system, running agent, CI/job, provider, or other event that the assistant should not replace with another Continue message?",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "assistant_latest_response": "Two licenses are plausible and the choice is a product/legal decision. Which one should I use?",
+          "boundary": "turn_settled",
+          "objective": "Publish the release with the correct license.",
+          "open_todos": [
+            "publish release"
+          ],
+          "runtime_summary": "",
+          "user_request": "Pick whatever license you think is best and publish it."
+        }
+      }
+    },
+    {
+      "expect": {
+        "needs_human": "false",
+        "task_completed": "false",
+        "waiting_external": "true"
+      },
+      "family": "typed",
+      "id": "typed_goal_waiting_external",
+      "origin": "extension/jev-judge-core.js buildJevGoalSemanticRequest",
+      "payload": {
+        "questions": {
+          "can_continue": {
+            "criteria": {
+              "false": "Safe progress requires a human decision, unavailable external event, or information the assistant does not currently have.",
+              "true": "Useful work can continue safely now using available tools, evidence, and already-granted authority."
+            },
+            "instructions": "Can the assistant autonomously continue useful work toward the current objective right now without a new human decision or unavailable external event?",
+            "type": "noul"
+          },
+          "needs_handoff": {
+            "criteria": {
+              "false": "The objective can continue in the current conversation without a continuity handoff.",
+              "true": "Continuing the same objective requires a fresh conversation because of context pressure or an explicit continuity transfer."
+            },
+            "instructions": "Does the latest state indicate that continuing the same objective requires handing off to a fresh conversation because of context pressure or an explicit planned continuity transfer?",
+            "type": "noul"
+          },
+          "needs_human": {
+            "criteria": {
+              "false": "No new human-owned decision or action is required for the assistant's next safe step.",
+              "true": "A human-owned decision, approval, credential, payment, publication, deletion, or subjective choice is required before safe progress."
+            },
+            "instructions": "Does the next safe step require a human decision, approval, subjective preference, credential, payment, publication, deletion, or other human-owned action?",
+            "type": "noul"
+          },
+          "task_completed": {
+            "criteria": {
+              "false": "Concrete requested work remains, or completion cannot yet be established from the supplied state.",
+              "true": "The requested objective appears complete and the latest state identifies no concrete remaining work."
+            },
+            "instructions": "Does the latest state appear to have completed the requested objective with no concrete work remaining? This is only a semantic hint, not evidence that TODOs are actually closed.",
+            "type": "noul"
+          },
+          "waiting_external": {
+            "criteria": {
+              "false": "No unresolved external event currently blocks useful progress.",
+              "true": "Progress is blocked on an external system, running job/agent, provider response, or other event that has not completed yet."
+            },
+            "instructions": "Is progress currently blocked waiting for an external system, running agent, CI/job, provider, or other event that the assistant should not replace with another Continue message?",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "assistant_latest_response": "The pipeline is still running; I will wait for the CI result before doing anything else.",
+          "boundary": "turn_settled",
+          "objective": "Land the change once CI is green.",
+          "open_todos": [
+            "collect CI result"
+          ],
+          "runtime_summary": "",
+          "user_request": "Continue until it is merged."
+        }
+      }
+    },
+    {
+      "expect": {
+        "can_continue": "false",
+        "task_completed": "true",
+        "waiting_external": "false"
+      },
+      "family": "typed",
+      "id": "typed_goal_task_completed",
+      "origin": "extension/jev-judge-core.js buildJevGoalSemanticRequest",
+      "payload": {
+        "questions": {
+          "can_continue": {
+            "criteria": {
+              "false": "Safe progress requires a human decision, unavailable external event, or information the assistant does not currently have.",
+              "true": "Useful work can continue safely now using available tools, evidence, and already-granted authority."
+            },
+            "instructions": "Can the assistant autonomously continue useful work toward the current objective right now without a new human decision or unavailable external event?",
+            "type": "noul"
+          },
+          "needs_handoff": {
+            "criteria": {
+              "false": "The objective can continue in the current conversation without a continuity handoff.",
+              "true": "Continuing the same objective requires a fresh conversation because of context pressure or an explicit continuity transfer."
+            },
+            "instructions": "Does the latest state indicate that continuing the same objective requires handing off to a fresh conversation because of context pressure or an explicit planned continuity transfer?",
+            "type": "noul"
+          },
+          "needs_human": {
+            "criteria": {
+              "false": "No new human-owned decision or action is required for the assistant's next safe step.",
+              "true": "A human-owned decision, approval, credential, payment, publication, deletion, or subjective choice is required before safe progress."
+            },
+            "instructions": "Does the next safe step require a human decision, approval, subjective preference, credential, payment, publication, deletion, or other human-owned action?",
+            "type": "noul"
+          },
+          "task_completed": {
+            "criteria": {
+              "false": "Concrete requested work remains, or completion cannot yet be established from the supplied state.",
+              "true": "The requested objective appears complete and the latest state identifies no concrete remaining work."
+            },
+            "instructions": "Does the latest state appear to have completed the requested objective with no concrete work remaining? This is only a semantic hint, not evidence that TODOs are actually closed.",
+            "type": "noul"
+          },
+          "waiting_external": {
+            "criteria": {
+              "false": "No unresolved external event currently blocks useful progress.",
+              "true": "Progress is blocked on an external system, running job/agent, provider response, or other event that has not completed yet."
+            },
+            "instructions": "Is progress currently blocked waiting for an external system, running agent, CI/job, provider, or other event that the assistant should not replace with another Continue message?",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "assistant_latest_response": "All requested work is complete: the helper is implemented, tested and committed, and every open TODO is closed.",
+          "boundary": "turn_settled",
+          "objective": "Add and verify the retry helper.",
+          "open_todos": [],
+          "runtime_summary": "",
+          "user_request": "Add the retry helper."
+        }
+      }
+    },
+    {
+      "expect": {
+        "needs_handoff": "true",
+        "task_completed": "false"
+      },
+      "family": "typed",
+      "id": "typed_goal_needs_handoff",
+      "origin": "extension/jev-judge-core.js buildJevGoalSemanticRequest",
+      "payload": {
+        "questions": {
+          "can_continue": {
+            "criteria": {
+              "false": "Safe progress requires a human decision, unavailable external event, or information the assistant does not currently have.",
+              "true": "Useful work can continue safely now using available tools, evidence, and already-granted authority."
+            },
+            "instructions": "Can the assistant autonomously continue useful work toward the current objective right now without a new human decision or unavailable external event?",
+            "type": "noul"
+          },
+          "needs_handoff": {
+            "criteria": {
+              "false": "The objective can continue in the current conversation without a continuity handoff.",
+              "true": "Continuing the same objective requires a fresh conversation because of context pressure or an explicit continuity transfer."
+            },
+            "instructions": "Does the latest state indicate that continuing the same objective requires handing off to a fresh conversation because of context pressure or an explicit planned continuity transfer?",
+            "type": "noul"
+          },
+          "needs_human": {
+            "criteria": {
+              "false": "No new human-owned decision or action is required for the assistant's next safe step.",
+              "true": "A human-owned decision, approval, credential, payment, publication, deletion, or subjective choice is required before safe progress."
+            },
+            "instructions": "Does the next safe step require a human decision, approval, subjective preference, credential, payment, publication, deletion, or other human-owned action?",
+            "type": "noul"
+          },
+          "task_completed": {
+            "criteria": {
+              "false": "Concrete requested work remains, or completion cannot yet be established from the supplied state.",
+              "true": "The requested objective appears complete and the latest state identifies no concrete remaining work."
+            },
+            "instructions": "Does the latest state appear to have completed the requested objective with no concrete work remaining? This is only a semantic hint, not evidence that TODOs are actually closed.",
+            "type": "noul"
+          },
+          "waiting_external": {
+            "criteria": {
+              "false": "No unresolved external event currently blocks useful progress.",
+              "true": "Progress is blocked on an external system, running job/agent, provider response, or other event that has not completed yet."
+            },
+            "instructions": "Is progress currently blocked waiting for an external system, running agent, CI/job, provider, or other event that the assistant should not replace with another Continue message?",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "assistant_latest_response": "The context window is nearly exhausted, so continuing this objective needs a fresh conversation with a continuity handoff.",
+          "boundary": "context_pressure",
+          "objective": "Finish the long multi-stage migration.",
+          "open_todos": [
+            "migrate remaining call sites"
+          ],
+          "runtime_summary": "context_state=rollover_required",
+          "user_request": "Continue the migration."
+        }
+      }
+    },
+    {
+      "expect": {
+        "external_blocked": "false",
+        "objective_done": "true"
+      },
+      "family": "typed",
+      "id": "typed_fastpath_objective_done",
+      "origin": "crates/herdr-mcp/src/mcp.rs browser_fast_path_decision (mirrored heads)",
+      "payload": {
+        "questions": {
+          "external_blocked": {
+            "criteria": {
+              "false": "No visible human or external boundary prevents autonomous progress",
+              "true": "A visible human or external boundary prevents autonomous progress"
+            },
+            "instructions": "Does the current visible page require a human or external action before Herdr can safely continue autonomously? Treat login or sign-in, CAPTCHA or challenge, consent or approval, permission, payment, and waiting for an external result as blocked. Do not call the page blocked when the visible evidence allows an offered low-risk action to make autonomous progress.",
+            "type": "noul"
+          },
+          "objective_done": {
+            "criteria": {
+              "false": "The current page does not yet visibly prove the objective is satisfied",
+              "true": "The current page visibly proves the objective is satisfied"
+            },
+            "instructions": "Does the current visible page itself prove that the objective is already satisfied?",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "authority": "advisory candidate selection only; no browser action is executed here",
+          "candidate_count": 0,
+          "objective": "Submit the support request and confirm it was accepted.",
+          "observation": {
+            "elements": [],
+            "generation": "g1",
+            "origin": "https://example.test",
+            "text": "Thank you. Your request has been received and is confirmed. Reference 48213.",
+            "title": "Request received",
+            "url": "https://example.test/support/thanks"
+          }
+        }
+      }
+    },
+    {
+      "expect": {
+        "external_blocked": "true",
+        "objective_done": "false"
+      },
+      "family": "typed",
+      "id": "typed_fastpath_login_boundary",
+      "origin": "crates/herdr-mcp/src/mcp.rs browser_fast_path_decision (mirrored heads)",
+      "payload": {
+        "questions": {
+          "external_blocked": {
+            "criteria": {
+              "false": "No visible human or external boundary prevents autonomous progress",
+              "true": "A visible human or external boundary prevents autonomous progress"
+            },
+            "instructions": "Does the current visible page require a human or external action before Herdr can safely continue autonomously? Treat login or sign-in, CAPTCHA or challenge, consent or approval, permission, payment, and waiting for an external result as blocked. Do not call the page blocked when the visible evidence allows an offered low-risk action to make autonomous progress.",
+            "type": "noul"
+          },
+          "objective_done": {
+            "criteria": {
+              "false": "The current page does not yet visibly prove the objective is satisfied",
+              "true": "The current page visibly proves the objective is satisfied"
+            },
+            "instructions": "Does the current visible page itself prove that the objective is already satisfied?",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "authority": "advisory candidate selection only; no browser action is executed here",
+          "candidate_count": 0,
+          "objective": "Open the billing report and read the totals.",
+          "observation": {
+            "elements": [],
+            "generation": "g2",
+            "origin": "https://example.test",
+            "text": "Sign in to continue. Enter your password to view the billing report.",
+            "title": "Sign in",
+            "url": "https://example.test/login"
+          }
+        }
+      }
+    },
+    {
+      "expect": {
+        "click_target": "target_0",
+        "external_blocked": "false",
+        "objective_done": "false",
+        "safe_click_supported": "true"
+      },
+      "family": "typed",
+      "id": "typed_fastpath_choose_primary_cta",
+      "origin": "crates/herdr-mcp/src/mcp.rs browser_fast_path_decision (mirrored heads)",
+      "payload": {
+        "questions": {
+          "click_target": {
+            "criteria": {
+              "target_0": "Click only this already-observed opaque element: {\"action\":\"click\",\"ref\":\"e10\",\"class\":\"same_origin_navigation\",\"label\":\"Continue\"}",
+              "target_1": "Click only this already-observed opaque element: {\"action\":\"click\",\"ref\":\"e11\",\"class\":\"reveal\",\"label\":\"Help\"}",
+              "target_2": "Click only this already-observed opaque element: {\"action\":\"click\",\"ref\":\"e12\",\"class\":\"same_origin_navigation\",\"label\":\"Learn more\"}"
+            },
+            "instructions": "If a low-risk click is supported, choose exactly one offered observed target whose visible label or semantics best match the requested next step. Never invent an element reference.",
+            "type": "choice"
+          },
+          "external_blocked": {
+            "criteria": {
+              "false": "No visible human or external boundary prevents autonomous progress",
+              "true": "A visible human or external boundary prevents autonomous progress"
+            },
+            "instructions": "Does the current visible page require a human or external action before Herdr can safely continue autonomously? Treat login or sign-in, CAPTCHA or challenge, consent or approval, permission, payment, and waiting for an external result as blocked. Do not call the page blocked when the visible evidence allows an offered low-risk action to make autonomous progress.",
+            "type": "noul"
+          },
+          "objective_done": {
+            "criteria": {
+              "false": "The current page does not yet visibly prove the objective is satisfied",
+              "true": "The current page visibly proves the objective is satisfied"
+            },
+            "instructions": "Does the current visible page itself prove that the objective is already satisfied?",
+            "type": "noul"
+          },
+          "safe_click_supported": {
+            "criteria": {
+              "false": "None of the offered candidates reasonably advances toward the objective",
+              "true": "At least one offered candidate reasonably advances toward the objective"
+            },
+            "instructions": "Considering only the Runtime-offered low-risk click candidates shown in the current observation, is at least one candidate a reasonable next action that advances toward the stated objective? Evaluate progress, not final completion.",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "authority": "advisory candidate selection only; no browser action is executed here",
+          "candidate_count": 3,
+          "objective": "Continue the multi-step checkout form to the next step.",
+          "observation": {
+            "elements": [
+              {
+                "candidate_id": "target_0",
+                "class": "same_origin_navigation",
+                "ref": "e10",
+                "text": "Continue"
+              },
+              {
+                "candidate_id": "target_1",
+                "class": "reveal",
+                "ref": "e11",
+                "text": "Help"
+              },
+              {
+                "candidate_id": "target_2",
+                "class": "same_origin_navigation",
+                "ref": "e12",
+                "text": "Learn more"
+              }
+            ],
+            "generation": "g3",
+            "origin": "https://example.test",
+            "text": "Step 1 of 3 completed. Choose Continue to go to step 2.",
+            "title": "Wizard step 1 of 3",
+            "url": "https://example.test/wizard/step-1"
+          }
+        }
+      }
+    },
+    {
+      "expect": {
+        "click_target": "target_1",
+        "safe_click_supported": "true"
+      },
+      "family": "typed",
+      "id": "typed_fastpath_choose_next_page",
+      "origin": "crates/herdr-mcp/src/mcp.rs browser_fast_path_decision (mirrored heads)",
+      "payload": {
+        "questions": {
+          "click_target": {
+            "criteria": {
+              "target_0": "Click only this already-observed opaque element: {\"action\":\"click\",\"ref\":\"e20\",\"class\":\"reveal\",\"label\":\"Help\"}",
+              "target_1": "Click only this already-observed opaque element: {\"action\":\"click\",\"ref\":\"e21\",\"class\":\"same_origin_navigation\",\"label\":\"Next page\"}",
+              "target_2": "Click only this already-observed opaque element: {\"action\":\"click\",\"ref\":\"e22\",\"class\":\"same_origin_navigation\",\"label\":\"Privacy policy\"}"
+            },
+            "instructions": "If a low-risk click is supported, choose exactly one offered observed target whose visible label or semantics best match the requested next step. Never invent an element reference.",
+            "type": "choice"
+          },
+          "external_blocked": {
+            "criteria": {
+              "false": "No visible human or external boundary prevents autonomous progress",
+              "true": "A visible human or external boundary prevents autonomous progress"
+            },
+            "instructions": "Does the current visible page require a human or external action before Herdr can safely continue autonomously? Treat login or sign-in, CAPTCHA or challenge, consent or approval, permission, payment, and waiting for an external result as blocked. Do not call the page blocked when the visible evidence allows an offered low-risk action to make autonomous progress.",
+            "type": "noul"
+          },
+          "objective_done": {
+            "criteria": {
+              "false": "The current page does not yet visibly prove the objective is satisfied",
+              "true": "The current page visibly proves the objective is satisfied"
+            },
+            "instructions": "Does the current visible page itself prove that the objective is already satisfied?",
+            "type": "noul"
+          },
+          "safe_click_supported": {
+            "criteria": {
+              "false": "None of the offered candidates reasonably advances toward the objective",
+              "true": "At least one offered candidate reasonably advances toward the objective"
+            },
+            "instructions": "Considering only the Runtime-offered low-risk click candidates shown in the current observation, is at least one candidate a reasonable next action that advances toward the stated objective? Evaluate progress, not final completion.",
+            "type": "noul"
+          }
+        },
+        "state": {
+          "authority": "advisory candidate selection only; no browser action is executed here",
+          "candidate_count": 3,
+          "objective": "Open the next page of archived notifications.",
+          "observation": {
+            "elements": [
+              {
+                "candidate_id": "target_0",
+                "class": "reveal",
+                "ref": "e20",
+                "text": "Help"
+              },
+              {
+                "candidate_id": "target_1",
+                "class": "same_origin_navigation",
+                "ref": "e21",
+                "text": "Next page"
+              },
+              {
+                "candidate_id": "target_2",
+                "class": "same_origin_navigation",
+                "ref": "e22",
+                "text": "Privacy policy"
+              }
+            ],
+            "generation": "g4",
+            "origin": "https://example.test",
+            "text": "Archive page 1 of 12. Use the pager to read older entries.",
+            "title": "Archive page 1",
+            "url": "https://example.test/archive?page=1"
+          }
+        }
+      }
+    }
+  ],
+  "version": 1
+}
