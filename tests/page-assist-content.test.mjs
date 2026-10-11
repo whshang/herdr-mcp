@@ -598,3 +598,27 @@ test("user sets a framework-managed checkbox | Given a checkbox whose native cli
   assert.equal(stuckValue, false);
   void stuckRef;
 });
+
+test("user fills a rich-text composer | Given a contenteditable editor that may ignore raw text writes | When fill runs | Then success is reported only after the text reads back", () => {
+  const value = "hello  claude\u00a0composer";
+  function fillOnly(element) {
+    const h = harness({ elements: [element] });
+    const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+    assert.equal(observed.elements.length, 1);
+    return h.send({
+      type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+      generation: observed.generation, ref: observed.elements[0].ref, value,
+    });
+  }
+  // ProseMirror-like: re-renders its own model and drops a raw innerText write.
+  const prose = createElement({ tag: "div", contentEditable: true, attrs: { "aria-label": "Prose editor" } });
+  Object.defineProperty(prose, "innerText", { get: () => "", set: () => {}, configurable: true });
+  Object.defineProperty(prose, "textContent", { get: () => "", set: () => {}, configurable: true });
+  const rejected = fillOnly(prose);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.error, "fill_not_applied");
+  assert.equal(rejected.applied, false);
+
+  const plain = createElement({ tag: "div", contentEditable: true, attrs: { "aria-label": "Plain editor" } });
+  assert.equal(fillOnly(plain).ok, true);
+});
