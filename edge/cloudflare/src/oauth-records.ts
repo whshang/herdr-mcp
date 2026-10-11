@@ -385,7 +385,7 @@ export function normalizeWebChatControlGrants(value: unknown): OAuthWebChatContr
     if (!Number.isSafeInteger(item.grant_generation) || (item.grant_generation as number) <= 0) return null;
     if (!boundedString(item.device_id, 64)) return null;
     if (!boundedString(item.endpoint_ref, 96) || !boundedString(item.account_ref, 96)) return null;
-    if (!boundedString(item.provider, 32) || !/^[a-z0-9][a-z0-9._-]*$/.test(item.provider)) return null;
+    if (!boundedString(item.provider, 32) || !(item.provider === "*" || /^[a-z0-9][a-z0-9._-]*$/.test(item.provider))) return null;
     grants.push({
       connector_id: item.connector_id,
       grant_generation: item.grant_generation as number,
