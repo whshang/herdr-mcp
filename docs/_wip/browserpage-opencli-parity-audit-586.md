@@ -29,6 +29,7 @@ Classification:
 | Wait text / URL / element | `wait` | `action expect` | verified-real | element_present/absent 0.1.154 |
 | Viewport scroll | `scroll` | `action scroll` | verified-real | 0.1.157, 9/9 UAT |
 | Targeted text extract | `get text`, `extract` | `action extract` | verified-real | 0.1.156, generation + ref bound |
+| Table extract | `extract` (table reads) | `action extract_table` (0.1.189) | unit-test-only | observed table refs, bounded headers/rows (max_rows 1..100, 32 cols, 200 chars/cell); Chrome UAT pending |
 | Screenshot | `screenshot` | `action screenshot` | verified-real | earlier UAT |
 | Navigate / goto | `goto`, `navigate` | (in progress on `feat/v11-next-navigation-20261009`, another lane) | missing-needed-for-1.1 | needed for post-submit route recovery; must reuse the mutation ledger |
 | Reload | `reload` | none | missing-needed-for-1.1 | the page-reload-mid-dispatch recovery test is still blocked; add next to `navigate` in the same lane |
@@ -82,3 +83,6 @@ Classification:
 3. Live proofs: late-acceptance promotion, SPA-return settlement (0.1.181),
    handoff, App-selection-failure cleanup.
 4. Cross-provider dispatch UAT (Grok, Claude) using the same envelope.
+5. Bounded `extract_table` (0.1.189) is unit-test-only; live proof on a
+   real table-bearing page and the rowspan/colspan flattening behavior
+   still need Chrome UAT.

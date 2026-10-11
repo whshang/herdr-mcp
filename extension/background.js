@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.188";
+const H2W_SCRIPT_VERSION = "0.1.189";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -8344,7 +8344,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "fill", "expect", "screenshot", "scroll", "press", "extract"].includes(action)) {
+  if (!["observe", "click", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -8409,6 +8409,7 @@ async function performBrowserPageActionRequest(msg) {
     direction: msg?.direction,
     amount: msg?.amount,
     key: msg?.key,
+    maxRows: msg?.maxRows,
   };
 
   const mutation = action === "click" || action === "fill" || action === "scroll" || action === "press";
@@ -8450,7 +8451,7 @@ async function performBrowserPageActionRequest(msg) {
     }
   }
 
-  if (!["observe", "expect", "extract"].includes(action)) {
+  if (!["observe", "expect", "extract", "extract_table"].includes(action)) {
     return withBrowserPageIdentity({ ok: false, error: "browser_page_action_unavailable" }, page);
   }
 

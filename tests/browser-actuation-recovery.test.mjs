@@ -888,6 +888,37 @@ test("user receives safe press mutation errors | Given an owned page and out-of-
   assert.equal(delivered.mutation_submitted, true);
 });
 
+test("user extracts table rows from an observed page | Given a claimed page with an observed table ref | When extract_table requests bounded rows | Then the bridge forwards max_rows without a mutation envelope", async () => {
+  const tabs = new Map([[76, { id: 76, url: "https://example.com/report", active: true }]]);
+  let forwarded = null;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      forwarded = payload;
+      return { ok: true, headers: ["Name", "Qty"], rows: [["Widget", "3"]], rows_truncated: false };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/report",
+    idempotencyKey: "claim-table-extract",
+  });
+  assert.equal(page.ok, true);
+  const result = await h.performBrowserPageActionRequest({
+    action: "extract_table", pageRef: page.page_ref, generation: "pa_table_1",
+    ref: "ref_pa_table_1_0", maxRows: 10,
+  });
+  assert.equal(forwarded.action, "extract_table");
+  assert.equal(forwarded.maxRows, 10);
+  assert.equal(forwarded.ref, "ref_pa_table_1_0");
+  assert.equal(forwarded.generation, "pa_table_1");
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.headers, ["Name", "Qty"]);
+  assert.deepEqual(result.rows, [["Widget", "3"]]);
+  assert.equal(result.page_ref, page.page_ref);
+  assert.ok(!Object.hasOwn(result, "delivery_state"), "read-only extract_table carries no mutation envelope");
+  assert.ok(!Object.hasOwn(result, "tab_id"));
+});
+
 test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {
   const sessionStorage = {};
   const tabs = new Map([

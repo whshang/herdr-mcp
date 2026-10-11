@@ -187,7 +187,7 @@
     if (!doc) return { ok: false, error: "document_unavailable" };
 
     const candidates = doc.querySelectorAll(
-      'button, a[href], input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
+      'button, a[href], input, textarea, select, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
     );
 
     const elements = [];
@@ -306,6 +306,65 @@
       ok: true, ref, generation,
       text: cleanText(raw, maxChars),
       truncated: raw.length > maxChars,
+    };
+  }
+
+  const MAX_TABLE_CELL_CHARS = 200;
+  const MAX_TABLE_COLUMNS = 32;
+
+  function executeExtractTable(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const generation = String(params.generation || "").trim();
+    if (!generation || generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    const ref = String(params.ref || "");
+    if (!ref.startsWith(`ref_${generation}_`)) return { ok: false, error: "invalid_ref" };
+    const maxRows = params.maxRows === undefined ? 25 : params.maxRows;
+    if (!Number.isInteger(maxRows) || maxRows < 1 || maxRows > 100) {
+      return { ok: false, error: "extract_table_params_invalid" };
+    }
+    const el = elementMap.get(ref);
+    if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+    if ((el.tagName || "").toLowerCase() !== "table") return { ok: false, error: "unsupported_element" };
+    if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
+      return { ok: false, error: "unsupported_element" };
+    }
+
+    // Visible cell text only: innerText drops display:none content, and no
+    // markup, attribute, input value or script surface is returned.
+    const cellText = (cell) => cleanText(cell.innerText || cell.textContent, MAX_TABLE_CELL_CHARS);
+    const rowCells = (row) => [...(row.children || [])]
+      .filter((cell) => ["td", "th"].includes(String(cell.tagName || "").toLowerCase()))
+      .slice(0, MAX_TABLE_COLUMNS)
+      .map(cellText);
+    const trList = [...(el.querySelectorAll?.("tr") || [])];
+    const allRows = trList.map(rowCells).filter((cells) => cells.length > 0);
+    let headers = [];
+    let dataRows = allRows;
+    const firstRowCells = trList.length ? [...(trList[0].children || [])] : [];
+    const firstRowHeaders = firstRowCells
+      .filter((cell) => String(cell.tagName || "").toLowerCase() === "th")
+      .slice(0, MAX_TABLE_COLUMNS)
+      .map(cellText);
+    const firstRowDataCells = firstRowCells
+      .filter((cell) => ["td", "th"].includes(String(cell.tagName || "").toLowerCase()));
+    if (firstRowHeaders.length > 0 && firstRowHeaders.length === firstRowDataCells.length) {
+      headers = firstRowHeaders;
+      dataRows = allRows.slice(1);
+    }
+    const rows_truncated = dataRows.length > maxRows;
+    return {
+      ok: true,
+      ref,
+      generation,
+      headers,
+      rows: dataRows.slice(0, maxRows),
+      rows_truncated,
+      requires_verification: true,
     };
   }
 
@@ -704,6 +763,7 @@
     if (action === "click") return executeClick(msg);
     if (action === "fill") return executeFill(msg);
     if (action === "extract") return executeExtract(msg);
+    if (action === "extract_table") return executeExtractTable(msg);
     if (action === "scroll") return executeScroll(msg);
     if (action === "press") return executePress(msg);
     if (action === "expect") return executeExpect(msg);

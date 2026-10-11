@@ -254,6 +254,81 @@ test("user extracts text from one observed control | Given a bounded safe DOM el
   assert.equal(extraction().error, "stale_generation");
 });
 
+test("user extracts one observed table | Given a page with a visible table ref | When extract_table requests bounded rows | Then headers and cell text return without markup or hidden values", () => {
+  const createTable = (rows, { visible = true } = {}) => {
+    const trList = rows.map((cells) => ({
+      children: cells.map(([tag, text]) => ({
+        tagName: tag.toUpperCase(),
+        innerText: text,
+        textContent: text,
+      })),
+    }));
+    return {
+      tagName: "TABLE",
+      type: "",
+      value: "",
+      disabled: false,
+      isConnected: true,
+      isContentEditable: false,
+      offsetParent: visible ? {} : null,
+      innerText: rows.map((cells) => cells.map(([, text]) => text).join(" ")).join("\n"),
+      textContent: "",
+      getAttribute() { return null; },
+      hasAttribute() { return false; },
+      getBoundingClientRect() { return visible ? { width: 400, height: 200 } : { width: 0, height: 0 }; },
+      querySelectorAll(selector) { return selector === "tr" ? trList : []; },
+    };
+  };
+  const longCell = "v".repeat(400);
+  const table = createTable([
+    [["th", "Name"], ["th", "Qty"]],
+    [["td", "Widget"], ["td", "3"]],
+    [["td", longCell], ["td", "0"]],
+    [["td", "Gadget"], ["td", "7"]],
+  ]);
+  const hiddenTable = createTable([[["td", "secret"]]], { visible: false });
+  const button = createElement({ tag: "button", text: "Filter" });
+  const h = harness({ elements: [table, hiddenTable, button] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 2);
+  const tableRef = observed.elements.find((item) => item.tag === "table")?.ref;
+  const buttonRef = observed.elements.find((item) => item.tag === "button")?.ref;
+  assert.ok(tableRef);
+
+  const extractTable = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: tableRef, ...params,
+  });
+  const result = extractTable();
+  assert.equal(result.ok, true);
+  assert.deepEqual(Array.from(result.headers), ["Name", "Qty"]);
+  assert.equal(result.rows.length, 3);
+  assert.deepEqual(Array.from(result.rows[0]), ["Widget", "3"]);
+  assert.equal(result.rows[1][0].length, 200);
+  assert.equal(result.rows_truncated, false);
+  assert.ok(!Object.hasOwn(result, "outerHTML"));
+  assert.ok(!Object.hasOwn(result, "attributes"));
+
+  const clipped = extractTable({ maxRows: 2 });
+  assert.equal(clipped.rows.length, 2);
+  assert.equal(clipped.rows_truncated, true);
+
+  assert.equal(extractTable({ maxRows: 101 }).error, "extract_table_params_invalid");
+  assert.equal(extractTable({ maxRows: 0 }).error, "extract_table_params_invalid");
+  assert.equal(extractTable({ selector: "table" }).error, "disallowed_parameter");
+  assert.equal(extractTable({ expectedOrigin: "https://other.test" }).error, "origin_mismatch");
+  assert.equal(extractTable({ generation: "old" }).error, "stale_generation");
+  assert.equal(extractTable({ ref: `ref_${observed.generation}_999` }).error, "element_detached");
+  assert.equal(h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: buttonRef,
+  }).error, "unsupported_element");
+
+  const reobserved = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.notEqual(reobserved.generation, observed.generation);
+  assert.equal(extractTable().error, "stale_generation");
+});
+
 test("user presses one bounded key | Given an observed page with a focused control | When a vocabulary key is pressed with or without a ref | Then key events reach one target and the generation expires", () => {
   class FakeKeyboardEvent {
     constructor(type, options = {}) {

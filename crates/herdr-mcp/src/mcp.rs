@@ -7905,6 +7905,7 @@ fn browser_page_action_call(
         "direction",
         "amount",
         "key",
+        "max_rows",
     ];
     if let Some(key) = object
         .keys()
@@ -7969,13 +7970,13 @@ fn browser_page_action_call(
     let action = match object.get("action").and_then(Value::as_str) {
         Some(
             value @ ("observe" | "click" | "fill" | "expect" | "screenshot" | "scroll" | "extract"
-            | "press"),
+            | "extract_table" | "press"),
         ) => value,
         _ => {
             return json!({
                 "ok": false,
                 "code": "invalid_params",
-                "message": "action must be observe, click, fill, expect, screenshot, scroll, extract, or press",
+                "message": "action must be observe, click, fill, expect, screenshot, scroll, extract, extract_table, or press",
             });
         }
     };
@@ -8180,6 +8181,55 @@ fn browser_page_action_call(
             bridge_params["generation"] = json!(generation);
             bridge_params["ref"] = json!(element_ref);
             bridge_params["max_chars"] = json!(max_chars);
+        }
+        "extract_table" => {
+            for disallowed in [
+                "value",
+                "condition",
+                "timeout_ms",
+                "idempotency_key",
+                "objective",
+                "key",
+                "max_chars",
+            ] {
+                if object.contains_key(disallowed) {
+                    return json!({"ok": false, "code": "invalid_params", "message": format!("{disallowed} is not accepted for extract_table")});
+                }
+            }
+            let generation = match object.get("generation").and_then(Value::as_str) {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 256
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "generation is required for extract_table"});
+                }
+            };
+            let element_ref = match object.get("ref").and_then(Value::as_str) {
+                Some(value)
+                    if value.starts_with(&format!("ref_{generation}_")) && value.len() <= 256 =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "current table ref is required for extract_table"});
+                }
+            };
+            let max_rows = match object.get("max_rows") {
+                None => 25,
+                Some(value) => match value.as_u64() {
+                    Some(value) if (1..=100).contains(&value) => value,
+                    _ => {
+                        return json!({"ok": false, "code": "invalid_params", "message": "extract_table max_rows must be an integer between 1 and 100"});
+                    }
+                },
+            };
+            bridge_params["generation"] = json!(generation);
+            bridge_params["ref"] = json!(element_ref);
+            bridge_params["max_rows"] = json!(max_rows);
         }
         "click" | "fill" | "scroll" | "press" => {
             for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
@@ -17470,6 +17520,105 @@ mod tests {
             assert!(read.get("op_id").is_none());
         }
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn browser_page_extract_table_routes_bounded_read_only_ref_without_mutation_reservation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct TableExtractActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for TableExtractActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("extract_table must route through the exact browser endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_table"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(params["action"], "extract_table");
+                assert_eq!(params["generation"], "pa_gen_table_1");
+                assert_eq!(params["ref"], "ref_pa_gen_table_1_0");
+                assert!(params["max_rows"] == 25 || params["max_rows"] == 10);
+                assert!(params.get("idempotency_key").is_none());
+                assert!(params.get("max_chars").is_none());
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "headers": ["Name", "Qty"],
+                    "rows": [["Widget", "3"]],
+                    "rows_truncated": false,
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_table".to_owned(),
+        }];
+        let actuator = TableExtractActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let params = json!({
+            "endpoint_ref": "bep_table",
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "extract_table",
+            "generation": "pa_gen_table_1",
+            "ref": "ref_pa_gen_table_1_0",
+        });
+        for (key, invalid) in [
+            ("max_rows", json!(101)),
+            ("max_rows", json!(0)),
+            ("max_rows", json!("25")),
+            ("max_chars", json!(4000)),
+            ("key", json!("Enter")),
+            ("value", json!("x")),
+            ("idempotency_key", json!("not_for_reads")),
+            ("ref", json!("ref_pa_gen_other_0")),
+        ] {
+            let mut bad = params.clone();
+            bad[key] = invalid;
+            assert_eq!(
+                browser_page_action_call(&store, &bad, &grants, Some(&actuator))["code"],
+                "invalid_params"
+            );
+        }
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 0);
+        for _ in 0..2 {
+            let read = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+            assert_eq!(read["ok"], true);
+            assert_eq!(read["rows"][0][1], "3");
+            assert!(read.get("op_id").is_none());
+        }
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+
+        let mut bounded = params.clone();
+        bounded["max_rows"] = json!(10);
+        let read = browser_page_action_call(&store, &bounded, &grants, Some(&actuator));
+        assert_eq!(read["ok"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
