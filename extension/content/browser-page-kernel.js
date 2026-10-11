@@ -24,6 +24,25 @@
     "cc-csc",
   ]);
 
+  // Fixed single-key vocabulary shared with the Runtime validation. No text,
+  // no modifier combos, no caller-controlled raw key codes.
+  const PRESS_KEY_EVENTS = {
+    Enter: { key: "Enter", code: "Enter", keyCode: 13 },
+    Escape: { key: "Escape", code: "Escape", keyCode: 27 },
+    Tab: { key: "Tab", code: "Tab", keyCode: 9 },
+    Backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+    Delete: { key: "Delete", code: "Delete", keyCode: 46 },
+    ArrowUp: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+    ArrowDown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+    ArrowLeft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+    ArrowRight: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+    Home: { key: "Home", code: "Home", keyCode: 36 },
+    End: { key: "End", code: "End", keyCode: 35 },
+    PageUp: { key: "PageUp", code: "PageUp", keyCode: 33 },
+    PageDown: { key: "PageDown", code: "PageDown", keyCode: 34 },
+    Space: { key: " ", code: "Space", keyCode: 32 },
+  };
+
   function isSensitiveField(el) {
     if (!el) return false;
     const tag = (el.tagName || "").toLowerCase();
@@ -320,6 +339,64 @@
       };
     } catch (_) {
       return { ok: false, error: "scroll_delivery_unknown" };
+    }
+  }
+
+  function executePress(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const generation = String(params.generation || "").trim();
+    if (!generation || generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    if (params.value !== undefined) return { ok: false, error: "press_params_invalid" };
+    const keyName = String(params.key || "");
+    const spec = PRESS_KEY_EVENTS[keyName];
+    if (!spec) return { ok: false, error: "press_params_invalid" };
+
+    let target = null;
+    let ref = "";
+    if (params.ref !== undefined && params.ref !== null) {
+      ref = String(params.ref);
+      if (!ref.startsWith(`ref_${generation}_`)) return { ok: false, error: "invalid_ref" };
+      const el = elementMap.get(ref);
+      if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+      if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
+        return { ok: false, error: "unsupported_element" };
+      }
+      target = el;
+    }
+    if (!target) {
+      const doc = global.document;
+      const active = doc?.activeElement;
+      target = active && active.isConnected ? active : doc?.body;
+    }
+    if (!target || typeof target.dispatchEvent !== "function") {
+      return { ok: false, error: "press_unavailable" };
+    }
+
+    try {
+      target.focus?.();
+      // Synthetic events reach page key handlers (SPA composers, feeds) but
+      // never browser default actions; text input belongs to fill.
+      for (const type of ["keydown", "keypress", "keyup"]) {
+        target.dispatchEvent(new KeyboardEvent(type, {
+          key: spec.key, code: spec.code, keyCode: spec.keyCode, which: spec.keyCode,
+          bubbles: true, cancelable: true,
+        }));
+      }
+      invalidateGeneration();
+      return {
+        ok: true,
+        key: keyName,
+        ...(ref ? { ref } : {}),
+        generation,
+        requires_verification: true,
+      };
+    } catch (_) {
+      return { ok: false, error: "press_delivery_unknown" };
     }
   }
 
@@ -628,6 +705,7 @@
     if (action === "fill") return executeFill(msg);
     if (action === "extract") return executeExtract(msg);
     if (action === "scroll") return executeScroll(msg);
+    if (action === "press") return executePress(msg);
     if (action === "expect") return executeExpect(msg);
     return { ok: false, error: "unsupported_action" };
   }

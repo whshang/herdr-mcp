@@ -832,6 +832,62 @@ test("user receives safe scroll mutation errors | Given an owned page and invali
   assert.equal(uncertain.retry_safe, false);
 });
 
+test("user receives safe press mutation errors | Given an owned page and out-of-vocabulary keys | When the content kernel rejects before dispatch | Then delivery stays not_applied", async () => {
+  const tabs = new Map([[74, { id: 74, url: "https://example.com/feed", active: true }]]);
+  let rejection = "press_params_invalid";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      assert.equal(payload.action, "press");
+      assert.equal(payload.key, "Enter");
+      assert.equal(payload.ref, undefined);
+      return { ok: false, error: rejection };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/feed",
+    idempotencyKey: "claim-press-reject",
+  });
+  assert.equal(page.ok, true);
+  for (const error of ["press_params_invalid", "press_unavailable"]) {
+    rejection = error;
+    const result = await h.performBrowserPageActionRequest({
+      action: "press", pageRef: page.page_ref, generation: "pa_press_1", key: "Enter",
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, error);
+    assert.equal(result.delivery_state, "not_applied");
+    assert.equal(result.retry_safe, true);
+    assert.equal(result.mutation_submitted, false);
+  }
+  rejection = "press_delivery_unknown";
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "press", pageRef: page.page_ref, generation: "pa_press_1", key: "Enter",
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+
+  let applied = false;
+  const forwarder = browserPageLifecycleHarness({
+    sessionStorage: h.sessionStorage,
+    tabs,
+    contentResponder(_tabId, payload) {
+      assert.equal(payload.action, "press");
+      assert.equal(payload.key, "Tab");
+      assert.equal(payload.ref, "ref_pa_press_2_0");
+      applied = true;
+      return { ok: true, key: "Tab" };
+    },
+  });
+  const delivered = await forwarder.performBrowserPageActionRequest({
+    action: "press", pageRef: page.page_ref, generation: "pa_press_2", key: "Tab", ref: "ref_pa_press_2_0",
+  });
+  assert.equal(applied, true);
+  assert.equal(delivered.ok, true);
+  assert.equal(delivered.delivery_state, "applied");
+  assert.equal(delivered.mutation_submitted, true);
+});
+
 test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {
   const sessionStorage = {};
   const tabs = new Map([

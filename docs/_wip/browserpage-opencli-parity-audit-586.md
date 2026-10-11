@@ -34,7 +34,7 @@ Classification:
 | Reload | `reload` | none | missing-needed-for-1.1 | the page-reload-mid-dispatch recovery test is still blocked; add next to `navigate` in the same lane |
 | Back / forward | `back`, `forward` | none | later | SPA navigation is covered by click + reopen; no 1.1 workflow needs history yet |
 | Tab list / select | `tab list` | `webchat resources`, claim by URL | unit-test-only | no generic tab enumeration action; claim needs an exact URL |
-| Keyboard press / hotkeys | `press`, `keys` | none (DEV-only trusted typing for the `@app` mention) | missing-needed-for-1.1 | forms and lazy-loaded feeds; trusted input stays scoped to the DEV build |
+| Keyboard press / hotkeys | `press`, `keys` | `action press` (single-key vocabulary, 0.1.188) | unit-test-only | fixed 14-key vocabulary, optional observed ref to focus; no text/modifier combos; Chrome UAT pending |
 | Hover / double-click / drag | `hover`, `dblclick`, `drag` | none | later | |
 | Nested scroll containers | `scroll --selector` | none | site-adapter-insufficient | feeds such as X use their own containers; adapters handle it |
 | HTML / attributes | `get html/attr` | none | later | redaction review first |
@@ -76,7 +76,9 @@ Classification:
 1. `navigate` + `reload` in the existing action path (coordinate with the
    navigation lane, which has uncommitted `navigate` work) -> then the
    page-reload-mid-dispatch recovery UAT.
-2. Keyboard `press` for forms and feeds.
+2. Keyboard `press` for forms and feeds: implemented as a unit-test-only
+   bounded single-key action (0.1.188); live Chrome proof and any
+   hotkey/modifier decision remain open.
 3. Live proofs: late-acceptance promotion, SPA-return settlement (0.1.181),
    handoff, App-selection-failure cleanup.
 4. Cross-provider dispatch UAT (Grok, Claude) using the same envelope.

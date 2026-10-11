@@ -67,12 +67,15 @@ function harness({
   elements = [],
   topOrigin = null,
   scrollMax = 0,
+  activeElement = null,
+  extraGlobals = {},
 } = {}) {
   let listener = null;
   const location = new URL(url);
   const document = {
     title,
     readyState: "complete",
+    activeElement,
     body: { innerText: bodyText, textContent: bodyText },
     documentElement: { scrollHeight: scrollMax + 600 },
     querySelectorAll() { return elements; },
@@ -87,6 +90,7 @@ function harness({
     setTimeout,
     document,
     location,
+    ...extraGlobals,
     scrollY: 0,
     innerHeight: 600,
     scrollBy({ top }) {
@@ -248,6 +252,83 @@ test("user extracts text from one observed control | Given a bounded safe DOM el
   const next = h.send({ type: "h2w_page_assist", action: "inspect" });
   assert.notEqual(next.generation, observed.generation);
   assert.equal(extraction().error, "stale_generation");
+});
+
+test("user presses one bounded key | Given an observed page with a focused control | When a vocabulary key is pressed with or without a ref | Then key events reach one target and the generation expires", () => {
+  class FakeKeyboardEvent {
+    constructor(type, options = {}) {
+      this.type = type;
+      this.key = options.key;
+      this.code = options.code;
+    }
+  }
+  const events = [];
+  const record = (label, element) => ({
+    ...element,
+    label,
+    dispatchEvent(event) {
+      events.push({ target: label, type: event.type, key: event.key, code: event.code });
+      return true;
+    },
+  });
+  const composer = record("composer", createElement({
+    tag: "div", text: "", contentEditable: true, attrs: { "aria-label": "Composer" },
+  }));
+  const focused = record("focused", createElement({
+    tag: "input", type: "text", attrs: { placeholder: "Search" },
+  }));
+  const h = harness({
+    elements: [composer],
+    activeElement: focused,
+    extraGlobals: { KeyboardEvent: FakeKeyboardEvent },
+  });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 1);
+
+  const press = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: observed.generation, key: "Enter", ...params,
+  });
+  const withoutRef = press();
+  assert.equal(withoutRef.ok, true);
+  assert.equal(withoutRef.key, "Enter");
+  assert.ok(!Object.hasOwn(withoutRef, "ref"));
+  assert.deepEqual(events.map((event) => `${event.target}:${event.type}`), [
+    "focused:keydown", "focused:keypress", "focused:keyup",
+  ]);
+  assert.deepEqual(
+    events.filter((event) => event.type === "keydown").map((event) => `${event.key}/${event.code}`),
+    ["Enter/Enter"],
+  );
+  assert.equal(withoutRef.requires_verification, true);
+
+  const reobserved = h.send({ type: "h2w_page_assist", action: "inspect" });
+  events.length = 0;
+  const withRef = press({ generation: reobserved.generation, ref: reobserved.elements[0].ref, key: "ArrowDown" });
+  assert.equal(withRef.ok, true);
+  assert.equal(withRef.ref, reobserved.elements[0].ref);
+  assert.deepEqual(events.map((event) => `${event.target}:${event.type}:${event.key}`), [
+    "composer:keydown:ArrowDown", "composer:keypress:ArrowDown", "composer:keyup:ArrowDown",
+  ]);
+
+  const fresh = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const invalid = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: fresh.generation, ...params,
+  });
+  assert.equal(invalid({ key: "ctrl+a" }).error, "press_params_invalid");
+  assert.equal(invalid({ key: "enter" }).error, "press_params_invalid");
+  assert.equal(invalid({ key: "" }).error, "press_params_invalid");
+  assert.equal(invalid({ key: "Enter", value: "text" }).error, "press_params_invalid");
+  assert.equal(invalid({ key: "Enter", selector: "input" }).error, "disallowed_parameter");
+  assert.equal(invalid({ key: "Enter", expectedOrigin: "https://other.test" }).error, "origin_mismatch");
+  assert.equal(invalid({ key: "Enter", generation: "old" }).error, "stale_generation");
+  assert.equal(invalid({ key: "Enter", ref: `ref_${fresh.generation}_999` }).error, "element_detached");
+  events.length = 0;
+  const afterPress = press({ generation: fresh.generation });
+  assert.equal(afterPress.ok, true);
+  assert.ok(!Object.hasOwn(afterPress, "value"));
+  assert.equal(press({ generation: fresh.generation }).error, "stale_generation");
 });
 
 test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMirror textbox | When observing DOM structure | Then only bounded structural attributes are returned", () => {
