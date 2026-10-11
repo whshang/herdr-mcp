@@ -550,8 +550,33 @@
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
       } else if (isContentEditable) {
-        el.innerText = fillValue;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
+        // Rich editors (ProseMirror/Lexical: Claude, ChatGPT, Grok) ignore a
+        // raw innerText write and re-render their own model, so a blind write
+        // reads as success while nothing lands. Use native editing
+        // (select-all + insertText, as h2w_insert_main does) and verify.
+        const norm = (value) => String(value || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim();
+        let inserted = false;
+        try {
+          el.focus?.();
+          const doc = el.ownerDocument || global.document;
+          const sel = doc?.getSelection?.();
+          if (sel && doc?.createRange) {
+            const range = doc.createRange();
+            range.selectNodeContents(el);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          }
+          inserted = doc?.execCommand?.("insertText", false, fillValue) === true;
+        } catch (_) {
+          inserted = false;
+        }
+        if (!inserted) {
+          el.innerText = fillValue;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        if (norm(el.innerText ?? el.textContent) !== norm(fillValue)) {
+          return { ok: false, error: "fill_not_applied", applied: false, method: inserted ? "insert_text" : "inner_text" };
+        }
       }
       invalidateGeneration();
       return { ok: true, ref, generation: gen };
