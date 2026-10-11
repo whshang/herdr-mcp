@@ -142,3 +142,10 @@ herdr-mcp connector webchat-control deny  CONNECTOR_ID DEVICE_ID ENDPOINT_REF PR
 A trailing `ACCOUNT_REF` before `--confirm` is still accepted (legacy form) but no longer
 narrows the match; `deny` removes every grant for that endpoint + provider. Caller grant,
 exact device/endpoint, tab ownership, origin and sensitive-field checks are unchanged.
+
+**Provider wildcard and Page Assist implication (2026-10-11 23:03).** A grant may use
+provider `*` (exact endpoint, any provider). Edge derives a `*` WebChat control grant at
+forward time from every Page Assist endpoint grant for the routed device, so
+`connector page-assist allow` also authorizes WebChat send/status/stop for all providers on
+that endpoint, existing Page Assist grants work without migration, and `page-assist deny`
+removes the derived grant. Explicit per-provider grants remain until denied.

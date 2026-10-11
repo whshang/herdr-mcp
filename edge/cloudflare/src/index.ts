@@ -424,7 +424,7 @@ export default {
         || !normalizedDeviceId || normalizedDeviceId !== deviceId
         || !endpointRef || endpointRef.length > 96
         || !accountRef || accountRef.length > 96
-        || !provider || provider.length > 32 || !/^[a-z0-9][a-z0-9._-]*$/.test(provider)
+        || !provider || provider.length > 32 || !(provider === "*" || /^[a-z0-9][a-z0-9._-]*$/.test(provider))
         || typeof parsed.value.allowed !== "boolean"
       ) {
         return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
