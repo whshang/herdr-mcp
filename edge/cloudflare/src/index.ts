@@ -68,6 +68,9 @@ import { createOAuthPublicStore, handleOAuthPublic } from "./oauth-public.js";
 import { randomBase64UrlToken } from "./oauth-token-crypto.js";
 import { sha256Hex } from "./device-crypto.js";
 
+/** Provider-scoped WebChat control grant marker: every account of the provider on the endpoint. */
+const WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT = "*";
+
 export { DeviceRegistryDO, OAuthStoreDO, WorkstationDO };
 
 const logger = createLogger("edge-worker");
@@ -410,7 +413,11 @@ export default {
       const deviceId = typeof parsed.value.device_id === "string" ? parsed.value.device_id.trim() : "";
       const endpointRef = typeof parsed.value.endpoint_ref === "string" ? parsed.value.endpoint_ref.trim() : "";
       const provider = typeof parsed.value.provider === "string" ? parsed.value.provider.trim() : "";
-      const accountRef = typeof parsed.value.account_ref === "string" ? parsed.value.account_ref.trim() : "";
+      // Provider-scoped grants: account_ref is optional ("*" = every account of
+      // the provider on this endpoint); a legacy explicit value is accepted.
+      const accountRef = typeof parsed.value.account_ref === "string" && parsed.value.account_ref.trim()
+        ? parsed.value.account_ref.trim()
+        : WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT;
       const normalizedDeviceId = normalizeDeviceId(deviceId);
       if (
         !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
