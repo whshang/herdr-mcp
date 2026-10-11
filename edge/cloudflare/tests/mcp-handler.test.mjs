@@ -1872,3 +1872,137 @@ test("user relies on page-scoped grant forwarding | Given the runtime dispatch t
     assert.ok(PAGE_SCOPED_LOCAL_METHODS.includes(method), `${method} must be in PAGE_SCOPED_LOCAL_METHODS`);
   }
 });
+
+// ---- Page-scoped caller-grant routing matrix -------------------------------
+// Every method in PAGE_SCOPED_LOCAL_METHODS authorizes on the runtime with a
+// Page Assist caller grant that the Edge forwards only for the routed device.
+// These scenarios pin that contract for the whole list, not one method at a
+// time, so a new page-scoped method cannot silently forward another device's
+// grant (or forward grants with no routed device at all).
+
+const PAGE_DEVICE_A = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const PAGE_DEVICE_B = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+const PAGE_DEVICE_C = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAX";
+const PAGE_GRANT_A = `be_${"e".repeat(64)}`;
+const PAGE_GRANT_B = `be_${"f".repeat(64)}`;
+
+function pageScopedRoutingDeps({ withGrants = true } = {}) {
+  return deps({
+    client: {
+      connectorId: "conn_pagescopedrouting123",
+      grantGeneration: 5,
+      pageAssistGrants: withGrants
+        ? [
+          { device_id: PAGE_DEVICE_A, endpoint_ref: PAGE_GRANT_A },
+          { device_id: PAGE_DEVICE_B, endpoint_ref: PAGE_GRANT_B },
+        ]
+        : [{ device_id: PAGE_DEVICE_B, endpoint_ref: PAGE_GRANT_B }],
+    },
+    resolveDevice: async (selector) => [PAGE_DEVICE_A, PAGE_DEVICE_B, PAGE_DEVICE_C].includes(selector)
+      ? {
+        ok: true,
+        device_id: selector,
+        workstation_id: `ws_${selector.slice(-1).toLowerCase()}`,
+        routing_reason: "explicit_device_selector",
+      }
+      : { ok: false, code: "device_not_found" },
+  });
+}
+
+// The Edge forwards runtime params unchanged for these private methods, so the
+// matrix only needs opaque, shape-valid refs to keep the trace comparable. The
+// requested endpoint_ref is deliberately distinct from every caller grant, so a
+// leaked grant can never be mistaken for the caller's own request field.
+function pageScopedMethodParams() {
+  return JSON.stringify({
+    endpoint_ref: `be_${"1".repeat(64)}`,
+    page_ref: `bp_${"a".repeat(64)}`,
+  });
+}
+
+test("user calls every page-scoped method | Given Page Assist grants on two enrolled devices | When the call is routed to one device | Then only that device's grant is forwarded and the other device's endpoint never is", async () => {
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+  assert.ok(PAGE_SCOPED_LOCAL_METHODS.length >= 9, "the page-scoped forwarding list is covered in full");
+
+  for (const method of PAGE_SCOPED_LOCAL_METHODS) {
+    for (const [device, granted, other] of [
+      [PAGE_DEVICE_A, PAGE_GRANT_A, PAGE_GRANT_B],
+      [PAGE_DEVICE_B, PAGE_GRANT_B, PAGE_GRANT_A],
+    ]) {
+      const d = pageScopedRoutingDeps();
+      const res = await handleMcp(
+        req(`matrix-${method}-${device}`, "tools/call", {
+          name: "herdr_call",
+          arguments: { method, device, params: pageScopedMethodParams() },
+        }),
+        "w1",
+        d.value,
+      );
+      assert.equal(res.body.result.isError, undefined, `${method} routed to ${device}`);
+      assert.equal(d.calls.length, 1, `${method} must forward exactly once`);
+      assert.deepEqual(
+        d.calls[0].trace?.page_assist_grants,
+        [{ endpoint_ref: granted }],
+        `${method} must forward only the routed device's Page Assist grant`,
+      );
+      assert.equal(
+        JSON.stringify(d.calls[0].trace ?? {}).includes(other),
+        false,
+        `${method} must never carry another device's grant endpoint in the forwarded trace`,
+      );
+      assert.equal(
+        d.calls[0].trace?.webchat_control_grants,
+        undefined,
+        `${method} must not attach WebChat control grants`,
+      );
+    }
+  }
+});
+
+test("user calls every page-scoped method on an un-granted device | Given the connector holds grants for other devices only | When the call is routed to that device | Then no Page Assist grant is forwarded", async () => {
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+
+  for (const method of PAGE_SCOPED_LOCAL_METHODS) {
+    const d = pageScopedRoutingDeps({ withGrants: false });
+    const res = await handleMcp(
+      req(`ungranted-${method}`, "tools/call", {
+        name: "herdr_call",
+        arguments: { method, device: PAGE_DEVICE_A, params: pageScopedMethodParams() },
+      }),
+      "w1",
+      d.value,
+    );
+    assert.equal(res.body.result.isError, undefined, `${method} still routes to the device it was told to`);
+    assert.equal(d.calls.length, 1, `${method} forwards to the routed device`);
+    assert.equal(
+      d.calls[0].trace?.page_assist_grants,
+      undefined,
+      `${method} must not invent a grant for the routed device`,
+    );
+    assert.equal(
+      JSON.stringify(d.calls[0].trace ?? {}).includes(PAGE_GRANT_B),
+      false,
+      `${method} must not forward an unrelated device's grant as a substitute`,
+    );
+  }
+});
+
+test("user calls every page-scoped method without a device | Given page-scoped forwarding needs an explicit enrolled device | When the selector is missing | Then the call is refused before any grant is forwarded", async () => {
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+
+  for (const method of PAGE_SCOPED_LOCAL_METHODS) {
+    const d = pageScopedRoutingDeps();
+    const res = await handleMcp(
+      req(`no-device-${method}`, "tools/call", {
+        name: "herdr_call",
+        arguments: { method, params: pageScopedMethodParams() },
+      }),
+      "w1",
+      d.value,
+    );
+    assert.equal(res.body.result.isError, true, `${method} must fail closed without a device`);
+    assert.equal(res.body.result.structuredContent.code, "device_required", method);
+    assert.equal(res.body.result.structuredContent.delivery_state, "not_delivered", method);
+    assert.equal(d.calls.length, 0, `${method} must not forward without a routed device`);
+  }
+});

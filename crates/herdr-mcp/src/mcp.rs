@@ -12348,6 +12348,420 @@ mod tests {
     }
 
     #[test]
+    fn browser_plain_text_mention_never_satisfies_a_required_app() {
+        // A user typing `@herdr` into the composer leaves provider DOM text, not
+        // a verified native App chip. The extension reports that as a refusal
+        // (`required-app-not-found`) or as an empty `required_apps_readback`, and
+        // neither may settle a required-app delivery as applied.
+        let params = json!({"required_apps": ["herdr"]});
+
+        for operation in [
+            BrowserOperation::SessionCreate,
+            BrowserOperation::DispatchSubmit,
+        ] {
+            // Accepted command, complete acceptance identity, but no App pill
+            // was read back: the plain text never counts as activation.
+            let mut accepted_without_app = BrowserPostconditionEvidence::resource_unavailable(7);
+            accepted_without_app.browser_online = true;
+            accepted_without_app.resource_available = true;
+            accepted_without_app.command_accepted = true;
+            accepted_without_app.stable_resource_ref_observed = true;
+            accepted_without_app.lifecycle_observed = true;
+            accepted_without_app.canonical_url_observed = true;
+            accepted_without_app.accepted_message_observed = true;
+            accepted_without_app.generation_owner = Some(7);
+            accepted_without_app.generation_status_observed = true;
+            accepted_without_app.result =
+                Some(json!({"accepted_user_message_ref": "provider-user-plain-text"}));
+            assert_eq!(
+                browser_delivery_state_from_postcondition(
+                    operation,
+                    &params,
+                    7,
+                    &accepted_without_app
+                )
+                .unwrap(),
+                BrowserDeliveryState::Uncertain,
+                "{operation:?}: a missing App readback must not settle as applied",
+            );
+
+            // A superset readback (some other provider App got attached) is not
+            // the exact requested activation either.
+            let mut superset = accepted_without_app.clone();
+            superset.required_apps_readback = vec!["herdr".to_owned(), "other".to_owned()];
+            assert_ne!(
+                browser_delivery_state_from_postcondition(operation, &params, 7, &superset)
+                    .unwrap(),
+                BrowserDeliveryState::Applied,
+                "{operation:?}: an extra App must not satisfy an exact activation request",
+            );
+
+            // The exact readback stays the positive control.
+            let mut exact = accepted_without_app.clone();
+            exact.required_apps_readback = vec!["herdr".to_owned()];
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &params, 7, &exact).unwrap(),
+                BrowserDeliveryState::Applied,
+                "{operation:?}: a verified unique App chip still applies",
+            );
+
+            // The extension's own refusal (no verified suggestion could be
+            // selected) is terminal for this attempt even when the composer
+            // command was accepted.
+            let mut refused = accepted_without_app.clone();
+            refused.rejected = true;
+            refused.result = Some(json!({
+                "error": "required-app-not-found",
+                "app_selection_probe": {"composer_found": true, "candidate_count": 0}
+            }));
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &params, 7, &refused).unwrap(),
+                BrowserDeliveryState::Rejected,
+                "{operation:?}: an App activation refusal must never settle as applied",
+            );
+
+            // Nothing was submitted at all: the dispatch is refused, not uncertain.
+            let mut no_command = BrowserPostconditionEvidence::resource_unavailable(7);
+            no_command.browser_online = true;
+            no_command.resource_available = true;
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &params, 7, &no_command)
+                    .unwrap(),
+                BrowserDeliveryState::NotApplied,
+                "{operation:?}: an unsubmitted command is refused",
+            );
+        }
+    }
+
+    // Shared fixture for the App-activation refusal scenarios below: one
+    // enrolled ChatGPT endpoint with a launchable account, and a browser
+    // actuator that stands in for the extension refusing to submit because the
+    // native App chip could not be verified.
+    struct RefusedAppActuator {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BrowserActuator for RefusedAppActuator {
+        fn actuate(
+            &self,
+            _operation: &str,
+            _params: &Value,
+            expected_generation: i64,
+            _dispatch_id: Option<&str>,
+        ) -> Result<BrowserPostconditionEvidence, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut evidence =
+                BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+            evidence.browser_online = true;
+            evidence.resource_available = true;
+            evidence.rejected = true;
+            evidence.result = Some(json!({
+                "error": "required-app-not-found",
+                "app_selection_probe": {
+                    "composer_found": true,
+                    "search_text_committed": true,
+                    "candidate_count": 0,
+                    // Non-conforming extension key: the runtime claims provider
+                    // strings never cross this boundary, so this must not reach
+                    // the caller.
+                    "page_text": "secret composer draft"
+                }
+            }));
+            Ok(evidence)
+        }
+    }
+
+    fn app_activation_refusal_fixture()
+    -> (std::sync::Arc<std::sync::Mutex<StateStore>>, String, String) {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let mut guard = store.lock().unwrap();
+        let endpoint = guard
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                profile_seed: "app-activation-refusal-profile-seed",
+                browser_family: "chrome",
+                extension_version: "0.1.91",
+                observed_at: 10,
+            })
+            .unwrap();
+        guard
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 7,
+                capabilities_json:
+                    r#"{"operations":["session.create","composer.submit","composer.select_tool","generation.status"]}"#,
+                observed_at: 11,
+            })
+            .unwrap();
+        let account = guard
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: "app-activation-refusal-account",
+                display_label: None,
+                observation_generation: 7,
+                observed_at: 12,
+            })
+            .unwrap();
+        guard
+            .upsert_browser_resource_locator(&account.resource_ref, "https://chatgpt.com/", 7, 12)
+            .unwrap();
+        guard
+            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                expected_revision: 0,
+                webchat_control_allowed: true,
+                tool_bridge_allowed: false,
+                tool_bridge_mutation_allowed: false,
+                observed_at: 14,
+            })
+            .unwrap();
+        (
+            Arc::clone(&store),
+            endpoint.endpoint_ref,
+            account.resource_ref,
+        )
+    }
+
+    fn create_with_required_app(
+        store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+        endpoint_ref: &str,
+        account_ref: &str,
+        actuator: &RefusedAppActuator,
+    ) -> Value {
+        browser_operation_call_with_grant(
+            store,
+            "herdr_mcp.browser_session.create",
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "account_ref": account_ref,
+                "display_label": "App activation refused",
+                "message": "verify the Herdr App before sending",
+                "required_apps": ["herdr"],
+                "expected_generation": 7,
+                "idempotency_key": "app-activation-refusal-create-1",
+            }),
+            true,
+            Some(actuator),
+        )
+    }
+
+    #[test]
+    fn webchat_create_refuses_unverified_app_activation_before_submitting() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (store, endpoint_ref, account_ref) = app_activation_refusal_fixture();
+        let actuator = RefusedAppActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let result = create_with_required_app(&store, &endpoint_ref, &account_ref, &actuator);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1, "{result}");
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "rejected", "{result}");
+        assert_eq!(result["delivery_state"], "rejected", "{result}");
+        assert_eq!(result["reconciled"], false, "{result}");
+        // The extension's fixed refusal token is what the caller retries
+        // against; the App was never verified, so nothing was submitted.
+        assert_eq!(
+            result["delivery_evidence"]["error"], "required-app-not-found",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["app_selection_probe"]["candidate_count"], 0,
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["app_selection_probe"]["search_text_committed"], true,
+            "{result}"
+        );
+        assert!(
+            !result.to_string().contains("provider-user"),
+            "a rejected App activation must not carry provider acceptance identity: {result}"
+        );
+    }
+
+    #[test]
+    #[ignore = "gap found by this task's Gap 1 work, not fixed here (product change out of scope): the first-attempt create rejection echoes the extension's whole raw `result` object as `delivery_evidence`, so the fixed App-probe allowlist and `app_refusal_reason` projection that the reconcile path applies are not enforced on the path that actually reports the refusal. The runtime comment at the reconcile projection states provider strings are never echoed; an extension key such as `page_text` therefore crosses to the caller. Needs a product decision: project `delivery_evidence` (and surface `app_refusal_reason`) on the first attempt too."]
+    fn browser_create_rejection_should_project_only_allowlisted_app_probe_keys() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (store, endpoint_ref, account_ref) = app_activation_refusal_fixture();
+        let actuator = RefusedAppActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let result = create_with_required_app(&store, &endpoint_ref, &account_ref, &actuator);
+        assert_eq!(
+            result["app_refusal_reason"], "required-app-not-found",
+            "the caller needs the fixed refusal token on the first attempt: {result}"
+        );
+        assert!(
+            !result.to_string().contains("secret composer draft"),
+            "only the allowlisted App probe keys may be projected: {result}"
+        );
+    }
+
+    #[test]
+    fn browser_dispatch_submit_with_required_apps_is_refused_before_actuation() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct AppliedWithIdentityActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for AppliedWithIdentityActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.command_accepted = true;
+                evidence.accepted_message_observed = true;
+                evidence.generation_owner = Some(expected_generation);
+                evidence.generation_status_observed = true;
+                evidence.result =
+                    Some(json!({"accepted_user_message_ref": "provider-user-required-apps"}));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let session_ref = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "required-apps-dispatch-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["composer.submit","composer.select_tool","generation.status"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "required-apps-dispatch-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "required-apps-dispatch-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            session.resource_ref
+        };
+
+        let actuator = AppliedWithIdentityActuator {
+            calls: AtomicUsize::new(0),
+        };
+        // Demanding an App on a dispatch is refused by the activation gateway
+        // before any browser actuation: a verified App chip is a precondition of
+        // the request, and unverified composer text cannot satisfy it.
+        let with_required_apps = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": "send only with the verified Herdr App",
+                "required_apps": ["herdr"],
+                "expected_generation": 7,
+                "idempotency_key": "required-apps-dispatch-1",
+            }),
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(with_required_apps["ok"], false, "{with_required_apps}");
+        assert_eq!(
+            with_required_apps["code"], "unsupported",
+            "{with_required_apps}"
+        );
+        assert_eq!(
+            with_required_apps["actuation_available"], false,
+            "{with_required_apps}"
+        );
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            0,
+            "a required-App dispatch must be refused before actuation"
+        );
+
+        // Control: without an App precondition the same session dispatches and
+        // settles only on provider acceptance identity.
+        let without_required_apps = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": "plain text draft is not an App activation",
+                "expected_generation": 7,
+                "idempotency_key": "required-apps-dispatch-control",
+            }),
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(without_required_apps["ok"], true, "{without_required_apps}");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            without_required_apps["dispatch"]["accepted_user_message_ref"],
+            "provider-user-required-apps"
+        );
+    }
+
+    #[test]
     fn browser_entrypoints_reject_unsafe_messages() {
         use std::sync::{Arc, Mutex};
 
@@ -17974,6 +18388,187 @@ mod tests {
         assert_eq!(allowed["generation"], "pa:test");
         assert_eq!(allowed["text"], "visible page text");
     }
+
+    #[test]
+    fn every_page_scoped_method_refuses_a_grant_for_a_different_endpoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        // The Edge forwards the caller's Page Assist grants for the routed
+        // device only; the runtime is the authority that the forwarded grant
+        // must match the requested endpoint_ref. A non-empty grant bound to a
+        // different endpoint must therefore be refused before any actuation,
+        // for every method the Edge treats as page-scoped.
+        struct CountingActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for CountingActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err("actuation_must_not_run_without_an_exact_caller_grant".to_owned())
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _endpoint_ref: Option<&str>,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err("actuation_must_not_run_without_an_exact_caller_grant".to_owned())
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let page_ref = format!("bp_{}", "c".repeat(64));
+        // Non-empty caller grants, but none bound to the requested endpoint_ref.
+        let mismatched_grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_matrix_other".to_owned(),
+        }];
+        let actuator = CountingActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let semantic = SemanticService::test_error("page-scoped-grant-matrix", "timeout");
+
+        let page_assist = page_assist_call(
+            &json!({
+                "endpoint_ref": "bep_matrix_page_assist",
+                "action": "inspect",
+                "target_origin": "https://example.com",
+                "page_ref": page_ref,
+                "max_chars": 4096,
+            }),
+            &mismatched_grants,
+            Some(&actuator),
+        );
+        let page_action = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_matrix_page_action",
+                "page_ref": page_ref,
+                "action": "observe",
+            }),
+            &mismatched_grants,
+            Some(&actuator),
+        );
+        let page_lifecycle = browser_page_lifecycle_call(
+            &json!({
+                "endpoint_ref": "bep_matrix_page_lifecycle",
+                "action": "open",
+                "target_origin": "https://example.com",
+                "url": "https://example.com/app",
+                "idempotency_key": "page-scoped-grant-matrix-lifecycle",
+            }),
+            &mismatched_grants,
+            Some(&actuator),
+        );
+        let fast_path = browser_fast_path_call_with_semantic(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_matrix_fast_path",
+                "page_ref": page_ref,
+                "objective": "Advance the visible page",
+                "idempotency_key": "page-scoped-grant-matrix-fast-path",
+            }),
+            &mismatched_grants,
+            Some(&actuator),
+            &semantic,
+        );
+        let bilibili = bilibili_video_transcript_call(
+            &json!({
+                "endpoint_ref": "bep_matrix_bilibili",
+                "page_ref": page_ref,
+                "offset": 5,
+                "limit": 2,
+                "language": "zh-CN",
+            }),
+            &mismatched_grants,
+            Some(&actuator),
+        );
+        let x_search = x_read_call(
+            X_SEARCH_POSTS_METHOD,
+            &json!({
+                "endpoint_ref": "bep_matrix_x",
+                "page_ref": page_ref,
+                "query": "from:OpenAI",
+                "limit": 3,
+            }),
+            &mismatched_grants,
+            Some(&actuator),
+        );
+        let x_thread = x_read_call(
+            X_THREAD_READ_METHOD,
+            &json!({
+                "endpoint_ref": "bep_matrix_x",
+                "page_ref": page_ref,
+                "post_id": "2101",
+                "limit": 2,
+                "cursor": "cursor-thread",
+            }),
+            &mismatched_grants,
+            Some(&actuator),
+        );
+        let doubao_generate = doubao_image_generate_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_matrix_doubao",
+                "page_ref": page_ref,
+                "prompt": "draw a small blue robot",
+                "idempotency_key": "page-scoped-grant-matrix-doubao",
+            }),
+            &mismatched_grants,
+            Some(&actuator),
+        );
+        let doubao_status = doubao_image_status_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_matrix_doubao",
+                "op_id": "op_0000000000000000",
+            }),
+            &mismatched_grants,
+            Some(&actuator),
+        );
+
+        // Direct refusals with the standard fail-closed shape.
+        for (method, result) in [
+            ("herdr_mcp.page_assist", &page_assist),
+            (BROWSER_PAGE_ACTION_METHOD, &page_action),
+            (BROWSER_PAGE_LIFECYCLE_METHOD, &page_lifecycle),
+            (BILIBILI_VIDEO_TRANSCRIPT_METHOD, &bilibili),
+            (X_SEARCH_POSTS_METHOD, &x_search),
+            (X_THREAD_READ_METHOD, &x_thread),
+            (DOUBAO_IMAGE_GENERATE_METHOD, &doubao_generate),
+            (DOUBAO_IMAGE_STATUS_METHOD, &doubao_status),
+        ] {
+            assert_eq!(result["ok"], false, "{method}: {result}");
+            assert_eq!(result["code"], "caller_grant_missing", "{method}: {result}");
+            assert_eq!(
+                result["delivery_state"], "not_delivered",
+                "{method}: {result}"
+            );
+        }
+        // The bounded fast path delegates its first observation to the same
+        // exact-grant gate, so it refuses through its own escalation shape.
+        assert_eq!(fast_path["ok"], false, "{fast_path}");
+        assert_eq!(fast_path["code"], "browser_fast_path_observation_failed");
+        assert_eq!(fast_path["reason"], "caller_grant_missing");
+        assert_eq!(fast_path["observation"]["code"], "caller_grant_missing");
+        assert_eq!(fast_path["mutations"], 0);
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            0,
+            "a mismatched caller grant must be refused before any browser actuation",
+        );
+    }
+
     #[test]
     fn page_assist_advisory_is_optional_and_no_config_preserves_inspect_result() {
         let _guard = crate::test_env::lock();
