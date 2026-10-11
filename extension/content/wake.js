@@ -888,6 +888,22 @@ function normalizeHerdrMentionAlias(value) {
     await wait(300);
   }
 
+  // After a failed submit, clear the composer only when it still holds exactly
+  // the message this automation inserted (whitespace-canonical, App pills
+  // ignored), so ChatGPT does not persist it as a Project new-chat draft.
+  // A user-authored or different draft is never touched.
+  async function clearAutomationDraft(message) {
+    const canonical = (text) => String(text || "").replace(/[\u00a0\ufeff]/g, " ").split(/\s+/u).filter(Boolean).join(" ");
+    const expected = canonical(message);
+    const ours = () => expected !== "" && canonical(ADAPTER.getComposerTextWithoutAppPills()) === expected;
+    if (!ours()) return ADAPTER.getComposerTextWithoutAppPills() === "" ? "empty" : "not_ours";
+    await clearComposer();
+    const deadline = Date.now() + 1500;
+    while (ADAPTER.getComposerTextWithoutAppPills() !== "" && Date.now() < deadline) await wait(100);
+    await wait(300);
+    return ADAPTER.getComposerTextWithoutAppPills() === "" ? "cleared" : "clear_failed";
+  }
+
   async function ensureRequiredComposerApps(requiredApps) {
     const requested = [...new Set((Array.isArray(requiredApps) ? requiredApps : [])
       .map((app) => String(app || '').trim().toLowerCase())
@@ -2181,6 +2197,14 @@ function normalizeHerdrMentionAlias(value) {
             evidence.result.accepted_user_message_ref = users[0].id;
             evidence.result.accepted_user_text_sha256 = await hex(full);
             evidence.result.accepted_user_body_sha256 = await hex(body);
+            // Whitespace-canonical digests: ChatGPT re-renders composer line
+            // breaks when storing the turn. Mirrors the runtime's
+            // browser_readback_text_canonical.
+            const canonical = (text) => text.replace(/[\u00a0\ufeff]/g, " ").split(/[\s]+/u).filter(Boolean).join(" ");
+            evidence.result.accepted_user_text_canonical_sha256 = await hex(canonical(full));
+            evidence.result.accepted_user_body_canonical_sha256 = await hex(canonical(body));
+            evidence.result.accepted_user_text_length = full.length;
+            evidence.result.accepted_user_body_length = body.length;
           } catch (_) {}
         }
       }
@@ -2431,10 +2455,16 @@ function normalizeHerdrMentionAlias(value) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
-      return browserRejectedEvidence(
+      let draftCleanup = null;
+      if (ADAPTER.name === "chatgpt") {
+        try { draftCleanup = await clearAutomationDraft(message); } catch (_) { draftCleanup = "clear_failed"; }
+      }
+      const rejectedEvidence = browserRejectedEvidence(
         evidence,
         creatingSession ? "browser_create_submit_failed" : "browser_dispatch_submit_failed",
       );
+      if (draftCleanup) rejectedEvidence.result.automation_draft_cleanup = draftCleanup;
+      return rejectedEvidence;
     }
     evidence.command_accepted = true;
 
