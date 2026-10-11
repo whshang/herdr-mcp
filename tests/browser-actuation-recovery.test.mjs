@@ -287,6 +287,32 @@ test("user finalizes one owned generic page | Given open is retried across a ser
   assert.ok(capacityStorage.herdrBrowserPagesV1.every((record) => record.ownership === "owned"));
 });
 
+test("user finalizes an owned page whose tab is already gone | Given another tab still shows the same URL | When finalize runs | Then cleanup is not reported verified and the remaining tab is counted", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const harness = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const opened = await harness.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-owned-dup",
+  });
+  assert.equal(opened.ok, true);
+  const [ownedId] = [...tabs.keys()];
+  tabs.delete(ownedId);
+  tabs.set(900, { id: 900, url: "https://example.com/app", status: "complete", windowId: 1, active: false });
+  const finalized = await harness.performBrowserPageLifecycleRequest({
+    action: "finalize",
+    pageRef: opened.page_ref,
+    idempotencyKey: "finalize-owned-dup",
+  });
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.already_closed, true);
+  assert.equal(finalized.tab_cleanup_verified, false);
+  assert.equal(finalized.same_url_tabs_open, 1);
+  assert.equal(tabs.has(900), true);
+});
+
 test("user can clean up an owned search page | Given a form navigates to a new URL | When the old ref becomes stale | Then mutations remain fenced and finalize closes exactly that task-owned tab", async () => {
   const sessionStorage = {};
   const tabs = new Map();
