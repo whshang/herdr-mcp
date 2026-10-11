@@ -2793,10 +2793,11 @@ fn trusted_edge_webchat_control_grants(
     let mut grants = Vec::with_capacity(items.len());
     for item in items {
         let object = item.as_object().ok_or(())?;
-        if object.len() != 3
+        // account_ref is optional: provider-scoped grants may omit it.
+        if !(object.len() == 3 || object.len() == 2)
             || !object.contains_key("endpoint_ref")
             || !object.contains_key("provider")
-            || !object.contains_key("account_ref")
+            || (object.len() == 3 && !object.contains_key("account_ref"))
         {
             return Err(());
         }
@@ -2805,10 +2806,10 @@ fn trusted_edge_webchat_control_grants(
             .and_then(Value::as_str)
             .ok_or(())?;
         let provider = object.get("provider").and_then(Value::as_str).ok_or(())?;
-        let account_ref = object
-            .get("account_ref")
-            .and_then(Value::as_str)
-            .ok_or(())?;
+        let account_ref = match object.get("account_ref") {
+            None => crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+            Some(value) => value.as_str().ok_or(())?,
+        };
         if !valid_browser_grant_ref(endpoint_ref, 96)
             || !valid_browser_grant_provider(provider)
             || !valid_browser_grant_ref(account_ref, 96)
