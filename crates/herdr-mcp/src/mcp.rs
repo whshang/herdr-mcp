@@ -2373,6 +2373,10 @@ fn browser_delivery_state_from_postcondition(
                 // materialization + locator generation above still fence the new
                 // resource to the requested browser generation.
                 && browser_evidence_accepted_user_message_ref(evidence)?.is_some()
+                // Re-verify the accepted provider text against the submitted
+                // message so a content-script acceptance bug cannot materialize a
+                // foreign conversation as this create's session.
+                && browser_evidence_accepted_text_matches(params, evidence)?
                 && browser_required_apps_match_evidence(params, evidence)?
         }
         BrowserOperation::SpaceOpen | BrowserOperation::SessionOpen => {
@@ -2408,6 +2412,9 @@ fn browser_delivery_state_from_postcondition(
                 && evidence.generation_owner == Some(expected_generation)
                 && evidence.generation_status_observed
                 && browser_evidence_accepted_user_message_ref(evidence)?.is_some()
+                // The runtime, not the content script, decides acceptance: the
+                // reported provider-text digest must equal the submitted message.
+                && browser_evidence_accepted_text_matches(params, evidence)?
                 && browser_required_apps_match_evidence(params, evidence)?
         }
         BrowserOperation::DispatchStop => evidence.generation_stopped,
@@ -2460,6 +2467,57 @@ fn browser_evidence_accepted_user_message_ref(
         return Err("browser_evidence_accepted_user_message_invalid".to_owned());
     }
     Ok(Some(text.to_owned()))
+}
+
+/// Re-verify the accepted provider user text reported by browser actuation.
+/// The content script reports the digest of the text it matched as accepted;
+/// the runtime accepts delivery only when one of those digests equals the
+/// submitted message (raw or whitespace-canonical, matching the late-acceptance
+/// readback rule). Absent evidence is missing proof, not success, so a submit
+/// whose provider turn was not read back stays uncertain instead of applied.
+fn browser_evidence_accepted_text_matches(
+    params: &Value,
+    evidence: &BrowserPostconditionEvidence,
+) -> Result<bool, String> {
+    let Some(result) = evidence.result.as_ref() else {
+        return Ok(false);
+    };
+    // The submit path carries the message text; the reconcile path only keeps
+    // the stored raw digest of that message.
+    let expected = if let Some(message) = params.get("message").and_then(Value::as_str) {
+        vec![
+            browser_sha256(message.trim()),
+            browser_sha256(&browser_readback_text_canonical(message)),
+        ]
+    } else if let Some(digest) = params.get("message_sha256").and_then(Value::as_str) {
+        vec![digest.to_owned()]
+    } else {
+        return Ok(false);
+    };
+    for key in [
+        "accepted_user_text_sha256",
+        "accepted_user_body_sha256",
+        "accepted_user_text_canonical_sha256",
+        "accepted_user_body_canonical_sha256",
+    ] {
+        let Some(value) = result.get(key) else {
+            continue;
+        };
+        let Some(digest) = value.as_str() else {
+            return Err("browser_evidence_accepted_text_invalid".to_owned());
+        };
+        if digest.len() != 64
+            || !digest
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return Err("browser_evidence_accepted_text_invalid".to_owned());
+        }
+        if expected.iter().any(|value| value == digest) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn browser_dispatch_submit(
@@ -2909,7 +2967,9 @@ fn browser_dispatch_status(
             };
             let delivery_state = match browser_delivery_state_from_postcondition(
                 operation,
-                &json!({}),
+                // The reconcile path has no message text, only the stored raw
+                // digest the accepted provider text must still match.
+                &json!({"message_sha256": dispatch.message_digest}),
                 dispatch.expected_generation,
                 &evidence,
             ) {
@@ -10496,6 +10556,35 @@ mod tests {
     }
     use super::*;
 
+    /// Accepted-text evidence a real content script now reports alongside the
+    /// provider user-message identity. Applied fixtures must carry it because
+    /// the runtime re-verifies the accepted provider text digest.
+    fn accepted_text_and_body_evidence(text: &str, body: &str) -> Value {
+        json!({
+            "accepted_user_text_sha256": browser_sha256(text.trim()),
+            "accepted_user_body_sha256": browser_sha256(body.trim()),
+            "accepted_user_text_canonical_sha256": browser_sha256(
+                &browser_readback_text_canonical(text)
+            ),
+            "accepted_user_body_canonical_sha256": browser_sha256(
+                &browser_readback_text_canonical(body)
+            ),
+        })
+    }
+
+    fn accepted_text_evidence(message: &str) -> Value {
+        accepted_text_and_body_evidence(message, message)
+    }
+
+    fn accepted_result(message: &str, accepted_ref: &str) -> Value {
+        let mut value = accepted_text_evidence(message);
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("accepted_user_message_ref".to_owned(), json!(accepted_ref));
+        value
+    }
+
     fn semantic_test_server(body: &'static str) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -12302,6 +12391,103 @@ mod tests {
     }
 
     #[test]
+    fn browser_session_create_accepts_only_the_exact_provider_text_digest() {
+        let params = json!({
+            "message": "ship the patch",
+            "required_apps": [],
+        });
+        let mut evidence = BrowserPostconditionEvidence::resource_unavailable(7);
+        evidence.resource_available = true;
+        evidence.command_accepted = true;
+        evidence.stable_resource_ref_observed = true;
+        evidence.lifecycle_observed = true;
+        evidence.canonical_url_observed = true;
+        evidence.accepted_message_observed = true;
+        // The landed conversation's latest user turn is somebody else's text.
+        evidence.result = Some(accepted_result("another worker turn", "provider-user-1"));
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::SessionCreate,
+                &params,
+                7,
+                &evidence,
+            )
+            .unwrap(),
+            BrowserDeliveryState::Uncertain,
+            "a foreign user turn must never materialize this create",
+        );
+        assert_eq!(
+            browser_evidence_accepted_user_message_ref(&evidence).unwrap(),
+            Some("provider-user-1".to_owned()),
+        );
+
+        evidence.result = Some(accepted_result("ship the patch", "provider-user-1"));
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::SessionCreate,
+                &params,
+                7,
+                &evidence,
+            )
+            .unwrap(),
+            BrowserDeliveryState::Applied,
+        );
+
+        // ChatGPT re-renders composer line breaks when it stores the turn; the
+        // whitespace-canonical digest is still the same message.
+        evidence.result = Some(accepted_result("ship the\n\npatch", "provider-user-1"));
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::SessionCreate,
+                &params,
+                7,
+                &evidence,
+            )
+            .unwrap(),
+            BrowserDeliveryState::Applied,
+        );
+
+        // A named App mention token in front of the body is stripped by the
+        // content script's body digest, so the message still matches.
+        let mut app_result =
+            accepted_text_and_body_evidence("herdr ship the patch", "ship the patch");
+        app_result.as_object_mut().unwrap().insert(
+            "accepted_user_message_ref".to_owned(),
+            json!("provider-user-1"),
+        );
+        evidence.result = Some(app_result);
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::SessionCreate,
+                &params,
+                7,
+                &evidence,
+            )
+            .unwrap(),
+            BrowserDeliveryState::Applied,
+        );
+
+        // A reported identity with no accepted-text digest is missing proof.
+        evidence.result = Some(json!({"accepted_user_message_ref": "provider-user-1"}));
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::SessionCreate,
+                &params,
+                7,
+                &evidence,
+            )
+            .unwrap(),
+            BrowserDeliveryState::Uncertain,
+        );
+
+        evidence.result = Some(json!({"accepted_user_text_sha256": "not-a-digest"}));
+        assert_eq!(
+            browser_evidence_accepted_text_matches(&params, &evidence).unwrap_err(),
+            "browser_evidence_accepted_text_invalid",
+        );
+    }
+
+    #[test]
     fn browser_required_app_activation_must_be_observed_before_delivery_is_applied() {
         let mut evidence = BrowserPostconditionEvidence::resource_unavailable(7);
         evidence.browser_online = true;
@@ -12313,9 +12499,9 @@ mod tests {
         evidence.accepted_message_observed = true;
         evidence.generation_owner = Some(7);
         evidence.generation_status_observed = true;
-        evidence.result = Some(json!({"accepted_user_message_ref": "provider-user-test"}));
-        let requiring_app = json!({"required_apps": ["herdr"]});
-        let legacy = json!({});
+        evidence.result = Some(accepted_result("worker turn", "provider-user-test"));
+        let requiring_app = json!({"message": "worker turn", "required_apps": ["herdr"]});
+        let legacy = json!({"message": "worker turn"});
 
         for operation in [
             BrowserOperation::SessionCreate,
@@ -12404,9 +12590,7 @@ mod tests {
             BrowserDeliveryState::Uncertain
         );
 
-        evidence.result = Some(json!({
-            "accepted_user_message_ref": "provider-user-1"
-        }));
+        evidence.result = Some(accepted_result("hello", "provider-user-1"));
         assert_eq!(
             browser_delivery_state_from_postcondition(
                 BrowserOperation::DispatchSubmit,
@@ -12417,6 +12601,34 @@ mod tests {
             .unwrap(),
             BrowserDeliveryState::Applied
         );
+
+        // A reported identity whose provider text digest does not equal the
+        // submitted message is not proof: the runtime must not promote it.
+        evidence.result = Some(accepted_result("a different turn", "provider-user-1"));
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::DispatchSubmit,
+                &params,
+                7,
+                &evidence,
+            )
+            .unwrap(),
+            BrowserDeliveryState::Uncertain
+        );
+
+        evidence.result = Some(json!({"accepted_user_message_ref": "provider-user-1"}));
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::DispatchSubmit,
+                &params,
+                7,
+                &evidence,
+            )
+            .unwrap(),
+            BrowserDeliveryState::Uncertain,
+            "an identity without accepted provider text is missing proof"
+        );
+        evidence.result = Some(accepted_result("hello", "provider-user-1"));
 
         evidence.observed_generation = 8;
         assert_eq!(
@@ -12437,9 +12649,7 @@ mod tests {
         create_evidence.lifecycle_observed = true;
         create_evidence.canonical_url_observed = true;
         create_evidence.accepted_message_observed = true;
-        create_evidence.result = Some(json!({
-            "accepted_user_message_ref": "provider-create-user-1"
-        }));
+        create_evidence.result = Some(accepted_result("hello", "provider-create-user-1"));
         assert_eq!(
             browser_delivery_state_from_postcondition(
                 BrowserOperation::SessionCreate,
@@ -12786,9 +12996,10 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
-                    result: Some(json!({
-                        "accepted_user_message_ref": "provider-user-delayed"
-                    })),
+                    result: Some(accepted_result(
+                        "dispatch with delayed evidence",
+                        "provider-user-delayed",
+                    )),
                 }))
             }
         }
@@ -12907,7 +13118,7 @@ mod tests {
             fn actuate(
                 &self,
                 _operation: &str,
-                _params: &Value,
+                params: &Value,
                 expected_generation: i64,
                 _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
@@ -12927,9 +13138,10 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
-                    result: Some(json!({
-                        "accepted_user_message_ref": "provider-user-applied"
-                    })),
+                    result: Some(accepted_result(
+                        params["message"].as_str().unwrap(),
+                        "provider-user-applied",
+                    )),
                 })
             }
         }
@@ -13393,7 +13605,10 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
-                    result: Some(json!({"accepted_user_message_ref": "provider-user-1"})),
+                    result: Some(accepted_result(
+                        "bounded worker assignment",
+                        "provider-user-1",
+                    )),
                 })
             }
         }
@@ -13531,9 +13746,10 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
-                    result: Some(json!({
-                        "accepted_user_message_ref": "provider-user-restart"
-                    })),
+                    result: Some(accepted_result(
+                        params["message"].as_str().unwrap(),
+                        "provider-user-restart",
+                    )),
                 })
             }
         }
@@ -15045,10 +15261,27 @@ mod tests {
             // Number of leading reconcile polls that observe no evidence yet,
             // simulating provider readback landing after the first create call.
             reconcile_pending_polls: usize,
+            // Last submitted create message, so late reconcile evidence carries
+            // the accepted-text digest the runtime now re-verifies.
+            last_message: std::sync::Mutex<String>,
         }
 
         impl SessionCreateActuator {
-            fn applied_evidence(expected_generation: i64) -> BrowserPostconditionEvidence {
+            fn applied_evidence(
+                message: &str,
+                expected_generation: i64,
+            ) -> BrowserPostconditionEvidence {
+                let mut result = accepted_result(message, "provider-created-session-user");
+                result.as_object_mut().unwrap().insert(
+                    "title_projection".to_owned(),
+                    json!({
+                        "status": "verified",
+                        "changed": true,
+                        "provider": "chatgpt",
+                        "readback_verified": true,
+                        "reason": null
+                    }),
+                );
                 BrowserPostconditionEvidence {
                     observed_generation: expected_generation,
                     command_accepted: true,
@@ -15065,16 +15298,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
-                    result: Some(json!({
-                        "accepted_user_message_ref": "provider-created-session-user",
-                        "title_projection": {
-                            "status": "verified",
-                            "changed": true,
-                            "provider": "chatgpt",
-                            "readback_verified": true,
-                            "reason": null
-                        }
-                    })),
+                    result: Some(result),
                 }
             }
 
@@ -15179,7 +15403,9 @@ mod tests {
                 if self.materialize_on_actuate {
                     self.materialize(params, expected_generation);
                 }
-                let mut evidence = Self::applied_evidence(expected_generation);
+                let message = params["message"].as_str().unwrap().to_owned();
+                *self.last_message.lock().unwrap() = message.clone();
+                let mut evidence = Self::applied_evidence(&message, expected_generation);
                 if self.materialized_but_partial {
                     evidence.stable_resource_ref_observed = false;
                     evidence.lifecycle_observed = false;
@@ -15207,7 +15433,8 @@ mod tests {
                 if poll <= self.reconcile_pending_polls {
                     return Ok(None);
                 }
-                Ok(Some(Self::applied_evidence(expected_generation)))
+                let message = self.last_message.lock().unwrap().clone();
+                Ok(Some(Self::applied_evidence(&message, expected_generation)))
             }
         }
 
@@ -15242,7 +15469,10 @@ mod tests {
                     return Ok(evidence);
                 }
                 self.inner.materialize(params, expected_generation);
-                Ok(SessionCreateActuator::applied_evidence(expected_generation))
+                Ok(SessionCreateActuator::applied_evidence(
+                    params["message"].as_str().unwrap(),
+                    expected_generation,
+                ))
             }
         }
 
@@ -15387,6 +15617,7 @@ mod tests {
             delayed: false,
             materialized_but_partial: false,
             reconcile_pending_polls: 0,
+            last_message: std::sync::Mutex::new(String::new()),
         };
         let retry_safe = RetrySafeThenAppliedActuator {
             inner: SessionCreateActuator {
@@ -15398,6 +15629,7 @@ mod tests {
                 delayed: false,
                 materialized_but_partial: false,
                 reconcile_pending_polls: 0,
+                last_message: std::sync::Mutex::new(String::new()),
             },
             calls: AtomicUsize::new(0),
         };
@@ -15591,6 +15823,7 @@ mod tests {
             delayed: false,
             materialized_but_partial: true,
             reconcile_pending_polls: 0,
+            last_message: std::sync::Mutex::new(String::new()),
         };
         let materialized_but_partial_params = json!({
             "endpoint_ref": endpoint_ref,
@@ -15632,6 +15865,7 @@ mod tests {
             delayed: true,
             materialized_but_partial: false,
             reconcile_pending_polls: usize::MAX,
+            last_message: std::sync::Mutex::new(String::new()),
         };
         let materialized_without_completion_params = json!({
             "endpoint_ref": endpoint_ref,
@@ -15708,6 +15942,7 @@ mod tests {
             delayed: true,
             materialized_but_partial: false,
             reconcile_pending_polls: usize::MAX,
+            last_message: std::sync::Mutex::new(String::new()),
         };
         let no_observation_params = json!({
             "endpoint_ref": endpoint_ref,
@@ -15745,6 +15980,7 @@ mod tests {
             delayed: true,
             materialized_but_partial: false,
             reconcile_pending_polls: usize::MAX,
+            last_message: std::sync::Mutex::new(String::new()),
         };
         let late_materialization_params = json!({
             "endpoint_ref": endpoint_ref,
@@ -15852,6 +16088,7 @@ mod tests {
             // Provider readback is late: the first reconcile poll is empty and
             // the second one returns applied evidence within the same call.
             reconcile_pending_polls: 1,
+            last_message: std::sync::Mutex::new(String::new()),
         };
         let delayed_params = json!({
             "endpoint_ref": endpoint_ref,
