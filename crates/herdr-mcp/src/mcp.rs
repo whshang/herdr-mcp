@@ -583,6 +583,17 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     ))
 }
 
+/// ChatGPT's composer rewrites a pasted chatgpt.com conversation URL into a
+/// conversation chip, so the inserted text never reads back verbatim and the
+/// bounded submit reports `browser_create_submit_failed`. Reference a ChatGPT
+/// source conversation by id in composer text instead of by URL.
+fn browser_composer_source_reference(source_url: &str) -> String {
+    match chatgpt_conversation_url_ref(source_url) {
+        Some((conversation_id, _)) => format!("chatgpt conversation {conversation_id}"),
+        None => source_url.to_owned(),
+    }
+}
+
 fn chatgpt_conversation_url_ref(raw: &str) -> Option<(String, Option<String>)> {
     let parsed = url::Url::parse(raw.trim()).ok()?;
     if parsed.scheme() != "https"
@@ -3359,9 +3370,12 @@ fn browser_session_create_late_acceptance_readback(
     let matches = ["accepted_user_text_sha256", "accepted_user_body_sha256"]
         .iter()
         .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected.as_str()))
-        || ["accepted_user_text_canonical_sha256", "accepted_user_body_canonical_sha256"]
-            .iter()
-            .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected_canonical.as_str()));
+        || [
+            "accepted_user_text_canonical_sha256",
+            "accepted_user_body_canonical_sha256",
+        ]
+        .iter()
+        .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected_canonical.as_str()));
     if !matches {
         return Err("readback_digest_mismatch");
     }
@@ -3713,10 +3727,12 @@ fn browser_session_create_params_from_source(
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
     }
     let message = browser_required_message(params, 262_144)?;
-    let message = if message.contains(source_url) {
-        message.to_owned()
+    let composer_source = browser_composer_source_reference(source_url);
+    let message = message.replace(source_url, &composer_source);
+    let message = if message.contains(&composer_source) {
+        message
     } else {
-        let source_reference = format!(" source_url: {source_url}");
+        let source_reference = format!(" source_url: {composer_source}");
         let actual_bytes = message.len().saturating_add(source_reference.len());
         if actual_bytes > 262_144 {
             return Err(json!({
@@ -4053,8 +4069,9 @@ fn browser_handoff_prepare(
         ));
         format!("hh_{}", &digest[..32])
     });
+    let source_reference = browser_composer_source_reference(&source_url);
     let message = format!(
-        "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_url} 工具执行状态以 Herdr 返回的 delivery/execution 证据为准。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
+        "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_reference} 工具执行状态以 Herdr 返回的 delivery/execution 证据为准。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
     );
 
     json!({
@@ -14560,7 +14577,9 @@ mod tests {
         assert!(message.contains("workspace / Git / runtime"));
         assert!(message.contains("delivery/execution"));
         assert!(!message.contains("host-side pre-delivery safety rejection"));
-        assert!(message.contains(source_url));
+        // ChatGPT rewrites pasted conversation URLs into chips; reference by id.
+        assert!(!message.contains(source_url));
+        assert!(message.contains(&browser_composer_source_reference(source_url)));
         assert!(message.len() < 2048);
         assert!(!message.contains("Keep the durable journal authoritative"));
         assert!(first.get("safety").is_none());
