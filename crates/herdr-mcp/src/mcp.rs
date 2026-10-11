@@ -16005,9 +16005,37 @@ mod tests {
                 .webchat_control_allowed
         );
 
+<<<<<<< HEAD
+=======
+        let local_consent_off = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &dispatch_params,
+            true,
+            None,
+        );
+        assert_eq!(local_consent_off["code"], "local_consent_off");
+
+        store
+            .lock()
+            .unwrap()
+            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                endpoint_ref: &endpoint_ref,
+                expected_revision: 0,
+                webchat_control_allowed: true,
+                tool_bridge_allowed: false,
+                tool_bridge_mutation_allowed: false,
+                observed_at: 14,
+            })
+            .unwrap();
+
+        // WebChat control grants are provider-scoped: a different account on the
+        // same endpoint+provider is authorized, so the fail-closed probe uses a
+        // different provider (still caller_grant_missing before any resource work).
+>>>>>>> 4027004e (Fix CI: test titles, provider-scoped fail-closed probe, skill digest)
         let wrong_account_grants = [BrowserCallerGrant {
             endpoint_ref: endpoint_ref.clone(),
-            provider: "chatgpt".to_owned(),
+            provider: "grok".to_owned(),
             account_ref: format!("br_{}", "e".repeat(64)),
         }];
         let wrong_account = browser_operation_call_with_grants(
