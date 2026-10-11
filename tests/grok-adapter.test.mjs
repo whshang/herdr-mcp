@@ -7,6 +7,16 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../extension/content/injector/grok.js", import.meta.url), "utf8");
 const wakeSource = readFileSync(new URL("../extension/content/wake.js", import.meta.url), "utf8");
 
+function grokDigest(text) {
+  const canonical = String(text).replace(/[\u00a0\ufeff]/g, " ").split(/\s+/u).filter(Boolean).join(" ");
+  let hash = 0x811c9dc5;
+  for (const byte of new TextEncoder().encode(canonical)) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
 function element({ text = "", attrs = {}, visible = true, parentElement = null } = {}) {
   return {
     innerText: text,
@@ -185,7 +195,7 @@ test("user keeps stable Grok turn identity | Given response wrappers are replace
   assert.deepEqual(
     JSON.parse(JSON.stringify(h.adapter.getMessageSnapshot("user"))),
     {
-      messageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
+      messageId: `grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0:t${grokDigest("prompt")}`,
       text: "prompt",
       count: 1,
     },
@@ -207,9 +217,9 @@ test("user keeps stable Grok turn identity | Given response wrappers are replace
     text: "answer",
     parentElement: element({ attrs: { id: "response-22222222-3333-4444-8555-666666666666" } }),
   }));
-  assert.equal(
+  assert.match(
     h.adapter.getMessageSnapshot("user").messageId,
-    "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
+    /^grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0:t[0-9a-f]{8}$/,
   );
   assert.equal(
     h.adapter.getMessageSnapshot("assistant").messageId,
@@ -238,7 +248,7 @@ test("user keeps stable Grok turn identity | Given hidden historical turns | Whe
 
   assert.equal(
     h.adapter.getMessageSnapshot("user").messageId,
-    "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:1",
+    `grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:1:t${grokDigest("current prompt")}`,
   );
   assert.deepEqual(
     JSON.parse(JSON.stringify(h.adapter.getResultSettlementSnapshot(
@@ -358,4 +368,29 @@ test("Grok must reuse provider-neutral account and single-attempt browser actuat
   assert.match(actuationSource, /adapterSupports\("browserActuation"\)/);
   assert.match(actuationSource, /adapterSupports\("stopGeneration"\)/);
   assert.doesNotMatch(actuationSource, /ADAPTER\.name\s*===\s*"grok"/);
+});
+
+test("user continues a Grok chat after reload | Given a recorded user ref whose DOM position drifted | When the result settlement snapshot is read | Then the user turn is matched by canonical text digest with position only as fallback", () => {
+  const h = harness();
+  const seed = element({ text: "seed", attrs: { "data-testid": "user-message" } });
+  const seedAnswer = element({ text: "OK", attrs: { "data-testid": "assistant-message" } });
+  const cont = element({ text: "continue:\u00a0reply  BETA", attrs: { "data-testid": "user-message" } });
+  const contAnswer = element({ text: "BETA", attrs: { "data-testid": "assistant-message" } });
+  h.set('[data-testid="user-message"]', [seed, cont]);
+  h.set('[data-testid="assistant-message"]', [seedAnswer, contAnswer]);
+  h.set('[data-testid="user-message"], [data-testid="assistant-message"]', [seed, seedAnswer, cont, contAnswer]);
+
+  // Recorded at position 0 (stale ordinal) but carrying the continue text digest.
+  const ref = `grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0:t${grokDigest("continue: reply BETA")}`;
+  const settled = h.adapter.getResultSettlementSnapshot(ref);
+  assert.equal(settled?.ok, true);
+  assert.equal(settled.text, "BETA");
+  assert.equal(settled.userMessageId, ref);
+
+  // Unknown digest falls back to position; legacy refs without a digest still work.
+  const fallback = h.adapter.getResultSettlementSnapshot(`grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0:t00000000`);
+  assert.equal(fallback?.ok, true);
+  assert.equal(fallback.text, "OK");
+  assert.equal(h.adapter.getResultSettlementSnapshot(`grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:1`)?.text, "BETA");
+  assert.equal(h.adapter.getResultSettlementSnapshot(`grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:x`), null);
 });
