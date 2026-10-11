@@ -2520,6 +2520,20 @@ fn browser_evidence_accepted_text_matches(
     Ok(false)
 }
 
+/// The provider user-message identity a create may persist. It is retained only
+/// when the accepted-text digest evidence equals the submitted message: a
+/// mismatching digest is missing proof, and a retained foreign identity would
+/// otherwise let materialization promotion mark the create applied.
+fn browser_session_create_evidence_accepted_ref(
+    params: &Value,
+    evidence: &BrowserPostconditionEvidence,
+) -> Result<Option<String>, String> {
+    if !browser_evidence_accepted_text_matches(params, evidence)? {
+        return Ok(None);
+    }
+    browser_evidence_accepted_user_message_ref(evidence)
+}
+
 fn browser_dispatch_submit(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -3681,10 +3695,11 @@ fn browser_session_create_reconcile_uncertain_inner(
         Ok(state) => state,
         Err(error) => return browser_store_error(error),
     };
-    let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence) {
-        Ok(value) => value,
-        Err(error) => return browser_store_error(error),
-    };
+    let accepted_user_message_ref =
+        match browser_session_create_evidence_accepted_ref(params, &evidence) {
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
+        };
     let Ok(mut guard) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
@@ -4624,10 +4639,11 @@ fn browser_session_create(
     } else {
         observed_delivery_state
     };
-    let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence) {
-        Ok(value) => value,
-        Err(error) => return browser_store_error(error),
-    };
+    let accepted_user_message_ref =
+        match browser_session_create_evidence_accepted_ref(params, &evidence) {
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
+        };
     let title_projection = evidence
         .result
         .as_ref()
@@ -12391,6 +12407,204 @@ mod tests {
     }
 
     #[test]
+    fn browser_session_create_does_not_persist_a_foreign_accepted_user_ref() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        struct ForeignConversationActuator {
+            store: Arc<Mutex<StateStore>>,
+        }
+
+        impl BrowserActuator for ForeignConversationActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                if operation == BROWSER_SESSION_ARCHIVE_STATUS_METHOD {
+                    // Late-acceptance readback is unavailable in this fixture.
+                    return Err("browser_actuation_unavailable".to_owned());
+                }
+                assert_eq!(operation, BrowserOperation::SessionCreate.method());
+                let reservation_ref = dispatch_id.unwrap().to_owned();
+                let reservation = self
+                    .store
+                    .lock()
+                    .unwrap()
+                    .browser_session_reservation(&reservation_ref)
+                    .unwrap()
+                    .unwrap();
+                let native_identity = format!("created-{reservation_ref}");
+                let canonical_url = format!("https://chatgpt.com/c/{reservation_ref}");
+                let mut guard = self.store.lock().unwrap();
+                let session = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &reservation.endpoint_ref,
+                        provider: &reservation.provider,
+                        kind: "session",
+                        parent_ref: reservation
+                            .space_ref
+                            .as_deref()
+                            .or(Some(&reservation.account_ref)),
+                        native_identity: &native_identity,
+                        display_label: None,
+                        observation_generation: expected_generation,
+                        observed_at: 20,
+                    })
+                    .unwrap();
+                guard
+                    .upsert_browser_resource_locator(
+                        &session.resource_ref,
+                        &canonical_url,
+                        expected_generation,
+                        20,
+                    )
+                    .unwrap();
+                guard
+                    .materialize_browser_session_reservation(
+                        &reservation_ref,
+                        &session.resource_ref,
+                        20,
+                    )
+                    .unwrap();
+                drop(guard);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.stable_resource_ref_observed = true;
+                evidence.lifecycle_observed = true;
+                evidence.canonical_url_observed = true;
+                evidence.accepted_message_observed = true;
+                // The landed conversation's latest user turn belongs to somebody
+                // else, and the reported digest says so.
+                evidence.result = Some(accepted_result("another worker turn", "provider-foreign"));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, account_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "foreign-ref-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.191",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.create","session.open","composer.submit"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "foreign-ref-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &account.resource_ref,
+                    "https://chatgpt.com",
+                    7,
+                    12,
+                )
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 13,
+                })
+                .unwrap();
+            (endpoint.endpoint_ref, account.resource_ref)
+        };
+
+        let actuator = ForeignConversationActuator {
+            store: store.clone(),
+        };
+        let created = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "account_ref": account_ref,
+                "display_label": "Foreign conversation create",
+                "message": "ship the patch",
+                "expected_generation": 7,
+                "idempotency_key": "session-create-foreign-ref-1"
+            }),
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(created["ok"], false);
+        assert_eq!(created["code"], "uncertain");
+        assert_eq!(created["delivery_state"], "uncertain");
+        let reservation_ref = created["reservation_ref"].as_str().unwrap().to_owned();
+        let stored = store
+            .lock()
+            .unwrap()
+            .browser_session_reservation(&reservation_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "materialized");
+        assert_eq!(
+            stored.accepted_user_message_ref, None,
+            "a create that landed on a foreign conversation must not retain its accepted user message",
+        );
+
+        // The same create replay must not promote the foreign identity either.
+        let replayed = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "account_ref": account_ref,
+                "display_label": "Foreign conversation create",
+                "message": "ship the patch",
+                "expected_generation": 7,
+                "idempotency_key": "session-create-foreign-ref-1"
+            }),
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(replayed["delivery_state"], "uncertain");
+        let after_replay = store
+            .lock()
+            .unwrap()
+            .browser_session_reservation(&reservation_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_replay.accepted_user_message_ref, None);
+    }
+
+    #[test]
     fn browser_session_create_accepts_only_the_exact_provider_text_digest() {
         let params = json!({
             "message": "ship the patch",
@@ -12416,9 +12630,16 @@ mod tests {
             BrowserDeliveryState::Uncertain,
             "a foreign user turn must never materialize this create",
         );
+        // The identity reader still sees the reported ref; persistence decides
+        // separately whether it may be retained (see the create settlement test).
         assert_eq!(
             browser_evidence_accepted_user_message_ref(&evidence).unwrap(),
             Some("provider-user-1".to_owned()),
+        );
+        assert_eq!(
+            browser_session_create_evidence_accepted_ref(&params, &evidence).unwrap(),
+            None,
+            "a mismatching digest must not be retained as the accepted user message",
         );
 
         evidence.result = Some(accepted_result("ship the patch", "provider-user-1"));
