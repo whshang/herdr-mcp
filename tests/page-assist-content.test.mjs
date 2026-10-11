@@ -67,6 +67,7 @@ function harness({
   elements = [],
   topOrigin = null,
   scrollMax = 0,
+  scrollY = 0,
   scrollingElement = null,
 } = {}) {
   let listener = null;
@@ -89,7 +90,7 @@ function harness({
     setTimeout,
     document,
     location,
-    scrollY: 0,
+    scrollY,
     innerHeight: 600,
     scrollBy({ top }) {
       this.scrollY = Math.max(0, Math.min(scrollMax, this.scrollY + top));
@@ -710,4 +711,31 @@ test("user scrolls a clipped document | Given a page whose only scrollable box i
   assert.deepEqual([moved.scroll_container_before, moved.scroll_container_after], [0, 300]);
   assert.equal(moved.requires_verification, true);
   assert.equal(scroller.scrollTop, 300);
+});
+
+test("user gets one effective scroll | Given a viewport whose subpixel movement rounds to the same reported position | When scroll down is requested | Then the viewport counts as moved and no observed container is also scrolled", () => {
+  const container = createElement({ tag: "div", attrs: { class: "feed-scroll" } });
+  container.overflowY = "auto";
+  container.scrollTop = 0;
+  container.scrollHeight = 2000;
+  container.clientHeight = 500;
+  container.scrollBy = function ({ top }) {
+    this.scrollTop = Math.max(0, Math.min(this.scrollHeight - this.clientHeight, this.scrollTop + top));
+  };
+  const button = createElement({ tag: "button", text: "Load more" });
+  button.parentElement = container;
+  const h = harness({ elements: [button], scrollMax: 0.4, scrollY: 0.2 });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.scroll.y, 0);
+  const moved = h.send({
+    type: "h2w_page_assist", action: "scroll", expectedOrigin: "https://app.test",
+    generation: observed.generation, direction: "down", amount: 500,
+  });
+  assert.equal(moved.ok, true);
+  assert.deepEqual([moved.before_y, moved.after_y], [0, 0]);
+  assert.equal(moved.moved, true);
+  assert.equal(moved.at_boundary, false);
+  assert.equal(moved.scroll_container, "viewport");
+  assert.deepEqual([moved.scroll_container_before, moved.scroll_container_after], [0.2, 0.4]);
+  assert.equal(container.scrollTop, 0);
 });

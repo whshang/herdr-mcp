@@ -342,6 +342,13 @@
     return overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
   }
 
+  // Movement is decided on the raw finite position. Reported values are rounded
+  // separately, so a subpixel move is never mistaken for a boundary.
+  function viewportScrollPosition() {
+    const value = Number(global.scrollY);
+    return Number.isFinite(value) ? value : 0;
+  }
+
   // A container only qualifies when it currently has scrollable overflow; the
   // caller still measures the resulting position, so a wrong guess can never be
   // reported as movement.
@@ -354,7 +361,7 @@
     const clientHeight = Number(el.clientHeight);
     if (![top, scrollHeight, clientHeight].every(Number.isFinite)) return null;
     if (scrollHeight <= clientHeight) return null;
-    return { top: Math.max(0, Math.round(top)) };
+    return { top: Math.max(0, top) };
   }
 
   function nearestObservedScrollContainer(el) {
@@ -417,18 +424,20 @@
       return { ok: false, error: "scroll_params_invalid" };
     }
     if (typeof global.scrollBy !== "function") return { ok: false, error: "scroll_unavailable" };
-    const beforeY = Math.max(0, Math.round(Number(global.scrollY) || 0));
+    const beforeRaw = viewportScrollPosition();
     const delta = direction === "down" ? amount : -amount;
     try {
       global.scrollBy({ top: delta, behavior: "instant" });
     } catch (_) {
       return { ok: false, error: "scroll_delivery_unknown" };
     }
-    const afterY = Math.max(0, Math.round(Number(global.scrollY) || 0));
+    const afterRaw = viewportScrollPosition();
+    const beforeY = Math.max(0, Math.round(beforeRaw));
+    const afterY = Math.max(0, Math.round(afterRaw));
 
     // The document viewport keeps its exact original semantics when it moves.
-    let movedContainer = afterY !== beforeY
-      ? { name: "viewport", before: beforeY, after: afterY }
+    let movedContainer = afterRaw !== beforeRaw
+      ? { name: "viewport", before: Math.max(0, beforeRaw), after: Math.max(0, afterRaw) }
       : null;
 
     if (!movedContainer) {
