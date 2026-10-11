@@ -26,7 +26,7 @@
 //   reused unless --force is passed.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,7 +45,7 @@ const PRODUCTION_BUDGET_MS = Object.freeze({
   chat: { attempt: 5000, pool: 12000, source: "SemanticService chat attempt/pool budget" },
 });
 
-const VALUE_FLAGS = new Set(["--routes", "--runs", "--pacing-ms", "--chat-pacing-ms", "--attempt-ms", "--results-dir", "--markdown", "--score-only"]);
+const VALUE_FLAGS = new Set(["--routes", "--runs", "--pacing-ms", "--chat-pacing-ms", "--attempt-ms", "--results-dir", "--markdown", "--score-only", "--merge-only"]);
 
 function parseArgs(argv) {
   const options = {
@@ -58,6 +58,7 @@ function parseArgs(argv) {
     resultsDir: null,
     markdown: null,
     scoreOnly: null,
+    mergeOnly: null,
     skipFixtureCheck: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -78,6 +79,7 @@ function parseArgs(argv) {
       case "--results-dir": options.resultsDir = raw; break;
       case "--markdown": options.markdown = raw; break;
       case "--score-only": options.scoreOnly = raw; break;
+      case "--merge-only": options.mergeOnly = raw; break;
       case "--force": options.force = true; break;
       case "--skip-fixture-check": options.skipFixtureCheck = true; break;
       default: throw new Error(`unknown argument: ${arg}`);
@@ -345,12 +347,12 @@ function renderMarkdown(meta, summaries, samples = []) {
   return `${lines.join("\n")}\n`;
 }
 
-function mergeRouteFiles(resultsDir, routes) {
+function mergeRouteFiles(resultsDir, routeNames) {
   const samples = [];
   const routeReports = [];
   let meta = null;
-  for (const route of routes) {
-    const path = join(resultsDir, `route-${route.name}.json`);
+  for (const name of routeNames) {
+    const path = join(resultsDir, `route-${name}.json`);
     if (!existsSync(path)) continue;
     const parsed = JSON.parse(readFileSync(path, "utf8"));
     meta = meta || parsed.bench;
@@ -364,6 +366,71 @@ function mergeRouteFiles(resultsDir, routes) {
     }
   }
   return { meta, routes: routeReports, samples };
+}
+
+/** Config order when the workstation has a readable config; otherwise alphabetical. */
+function configRouteOrder() {
+  try {
+    return readRouteInventory().map((route) => route.name);
+  } catch {
+    return [];
+  }
+}
+
+/** Route names with a recorded result file, in config order when known. */
+function recordedRouteNames(resultsDir) {
+  const recorded = readdirSync(resultsDir)
+    .filter((name) => name.startsWith("route-") && name.endsWith(".json"))
+    .map((name) => name.slice("route-".length, -".json".length));
+  const order = configRouteOrder();
+  return [
+    ...order.filter((name) => recorded.includes(name)),
+    ...recorded.filter((name) => !order.includes(name)).sort(),
+  ];
+}
+
+/**
+ * Metadata for a merged multi-route report. `route_filter` must name every route
+ * the merged samples actually cover: inheriting the first route file's filter
+ * would describe the artifact as a single-route run.
+ */
+function mergedMeta(baseMeta, routeNames, options, resultsDir) {
+  const fixture = JSON.parse(readFileSync(fixturePath, "utf8"));
+  return {
+    ...(baseMeta || {}),
+    startedAt: baseMeta?.started_at ?? new Date().toISOString(),
+    runtimeVersion: baseMeta?.runtime_version ?? null,
+    commit: baseMeta?.commit ?? git(["rev-parse", "HEAD"]),
+    runs: baseMeta?.runs_per_case ?? options.runs,
+    pacingMs: baseMeta?.typed_pacing_ms ?? options.pacingMs,
+    chatPacingMs: baseMeta?.chat_pacing_ms ?? options.chatPacingMs,
+    attemptMs: baseMeta?.attempt_timeout_ms ?? options.attemptMs,
+    typedCases: fixture.typed_case_count,
+    chatCases: fixture.chat_case_count,
+    routeFilter: routeNames,
+    route_filter: routeNames,
+    resultsDir,
+  };
+}
+
+/** Merge per-route results into one artifact + table, without provider calls. */
+function mergeAndRender(resultsDir, routeNames, options) {
+  const merged = mergeRouteFiles(resultsDir, routeNames);
+  const routes = merged.routes.map((route, index) => ({
+    ...route,
+    order: index + 1,
+    role: route.role || (index === 0 ? "primary" : "fallback"),
+    family: route.family || (route.protocol === "openai-chat" ? "chat" : "typed"),
+  }));
+  const samples = merged.samples;
+  const meta = mergedMeta(merged.meta, routeNames, options, resultsDir);
+  const rawPath = join(resultsDir, "samples-merged.json");
+  writeFileSync(
+    rawPath,
+    `${JSON.stringify({ bench: meta, routes: routes.map(({ order, ...rest }) => rest), samples }, null, 2)}\n`,
+  );
+  console.log(`bench: merged samples ${rawPath}`);
+  return { meta, routes, samples, rawPath };
 }
 
 function main() {
@@ -382,6 +449,15 @@ function main() {
     meta = { ...parsed.bench, startedAt: parsed.bench?.started_at ?? "unknown" };
     summaries = summarize(samples, routes);
     markdown = renderMarkdown(meta, summaries, samples);
+  } else if (options.mergeOnly) {
+    if (!options.skipFixtureCheck) console.log(ensureFixtureMatchesBuilders());
+    const resultsDir = resolve(options.mergeOnly);
+    if (!existsSync(resultsDir)) throw new Error(`results directory not found: ${resultsDir}`);
+    const routeNames = recordedRouteNames(resultsDir);
+    if (!routeNames.length) throw new Error(`no route-*.json results in ${resultsDir}`);
+    const merged = mergeAndRender(resultsDir, routeNames, options);
+    summaries = summarize(merged.samples, merged.routes);
+    markdown = renderMarkdown(merged.meta, summaries, merged.samples);
   } else {
     const fixtureCheck = options.skipFixtureCheck ? "skipped" : ensureFixtureMatchesBuilders();
     if (!options.skipFixtureCheck) console.log(fixtureCheck);
@@ -398,27 +474,9 @@ function main() {
     console.log(`bench: results dir ${resultsDir}`);
     for (const route of runnable) runRouteBench(route, options, resultsDir);
 
-    const fixture = JSON.parse(readFileSync(fixturePath, "utf8"));
-    const merged = mergeRouteFiles(resultsDir, runnable);
-    const routes = runnable.map((route) => ({ ...route, family: route.protocol === "openai-chat" ? "chat" : "typed" }));
-    summaries = summarize(merged.samples, routes);
-    meta = {
-      ...(merged.meta || {}),
-      startedAt: merged.meta?.started_at ?? new Date().toISOString(),
-      runtimeVersion: merged.meta?.runtime_version ?? null,
-      commit: merged.meta?.commit ?? git(["rev-parse", "HEAD"]),
-      runs: merged.meta?.runs_per_case ?? options.runs,
-      pacingMs: merged.meta?.typed_pacing_ms ?? options.pacingMs,
-      chatPacingMs: merged.meta?.chat_pacing_ms ?? options.chatPacingMs,
-      attemptMs: merged.meta?.attempt_ms ?? options.attemptMs,
-      typedCases: fixture.typed_case_count,
-      chatCases: fixture.chat_case_count,
-      resultsDir,
-    };
-    const rawPath = options.resultsDir ? join(resultsDir, "samples-merged.json") : join(tmpdir(), "semantic-bench-samples.json");
-    writeFileSync(rawPath, `${JSON.stringify({ bench: meta, routes: merged.routes, samples: merged.samples }, null, 2)}\n`);
-    console.log(`bench: merged samples ${rawPath}`);
-    markdown = renderMarkdown(meta, summaries, merged.samples);
+    const merged = mergeAndRender(resultsDir, runnable.map((route) => route.name), options);
+    summaries = summarize(merged.samples, merged.routes);
+    markdown = renderMarkdown(merged.meta, summaries, merged.samples);
   }
 
   markdown = markdown || renderMarkdown(meta, summaries);
@@ -432,4 +490,7 @@ function main() {
   }
 }
 
-main();
+// Import-safe: the CLI runs only when invoked directly, so tests can import this
+// module (and the pure helpers) without side effects.
+const invokedDirectly = Boolean(process.argv[1]) && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedDirectly) main();
