@@ -6,6 +6,20 @@ const GROK_ADAPTER_CAPABILITIES = Object.freeze({
   stopGeneration: true,
 });
 
+// Whitespace-canonical text digest (same normalization as wake.js
+// canonical_sha256 / runtime browser_readback_text_canonical), FNV-1a 32-bit
+// so DOM settlement stays synchronous. Identifies a Grok user turn by content
+// because DOM ordinals drift (lagging/virtualized user bubbles).
+function grokCanonicalTextDigest(text) {
+  const canonical = String(text || "").replace(/[\u00a0\ufeff]/g, " ").split(/\s+/u).filter(Boolean).join(" ");
+  let hash = 0x811c9dc5;
+  for (const byte of new TextEncoder().encode(canonical)) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
 class GrokAdapter extends BaseAdapter {
   get name() { return "grok"; }
   get capabilities() { return GROK_ADAPTER_CAPABILITIES; }
@@ -164,6 +178,9 @@ class GrokAdapter extends BaseAdapter {
       const ordinal = nodes.indexOf(element);
       if (sessionId && ordinal >= 0) {
         messageId = `grok-dom-v1:${sessionId}:${role}:${ordinal}`;
+        if (role === "user") {
+          messageId += `:t${grokCanonicalTextDigest(element.innerText || element.textContent || "")}`;
+        }
       }
     }
     return {
@@ -184,11 +201,19 @@ class GrokAdapter extends BaseAdapter {
       ? `grok-dom-v1:${sessionId}:user:`
       : null;
     if (syntheticPrefix && acceptedUserMessageRef.startsWith(syntheticPrefix)) {
-      const ordinalText = acceptedUserMessageRef.slice(syntheticPrefix.length);
-      if (!/^\d+$/.test(ordinalText)) return null;
-      const userOrdinal = Number(ordinalText);
+      const match = acceptedUserMessageRef.slice(syntheticPrefix.length).match(/^(\d+)(?::t([0-9a-f]{8}))?$/);
+      if (!match) return null;
+      const userOrdinal = Number(match[1]);
       const users = [...document.querySelectorAll('[data-testid="user-message"]')];
-      const acceptedUser = users[userOrdinal] || null;
+      // Content first: the latest user turn with the accepted text digest.
+      // Position is only the fallback for refs without a digest (or when the
+      // digest is no longer present, e.g. text re-rendered differently).
+      const byDigest = match[2]
+        ? [...users].reverse().find((element) => grokCanonicalTextDigest(
+          element.innerText || element.textContent || "",
+        ) === match[2]) || null
+        : null;
+      const acceptedUser = byDigest || users[userOrdinal] || null;
       if (!acceptedUser) return null;
 
       const transcript = [
