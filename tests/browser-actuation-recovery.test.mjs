@@ -779,6 +779,7 @@ test("user rejects invalid native form states | Given unavailable dropdown or un
 
   for (const error of [
     "select_option_unavailable",
+    "select_option_not_observed",
     "select_option_ambiguous",
     "select_option_stale",
     "multiple_select_unsupported",

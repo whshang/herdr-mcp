@@ -73,11 +73,14 @@
   let currentGenerationToken = "";
   const elementMap = new Map();
   const selectOptionMap = new Map();
+  // Refs whose observed option list was a truncated prefix of the live list.
+  const selectOptionTruncatedRefs = new Set();
 
   function invalidateGeneration() {
     currentGenerationToken = "";
     elementMap.clear();
     selectOptionMap.clear();
+    selectOptionTruncatedRefs.clear();
   }
 
   function isCrossOriginFrame() {
@@ -191,6 +194,7 @@
     currentGenerationToken = `pa_gen_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
     selectOptionMap.clear();
+    selectOptionTruncatedRefs.clear();
 
     const doc = global.document;
     if (!doc) return { ok: false, error: "document_unavailable" };
@@ -243,6 +247,9 @@
           value: String(option.value),
           label: String(option.label || option.textContent || "").trim(),
         })));
+        // Record a truncated observation window: absence from it is then not
+        // evidence that a requested option does not exist.
+        if (selectOptions.length > 24) selectOptionTruncatedRefs.add(ref);
       }
 
       elements.push({
@@ -483,10 +490,21 @@
       if (el.multiple === true) return { ok: false, error: "multiple_select_unsupported" };
       // Match only options offered in the latest observation. A page must not
       // introduce a new option after inspect and have it selected by old refs.
-      const matches = (selectOptionMap.get(ref) || []).filter((option) => (
+      const observedOptions = selectOptionMap.get(ref) || [];
+      const matches = observedOptions.filter((option) => (
         option.value === fillValue || option.label === fillValue
       ));
       if (matches.length !== 1) {
+        if (matches.length === 0 && selectOptionTruncatedRefs.has(ref)) {
+          // The observation held only a truncated prefix of the options, so the
+          // request cannot be proven absent. Never select an unobserved option;
+          // the caller must re-observe to widen the window.
+          return {
+            ok: false,
+            error: "select_option_not_observed",
+            options_observed: observedOptions.length,
+          };
+        }
         return { ok: false, error: matches.length ? "select_option_ambiguous" : "select_option_unavailable" };
       }
       const snapshot = matches[0];

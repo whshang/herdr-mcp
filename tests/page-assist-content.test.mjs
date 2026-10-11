@@ -598,3 +598,46 @@ test("user sets a framework-managed checkbox | Given a checkbox whose native cli
   assert.equal(stuckValue, false);
   void stuckRef;
 });
+
+test("user distinguishes a truncated dropdown observation from an absent option | Given a select whose observed option list was cut at the observation window | When fill asks for an option outside that window | Then it fails closed with a truncation-specific error and never selects the live option", () => {
+  const dropdown = createElement({ tag: "select", attrs: { "aria-label": "Region" }, value: "" });
+  dropdown.options = [
+    { value: "", textContent: "Choose region", disabled: true },
+    ...Array.from({ length: 30 }, (_, i) => ({ value: `r${i}`, textContent: `Region ${i}`, disabled: false })),
+  ];
+  const h = harness({ elements: [dropdown] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements[0].options.length, 24);
+  assert.equal(observed.elements[0].options_truncated, true);
+  const choose = (value) => h.send({
+    type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[0].ref, value,
+  });
+
+  // "Region 27" exists in the live control but was never observed.
+  const beyondWindow = choose("Region 27");
+  assert.equal(beyondWindow.ok, false);
+  assert.equal(beyondWindow.error, "select_option_not_observed");
+  assert.equal(beyondWindow.options_observed, 24);
+  assert.equal(dropdown.value, "");
+  assert.deepEqual(dropdown.events, []);
+  assert.equal(dropdown.focused, 0);
+
+  // The rejection happened before any mutation, so the generation still stands.
+  assert.equal(choose("Region 3").ok, true);
+  assert.equal(dropdown.value, "r3");
+  assert.equal(choose("Region 28").error, "stale_generation");
+
+  // A complete observation keeps reporting an option that is genuinely absent.
+  const small = createElement({ tag: "select", attrs: { "aria-label": "Small" }, value: "" });
+  small.options = [{ value: "alpha", textContent: "Alpha", disabled: false }];
+  const full = harness({ elements: [small] });
+  const seen = full.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(seen.elements[0].options_truncated, undefined);
+  const absent = full.send({
+    type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+    generation: seen.generation, ref: seen.elements[0].ref, value: "Omega",
+  });
+  assert.equal(absent.error, "select_option_unavailable");
+  assert.equal(small.value, "");
+});
