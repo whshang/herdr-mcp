@@ -88,7 +88,7 @@ Everything below is a real local precondition, not a formality:
    ```bash
    herdr-mcp webchat endpoints
    ```
-   The endpoint must report `consent.webchat_control: true`. `consent.tool_bridge` and `consent.tool_bridge_workstation_mutation` are separate switches for a different feature (Web AI tool calls through the page) and are not required here.
+   Registered endpoints report `consent.webchat_control: true` by default; there is no local WebChat Control switch. `consent.tool_bridge` and `consent.tool_bridge_workstation_mutation` remain separate gates for a different feature (Web AI tool calls through the page) and are not required here.
 4. **A signed-in provider account that the extension has observed.** Accounts, ChatGPT Projects (`space` resources), and conversations (`session` resources) appear as resources under that endpoint.
 5. **No manual credential handling.** The `herdr-mcp` CLI is a first-party local client: it attaches the trusted local caller grant itself. Never print, copy, or ask the user for the runtime bearer, browser cookies, or connector credentials.
 
@@ -121,7 +121,7 @@ Read the results as follows:
 | `resource_ref` | The exact account / `space` (Project) / `session` (conversation) identity |
 | `parent_ref` | The hierarchy edge: account → space → session |
 | `observation_generation` | The generation the extension reported for that resource; pass it as `--expected-generation` |
-| `consent.webchat_control` | Whether this endpoint may be driven |
+| `consent.webchat_control` | Compatibility projection; `true` for registered endpoints, not a separate local gate |
 | `actuation_available` / `actuation_reason` (from `inspect`) | The capability of *that inspect call*, not a generic mutation preflight. For mutations, trust the operation's returned delivery state |
 
 `herdr-mcp webchat resources` returns `actuation_evaluated: false` with `actuation_reason: "not_evaluated_by_list"`; a list result is never a health or consent signal.
@@ -273,7 +273,7 @@ Idempotency: one logical handoff keeps one key. Without `--idempotency-key` the 
 
 **Prepared is not delivered.** When the source conversation is not currently registered, or browser control is unavailable, the packet and `manual_delivery.copy_prompt` are still returned with `automatic_delivery.attempted=false` and the runtime's reason. That is a usable result for manual continuation, and it is **not** a completed handoff: only `automatic_delivery.completed=true` (that is, `delivery_state=applied`) means a new conversation was actually created. An `uncertain` delivery is reported as-is and never retried automatically.
 
-`herdr-mcp webchat create --source-url URL` now exposes the same source-anchored route for exact window affinity without requiring caller-supplied endpoint/provider/account refs. The local CLI first asks Runtime over trusted Unix IPC to resolve the latest exact route with the same canonical source resolver, then attaches the trusted local grant derived from that route. The create payload still uses `source_url` as its only route input and Runtime resolves and validates it again before mutation. If the route changes between those reads, the exact grant no longer matches and the operation fails closed instead of targeting the stale endpoint. Explicit direct create still requires endpoint/provider/account and generation.
+`herdr-mcp webchat create --source-url URL` now exposes the same source-anchored route for exact window affinity without requiring caller-supplied endpoint/provider/account refs. The local CLI first asks Runtime over trusted Unix IPC to resolve the exact route with the same canonical source resolver, then attaches the trusted local grant derived from that route. The create payload still uses `source_url` as its only route input and Runtime resolves and validates it again before mutation. If the route changes between those reads, the exact grant no longer matches and the operation fails closed instead of targeting the stale endpoint. An exact canonical URL observed by more than one browser session is ambiguous and fails closed as `browser_canonical_url_ambiguous`, so a source-anchored create never resolves to another profile/account's session. Explicit direct create still requires endpoint/provider/account and generation.
 
 ## 7. Local agent example
 
@@ -283,7 +283,7 @@ A local agent task might read:
 
 The agent should proceed in this order:
 
-1. **Capability discovery** — `herdr-mcp webchat endpoints`, `herdr-mcp webchat resources --kind space`, `herdr-mcp webchat inspect SPACE_REF`. Confirm `consent.webchat_control` is true and capture `observation_generation`.
+1. **Capability discovery** — `herdr-mcp webchat endpoints`, `herdr-mcp webchat resources --kind space`, `herdr-mcp webchat inspect SPACE_REF`. Registered endpoints report `consent.webchat_control: true`; capture `observation_generation` and use the exact observed identities.
 2. **Resolve identity** — pick the exact `endpoint_ref` / `account_ref` / `space_ref` from the returned resources. Do not guess, do not reuse a ref from another machine or another Project.
 3. **Resolve durable state** — `herdr-mcp continuity resume hc:...` (or a bounded `herdr-mcp continuity search ... --project-path <checkout>` first, honoring `confirmation_required`). This is the only source of the task's durable state.
 4. **Run the canonical handoff** — `herdr-mcp webchat handoff --continuity-id hc:... --source-url '<exact conversation URL>'` (add `--work-chain-id` when the chain already has one). This performs canonical preparation *and* the automatic delivery in one step; `--prepare-only` returns just the packet.
@@ -330,10 +330,10 @@ The practical failure mode is collapsing these into one "session id". `continuit
 | Symptom | What to check |
 | --- | --- |
 | No endpoint at all | `herdr-mcp native-host status`, `herdr-mcp extension standalone status`, `herdr-mcp doctor` (the `standalone-extension-load` advisories if you use the STANDALONE channel) |
-| Endpoint present, `consent.webchat_control: false` | The extension's control switch/consent has not been granted on this endpoint; this is a browser-side action, not a CLI flag |
+| Endpoint present, `consent.webchat_control: false` | Stale runtime/extension state from the retired local switch; update/reload the current DEV or release path and re-observe the endpoint |
 | Account or Project ambiguous | List again and choose by returned refs; never resolve ambiguity by guessing or by "most recent" |
 | `browser_resource_not_found` / stale session | Re-run `herdr-mcp webchat resources`; the conversation may have been closed, archived, or replaced by a newer observation |
-| The same conversation was observed by two browser endpoints | The canonical URL resolves to the **newest** observation, so a browser-profile or extension-identity switch does not strand an otherwise fresh conversation. Only two distinct sessions sharing that newest timestamp fail closed as `browser_canonical_url_ambiguous` |
+| The same conversation was observed by two browser endpoints | A canonical URL must resolve to exactly one registered session. Two distinct sessions sharing it are ambiguous and fail closed as `browser_canonical_url_ambiguous`; neither source-anchored create nor handoff follows the newest observation, so work is never retargeted to another profile or account. Re-observing does not remove the other session's record, so the URL stays ambiguous for source-anchored create and handoff; use a direct create with an explicit endpoint, provider, account, and generation instead |
 | Dispatch timeout | Read `herdr-mcp webchat dispatch-status DISPATCH_ID`; then observe the session; only then decide |
 | Mutation delivery uncertain | Re-observe first. Do not resend with a new idempotency key |
 | `code: "caller_grant_missing"` | You are not on the trusted local path (for example a raw TCP MCP client). Use the `herdr-mcp` CLI, which attaches the local grant itself; grants cannot be asserted over TCP |

@@ -305,7 +305,7 @@ CREATE TABLE IF NOT EXISTS browser_endpoints (
     device_id                       TEXT NOT NULL,
     browser_family                  TEXT NOT NULL,
     extension_version               TEXT NOT NULL,
-    webchat_control_allowed         INTEGER NOT NULL DEFAULT 0,
+    webchat_control_allowed         INTEGER NOT NULL DEFAULT 1,
     tool_bridge_allowed             INTEGER NOT NULL DEFAULT 0,
     tool_bridge_mutation_allowed    INTEGER NOT NULL DEFAULT 0,
     consent_revision                INTEGER NOT NULL DEFAULT 0,
@@ -622,6 +622,33 @@ pub(super) fn ensure_browser_archive_auxiliary_schema(conn: &Connection) -> Resu
             [],
         )
         .map_err(|error| format!("cannot extend browser archive auxiliary schema: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Forward-additive browser-dispatch settlement evidence.
+///
+/// `message_canonical_digest` is intentionally **not** a numbered migration: it
+/// is a nullable additive column. A schema-15 PROD binary reads and writes
+/// browser dispatches through explicit column lists, so it ignores the extra
+/// column and can still open the same database. That keeps `herdr-mcp dev
+/// rollback` to the pinned schema-15 PROD binary possible after DEV has written
+/// canonical digests. Legacy rows keep `NULL` and reconcile raw-only, which is
+/// fail-closed rather than a fabricated canonical match.
+pub(super) fn ensure_browser_dispatch_auxiliary_schema(conn: &Connection) -> Result<(), String> {
+    let has_canonical_digest = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('browser_dispatches') WHERE name = 'message_canonical_digest'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("cannot inspect browser dispatch auxiliary schema: {error}"))?;
+    if has_canonical_digest == 0 {
+        conn.execute(
+            "ALTER TABLE browser_dispatches ADD COLUMN message_canonical_digest TEXT",
+            [],
+        )
+        .map_err(|error| format!("cannot extend browser dispatch auxiliary schema: {error}"))?;
     }
     Ok(())
 }

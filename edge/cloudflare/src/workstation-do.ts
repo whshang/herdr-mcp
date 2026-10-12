@@ -59,6 +59,8 @@ import {
   PendingRequestRegistry,
   decodeStoredPendingRequest,
   newRequestId,
+  idempotencyRecordFor,
+  LEGACY_PRINCIPAL_REF,
   type Completion,
   type IdempotencyRecord,
   type PendingRequest,
@@ -122,34 +124,32 @@ const MAX_RECENT_READ_DEDUPE_RESULTS = 128;
 /**
  * Durable settlement row (completed:<id>). The completed row is the
  * authoritative, self-contained settlement record: it carries the completion
- * AND the idempotency binding (idempotencyKey + op) for that request. This is
- * what makes settlement crash-recoverable without relying on write ordering:
- * even if the separate idem:<key> row is lost to a crash/failure, the binding
- * is recovered from the completed row on init, so a same-key retry returns the
- * prior completion and the mutation is never re-executed. Legacy rows written
- * before this shape store the bare Completion; they are tolerated on load.
+ * AND the full idempotency binding (scoped identity + payload hash + page
+ * scope) for that request. This is what makes settlement crash-recoverable
+ * without relying on write ordering: even if the separate idem:<key> row is
+ * lost to a crash/failure, the binding is recovered from the completed row on
+ * init, so an authorized same-key retry returns the prior completion and the
+ * mutation is never re-executed. Legacy rows written before this shape store
+ * the bare Completion (or a pre-scope flat idempotency key) and are tolerated
+ * on load but are never replayable, because they carry no payload binding.
  */
 interface CompletedRow {
   completion: Completion;
+  /** Full idempotency binding embedded for crash recovery. */
+  idem?: IdempotencyRecord;
+  /** Legacy flat binding (pre-scope releases); never replayable. */
   idempotencyKey?: string;
   op?: string;
-  /** Settled-at evidence for idem reconstruction (mirrors IdempotencyRecord). */
+  /** Settled-at evidence for legacy idem reconstruction. */
   settledAtMs?: number;
 }
 
 function encodeCompletedRow(
-  entry: { idempotencyKey?: string; op: string } | undefined,
+  entry: PendingRequest | undefined,
   completion: Completion,
 ): CompletedRow {
-  if (entry?.idempotencyKey !== undefined) {
-    return {
-      completion,
-      idempotencyKey: entry.idempotencyKey,
-      op: entry.op,
-      settledAtMs: completion.servedAtMs,
-    };
-  }
-  return { completion };
+  const idem = entry === undefined ? undefined : idempotencyRecordFor(entry, completion.servedAtMs);
+  return idem === undefined ? { completion } : { completion, idem };
 }
 
 function releasesIdempotencyBinding(completion: Completion): boolean {
@@ -159,13 +159,32 @@ function releasesIdempotencyBinding(completion: Completion): boolean {
     && completion.error.delivery_state === "not_delivered";
 }
 
-/** Tolerate both the current envelope and legacy bare-Completion rows. */
+function decodeIdempotencyRecord(value: unknown): IdempotencyRecord | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const v = value as Record<string, unknown>;
+  if (typeof v.idempotencyKey !== "string" || typeof v.requestId !== "string") return undefined;
+  return {
+    idempotencyKey: v.idempotencyKey,
+    requestId: v.requestId,
+    op: typeof v.op === "string" ? v.op : "",
+    settledAtMs: typeof v.settledAtMs === "number" ? v.settledAtMs : 0,
+    ...(typeof v.callerKey === "string" ? { callerKey: v.callerKey } : {}),
+    ...(typeof v.principalRef === "string" ? { principalRef: v.principalRef } : {}),
+    ...(typeof v.routeDeviceId === "string" ? { routeDeviceId: v.routeDeviceId } : {}),
+    ...(typeof v.grantGeneration === "number" ? { grantGeneration: v.grantGeneration } : {}),
+    ...(typeof v.requestHash === "string" ? { requestHash: v.requestHash } : {}),
+    ...(typeof v.pageScopedEndpointRef === "string" ? { pageScopedEndpointRef: v.pageScopedEndpointRef } : {}),
+  };
+}
+
+/** Tolerate the current envelope, a pre-scope flat binding, and bare-Completion rows. */
 function decodeCompletedRow(value: unknown): CompletedRow | null {
   if (value === null || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
   if (v.completion !== undefined && typeof v.completion === "object" && v.completion !== null) {
     return {
       completion: v.completion as Completion,
+      ...(v.idem !== undefined ? { idem: decodeIdempotencyRecord(v.idem) } : {}),
       ...(typeof v.idempotencyKey === "string" ? { idempotencyKey: v.idempotencyKey } : {}),
       ...(typeof v.op === "string" ? { op: v.op } : {}),
       ...(typeof v.settledAtMs === "number" ? { settledAtMs: v.settledAtMs } : {}),
@@ -188,6 +207,15 @@ export interface InternalForwardRequest {
   contractEpoch?: number;
   contractHash?: string;
   idempotencyKey?: string;
+  /**
+   * Trusted Edge-only relay idempotency binding. The authenticated principal,
+   * routed device and connector grant generation scope the ledger identity;
+   * this hash binds that identity to the exact request payload so a reused
+   * key can never return a completion produced for a different request. A
+   * request without a binding is never replayed (fails closed). Never
+   * forwarded to the workstation Link.
+   */
+  replayBinding?: ReplayBinding;
   /** Edge-generated hash for short-window coalescing of identical read calls. */
   readDedupeKey?: string;
   trace?: Record<string, unknown>;
@@ -195,6 +223,33 @@ export interface InternalForwardRequest {
   routeDeviceId?: string;
   /** Authoritative registry snapshot used to bootstrap/refresh the local fence. */
   executionFence?: DeviceExecutionFence;
+}
+
+/** Edge-canonical idempotency payload binding for one forwarded request. */
+export interface ReplayBinding {
+  /** Hash of inner method + canonical args + endpoint_ref. */
+  requestHash: string;
+  /** Page Assist endpoint this request requires, when the method is scoped. */
+  pageScopedEndpointRef?: string;
+  /** Authenticated connector grant generation at this request. */
+  grantGeneration?: number;
+}
+
+/**
+ * Page Assist endpoints the *current* caller is authorized for on this routed
+ * device (the Edge filtered them by device and connector generation). Used to
+ * refuse replaying a page-scoped completion whose grant no longer exists.
+ */
+function authorizedPageAssistEndpoints(trace: Record<string, unknown> | undefined): string[] {
+  const grants = trace?.page_assist_grants;
+  if (!Array.isArray(grants)) return [];
+  const out: string[] = [];
+  for (const grant of grants) {
+    if (grant === null || typeof grant !== "object") continue;
+    const ref = (grant as Record<string, unknown>).endpoint_ref;
+    if (typeof ref === "string" && ref.length > 0) out.push(ref);
+  }
+  return out;
 }
 
 export type ForwardOutcome =
@@ -309,8 +364,8 @@ export class WorkstationDO {
       // the idempotency bindings embedded in completed:<id> rows. A crash
       // between writing completed:<id> and idem:<key> (or after idem:<key> but
       // before the pending delete) therefore still recovers the full
-      // completion + binding: a same-key retry returns the prior completion and
-      // never re-executes a mutation that may already have run.
+      // completion + binding: an authorized same-key retry returns the prior
+      // completion and never re-executes a mutation that may already have run.
       const restoredCompletionIds = new Set(
         this.registry.completedEntries().map(({ requestId }) => requestId),
       );
@@ -322,18 +377,10 @@ export class WorkstationDO {
       }
       for (const row of completed) {
         if (!restoredCompletionIds.has(row.requestId)) continue;
-        if (row.idempotencyKey === undefined) continue;
-        const existing = idemByKey.get(row.idempotencyKey);
+        if (row.idem === undefined) continue;
         // Prefer the durable idem:<key> row when present (it is the freshest
         // evidence); otherwise reconstruct the binding from the completed row.
-        if (!existing) {
-          idemByKey.set(row.idempotencyKey, {
-            idempotencyKey: row.idempotencyKey,
-            requestId: row.requestId,
-            op: row.op ?? "",
-            settledAtMs: row.completion.servedAtMs,
-          });
-        }
+        if (!idemByKey.has(row.idem.idempotencyKey)) idemByKey.set(row.idem.idempotencyKey, row.idem);
       }
       this.registry.restoreIdem([...idemByKey.values()]);
       // Initialization is deliberately read-only. A storage write quota must
@@ -375,17 +422,16 @@ export class WorkstationDO {
     return out;
   }
 
-  private async loadCompleted(): Promise<Array<{ requestId: string; completion: Completion; idempotencyKey?: string; op?: string }>> {
+  private async loadCompleted(): Promise<Array<{ requestId: string; completion: Completion; idem?: IdempotencyRecord }>> {
     const map = await this.state.storage.list<unknown>({ prefix: PREFIX_COMPLETED });
-    const out: Array<{ requestId: string; completion: Completion; idempotencyKey?: string; op?: string }> = [];
+    const out: Array<{ requestId: string; completion: Completion; idem?: IdempotencyRecord }> = [];
     for (const [key, value] of map) {
       const row = decodeCompletedRow(value);
       if (!row) continue;
       out.push({
         requestId: key.slice(PREFIX_COMPLETED.length),
         completion: row.completion,
-        ...(row.idempotencyKey !== undefined ? { idempotencyKey: row.idempotencyKey } : {}),
-        ...(row.op !== undefined ? { op: row.op } : {}),
+        ...(row.idem !== undefined ? { idem: row.idem } : {}),
       });
     }
     return out;
@@ -692,7 +738,7 @@ export class WorkstationDO {
     const now = Date.now();
     const workstationId = this.workstationId();
     const requestId = req.requestId ?? newRequestId();
-    const resourcePrincipalRef = req.resourcePrincipalRef ?? "principal:legacy";
+    const resourcePrincipalRef = req.resourcePrincipalRef ?? LEGACY_PRINCIPAL_REF;
     const principalLimit = Math.min(this.limits.maxPendingPerPrincipal, this.limits.maxPendingRequests);
     if (req.routeDeviceId) {
       const fenceError = await this.enforceExecutionFence(req, requestId, workstationId);
@@ -797,10 +843,69 @@ export class WorkstationDO {
     this.inFlightReadDedupe.clear();
     this.recentReadDedupe.clear();
 
-    if (req.idempotencyKey !== undefined) {
-      const replay = this.registry.idempotentCompletion(req.op, req.idempotencyKey);
-      if (replay !== undefined) {
-        return this.successfulForwardResponse(replay, req.routeDeviceId);
+    if (req.idempotencyKey !== undefined && req.replayBinding !== undefined) {
+      const replayBinding = req.replayBinding;
+      const replay = this.registry.replay({
+        principalRef: resourcePrincipalRef,
+        ...(req.routeDeviceId !== undefined ? { routeDeviceId: req.routeDeviceId } : {}),
+        ...(replayBinding.grantGeneration !== undefined
+          ? { grantGeneration: replayBinding.grantGeneration }
+          : {}),
+        callerKey: req.idempotencyKey,
+        requestHash: replayBinding.requestHash,
+        ...(replayBinding.pageScopedEndpointRef !== undefined
+          ? { pageScopedEndpointRef: replayBinding.pageScopedEndpointRef }
+          : {}),
+        authorizedPageAssistEndpoints: authorizedPageAssistEndpoints(req.trace),
+      }, req.op);
+      if (replay.status === "hit") {
+        return this.successfulForwardResponse(replay.completion, req.routeDeviceId);
+      }
+      if (replay.status === "payload_mismatch") {
+        return this.json(
+          { status: "error", error: errorResult("idempotency_key_payload_mismatch", {
+            requestId,
+            workstationId,
+            atMs: now,
+            retryable: false,
+            delivery_state: "not_delivered",
+            message: "idempotency key is already bound to a different request for this caller; repeat the original request or verify live state before issuing a new key",
+          }) },
+          409,
+        );
+      }
+      if (replay.status === "grant_required") {
+        // The cached page-scoped completion required a Page Assist endpoint the
+        // caller no longer holds; never serve its content or re-send it.
+        return this.json(
+          { status: "error", error: errorResult("idempotency_replay_unauthorized", {
+            requestId,
+            workstationId,
+            atMs: now,
+            retryable: false,
+            delivery_state: "not_delivered",
+            message: "cached completion requires a Page Assist grant this caller no longer holds",
+            details: { endpoint_ref: replay.endpointRef ?? null },
+          }) },
+          403,
+        );
+      }
+      if (replay.status === "binding_unavailable") {
+        // Upgrade window: the key is already spent on a settled mutation whose
+        // record predates replay binding. The completion cannot be served (it
+        // cannot be proven to belong to this request) and the mutation must not
+        // be forwarded again (it already ran). Fail closed, deterministically.
+        return this.json(
+          { status: "error", error: errorResult("idempotency_replay_unavailable", {
+            requestId,
+            workstationId,
+            atMs: now,
+            retryable: false,
+            delivery_state: "not_delivered",
+            message: "an earlier mutation for this idempotency key already settled, but its record predates request binding, so its outcome cannot be replayed and the mutation must not be re-sent; verify live state instead of repeating it with a new key",
+          }) },
+          409,
+        );
       }
     }
 
@@ -843,17 +948,26 @@ export class WorkstationDO {
       requestId,
       workstationId,
       resourcePrincipalRef,
+      ...(req.routeDeviceId !== undefined ? { routeDeviceId: req.routeDeviceId } : {}),
       op: req.op,
       opClass,
       argsSummary: { argKeys: Object.keys((req.args ?? {}) as Record<string, unknown>).slice(0, 32) },
       deadlineMs,
       idempotencyKey: req.idempotencyKey,
+      ...(req.replayBinding !== undefined
+        ? {
+            requestHash: req.replayBinding.requestHash,
+            ...(req.replayBinding.pageScopedEndpointRef !== undefined
+              ? { pageScopedEndpointRef: req.replayBinding.pageScopedEndpointRef }
+              : {}),
+            ...(req.replayBinding.grantGeneration !== undefined
+              ? { grantGeneration: req.replayBinding.grantGeneration }
+              : {}),
+          }
+        : {}),
       contractEpoch: req.contractEpoch,
     });
 
-    if (add.status === "idem_hit") {
-      return this.successfulForwardResponse(add.completion, req.routeDeviceId);
-    }
     if (add.status === "capacity_full") {
       return this.json({ status: "error", error: capacityResult({ requestId, workstationId, atMs: now }) }, 429);
     }
@@ -1287,14 +1401,9 @@ export class WorkstationDO {
     // pending row is cleaned up.
     try {
       await this.state.storage.put(PREFIX_COMPLETED + requestId, encodeCompletedRow(settlementEntry, completion) as unknown as string);
-      if (settlementEntry.idempotencyKey !== undefined) {
-        const record: IdempotencyRecord = {
-          idempotencyKey: settlementEntry.idempotencyKey,
-          requestId,
-          op: settlementEntry.op,
-          settledAtMs: completion.servedAtMs,
-        };
-        await this.state.storage.put(PREFIX_IDEM + settlementEntry.idempotencyKey, record as unknown as string);
+      const idemRecord = idempotencyRecordFor(settlementEntry, completion.servedAtMs);
+      if (idemRecord !== undefined) {
+        await this.state.storage.put(PREFIX_IDEM + idemRecord.idempotencyKey, idemRecord as unknown as string);
       }
       await this.state.storage.delete(PREFIX_PENDING + requestId);
     } catch (persistErr) {
@@ -1345,14 +1454,9 @@ export class WorkstationDO {
     // completion and the binding even if the idem:<key> write failed.
     try {
       await this.state.storage.put(PREFIX_COMPLETED + requestId, encodeCompletedRow(entry, completion) as unknown as string);
-      if (entry.idempotencyKey !== undefined) {
-        const record: IdempotencyRecord = {
-          idempotencyKey: entry.idempotencyKey,
-          requestId,
-          op: entry.op,
-          settledAtMs: completion.servedAtMs,
-        };
-        await this.state.storage.put(PREFIX_IDEM + entry.idempotencyKey, record as unknown as string);
+      const idemRecord = idempotencyRecordFor(entry, completion.servedAtMs);
+      if (idemRecord !== undefined) {
+        await this.state.storage.put(PREFIX_IDEM + idemRecord.idempotencyKey, idemRecord as unknown as string);
       }
       await this.state.storage.delete(PREFIX_PENDING + requestId);
     } catch (persistErr) {
@@ -1839,8 +1943,9 @@ export class WorkstationDO {
       await this.settleAsTimeout(entry.requestId);
     }
     for (const requestId of this.registry.completedExpired(now)) {
-      const entry = this.registry.get(requestId);
-      const idemKey = entry?.idempotencyKey ?? this.registry.idempotencyKeyFor(requestId);
+      // The idempotency index owns the scoped ledger key; the raw caller key
+      // is never a storage key in the current format.
+      const idemKey = this.registry.idempotencyKeyFor(requestId);
       this.registry.dropCompleted(requestId, idemKey);
       await this.state.storage.delete(PREFIX_COMPLETED + requestId);
       if (idemKey !== undefined) await this.state.storage.delete(PREFIX_IDEM + idemKey);

@@ -206,7 +206,7 @@ function observationHarness({
     "registeredBrowserSessionRef", "registeredBrowserGeneration", "registeredConvKey",
     "acceptedDispatchAssignments", "sendBg", "ADAPTER", "fetchChatGptConversationSnapshot",
     "chatGptDomTurnSequence", "isTurnInProgress", "Date", "setInterval", "document", "window", "recovered",
-    `${settlementSource}\n${wakeSource.slice(routeStart, routeEnd)}\nrestoreBrowserResultAssignment(recovered); startConversationRouteWatch(); return observeBrowserResultSettlement;`,
+    `${settlementSource}\nconst maybeRefreshBrowserPendingDispatchAssignment = () => {};\n${wakeSource.slice(routeStart, routeEnd)}\nrestoreBrowserResultAssignment(recovered); startConversationRouteWatch(); return observeBrowserResultSettlement;`,
   )("br_worker", 7, route, assignments, async (payload) => {
     sent.push(payload);
     return sends.shift() || { ok: true };
@@ -477,12 +477,13 @@ test("ChatGPT DOM fallback recognizes current data-turn structure without treati
 });
 
 test("ChatGPT dispatch accepts only a changed exact DOM user message identity when snapshot lookup is unavailable", () => {
-  const start = wakeSource.indexOf("  function exactDomAcceptedUserMessageRef(beforeDom, afterDom, message) {");
+  const start = wakeSource.indexOf("  // The exact Unicode White_Space set Rust");
   const end = wakeSource.indexOf("\n  function providerCanonicalConversationObserved()", start);
   assert.ok(start >= 0 && end > start, "exact DOM accepted-user helper must remain extractable");
-  const exactDomAcceptedUserMessageRef = new Function(
-    `${wakeSource.slice(start, end)}; return exactDomAcceptedUserMessageRef;`,
+  const helpers = new Function(
+    `${wakeSource.slice(start, end)}; return { exactDomAcceptedUserMessageRef, providerUserTextMatchesSubmitted };`,
   )();
+  const { exactDomAcceptedUserMessageRef, providerUserTextMatchesSubmitted } = helpers;
   const before = { messageId: "user-old", exactMessageId: true, text: "old" };
   assert.equal(exactDomAcceptedUserMessageRef(before, {
     messageId: "user-new",
@@ -504,7 +505,37 @@ test("ChatGPT dispatch accepts only a changed exact DOM user message identity wh
     exactMessageId: true,
     text: "different prompt",
   }, "Reply with exactly ACK and nothing else."), null);
-  assert.match(wakeSource, /serverAdvanced \? afterServer\.userMessageId : exactDomUserMessageRef/);
+  // A short foreign turn that merely occurs inside the outgoing prompt is not
+  // this submit's acceptance; the old 120-character overlap accepted it.
+  assert.equal(exactDomAcceptedUserMessageRef(
+    { messageId: "user-old", exactMessageId: true, text: "old" },
+    { messageId: "user-ok", exactMessageId: true, text: "ok" },
+    "Please reply with ok once the patch is ready.",
+  ), null);
+  assert.equal(providerUserTextMatchesSubmitted("ok", {
+    messageText: "Please reply with ok once the patch is ready.",
+    composer: "",
+    selectedApps: [],
+  }), false);
+  // The named App mention token in front of the body is still the same turn.
+  assert.equal(providerUserTextMatchesSubmitted("herdr ship the patch", {
+    messageText: "ship the patch",
+    composer: "",
+    selectedApps: ["herdr"],
+  }), true);
+  assert.equal(providerUserTextMatchesSubmitted("herdr ship the p", {
+    messageText: "ship the patch",
+    composer: "",
+    selectedApps: ["herdr"],
+  }), false);
+  // Whitespace re-rendering is the only tolerated difference.
+  assert.equal(providerUserTextMatchesSubmitted("ship the\n\npatch", {
+    messageText: "ship the patch",
+    composer: "",
+    selectedApps: [],
+  }), true);
+  assert.match(wakeSource, /serverAdvanced\s*\n?\s*\? afterServer\.userMessageId/);
+  assert.doesNotMatch(wakeSource.slice(start, end), /slice\(0, 120\)/);
 });
 
 test("late accepted-dispatch observation preserves an already reported assistant identity", () => {
@@ -602,7 +633,10 @@ test("session.create re-registers boundedly until its synthesized pending dispat
   assert.match(wakeSource, /until:\s*Date\.now\(\) \+ BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS/);
   assert.match(wakeSource, /refresh\.retryMs = Math\.min\(refresh\.retryMs \* 2, 30000\)/);
   assert.match(wakeSource, /registerCurrentConversation\("session-create-pending-dispatch"\)/);
-  assert.match(wakeSource, /response\?\.browser_pending_dispatch\s*\|\|\s*acceptedDispatchAssignments\.has\(registeredBrowserSessionRef\)/);
+  assert.match(wakeSource, /response\?\.browser_pending_dispatch\s*\|\|\s*\/\^bd_\[0-9a-f\]\{64\}\$\/\.test\(String\(acceptedDispatchAssignments\.get\(registeredBrowserSessionRef\)\?\.dispatchId/);
+  // A create assignment recorded before the runtime dispatch exists adopts it
+  // only on an exact accepted-message and generation match.
+  assert.match(wakeSource, /current && !current\.dispatchId\s*&& current\.acceptedUserMessageRef === pending\.accepted_user_message_ref\s*&& current\.generation === pending\.generation/);
   assert.match(wakeSource, /maybeRefreshBrowserPendingDispatchAssignment\(\);/);
 });
 
@@ -614,4 +648,24 @@ test("persistent identity rejection stops retries but a new assignment can proce
   h.assignments.set("br_worker", { dispatchId: `bd_${"b".repeat(64)}`, generation: 7, acceptedUserMessageRef: "user-2", reportedAssistantRef: null });
   assert.equal(await h.observe(), true);
   assert.equal(h.sent.length, 4);
+});
+
+test("user dispatches to a hidden worker | Given a hidden session.create worker tab | When its pending dispatch identity changes | Then the tab still refreshes that identity", () => {
+  const route = wakeSource.slice(wakeSource.indexOf("  function startConversationRouteWatch() {"));
+  const refreshAt = route.indexOf("maybeRefreshBrowserPendingDispatchAssignment();");
+  const hiddenAt = route.indexOf("if (document.hidden) return;");
+  assert.ok(refreshAt > 0 && hiddenAt > refreshAt, "refresh must run before the hidden-tab early return");
+  const fn = wakeSource.slice(wakeSource.indexOf("  function maybeRefreshBrowserPendingDispatchAssignment() {"),
+    wakeSource.indexOf("  function scheduleDurableArchiveRetryWake("));
+  assert.doesNotMatch(fn, /document\.hidden/);
+  assert.match(fn, /Date\.now\(\) >= refresh\.until/);
+});
+
+test("user dispatches to a hidden worker | Given a hidden worker tab on the create route | When the route moves to the concrete conversation | Then the tab re-registers", () => {
+  const route = wakeSource.slice(wakeSource.indexOf("  function startConversationRouteWatch() {"),
+    wakeSource.indexOf("  function assistantSignature("));
+  const hidden = route.slice(route.indexOf("if (document.hidden) {"), route.indexOf("const convKey = ADAPTER.getConversationKey();"));
+  assert.match(hidden, /hiddenKey !== registeredConvKey && !hiddenRouteRegistrationInFlight/);
+  assert.match(hidden, /registerCurrentConversation\("poll-hidden"\)/);
+  assert.doesNotMatch(hidden, /ensureQueuedInsertButton|app-identity/);
 });

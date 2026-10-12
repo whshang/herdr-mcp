@@ -88,7 +88,7 @@ Web AI（planner）                      本地 coding Agent（planner/executor�
    ```bash
    herdr-mcp webchat endpoints
    ```
-   endpoint 必须报告 `consent.webchat_control: true`。`consent.tool_bridge` 与 `consent.tool_bridge_workstation_mutation` 是另一个能力（网页内 Web AI 工具调用）的独立开关，这里不需要。
+   已注册 endpoint 默认报告 `consent.webchat_control: true`，不再有本地 WebChat Control 开关。`consent.tool_bridge` 与 `consent.tool_bridge_workstation_mutation` 仍是另一个能力（网页内 Web AI 工具调用）的独立 gate，这里不需要。
 4. **扩展已观测到已登录的 provider 账号。** 账号、ChatGPT Project（`space` 资源）和会话（`session` 资源）都以该 endpoint 下的资源形式出现。
 5. **不要手工处理凭据。** `herdr-mcp` CLI 是第一方本地客户端，会自己附带受信任的本地调用方 grant。永远不要打印、复制或向用户索要 runtime bearer、浏览器 cookie 或 Connector 凭据。
 
@@ -121,7 +121,7 @@ herdr-mcp webchat inspect SESSION_REF
 | `resource_ref` | 精确的账号 / `space`（Project）/ `session`（会话）身份 |
 | `parent_ref` | 层级关系：account → space → session |
 | `observation_generation` | 扩展针对该资源报告的 generation，作为 `--expected-generation` 传入 |
-| `consent.webchat_control` | 该 endpoint 是否允许被驱动 |
+| `consent.webchat_control` | 兼容投影；已注册 endpoint 恒为 `true`，不再是独立本地 gate |
 | `actuation_available` / `actuation_reason`（来自 `inspect`） | 表示*这次 inspect 调用*的能力，而不是通用写操作预检。写操作的真相以操作返回的 delivery state 为准 |
 
 `herdr-mcp webchat resources` 会返回 `actuation_evaluated: false` 与 `actuation_reason: "not_evaluated_by_list"`；列表结果从不代表健康状态或 consent 状态。
@@ -273,7 +273,7 @@ Idempotency：一次 logical handoff 只用一个 key。不传 `--idempotency-ke
 
 **准备完成不等于已投递。** 当源会话当前未注册、或 browser control 不可用时，packet 与 `manual_delivery.copy_prompt` 仍会返回，同时 `automatic_delivery.attempted=false` 并带上 runtime 的原因。这是可用于手工接力的结果，**不是**已完成的 handoff：只有 `automatic_delivery.completed=true`（即 `delivery_state=applied`）才代表真的新建了会话。`uncertain` 状态会如实返回，绝不会自动重试。
 
-`herdr-mcp webchat create --source-url URL` 现在也支持精确 source-window affinity，并且不再要求调用方传 endpoint/provider/account ref。本地 CLI 先通过 trusted Unix IPC 让 Runtime 用同一个 canonical source resolver 读取最新 exact route，再用该 route 附加 trusted local grant；create 请求体仍只把 `source_url` 作为路由输入，Runtime 在 mutation 前再次解析并校验。若两次解析之间 route 又变化，exact grant 会失配并 fail closed，不会把写操作误投到旧 endpoint。显式 direct create 仍要求 endpoint/provider/account 与 generation。
+`herdr-mcp webchat create --source-url URL` 现在也支持精确 source-window affinity，并且不再要求调用方传 endpoint/provider/account ref。本地 CLI 先通过 trusted Unix IPC 让 Runtime 用同一个 canonical source resolver 读取 exact route，再用该 route 附加 trusted local grant；create 请求体仍只把 `source_url` 作为路由输入，Runtime 在 mutation 前再次解析并校验。若两次解析之间 route 又变化，exact grant 会失配并 fail closed，不会把写操作误投到旧 endpoint。同一个 canonical URL 若被多个 browser session 观测过即视为歧义，直接返回 `browser_canonical_url_ambiguous`，source-anchored create 不会解析到其他 profile/account 的 session。显式 direct create 仍要求 endpoint/provider/account 与 generation。
 
 ## 7. 本地 Agent 示例
 
@@ -283,7 +283,7 @@ Idempotency：一次 logical handoff 只用一个 key。不传 `--idempotency-ke
 
 Agent 应按这个顺序做：
 
-1. **能力发现** —— `herdr-mcp webchat endpoints`、`herdr-mcp webchat resources --kind space`、`herdr-mcp webchat inspect SPACE_REF`。确认 `consent.webchat_control` 为真并记录 `observation_generation`。
+1. **能力发现** —— `herdr-mcp webchat endpoints`、`herdr-mcp webchat resources --kind space`、`herdr-mcp webchat inspect SPACE_REF`。已注册 endpoint 会报告 `consent.webchat_control: true`；记录 `observation_generation` 并使用精确观测到的身份。
 2. **解析身份** —— 从返回资源里挑出确切的 `endpoint_ref` / `account_ref` / `space_ref`。不要猜，也不要复用来自其它机器或其它 Project 的 ref。
 3. **解析持久状态** —— `herdr-mcp continuity resume hc:...`（先做有界的 `herdr-mcp continuity search ... --project-path <checkout>` 也可以，但必须遵守 `confirmation_required`）。这是任务持久状态的唯一来源。
 4. **执行 canonical handoff** —— `herdr-mcp webchat handoff --continuity-id hc:... --source-url '<确切会话 URL>'`（该链已有 work chain 时加 `--work-chain-id`）。它一步完成 canonical 准备与自动投递；`--prepare-only` 只返回 packet。
@@ -330,10 +330,10 @@ Agent 应按这个顺序做：
 | 现象 | 检查什么 |
 | --- | --- |
 | 完全没有 endpoint | `herdr-mcp native-host status`、`herdr-mcp extension standalone status`、`herdr-mcp doctor`（STANDALONE 通道关注 `standalone-extension-load` 提示） |
-| 有 endpoint，但 `consent.webchat_control: false` | 该 endpoint 尚未授予扩展控制开关/consent；这是浏览器侧动作，不是 CLI 参数 |
+| 有 endpoint，但 `consent.webchat_control: false` | 仍在使用带旧本地开关语义的 runtime/extension；更新或 Reload 当前 DEV/发布版本后重新观测 endpoint |
 | account / Project 有歧义 | 重新列举并按返回 ref 选择；不要猜，也不要按“最近一次”选 |
 | `browser_resource_not_found` / session 失效 | 重新执行 `herdr-mcp webchat resources`；会话可能已关闭、归档，或被更新的观测取代 |
-| 同一个会话被两个 browser endpoint 观测过 | canonical URL 会解析到**最新**的那次观测，因此切换浏览器 profile / 扩展 identity 不会让本来新鲜的会话变成不可用；只有当两个不同 session 的最新观测时间完全相同时才 fail closed（`browser_canonical_url_ambiguous`） |
+| 同一个会话被两个 browser endpoint 观测过 | canonical URL 必须唯一解析到一个已登记的 session。两个不同 session 共享同一 URL 即为歧义，直接返回 `browser_canonical_url_ambiguous`，不会按最新观测选择，source-anchored create 与 handoff 都不会改投到其他 profile/account 的 session。重新观测不会移除另一个 session 的记录，该 URL 对 source-anchored create 与 handoff 仍然有歧义；请改用显式指定 endpoint、provider、account 与 generation 的 direct create |
 | dispatch 超时 | 先读 `herdr-mcp webchat dispatch-status DISPATCH_ID`，再观测会话，然后才决策 |
 | 写操作 delivery 不确定 | 先重新观测。不要换新 idempotency key 重发 |
 | `code: "caller_grant_missing"` | 你不在受信任本地路径上（例如裸 TCP MCP 客户端）。请使用 `herdr-mcp` CLI，它自己附带本地 grant；grant 无法通过 TCP 自证 |

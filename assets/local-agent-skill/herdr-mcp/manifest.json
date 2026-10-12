@@ -4,7 +4,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "sha256": "ce4079577e8e11e54967222b7d2e069328016c04c66f4b0baeb54635e70b893b"
+      "sha256": "55953481917abd2f958ca240a1261210d54cf2ecebf15a92f767de7bf46671bc"
+    },
+    {
+      "path": "references/browser-control.md",
+      "sha256": "1c1ea414e539274764b71f0b5c7b0d7acd5583b1db3912cd954bdb80a7d261b2"
     },
     {
       "path": "references/memory.md",
@@ -12,7 +16,7 @@
     },
     {
       "path": "references/webchat-control.md",
-      "sha256": "0eb9f51abf47e9ff3346a9f4c095c39c51e7a828a9e3e3013844fdf319125a2c"
+      "sha256": "3800159ca9f8d8efee257a6ea1d6a69881d02318458fd6645ff803e488699a4b"
     },
     {
       "path": "references/webchat.md",

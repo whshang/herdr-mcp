@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { WorkstationDO } from "../dist/workstation-do.js";
+import { idempotencyScopeKey } from "../dist/pending.js";
 
 class FakeStorage {
   constructor(entries = []) {
@@ -175,15 +176,19 @@ test("generation supersede proven not delivered releases mutation idempotency fo
   };
   const subject = new WorkstationDO(fakeState(storage, [activeSocket]), {});
   const idempotencyKey = "generation-reresolve";
+  const principalRef = "principal:generation-reresolve";
+  const scopedIdemKey = idempotencyScopeKey({ principalRef, callerKey: idempotencyKey });
   await subject.fetch(new Request("https://do/internal/status"));
 
   const first = subject.forwardInternal({
     kind: "request",
     requestId: "generation-old",
+    resourcePrincipalRef: principalRef,
     op: "herdr_prompt",
     args: { target: "w1:p1", text: "continue" },
     deadlineMs: Date.now() + 1_000,
     idempotencyKey,
+    replayBinding: { requestHash: "hash-generation-reresolve" },
   });
   await waitForToolRequests(sent, 1);
   await subject.handleToolError({
@@ -197,15 +202,17 @@ test("generation supersede proven not delivered releases mutation idempotency fo
     served_at_ms: Date.now(),
   });
   await first;
-  assert.equal(storage.map.has(`idem:${idempotencyKey}`), false);
+  assert.equal(storage.map.has(`idem:${scopedIdemKey}`), false);
 
   const second = subject.forwardInternal({
     kind: "request",
     requestId: "generation-new",
+    resourcePrincipalRef: principalRef,
     op: "herdr_prompt",
     args: { target: "w1:p1", text: "continue" },
     deadlineMs: Date.now() + 1_000,
     idempotencyKey,
+    replayBinding: { requestHash: "hash-generation-reresolve" },
   });
   await waitForToolRequests(sent, 2);
   assert.equal(sent.filter((frame) => frame.kind === "tool_request").length, 2);
@@ -218,7 +225,7 @@ test("generation supersede proven not delivered releases mutation idempotency fo
     served_at_ms: Date.now(),
   });
   await second;
-  assert.equal(storage.map.get(`idem:${idempotencyKey}`).requestId, "generation-new");
+  assert.equal(storage.map.get(`idem:${scopedIdemKey}`).requestId, "generation-new");
 });
 
 

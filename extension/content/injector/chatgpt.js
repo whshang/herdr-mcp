@@ -1,6 +1,5 @@
 // injector/chatgpt.js — chatgpt.com wake-up adapter
-// Selectors verified while signed in on 2026-08-20:
-//   - composer: div#prompt-textarea[contenteditable="true"] (ProseMirror, role=textbox)
+// Composer layouts: legacy #prompt-textarea and the id-less Project ProseMirror textbox.
 //   - send button: button[data-testid="send-button"]
 //   - insertion: MAIN-world execCommand insertText commits to the ProseMirror model
 const CHATGPT_ADAPTER_CAPABILITIES = Object.freeze({
@@ -8,6 +7,7 @@ const CHATGPT_ADAPTER_CAPABILITIES = Object.freeze({
   stopGeneration: true,
   sessionCreate: true,
   sessionOpen: true,
+  titleProjection: true,
   chatModeGuard: true,
 });
 const CHATGPT_ADAPTER_POLICY = Object.freeze({
@@ -59,33 +59,42 @@ class ChatGPTAdapter extends BaseAdapter {
     return { ok: false, error: "chat_mode_switch_timeout" };
   }
 
-  async getAccountNativeIdentity() {
-    try {
-      const response = await fetch("/backend-api/me", {
-        method: "GET",
-        credentials: "include",
-        cache: "no-store",
-        headers: { accept: "application/json" },
-      });
-      if (!response.ok) return null;
-      const payload = await response.json();
-      const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-      return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
-    } catch (_) {
-      return null;
+  async getAccountNativeIdentity(timeoutMs = 1500) {
+    for (const url of ["/backend-api/me", "/api/auth/session"]) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+          headers: { accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) continue;
+        const payload = await response.json();
+        const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
+        if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+      } catch (_) {
+      } finally {
+        clearTimeout(timer);
+      }
     }
+    return null;
   }
 
   getConversationKey() {
     try {
       const origin = location.origin;
       const pathname = location.pathname.replace(/\/+$/, "") || "/";
+      const provisionalChat = (segment) => /^local-chatgpt(?::|%3a)/i.test(segment);
       if (pathname === "/") return origin;
       const normal = pathname.match(/^\/c\/([^/]+)$/);
-      if (normal) return `${origin}/c/${normal[1]}`;
+      if (normal) return provisionalChat(normal[1]) ? null : `${origin}/c/${normal[1]}`;
 
       const projectConversation = pathname.match(/^\/g\/(g-p-[^/]+)\/c\/([^/]+)$/i);
       const projectHome = pathname.match(/^\/g\/(g-p-[^/]+)(?:\/project)?$/i);
+      if (projectConversation && provisionalChat(projectConversation[2])) return null;
       const projectSegment = projectConversation?.[1] || projectHome?.[1] || null;
       if (!projectSegment) return null;
       // ChatGPT may decorate a Project resource id with a human-readable slug.
@@ -100,7 +109,12 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   getInputEl() {
-    return document.querySelector('#prompt-textarea[contenteditable="true"]');
+    const legacy = document.querySelector('#prompt-textarea[contenteditable="true"]');
+    if (legacy) return legacy;
+    const candidates = document.querySelectorAll('div.ProseMirror[role="textbox"][contenteditable="true"]');
+    return candidates.length === 1 && this.elementVisible(candidates[0])
+      ? candidates[0]
+      : null;
   }
 
   getSelectedComposerApps() {
@@ -111,7 +125,27 @@ class ChatGPTAdapter extends BaseAdapter {
       const keyword = String(pill.getAttribute('data-keyword') || '').trim().toLowerCase();
       if (keyword) selected.add(keyword);
     }
+    for (const keyword of this.getInlineAppMentionKeywords(input)) selected.add(keyword);
     return [...selected];
+  }
+
+  // Current ChatGPT composer (live 0.1.172 evidence): a selected App is an
+  // inline span with data-appearance="inline-mention" carrying provider-owned
+  // app-mention-name and app-mention-path attributes. Identity is the exact
+  // app-mention-name; a path is required so plain text can never qualify.
+  getInlineAppMentionNodes(root) {
+    if (!root) return [];
+    return [...root.querySelectorAll('span[data-appearance="inline-mention"][app-mention-name][app-mention-path]')]
+      .filter((node) => String(node.getAttribute('app-mention-path') || '').trim() !== '');
+  }
+
+  getInlineAppMentionKeywords(root) {
+    const out = new Set();
+    for (const node of this.getInlineAppMentionNodes(root)) {
+      const name = String(node.getAttribute('app-mention-name') || '').trim().toLowerCase();
+      if (/^[a-z0-9_-]{1,64}$/.test(name)) out.add(name);
+    }
+    return [...out];
   }
 
   getLatestUserAppKeywords(latestUser = null) {
@@ -125,6 +159,7 @@ class ChatGPTAdapter extends BaseAdapter {
       const keyword = String(pill.getAttribute('data-keyword') || '').trim().toLowerCase();
       if (keyword) selected.add(keyword);
     }
+    for (const keyword of this.getInlineAppMentionKeywords(latest)) selected.add(keyword);
     return [...selected];
   }
 
@@ -135,6 +170,7 @@ class ChatGPTAdapter extends BaseAdapter {
     for (const node of clone.querySelectorAll('[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]')) {
       node.remove();
     }
+    for (const node of this.getInlineAppMentionNodes(clone)) node.remove();
     return String(clone.textContent || '').replace(/\uFEFF/g, '').trim();
   }
 
@@ -145,13 +181,46 @@ class ChatGPTAdapter extends BaseAdapter {
     return this.getComposerTextWithoutAppPills() === '';
   }
 
-  openComposerAppsMenu() {
+  // The composer's own native mention popup, resolved only through the
+  // provider's own association attributes (aria-controls / aria-owns). There is
+  // deliberately no document-wide fallback: when the composer does not own a
+  // visible popup, App selection fails closed instead of clicking an unrelated
+  // control that happens to share the keyword.
+  getComposerOwnedPopup(input = this.getInputEl()) {
+    if (!input) return null;
+    const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
+    for (const attribute of ['aria-controls', 'aria-owns']) {
+      const id = String(input.getAttribute(attribute) || '').trim();
+      if (!id) continue;
+      const popup = document.getElementById(id);
+      if (popup && !input.contains(popup) && visible(popup)) return popup;
+    }
+    return null;
+  }
+
+  // Live 0.1.168 evidence: after trusted `@herdr` keys ChatGPT renders the
+  // mention suggestion rows inside the composer-owned popup (no menu/listbox
+  // role). Return visible buttons in that popup whose text is exactly the
+  // keyword; callers must subtract the pre-typing baseline so only buttons
+  // that appeared because of this search are candidates. No owned popup means
+  // no candidates.
+  getComposerAppSuggestionButtons(keyword) {
+    const wanted = String(keyword || '').trim().toLowerCase();
     const input = this.getInputEl();
-    const scope = input?.closest?.('form') || document;
-    const button = scope.querySelector('#composer-plus-btn, button[data-testid="composer-plus-btn"]');
-    if (!button || button.disabled === true || button.getAttribute('aria-disabled') === 'true') return false;
-    button.click();
-    return true;
+    if (!wanted || !input) return [];
+    const popup = this.getComposerOwnedPopup(input);
+    if (!popup) return [];
+    const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
+    const out = new Set();
+    for (const button of popup.querySelectorAll('button, [role="button"]')) {
+      if (!visible(button) || input.contains(button) || button.disabled) continue;
+      const exactLabel = [button, ...button.querySelectorAll('span, div')].some((node) => (
+        String(node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase() === wanted
+      ));
+      if (!exactLabel) continue;
+      out.add(button);
+    }
+    return [...out];
   }
 
   getComposerAppCandidates(keyword) {
@@ -159,9 +228,11 @@ class ChatGPTAdapter extends BaseAdapter {
     const input = this.getInputEl();
     if (!wanted || !input) return [];
     const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
-    const menuRoots = [...document.querySelectorAll('.popover, [role="menu"], [role="listbox"]')]
-      .filter((node) => visible(node) && !input.contains(node));
-    if (!menuRoots.length) return [];
+    // Only the popup the composer itself owns is searched. A document-wide
+    // popover/menu/listbox scan can pick a sidebar or unrelated control with
+    // the same keyword, so it is never used as a fallback.
+    const popup = this.getComposerOwnedPopup(input);
+    if (!popup) return [];
     const keywordMatches = (element) => {
       const nodes = [
         element,
@@ -180,18 +251,13 @@ class ChatGPTAdapter extends BaseAdapter {
       '[data-testid*="app"]',
       '[tabindex="0"]',
     ];
-    for (const root of menuRoots) {
-      for (const node of root.querySelectorAll(selectors.join(','))) {
-        if (!visible(node) || input.contains(node) || seen.has(node)) continue;
-        const text = [
-          node.textContent,
-          node.getAttribute('aria-label'),
-          node.getAttribute('data-value'),
-        ].filter(Boolean).join(' ').trim().toLowerCase();
-        if (!keywordMatches(node) && !text.includes(wanted)) continue;
-        seen.add(node);
-        matches.push(node);
-      }
+    for (const node of popup.querySelectorAll(selectors.join(','))) {
+      if (!visible(node) || input.contains(node) || seen.has(node)) continue;
+      // Exact provider keyword identity only. A text substring match is never
+      // enough to activate an App.
+      if (!keywordMatches(node)) continue;
+      seen.add(node);
+      matches.push(node);
     }
     return matches.sort((a, b) => {
       const score = (node) => {
@@ -208,8 +274,131 @@ class ChatGPTAdapter extends BaseAdapter {
     });
   }
 
+  // App identity carried by one exact accepted provider user message. Only the
+  // provider's own inline mention nodes with a non-empty app-mention-path count:
+  // plain text (including a typed `@herdr`) never selected an App, and a
+  // composer pill that never landed in the turn is not delivery proof. Any
+  // ambiguity (zero or several carriers of the same id) fails closed.
+  getAcceptedUserAppIdentity(messageId) {
+    const id = String(messageId || '').trim();
+    if (!id) return [];
+    const carriers = [...document.querySelectorAll('[data-message-id]')]
+      .filter((node) => String(node.getAttribute('data-message-id') || '') === id);
+    if (carriers.length !== 1) return [];
+    const carrier = carriers[0];
+    const turn = (carrier.matches?.('[data-message-author-role="user"]') ? carrier : null)
+      || carrier.querySelector?.('[data-message-author-role="user"]')
+      || carrier.closest?.('[data-message-author-role="user"]')
+      || carrier;
+    const seen = new Set();
+    const out = [];
+    for (const mention of this.getInlineAppMentionNodes(turn)) {
+      const name = String(mention.getAttribute('app-mention-name') || '').trim().toLowerCase();
+      const path = String(mention.getAttribute('app-mention-path') || '').trim();
+      if (!/^[a-z0-9_-]{1,64}$/.test(name) || !path || seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name, path: path.slice(0, 240) });
+    }
+    return out;
+  }
+
+
+  // Fixed-shape, non-sensitive App search diagnostics. Returns only booleans
+  // and small counts derived from DOM structure; never page or draft text.
+  // Used to discriminate "native suggestions never opened" from "opened in a
+  // root this adapter does not scan" without loosening the identity contract.
+  describeComposerAppSearch(keyword) {
+    const wanted = String(keyword || '').trim().toLowerCase();
+    const input = this.getInputEl();
+    const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
+    const count = (selector) => [...document.querySelectorAll(selector)]
+      .filter((node) => visible(node) && !(input && input.contains(node))).length;
+    const clamp = (n) => Math.min(Number(n) || 0, 50);
+    const plain = input ? this.getComposerTextWithoutAppPills().toLowerCase() : '';
+    const controlsId = input?.getAttribute?.('aria-controls') || input?.getAttribute?.('aria-owns') || '';
+    const controlsTarget = controlsId ? document.getElementById(controlsId) : null;
+    return {
+      composer_found: Boolean(input),
+      document_has_focus: typeof document.hasFocus === 'function' ? document.hasFocus() : false,
+      document_visible: document.visibilityState === 'visible',
+      composer_focused: Boolean(input && (input === document.activeElement || input.contains(document.activeElement))),
+      composer_is_prompt_textarea: input?.id === 'prompt-textarea',
+      search_text_committed: Boolean(wanted) && plain === `@${wanted}`,
+      selected_pill_count: clamp(input ? input.querySelectorAll('[data-inline-selection-pill]').length : 0),
+      inline_mention_count: clamp(input ? this.getInlineAppMentionNodes(input).length : 0),
+      inline_mention_names: input ? this.getInlineAppMentionKeywords(input).slice(0, 5) : [],
+      inline_mention_paths: input ? this.getInlineAppMentionNodes(input).slice(0, 3).map((n) => String(n.getAttribute('app-mention-path') || '').toLowerCase().replace(/[^a-z0-9_.:\/-]/g, '').slice(0, 80)) : [],
+      composer_aria_expanded: input?.getAttribute?.('aria-expanded') === 'true',
+      composer_aria_controls_present: Boolean(controlsId),
+      composer_aria_controls_visible: visible(controlsTarget),
+      composer_owned_popup_visible: Boolean(this.getComposerOwnedPopup(input)),
+      visible_popover_roots: clamp(count('.popover')),
+      visible_menu_roots: clamp(count('[role="menu"]')),
+      visible_listbox_roots: clamp(count('[role="listbox"]')),
+      visible_dialog_roots: clamp(count('[role="dialog"]')),
+      visible_popper_wrappers: clamp(count('[data-radix-popper-content-wrapper]')),
+      visible_option_nodes: clamp(count('[role="option"]')),
+      visible_keyword_nodes: clamp([...document.querySelectorAll('[data-keyword]')]
+        .filter((node) => visible(node) && !(input && input.contains(node))
+          && String(node.getAttribute('data-keyword') || '').trim().toLowerCase() === wanted).length),
+      candidate_count: clamp(input && wanted ? this.getComposerAppCandidates(wanted).length : 0),
+      ...(() => {
+        // Structure-only search for an unroled suggestion list: count visible
+        // leaf-ish elements outside the composer whose own text is exactly the
+        // keyword, and describe the first one's ancestors by tag/role/testid.
+        if (!wanted) return {};
+        const exact = [...document.querySelectorAll('body *')].filter((node) => {
+          if (!visible(node) || (input && input.contains(node)) || node.children.length > 3) return false;
+          return String(node.textContent || '').trim().toLowerCase() === wanted;
+        });
+        const chain = [];
+        let cur = exact[0] || null;
+        for (let i = 0; cur && i < 8; i += 1, cur = cur.parentElement) {
+          const testid = String(cur.getAttribute('data-testid') || '').replace(/[^a-z0-9_-]/gi, '').slice(0, 40);
+          chain.push([cur.tagName.toLowerCase(), cur.getAttribute('role') || '', testid,
+            cur.hasAttribute('data-radix-popper-content-wrapper') ? 'popper' : '',
+            /fixed|absolute/.test(getComputedStyle(cur).position) ? getComputedStyle(cur).position : ''].join('|'));
+        }
+        // Structure of an exact-keyword node inside the composer form but
+        // outside the editor (a possible attachment chip): attribute names,
+        // up to three class tokens, and whether aria-label equals the keyword.
+        const form = input?.closest?.('form');
+        const inForm = form ? exact.find((node) => form.contains(node)) : null;
+        const formChain = [];
+        let fc = inForm || null;
+        for (let i = 0; fc && fc !== form && i < 7; i += 1, fc = fc.parentElement) {
+          const names = [...fc.attributes].map((a) => a.name).filter((n) => /^[a-z-]{1,40}$/.test(n)).slice(0, 12);
+          const classes = String(fc.getAttribute('class') || '').split(/\s+/).filter((c) => /^[A-Za-z0-9_:\[\]./%-]{1,40}$/.test(c)).slice(0, 3);
+          formChain.push(`${fc.tagName.toLowerCase()}|${names.join(',')}|${classes.join(' ')}|${String(fc.getAttribute('aria-label') || '').trim().toLowerCase() === wanted ? 'label=kw' : ''}`);
+        }
+        // Editor-internal structure: tag, attribute names, and sanitized
+        // values of identity-like data attributes only (no text content).
+        const editorNodes = input ? [...input.querySelectorAll('*')].slice(0, 16).map((node) => {
+          const names = [...node.attributes].map((a) => a.name).filter((n) => /^[a-z-]{1,40}$/.test(n)).slice(0, 10);
+          const ids = [...node.attributes]
+            .filter((a) => /^data-(keyword|symbol|type|id|mention|app|kind|node-type|entity)/.test(a.name))
+            .map((a) => `${a.name}=${String(a.value || '').toLowerCase().replace(/[^a-z0-9_.:-]/g, '').slice(0, 40)}`)
+            .slice(0, 6);
+          return `${node.tagName.toLowerCase()}|${names.join(',')}|${ids.join(';')}|${String(node.textContent || '').trim().toLowerCase() === wanted ? 'kw' : ''}`;
+        }) : [];
+        return {
+          editor_nodes: editorNodes,
+          editor_contains_exact_keyword: Boolean(input && String(input.textContent || '').replace(/\uFEFF/g, '').trim().toLowerCase() === wanted),
+          exact_keyword_form_chain: formChain,
+          visible_exact_keyword_text_nodes: clamp(exact.length),
+          exact_keyword_ancestor_chain: chain,
+          exact_keyword_in_composer_form: Boolean(exact[0] && input?.closest?.('form')?.contains(exact[0])),
+        };
+      })(),
+    };
+  }
+
   getWatchMainWorldSelector() {
-    return '#prompt-textarea[contenteditable="true"]';
+    const input = this.getInputEl();
+    if (!input) return null;
+    return input.id === 'prompt-textarea'
+      ? '#prompt-textarea[contenteditable="true"]'
+      : 'div.ProseMirror[role="textbox"][contenteditable="true"]';
   }
 
   getSendButtonCandidates() {

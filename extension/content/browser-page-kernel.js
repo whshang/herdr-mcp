@@ -41,13 +41,46 @@
     return false;
   }
 
+  // Visible-text projection for extract: never falls back to raw textContent,
+  // so hidden, aria-hidden, sensitive or form-control descendants cannot leak.
+  function collectVisibleText(root, limit) {
+    if (!root || !root.childNodes) return String(root?.innerText || "");
+    const parts = [];
+    let size = 0;
+    const walk = (node) => {
+      if (size >= limit || !node) return;
+      if (node.nodeType === 3) {
+        const t = String(node.nodeValue || "");
+        if (t) { parts.push(t); size += t.length; }
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      if (node !== root) {
+        const tag = (node.tagName || "").toLowerCase();
+        if (tag === "script" || tag === "style" || tag === "template" || tag === "noscript") return;
+        if (tag === "input" || tag === "textarea" || tag === "select" || tag === "option") return;
+        if (node.hidden === true || node.getAttribute?.("aria-hidden") === "true") return;
+        if (isSensitiveField(node) || isElementHidden(node)) return;
+        if (tag === "br" || tag === "p" || tag === "div" || tag === "li" || tag === "tr") { parts.push(" "); }
+      }
+      for (const child of Array.from(node.childNodes || [])) walk(child);
+    };
+    walk(root);
+    return parts.join("").replace(/\s+/g, " ");
+  }
+
   let generationSeq = 0;
   let currentGenerationToken = "";
   const elementMap = new Map();
+  const selectOptionMap = new Map();
+  // Refs whose observed option list was a truncated prefix of the live list.
+  const selectOptionTruncatedRefs = new Set();
 
   function invalidateGeneration() {
     currentGenerationToken = "";
     elementMap.clear();
+    selectOptionMap.clear();
+    selectOptionTruncatedRefs.clear();
   }
 
   function isCrossOriginFrame() {
@@ -93,6 +126,13 @@
     const text = String(raw || "").replace(/\r\n?/g, "\n").trim();
     const limit = Math.max(1, Math.min(Number(maxChars) || DEFAULT_MAX_CHARS, MAX_CHARS_CEILING));
     return text.slice(0, limit);
+  }
+
+  function structuralToken(value, maxLength = 80) {
+    const token = String(value || "").trim();
+    return token.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(token)
+      ? token
+      : undefined;
   }
 
   function fastPathActionClass(el, tag) {
@@ -153,6 +193,8 @@
     generationSeq += 1;
     currentGenerationToken = `pa_gen_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
+    selectOptionMap.clear();
+    selectOptionTruncatedRefs.clear();
 
     const doc = global.document;
     if (!doc) return { ok: false, error: "document_unavailable" };
@@ -188,14 +230,51 @@
         el.value ||
         ""
       ).trim().slice(0, 120);
+      const classes = String(el.getAttribute("class") || "")
+        .split(/\s+/)
+        .map((value) => structuralToken(value, 48))
+        .filter(Boolean)
+        .slice(0, 4);
+      // Expose bounded visible labels only; never an option's raw value.
+      const selectOptions = tag === "select"
+        ? [...(el.options || [])].filter((option) => (
+          !option.hidden && !option.disabled && !option.parentElement?.disabled
+        ))
+        : null;
+      if (selectOptions) {
+        selectOptionMap.set(ref, selectOptions.slice(0, 24).map((option) => ({
+          node: option,
+          value: String(option.value),
+          label: String(option.label || option.textContent || "").trim(),
+        })));
+        // Record a truncated observation window: absence from it is then not
+        // evidence that a requested option does not exist.
+        if (selectOptions.length > 24) selectOptionTruncatedRefs.add(ref);
+      }
 
       elements.push({
         ref: ref.slice(0, 256),
+        tag,
         role: String(role || "").slice(0, 64),
+        id: structuralToken(el.getAttribute("id")),
+        data_testid: structuralToken(el.getAttribute("data-testid")),
+        classes: classes.length ? classes : undefined,
+        contenteditable: el.getAttribute("contenteditable") === "true" || undefined,
         type: (tag === "input" || tag === "button")
           ? String(el.type || (tag === "input" ? "text" : "")).slice(0, 64)
           : undefined,
+        checked: tag === "input" && ["checkbox", "radio"].includes(String(el.type || "").toLowerCase())
+          ? el.checked === true
+          : undefined,
         text: label,
+        options: selectOptions ? selectOptions.slice(0, 24).map((option) => (
+          cleanText(option.label || option.textContent, 80)
+        )) : undefined,
+        options_truncated: selectOptions && selectOptions.length > 24 ? true : undefined,
+        selected_option: tag === "select" && !el.multiple
+          ? cleanText((selectOptions || []).find((option) => option.value === el.value)?.label
+            || (selectOptions || []).find((option) => option.value === el.value)?.textContent, 80) || undefined
+          : undefined,
         fast_path: fastPathActionClass(el, tag),
       });
     }
@@ -209,8 +288,202 @@
       origin: String(global.location ? global.location.origin : "").slice(0, 512),
       title: String(doc.title || "").slice(0, 512),
       generation: currentGenerationToken,
+      scroll: {
+        y: Math.max(0, Math.round(Number(global.scrollY) || 0)),
+        max_y: Math.max(0, Math.round((Number(doc.documentElement?.scrollHeight) || 0) - (Number(global.innerHeight) || 0))),
+      },
       text,
       elements,
+    };
+  }
+
+  function executeExtract(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const generation = String(params.generation || "").trim();
+    if (!generation || generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    const ref = String(params.ref || "");
+    if (!ref.startsWith(`ref_${generation}_`)) return { ok: false, error: "invalid_ref" };
+    const maxChars = params.maxChars === undefined ? 4000 : params.maxChars;
+    if (!Number.isInteger(maxChars) || maxChars < 1 || maxChars > 8192) {
+      return { ok: false, error: "extract_params_invalid" };
+    }
+    const el = elementMap.get(ref);
+    if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+    if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
+      return { ok: false, error: "unsupported_element" };
+    }
+    const raw = collectVisibleText(el, maxChars + 1).trim();
+    return {
+      ok: true, ref, generation,
+      text: cleanText(raw, maxChars),
+      truncated: raw.length > maxChars,
+    };
+  }
+
+  const SCROLL_ANCESTOR_DEPTH = 10;
+  const SCROLL_OBSERVED_LIMIT = 32;
+  const SCROLL_CONTAINER_LIMIT = 3;
+
+  function computedStyleOf(el) {
+    try {
+      return global.getComputedStyle ? global.getComputedStyle(el) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function isScrollableOverflow(el) {
+    const overflowY = String(computedStyleOf(el)?.overflowY || "").toLowerCase();
+    return overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+  }
+
+  // Movement is decided on the raw finite position. Reported values are rounded
+  // separately, so a subpixel move is never mistaken for a boundary.
+  function viewportScrollPosition() {
+    const value = Number(global.scrollY);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  // A container only qualifies when it currently has scrollable overflow; the
+  // caller still measures the resulting position, so a wrong guess can never be
+  // reported as movement.
+  function scrollContainerState(el) {
+    if (!el) return null;
+    const style = computedStyleOf(el);
+    if (style && style.display === "none") return null;
+    const top = Number(el.scrollTop);
+    const scrollHeight = Number(el.scrollHeight);
+    const clientHeight = Number(el.clientHeight);
+    if (![top, scrollHeight, clientHeight].every(Number.isFinite)) return null;
+    if (scrollHeight <= clientHeight) return null;
+    return { top: Math.max(0, top) };
+  }
+
+  function nearestObservedScrollContainer(el) {
+    let node = el?.parentElement || null;
+    for (let depth = 0; node && depth < SCROLL_ANCESTOR_DEPTH; depth += 1) {
+      if (isScrollableOverflow(node) && scrollContainerState(node)) return node;
+      node = node.parentElement || null;
+    }
+    return null;
+  }
+
+  // Production scroll carries no element ref, so the inner container is derived
+  // from the current generation's observed elements: the scrollable ancestor
+  // shared by the most of them wins, then the scrolling element, then the body.
+  function observedScrollCandidates() {
+    const counts = new Map();
+    let inspected = 0;
+    for (const el of elementMap.values()) {
+      if (inspected++ >= SCROLL_OBSERVED_LIMIT) break;
+      if (!el || el.isConnected === false) continue;
+      const node = nearestObservedScrollContainer(el);
+      if (node) counts.set(node, (counts.get(node) || 0) + 1);
+    }
+    const candidates = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, SCROLL_CONTAINER_LIMIT)
+      .map(([node]) => node);
+    for (const node of [global.document?.scrollingElement, global.document?.body]) {
+      if (node && !candidates.includes(node)) candidates.push(node);
+    }
+    return candidates;
+  }
+
+  function attemptContainerScroll(container, delta) {
+    const before = scrollContainerState(container);
+    if (!before) return null;
+    if (typeof container.scrollBy === "function") {
+      container.scrollBy({ top: delta, behavior: "instant" });
+    } else {
+      container.scrollTop = before.top + delta;
+    }
+    const after = scrollContainerState(container);
+    if (!after || after.top === before.top) return null;
+    return { before: before.top, after: after.top };
+  }
+
+  function executeScroll(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const generation = String(params.generation || "").trim();
+    if (!generation || generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    const direction = params.direction;
+    const amount = params.amount === undefined ? 500 : params.amount;
+    if ((direction !== "up" && direction !== "down")
+        || !Number.isInteger(amount) || amount < 1 || amount > 1500) {
+      return { ok: false, error: "scroll_params_invalid" };
+    }
+    if (typeof global.scrollBy !== "function") return { ok: false, error: "scroll_unavailable" };
+    const beforeRaw = viewportScrollPosition();
+    const delta = direction === "down" ? amount : -amount;
+    try {
+      global.scrollBy({ top: delta, behavior: "instant" });
+    } catch (_) {
+      return { ok: false, error: "scroll_delivery_unknown" };
+    }
+    const afterRaw = viewportScrollPosition();
+    const beforeY = Math.max(0, Math.round(beforeRaw));
+    const afterY = Math.max(0, Math.round(afterRaw));
+
+    // The document viewport keeps its exact original semantics when it moves.
+    let movedContainer = afterRaw !== beforeRaw
+      ? { name: "viewport", before: Math.max(0, beforeRaw), after: Math.max(0, afterRaw) }
+      : null;
+
+    if (!movedContainer) {
+      // Applications that disable document scrolling move an inner container
+      // instead. Only containers that hold observed content are considered and
+      // every attempt is measured; nothing is reported without real movement.
+      let candidates = [];
+      try {
+        candidates = observedScrollCandidates();
+      } catch (_) {
+        candidates = [];
+      }
+      for (const candidate of candidates) {
+        let attempt = null;
+        try {
+          attempt = attemptContainerScroll(candidate, delta);
+        } catch (_) {
+          return { ok: false, error: "scroll_delivery_unknown" };
+        }
+        if (attempt) {
+          const isViewportOwner = candidate === global.document?.scrollingElement
+            || candidate === global.document?.body;
+          movedContainer = {
+            name: isViewportOwner ? "document_scrolling_element" : "observed_ancestor",
+            tag: String(candidate.tagName || "").toLowerCase().slice(0, 32),
+            before: attempt.before,
+            after: attempt.after,
+          };
+          break;
+        }
+      }
+    }
+
+    invalidateGeneration();
+    return {
+      ok: true, direction, amount,
+      before_y: beforeY, after_y: afterY,
+      moved: movedContainer !== null,
+      at_boundary: movedContainer === null,
+      ...(movedContainer ? {
+        scroll_container: movedContainer.name,
+        ...(movedContainer.tag ? { scroll_container_tag: movedContainer.tag } : {}),
+        scroll_container_before: movedContainer.before,
+        scroll_container_after: movedContainer.after,
+      } : {}),
+      requires_verification: true,
     };
   }
 
@@ -316,7 +589,7 @@
 
     const tag = (el.tagName || "").toLowerCase();
     const isContentEditable = el.isContentEditable === true || el.getAttribute("contenteditable") === "true";
-    if (tag !== "input" && tag !== "textarea" && !isContentEditable) {
+    if (tag !== "input" && tag !== "textarea" && tag !== "select" && !isContentEditable) {
       return { ok: false, error: "element_not_fillable" };
     }
 
@@ -325,10 +598,95 @@
     }
 
     const fillValue = params.value.slice(0, MAX_FILL_CHARS);
+    const controlType = tag === "input" ? String(el.type || "").toLowerCase() : "";
+    const isCheckable = controlType === "checkbox" || controlType === "radio";
+    let targetChecked = null;
+    if (isCheckable) {
+      if (fillValue !== "true" && fillValue !== "false") {
+        return { ok: false, error: "checkable_state_required" };
+      }
+      targetChecked = fillValue === "true";
+      if (controlType === "radio" && !targetChecked) {
+        return { ok: false, error: "radio_uncheck_unsupported" };
+      }
+      if ((el.checked === true) === targetChecked) {
+        return { ok: false, error: "control_already_in_state" };
+      }
+    }
+
+    let selectedOption = null;
+    if (tag === "select") {
+      if (el.multiple === true) return { ok: false, error: "multiple_select_unsupported" };
+      // Match only options offered in the latest observation. A page must not
+      // introduce a new option after inspect and have it selected by old refs.
+      const observedOptions = selectOptionMap.get(ref) || [];
+      const matches = observedOptions.filter((option) => (
+        option.value === fillValue || option.label === fillValue
+      ));
+      if (matches.length !== 1) {
+        if (matches.length === 0 && selectOptionTruncatedRefs.has(ref)) {
+          // The observation held only a truncated prefix of the options, so the
+          // request cannot be proven absent. Never select an unobserved option;
+          // the caller must re-observe to widen the window.
+          return {
+            ok: false,
+            error: "select_option_not_observed",
+            options_observed: observedOptions.length,
+          };
+        }
+        return { ok: false, error: matches.length ? "select_option_ambiguous" : "select_option_unavailable" };
+      }
+      const snapshot = matches[0];
+      selectedOption = snapshot.node;
+      const liveMatches = [...(el.options || [])].filter((option) => (
+        !option.hidden && !option.disabled && !option.parentElement?.disabled
+        && (String(option.value) === fillValue
+          || String(option.label || option.textContent || "").trim() === fillValue)
+      ));
+      if (liveMatches.length > 1) return { ok: false, error: "select_option_ambiguous" };
+      if (
+        selectedOption.isConnected === false
+        || ![...(el.options || [])].includes(selectedOption)
+        || liveMatches.length !== 1 || liveMatches[0] !== selectedOption
+        || selectedOption.hidden || selectedOption.disabled || selectedOption.parentElement?.disabled
+        || String(selectedOption.value) !== snapshot.value
+        || String(selectedOption.label || selectedOption.textContent || "").trim() !== snapshot.label
+      ) {
+        return { ok: false, error: "select_option_stale" };
+      }
+    }
 
     try {
       el.focus?.();
-      if (tag === "input" || tag === "textarea") {
+      if (isCheckable) {
+        const descriptor = global.HTMLInputElement?.prototype
+          ? Object.getOwnPropertyDescriptor(global.HTMLInputElement.prototype, "checked")
+          : null;
+        // Prefer the native activation path so framework click/change handlers
+        // (React, Vue) observe a real toggle; fall back to the native setter plus
+        // events only when the click did not land, then require the final state.
+        if ((el.checked === true) !== targetChecked && typeof el.click === "function") {
+          el.click();
+        }
+        if ((el.checked === true) !== targetChecked) {
+          if (descriptor?.set) descriptor.set.call(el, targetChecked);
+          else el.checked = targetChecked;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        if ((el.checked === true) !== targetChecked) {
+          return { ok: false, error: "control_state_not_applied", checked: el.checked === true };
+        }
+      } else if (tag === "select") {
+        const descriptor = global.HTMLSelectElement?.prototype
+          ? Object.getOwnPropertyDescriptor(global.HTMLSelectElement.prototype, "value")
+          : null;
+        if (descriptor?.set) descriptor.set.call(el, selectedOption.value);
+        else el.value = selectedOption.value;
+        if (el.value !== selectedOption.value) return { ok: false, error: "select_not_applied" };
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if (tag === "input" || tag === "textarea") {
         const proto = tag === "input" ? global.HTMLInputElement?.prototype : global.HTMLTextAreaElement?.prototype;
         const descriptor = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
         if (descriptor?.set) {
@@ -339,8 +697,40 @@
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
       } else if (isContentEditable) {
-        el.innerText = fillValue;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
+        // Rich editors (ProseMirror/Lexical: Claude, ChatGPT, Grok) ignore a
+        // raw innerText write and re-render their own model, so a blind write
+        // reads as success while nothing lands. Use native editing
+        // (select-all + insertText, as h2w_insert_main does) and verify.
+        if (params.mainWorldFill === true) {
+          // The extension commits rich editors from the MAIN world (same path
+          // as WebChat composer insertion) and verifies the readback there.
+          const token = `f${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+          el.setAttribute("data-h2w-fill-token", token);
+          return { ok: true, ref, generation: gen, main_world_fill_token: token, value: fillValue };
+        }
+        const norm = (value) => String(value || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim();
+        let inserted = false;
+        try {
+          el.focus?.();
+          const doc = el.ownerDocument || global.document;
+          const sel = doc?.getSelection?.();
+          if (sel && doc?.createRange) {
+            const range = doc.createRange();
+            range.selectNodeContents(el);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          }
+          inserted = doc?.execCommand?.("insertText", false, fillValue) === true;
+        } catch (_) {
+          inserted = false;
+        }
+        if (!inserted) {
+          el.innerText = fillValue;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        if (norm(el.innerText ?? el.textContent) !== norm(fillValue)) {
+          return { ok: false, error: "fill_not_applied", applied: false, method: inserted ? "insert_text" : "inner_text" };
+        }
       }
       invalidateGeneration();
       return { ok: true, ref, generation: gen };
@@ -366,7 +756,7 @@
 
     const condition = String(params.condition || "").toLowerCase();
     const value = typeof params.value === "string" ? params.value : "";
-    if (!["document_ready", "url_equals", "text_present", "text_absent"].includes(condition)) {
+    if (!["document_ready", "url_equals", "text_present", "text_absent", "element_present", "element_absent"].includes(condition)) {
       return { ok: false, error: "unsupported_expect_condition" };
     }
     if (condition === "document_ready") {
@@ -381,6 +771,37 @@
         condition,
         value,
       };
+    }
+    if (condition === "element_present" || condition === "element_absent") {
+      // No caller-controlled selector languages or scripts. Compare an exact
+      // label on the same fixed, non-sensitive, visible control vocabulary.
+      if (value.length > 256 || value !== value.trim()) {
+        return { ok: false, error: "expect_value_invalid", condition };
+      }
+      const controls = global.document?.querySelectorAll?.(
+        'button, a[href], input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
+      ) || [];
+      const truncated = controls.length > MAX_ELEMENTS;
+      let found = false;
+      let inspected = 0;
+      for (const el of controls) {
+        if (++inspected > MAX_ELEMENTS) break;
+        if (!el.isConnected || isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) continue;
+        const exactLabels = [
+          el.getAttribute?.("aria-label"),
+          el.getAttribute?.("placeholder"),
+          el.innerText,
+          el.textContent,
+        ];
+        if (exactLabels.some((label) => String(label || "").trim() === value)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found && truncated) {
+        return { ok: false, error: "element_scan_truncated", condition };
+      }
+      return { ok: condition === "element_present" ? found : !found, condition };
     }
     const text = pageText();
     const present = text.includes(value);
@@ -420,6 +841,8 @@
     if (action === "inspect" || action === "observe") return scanDocument(msg);
     if (action === "click") return executeClick(msg);
     if (action === "fill") return executeFill(msg);
+    if (action === "extract") return executeExtract(msg);
+    if (action === "scroll") return executeScroll(msg);
     if (action === "expect") return executeExpect(msg);
     return { ok: false, error: "unsupported_action" };
   }

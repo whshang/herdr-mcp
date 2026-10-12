@@ -11,6 +11,18 @@ const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "b
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
+test("user scrolls a browser page | Given a typed Rust actuation payload | When the extension bridge forwards it | Then direction and amount reach the normal Page Assist action path", () => {
+  const start = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
+  const end = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', start);
+  assert.ok(start > 0 && end > start);
+  const bridge = backgroundSource.slice(start, end);
+  assert.match(bridge, /pageRef:\s*params\.page_ref/);
+  assert.match(bridge, /action:\s*params\.action/);
+  assert.match(bridge, /generation:\s*params\.generation/);
+  assert.match(bridge, /direction:\s*params\.direction/);
+  assert.match(bridge, /amount:\s*params\.amount/);
+});
+
 const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
 const browserPageLifecycleEnd = backgroundSource.indexOf("\nasync function performPageAssistRequest", browserPageLifecycleStart);
 assert.ok(browserPageLifecycleStart >= 0 && browserPageLifecycleEnd > browserPageLifecycleStart,
@@ -273,6 +285,106 @@ test("user finalizes one owned generic page | Given open is retried across a ser
   assert.equal(capacityTabs.size, 128);
   assert.equal(capacityStorage.herdrBrowserPagesV1.length, 128);
   assert.ok(capacityStorage.herdrBrowserPagesV1.every((record) => record.ownership === "owned"));
+});
+
+test("user finalizes an owned page whose tab is already gone | Given another tab still shows the same URL | When finalize runs | Then cleanup is not reported verified and the remaining tab is counted", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const harness = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const opened = await harness.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-owned-dup",
+  });
+  assert.equal(opened.ok, true);
+  const [ownedId] = [...tabs.keys()];
+  tabs.delete(ownedId);
+  tabs.set(900, { id: 900, url: "https://example.com/app", status: "complete", windowId: 1, active: false });
+  const finalized = await harness.performBrowserPageLifecycleRequest({
+    action: "finalize",
+    pageRef: opened.page_ref,
+    idempotencyKey: "finalize-owned-dup",
+  });
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.already_closed, true);
+  assert.equal(finalized.tab_cleanup_verified, false);
+  assert.equal(finalized.same_url_tabs_open, 1);
+  assert.equal(tabs.has(900), true);
+});
+
+test("user can clean up an owned search page | Given a form navigates to a new URL | When the old ref becomes stale | Then mutations remain fenced and finalize closes exactly that task-owned tab", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/search",
+    idempotencyKey: "form-search-owned-1",
+  });
+  assert.equal(opened.ok, true);
+  const tab = [...tabs.values()][0];
+  tab.url = "https://example.com/results?q=sample";
+
+  const stale = await h.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.error, "browser_page_stale");
+  assert.equal(sessionStorage.herdrBrowserPagesV1[0]?.stale, true);
+  assert.equal(sessionStorage.herdrBrowserPagesV1[0]?.ownership, "owned");
+
+  tab.url = "https://example.com/search";
+  const restarted = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const revived = await restarted.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(revived.error, "browser_page_stale");
+  const replayed = await restarted.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/search",
+    idempotencyKey: "form-search-owned-1",
+  });
+  assert.equal(replayed.error, "browser_page_operation_stale");
+  assert.equal(tabs.size, 1);
+
+  tab.url = "https://example.com/results?q=sample";
+  const resultsPage = await restarted.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/results?q=sample",
+    idempotencyKey: "form-search-results-claim-1",
+  });
+  assert.equal(resultsPage.ok, true);
+  assert.equal(resultsPage.ownership, "claimed");
+  assert.notEqual(resultsPage.page_ref, opened.page_ref);
+  const releasedResults = await restarted.performBrowserPageLifecycleRequest({
+    action: "release",
+    pageRef: resultsPage.page_ref,
+  });
+  assert.equal(releasedResults.ok, true);
+  assert.equal(releasedResults.tab_closed, false);
+  assert.equal(tabs.size, 1);
+
+  tab.url = "https://other.example/redirect";
+  const outsideOrigin = await restarted.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(outsideOrigin.error, "browser_page_origin_mismatch");
+  const finalized = await restarted.performBrowserPageLifecycleRequest({
+    action: "finalize",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(finalized.ok, true);
+  assert.equal(finalized.tab_cleanup_verified, true);
+  assert.equal(finalized.tab_closed, true);
+  assert.equal(tabs.size, 0);
+  assert.deepEqual(sessionStorage.herdrBrowserPagesV1, []);
 });
 
 test("user releases a claimed generic page | Given one exact user tab and another unrelated tab | When claim and release run | Then the user tab survives and ambiguous duplicate claims fail closed", async () => {
@@ -645,6 +757,106 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(uncertain.delivery_state, "delivery_unknown");
   assert.equal(uncertain.retry_safe, false);
   assert.equal(uncertain.mutation_submitted, true);
+});
+
+test("user rejects invalid native form states | Given unavailable dropdown or unsupported checkable state | When fill checks the observed control | Then delivery is not_applied and retry-safe", async () => {
+  const tabs = new Map([[71, { id: 71, url: "https://example.com/form", active: true }]]);
+  let rejection = "select_option_unavailable";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action !== "fill") throw new Error("unexpected test action");
+      return { ok: false, error: rejection };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/form",
+    idempotencyKey: "claim-native-select-reject-1",
+  });
+  assert.equal(page.ok, true);
+
+  for (const error of [
+    "select_option_unavailable",
+    "select_option_not_observed",
+    "select_option_ambiguous",
+    "select_option_stale",
+    "multiple_select_unsupported",
+    "checkable_state_required",
+    "radio_uncheck_unsupported",
+    "control_already_in_state",
+  ]) {
+    rejection = error;
+    const result = await h.performBrowserPageActionRequest({
+      action: "fill",
+      pageRef: page.page_ref,
+      generation: "pa_gen_select_test",
+      ref: "ref_pa_gen_select_test_0",
+      value: "Disabled or changed option",
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, error);
+    assert.equal(result.delivery_state, "not_applied");
+    assert.equal(result.retry_safe, true);
+    assert.equal(result.mutation_submitted, false);
+  }
+  rejection = "select_not_applied";
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "fill",
+    pageRef: page.page_ref,
+    generation: "pa_gen_select_test",
+    ref: "ref_pa_gen_select_test_0",
+    value: "Unknown setter outcome",
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  rejection = "control_state_not_applied";
+  const controlOutcome = await h.performBrowserPageActionRequest({
+    action: "fill",
+    pageRef: page.page_ref,
+    generation: "pa_gen_select_test",
+    ref: "ref_pa_gen_select_test_0",
+    value: "true",
+  });
+  assert.equal(controlOutcome.delivery_state, "delivery_unknown");
+  assert.equal(controlOutcome.retry_safe, false);
+});
+
+test("user receives safe scroll mutation errors | Given an owned page and invalid scroll inputs | When the content kernel rejects before scrolling | Then delivery stays not_applied", async () => {
+  const tabs = new Map([[72, { id: 72, url: "https://example.com/list", active: true }]]);
+  let rejection = "scroll_params_invalid";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      assert.equal(payload.action, "scroll");
+      assert.equal(payload.direction, "down");
+      assert.equal(payload.amount, 500);
+      return { ok: false, error: rejection };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/list",
+    idempotencyKey: "claim-scroll-reject",
+  });
+  assert.equal(page.ok, true);
+  for (const error of ["scroll_params_invalid", "scroll_unavailable"]) {
+    rejection = error;
+    const result = await h.performBrowserPageActionRequest({
+      action: "scroll", pageRef: page.page_ref, generation: "pa_scroll_1", direction: "down", amount: 500,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, error);
+    assert.equal(result.delivery_state, "not_applied");
+    assert.equal(result.retry_safe, true);
+    assert.equal(result.mutation_submitted, false);
+  }
+  rejection = "scroll_delivery_unknown";
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "scroll", pageRef: page.page_ref, generation: "pa_scroll_1", direction: "down", amount: 500,
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
 });
 
 test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {
@@ -1787,7 +1999,11 @@ test("user keeps the ordinary ChatGPT submit path bounded | Given a ready compos
   const ackSegment = wakeSource.slice(ackStart, ackEnd);
   assert.match(ackSegment, /ADAPTER\.name !== "chatgpt"\) return !ADAPTER\.inputHasContent\(\)/);
   assert.doesNotMatch(ackSegment, /if \(!ADAPTER\.inputHasContent\(\)\) return true/);
-  assert.match(ackSegment, /location\.href !== baseline\.href/);
+  // A URL change is no longer acceptance on its own, and the 120-character
+  // prefix overlap is gone: only exact canonical text equality counts.
+  assert.doesNotMatch(ackSegment, /location\.href !== baseline\.href/);
+  assert.match(ackSegment, /providerUserTextMatchesSubmitted\(latestText, baseline\)/);
+  assert.doesNotMatch(ackSegment, /slice\(0, 120\)/);
   assert.doesNotMatch(ackSegment, /baseline\?\.generating|isComposerGenerating\(\)/);
   assert.doesNotMatch(ackSegment, /sendButton\.isConnected|isSendButton\(baseline\.sendButton\)/);
 });
@@ -1884,6 +2100,8 @@ test("ChatGPT session.open is the only supported existing-view open", () => {
   assert.match(backgroundSource, /provider_message_chars:\s*\{\s*status:\s*"unknown"/);
   assert.match(backgroundSource, /provider_model_reasoning_combinations:\s*\{\s*status:\s*"unknown"/);
   assert.match(backgroundSource, /"session\.open"/);
+  assert.match(backgroundSource, /"session\.title_projection"/);
+  assert.match(chatGptAdapterSource, /titleProjection:\s*true/);
   assert.match(wakeSource, /herdr_mcp\.browser_session\.open/);
 });
 
@@ -2052,7 +2270,7 @@ test("user can stop a live answer | Given an explicit visible stop control while
 });
 
 test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then one Enter submit is attempted and uncertain delivery never falls through to another submit", async () => {
-  const start = wakeSource.indexOf("  async function submitBrowserActuationOnce()");
+  const start = wakeSource.indexOf("  async function submitBrowserActuationOnce(");
   const end = wakeSource.indexOf("  // ---- Submission ----", start);
   assert.ok(start >= 0 && end > start, "bounded Browser Actuation submit helper must remain extractable");
   const helperSource = wakeSource.slice(start, end);
@@ -2647,10 +2865,21 @@ function selfArchiveHarness(overrides = {}) {
   const end = wakeSource.indexOf("async function performBrowserActuationCommand", start);
   assert.ok(start >= 0 && end > start, "deferred self-archive helper must remain extractable");
   const segment = wakeSource.slice(start, end);
+  // The acceptance trim/canonical helpers live earlier in the file than the
+  // deferred-self-archive block, so inject the real ones for the late readback.
+  const acceptanceStart = wakeSource.indexOf("  // The exact Unicode White_Space set Rust");
+  const acceptanceEnd = wakeSource.indexOf("\n  // Exact submit acceptance.", acceptanceStart);
+  assert.ok(acceptanceStart >= 0 && acceptanceEnd > acceptanceStart,
+    "acceptance canonicalization helpers must remain extractable");
+  const acceptanceSource = wakeSource.slice(acceptanceStart, acceptanceEnd);
   const api = new Function("ctx", "sessionStorage", "setTimeout", "Date", `
-    const ADAPTER = { name: "chatgpt" };
+    const ADAPTER = { name: "chatgpt", ...(ctx.adapter || {}) };
     const chatGptConversationId = () => ctx.conversationId;
     const isTurnInProgress = () => ctx.turnInProgress;
+    const fetch = ctx.fetch || (() => { throw new Error("unexpected fetch"); });
+    // The archive API fallback is opt-in: existing fixtures keep the historical
+    // "no provider token" behaviour unless a test supplies one.
+    const readChatGptAccessToken = async () => (ctx.accessToken === undefined ? null : ctx.accessToken);
     const openChatGptArchiveMenu = async () => {
       if (ctx.menuGate) await ctx.menuGate;
       return ctx.archiveAvailable
@@ -2664,10 +2893,14 @@ function selfArchiveHarness(overrides = {}) {
     };
     const fetchChatGptConversation = async () => {
       if (ctx.verifyGate && ctx.clicks.length > 0) await ctx.verifyGate;
+      if (ctx.readbackStatus) {
+        return { ok: false, status: ctx.readbackStatus, error: "conversation-http", reason: "http-" + ctx.readbackStatus };
+      }
       return ctx.archiveVerifies
         ? { ok: true, body: { is_archived: ctx.providerArchived === true } }
         : { ok: false };
     };
+    const fetchChatGptConversationDetail = async () => ctx.detail || { ok: false };
     const fetchChatGptArchivedConversationList = async () => ({
       ok: true,
       items: ctx.archiveListContains
@@ -2682,6 +2915,7 @@ function selfArchiveHarness(overrides = {}) {
     });
     let registeredBrowserSessionRef = ctx.sessionRef;
     let registeredBrowserGeneration = ctx.generation;
+    ${acceptanceSource}
     ${segment}
     return {
       performChatGptSessionArchive,
@@ -3235,6 +3469,9 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   );
   assert.match(createSegment, /registerCurrentConversation\("browser-session-create"\)/);
   assert.match(createSegment, /registeredBrowserSessionRef/);
+  assert.match(createSegment, /adapterSupports\("titleProjection"\)/);
+  assert.match(createSegment, /projectChatGptConversationTitle\(params\.display_label\)/);
+  assert.match(createSegment, /title_projection:\s*titleProjection/);
   const createRegistration = createSegment.indexOf("registerCurrentConversation(\"browser-session-create\")");
   const createSettlementAssignment = createSegment.indexOf("acceptedDispatchAssignments.set(registeredBrowserSessionRef");
   assert.ok(
@@ -3243,7 +3480,11 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   );
   assert.doesNotMatch(createSegment, /reasoning != null \|\| requiredApps\.length > 0/);
   assert.match(createSegment, /ensureRequiredComposerApps\(requiredApps\)/);
-  assert.match(createSegment, /evidence\.required_apps_readback = appSelection\.apps/);
+  // The runtime-visible App readback must come from the accepted provider
+  // message, never from the pre-submit composer selection.
+  assert.match(createSegment, /evidence\.required_apps_readback = acceptedApps\.map\(\(app\) => app\.name\)/);
+  assert.match(createSegment, /getAcceptedUserAppIdentity\(acceptedUserMessageRef\)/);
+  assert.doesNotMatch(createSegment, /evidence\.required_apps_readback = appSelection\.apps/);
   assert.match(createSegment, /requiredApps,/);
 
   const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
@@ -3257,6 +3498,139 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   const refreshClearStart = wakeSource.indexOf("function clearBrowserPendingDispatchRefresh");
   const refreshClearSegment = wakeSource.slice(refreshClearStart, refreshClearStart + 500);
   assert.match(refreshClearSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
+});
+
+function chatGptTitleProjectionHarness({
+  initialTitle = "Provider title",
+  readbackTitles = [],
+  patchOk = true,
+} = {}) {
+  const start = wakeSource.indexOf("  async function projectChatGptConversationTitle(");
+  const end = wakeSource.indexOf("\n  async function fetchChatGptArchivedConversationList", start);
+  assert.ok(start >= 0 && end > start, "ChatGPT title projection helper must remain extractable");
+  const helperSource = wakeSource.slice(start, end);
+  const ctx = {
+    now: 0,
+    reads: [initialTitle, ...readbackTitles],
+    lastRead: initialTitle,
+    patchCalls: [],
+    patchOk,
+  };
+  const project = new Function("ctx", `
+    const ADAPTER = { name: "chatgpt", capabilities: { titleProjection: true } };
+    const adapterSupports = (capability) => ADAPTER.capabilities?.[capability] === true;
+    const normText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const chatGptConversationId = () => "conv-123";
+    const fetchChatGptConversation = async () => {
+      const title = ctx.reads.length ? ctx.reads.shift() : ctx.lastRead;
+      ctx.lastRead = title;
+      ctx.now += 100;
+      return { ok: true, body: { title } };
+    };
+    const readChatGptAccessToken = async () => {
+      ctx.now += 100;
+      return "short-lived-test-token";
+    };
+    const fetch = async (url, init) => {
+      ctx.patchCalls.push({ url, init });
+      ctx.now += 100;
+      return { ok: ctx.patchOk };
+    };
+    class AbortController {
+      constructor() { this.signal = {}; }
+      abort() {}
+    }
+    const setTimeout = () => 1;
+    const clearTimeout = () => {};
+    const wait = async (ms) => { ctx.now += ms; };
+    const Date = { now: () => ctx.now };
+    ${helperSource}
+    return projectChatGptConversationTitle;
+  `)(ctx);
+  return { ctx, project };
+}
+
+test("user sees the requested ChatGPT worker title | Given a new conversation has a different provider title | When session.create projects its display label | Then one provider PATCH is accepted only after exact title readback", async () => {
+  const { ctx, project } = chatGptTitleProjectionHarness({
+    initialTitle: "Provider title",
+    readbackTitles: ["Worker A"],
+  });
+  const result = await project("  Worker   A  ");
+
+  assert.deepEqual(result, {
+    status: "verified",
+    changed: true,
+    provider: "chatgpt",
+    readback_verified: true,
+    reason: null,
+  });
+  assert.equal(ctx.patchCalls.length, 1);
+  assert.equal(ctx.patchCalls[0].url, "/backend-api/conversation/conv-123");
+  assert.equal(ctx.patchCalls[0].init.method, "PATCH");
+  assert.equal(ctx.patchCalls[0].init.credentials, "include");
+  assert.equal(ctx.patchCalls[0].init.redirect, "error");
+  assert.equal(ctx.patchCalls[0].init.headers["content-type"], "application/json");
+  assert.equal(ctx.patchCalls[0].init.headers.authorization, "Bearer short-lived-test-token");
+  assert.deepEqual(JSON.parse(ctx.patchCalls[0].init.body), { title: "Worker A" });
+  assert.equal(JSON.stringify(result).includes("short-lived-test-token"), false);
+});
+
+test("user keeps a successful create when title projection cannot be verified | Given the provider keeps returning another title | When session.create attempts projection | Then the projection fails after one PATCH without claiming readback success", async () => {
+  const { ctx, project } = chatGptTitleProjectionHarness({
+    initialTitle: "Provider title",
+    readbackTitles: ["Still provider title"],
+  });
+  const projection = await project("Worker B");
+
+  assert.equal(projection.status, "failed");
+  assert.equal(projection.changed, null);
+  assert.equal(projection.provider, "chatgpt");
+  assert.equal(projection.readback_verified, false);
+  assert.equal(projection.reason, "title_projection_readback_unverified");
+  assert.equal(ctx.patchCalls.length, 1);
+
+  const successStart = wakeSource.indexOf("      if (evidence.accepted_message_observed");
+  const successEnd = wakeSource.indexOf("\n      await wait(200);", successStart);
+  assert.ok(successStart >= 0 && successEnd > successStart, "create success gate must remain extractable");
+  const successGate = wakeSource.slice(successStart, successEnd);
+  const settleCreate = new Function("projection", `
+    return async function settleCreate() {
+      const evidence = {
+        command_accepted: true,
+        resource_available: true,
+        rejected: false,
+        stable_resource_ref_observed: true,
+        lifecycle_observed: true,
+        canonical_url_observed: true,
+        accepted_message_observed: true,
+        generation_status_observed: true,
+        generation_owner: null,
+        result: { accepted_user_message_ref: "provider-user-1" },
+      };
+      const exactChatGptDispatchIdentity = false;
+      const acceptedUserMessageRef = "provider-user-1";
+      const creatingSession = true;
+      const expectedGeneration = 17;
+      const params = { display_label: "Worker B" };
+      const ADAPTER = { name: "chatgpt" };
+      const adapterSupports = (capability) => capability === "titleProjection";
+      const projectChatGptConversationTitle = async () => projection;
+      ${successGate}
+      throw new Error("create success gate did not return");
+    };
+  `)(projection);
+  const evidence = await settleCreate();
+  assert.equal(evidence.command_accepted, true);
+  assert.equal(evidence.resource_available, true);
+  assert.equal(evidence.rejected, false);
+  assert.equal(evidence.stable_resource_ref_observed, true);
+  assert.equal(evidence.lifecycle_observed, true);
+  assert.equal(evidence.canonical_url_observed, true);
+  assert.equal(evidence.accepted_message_observed, true);
+  assert.equal(evidence.generation_status_observed, true);
+  assert.equal(evidence.generation_owner, 17);
+  assert.equal(evidence.result.accepted_user_message_ref, "provider-user-1");
+  assert.deepEqual(evidence.result.title_projection, projection);
 });
 
 test("user returns ChatGPT browser actuation to Chat mode | Given Work mode is active | When browser actuation runs | Then the provider adapter switches to Chat mode", () => {
@@ -3280,27 +3654,44 @@ test("user returns ChatGPT browser actuation to Chat mode | Given Work mode is a
 
 test("ChatGPT required_apps selects a real composer app pill and fails closed on ambiguity", () => {
   assert.match(backgroundSource, /"composer\.select_tool"/);
-  assert.match(chatGptAdapterSource, /#composer-plus-btn/);
-  assert.match(chatGptAdapterSource, /data-testid="composer-plus-btn"/);
+  assert.doesNotMatch(wakeSource, /ADAPTER\.openComposerAppsMenu\(\)|ADAPTER\.searchComposerApp\(app\)/);
+  assert.doesNotMatch(chatGptAdapterSource, /openComposerAppsMenu\(\)|searchComposerApp\(keyword\)/);
   assert.match(chatGptAdapterSource, /data-inline-selection-pill/);
   assert.match(chatGptAdapterSource, /data-symbol="ecosystemMention"/);
   assert.match(chatGptAdapterSource, /data-keyword/);
-  // The generalized picker resolves the pill from visible, scored candidates in
-  // the opened menu; ambiguity stays fail-closed via candidates.length !== 1 in
-  // wake.js (asserted below).
-  assert.match(chatGptAdapterSource, /getComposerAppCandidates\(keyword\)/);
-  assert.match(chatGptAdapterSource, /\[data-keyword\], \[data-value\]/);
-  assert.match(chatGptAdapterSource, /keywordMatches\(node\)/);
-  assert.match(chatGptAdapterSource, /visible\(node\)/);
-  assert.match(chatGptAdapterSource, /if \(!menuRoots\.length\) return \[\]/);
-  assert.match(chatGptAdapterSource, /for \(const root of menuRoots\)/);
+  // Direct @ typing triggers the provider suggestion list; a unique visible
+  // candidate and a real selected pill are still mandatory before submit.
+  // Candidates come only from the popup the composer itself owns through its
+  // own association attributes; a document-wide popup/menu scan is never a
+  // fallback and substring text is never a keyword match.
+  assert.match(chatGptAdapterSource, /getComposerOwnedPopup\(input\)/);
+  assert.match(chatGptAdapterSource, /aria-controls/);
+  assert.match(chatGptAdapterSource, /aria-owns/);
+  assert.match(chatGptAdapterSource, /if \(!popup\) return \[\]/);
+  assert.match(chatGptAdapterSource, /for \(const node of popup\.querySelectorAll\(selectors\.join\(','\)\)\)/);
+  assert.match(chatGptAdapterSource, /if \(!keywordMatches\(node\)\) continue/);
+  assert.doesNotMatch(chatGptAdapterSource, /text\.includes\(wanted\)/);
+  assert.doesNotMatch(chatGptAdapterSource, /menuRoots/);
   assert.match(chatGptAdapterSource, /return matches\.sort/);
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
-  assert.match(wakeSource, /!composerModelVisibleText\(\)/);
-  assert.match(wakeSource, /const search = selector \? await insertMainWorld\(app, selector\) : null/);
-  assert.match(wakeSource, /if \(searchInserted\) await clearComposer\(\)/);
+  assert.match(wakeSource, /ADAPTER\.getComposerTextWithoutAppPills\(\) !== ''/);
+  assert.match(wakeSource, /const prefix = selector \? await insertMainWorld\('@', selector,/);
+  assert.match(wakeSource, /const search = await insertMainWorld\(app, selector, true\)/);
+  assert.ok(wakeSource.indexOf("await insertMainWorld('@', selector")
+    < wakeSource.indexOf("await insertMainWorld(app, selector, true)"));
+  assert.match(wakeSource, /required-app-selection-not-observed/);
+  // Rejections carry fixed-shape DOM diagnostics captured before cleanup.
+  assert.match(chatGptAdapterSource, /describeComposerAppSearch\(keyword\)/);
+  assert.match(wakeSource, /app_selection_probe: probe/);
+  assert.doesNotMatch(
+    chatGptAdapterSource.slice(chatGptAdapterSource.indexOf('describeComposerAppSearch(keyword)'),
+      chatGptAdapterSource.indexOf('getWatchMainWorldSelector()')),
+    /outerHTML|innerHTML|innerText/,
+  );
+  assert.match(wakeSource, /!ADAPTER\.getSelectedComposerApps\(\)\.includes\(app\)/);
+  assert.match(wakeSource, /if \(searchInserted\) await clearAutomationSearch\(app\)/);
   assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
   assert.match(wakeSource, /if \(!registeredHerdrAppKeyword\) return \[\]/);
   assert.match(wakeSource, /const observedHerdrApps = ADAPTER\.name === "chatgpt" \? currentHerdrRequiredApps\(\) : \[\]/);
@@ -3352,8 +3743,10 @@ test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conv
   assert.ok(resumeStart >= 0 && resumeEnd > resumeStart);
   const resume = wake.slice(resumeStart, resumeEnd);
   assert.match(resume, /ensureRequiredComposerApps\(requiredApps\)/);
-  assert.ok(resume.indexOf("ensureRequiredComposerApps(requiredApps)") < resume.indexOf("await submit()"),
-    "resume-only submission must restore the required App before submit");
+  assert.ok(resume.indexOf("ensureRequiredComposerApps(requiredApps)") < resume.indexOf("submitWakeText()"),
+    "resume-only submission must restore the required App before the single-shot submit");
+  assert.doesNotMatch(resume, /await submit\(\)/,
+    "resume-only must not fall back to the retrying submit loop");
   const clearBeforeInsert = wake.indexOf("if (clearBeforeInsert) await clearComposer()");
   const mainAppSelection = wake.indexOf("let appSelection = { ok: true, apps: [] }");
   assert.ok(clearBeforeInsert >= 0 && mainAppSelection > clearBeforeInsert,
@@ -3892,4 +4285,406 @@ test("user still fails closed after source recovery | Given source affinity fall
   assert.equal(failure.evidence.command_accepted, false);
   assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
   assert.equal(harness.actuationMessages.length, 0);
+});
+
+test('user mentions an App in ChatGPT | Given an inline-mention App pill | When the composer is inspected | Then the pill is recognised only with provider identity attributes', () => {
+  const adapter = readFileSync(new URL('../extension/content/injector/chatgpt.js', import.meta.url), 'utf8');
+  assert.match(adapter, /span\[data-appearance="inline-mention"\]\[app-mention-name\]\[app-mention-path\]/);
+  assert.match(adapter, /for \(const keyword of this\.getInlineAppMentionKeywords\(input\)\) selected\.add\(keyword\);/);
+  assert.match(adapter, /for \(const node of this\.getInlineAppMentionNodes\(clone\)\) node\.remove\(\);/);
+  assert.match(adapter, /\^\[a-z0-9_-\]\{1,64\}\$/);
+});
+
+// Shared harness for the submit-acceptance rules. It extracts the real
+// evidence + command sources from wake.js so the tests exercise the shipped
+// acceptance logic instead of source text alone.
+function browserSubmitAcceptanceHarness(ctx = {}) {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart, "browser evidence helpers must remain extractable");
+  assert.ok(commandStart >= 0 && commandEnd > commandStart, "browser actuation command must remain extractable");
+  const helperStart = wakeSource.indexOf("  // The exact Unicode White_Space set Rust");
+  const helperEnd = wakeSource.indexOf("\n  function providerCanonicalConversationObserved()", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "exact acceptance helpers must remain extractable");
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const helperSource = wakeSource.slice(helperStart, helperEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  return new Function("ctx", `
+    const crypto = ctx.crypto;
+    const ADAPTER = {
+      name: "chatgpt",
+      capabilities: { browserActuation: true, sessionCreate: true, chatModeGuard: true },
+      prepareBrowserActuation: async () => ({ ok: true, switched: false }),
+      getConversationKey: () => ctx.currentConvKey,
+      getCanonicalConversationUrl: () => ctx.canonicalUrl === "" ? "" : "https://chatgpt.com/c/current",
+      getInputEl: () => ({}),
+      inputHasContent: () => ctx.inputHasContent === true,
+      getAcceptedUserAppIdentity: (messageId) => (typeof ctx.acceptedUserApps === "function"
+        ? ctx.acceptedUserApps(messageId)
+        : []),
+    };
+    const chatGptConversationId = () => {
+      const match = String(ADAPTER.getConversationKey() || "").match(/\\/c\\/([^/?#]+)/);
+      return match ? match[1] : null;
+    };
+    const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    let registeredBrowserSessionRef = ctx.registeredSessionRef || null;
+    let registeredBrowserGeneration = 17;
+    let registeredConvKey = ctx.registeredConvKey || null;
+    const registerCurrentConversation = async () => { ctx.registers = (ctx.registers || 0) + 1; };
+    const currentHerdrRequiredApps = () => ctx.herdrApps || [];
+    const providerCanonicalConversationObserved = () => ctx.canonicalObserved !== false;
+    const document = { hidden: false };
+    const isTurnInProgress = () => ctx.turnInProgress === true;
+    const runtimeAlive = () => true;
+    const BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS = 30000;
+    const acceptedDispatchAssignments = new Map();
+    const Date = { now: () => ctx.now || 0 };
+    const wait = async (ms = 0) => { ctx.now = (ctx.now || 0) + Math.max(1, ms); };
+    const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
+    let snapshotIndex = 0;
+    const fetchChatGptConversationSnapshot = async () => {
+      const snapshots = ctx.snapshots || [];
+      const value = snapshots[Math.min(snapshotIndex, snapshots.length - 1)] || { ok: false };
+      snapshotIndex += 1;
+      return value;
+    };
+    let userSnapshotIndex = 0;
+    const providerMessageSnapshot = (role) => {
+      if (role === "assistant") return ctx.assistantSnapshot || { messageId: null, text: "", count: 0 };
+      const first = userSnapshotIndex === 0;
+      userSnapshotIndex += 1;
+      return first ? ctx.domBefore : ctx.domAfter;
+    };
+    const performWake = async (args) => {
+      ctx.wakeArgs = ctx.wakeArgs || [];
+      ctx.wakeArgs.push(args);
+      if (typeof ctx.afterWake === "function") ctx.afterWake();
+      return ctx.wakeResult || { ok: true };
+    };
+    const projectChatGptConversationTitle = async () => ({
+      status: "unsupported",
+      changed: null,
+      provider: "chatgpt",
+      readback_verified: false,
+      reason: "title_projection_unsupported",
+    });
+    ${evidenceSource}
+    ${helperSource}
+    ${commandSource}
+    return performBrowserActuationCommand;
+  `)({ crypto: webcrypto, ...ctx });
+}
+
+test("user dispatch stays uncertain | Given the before snapshot fails and the latest user id is unchanged | When dispatch.submit acknowledges | Then the previous user message is not recorded", async () => {
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [{ ok: false }, { ok: false }],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: [] },
+  });
+
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.accepted_message_observed, false);
+  assert.equal(result.message_baseline_advanced, false);
+  assert.equal(result.generation_owner, null);
+  assert.equal(result.result, undefined, "no provider identity may be recorded without a before snapshot or an exact new turn");
+});
+
+test("user dispatch does not adopt a short overlapping turn | Given a submitted prompt that contains 'ok' | When a new user turn is only 'ok' | Then delivery stays uncertain and no accepted user message is recorded", async () => {
+  const prompt = "Please reply with ok once the patch is ready and the tests pass.";
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn" },
+      { ok: true, userMessageId: "user-2", userText: "ok" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "ok", count: 2 },
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: prompt, required_apps: [] },
+  });
+
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.accepted_message_observed, false);
+  assert.equal(result.message_baseline_advanced, false);
+  assert.equal(result.generation_owner, null);
+  assert.equal(result.result, undefined, "a short foreign turn inside the prompt must not become the accepted user message");
+});
+
+test("user dispatch ignores an idle prior generation | Given the conversation is idle on an assistant node | When no new generation starts | Then generation_status_observed remains false", async () => {
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn", currentNodeRole: "assistant" },
+      { ok: true, userMessageId: "user-2", userText: "next turn", currentNodeRole: "assistant" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "next turn", count: 2 },
+    assistantSnapshot: { messageId: "assistant-1", text: "previous answer", count: 1 },
+    turnInProgress: false,
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: [] },
+  });
+
+  assert.equal(result.accepted_message_observed, true);
+  assert.equal(result.result.accepted_user_message_ref, "user-2");
+  assert.match(result.result.accepted_user_text_canonical_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(result.generation_status_observed, false, "an idle pre-existing conversation is not an observed generation");
+  assert.equal(result.generation_owner, null, "dispatch must not claim generation ownership without proof");
+});
+
+test("user create does not adopt a foreign conversation | Given a Project-home tab whose URL changes to an existing conversation with different user text | When session.create submits | Then delivery proof is absent and the conversation is not registered", async () => {
+  const ctx = {
+    currentConvKey: "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    canonicalObserved: true,
+    snapshots: [
+      { ok: false },
+      { ok: true, userMessageId: "user-foreign", userText: "someone else's turn" },
+    ],
+    domBefore: { messageId: null, exactMessageId: false, text: "", count: 0 },
+    domAfter: { messageId: "user-foreign", exactMessageId: true, text: "someone else's turn", count: 1 },
+    afterWake: () => { ctx.currentConvKey = "https://chatgpt.com/c/foreign-conversation"; },
+  };
+  const act = browserSubmitAcceptanceHarness(ctx);
+
+  const result = await act({
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      reservation_ref: "bsr_" + "e".repeat(64),
+      message: "ship the patch",
+      required_apps: [],
+    },
+  });
+
+  assert.equal(result.rejected, false);
+  assert.equal(result.accepted_message_observed, false);
+  assert.equal(result.message_baseline_advanced, false);
+  assert.equal(result.stable_resource_ref_observed, false);
+  assert.equal(result.result, undefined, "a foreign conversation's latest turn is not this create's acceptance");
+  assert.equal(ctx.registers || 0, 0, "the landed conversation must not be materialized as the new session");
+});
+
+test("user accepted message must carry the required app | Given the composer selected herdr but the accepted provider message carries no app identity | When acceptance is evaluated | Then the required-app readback is empty and no app is credited", async () => {
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn" },
+      { ok: true, userMessageId: "user-2", userText: "next turn" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "next turn", count: 2 },
+    assistantSnapshot: { messageId: "assistant-1", text: "previous answer", count: 1 },
+    turnInProgress: false,
+    acceptedUserApps: () => [],
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: ["herdr"] },
+  });
+
+  assert.equal(result.accepted_message_observed, true);
+  assert.equal(result.result.accepted_user_message_ref, "user-2");
+  assert.equal(
+    result.required_apps_readback.length,
+    0,
+    "a pre-submit composer pill must never satisfy the required app",
+  );
+  assert.equal(result.result.accepted_user_apps, undefined);
+
+  const credited = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn" },
+      { ok: true, userMessageId: "user-2", userText: "next turn" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "next turn", count: 2 },
+    assistantSnapshot: { messageId: "assistant-1", text: "previous answer", count: 1 },
+    turnInProgress: false,
+    acceptedUserApps: (messageId) => (messageId === "user-2"
+      ? [{ name: "herdr", path: "connectors/herdr" }]
+      : []),
+  });
+  const applied = await credited({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: ["herdr"] },
+  });
+  assert.deepEqual([...applied.required_apps_readback], ["herdr"]);
+  assert.deepEqual([...applied.result.accepted_user_apps].map((app) => ({
+    name: app.name,
+    path: app.path,
+  })), [{ name: "herdr", path: "connectors/herdr" }]);
+});
+
+test("user archive handles a rate-limited preflight | Given the preflight read returns HTTP 429 | When archive is requested | Then rate_limited is returned without any provider mutation", async () => {
+  const fetchCalls = [];
+  const { ctx, api } = selfArchiveHarness({
+    turnInProgress: false,
+    archiveAvailable: false,
+    readbackStatus: 429,
+    fetch: async (url, init = {}) => {
+      fetchCalls.push({ url, method: init.method || "GET" });
+      return { ok: false, status: 429 };
+    },
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      idempotency_key: "archive-preflight-rate-limited",
+    },
+  };
+  const evidence = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(evidence.rejected, true);
+  assert.equal(evidence.result.error, "rate_limited");
+  assert.equal(fetchCalls.length, 0, "nothing may be mutated while the preflight read is throttled");
+});
+
+test("user archive retry never repeats mutation | Given the archive PATCH is throttled with 429 | When the same key is retried | Then it stays unconfirmed and only one PATCH is dispatched", async () => {
+  const patches = [];
+  const { ctx, api } = selfArchiveHarness({
+    turnInProgress: false,
+    archiveAvailable: false,
+    accessToken: "archive-test-token",
+    fetch: async (url, init = {}) => {
+      if ((init.method || "GET") === "PATCH") {
+        patches.push(url);
+        return { ok: false, status: 429 };
+      }
+      return { ok: false, status: 500 };
+    },
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      idempotency_key: "archive-patch-rate-limited",
+    },
+  };
+  const first = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(first.command_accepted, true);
+  assert.equal(first.lifecycle_observed, false, "a throttled PATCH may have been applied: stay unconfirmed");
+  assert.equal(patches.length, 1);
+
+  const second = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(second.command_accepted, true);
+  assert.equal(second.lifecycle_observed, false);
+  assert.equal(patches.length, 1, "an uncertain archive is terminal and must never be re-mutated");
+});
+
+test("user archive treats a definitive provider rejection as not applied | Given the archive PATCH is rejected with HTTP 400 | When archive is requested | Then the provider is reported as rejecting it without a replay", async () => {
+  const patches = [];
+  const { ctx, api } = selfArchiveHarness({
+    turnInProgress: false,
+    archiveAvailable: false,
+    accessToken: "archive-test-token",
+    fetch: async (url, init = {}) => {
+      if ((init.method || "GET") === "PATCH") patches.push(url);
+      return { ok: false, status: 400 };
+    },
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      idempotency_key: "archive-patch-rejected",
+    },
+  };
+  const evidence = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(evidence.rejected, true);
+  assert.equal(evidence.result.error, "browser_archive_control_unavailable");
+  assert.equal(patches.length, 1);
+});
+
+test("user late acceptance verifies app identity | Given a matching message digest without the required App path | When the late readback runs | Then the app readback is empty and only the exact provider message identity is offered", async () => {
+  const detail = {
+    ok: true,
+    body: {
+      mapping: {
+        n1: {
+          message: {
+            id: "m1",
+            author: { role: "user" },
+            content: { content_type: "text", parts: ["late accepted turn"] },
+            metadata: {},
+          },
+        },
+      },
+    },
+  };
+  const commandFor = (ctx) => ({
+    operation: "herdr_mcp.browser_session.archive_status",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      readback_accepted: true,
+      required_apps: ["herdr"],
+    },
+  });
+
+  const withoutApps = selfArchiveHarness({
+    turnInProgress: false,
+    detail,
+    adapter: { getAcceptedUserAppIdentity: () => [] },
+  });
+  const plain = await withoutApps.api.performChatGptSessionArchiveStatus(
+    commandFor(withoutApps.ctx),
+    { observed_generation: 7 },
+  );
+  assert.equal(plain.result.accepted_user_message_ref, "m1");
+  assert.equal(plain.required_apps_readback.length, 0);
+  assert.equal(plain.result.accepted_user_apps, undefined, "a digest match without app proof stays app-less");
+
+  const withApps = selfArchiveHarness({
+    turnInProgress: false,
+    detail,
+    adapter: {
+      getAcceptedUserAppIdentity: (messageId) => (messageId === "m1"
+        ? [{ name: "herdr", path: "connectors/herdr" }]
+        : []),
+    },
+  });
+  const credited = await withApps.api.performChatGptSessionArchiveStatus(
+    commandFor(withApps.ctx),
+    { observed_generation: 7 },
+  );
+  assert.deepEqual([...credited.required_apps_readback], ["herdr"]);
+  assert.deepEqual([...credited.result.accepted_user_apps].map((app) => ({
+    name: app.name,
+    path: app.path,
+  })), [{ name: "herdr", path: "connectors/herdr" }]);
 });

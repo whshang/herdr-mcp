@@ -223,6 +223,7 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             space_ref,
             source_url,
             display_label,
+            required_app,
             message,
             expected_generation,
             idempotency_key,
@@ -256,6 +257,9 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
                 }
             };
             params.insert("message".to_owned(), json!(message));
+            if let Some(app) = required_app {
+                params.insert("required_apps".to_owned(), json!([app]));
+            }
             params.insert("idempotency_key".to_owned(), json!(idempotency_key));
             insert_optional(&mut params, "work_chain_id", work_chain_id);
             print_private_result(call_private(
@@ -266,6 +270,7 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
         }
         WebChatCommand::Send {
             session_ref,
+            required_app,
             message,
             expected_generation,
             idempotency_key,
@@ -275,6 +280,9 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             let mut params = Map::new();
             params.insert("session_ref".to_owned(), json!(session_ref));
             params.insert("message".to_owned(), json!(message));
+            if let Some(app) = required_app {
+                params.insert("required_apps".to_owned(), json!([app]));
+            }
             params.insert("expected_generation".to_owned(), json!(expected_generation));
             params.insert("idempotency_key".to_owned(), json!(idempotency_key));
             insert_optional(&mut params, "work_chain_id", work_chain_id);
@@ -287,6 +295,11 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
         WebChatCommand::DispatchStatus { dispatch_id } => print_private_result(call_private(
             BROWSER_DISPATCH_STATUS_METHOD,
             json!({"dispatch_id": dispatch_id}),
+            None,
+        )?),
+        WebChatCommand::FanoutStatus { work_chain_id } => print_private_result(call_private(
+            BROWSER_DISPATCH_STATUS_METHOD,
+            json!({"work_chain_id": work_chain_id}),
             None,
         )?),
         WebChatCommand::Open {
@@ -942,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn user_source_route_result_builds_the_latest_exact_grant() {
+    fn user_source_route_result_builds_the_exact_grant() {
         let result = json!({
             "ok": true,
             "route": {
@@ -1156,6 +1169,43 @@ mod tests {
         assert_eq!(
             output["automatic_delivery"]["reason"],
             "browser_source_session_not_found"
+        );
+        assert_eq!(
+            output["manual_delivery"]["copy_prompt"],
+            canonical_handoff_message()
+        );
+        assert!(
+            output["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("not a completed handoff")
+        );
+    }
+
+    #[test]
+    fn user_handoff_given_ambiguous_source_when_cli_prepares_then_automatic_delivery_refused() {
+        let mut runtime = FakeRuntime::new(
+            canonical_prepare_response(Value::Null, json!("browser_canonical_url_ambiguous")),
+            applied_create_response(false),
+        );
+        let output = webchat_handoff(handoff_request(None, false), |method, params, grant| {
+            runtime.call(method, params, grant)
+        })
+        .unwrap();
+        // An ambiguous source never reaches automatic delivery; the reported reason is the
+        // runtime's fail-closed code so the caller can resolve the profile/account first.
+        assert_eq!(runtime.create_calls().len(), 0);
+        assert_eq!(output["ok"], true);
+        assert_eq!(output["source_route"], Value::Null);
+        assert_eq!(
+            output["source_route_error"],
+            "browser_canonical_url_ambiguous"
+        );
+        assert_eq!(output["automatic_delivery"]["attempted"], false);
+        assert_eq!(output["automatic_delivery"]["completed"], false);
+        assert_eq!(
+            output["automatic_delivery"]["reason"],
+            "browser_canonical_url_ambiguous"
         );
         assert_eq!(
             output["manual_delivery"]["copy_prompt"],
