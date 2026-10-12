@@ -797,3 +797,19 @@ pub(super) fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .map_err(|error| format!("cannot set state store mode on {}: {error}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::MIGRATION_V7;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn migration_v7_matches_published_main_bytes() {
+        // Frozen from ac4b3bab226de179ddf5923f43bc7d5beca47de6 (main/rc.1).
+        // Applied migration text must not change, including whitespace/defaults.
+        assert_eq!(
+            format!("{:x}", Sha256::digest(MIGRATION_V7.as_bytes())),
+            "aef49b2c83dede770188725bb323e6767764f3d85cf8ff052a1463965e2882eb"
+        );
+    }
+}
