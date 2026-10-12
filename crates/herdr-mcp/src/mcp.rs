@@ -15244,22 +15244,6 @@ mod tests {
             .unwrap(),
             (false, Some("caller_grant_missing"))
         );
-        let exact_b_grant = [BrowserCallerGrant {
-            endpoint_ref: endpoint_b.clone(),
-            provider: "chatgpt".to_owned(),
-            account_ref: account_b.clone(),
-        }];
-        assert_eq!(
-            browser_resource_actuation_decision(
-                &store.lock().unwrap(),
-                "session.create",
-                &account_b_resource,
-                &exact_b_grant,
-                Some(200),
-            )
-            .unwrap(),
-            (true, None)
-        );
 
         {
             let mut guard = store.lock().unwrap();

@@ -333,7 +333,7 @@ Agent は次の順で進めます。
 | endpoint はあるが `consent.webchat_control: false` | 廃止済みのローカルスイッチ意味論を持つ古い runtime/extension。現在の DEV またはリリース版へ更新／Reload して endpoint を再観測します |
 | account / Project が曖昧 | 再列挙し、返された ref で選ぶ。推測や「最新」での選択はしない |
 | `browser_resource_not_found` / session が古い | `herdr-mcp webchat resources` を再実行。会話が閉じられた、アーカイブされた、または新しい観測に置き換わった可能性 |
-| 同じ会話が 2 つの browser endpoint から観測された | canonical URL は必ず 1 つの登録済み session に解決される必要があります。2 つの異なる session が同じ URL を共有する場合は曖昧として `browser_canonical_url_ambiguous` で fail closed し、最新の観測を選ぶことはありません。source-anchored create と handoff が別 profile/account の session へ向き先を変えることはありません。1 つの profile で再観測してから再試行してください |
+| 同じ会話が 2 つの browser endpoint から観測された | canonical URL は必ず 1 つの登録済み session に解決される必要があります。2 つの異なる session が同じ URL を共有する場合は曖昧として `browser_canonical_url_ambiguous` で fail closed し、最新の観測を選ぶことはありません。source-anchored create と handoff が別 profile/account の session へ向き先を変えることはありません。再観測してももう一方の session の記録は消えないため、この URL は source-anchored create と handoff では曖昧なままです。代わりに endpoint、provider、account、generation を明示した direct create を使ってください |
 | dispatch タイムアウト | まず `herdr-mcp webchat dispatch-status DISPATCH_ID` を読み、次に会話を観測してから判断 |
 | 変更の delivery が不確実 | まず再観測。新しい idempotency key で再送しない |
 | `code: "caller_grant_missing"` | 信頼されたローカル経路にいない（例：生の TCP MCP クライアント）。`herdr-mcp` CLI を使う。grant は TCP で自称できません |

@@ -333,7 +333,7 @@ Agent 应按这个顺序做：
 | 有 endpoint，但 `consent.webchat_control: false` | 仍在使用带旧本地开关语义的 runtime/extension；更新或 Reload 当前 DEV/发布版本后重新观测 endpoint |
 | account / Project 有歧义 | 重新列举并按返回 ref 选择；不要猜，也不要按“最近一次”选 |
 | `browser_resource_not_found` / session 失效 | 重新执行 `herdr-mcp webchat resources`；会话可能已关闭、归档，或被更新的观测取代 |
-| 同一个会话被两个 browser endpoint 观测过 | canonical URL 必须唯一解析到一个已登记的 session。两个不同 session 共享同一 URL 即为歧义，直接返回 `browser_canonical_url_ambiguous`，不会按最新观测选择，source-anchored create 与 handoff 都不会改投到其他 profile/account 的 session。请先用单一 profile 重新观测再重试 |
+| 同一个会话被两个 browser endpoint 观测过 | canonical URL 必须唯一解析到一个已登记的 session。两个不同 session 共享同一 URL 即为歧义，直接返回 `browser_canonical_url_ambiguous`，不会按最新观测选择，source-anchored create 与 handoff 都不会改投到其他 profile/account 的 session。重新观测不会移除另一个 session 的记录，该 URL 对 source-anchored create 与 handoff 仍然有歧义；请改用显式指定 endpoint、provider、account 与 generation 的 direct create |
 | dispatch 超时 | 先读 `herdr-mcp webchat dispatch-status DISPATCH_ID`，再观测会话，然后才决策 |
 | 写操作 delivery 不确定 | 先重新观测。不要换新 idempotency key 重发 |
 | `code: "caller_grant_missing"` | 你不在受信任本地路径上（例如裸 TCP MCP 客户端）。请使用 `herdr-mcp` CLI，它自己附带本地 grant；grant 无法通过 TCP 自证 |
