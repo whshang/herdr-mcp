@@ -255,9 +255,31 @@ class ClaudeAdapter extends BaseAdapter {
 
   isGenerationInProgress() {
     if (this.getStopButtonCandidates().length > 0) return true;
-    const selectors = ['[data-is-streaming="true"]', '[aria-busy="true"]'];
-    return selectors.some((selector) => [...document.querySelectorAll(selector)]
-      .some((element) => this.elementVisible(element)));
+    // After a reload unrelated regions stay aria-busy while idle, so only the
+    // newest assistant turn decides.
+    // The transcript is virtualized; DOM order is not turn order after a
+    // reload, so the newest turn is the row with the highest data-index.
+    // aria-busy is not a streaming signal (idle rows keep it for lazy media).
+    const rows = [...document.querySelectorAll('[data-testid="transcript-row"]')];
+    let latest = null;
+    let latestIndex = -1;
+    for (const row of rows) {
+      const raw = String(row.getAttribute?.("data-index") ?? "");
+      const index = /^(0|[1-9]\d*)$/.test(raw) ? Number(raw) : -1;
+      if (Number.isSafeInteger(index) && index > latestIndex) {
+        latest = row;
+        latestIndex = index;
+      }
+    }
+    if (!latest) latest = rows[rows.length - 1] || null;
+    if (latest) {
+      if (latest.getAttribute?.("data-perf-row") !== "assistant") return false;
+      if (latest.getAttribute?.("data-perf-row-streaming") === "true") return true;
+      return [...(latest.querySelectorAll?.('[data-is-streaming="true"]') || [])]
+        .some((element) => this.elementVisible(element));
+    }
+    return [...document.querySelectorAll('[data-is-streaming="true"]')]
+      .some((element) => this.elementVisible(element));
   }
 
   async getAccountNativeIdentity() {

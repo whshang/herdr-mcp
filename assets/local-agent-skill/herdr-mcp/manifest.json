@@ -7,16 +7,12 @@
       "sha256": "55953481917abd2f958ca240a1261210d54cf2ecebf15a92f767de7bf46671bc"
     },
     {
-      "path": "references/browser-control.md",
-      "sha256": "1c1ea414e539274764b71f0b5c7b0d7acd5583b1db3912cd954bdb80a7d261b2"
-    },
-    {
       "path": "references/memory.md",
       "sha256": "a751cc2c01d810b753fbebcb6ef284d7c9b37bf0b4445ecf06aadcfcdbf10bd7"
     },
     {
       "path": "references/webchat-control.md",
-      "sha256": "a4b648afef29b7314453bdf42b57172e13559ba9edfc230382143cacd1885e48"
+      "sha256": "dd4f38a8b4a3a37ee0e7faee810c7ce33ce6f8b5f11a13efda3fe5a0e30e80fa"
     },
     {
       "path": "references/webchat.md",
