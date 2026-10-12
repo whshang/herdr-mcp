@@ -2679,6 +2679,26 @@ fn browser_dispatch_submit(
     response
 }
 
+/// Actuation params for `browser_dispatch.stop`: the caller's params plus the
+/// parent dispatch's target session, provider and canonical URL so the
+/// extension resolves the same tab that received the submit.
+fn browser_stop_actuation_params(
+    params: &Value,
+    target_session_ref: &str,
+    provider: &str,
+    canonical_url: Option<&str>,
+) -> Value {
+    let mut out = params.clone();
+    if let Some(object) = out.as_object_mut() {
+        object.insert("session_ref".to_owned(), json!(target_session_ref));
+        object.insert("provider".to_owned(), json!(provider));
+        if let Some(canonical_url) = canonical_url {
+            object.insert("canonical_url".to_owned(), json!(canonical_url));
+        }
+    }
+    out
+}
+
 fn browser_dispatch_stop(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -2797,12 +2817,29 @@ fn browser_dispatch_stop(
     }) {
         return browser_store_error(error);
     }
+    // The stop request only names the parent dispatch; the extension resolves
+    // its tab by session_ref (+ provider/canonical_url recovery), exactly like
+    // submit. Without these the extension cannot find the tab that received
+    // the submit and reports resource_unavailable.
+    let stop_locator = match store_guard.browser_resource_locator(&parent.target_session_ref) {
+        Ok(Some(locator)) if locator.observation_generation == expected_generation => {
+            Some(locator.canonical_url)
+        }
+        Ok(_) => None,
+        Err(error) => return browser_store_error(error),
+    };
+    let stop_actuation_params = browser_stop_actuation_params(
+        params,
+        &parent.target_session_ref,
+        &parent.provider,
+        stop_locator.as_deref(),
+    );
     drop(store_guard);
 
     let evidence = match actuator {
         Some(actuator) => match actuator.actuate_for_endpoint(
             BrowserOperation::DispatchStop.method(),
-            params,
+            &stop_actuation_params,
             expected_generation,
             Some(&actuation_endpoint_ref),
             Some(&reserved.dispatch_id),
@@ -18367,5 +18404,37 @@ mod webchat_control_provider_scope_tests {
     fn user_owner_given_legacy_account_grant_when_same_endpoint_provider_then_authorized() {
         let g = grant("bep_a", "chatgpt", "br_legacy_account");
         assert!(webchat_control_grant_covers(&g, "bep_a", "chatgpt"));
+    }
+}
+
+#[cfg(test)]
+mod browser_stop_target_tests {
+    use super::*;
+
+    /// user remote connector | Given a submitted Grok dispatch whose tab was opened by page lifecycle | When stop is actuated with only dispatch_id | Then the actuation carries the parent session_ref, provider and canonical_url
+    #[test]
+    fn user_connector_given_grok_dispatch_when_stop_actuated_then_target_session_forwarded() {
+        let params =
+            json!({"dispatch_id": "bd_1", "expected_generation": 7, "idempotency_key": "k"});
+        let out = browser_stop_actuation_params(
+            &params,
+            "br_grok",
+            "grok",
+            Some("https://grok.com/c/abc"),
+        );
+        assert_eq!(out["session_ref"], "br_grok");
+        assert_eq!(out["provider"], "grok");
+        assert_eq!(out["canonical_url"], "https://grok.com/c/abc");
+        assert_eq!(out["dispatch_id"], "bd_1");
+    }
+
+    /// user remote connector | Given no current locator for the session | When stop is actuated | Then session_ref and provider are still forwarded without a canonical_url
+    #[test]
+    fn user_connector_given_no_locator_when_stop_actuated_then_no_canonical_url() {
+        let params = json!({"dispatch_id": "bd_1"});
+        let out = browser_stop_actuation_params(&params, "br_claude", "claude", None);
+        assert_eq!(out["session_ref"], "br_claude");
+        assert_eq!(out["provider"], "claude");
+        assert!(out.get("canonical_url").is_none());
     }
 }
