@@ -63,11 +63,25 @@ const HERDR_CALL_TOP_LEVEL_ARGS: ReadonlySet<string> = new Set([
   "idempotency_key",
 ]);
 
-/** Bounded, control-character-free relay idempotency key. */
+/**
+ * Bounded, control-character-free relay idempotency key.
+ *
+ * The 128 bound mirrors `MAX_IDEMPOTENCY_KEY_LEN` in
+ * crates/herdr-mcp/src/relay/validation.rs, which the Link applies to the wire
+ * `tool_request.idempotency_key` field (`1..=128` relay identifier grammar, so
+ * no whitespace or control characters either). A key over that bound, wrapped
+ * in whitespace, or carrying control characters was already forwarded as that
+ * frame field and rejected there as `invalid_id`; the Edge now reports the same
+ * shapes earlier and explicitly. The empty string is the only newly rejected
+ * shape: it used to be omitted from the frame field and forwarded unvalidated
+ * in `arguments`. Keys the Edge still accepts are unchanged.
+ */
+const MAX_RELAY_IDEMPOTENCY_KEY_LEN = 128;
+
 function validRelayIdempotencyKey(value: unknown): value is string {
   return typeof value === "string"
     && value.length > 0
-    && value.length <= 128
+    && value.length <= MAX_RELAY_IDEMPOTENCY_KEY_LEN
     && value === value.trim()
     && !/[\u0000-\u001f\u007f]/.test(value);
 }
@@ -1209,7 +1223,7 @@ export async function handleMcp(
         retryable: false,
         delivery_state: "not_delivered",
         field: "idempotency_key",
-        message: "idempotency_key must be a non-empty string of at most 128 characters with no control characters",
+        message: `idempotency_key must be a non-empty string of at most ${MAX_RELAY_IDEMPOTENCY_KEY_LEN} characters, without leading or trailing whitespace and without control characters (the relay link rejects the same shapes)`,
       }, true));
     }
 

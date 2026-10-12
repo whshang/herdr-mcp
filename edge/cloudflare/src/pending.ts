@@ -12,7 +12,9 @@
  * routed device and connector grant generation present the *same* canonical
  * request, and any Page Assist endpoint the cached request required is still
  * granted to that principal. A caller-supplied key is therefore an identity
- * hint, never an authorization to read another caller's result.
+ * hint, never an authorization to read another caller's result. A record that
+ * owns the key but predates this binding fails closed instead of being
+ * forwarded again, so the upgrade window cannot re-execute a settled mutation.
  */
 
 import type { RelayErrorResult } from "./errors.js";
@@ -115,7 +117,22 @@ export type ReplayOutcome =
   /** Same caller re-used a key for a different request payload. */
   | { status: "payload_mismatch" }
   /** Cached page-scoped completion whose endpoint grant is no longer held. */
-  | { status: "grant_required"; endpointRef?: string };
+  | { status: "grant_required"; endpointRef?: string }
+  /**
+   * A settled record already owns this caller key but carries no principal or
+   * payload binding, so its completion can be neither served nor safely
+   * re-executed. Callers must refuse the request instead of forwarding it.
+   */
+  | { status: "binding_unavailable"; settledAtMs?: number };
+
+/**
+ * A record is replayable only when it proves both ownership (the trusted
+ * principal it was settled under) and payload identity (the canonical request
+ * hash). Records written before either existed can never be replayed.
+ */
+function hasReplayBinding(rec: IdempotencyRecord): boolean {
+  return rec.requestHash !== undefined && rec.principalRef !== undefined;
+}
 
 /**
  * Durable idempotency record for one settled request entry, or undefined when
@@ -259,22 +276,45 @@ export class PendingRequestRegistry {
    * under this exact (principal, device, generation, caller key) identity;
    * a record bound to a different payload is a mismatch, and a page-scoped
    * record whose endpoint grant is no longer held is refused. Records written
-   * before replay binding existed can never be replayed.
+   * before replay binding existed are `binding_unavailable`: they can never be
+   * replayed, and they must never be forwarded either, because the mutation
+   * they describe already settled and re-sending it would execute it twice.
    */
   replay(scope: ReplayScope, op: string): ReplayOutcome {
     const rec = this.idemByKey.get(idempotencyScopeKey(scope));
-    if (!rec) return { status: "none" };
-    if (rec.requestHash === undefined || rec.principalRef === undefined) return { status: "none" };
-    if (rec.op !== op || rec.requestHash !== scope.requestHash) return { status: "payload_mismatch" };
-    if (rec.pageScopedEndpointRef !== undefined) {
-      const granted = scope.authorizedPageAssistEndpoints ?? [];
-      if (!granted.includes(rec.pageScopedEndpointRef)) {
-        return { status: "grant_required", endpointRef: rec.pageScopedEndpointRef };
+    if (rec !== undefined) {
+      // Upgrade window: an Edge that predates the replay binding (or any path
+      // that recorded the key without one) leaves a scoped record with no
+      // binding. Failing closed here is what stops a same-key retry inside the
+      // completed TTL from re-executing the mutation.
+      if (!hasReplayBinding(rec)) {
+        return rec.op === op
+          ? { status: "binding_unavailable", settledAtMs: rec.settledAtMs }
+          // A different op reusing the key is a new request: the pre-binding
+          // ledger identity was (key, op), so it was forwarded then too.
+          : { status: "none" };
       }
+      if (rec.op !== op || rec.requestHash !== scope.requestHash) return { status: "payload_mismatch" };
+      if (rec.pageScopedEndpointRef !== undefined) {
+        const granted = scope.authorizedPageAssistEndpoints ?? [];
+        if (!granted.includes(rec.pageScopedEndpointRef)) {
+          return { status: "grant_required", endpointRef: rec.pageScopedEndpointRef };
+        }
+      }
+      const completion = this.completed.get(rec.requestId);
+      if (!completion) return { status: "none" };
+      return { status: "hit", completion };
     }
-    const completion = this.completed.get(rec.requestId);
-    if (!completion) return { status: "none" };
-    return { status: "hit", completion };
+    // Pre-scope records were indexed by the raw caller key and carry no
+    // ownership or payload binding. Settled completions always keep their
+    // idempotency record (see `recordSettlement`/`restoreIdem`), so a raw-key
+    // record for this caller key and op can only mean "already settled,
+    // unprovable": refuse rather than forward a second mutation.
+    const preScope = this.idemByKey.get(scope.callerKey);
+    if (preScope !== undefined && !hasReplayBinding(preScope) && preScope.op === op) {
+      return { status: "binding_unavailable", settledAtMs: preScope.settledAtMs };
+    }
+    return { status: "none" };
   }
 
   /**

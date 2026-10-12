@@ -133,13 +133,41 @@ test("user cannot read a revoked page completion | Given a settled page-scoped r
   assert.equal(r.replay({ ...scope, authorizedPageAssistEndpoints: ["be_endpoint_1"] }, "herdr_call").status, "hit");
 });
 
-test("user never replays a pre-scope record | Given a persisted idempotency record without a payload binding | When the key is presented again | Then no completion is replayed", () => {
+test("user is refused instead of re-running a settled mutation | Given a persisted pre-scope idempotency record without a payload binding | When the key is presented again | Then the replay fails closed instead of being forwarded", () => {
   const r = new PendingRequestRegistry({ limits: makeLimits() });
-  r.restoreIdem([{ idempotencyKey: "legacy-key", requestId: "legacy-1", op: "herdr_prompt", settledAtMs: 5 }]);
+  // Order matters and mirrors WorkstationDO init: `restore` clears the
+  // idempotency index, so it is seeded afterwards from durable `idem:` rows.
   r.restore({ pending: [], completed: [{ requestId: "legacy-1", completion: { status: "ok", result: "legacy", servedAtMs: 5 } }] });
+  r.restoreIdem([{ idempotencyKey: "legacy-key", requestId: "legacy-1", op: "herdr_prompt", settledAtMs: 5 }]);
+  const replay = r.replay({ principalRef: "principal:legacy", callerKey: "legacy-key", requestHash: "any" }, "herdr_prompt");
+  assert.equal(replay.status, "binding_unavailable",
+    "an unbound record must never be reported as a miss, which would forward the mutation again");
+  assert.equal(replay.settledAtMs, 5, "the settled-at evidence is carried so the refusal is explainable");
+});
+
+test("user is refused instead of re-running a settled mutation | Given a scoped record settled without a request hash | When the same scoped identity retries with a binding | Then the retry fails closed and a different op still forwards", () => {
+  const r = new PendingRequestRegistry({ limits: makeLimits() });
+  const scope = { principalRef: "principal:connectorA", routeDeviceId: "dev_A", grantGeneration: 7, callerKey: "upgrade-key" };
+  r.restore({ pending: [], completed: [{ requestId: "upgrade-1", completion: { status: "ok", result: "settled", servedAtMs: 9 } }] });
+  r.restoreIdem([{
+    idempotencyKey: idempotencyScopeKey(scope),
+    callerKey: "upgrade-key",
+    requestId: "upgrade-1",
+    op: "herdr_prompt",
+    settledAtMs: 9,
+    principalRef: "principal:connectorA",
+    routeDeviceId: "dev_A",
+    grantGeneration: 7,
+  }]);
   assert.equal(
-    r.replay({ principalRef: "principal:legacy", callerKey: "legacy-key", requestHash: "any" }, "herdr_prompt").status,
+    r.replay({ ...scope, requestHash: "hash-from-new-edge" }, "herdr_prompt").status,
+    "binding_unavailable",
+    "an Edge that predates the replay binding must not let a same-key retry re-execute the mutation",
+  );
+  assert.equal(
+    r.replay({ ...scope, requestHash: "hash-from-new-edge" }, "herdr_inspect").status,
     "none",
+    "a different op reusing the key is not the settled request",
   );
 });
 

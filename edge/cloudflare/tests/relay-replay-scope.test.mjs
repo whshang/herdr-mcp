@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { makeLimits } from "../dist/limits.js";
 import { handleMcp } from "../dist/mcp-handler.js";
+import { idempotencyScopeKey } from "../dist/pending.js";
 import { WorkstationDO } from "../dist/workstation-do.js";
 
 // ---------------------------------------------------------------------------
@@ -249,6 +250,109 @@ test("user cannot replay another device's completion | Given a settled page-scop
 });
 
 // ---------------------------------------------------------------------------
+// Upgrade window: a settled mutation whose ledger record predates the replay
+// binding must never be forwarded again. Both shapes are seeded from the exact
+// durable rows the previous release wrote.
+// ---------------------------------------------------------------------------
+
+const LEGACY_SETTLED_CONTENT = { ok: true, page_text: "pre-upgrade completion payload" };
+
+async function settledCount(subject) {
+  const snapshot = await subject.registry.snapshot();
+  return snapshot.completed.length;
+}
+
+test("user is refused instead of re-running a settled mutation | Given a pre-scope replay record indexed by the raw caller key | When the same key retries inside the completed TTL | Then the request fails closed and nothing reaches the device", async () => {
+  const { subject, events, storage } = makeSubject();
+  // Exactly what the previous release persisted: a flat `idem:<raw key>` row
+  // plus a completed row carrying the same flat binding.
+  storage.map.set("idem:pre-upgrade-key", {
+    idempotencyKey: "pre-upgrade-key",
+    requestId: "pre-upgrade-settled",
+    op: "herdr_call",
+    settledAtMs: 5_000,
+  });
+  storage.map.set("completed:pre-upgrade-settled", {
+    completion: { status: "ok", result: LEGACY_SETTLED_CONTENT, servedAtMs: 5_000 },
+    idempotencyKey: "pre-upgrade-key",
+    op: "herdr_call",
+    settledAtMs: 5_000,
+  });
+  await subject.fetch(new Request("https://do.internal/internal/status"));
+
+  const retry = await subject.forwardInternal(pageAssistCall({
+    requestId: "pre-upgrade-retry",
+    idempotencyKey: "pre-upgrade-key",
+  }));
+  assert.equal(retry.status, 409, "a retry of a settled pre-upgrade key must fail closed");
+  const body = await retry.json();
+  assert.equal(body.status, "error");
+  assert.equal(body.error.code, "idempotency_replay_unavailable");
+  assert.equal(body.error.retryable, false);
+  assert.equal(body.error.delivery_state, "not_delivered");
+  assert.match(body.error.message, /already settled/);
+  assert.equal(JSON.stringify(body).includes("pre-upgrade completion payload"), false,
+    "an unbound completion must never be disclosed");
+  assert.equal(toolRequests(events).length, 0, "the mutation must not be re-executed on the device");
+  assert.equal(await settledCount(subject), 1, "no second settlement is recorded");
+});
+
+test("user is refused instead of re-running a settled mutation | Given a scoped record settled without a request hash | When a same-scope retry presents a binding | Then the retry fails closed with a 409 while a fresh key still runs", async () => {
+  const { subject, events, storage } = makeSubject();
+  // Rolling upgrade shape: the newer DO settled the key, but the older Edge
+  // that forwarded it sent no replay binding, so the scoped record has no hash.
+  const scope = {
+    principalRef: CONNECTOR_A,
+    routeDeviceId: ROUTE_DEVICE,
+    grantGeneration: 7,
+    callerKey: SHARED_KEY,
+  };
+  const scopedKey = idempotencyScopeKey(scope);
+  const unboundRecord = {
+    idempotencyKey: scopedKey,
+    callerKey: SHARED_KEY,
+    requestId: "scoped-unbound-settled",
+    op: "herdr_call",
+    settledAtMs: 6_000,
+    principalRef: CONNECTOR_A,
+    routeDeviceId: ROUTE_DEVICE,
+    grantGeneration: 7,
+  };
+  storage.map.set(`idem:${scopedKey}`, unboundRecord);
+  storage.map.set("completed:scoped-unbound-settled", {
+    completion: { status: "ok", result: LEGACY_SETTLED_CONTENT, servedAtMs: 6_000 },
+    idem: unboundRecord,
+  });
+  await subject.fetch(new Request("https://do.internal/internal/status"));
+
+  const retry = await subject.forwardInternal(pageAssistCall({ requestId: "scoped-unbound-retry" }));
+  assert.equal(retry.status, 409);
+  const body = await retry.json();
+  assert.equal(body.error.code, "idempotency_replay_unavailable");
+  assert.equal(JSON.stringify(body).includes("pre-upgrade completion payload"), false);
+  assert.equal(toolRequests(events).length, 0, "an unbound same-key retry must not reach the device");
+
+  // The refusal is bound to that key, not to the caller: a fresh key runs.
+  const fresh = subject.forwardInternal(pageAssistCall({
+    requestId: "scoped-unbound-fresh",
+    idempotencyKey: "a-fresh-key-after-the-refusal",
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(toolRequests(events).some((event) => event[1].request_id === "scoped-unbound-fresh"),
+    "a different idempotency key is a new request and still reaches the device");
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: WORKSTATION_ID,
+    request_id: "scoped-unbound-fresh",
+    result: { ok: true },
+    served_at_ms: Date.now(),
+  });
+  const freshBody = await (await fresh).json();
+  assert.equal(freshBody.completion.status, "ok");
+});
+
+// ---------------------------------------------------------------------------
 // Edge surface: published herdr_call schema + relay idempotency binding.
 // ---------------------------------------------------------------------------
 
@@ -364,4 +468,40 @@ test("user keeps relay idempotency scoped | Given a page-scoped herdr_call with 
   }), "w1", d.value);
   assert.equal(malformedKey.body.result.structuredContent.code, "invalid_params");
   assert.equal(d.calls.length, 3, "a malformed relay key is rejected before routing");
+});
+
+test("user sees the relay key rule before routing | Given the documented relay idempotency key bound | When a key exceeds it, carries control characters, or has leading whitespace | Then each is rejected as an explicit invalid_params naming the field", async () => {
+  const d = edgeDeps({ client: PAGE_CONNECTOR_CLIENT });
+  const rejected = [
+    { key: "k".repeat(129), why: "one character over the 128 relay bound" },
+    { key: `control\u0000character`, why: "embedded control character" },
+    { key: " leading-whitespace", why: "leading whitespace" },
+    { key: "", why: "empty string" },
+  ];
+  for (const [index, { key, why }] of rejected.entries()) {
+    const res = await handleMcp(edgeReq(100 + index, {
+      method: "herdr_mcp.page_assist",
+      device: ROUTE_DEVICE,
+      idempotency_key: key,
+      params: JSON.stringify({ endpoint_ref: ENDPOINT_E, action: "inspect" }),
+    }), "w1", d.value);
+    assert.equal(res.body.result.isError, true, `${why} must be rejected`);
+    assert.equal(res.body.result.structuredContent.code, "invalid_params", why);
+    assert.equal(res.body.result.structuredContent.field, "idempotency_key");
+    assert.match(res.body.result.structuredContent.message, /at most 128 characters/);
+    assert.equal(res.body.result.structuredContent.delivery_state, "not_delivered");
+  }
+  assert.equal(d.calls.length, 0, "no rejected key may reach a workstation");
+
+  // The bound itself is accepted, so the tightening only rejects shapes the
+  // relay link rejects too.
+  const atBound = await handleMcp(edgeReq(110, {
+    method: "herdr_mcp.page_assist",
+    device: ROUTE_DEVICE,
+    idempotency_key: "k".repeat(128),
+    params: JSON.stringify({ endpoint_ref: ENDPOINT_E, action: "inspect" }),
+  }), "w1", d.value);
+  assert.equal(atBound.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].idempotencyKey, "k".repeat(128));
 });

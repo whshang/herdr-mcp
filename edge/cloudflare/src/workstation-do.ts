@@ -888,6 +888,23 @@ export class WorkstationDO {
           403,
         );
       }
+      if (replay.status === "binding_unavailable") {
+        // Upgrade window: the key is already spent on a settled mutation whose
+        // record predates replay binding. The completion cannot be served (it
+        // cannot be proven to belong to this request) and the mutation must not
+        // be forwarded again (it already ran). Fail closed, deterministically.
+        return this.json(
+          { status: "error", error: errorResult("idempotency_replay_unavailable", {
+            requestId,
+            workstationId,
+            atMs: now,
+            retryable: false,
+            delivery_state: "not_delivered",
+            message: "an earlier mutation for this idempotency key already settled, but its record predates request binding, so its outcome cannot be replayed and the mutation must not be re-sent; verify live state instead of repeating it with a new key",
+          }) },
+          409,
+        );
+      }
     }
 
     // Reconcile any durable mutation left past deadline by a previous isolate
