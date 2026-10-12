@@ -47,6 +47,9 @@ mod release_plan;
 
 use release_plan::{ReleaseAsset, ReleasePlan, fetch_release_plan};
 
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod scheduled_tests;
+
 const ATTESTATION_MAX_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(45);
@@ -1630,8 +1633,12 @@ fn download_asset<W: Write>(
     target: &Path,
     progress: &mut UpdateProgress<W>,
 ) -> Result<(), String> {
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    let url = scheduled_tests::asset_url(&asset.url);
+    #[cfg(not(test))]
+    let url = asset.url.clone();
     let mut response = client
-        .get(asset.url.clone())
+        .get(url)
         .send()
         .map_err(|error| format!("release asset download failed: {}", error_kind(&error)))?;
     validate_response(&response)?;
@@ -1869,6 +1876,10 @@ fn spawn_worker(
 }
 
 fn fetch_bounded(client: &Client, url: Url, max: usize, label: &str) -> Result<Vec<u8>, String> {
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    if let Some(bytes) = scheduled_tests::metadata(&url, label) {
+        return Ok(bytes);
+    }
     fetch_bounded_with_retry(
         client,
         url,
@@ -1929,6 +1940,10 @@ fn verify_artifact_attestation(
     sha256: &str,
     identity: &ReleaseIdentity,
 ) -> Result<(), String> {
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    if let Some(result) = scheduled_tests::attestation(artifact_name, sha256, identity) {
+        return result;
+    }
     let url = release_trust::attestation_api_url(sha256)?;
     let mut response = client
         .get(url)

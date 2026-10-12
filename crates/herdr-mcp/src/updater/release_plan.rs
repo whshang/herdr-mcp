@@ -193,7 +193,10 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
     if value.get("product").and_then(Value::as_str) != Some("herdr-mcp") {
         return Err("release manifest product mismatch".to_owned());
     }
-    let target_contract = admit_release_contract(value, &contract::identity()?, SCHEMA_VERSION)?;
+    let local = contract::identity()?;
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    let local = super::scheduled_tests::local_contract().unwrap_or(local);
+    let target_contract = admit_release_contract(value, &local, SCHEMA_VERSION)?;
     let version_text = value
         .get("version")
         .and_then(Value::as_str)
