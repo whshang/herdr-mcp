@@ -179,37 +179,27 @@ All other gates are unchanged and still run: manifest attestation, tag/source_re
 
 `update auto` runs the same discovery and the same admission check as the interactive command, so it may cross one planned epoch under exactly that rule and remains PROD + Stable only. This protocol does not permit a state-schema migration; schema changes still need the explicit major-migration path.
 
-### The v1.0.4 bridge is planned, and `herdr-mcp update` cannot reach it
+### The v1.0.4 bridge is planned and unpublished
 
-The ordinary v1.0.x → v1.1 path is intended to be two steps: `herdr-mcp update` to the v1.0.4 epoch-4 bridge (identical contract identity, so it would be an ordinary same-contract update), then `herdr-mcp update` to the first v1.1 release whose manifest declares `contract_migration` from epoch 4 (planned v1.1.0-rc.2). Two facts limit that plan today:
+The ordinary v1.0.x → v1.1 path is two steps: `herdr-mcp update` to the v1.0.4 epoch-4 bridge (identical contract identity, so it is an ordinary same-contract update), then `herdr-mcp update` to the first v1.1 release whose manifest declares `contract_migration` from epoch 4 (planned v1.1.0-rc.2).
 
-- v1.0.4 is a **planned** bridge release, not an established published one. No v1.0.x workstation can install it yet, and v1.1.0-rc.1 is not reachable from v1.0.x by any path.
-- Even once v1.0.4 is published, the ordinary `herdr-mcp update` path on a released v1.0.0–v1.0.3 runtime fails after download. Those updaters hardcode the post-download candidate probe to the string `contract epoch 2 / 18 tools`; the probe reads the downloaded candidate's own `herdr-mcp version` output and rejects it with `staged update binary identity does not match release manifest`, because a v1.0.x or v1.0.4 candidate reports its real epoch 4. A later updater has to correct that probe before ordinary update can install the bridge. The same hardcoded probe is still present in the current 1.1.0-rc.1 source, so correcting it is a prerequisite for the planned path, not only a v1.0.x artifact.
+v1.0.4 is a **planned, unreleased** bridge. Until it is published there is no installable bridge, and v1.1.0-rc.1 is not reachable from v1.0.x.
 
-The primary supported path to v1.0.4 is therefore an authenticated manual install of the v1.0.4 release binary:
+Once v1.0.4 is published, released v1.0.0–v1.0.3 update to it normally. Its `version` output also prints a legacy compatibility line containing `contract epoch 2 / 18 tools`, so the candidate probe those released updaters already run accepts the bridge. Both the foreground `herdr-mcp update` and the background stable scheduler (`update auto`) install it. No manual install is required.
 
-1. read the published `runtime-manifest.json` for the exact target and take the asset name and sha256;
-2. download that asset from the release and verify its sha256;
-3. verify the release artifact attestation, for example `gh attestation verify <asset> --repo whshang/herdr-mcp`;
-4. run the verified binary's own installer:
-
-```bash
-<binary> install
-```
-
-Manual install stages an immutable generation through the same service lifecycle; it does not bypass the contract identity, state-schema, attestation or health gates.
+The second step still depends on the planned `contract_migration` admission rule, which no released updater implements. v1.1.0-rc.1 does not declare `contract_migration`, so only the first v1.1 release that does (planned v1.1.0-rc.2) can be admitted from the v1.0.4 bridge.
 
 ### Rollback after an epoch crossing
 
 `herdr-mcp rollback` re-activates the previously installed generation (for example 1.1 → v1.0.4). It is a service rollback, so the platform boundary matters:
 
 - on macOS, a successful install/activation records a ready service rollback (the previous service definition and the previous generation) and `herdr-mcp rollback` revalidates and re-activates it;
-- on Linux, `herdr-mcp rollback` is not exposed as a public operation and no post-success service rollback record is written; failed installs restore the prior generation transactionally instead. Cross-epoch rollback of an already-successful update is therefore macOS-only.
+- Linux writes no post-success service rollback record. `herdr-mcp rollback` is macOS-only.
 
-Both sides use state schema 15, so no database restore is needed, and durable state written after the update is not rewound. Inspect the real service/state before relying on it. Two epoch-5 writes in that shared state are worth knowing about:
+Both sides use state schema 15, so no database restore is needed, and durable state written after the update is not rewound. Inspect the real service/state before relying on it.
 
 - `browser_dispatches.message_canonical_digest` is a nullable additive column, not a numbered migration. A schema-15 epoch-4 binary opens the same database and ignores the column; rows written before it stay `NULL` and reconcile raw-only, which is fail-closed rather than a fabricated canonical match.
-- the epoch-5 browser-endpoint registration writer stores `webchat_control_allowed=1`, and re-registration overwrites an earlier `0`. A rolled-back epoch-4 binary reads that persisted value and treats WebChat control as allowed, so rollback does not rewind a consent decision made by 1.1.
+- 1.1 re-registration no longer overwrites an explicit webchat-control deny, so rollback to epoch 4 never widens permissions. The fix is in progress on [PR #605](https://github.com/whshang/herdr-mcp/pull/605).
 
 ## Switching traffic
 
@@ -310,7 +300,7 @@ The Worker identity and public origin remain stable. Durable Objects, secrets, k
 
 The bridge keeps the exact v0.4.8 binary and schema-5 database snapshot as N-1 rollback material before migration. `herdr-mcp update major-rollback` remains the explicit recovery command if the migrated Runtime must be reverted. `update major-apply` remains an operator-level primitive used by the bridge and recovery/UAT workflows, not the normal v0.4.8 user instruction.
 
-This one-command contract covers the schema-5 v0.4.8 → 1.0 boundary only. Moving a released v1.0.x to the planned v1.0.4 epoch-4 bridge is a different boundary that ordinary `herdr-mcp update` currently cannot complete; see [the v1.0.4 bridge section](#the-v104-bridge-is-planned-and-herdr-mcp-update-cannot-reach-it).
+This one-command contract covers the schema-5 v0.4.8 → 1.0 boundary only. The planned v1.0.4 epoch-4 bridge is a different boundary: once that unpublished release exists, released v1.0.0–v1.0.3 install it with ordinary foreground `herdr-mcp update` and the background stable scheduler (`update auto`). See [the v1.0.4 bridge section](#the-v104-bridge-is-planned-and-unpublished).
 
 ## `herdr-self-update`
 
