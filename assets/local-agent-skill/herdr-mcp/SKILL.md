@@ -1,6 +1,6 @@
 ---
 name: herdr-mcp
-description: "Use when a local coding agent needs Herdr-MCP collaboration: recover prior project work, search Work Memory, create/continue/hand off/observe supported WebChat or ChatGPT browser sessions through the browser extension, dispatch to a Web AI conversation, inspect/install the extension bridge, or clean up Herdr/WebChat resources created by the current task."
+description: "Use when a local coding agent needs Herdr-MCP collaboration or user-approved generic webpage control through BrowserPage and a bounded Jev fast path: recover prior project work, search Work Memory, create/continue/hand off/observe supported WebChat or ChatGPT browser sessions through the browser extension, dispatch to a Web AI conversation, inspect/install the extension bridge, or clean up Herdr/WebChat resources created by the current task."
 ---
 
 # Herdr-MCP local agent
@@ -10,6 +10,7 @@ Use the installed `herdr-mcp` CLI as the supported boundary. Runtime state, brow
 Load only the reference needed for the current task:
 
 - Prior-work intent, historical decisions, or a named work chain: read `references/memory.md`.
+- Generic webpage work — inspect, click, fill, verify, use bounded Jev fast path, or author project-local Browser Adapter: read `references/browser-control.md`.
 - WebChat/ChatGPT browser work — create a new chat, continue in another conversation, dispatch to Web AI, resume a browser conversation, hand off, or observe session state: read `references/webchat-control.md`.
 - Extension installation, bridge status, or the WebChat CLI surface: read `references/webchat.md`.
 - Agent/Herdr collaboration and resource ownership/cleanup: read `references/resources.md`.

@@ -1976,6 +1976,59 @@ impl StateStore {
         })
     }
 
+    /// Bind a freshly created browser session into the single active Work
+    /// Memory chain that already owns `work_chain_id`, so its later dispatch
+    /// settlement can append the assistant turn. Never creates a chain: an
+    /// unknown chain stays `work_memory_not_found`, and an ambiguous chain
+    /// fails closed.
+    pub fn bind_created_browser_session_work_chain(
+        &mut self,
+        work_chain_id: &str,
+        provider: &str,
+        account_ref: Option<&str>,
+        space_ref: Option<&str>,
+        session_ref: &str,
+        bound_at: i64,
+    ) -> Result<String, String> {
+        if !valid_work_chain_id(work_chain_id) {
+            return Err("work_memory_work_chain_id_invalid".to_owned());
+        }
+        validate_provider_binding(provider, account_ref, space_ref, session_ref)?;
+        let mut ids = self
+            .conn
+            .prepare(
+                "SELECT continuity_id FROM continuity_chains
+                 WHERE work_chain_id = ?1 AND status = 'active'
+                 ORDER BY continuity_id LIMIT 2",
+            )
+            .map_err(|error| format!("cannot resolve work chain: {error}"))?
+            .query_map([work_chain_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query work chain: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read work chain: {error}"))?;
+        let continuity_id = match ids.len() {
+            0 => return Err("work_memory_not_found".to_owned()),
+            1 => ids.remove(0),
+            _ => return Err("work_memory_ambiguous".to_owned()),
+        };
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO continuity_provider_bindings (
+                    continuity_id, provider, account_ref, space_ref, session_ref, bound_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    continuity_id,
+                    provider,
+                    account_ref.unwrap_or(""),
+                    space_ref.unwrap_or(""),
+                    session_ref,
+                    bound_at
+                ],
+            )
+            .map_err(|error| format!("cannot persist work memory provider binding: {error}"))?;
+        Ok(continuity_id)
+    }
+
     pub fn append_browser_dispatch_work_memory_evidence(
         &mut self,
         work_chain_id: &str,
@@ -2872,6 +2925,7 @@ impl StateStore {
                 "UPDATE browser_endpoints
                  SET browser_family = ?2,
                      extension_version = ?3,
+                     webchat_control_allowed = 1,
                      last_observed_at = MAX(last_observed_at, ?4)
                  WHERE endpoint_ref = ?1",
                 params![
@@ -2889,7 +2943,7 @@ impl StateStore {
                     webchat_control_allowed, tool_bridge_allowed,
                     tool_bridge_mutation_allowed, consent_revision,
                     first_observed_at, last_observed_at
-                 ) VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, ?5, ?5)",
+                 ) VALUES (?1, ?2, ?3, ?4, 1, 0, 0, 0, ?5, ?5)",
                 params![
                     endpoint_ref,
                     input.device_id,
@@ -2932,7 +2986,7 @@ impl StateStore {
                  WHERE endpoint_ref = ?1 AND consent_revision = ?6",
                 params![
                     input.endpoint_ref,
-                    i64::from(input.webchat_control_allowed),
+                    1i64,
                     i64::from(input.tool_bridge_allowed),
                     i64::from(input.tool_bridge_mutation_allowed),
                     input.observed_at,
@@ -3864,29 +3918,19 @@ impl StateStore {
             })?;
             return Ok(None);
         };
-        let (kind, resource_generation, webchat_control_allowed) = tx
+        let (kind, resource_generation) = tx
             .query_row(
-                "SELECT r.kind, r.observation_generation, e.webchat_control_allowed
+                "SELECT r.kind, r.observation_generation
                  FROM browser_resources r
-                 JOIN browser_endpoints e ON e.endpoint_ref = r.endpoint_ref
                  WHERE r.resource_ref = ?1 AND r.endpoint_ref = ?2 AND r.provider = ?3",
                 params![session_ref, pending.endpoint_ref, pending.provider],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)? != 0,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()
             .map_err(|error| format!("cannot read browser archive claim resource: {error}"))?
             .ok_or_else(|| "browser_resource_not_found".to_owned())?;
         if kind != "session" {
             return Err("browser_resource_kind_mismatch".to_owned());
-        }
-        if !webchat_control_allowed {
-            return Err("browser_control_not_allowed".to_owned());
         }
         require_current_browser_generation(
             &tx,
@@ -4800,6 +4844,37 @@ impl StateStore {
         }
     }
 
+    /// Read-only fanout view: every dispatch already recorded for one work
+    /// chain, oldest first, bounded. Reads the existing dispatch ledger only.
+    pub fn browser_dispatches_for_work_chain(
+        &self,
+        work_chain_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BrowserDispatchRecord>, String> {
+        validate_browser_work_chain_id(work_chain_id)?;
+        let ids = self
+            .conn
+            .prepare(
+                "SELECT dispatch_id FROM browser_dispatches
+                 WHERE work_chain_id = ?1
+                 ORDER BY created_at ASC, dispatch_id ASC LIMIT ?2",
+            )
+            .map_err(|error| format!("cannot prepare fanout read: {error}"))?
+            .query_map(params![work_chain_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("cannot read fanout dispatches: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode fanout dispatches: {error}"))?;
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(record) = self.browser_dispatch(&id)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     pub fn latest_browser_dispatch_for_session(
         &self,
         session_ref: &str,
@@ -5617,6 +5692,7 @@ const ALLOWED_BROWSER_CAPABILITY_OPERATIONS: &[&str] = &[
     "session.list",
     "session.move_to_space",
     "session.open",
+    "session.title_projection",
     "session.remove_from_space",
     "session.rename",
     "space.archive",
@@ -11461,7 +11537,7 @@ mod tests {
         assert!(endpoint.endpoint_ref.starts_with("bep_"));
         assert!(!endpoint.endpoint_ref.contains(PROFILE_SEED));
         assert_eq!(endpoint.device_id, DEVICE);
-        assert!(!endpoint.webchat_control_allowed);
+        assert!(endpoint.webchat_control_allowed);
         assert!(!endpoint.tool_bridge_allowed);
         assert!(!endpoint.tool_bridge_mutation_allowed);
 
@@ -11482,7 +11558,7 @@ mod tests {
             "browser_consent_cas_conflict"
         );
 
-        // Successful consent mutation from revision 0 -> 1.
+        // Tool Bridge consent mutation from revision 0 -> 1 keeps WebChat control enabled.
         let consent = store
             .set_browser_endpoint_consent(BrowserEndpointConsentInput {
                 endpoint_ref: &endpoint.endpoint_ref,
@@ -11498,7 +11574,7 @@ mod tests {
         assert!(consent.tool_bridge_mutation_allowed);
         assert_eq!(consent.consent_revision, 1);
 
-        // Turn OFF WebChat control from revision 1 -> 2.
+        // A legacy false WebChat field is normalized to enabled at revision 2.
         let consent_off = store
             .set_browser_endpoint_consent(BrowserEndpointConsentInput {
                 endpoint_ref: &endpoint.endpoint_ref,
@@ -11509,10 +11585,10 @@ mod tests {
                 observed_at: 12,
             })
             .unwrap();
-        assert!(!consent_off.webchat_control_allowed);
+        assert!(consent_off.webchat_control_allowed);
         assert_eq!(consent_off.consent_revision, 2);
 
-        // Stale ON request (with old revision 1 or 0) fails closed and cannot overwrite newer OFF.
+        // A stale revision still fails closed and cannot overwrite the newer Tool Bridge state.
         assert_eq!(
             store
                 .set_browser_endpoint_consent(BrowserEndpointConsentInput {
@@ -11526,12 +11602,12 @@ mod tests {
                 .unwrap_err(),
             "browser_consent_cas_conflict"
         );
-        // Verify still OFF
+        // Verify the current WebChat projection remains enabled.
         let current_ep = store
             .browser_endpoint(&endpoint.endpoint_ref)
             .unwrap()
             .unwrap();
-        assert!(!current_ep.webchat_control_allowed);
+        assert!(current_ep.webchat_control_allowed);
         assert_eq!(current_ep.consent_revision, 2);
 
         // Valid widening with current revision 2 -> 3
@@ -12096,7 +12172,7 @@ mod tests {
                 provider: "chatgpt",
                 adapter_protocol_version: 1,
                 observation_generation: 1_789_378_392_882,
-                capabilities_json: r#"{"schema_version":1,"operations":["composer.submit","composer.select_tool","generation.status","generation.stop","session.archive","session.inspect","session.open","session.create"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"}}}"#,
+                capabilities_json: r#"{"schema_version":1,"operations":["composer.submit","composer.select_tool","generation.status","generation.stop","session.archive","session.inspect","session.open","session.create","session.title_projection"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"}}}"#,
                 observed_at: 11,
             })
             .unwrap();
@@ -12106,6 +12182,13 @@ mod tests {
         assert_eq!(
             observed_capabilities["input_modalities"],
             serde_json::json!(["text"])
+        );
+        assert!(
+            observed_capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("session.title_projection"))
         );
         assert_eq!(
             observed_capabilities["limits"]["attachment_count"]["max"],

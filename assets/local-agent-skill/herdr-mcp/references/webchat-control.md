@@ -14,7 +14,7 @@ herdr-mcp webchat resources [--endpoint-ref REF] [--provider chatgpt] [--kind ac
 herdr-mcp webchat inspect RESOURCE_REF
 ```
 
-- `endpoint_ref` must report `consent.webchat_control: true`, otherwise the browser is not drivable.
+- Registered endpoints report `consent.webchat_control: true`; there is no local WebChat Control toggle. Actual mutation availability still intersects the exact caller grant, account binding, provider capability, and current observation generation.
 - Hierarchy is account → `space` (ChatGPT Project) → `session` (conversation); `parent_ref` gives the edge.
 - `resource_ref`, `endpoint_ref`, and `observation_generation` are the only valid identities. Never synthesize, transform, or guess a ref, and never reuse one from another machine or Project.
 - Pass the observed generation as `--expected-generation`.
@@ -38,6 +38,16 @@ herdr-mcp webchat create \
   --space-ref SPACE_REF --display-label LABEL --message MESSAGE \
   --expected-generation N --idempotency-key KEY [--work-chain-id WORK_CHAIN_ID]
 ```
+
+To make a WebChat child actually eligible to use the **provider-owned** Herdr App,
+pass `--required-app herdr` to `webchat create` or `webchat send`.
+The value is a provider App keyword, not Markdown text or a fabricated App pill.
+The Extension selects the *unique* matching provider App and reads its selected
+identity before submitting; absence, ambiguity or failed selection stops delivery.
+The Runtime must not classify a required-App message as `applied` unless
+`required_apps_readback` matches exactly. This is **App selection evidence only**:
+confirm a real tool call and result inside the child before claiming execution.
+With `uncertain`, read back first; never resend with a new idempotency key.
 
 Dispatch and observe:
 

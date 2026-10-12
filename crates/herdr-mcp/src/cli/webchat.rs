@@ -27,6 +27,14 @@ pub(super) fn parse_webchat(args: &[String]) -> Result<Command, String> {
         }
         Some("create") => parse_webchat_create(&args[1..]),
         Some("send") => parse_webchat_send(&args[1..]),
+        Some("dispatch-status") if args.get(1).map(String::as_str) == Some("--work-chain-id") => {
+            if args.len() != 3 || args[2].is_empty() {
+                return Err("webchat dispatch-status --work-chain-id requires <work_chain_id>".to_owned());
+            }
+            Ok(Command::WebChat(WebChatCommand::FanoutStatus {
+                work_chain_id: args[2].clone(),
+            }))
+        }
         Some("dispatch-status") => {
             if args.len() != 2 || args[1].is_empty() {
                 return Err("webchat dispatch-status requires <dispatch_id>".to_owned());
@@ -92,6 +100,7 @@ fn parse_webchat_create(args: &[String]) -> Result<Command, String> {
     let mut space_ref = None;
     let mut source_url = None;
     let mut display_label = None;
+    let mut required_app = None;
     let mut message = None;
     let mut expected_generation = None;
     let mut idempotency_key = None;
@@ -109,6 +118,7 @@ fn parse_webchat_create(args: &[String]) -> Result<Command, String> {
             "--space-ref" => space_ref = Some(value.clone()),
             "--source-url" => source_url = Some(value.clone()),
             "--display-label" => display_label = Some(value.clone()),
+            "--required-app" => required_app = Some(parse_webchat_required_app(value)?),
             "--message" => message = Some(value.clone()),
             "--expected-generation" => {
                 expected_generation = Some(parse_positive_i64(value, "--expected-generation")?)
@@ -145,6 +155,7 @@ fn parse_webchat_create(args: &[String]) -> Result<Command, String> {
         space_ref,
         source_url,
         display_label,
+        required_app,
         message: required_flag(message, "--message")?,
         expected_generation,
         idempotency_key: required_flag(idempotency_key, "--idempotency-key")?,
@@ -154,6 +165,7 @@ fn parse_webchat_create(args: &[String]) -> Result<Command, String> {
 
 fn parse_webchat_send(args: &[String]) -> Result<Command, String> {
     let mut session_ref = None;
+    let mut required_app = None;
     let mut message = None;
     let mut expected_generation = None;
     let mut idempotency_key = None;
@@ -166,6 +178,7 @@ fn parse_webchat_send(args: &[String]) -> Result<Command, String> {
             .ok_or_else(|| format!("{flag} requires a value"))?;
         match flag {
             "--session-ref" => session_ref = Some(value.clone()),
+            "--required-app" => required_app = Some(parse_webchat_required_app(value)?),
             "--message" => message = Some(value.clone()),
             "--expected-generation" => {
                 expected_generation = Some(parse_positive_i64(value, "--expected-generation")?)
@@ -178,6 +191,7 @@ fn parse_webchat_send(args: &[String]) -> Result<Command, String> {
     }
     Ok(Command::WebChat(WebChatCommand::Send {
         session_ref: required_flag(session_ref, "--session-ref")?,
+        required_app,
         message: required_flag(message, "--message")?,
         expected_generation: expected_generation
             .ok_or_else(|| "webchat send requires --expected-generation".to_owned())?,
@@ -322,6 +336,18 @@ fn parse_webchat_handoff(args: &[String]) -> Result<Command, String> {
     }))
 }
 
+fn parse_webchat_required_app(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("--required-app must be a single provider App keyword (ASCII letters, digits, hyphen, underscore; at most 64 bytes)".to_owned());
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 fn parse_optional_limit_flag(args: &[String], default: usize) -> Result<usize, String> {
     if args.is_empty() {
         return Ok(default);
@@ -352,9 +378,9 @@ Usage:\n\
   herdr-mcp webchat endpoints [--limit N]\n\
   herdr-mcp webchat resources [--endpoint-ref REF] [--provider PROVIDER] [--kind account|space|session] [--parent-ref REF] [--limit N]\n\
   herdr-mcp webchat inspect <resource_ref>\n\
-  herdr-mcp webchat create --endpoint-ref REF --provider PROVIDER --account-ref REF --display-label LABEL --message MESSAGE --expected-generation N --idempotency-key KEY [--space-ref REF] [--work-chain-id ID]\n\
-  herdr-mcp webchat create --source-url URL --message MESSAGE --idempotency-key KEY [--work-chain-id ID]\n\
-  herdr-mcp webchat send --session-ref REF --message MESSAGE --expected-generation N --idempotency-key KEY [--work-chain-id ID]\n\
+  herdr-mcp webchat create --endpoint-ref REF --provider PROVIDER --account-ref REF --display-label LABEL --message MESSAGE --expected-generation N --idempotency-key KEY [--space-ref REF] [--work-chain-id ID] [--required-app APP_KEYWORD]\n\
+  herdr-mcp webchat create --source-url URL --message MESSAGE --idempotency-key KEY [--work-chain-id ID] [--required-app APP_KEYWORD]\n\
+  herdr-mcp webchat send --session-ref REF --message MESSAGE --expected-generation N --idempotency-key KEY [--work-chain-id ID] [--required-app APP_KEYWORD]\n\
   herdr-mcp webchat dispatch-status <dispatch_id>\n\
   herdr-mcp webchat open --session-ref REF --expected-generation N --idempotency-key KEY\n\
   herdr-mcp webchat archive --session-ref REF --expected-generation N --idempotency-key KEY\n\

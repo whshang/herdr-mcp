@@ -305,7 +305,7 @@ CREATE TABLE IF NOT EXISTS browser_endpoints (
     device_id                       TEXT NOT NULL,
     browser_family                  TEXT NOT NULL,
     extension_version               TEXT NOT NULL,
-    webchat_control_allowed         INTEGER NOT NULL DEFAULT 0,
+    webchat_control_allowed         INTEGER NOT NULL DEFAULT 1,
     tool_bridge_allowed             INTEGER NOT NULL DEFAULT 0,
     tool_bridge_mutation_allowed    INTEGER NOT NULL DEFAULT 0,
     consent_revision                INTEGER NOT NULL DEFAULT 0,

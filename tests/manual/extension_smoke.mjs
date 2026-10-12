@@ -308,10 +308,10 @@ ok(wakeSource.includes("chatGptProjectCatalog")
     && backgroundSource.includes("enrichConversationInfoWithBrowserScope")
     && backgroundSource.includes("project_roots"),
   "ChatGPT project catalog restores project identity for plain conversation URLs and keeps local roots on bindings");
-ok(!backgroundSource.includes('project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`')
-    && !backgroundSource.includes('canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`')
-    && !backgroundSource.includes('project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(catalogProjectId)}/project`'),
-  "ChatGPT Project launchers keep the stable resource-id route instead of the redirect target");
+ok(backgroundSource.includes('project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`')
+    && backgroundSource.includes('canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`')
+    && backgroundSource.includes('project_launch_url: `${projectKey}/project`'),
+  "ChatGPT Project launchers use the working /project page while keeping the stable resource-id key");
 ok(controlCenterSource.includes("[HERDR_PROJECT_CONTEXT_START]")
     && controlCenterSource.includes("projectInstructionContext")
     && controlCenterSource.includes('type: "h2w_sync_project_instructions"')
@@ -757,6 +757,9 @@ ok(
 
   const accountCtx = vm.createContext({
     window: {},
+    AbortController,
+    setTimeout,
+    clearTimeout,
     location: { origin: u.origin, pathname: "/c/test" },
     document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
     fetch: async (url, options) => ({
@@ -773,6 +776,53 @@ ok(
   ok(await vm.runInContext("window.__H2W_ADAPTER__.getAccountNativeIdentity()", accountCtx)
       === "chatgpt-user-123",
     "ChatGPT account identity is observed through the provider adapter hook");
+
+  const accountFallbackCtx = vm.createContext({
+    window: {},
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    location: { origin: u.origin, pathname: "/c/test" },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    fetch: async (url, options) => ({
+      ok: url === "/api/auth/session"
+        && options?.method === "GET"
+        && options?.credentials === "include"
+        && options?.cache === "no-store",
+      json: async () => url === "/api/auth/session"
+        ? { user: { id: "  chatgpt-session-user-456  " }, accessToken: "ignored-secret" }
+        : {},
+    }),
+    console,
+  });
+  vm.runInContext(baseCode, accountFallbackCtx);
+  vm.runInContext(chatgptCode, accountFallbackCtx);
+  ok(await vm.runInContext("window.__H2W_ADAPTER__.getAccountNativeIdentity()", accountFallbackCtx)
+      === "chatgpt-session-user-456",
+    "ChatGPT account identity falls back only to an explicit signed-in session account id");
+
+  const tokenOnlyCtx = vm.createContext({
+    window: {},
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    location: { origin: u.origin, pathname: "/c/test" },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    fetch: async (url, options) => ({
+      ok: url === "/api/auth/session"
+        && options?.method === "GET"
+        && options?.credentials === "include"
+        && options?.cache === "no-store",
+      json: async () => url === "/api/auth/session"
+        ? { user: { name: "no-id" }, accessToken: "header.payload.signature" }
+        : {},
+    }),
+    console,
+  });
+  vm.runInContext(baseCode, tokenOnlyCtx);
+  vm.runInContext(chatgptCode, tokenOnlyCtx);
+  ok(await vm.runInContext("window.__H2W_ADAPTER__.getAccountNativeIdentity()", tokenOnlyCtx) === null,
+    "ChatGPT account identity fails closed when the signed-in session exposes only a token");
 
   const composerStop = { id: "composer-stop" };
   const unrelatedStop = { id: "unrelated-stop" };
@@ -810,8 +860,9 @@ ok(
     "URL fallback recognizes the reported ChatGPT project conversation");
   ok(conversationInfoFromSupportedUrl(slugged)?.convKey === project,
     "URL fallback normalizes a slugged ChatGPT Project alias to the resource-id key");
-  ok(chatGptConversationInfo(slugged)?.project_launch_url === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978",
-    "Project rollover launcher uses stable Project resource id");
+  ok(chatGptConversationInfo(slugged)?.project_key === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978"
+      && chatGptConversationInfo(slugged)?.project_launch_url === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/project",
+    "Project rollover keeps stable identity but opens the real /project home");
   ok(conversationInfoFromSupportedUrl(projectHome)?.convKey
       === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978"
       && conversationInfoFromSupportedUrl(projectHome)?.binding_scope === "project",
@@ -1202,6 +1253,68 @@ ok(chatGptAdapterSource.includes("getStopButtonCandidates()")
     && wakeSource.includes('data.manual === true ? 1200 : (boundedBrowserActuation ? 1500 : 15000)')
     && wakeSource.includes('busy_reason: composerBusyReason() || "unknown"'),
   "manual Continue scopes composer busy detection to explicit composer stop controls and fails fast when truly busy");
+// ChatGPT wake.js and Generic Web Page Assist install independent content
+// listeners. Wake must not respond first to a message owned by Page Assist.
+const pageAssistListenerStart = wakeSource.indexOf("chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {");
+const pageAssistListenerEnd = wakeSource.indexOf("\n    });\n  } catch (e)", pageAssistListenerStart);
+let wakeContentListener = null;
+if (pageAssistListenerStart >= 0 && pageAssistListenerEnd > pageAssistListenerStart) {
+  vm.runInNewContext(
+    wakeSource.slice(pageAssistListenerStart, pageAssistListenerEnd + "\n    });".length),
+    { chrome: { runtime: { onMessage: { addListener(fn) { wakeContentListener = fn; } } } } },
+  );
+}
+let pageAssistSwallowed = false;
+const pageAssistReturn = wakeContentListener?.(
+  { type: "h2w_page_assist", action: "observe" },
+  {},
+  () => { pageAssistSwallowed = true; },
+);
+ok(pageAssistReturn === false && !pageAssistSwallowed,
+  "WebChat content listener leaves h2w_page_assist responses to the Generic Web listener");
+// Exercise the actual BrowserPage read handler with a Chrome-compatible
+// unresolved initial response. The absence of a Page Assist listener must
+// invoke its existing one-shot kernel injection and settle with a DOM read.
+const pageActionStart = backgroundSource.indexOf("async function performBrowserPageActionRequest(msg) {");
+const pageIdentityStart = backgroundSource.indexOf("function withBrowserPageIdentity(result, page) {", pageActionStart);
+const pageIdentityEnd = backgroundSource.indexOf("\nasync function resolveDoubaoImagePage(", pageIdentityStart);
+let pageReadResponse = null;
+if (pageActionStart >= 0 && pageIdentityStart > pageActionStart && pageIdentityEnd > pageIdentityStart) {
+  const pageRef = "bp_" + "a".repeat(64);
+  let pageSendCount = 0;
+  let pageScriptInjections = 0;
+  const page = { page_ref: pageRef, page_generation: 1, ownership: "claimed", origin: "https://chatgpt.com" };
+  const pageActionCtx = vm.createContext({
+    configReady: Promise.resolve(),
+    browserEndpoint: { endpoint_ref: "bep_test" },
+    browserEndpointView: (endpoint) => endpoint,
+    validBrowserPageRef: (value) => value === pageRef,
+    loadBrowserPages: async () => {},
+    browserPagesByRef: new Map([[pageRef, { endpoint_ref: "bep_test" }]]),
+    originToMatchPattern: () => "https://chatgpt.com/*",
+    hasHostPermission: async () => true,
+    resolveBrowserPage: async () => ({ ok: true, page, tab: { id: 123 } }),
+    chrome: {
+      tabs: { sendMessage: async () => (++pageSendCount === 1
+        ? undefined
+        : { ok: true, generation: "fresh_dom_generation", elements: [] }) },
+      scripting: { executeScript: async () => { pageScriptInjections += 1; } },
+    },
+  });
+  vm.runInContext(
+    backgroundSource.slice(pageActionStart, pageIdentityEnd)
+      + "\n globalThis.exercisePageAction = performBrowserPageActionRequest;",
+    pageActionCtx,
+  );
+  pageReadResponse = await pageActionCtx.exercisePageAction({ action: "observe", pageRef });
+  ok(pageReadResponse?.ok === true
+      && pageReadResponse.generation === "fresh_dom_generation"
+      && pageSendCount === 2
+      && pageScriptInjections === 1,
+    "read-only BrowserPage observe recovers one missing content reply via one kernel injection");
+} else {
+  ok(false, "read-only BrowserPage observe recovery handler is present");
+}
 const wakeHandlerStart = wakeSource.indexOf('if (msg?.type === "h2w_wake")');
 const wakeHandlerEnd = wakeHandlerStart >= 0 ? wakeSource.indexOf('sendResponse({});', wakeHandlerStart) : -1;
 const wakeHandlerBlock = wakeHandlerStart >= 0 && wakeHandlerEnd > wakeHandlerStart

@@ -136,9 +136,18 @@ const probes = {
       "const menuRoots = [...document.querySelectorAll('.popover, [role=\"menu\"], [role=\"listbox\"]')]",
     )
       && source.adapter.includes("for (const root of menuRoots)")
-      && source.wake.includes("!composerModelVisibleText()")
-      && source.wake.includes("const search = selector ? await insertMainWorld(app, selector) : null")
-      && source.wake.includes("if (searchInserted) await clearComposer()");
+      && (source.wake.includes("!composerModelVisibleText()")
+        || source.wake.includes("ADAPTER.getComposerTextWithoutAppPills() !== ''"))
+      && (
+        source.wake.includes("const search = selector ? await insertMainWorld(app, selector) : null")
+        || source.wake.includes("const search = selector ? await insertMainWorld(`@${app}`, selector) : null")
+        || (source.wake.includes("await insertMainWorld('@', selector")
+          && source.wake.includes("await insertMainWorld(app, selector, true)"))
+      )
+      && (source.wake.includes("if (searchInserted) await clearComposer()")
+        // 0.1.168: cleanup removes only the automation-typed search text.
+        || (source.wake.includes("if (searchInserted) await clearAutomationSearch(app)")
+          && source.wake.includes("async function clearAutomationSearch(app)")));
   },
 
   manual_semantic_binding_identity(source) {
