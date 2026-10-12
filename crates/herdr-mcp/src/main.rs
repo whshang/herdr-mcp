@@ -148,8 +148,8 @@ fn main_inner() -> ExitCode {
 /// v1.0.0–v1.0.3 foreground updaters, whose candidate probe admits a
 /// downloaded candidate only when its version output *contains* the
 /// 0.4.x-era hardcoded `contract epoch 2 / 18 tools` string (tag v1.0.1,
-/// updater.rs:1937-1942; byte-identical in v1.0.0 and v1.0.3 at
-/// updater.rs:2051-2056). It is a labeled compatibility marker, not this
+/// updater.rs:1937-1942, byte-identical in v1.0.0 and v1.0.2; the same
+/// check is at updater.rs:2051-2056 in v1.0.3). It is a labeled compatibility marker, not this
 /// runtime's contract epoch: this runtime's own probe matches epoch lines
 /// exactly, so this line can never satisfy an epoch check.
 pub(crate) fn version_output_text(contract: &contract::ContractIdentity) -> String {
