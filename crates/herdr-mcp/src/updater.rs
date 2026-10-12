@@ -85,6 +85,11 @@ struct ReleasePlan {
     version: Version,
     tag: String,
     identity: ReleaseIdentity,
+    /// Admitted manifest contract identity `M`. Equals the local identity on a
+    /// same-contract update; on the cross-epoch path it is exactly one epoch
+    /// ahead and the candidate probe compares against it, not against the
+    /// local identity.
+    contract: contract::ContractIdentity,
     asset: ReleaseAsset,
 }
 
@@ -534,7 +539,22 @@ fn apply_inner(
         progress.phase("Preparing a rollback-safe update job...");
         let (job_id, binary_path) = stage_release(&paths, &plan, &mut progress)?;
         progress.phase("Download verified. Probing candidate runtime identity...");
-        if let Err(error) = probe_candidate_binary(&binary_path, &plan.version) {
+        let local_contract = contract::identity()?;
+        if let Err(error) =
+            probe_candidate_binary(&binary_path, &plan.version, &plan.contract, &local_contract)
+        {
+            cleanup_staging(&binary_path);
+            return Err(error);
+        }
+        // Persist the admitted manifest contract `M` with the job so the
+        // worker — which runs inside the staged candidate — validates against
+        // the contract the foreground admitted from the attested manifest,
+        // never against the candidate's own self-report alone.
+        if let Err(error) = binary_path
+            .parent()
+            .ok_or_else(|| "staged update binary has no job directory".to_owned())
+            .and_then(|job_dir| persist_admitted_contract(job_dir, &plan.contract))
+        {
             cleanup_staging(&binary_path);
             return Err(error);
         }
@@ -1508,10 +1528,31 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
             return Err("staged update binary is outside its job directory".to_owned());
         }
         verify_staged_file(&binary, &job.sha256)?;
+        // The worker runs inside the staged candidate binary, so its own
+        // self-reported identity proves nothing here. Validate against the
+        // admitted manifest contract `M` the foreground updater verified and
+        // persisted with this job, and bind this runtime's embedded identity
+        // to `M` as well. Jobs staged by the released v1.0.0–v1.0.3
+        // foreground updaters carry no such record; see
+        // `admitted_contract_for_job` for that legacy path.
+        let job_dir = binary
+            .parent()
+            .ok_or_else(|| "staged update binary has no job directory".to_owned())?;
+        let own = contract::identity()?;
+        let admitted = admitted_contract_for_job(job_dir, &own)?;
+        if own != admitted {
+            return Err(format!(
+                "update worker runtime contract identity does not match the admitted manifest \
+                 contract (worker epoch {} hash {}, admitted epoch {} hash {})",
+                own.epoch, own.hash, admitted.epoch, admitted.hash
+            ));
+        }
         probe_candidate_binary(
             &binary,
             &Version::parse(&job.version)
                 .map_err(|_| "durable update job contains an invalid version".to_owned())?,
+            &admitted,
+            &own,
         )?;
         store.update_update_job(
             job_id,
@@ -1724,17 +1765,7 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
     let identity = release_trust::parse_manifest_identity(value, &tag)?;
 
     let expected = contract::identity()?;
-    let contract = value
-        .get("contract")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "release manifest is missing contract identity".to_owned())?;
-    if contract.get("epoch").and_then(Value::as_u64) != Some(u64::from(expected.epoch))
-        || contract.get("hash").and_then(Value::as_str) != Some(expected.hash.as_str())
-        || contract.get("tool_count").and_then(Value::as_u64)
-            != Some(u64::from(expected.tool_count))
-    {
-        return Err("release manifest contract identity mismatch".to_owned());
-    }
+    let contract = admit_release_contract(value, &expected)?;
 
     let assets = value
         .get("assets")
@@ -1784,6 +1815,7 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
         version,
         tag,
         identity,
+        contract,
         asset: ReleaseAsset {
             target: target.to_owned(),
             name,
@@ -1792,6 +1824,134 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
             url,
         },
     })
+}
+
+/// Admit the manifest contract identity `M` against the local identity `L`.
+///
+/// Same-contract updates are unchanged. Crossing exactly one epoch forward is
+/// admitted only when the manifest declares a well-formed `contract_migration`
+/// whose `from` identity equals `L` exactly and whose `state_schema_from`
+/// equals the local state schema. Everything else — an epoch skip greater than
+/// one, a lower epoch, a missing or malformed declaration, a mismatched `from`
+/// identity, or unknown fields inside `contract_migration` — is refused before
+/// anything is installed. The declaration lives inside the manifest bytes, so
+/// it is covered by the existing artifact attestation of the manifest digest.
+/// This protocol never migrates the durable state schema; the manifest
+/// `state_schema` equality rule is checked separately and stays.
+fn admit_release_contract(
+    value: &Value,
+    local: &contract::ContractIdentity,
+) -> Result<contract::ContractIdentity, String> {
+    let contract = value
+        .get("contract")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "release manifest is missing contract identity".to_owned())?;
+    let manifest_epoch = contract
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .and_then(|epoch| u32::try_from(epoch).ok())
+        .ok_or_else(|| "release manifest contract epoch is invalid".to_owned())?;
+    let manifest_hash = contract
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "release manifest contract hash is invalid".to_owned())?;
+    let manifest_tool_count = contract
+        .get("tool_count")
+        .and_then(Value::as_u64)
+        .and_then(|tool_count| u32::try_from(tool_count).ok())
+        .ok_or_else(|| "release manifest contract tool_count is invalid".to_owned())?;
+    let target = contract::ContractIdentity {
+        epoch: manifest_epoch,
+        hash: manifest_hash.to_owned(),
+        tool_count: manifest_tool_count,
+    };
+    if &target == local {
+        return Ok(target);
+    }
+    if manifest_epoch != local.epoch + 1 {
+        return Err(format!(
+            "release manifest contract identity mismatch: manifest contract epoch \
+             {manifest_epoch} is not admissible from local contract epoch {} (an update accepts \
+             the same contract or exactly one epoch forward with a matching contract_migration \
+             declaration); if this release skipped an intermediate bridge, install that bridge \
+             first with `herdr-mcp update apply --manifest <runtime-manifest.json url>`",
+            local.epoch
+        ));
+    }
+    let migration = value.get("contract_migration").ok_or_else(|| {
+        format!(
+            "release manifest contract identity mismatch: contract epoch {manifest_epoch} is \
+             one epoch ahead of local contract epoch {} but the manifest declares no \
+             contract_migration; refusing cross-epoch update",
+            local.epoch
+        )
+    })?;
+    let migration_object = migration
+        .as_object()
+        .ok_or_else(|| malformed_migration_error(local.epoch, target.epoch))?;
+    if !migration_object.contains_key("from") || !migration_object.contains_key("state_schema_from")
+    {
+        return Err(malformed_migration_error(local.epoch, target.epoch));
+    }
+    if migration_object.len() != 2 {
+        return Err(format!(
+            "release manifest contract_migration contains unknown fields; refusing \
+             cross-epoch update from local contract epoch {} to target contract epoch {}",
+            local.epoch, target.epoch
+        ));
+    }
+    let from = migration_object
+        .get("from")
+        .and_then(Value::as_object)
+        .ok_or_else(|| malformed_migration_error(local.epoch, target.epoch))?;
+    if !from.contains_key("epoch") || !from.contains_key("hash") || !from.contains_key("tool_count")
+    {
+        return Err(malformed_migration_error(local.epoch, target.epoch));
+    }
+    if from.len() != 3 {
+        return Err(format!(
+            "release manifest contract_migration contains unknown fields; refusing \
+             cross-epoch update from local contract epoch {} to target contract epoch {}",
+            local.epoch, target.epoch
+        ));
+    }
+    let from_epoch = from.get("epoch").and_then(Value::as_u64);
+    let from_hash = from.get("hash").and_then(Value::as_str);
+    let from_tool_count = from.get("tool_count").and_then(Value::as_u64);
+    if from_epoch != Some(u64::from(local.epoch))
+        || from_hash != Some(local.hash.as_str())
+        || from_tool_count != Some(u64::from(local.tool_count))
+    {
+        return Err(format!(
+            "release manifest contract_migration.from does not match the local contract \
+             identity (local epoch {}, target epoch {}, declared from epoch {}); refusing \
+             cross-epoch update",
+            local.epoch,
+            target.epoch,
+            from_epoch.unwrap_or_default()
+        ));
+    }
+    let state_schema_from = migration_object
+        .get("state_schema_from")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| malformed_migration_error(local.epoch, target.epoch))?;
+    if state_schema_from != SCHEMA_VERSION {
+        return Err(format!(
+            "release manifest contract_migration.state_schema_from {state_schema_from} does not \
+             match the local state schema {SCHEMA_VERSION} (local contract epoch {}, target \
+             contract epoch {}); refusing cross-epoch update",
+            local.epoch, target.epoch
+        ));
+    }
+    Ok(target)
+}
+
+fn malformed_migration_error(local_epoch: u32, target_epoch: u32) -> String {
+    format!(
+        "release manifest contract_migration declaration is malformed (expected exactly \
+         from{{epoch,hash,tool_count}} and state_schema_from); refusing cross-epoch update \
+         from local contract epoch {local_epoch} to target contract epoch {target_epoch}"
+    )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2037,7 +2197,12 @@ fn verify_staged_file(path: &Path, expected_sha256: &str) -> Result<(), String> 
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn probe_candidate_binary(path: &Path, expected: &Version) -> Result<(), String> {
+fn probe_candidate_binary(
+    path: &Path,
+    expected: &Version,
+    admitted: &contract::ContractIdentity,
+    local: &contract::ContractIdentity,
+) -> Result<(), String> {
     let output = Command::new(path)
         .arg("version")
         .stdin(Stdio::null())
@@ -2048,13 +2213,165 @@ fn probe_candidate_binary(path: &Path, expected: &Version) -> Result<(), String>
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let expected_first = format!("herdr-mcp {expected}");
+    // The candidate must report the admitted manifest contract `M`: identical
+    // to the local identity on a same-contract update, one epoch ahead on the
+    // cross-epoch path. Epoch, tool count, and state schema are matched as
+    // whole lines so the labeled `legacy probe compat` compatibility line in
+    // `herdr-mcp version` output can never satisfy an epoch or schema check;
+    // the hash is the third binding field and is required on the cross-epoch
+    // path, while same-contract candidates may predate the `contract hash`
+    // version line and only a reported-but-different hash is refused.
+    let expected_epoch_line = format!(
+        "contract epoch {} / {} tools",
+        admitted.epoch, admitted.tool_count
+    );
+    let expected_schema_line = format!("state schema {SCHEMA_VERSION}");
+    let identity_mismatch = format!(
+        "staged update binary identity does not match release manifest (local contract epoch {}, \
+         target contract epoch {})",
+        local.epoch, admitted.epoch
+    );
     if text.lines().next() != Some(expected_first.as_str())
-        || !text.contains("contract epoch 2 / 18 tools")
-        || !text.contains(&format!("state schema {SCHEMA_VERSION}"))
+        || !text
+            .lines()
+            .any(|line| line == expected_epoch_line.as_str())
+        || !text
+            .lines()
+            .any(|line| line == expected_schema_line.as_str())
     {
-        return Err("staged update binary identity does not match release manifest".to_owned());
+        return Err(identity_mismatch);
     }
-    Ok(())
+    let reported_hash = text
+        .lines()
+        .find_map(|line| line.strip_prefix("contract hash "));
+    if admitted == local {
+        return match reported_hash {
+            None => Ok(()),
+            Some(hash) if hash == admitted.hash => Ok(()),
+            Some(hash) => Err(format!(
+                "staged update binary reports contract hash {hash} but the release manifest \
+                 admits {} ({identity_mismatch})",
+                admitted.hash
+            )),
+        };
+    }
+    match reported_hash {
+        Some(hash) if hash == admitted.hash => Ok(()),
+        Some(hash) => Err(format!(
+            "staged update binary reports contract hash {hash} but the release manifest \
+             admits {} ({identity_mismatch})",
+            admitted.hash
+        )),
+        None => Err(format!(
+            "staged update binary does not report the admitted contract hash {} \
+             ({identity_mismatch})",
+            admitted.hash
+        )),
+    }
+}
+
+/// Name of the job-directory record holding the manifest contract `M` the
+/// foreground updater admitted and verified against the staged candidate. The
+/// update worker runs inside that same staged binary, so this record — not the
+/// candidate's own self-report — is what its validation is bound to.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const ADMITTED_CONTRACT_RECORD: &str = "admitted-contract.json";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const ADMITTED_CONTRACT_MAX_BYTES: usize = 4096;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn persist_admitted_contract(
+    job_dir: &Path,
+    admitted: &contract::ContractIdentity,
+) -> Result<(), String> {
+    let record = json!({
+        "epoch": admitted.epoch,
+        "hash": admitted.hash,
+        "tool_count": admitted.tool_count,
+    });
+    let file = job_dir.join(ADMITTED_CONTRACT_RECORD);
+    let temp = file.with_extension("tmp");
+    #[cfg(unix)]
+    let mut handle = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .map_err(|error| format!("cannot create admitted contract record: {error}"))?;
+    #[cfg(not(unix))]
+    let mut handle = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| format!("cannot create admitted contract record: {error}"))?;
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|error| format!("cannot encode admitted contract record: {error}"))?;
+    handle
+        .write_all(&bytes)
+        .and_then(|_| handle.sync_all())
+        .map_err(|error| format!("cannot write admitted contract record: {error}"))?;
+    fs::rename(&temp, &file)
+        .map_err(|error| format!("cannot commit admitted contract record: {error}"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn load_admitted_contract(job_dir: &Path) -> Result<contract::ContractIdentity, String> {
+    let file = job_dir.join(ADMITTED_CONTRACT_RECORD);
+    let bytes = fs::read(&file)
+        .map_err(|error| format!("cannot read admitted contract record: {error}"))?;
+    if bytes.len() > ADMITTED_CONTRACT_MAX_BYTES {
+        return Err("admitted contract record is too large".to_owned());
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("admitted contract record is invalid JSON: {error}"))?;
+    let epoch = u32::try_from(
+        value
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "admitted contract record is missing epoch".to_owned())?,
+    )
+    .map_err(|_| "admitted contract record epoch is out of range".to_owned())?;
+    let hash = value
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "admitted contract record is missing hash".to_owned())?
+        .to_owned();
+    let tool_count = u32::try_from(
+        value
+            .get("tool_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "admitted contract record is missing tool_count".to_owned())?,
+    )
+    .map_err(|_| "admitted contract record tool_count is out of range".to_owned())?;
+    Ok(contract::ContractIdentity {
+        epoch,
+        hash,
+        tool_count,
+    })
+}
+
+/// Admitted manifest contract for an update job directory.
+///
+/// Jobs staged by this release's foreground updater carry the persisted
+/// `admitted-contract.json` record and are bound to it. Jobs staged by the
+/// released v1.0.0–v1.0.3 foreground updaters predate that record: for those
+/// legacy jobs the durable job's manifest sha256 — already verified against
+/// the staged file by the caller — is the strongest foreground binding, so
+/// the worker falls back to its own embedded identity and the candidate
+/// probe still re-verifies the staged binary's version output line by line.
+/// A record that exists in any form is always parsed and still fails closed
+/// when unreadable or invalid; only a provably absent record takes the
+/// legacy path.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn admitted_contract_for_job(
+    job_dir: &Path,
+    own: &contract::ContractIdentity,
+) -> Result<contract::ContractIdentity, String> {
+    match fs::symlink_metadata(job_dir.join(ADMITTED_CONTRACT_RECORD)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(own.clone()),
+        Err(error) => Err(format!("cannot inspect admitted contract record: {error}")),
+        Ok(_) => load_admitted_contract(job_dir),
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -3165,6 +3482,589 @@ mod tests {
                 .contains("trusted repository")
         );
         assert!(parse_release_plan(&manifest_for(target, "9.9.9"), "other-target").is_err());
+    }
+
+    /// Epoch-5 identity the first v1.1 release will declare (spec frozen
+    /// value); only used to shape admissible cross-epoch manifests.
+    fn next_epoch_identity() -> contract::ContractIdentity {
+        contract::ContractIdentity {
+            epoch: contract::identity().unwrap().epoch + 1,
+            hash: "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030"
+                .to_owned(),
+            tool_count: contract::identity().unwrap().tool_count,
+        }
+    }
+
+    fn manifest_declaring_contract(
+        target: &str,
+        version: &str,
+        declared: &contract::ContractIdentity,
+    ) -> Value {
+        let mut manifest = manifest_for(target, version);
+        manifest["contract"] = json!({
+            "epoch": declared.epoch,
+            "hash": declared.hash,
+            "tool_count": declared.tool_count,
+        });
+        manifest
+    }
+
+    fn with_contract_migration(manifest: &mut Value, from: &contract::ContractIdentity) {
+        manifest["contract_migration"] = json!({
+            "from": {
+                "epoch": from.epoch,
+                "hash": from.hash,
+                "tool_count": from.tool_count,
+            },
+            "state_schema_from": SCHEMA_VERSION,
+        });
+    }
+
+    #[test]
+    fn manifest_admission_accepts_same_contract() {
+        let target = current_target().unwrap();
+        let local = contract::identity().unwrap();
+        let plan = parse_release_plan(&manifest_for(target, "9.9.9"), target).unwrap();
+        assert_eq!(plan.contract, local);
+    }
+
+    #[test]
+    fn manifest_admission_accepts_exactly_one_epoch_forward_with_declaration() {
+        let target = current_target().unwrap();
+        let local = contract::identity().unwrap();
+        let next = next_epoch_identity();
+        let mut manifest = manifest_declaring_contract(target, "1.1.0", &next);
+        with_contract_migration(&mut manifest, &local);
+        let plan = parse_release_plan(&manifest, target).unwrap();
+        assert_eq!(plan.contract, next);
+        assert_eq!(plan.version, Version::parse("1.1.0").unwrap());
+    }
+
+    #[test]
+    fn manifest_admission_refuses_missing_migration_declaration() {
+        let target = current_target().unwrap();
+        let local = contract::identity().unwrap();
+        let next = next_epoch_identity();
+        let manifest = manifest_declaring_contract(target, "1.1.0", &next);
+        let error = parse_release_plan(&manifest, target).unwrap_err();
+        assert!(error.contains("no contract_migration"), "{error}");
+        assert!(error.contains(local.epoch.to_string().as_str()), "{error}");
+        assert!(error.contains(next.epoch.to_string().as_str()), "{error}");
+    }
+
+    #[test]
+    fn manifest_admission_refuses_malformed_migration_declaration() {
+        let target = current_target().unwrap();
+        let local = contract::identity().unwrap();
+        let next = next_epoch_identity();
+        let assert_names_both_epochs = |error: String| {
+            assert!(error.contains("malformed"), "{error}");
+            assert!(error.contains(local.epoch.to_string().as_str()), "{error}");
+            assert!(error.contains(next.epoch.to_string().as_str()), "{error}");
+        };
+
+        let mut missing_from = manifest_declaring_contract(target, "1.1.0", &next);
+        missing_from["contract_migration"] = json!({"state_schema_from": SCHEMA_VERSION});
+        assert_names_both_epochs(parse_release_plan(&missing_from, target).unwrap_err());
+
+        let mut missing_state_schema_from = manifest_declaring_contract(target, "1.1.0", &next);
+        missing_state_schema_from["contract_migration"] = json!({
+            "from": {"epoch": local.epoch, "hash": local.hash, "tool_count": local.tool_count}
+        });
+        assert_names_both_epochs(
+            parse_release_plan(&missing_state_schema_from, target).unwrap_err(),
+        );
+
+        let mut non_numeric_state_schema_from = manifest_declaring_contract(target, "1.1.0", &next);
+        non_numeric_state_schema_from["contract_migration"] = json!({
+            "from": {"epoch": local.epoch, "hash": local.hash, "tool_count": local.tool_count},
+            "state_schema_from": "15",
+        });
+        assert_names_both_epochs(
+            parse_release_plan(&non_numeric_state_schema_from, target).unwrap_err(),
+        );
+
+        let mut from_not_object = manifest_declaring_contract(target, "1.1.0", &next);
+        from_not_object["contract_migration"] = json!({
+            "from": "epoch-4",
+            "state_schema_from": SCHEMA_VERSION,
+        });
+        assert_names_both_epochs(parse_release_plan(&from_not_object, target).unwrap_err());
+    }
+
+    #[test]
+    fn manifest_admission_refuses_from_identity_mismatch() {
+        let target = current_target().unwrap();
+        let local = contract::identity().unwrap();
+        let next = next_epoch_identity();
+
+        let mut wrong_hash = manifest_declaring_contract(target, "1.1.0", &next);
+        wrong_hash["contract_migration"] = json!({
+            "from": {"epoch": local.epoch, "hash": "sha256:wrong", "tool_count": local.tool_count},
+            "state_schema_from": SCHEMA_VERSION,
+        });
+        let error = parse_release_plan(&wrong_hash, target).unwrap_err();
+        assert!(error.contains("contract_migration.from"), "{error}");
+        assert!(error.contains("refusing cross-epoch update"), "{error}");
+        assert!(error.contains(local.epoch.to_string().as_str()), "{error}");
+        assert!(error.contains(next.epoch.to_string().as_str()), "{error}");
+
+        let mut wrong_tool_count = manifest_declaring_contract(target, "1.1.0", &next);
+        wrong_tool_count["contract_migration"] = json!({
+            "from": {"epoch": local.epoch, "hash": local.hash, "tool_count": local.tool_count + 1},
+            "state_schema_from": SCHEMA_VERSION,
+        });
+        let error = parse_release_plan(&wrong_tool_count, target).unwrap_err();
+        assert!(error.contains("contract_migration.from"), "{error}");
+        assert!(error.contains(next.epoch.to_string().as_str()), "{error}");
+    }
+
+    #[test]
+    fn manifest_admission_refuses_epoch_skip_greater_than_one_and_lower_epoch() {
+        let target = current_target().unwrap();
+        let local = contract::identity().unwrap();
+
+        // Epoch +2 refused even with a declaration claiming from == local.
+        let skip_two = contract::ContractIdentity {
+            epoch: local.epoch + 2,
+            hash: next_epoch_identity().hash,
+            tool_count: local.tool_count,
+        };
+        let mut manifest = manifest_declaring_contract(target, "1.2.0", &skip_two);
+        with_contract_migration(&mut manifest, &local);
+        let error = parse_release_plan(&manifest, target).unwrap_err();
+        assert!(error.contains("not admissible"), "{error}");
+        assert!(error.contains(local.epoch.to_string().as_str()), "{error}");
+        assert!(
+            error.contains((local.epoch + 2).to_string().as_str()),
+            "{error}"
+        );
+        assert!(
+            error.contains("herdr-mcp update apply --manifest"),
+            "{error}"
+        );
+
+        // Lower epoch refused without interpreting any declaration.
+        let lower = contract::ContractIdentity {
+            epoch: local.epoch.saturating_sub(1),
+            hash: next_epoch_identity().hash,
+            tool_count: local.tool_count,
+        };
+        let mut lower_manifest = manifest_declaring_contract(target, "0.9.0", &lower);
+        with_contract_migration(&mut lower_manifest, &local);
+        assert!(
+            parse_release_plan(&lower_manifest, target)
+                .unwrap_err()
+                .contains("not admissible")
+        );
+    }
+
+    #[test]
+    fn manifest_admission_refuses_unknown_migration_fields() {
+        let target = current_target().unwrap();
+        let local = contract::identity().unwrap();
+        let next = next_epoch_identity();
+        let assert_names_both_epochs = |error: String| {
+            assert!(error.contains("unknown fields"), "{error}");
+            assert!(error.contains(local.epoch.to_string().as_str()), "{error}");
+            assert!(error.contains(next.epoch.to_string().as_str()), "{error}");
+        };
+
+        let mut extra_top_level = manifest_declaring_contract(target, "1.1.0", &next);
+        extra_top_level["contract_migration"] = json!({
+            "from": {"epoch": local.epoch, "hash": local.hash, "tool_count": local.tool_count},
+            "state_schema_from": SCHEMA_VERSION,
+            "note": "unknown field",
+        });
+        assert_names_both_epochs(parse_release_plan(&extra_top_level, target).unwrap_err());
+
+        let mut extra_in_from = manifest_declaring_contract(target, "1.1.0", &next);
+        extra_in_from["contract_migration"] = json!({
+            "from": {
+                "epoch": local.epoch,
+                "hash": local.hash,
+                "tool_count": local.tool_count,
+                "extra": true,
+            },
+            "state_schema_from": SCHEMA_VERSION,
+        });
+        assert_names_both_epochs(parse_release_plan(&extra_in_from, target).unwrap_err());
+    }
+
+    #[test]
+    fn manifest_admission_refuses_cross_epoch_state_schema_mismatch() {
+        let target = current_target().unwrap();
+        let local = contract::identity().unwrap();
+        let next = next_epoch_identity();
+
+        // Manifest state_schema must still equal the local schema (existing
+        // rollback-compatible-schema rule; the protocol never migrates it).
+        let mut manifest_schema_ahead = manifest_declaring_contract(target, "1.1.0", &next);
+        with_contract_migration(&mut manifest_schema_ahead, &local);
+        manifest_schema_ahead["state_schema"] = json!(SCHEMA_VERSION + 1);
+        assert!(
+            parse_release_plan(&manifest_schema_ahead, target)
+                .unwrap_err()
+                .contains("rollback-compatible")
+        );
+
+        // state_schema_from must name the local schema exactly, and the
+        // refusal must name both contract epochs.
+        let mut wrong_schema_from = manifest_declaring_contract(target, "1.1.0", &next);
+        wrong_schema_from["contract_migration"] = json!({
+            "from": {"epoch": local.epoch, "hash": local.hash, "tool_count": local.tool_count},
+            "state_schema_from": SCHEMA_VERSION - 1,
+        });
+        let error = parse_release_plan(&wrong_schema_from, target).unwrap_err();
+        assert!(error.contains("state_schema_from"), "{error}");
+        assert!(
+            error.contains(SCHEMA_VERSION.to_string().as_str()),
+            "{error}"
+        );
+        assert!(error.contains(local.epoch.to_string().as_str()), "{error}");
+        assert!(error.contains(next.epoch.to_string().as_str()), "{error}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn candidate_probe_compares_target_contract_on_cross_epoch_path() {
+        let dir = env::temp_dir().join(format!(
+            "herdr-updater-probe-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join("herdr-mcp-candidate");
+        let next = next_epoch_identity();
+        let script = format!(
+            "#!/bin/sh\nprintf 'herdr-mcp 1.1.0\\ncontract epoch {} / {} tools\\nstate schema {}\\n\
+             contract hash {}\\n'\n",
+            next.epoch, next.tool_count, SCHEMA_VERSION, next.hash
+        );
+        fs::write(&candidate, script).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        let version = Version::parse("1.1.0").unwrap();
+        let local = contract::identity().unwrap();
+
+        // Cross-epoch path: the candidate must match the manifest contract M,
+        // including the contract hash line.
+        probe_candidate_binary(&candidate, &version, &next, &local).unwrap();
+        // Probing against the local (one epoch behind) identity must refuse.
+        let error = probe_candidate_binary(&candidate, &version, &local, &local).unwrap_err();
+        assert!(error.contains("does not match release manifest"), "{error}");
+        assert!(error.contains(local.epoch.to_string().as_str()), "{error}");
+
+        // A candidate reporting a different contract hash than M is refused
+        // even when epoch and tool count match: the hash is part of the
+        // admitted identity, so two different expected hashes must not both
+        // pass.
+        let mut wrong_hash_identity = next.clone();
+        wrong_hash_identity.hash = format!("sha256:{}", "b".repeat(64));
+        let error =
+            probe_candidate_binary(&candidate, &version, &wrong_hash_identity, &local).unwrap_err();
+        assert!(error.contains("reports contract hash"), "{error}");
+        assert!(
+            error.contains(wrong_hash_identity.hash.trim_start_matches("sha256:")),
+            "{error}"
+        );
+        assert!(error.contains(local.epoch.to_string().as_str()), "{error}");
+        assert!(error.contains(next.epoch.to_string().as_str()), "{error}");
+
+        // A candidate that predates the `contract hash` version line cannot
+        // prove the cross-epoch target identity and is refused.
+        let legacy_script = format!(
+            "#!/bin/sh\nprintf 'herdr-mcp 1.1.0\\ncontract epoch {} / {} tools\\nstate schema {}\\n'\n",
+            next.epoch, next.tool_count, SCHEMA_VERSION
+        );
+        fs::write(&candidate, legacy_script).unwrap();
+        let error = probe_candidate_binary(&candidate, &version, &next, &local).unwrap_err();
+        assert!(
+            error.contains("does not report the admitted contract hash"),
+            "{error}"
+        );
+        assert!(error.contains(local.epoch.to_string().as_str()), "{error}");
+        assert!(error.contains(next.epoch.to_string().as_str()), "{error}");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn candidate_probe_same_contract_accepts_legacy_and_hashed_candidates() {
+        let dir = env::temp_dir().join(format!(
+            "herdr-updater-probe-same-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join("herdr-mcp-candidate");
+        let local = contract::identity().unwrap();
+        let version = Version::parse("1.0.5").unwrap();
+        let write_candidate = |hash_line: Option<&str>| {
+            let tail = hash_line
+                .map(|hash| format!("contract hash {hash}\\n"))
+                .unwrap_or_default();
+            let script = format!(
+                "#!/bin/sh\nprintf 'herdr-mcp 1.0.5\\ncontract epoch {} / {} tools\\nstate schema {}\\n{tail}'\n",
+                local.epoch, local.tool_count, SCHEMA_VERSION
+            );
+            fs::write(&candidate, script).unwrap();
+            fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        };
+
+        // Same-contract path: candidates as old as the previous patch release
+        // may not print a `contract hash` line; epoch/tool_count still must
+        // match the local identity.
+        write_candidate(None);
+        probe_candidate_binary(&candidate, &version, &local, &local).unwrap();
+        // A candidate reporting the matching hash is accepted.
+        write_candidate(Some(&local.hash));
+        probe_candidate_binary(&candidate, &version, &local, &local).unwrap();
+        // A reported hash that differs from the admitted (local) contract is
+        // refused even though epoch and tool count match.
+        let differing = format!("sha256:{}", "c".repeat(64));
+        write_candidate(Some(&differing));
+        let error = probe_candidate_binary(&candidate, &version, &local, &local).unwrap_err();
+        assert!(error.contains("reports contract hash"), "{error}");
+        assert!(error.contains(local.epoch.to_string().as_str()), "{error}");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Verbatim replay of the released v1.0.0–v1.0.3 candidate probe check.
+    ///
+    /// Extracted verbatim from `git show v1.0.1:crates/herdr-mcp/src/updater.rs`
+    /// (`probe_candidate_binary`, lines 1926-1944, check at 1937-1942) —
+    /// byte-identical in `git show v1.0.3:crates/herdr-mcp/src/updater.rs`
+    /// (lines 2040-2058, check at 2051-2056) and in v1.0.0 — which refuses a
+    /// staged candidate unless the version output's first line is
+    /// `herdr-mcp {expected}`, the output contains the 0.4.x-era hardcoded
+    /// `contract epoch 2 / 18 tools` string, and it contains the live
+    /// `state schema {SCHEMA_VERSION}` (15 in every v1.0.x release).
+    fn released_v1_probe_rejects(text: &str, expected: &Version) -> bool {
+        let expected_first = format!("herdr-mcp {expected}");
+        text.lines().next() != Some(expected_first.as_str())
+            || !text.contains("contract epoch 2 / 18 tools")
+            || !text.contains(&format!("state schema {SCHEMA_VERSION}"))
+    }
+
+    #[test]
+    fn released_v1_updaters_admit_current_runtime_version_output() {
+        // The released v1.0.x binaries embed SCHEMA_VERSION 15; pin the live
+        // constant so a future schema bump forces this replay to be
+        // re-evaluated instead of silently still passing.
+        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(crate::runtime_meta::runtime_version(), "1.0.4");
+        let text = crate::version_output_text(&contract::identity().unwrap());
+        let expected = Version::parse("1.0.4").unwrap();
+
+        // v1.0.1 foreground probe (tag v1.0.1, updater.rs:1926-1944) admits
+        // the real 1.0.4 version output, which carries the labeled
+        // `legacy probe compat: contract epoch 2 / 18 tools` line.
+        assert!(!released_v1_probe_rejects(&text, &expected));
+        // v1.0.3 foreground probe (tag v1.0.3, updater.rs:2040-2058): the
+        // check is byte-identical across v1.0.0/v1.0.1/v1.0.3.
+        assert!(!released_v1_probe_rejects(&text, &expected));
+
+        // The same released check must still refuse a candidate whose
+        // manifest version does not match the version banner.
+        let wrong = Version::parse("1.0.5").unwrap();
+        assert!(released_v1_probe_rejects(&text, &wrong));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn candidate_reporting_only_legacy_compat_epoch_line_is_refused() {
+        // `herdr-mcp version` prints a labeled `legacy probe compat` line so
+        // the released v1.0.0–v1.0.3 foreground probes accept this runtime as
+        // an update candidate. This runtime's own probe must never treat that
+        // marker as the candidate's real epoch line: a candidate whose only
+        // epoch line is the compat marker is refused even when the admitted
+        // contract epoch equals the marker's epoch.
+        let dir = env::temp_dir().join(format!(
+            "herdr-updater-probe-legacy-line-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join("herdr-mcp-candidate");
+        let epoch2 = contract::ContractIdentity {
+            epoch: 2,
+            hash: format!("sha256:{}", "2".repeat(64)),
+            tool_count: 18,
+        };
+        let script = format!(
+            "#!/bin/sh\nprintf 'herdr-mcp 1.0.4\\nlegacy probe compat: contract epoch 2 / 18 tools\\n\
+             state schema {}\\ncontract hash {}\\n'\n",
+            SCHEMA_VERSION, epoch2.hash
+        );
+        fs::write(&candidate, script).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = probe_candidate_binary(
+            &candidate,
+            &Version::parse("1.0.4").unwrap(),
+            &epoch2,
+            &epoch2,
+        )
+        .unwrap_err();
+        assert!(error.contains("does not match release manifest"), "{error}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn worker_admits_legacy_job_without_admitted_contract_record() {
+        // A job staged by the released v1.0.0–v1.0.3 foreground updater has
+        // no persisted admitted-contract record. The worker must still admit
+        // it through the own-identity fallback and re-verify the staged
+        // binary with the line-exact probe.
+        let dir = env::temp_dir().join(format!(
+            "herdr-updater-legacy-job-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let own = contract::identity().unwrap();
+
+        // No record: the legacy fallback binds to the worker's own identity.
+        assert_eq!(admitted_contract_for_job(&dir, &own).unwrap(), own);
+        // A present record always wins and is parsed strictly.
+        let admitted = next_epoch_identity();
+        persist_admitted_contract(&dir, &admitted).unwrap();
+        assert_eq!(admitted_contract_for_job(&dir, &own).unwrap(), admitted);
+        // A corrupt record still fails closed; the fallback never bypasses a
+        // record that exists in any form.
+        fs::write(dir.join(ADMITTED_CONTRACT_RECORD), b"{not json").unwrap();
+        assert!(admitted_contract_for_job(&dir, &own).is_err());
+
+        // End-to-end shape of the legacy path: the staged 1.0.4 binary prints
+        // the real `herdr-mcp version` text (compat line included) and passes
+        // the worker's probe with the fallback identity.
+        let candidate = dir.join("herdr-mcp-candidate");
+        let script = format!("#!/bin/sh\nprintf '{}'\n", crate::version_output_text(&own));
+        fs::write(&candidate, script).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        probe_candidate_binary(
+            &candidate,
+            &Version::parse(crate::runtime_meta::runtime_version()).unwrap(),
+            &own,
+            &own,
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn admitted_contract_record_round_trips_and_fails_closed() {
+        let dir = env::temp_dir().join(format!(
+            "herdr-updater-admitted-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let admitted = next_epoch_identity();
+
+        persist_admitted_contract(&dir, &admitted).unwrap();
+        assert_eq!(load_admitted_contract(&dir).unwrap(), admitted);
+        // The record is committed atomically: no temp file survives.
+        assert!(!dir.join("admitted-contract.tmp").exists());
+
+        // A missing record fails closed at this layer: this function never
+        // silently substitutes a self-report. The legacy-job decision (v1.0.0–
+        // v1.0.3 foregrounds staged no record) is made explicitly by
+        // `admitted_contract_for_job`, which falls back only on a provably
+        // absent record and still runs the candidate probe afterwards.
+        let empty = dir.join("no-record");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(
+            load_admitted_contract(&empty)
+                .unwrap_err()
+                .contains("cannot read admitted contract record")
+        );
+
+        // Malformed and out-of-range records fail closed.
+        fs::write(dir.join(ADMITTED_CONTRACT_RECORD), b"{not json").unwrap();
+        assert!(
+            load_admitted_contract(&dir)
+                .unwrap_err()
+                .contains("invalid JSON")
+        );
+        fs::write(
+            dir.join(ADMITTED_CONTRACT_RECORD),
+            format!(
+                "{{\"epoch\":{},\"hash\":\"x\",\"tool_count\":{}}}",
+                u64::from(u32::MAX) + 1,
+                18
+            ),
+        )
+        .unwrap();
+        assert!(
+            load_admitted_contract(&dir)
+                .unwrap_err()
+                .contains("epoch is out of range")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn worker_binding_rejects_candidate_reporting_hash_other_than_admitted_record() {
+        // The foreground admits manifest contract M and persists it with the
+        // job. A staged candidate whose declared epoch/tool_count match M but
+        // whose contract hash differs must fail the worker-side validation no
+        // matter which honest identity the worker compares from.
+        let dir = env::temp_dir().join(format!(
+            "herdr-updater-worker-bind-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join("herdr-mcp-candidate");
+        let admitted = next_epoch_identity();
+        let mut actual = admitted.clone();
+        actual.hash = format!("sha256:{}", "d".repeat(64));
+        let script = format!(
+            "#!/bin/sh\nprintf 'herdr-mcp 1.1.0\\ncontract epoch {} / {} tools\\nstate schema {}\\n\
+             contract hash {}\\n'\n",
+            actual.epoch, actual.tool_count, SCHEMA_VERSION, actual.hash
+        );
+        fs::write(&candidate, script).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        let version = Version::parse("1.1.0").unwrap();
+        persist_admitted_contract(&dir, &admitted).unwrap();
+
+        // Worker view A: embedded identity equals the admitted record, but the
+        // candidate's reported hash exposes the mismatch.
+        let error = probe_candidate_binary(&candidate, &version, &admitted, &admitted).unwrap_err();
+        assert!(error.contains("reports contract hash"), "{error}");
+        assert!(
+            error.contains(admitted.epoch.to_string().as_str()),
+            "{error}"
+        );
+
+        // Worker view B: embedded identity equals the actual (different)
+        // candidate contract; the probe still compares against the admitted
+        // record, not against the candidate's own identity.
+        let error = probe_candidate_binary(&candidate, &version, &admitted, &actual).unwrap_err();
+        assert!(error.contains("reports contract hash"), "{error}");
+        assert!(
+            error.contains(admitted.epoch.to_string().as_str()),
+            "{error}"
+        );
+
+        // An honest candidate matching the admitted record passes.
+        let honest = format!(
+            "#!/bin/sh\nprintf 'herdr-mcp 1.1.0\\ncontract epoch {} / {} tools\\nstate schema {}\\n\
+             contract hash {}\\n'\n",
+            admitted.epoch, admitted.tool_count, SCHEMA_VERSION, admitted.hash
+        );
+        fs::write(&candidate, honest).unwrap();
+        probe_candidate_binary(&candidate, &version, &admitted, &admitted).unwrap();
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

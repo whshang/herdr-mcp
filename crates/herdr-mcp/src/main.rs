@@ -138,6 +138,32 @@ fn main_inner() -> ExitCode {
     }
 }
 
+/// Full text printed by `herdr-mcp version`.
+///
+/// The first four lines are the runtime identity (version banner, contract
+/// epoch, durable state schema, contract hash) and parsers of this output
+/// must match them as whole lines.
+///
+/// The trailing `legacy probe compat` line exists only for the released
+/// v1.0.0–v1.0.3 foreground updaters, whose candidate probe admits a
+/// downloaded candidate only when its version output *contains* the
+/// 0.4.x-era hardcoded `contract epoch 2 / 18 tools` string (tag v1.0.1,
+/// updater.rs:1937-1942, byte-identical in v1.0.0 and v1.0.2; the same
+/// check is at updater.rs:2051-2056 in v1.0.3). It is a labeled compatibility marker, not this
+/// runtime's contract epoch: this runtime's own probe matches epoch lines
+/// exactly, so this line can never satisfy an epoch check.
+pub(crate) fn version_output_text(contract: &contract::ContractIdentity) -> String {
+    format!(
+        "herdr-mcp {}\ncontract epoch {} / {} tools\nstate schema {}\ncontract hash {}\n\
+         legacy probe compat: contract epoch 2 / 18 tools\n",
+        runtime_meta::runtime_version(),
+        contract.epoch,
+        contract.tool_count,
+        state_store::SCHEMA_VERSION,
+        contract.hash,
+    )
+}
+
 fn run() -> Result<ExitCode, String> {
     let parsed = cli::parse(std::env::args().skip(1))?;
     if let Some(name) = parsed.instance.as_deref() {
@@ -160,12 +186,7 @@ fn run() -> Result<ExitCode, String> {
         }
         cli::Command::Version => {
             let contract = contract::identity()?;
-            println!("herdr-mcp {}", runtime_meta::runtime_version());
-            println!(
-                "contract epoch {} / {} tools",
-                contract.epoch, contract.tool_count
-            );
-            println!("state schema {}", state_store::SCHEMA_VERSION);
+            print!("{}", version_output_text(&contract));
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Status { verbose } => {
