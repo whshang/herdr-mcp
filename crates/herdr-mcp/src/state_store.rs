@@ -10579,17 +10579,17 @@ mod tests {
             .conn
             .execute(
                 "UPDATE browser_dispatches
-                 SET delivery_state = ?1, generation_owner = ?2,
-                     accepted_user_message_ref = COALESCE(?3, accepted_user_message_ref),
-                     updated_at = ?4
-                 WHERE dispatch_id = ?5 AND expected_generation = ?6",
+                 SET delivery_state = ?2, generation_owner = ?3,
+                     accepted_user_message_ref = COALESCE(?6, accepted_user_message_ref),
+                     updated_at = MAX(updated_at, ?4)
+                 WHERE dispatch_id = ?1 AND expected_generation = ?5",
                 params![
+                    record.dispatch_id,
                     "uncertain",
                     None::<i64>,
+                    9,
+                    7,
                     None::<String>,
-                    11,
-                    record.dispatch_id,
-                    7
                 ],
             )
             .unwrap();
@@ -10605,6 +10605,7 @@ mod tests {
             after_rollback.message_canonical_digest.as_deref(),
             Some(canonical_digest.as_str())
         );
+        assert_eq!(after_rollback.updated_at, 10);
         assert_eq!(store.schema_version().unwrap(), 15);
     }
 
