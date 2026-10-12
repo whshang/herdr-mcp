@@ -185,7 +185,7 @@ Release の選択は 2 つの独立した段階、discovery と admission から
 
 v1.0.4 は**計画中で未公開**の bridge です。公開されるまではインストール可能な bridge がなく、v1.1.0-rc.1 は v1.0.x から到達できません。
 
-v1.0.4 が公開されれば、公開済みの v1.0.0–v1.0.3 は通常の更新で到達できます。その `version` 出力は `contract epoch 2 / 18 tools` を含むレガシー互換行も印字するため、これらの公開済みアップデータが既に実行する candidate probe は bridge を受理します。フォアグラウンドの `herdr-mcp update` とバックグラウンドの stable scheduler（`update auto`）の両方がインストールします。手動インストールは不要です。
+v1.0.4 が公開されれば、公開済みの v1.0.0–v1.0.3 は通常の更新で到達できます。その `version` 出力は `contract epoch 2 / 18 tools` を含むレガシー互換行も印字するため、これらの公開済みアップデータが既に実行する candidate probe は bridge を受理します。フォアグラウンドの `herdr-mcp update` と macOS のバックグラウンドの stable scheduler（`update auto`）の両方がインストールします。手動インストールは不要です。
 
 第 2 段階は、公開済みのどのアップデータにもまだ実装されていない、計画中の `contract_migration` 受理規則に依存します。v1.1.0-rc.1 は `contract_migration` を宣言しないため、それを宣言する最初の v1.1 Release（予定は v1.1.0-rc.2）だけが v1.0.4 bridge から受理されます。
 
@@ -199,7 +199,7 @@ v1.0.4 が公開されれば、公開済みの v1.0.0–v1.0.3 は通常の更�
 両側とも state schema 15 なのでデータベースの復元は不要であり、更新後に書き込まれた durable state は巻き戻りません。依拠する前に実際の service/state を確認してください。
 
 - `browser_dispatches.message_canonical_digest` は nullable な前向き追加列であり、番号付き migration ではありません。schema 15 の epoch 4 binary は同じデータベースを開き、この列を無視します。以前に書き込まれた行は `NULL` のままで raw のみで照合され、これは偽の canonical 一致ではなく fail-closed です。
-- 1.1 の再登録は、明示的な webchat-control の拒否を上書きしなくなりました。そのため epoch 4 への rollback で権限が広がることはありません。この修正は [PR #605](https://github.com/whshang/herdr-mcp/pull/605) で進行中です。
+- [PR #605](https://github.com/whshang/herdr-mcp/pull/605) がマージされた後、この修正を含むリリースでは、1.1 の再登録時に明示的な webchat-control の拒否が保持されるようになります。そのため epoch 4 への rollback で権限が広がることはなくなります。
 
 ## トラフィックの切り替え
 
@@ -300,7 +300,7 @@ Worker name と public origin は変わらず、Durable Objects、secrets、既�
 
 migration 前には exact v0.4.8 binary と schema-5 database snapshot を N-1 rollback material として保存します。必要な場合の recovery command は `herdr-mcp update major-rollback` です。`update major-apply` は bridge 内部および maintainer recovery/UAT 用 primitive として残りますが、通常の v0.4.8 user の手順ではありません。
 
-この 1 コマンドの経路は schema-5 の v0.4.8 → 1.0 境界だけを対象とします。計画中の v1.0.4 epoch-4 bridge は別の境界です。その未公開 Release が存在するようになれば、公開済みの v1.0.0–v1.0.3 はフォアグラウンドの `herdr-mcp update` とバックグラウンドの stable scheduler（`update auto`）でインストールします。前述の節を参照してください。
+この 1 コマンドの経路は schema-5 の v0.4.8 → 1.0 境界だけを対象とします。計画中の v1.0.4 epoch-4 bridge は別の境界です。その未公開 Release が存在するようになれば、公開済みの v1.0.0–v1.0.3 はフォアグラウンドの `herdr-mcp update` と macOS のバックグラウンドの stable scheduler（`update auto`）でインストールします。前述の節を参照してください。
 
 ## `herdr-self-update`
 

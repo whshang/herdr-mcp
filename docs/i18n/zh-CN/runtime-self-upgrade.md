@@ -210,7 +210,7 @@ public MCP contract migration
 
 v1.0.4 是**计划中、尚未发布**的 bridge。在它发布之前没有可安装的 bridge，v1.1.0-rc.1 也无法从 v1.0.x 到达。
 
-v1.0.4 一旦发布，已发布的 v1.0.0–v1.0.3 可以正常更新到它。它的 `version` 输出还会打印一行包含 `contract epoch 2 / 18 tools` 的旧版兼容文本，因此这些已发布 updater 已有的 candidate probe 会接纳该 bridge。前台 `herdr-mcp update` 和后台 stable scheduler（`update auto`）都会安装它。不需要手工安装。
+v1.0.4 一旦发布，已发布的 v1.0.0–v1.0.3 可以正常更新到它。它的 `version` 输出还会打印一行包含 `contract epoch 2 / 18 tools` 的旧版兼容文本，因此这些已发布 updater 已有的 candidate probe 会接纳该 bridge。前台 `herdr-mcp update` 和 macOS 后台 stable scheduler（`update auto`）都会安装它。不需要手工安装。
 
 第二步仍取决于计划中的 `contract_migration` 接纳规则，任何已发布的 updater 都尚未实现。v1.1.0-rc.1 没有声明 `contract_migration`，所以只有第一个作出该声明的 v1.1 发布（计划 v1.1.0-rc.2）才能从 v1.0.4 bridge 被接纳。
 
@@ -224,7 +224,7 @@ v1.0.4 一旦发布，已发布的 v1.0.0–v1.0.3 可以正常更新到它。�
 两侧都是 state schema 15，所以不需要数据库恢复，但更新之后写入的持久状态不会被回退。在依赖它之前，先检查真实 service/state。
 
 - `browser_dispatches.message_canonical_digest` 是一个可空的前向新增列，不是编号迁移。schema 15 的 epoch 4 binary 会打开同一个数据库并忽略该列；更早写入的行保持 `NULL` 并只走 raw 比对，属 fail-closed，而不是伪造 canonical 匹配。
-- 1.1 的重新注册不再覆盖显式的 webchat-control 拒绝，因此回滚到 epoch 4 不会放宽权限。该修复正在 [PR #605](https://github.com/whshang/herdr-mcp/pull/605) 进行中。
+- [PR #605](https://github.com/whshang/herdr-mcp/pull/605) 合并后，包含该修复的发布版本将在 1.1 重新注册时保留显式的 webchat-control 拒绝，因此回滚到 epoch 4 将不会放宽权限。
 
 ## 激活发生时会怎样
 
@@ -339,7 +339,7 @@ Worker name 与公网 origin 保持不变；Durable Objects、secrets、已知�
 
 迁移前会保存精确 v0.4.8 binary 与 schema-5 数据库 snapshot 作为 N-1 rollback material。如必须回退，显式使用 `herdr-mcp update major-rollback`。`update major-apply` 继续作为 bridge 内部及维护者恢复/UAT 的底层 primitive，不再是普通 v0.4.8 用户的升级步骤。
 
-这条一条命令路径只覆盖 schema-5 的 v0.4.8 → 1.0 边界。计划中的 v1.0.4 epoch-4 bridge 是另一条边界：该尚未发布的版本一旦存在，已发布的 v1.0.0–v1.0.3 会用前台 `herdr-mcp update` 和后台 stable scheduler（`update auto`）安装它。见上一节。
+这条单命令路径只覆盖 schema-5 的 v0.4.8 → 1.0 边界。计划中的 v1.0.4 epoch-4 bridge 是另一条边界：该尚未发布的版本一旦存在，已发布的 v1.0.0–v1.0.3 会用前台 `herdr-mcp update` 和 macOS 后台 stable scheduler（`update auto`）安装它。见上一节。
 
 ## `herdr-self-update` 适合做什么
 

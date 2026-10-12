@@ -185,7 +185,7 @@ The ordinary v1.0.x → v1.1 path is two steps: `herdr-mcp update` to the v1.0.4
 
 v1.0.4 is a **planned, unreleased** bridge. Until it is published there is no installable bridge, and v1.1.0-rc.1 is not reachable from v1.0.x.
 
-Once v1.0.4 is published, released v1.0.0–v1.0.3 update to it normally. Its `version` output also prints a legacy compatibility line containing `contract epoch 2 / 18 tools`, so the candidate probe those released updaters already run accepts the bridge. Both the foreground `herdr-mcp update` and the background stable scheduler (`update auto`) install it. No manual install is required.
+Once v1.0.4 is published, released v1.0.0–v1.0.3 update to it normally. Its `version` output also prints a legacy compatibility line containing `contract epoch 2 / 18 tools`, so the candidate probe those released updaters already run accepts the bridge. Both the foreground `herdr-mcp update` and the macOS background stable scheduler (`update auto`) install it. No manual install is required.
 
 The second step still depends on the planned `contract_migration` admission rule, which no released updater implements. v1.1.0-rc.1 does not declare `contract_migration`, so only the first v1.1 release that does (planned v1.1.0-rc.2) can be admitted from the v1.0.4 bridge.
 
@@ -199,7 +199,7 @@ The second step still depends on the planned `contract_migration` admission rule
 Both sides use state schema 15, so no database restore is needed, and durable state written after the update is not rewound. Inspect the real service/state before relying on it.
 
 - `browser_dispatches.message_canonical_digest` is a nullable additive column, not a numbered migration. A schema-15 epoch-4 binary opens the same database and ignores the column; rows written before it stay `NULL` and reconcile raw-only, which is fail-closed rather than a fabricated canonical match.
-- 1.1 re-registration no longer overwrites an explicit webchat-control deny, so rollback to epoch 4 never widens permissions. The fix is in progress on [PR #605](https://github.com/whshang/herdr-mcp/pull/605).
+- Once [PR #605](https://github.com/whshang/herdr-mcp/pull/605) lands, releases containing that fix will preserve an explicit webchat-control deny during 1.1 re-registration, so rollback to epoch 4 will not widen permissions.
 
 ## Switching traffic
 
@@ -300,7 +300,7 @@ The Worker identity and public origin remain stable. Durable Objects, secrets, k
 
 The bridge keeps the exact v0.4.8 binary and schema-5 database snapshot as N-1 rollback material before migration. `herdr-mcp update major-rollback` remains the explicit recovery command if the migrated Runtime must be reverted. `update major-apply` remains an operator-level primitive used by the bridge and recovery/UAT workflows, not the normal v0.4.8 user instruction.
 
-This one-command contract covers the schema-5 v0.4.8 → 1.0 boundary only. The planned v1.0.4 epoch-4 bridge is a different boundary: once that unpublished release exists, released v1.0.0–v1.0.3 install it with ordinary foreground `herdr-mcp update` and the background stable scheduler (`update auto`). See [the v1.0.4 bridge section](#the-v104-bridge-is-planned-and-unpublished).
+This one-command contract covers the schema-5 v0.4.8 → 1.0 boundary only. The planned v1.0.4 epoch-4 bridge is a different boundary: once that unpublished release exists, released v1.0.0–v1.0.3 install it with ordinary foreground `herdr-mcp update` and the macOS background stable scheduler (`update auto`). See [the v1.0.4 bridge section](#the-v104-bridge-is-planned-and-unpublished).
 
 ## `herdr-self-update`
 
