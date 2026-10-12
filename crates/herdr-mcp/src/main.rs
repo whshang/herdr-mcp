@@ -166,6 +166,7 @@ fn run() -> Result<ExitCode, String> {
                 contract.epoch, contract.tool_count
             );
             println!("state schema {}", state_store::SCHEMA_VERSION);
+            println!("contract hash {}", contract.hash);
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Status { verbose } => {
