@@ -4401,7 +4401,7 @@ test("user dispatch stays uncertain | Given the before snapshot fails and the la
   assert.equal(result.result, undefined, "no provider identity may be recorded without a before snapshot or an exact new turn");
 });
 
-test("user dispatch does not adopt a short overlapping turn | Given a submitted prompt that contains \"ok\" | When a new user turn is only \"ok\" | Then delivery stays uncertain and no accepted user message is recorded", async () => {
+test("user dispatch does not adopt a short overlapping turn | Given a submitted prompt that contains 'ok' | When a new user turn is only 'ok' | Then delivery stays uncertain and no accepted user message is recorded", async () => {
   const prompt = "Please reply with ok once the patch is ready and the tests pass.";
   const act = browserSubmitAcceptanceHarness({
     currentConvKey: "https://chatgpt.com/c/current",
