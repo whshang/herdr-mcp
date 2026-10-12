@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.4 — 2026-10-12
+
+- v1.0.4 是 epoch 迁移桥（contract identity 与 v1.0.3 完全一致）：updater 现在接受"同契约"或"恰好跨一个 epoch 且清单声明结构合法 `contract_migration`（`from` 与本机 identity 完全相等、`state_schema_from` 与本机 schema 一致、无未知字段）"的发布清单；epoch 跨度大于 1、更低 epoch、声明缺失/畸形/不匹配在安装前拒绝并报出两侧 epoch。candidate probe 改为按清单声明的目标契约比对（修复历史前台 probe 遗留的 0.4.x 时代 `contract epoch 2` 硬编码，该缺陷使已发布的 v1.0.0–v1.0.3 前台更新在任何 1.0.x 候选上失败，受影响机器可手动下载本版本二进制并以 `<二进制> install` 安装）。1.0.x 用户先 `herdr-mcp update` 到本版本，之后即可普通更新到第一个声明 `contract_migration.from = epoch 4` 的 v1.1 发布。`update auto` 适用同一规则并保持 PROD + Stable；state schema 保持 15，本协议不允许伴随 schema 迁移。 [PR #601](https://github.com/whshang/herdr-mcp/pull/601)
+
 ## v1.0.3 — 2026-09-24
 
 - 修复早期 v0.4.x 安装无法经 v0.4.9 migration bridge 升级到 1.x：`worker update` 现在可以原地更新 wrangler 模板部署的旧 Worker；通用 `herdr-edge` 身份在 workers.dev 下由主机名证明脚本名，在自定义域名下则必须通过 Cloudflare Custom Domains API 精确证明 `hostname → service(script)` 后才允许 mutation；未登记 device id 时还要求本机 Link 与 Worker 的 `DEFAULT_WORKSTATION_ID` 一致并原值保留。并修复 Worker 地址只存在于 Link plist 时的静默跳过。1.x 不再改名 0.4.x 的 `config.toml`，大版本回滚会恢复被 v1.0.0–v1.0.2 改名的配置；若配置恢复不完整则保留 rollback material 并报告失败。major-apply 失败原因完整写入 `~/.config/herdr-mcp/major-upgrade-last-failure.log`。同时包含 major migration 已提交后 sidecar 失败改为可恢复警告的修复。 [PR #566](https://github.com/whshang/herdr-mcp/pull/566) [PR #561](https://github.com/whshang/herdr-mcp/pull/561)
