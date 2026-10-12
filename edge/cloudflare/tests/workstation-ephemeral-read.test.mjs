@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { WorkstationDO } from "../dist/workstation-do.js";
+import { idempotencyScopeKey } from "../dist/pending.js";
 
 class FakeStorage {
   constructor(events) {
@@ -624,6 +625,7 @@ test("principal admission counts current Link occupancy past its deadline and id
     argsSummary: { argKeys: [] },
     deadlineMs: Date.now() + 30_000,
     idempotencyKey: "replay-key",
+    requestHash: "replay-hash",
   });
   subject.registry.markSent("replay-source", Date.now());
   subject.registry.settle("replay-source", {
@@ -670,6 +672,7 @@ test("principal admission counts current Link occupancy past its deadline and id
     op: "herdr_prompt",
     args: { target: "worker", text: "must not resend" },
     idempotencyKey: "replay-key",
+    replayBinding: { requestHash: "replay-hash" },
     deadlineMs: Date.now() + 30_000,
   });
   assert.equal(replay.status, 200);
@@ -724,5 +727,8 @@ test("ordinary mutation settlement bounds durable completed and idempotency rows
   assert.equal(completedKeys.length, 2);
   assert.equal(idemKeys.length, 2);
   assert.deepEqual(completedKeys.sort(), ["completed:retained-2", "completed:retained-3"]);
-  assert.deepEqual(idemKeys.sort(), ["idem:retained-idem-2", "idem:retained-idem-3"]);
+  assert.deepEqual(idemKeys.sort(), [2, 3].map((i) => `idem:${idempotencyScopeKey({
+    principalRef: "principal:retention",
+    callerKey: `retained-idem-${i}`,
+  })}`).sort());
 });

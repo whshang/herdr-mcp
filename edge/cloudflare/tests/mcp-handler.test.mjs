@@ -1898,6 +1898,9 @@ test("user stops a WebChat generation remotely | Given WebChat control and Page 
   assert.equal(res.body.result.isError, undefined);
   assert.equal(d.calls.length, 1);
   assert.equal(d.calls[0].args.method, "herdr_mcp.browser_dispatch.stop");
+  // The same "stops a WebChat generation remotely" routing also carries the
+  // wildcard WebChat control grant derived from the device's Page Assist grant
+  // (base tip), alongside the explicitly issued per-provider grant.
   assert.deepEqual(d.calls[0].trace?.webchat_control_grants, [{
     endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     provider: "chatgpt",
