@@ -174,6 +174,58 @@ public MCP contract migration
 
 因此 `herdr-self-update` 不应该被用来偷偷跨 contract epoch。
 
+### 跨一个 epoch（N → N+1）
+
+选择一个发布包含两个独立步骤：发现（discovery）与接纳（admission）。
+
+**发现**只回答“这台工作站应该看哪个发布”。它读取 GitHub releases 索引，选出唯一一个同时满足以下条件的最高版本：非 draft 的语义化版本、该 tag 发布了 release manifest、并且当前 update 通道接纳该版本。发现流程不读取 contract identity，所以它既不会退而选择更旧的发布，也不会把选择改写到某个中间 bridge；通道内最高的合格发布就是被选中的发布。
+
+**接纳**随后在下载任何东西之前校验被选中的 manifest。所有已发布的 updater 都只实现“完全相等”这一种接纳：manifest 的 `contract` identity `{epoch, hash, tool_count}` 必须等于本机 Runtime 的 contract identity，否则以 `release manifest contract identity mismatch` fail closed。因此任何已发布的 v1.0.x（epoch 4）都无法在任何通道上直接 update 到 epoch 5 的发布，而且结果是拒绝，不是回退到另一个发布。
+
+向前跨恰好一个 epoch 是**计划能力**，任何已发布的 updater 都尚未实现。它将来会写在 `runtime-manifest.json` 里：
+
+```json
+"contract": { "epoch": 5, "hash": "sha256:<epoch-5>", "tool_count": 18 },
+"contract_migration": {
+  "from": { "epoch": 4, "hash": "sha256:<epoch-4>", "tool_count": 18 },
+  "state_schema_from": 15
+}
+```
+
+这段声明属于 manifest 字节本身，因此会（在实现后）被现有的 manifest digest GitHub artifact attestation 覆盖。
+
+计划中的接纳规则（`L` 为本机 contract identity，`M` 为清单中的 `contract`）：
+
+1. `M == L`：普通同 contract 更新，行为不变。
+2. `M != L`：仅当以下全部成立时接纳：`M.epoch == L.epoch + 1`；`contract_migration` 存在且格式合法；`contract_migration.from` 与 `L` 完全相等（epoch、hash、tool_count）；`contract_migration.state_schema_from` 等于本机 state schema；`manifest.state_schema` 等于本机 state schema。
+3. 其他情况在安装任何东西之前就拒绝，并报出本机与目标 epoch：跨多个 epoch、epoch 更低、`from` hash/tool_count 不匹配、声明缺失或格式错误、`contract_migration` 内出现未知字段。
+
+其余关卡全部保留并照常执行：manifest attestation、tag/source_ref identity、asset sha256、candidate probe、健康门控激活、update fence 与通道规则。在跨 epoch 更新中，下载后的 candidate 会按目标 contract `M`（而不是 `L`）验证。
+
+`update auto` 与交互命令使用同一套发现和同一套接纳检查，因此它可以在完全相同的规则下跨一个（计划中的）epoch，且仍仅限 PROD + Stable。本协议不允许 state schema 迁移；schema 变更仍走显式的 major migration 路径。
+
+### v1.0.4 bridge 是计划中、尚未发布的版本
+
+常规的 v1.0.x → v1.1 路径是两步：先 `herdr-mcp update` 到 v1.0.4 epoch-4 bridge（contract identity 相同，属于普通同 contract 更新），再 `herdr-mcp update` 到第一个在 manifest 中声明 `contract_migration.from = epoch 4` 的 v1.1 发布（计划 v1.1.0-rc.2）。
+
+v1.0.4 是**计划中、尚未发布**的 bridge。在它发布之前没有可安装的 bridge，v1.1.0-rc.1 也无法从 v1.0.x 到达。
+
+v1.0.4 一旦发布，已发布的 v1.0.0–v1.0.3 可以正常更新到它。它的 `version` 输出还会打印一行包含 `contract epoch 2 / 18 tools` 的旧版兼容文本，因此这些已发布 updater 已有的 candidate probe 会接纳该 bridge。前台 `herdr-mcp update` 和 macOS 后台 stable scheduler（`update auto`）都会安装它。不需要手工安装。
+
+第二步仍取决于计划中的 `contract_migration` 接纳规则，任何已发布的 updater 都尚未实现。v1.1.0-rc.1 没有声明 `contract_migration`，所以只有第一个作出该声明的 v1.1 发布（计划 v1.1.0-rc.2）才能从 v1.0.4 bridge 被接纳。
+
+### 跨 epoch 之后的回滚
+
+`herdr-mcp rollback` 重新激活上一个已安装的 generation（例如 1.1 → v1.0.4）。它属于 service 回滚，因此平台边界很重要：
+
+- 在 macOS 上，一次成功的 install/activation 会记录一份 ready service rollback（上一份 service 定义和上一个 generation），`herdr-mcp rollback` 会重新校验并重新激活它；
+- Linux 不写入成功之后的 service rollback 记录。`herdr-mcp rollback` 仅限 macOS。
+
+两侧都是 state schema 15，所以不需要数据库恢复，但更新之后写入的持久状态不会被回退。在依赖它之前，先检查真实 service/state。
+
+- `browser_dispatches.message_canonical_digest` 是一个可空的前向新增列，不是编号迁移。schema 15 的 epoch 4 binary 会打开同一个数据库并忽略该列；更早写入的行保持 `NULL` 并只走 raw 比对，属 fail-closed，而不是伪造 canonical 匹配。
+- [PR #605](https://github.com/whshang/herdr-mcp/pull/605) 合并后，包含该修复的发布版本将在 1.1 重新注册时保留显式的 webchat-control 拒绝，因此回滚到 epoch 4 将不会放宽权限。
+
 ## 激活发生时会怎样
 
 可以把 active pointer 理解成一个本机路由开关：
@@ -286,6 +338,8 @@ herdr-mcp update
 Worker name 与公网 origin 保持不变；Durable Objects、secrets、已知可选 binding、已 enrollment 设备、OAuth issuer 和 Connector records 都保留。同一次 update job 中可能自动打开 Cloudflare 授权页面。若多个可访问 Cloudflare Account 都存在同名 Worker，则 fail-closed，用户可用非秘密的 `CLOUDFLARE_ACCOUNT_ID` 消歧。如果 v0.4.8 前台 updater 的有界等待先结束，而浏览器授权仍在进行，detached migration 会继续执行；不要求用户再输入第二条 update 命令。
 
 迁移前会保存精确 v0.4.8 binary 与 schema-5 数据库 snapshot 作为 N-1 rollback material。如必须回退，显式使用 `herdr-mcp update major-rollback`。`update major-apply` 继续作为 bridge 内部及维护者恢复/UAT 的底层 primitive，不再是普通 v0.4.8 用户的升级步骤。
+
+这条单命令路径只覆盖 schema-5 的 v0.4.8 → 1.0 边界。计划中的 v1.0.4 epoch-4 bridge 是另一条边界：该尚未发布的版本一旦存在，已发布的 v1.0.0–v1.0.3 会用前台 `herdr-mcp update` 和 macOS 后台 stable scheduler（`update auto`）安装它。见上一节。
 
 ## `herdr-self-update` 适合做什么
 

@@ -149,6 +149,58 @@ public MCP contract migration
 
 Contract migrations affect ChatGPT tool snapshots, Edge compatibility and Link expectations. They require an explicit epoch migration process.
 
+### Crossing one epoch (N → N+1)
+
+Selecting a release has two independent steps: discovery and admission.
+
+**Discovery** answers only “which release should this workstation look at”. It reads the GitHub releases index and selects the single highest non-draft semantic version that also publishes a release manifest and that the configured update channel accepts. Discovery does not read contract identity, so it never substitutes an older release and never rewrites the choice to an intermediate bridge; the highest channel-eligible release stays the selected release.
+
+**Admission** then validates that selected manifest before anything is downloaded. Every released updater implements admission as exact equality: the manifest `contract` identity `{epoch, hash, tool_count}` must equal the running Runtime's contract identity, otherwise the update fails closed with `release manifest contract identity mismatch`. No released v1.0.x (epoch 4) can therefore update directly to an epoch-5 release on any channel, and the result is a refusal, not a fallback to another release.
+
+Accepting exactly one epoch forward is **planned**, not implemented in any released updater. It would be declared inside `runtime-manifest.json`:
+
+```json
+"contract": { "epoch": 5, "hash": "sha256:<epoch-5>", "tool_count": 18 },
+"contract_migration": {
+  "from": { "epoch": 4, "hash": "sha256:<epoch-4>", "tool_count": 18 },
+  "state_schema_from": 15
+}
+```
+
+The declaration would be part of the manifest bytes already covered by the existing GitHub artifact attestation of the manifest digest.
+
+Planned admission rule, with `L` the local contract identity and `M` the manifest `contract`:
+
+1. `M == L` — ordinary same-contract update, unchanged.
+2. `M != L` — accept only when all of the following hold: `M.epoch == L.epoch + 1`; `contract_migration` is present and well formed; `contract_migration.from` equals `L` exactly (epoch, hash, tool_count); `contract_migration.state_schema_from` equals the local state schema; and `manifest.state_schema` equals the local state schema.
+3. Everything else is refused before anything is installed, with an error naming the local and target epochs: an epoch skip greater than one, a lower epoch, a mismatched `from` hash or tool count, a missing or malformed declaration, or unknown extra fields inside `contract_migration`.
+
+All other gates are unchanged and still run: manifest attestation, tag/source_ref identity, asset sha256, candidate probe, health-gated activation, update fence and channel rules. On a cross-epoch update the downloaded candidate would be probed against the target contract `M`, not `L`.
+
+`update auto` runs the same discovery and the same admission check as the interactive command, so it may cross one planned epoch under exactly that rule and remains PROD + Stable only. This protocol does not permit a state-schema migration; schema changes still need the explicit major-migration path.
+
+### The v1.0.4 bridge is planned and unpublished
+
+The ordinary v1.0.x → v1.1 path is two steps: `herdr-mcp update` to the v1.0.4 epoch-4 bridge (identical contract identity, so it is an ordinary same-contract update), then `herdr-mcp update` to the first v1.1 release whose manifest declares `contract_migration` from epoch 4 (planned v1.1.0-rc.2).
+
+v1.0.4 is a **planned, unreleased** bridge. Until it is published there is no installable bridge, and v1.1.0-rc.1 is not reachable from v1.0.x.
+
+Once v1.0.4 is published, released v1.0.0–v1.0.3 update to it normally. Its `version` output also prints a legacy compatibility line containing `contract epoch 2 / 18 tools`, so the candidate probe those released updaters already run accepts the bridge. Both the foreground `herdr-mcp update` and the macOS background stable scheduler (`update auto`) install it. No manual install is required.
+
+The second step still depends on the planned `contract_migration` admission rule, which no released updater implements. v1.1.0-rc.1 does not declare `contract_migration`, so only the first v1.1 release that does (planned v1.1.0-rc.2) can be admitted from the v1.0.4 bridge.
+
+### Rollback after an epoch crossing
+
+`herdr-mcp rollback` re-activates the previously installed generation (for example 1.1 → v1.0.4). It is a service rollback, so the platform boundary matters:
+
+- on macOS, a successful install/activation records a ready service rollback (the previous service definition and the previous generation) and `herdr-mcp rollback` revalidates and re-activates it;
+- Linux writes no post-success service rollback record. `herdr-mcp rollback` is macOS-only.
+
+Both sides use state schema 15, so no database restore is needed, and durable state written after the update is not rewound. Inspect the real service/state before relying on it.
+
+- `browser_dispatches.message_canonical_digest` is a nullable additive column, not a numbered migration. A schema-15 epoch-4 binary opens the same database and ignores the column; rows written before it stay `NULL` and reconcile raw-only, which is fail-closed rather than a fabricated canonical match.
+- Once [PR #605](https://github.com/whshang/herdr-mcp/pull/605) lands, releases containing that fix will preserve an explicit webchat-control deny during 1.1 re-registration, so rollback to epoch 4 will not widen permissions.
+
 ## Switching traffic
 
 Activation changes the local routing pointer:
@@ -247,6 +299,8 @@ The user does **not** download a 1.0 binary manually, run `update major-apply`, 
 The Worker identity and public origin remain stable. Durable Objects, secrets, known optional bindings, enrolled devices, OAuth issuer and Connector records are retained. Cloudflare authorization may open in the browser during the same update job. If more than one accessible Cloudflare account contains the same Worker name, the update fails closed unless the non-secret `CLOUDFLARE_ACCOUNT_ID` disambiguator is supplied. If the foreground v0.4.8 updater reaches its bounded watch timeout while authorization is still pending, the detached migration continues; a second update command is not required.
 
 The bridge keeps the exact v0.4.8 binary and schema-5 database snapshot as N-1 rollback material before migration. `herdr-mcp update major-rollback` remains the explicit recovery command if the migrated Runtime must be reverted. `update major-apply` remains an operator-level primitive used by the bridge and recovery/UAT workflows, not the normal v0.4.8 user instruction.
+
+This one-command contract covers the schema-5 v0.4.8 → 1.0 boundary only. The planned v1.0.4 epoch-4 bridge is a different boundary: once that unpublished release exists, released v1.0.0–v1.0.3 install it with ordinary foreground `herdr-mcp update` and the macOS background stable scheduler (`update auto`). See [the v1.0.4 bridge section](#the-v104-bridge-is-planned-and-unpublished).
 
 ## `herdr-self-update`
 
