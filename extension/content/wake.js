@@ -893,7 +893,7 @@ function normalizeHerdrMentionAlias(value) {
   // ignored), so ChatGPT does not persist it as a Project new-chat draft.
   // A user-authored or different draft is never touched.
   async function clearAutomationDraft(message) {
-    const canonical = (text) => String(text || "").replace(/[\u00a0\ufeff]/g, " ").split(/\s+/u).filter(Boolean).join(" ");
+    const canonical = canonicalAcceptanceText;
     const expected = canonical(message);
     const ours = () => expected !== "" && canonical(ADAPTER.getComposerTextWithoutAppPills()) === expected;
     if (!ours()) return ADAPTER.getComposerTextWithoutAppPills() === "" ? "empty" : "not_ours";
@@ -1134,10 +1134,27 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
+  // ChatGPT must dispatch at most one provider mutation per wake invocation.
+  // `submitBrowserActuationOnce` performs exactly one Enter submit and reports
+  // `attempted`/`uncertain`, so every ChatGPT caller (MCP dispatch, handoff,
+  // queue, recovery, generic wake) can keep an unproven acknowledgement honest
+  // instead of retrying it into a duplicate provider user message. `submit()`, 
+  // `submitTextarea()`, and `submitAfterPermissionClick()` keep their bounded
+  // retry loop only for non-ChatGPT adapters.
+  async function submitChatGptOnce(options = {}) {
+    await waitForComposerIdle(4000);
+    return submitBrowserActuationOnce(options);
+  }
+
   // ---- Submission ----
   // For contenteditable sites, wait for an enabled send button because ProseMirror
   // often consumes synthetic keyboard events. ChatGPT success requires durable
   // conversation navigation or a matching new user turn, not transient composer UI.
+  //
+  // A permission click may already have submitted the turn. The single Send click
+  // below is the only dispatch; there is deliberately no Enter fallback, because a
+  // second submit primitive after an unproven acknowledgement can create a
+  // duplicate provider user message. An unconfirmed click stays unconfirmed.
   async function submitAfterPermissionClick() {
     if (!lastPermClickAt || Date.now() - lastPermClickAt > 6000) return false;
     await wait(1200);
@@ -1148,13 +1165,11 @@ function normalizeHerdrMentionAlias(value) {
       btn.click();
       if (await waitForSubmitAck(baseline, ADAPTER.policy?.submitAckTimeoutMs ?? 4000)) return true;
     }
-    const enterBaseline = captureSubmitAckBaseline(findSendButton());
-    dispatchEnterSubmit(ADAPTER.getInputEl());
-    if (await waitForSubmitAck(enterBaseline, 3000)) return true;
     return false;
   }
 
   async function submitTextarea() {
+    if (ADAPTER.name === "chatgpt") return (await submitChatGptOnce()).ok === true;
     await waitForComposerIdle();
     await wait(420);
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -1177,6 +1192,8 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function submit() {
+    // ChatGPT is single-shot: exactly one dispatch primitive per invocation.
+    if (ADAPTER.name === "chatgpt") return (await submitChatGptOnce()).ok === true;
     if (ADAPTER.needsMainWorldInsert) {
       await waitForComposerIdle();
       const postInsertMs = Math.min(1200, 350 + Math.floor((ADAPTER.getInputEl()?.innerText?.length || 0) / 40) * 50);
@@ -1285,6 +1302,13 @@ function normalizeHerdrMentionAlias(value) {
   let lastWakeNorm = "";
   let lastWakeAt = 0;
   let lastFailedWakeNorm = "";
+  // One ChatGPT submit that provably dispatched a provider mutation but could
+  // not be confirmed may already have created the user turn. Retrying that exact
+  // text would create a duplicate, so the uncertainty is terminal for this
+  // document until the page state is rebuilt (reload/navigation) or the turn is
+  // observed. The latch is the cross-caller guard for handoff, queue, recovery,
+  // and generic wake; an uncertain ack is never re-sent.
+  let uncertainSubmitWakeNorm = "";
   function noteWakeResult(textNorm, sent) {
     if (sent) {
       lastWakeNorm = textNorm;
@@ -1293,6 +1317,12 @@ function normalizeHerdrMentionAlias(value) {
     } else if (textNorm) {
       lastFailedWakeNorm = textNorm;
     }
+  }
+  function noteUncertainSubmit(textNorm) {
+    if (textNorm) uncertainSubmitWakeNorm = textNorm;
+  }
+  function clearUncertainSubmit(textNorm) {
+    if (!textNorm || uncertainSubmitWakeNorm === textNorm) uncertainSubmitWakeNorm = "";
   }
   async function performWake(data) {
     if (!runtimeAlive()) return { ok: false, error: "context-invalidated" };
@@ -1315,6 +1345,19 @@ function normalizeHerdrMentionAlias(value) {
       .map((app) => normalizeHerdrMentionAlias(app).toLowerCase())
       .filter(Boolean))];
     // Short-window deduplication prevents repeated insertion from retries or duplicate timers.
+    if (ADAPTER.name === "chatgpt" && uncertainSubmitWakeNorm && uncertainSubmitWakeNorm === n) {
+      // An earlier submit for this exact text dispatched without confirmation.
+      // Report the same uncertainty instead of sending a second provider turn.
+      return {
+        ok: false,
+        blocked: "submit-uncertain",
+        uncertain: true,
+        attempted: true,
+        committed: true,
+        site: ADAPTER.name,
+        error: "submit-unconfirmed",
+      };
+    }
     if (!data.queueInsert && n && n === lastWakeNorm && Date.now() - lastWakeAt < 8000) {
       return { ok: false, blocked: "dedupe" };
     }
@@ -1339,6 +1382,35 @@ function normalizeHerdrMentionAlias(value) {
       // leave a Herdr tool invocation waiting for a manual Allow click.
       startPermissionWatch();
 
+      // Route every ChatGPT submission through the single-shot path and return its
+      // honest outcome: `attempted` records that a provider mutation was
+      // dispatched and `uncertain` that it could not be confirmed. Non-ChatGPT
+      // adapters keep their bounded retry loop. An uncertain ChatGPT submit is
+      // latched so this exact text is never re-sent; handoff, queue, recovery, and
+      // generic wake all observe the same guard.
+      const submitWakeText = async () => {
+        if (ADAPTER.name === "chatgpt") {
+          const outcome = await submitChatGptOnce({
+            creatingSession: data.browserSessionCreate === true,
+            expectedConvKey: data.expectedConvKey ?? null,
+            requiredApps,
+          });
+          noteWakeResult(n, outcome.ok);
+          if (outcome.ok) {
+            clearUncertainSubmit(n);
+            return { ok: true, committed: true, site: ADAPTER.name };
+          }
+          if (outcome.attempted === true) {
+            noteUncertainSubmit(n);
+            return { ...outcome, uncertain: true, committed: true, site: ADAPTER.name };
+          }
+          return { ...outcome, committed: true, site: ADAPTER.name };
+        }
+        const sent = await submit();
+        noteWakeResult(n, sent);
+        return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+      };
+
       // z.ai/DeepSeek JSON bridge intentionally intercepts normal user submits
       // so it can add the Herdr tool protocol. Handoff prompts and seeds are
       // continuity-control messages, not agent tasks; send them through the
@@ -1362,18 +1434,7 @@ function normalizeHerdrMentionAlias(value) {
             };
           }
         }
-        if (boundedBrowserActuation) {
-          const outcome = await submitBrowserActuationOnce({
-            creatingSession: data.browserSessionCreate === true,
-            expectedConvKey: data.expectedConvKey ?? null,
-            requiredApps,
-          });
-          noteWakeResult(n, outcome.ok);
-          return { ...outcome, committed: true, resumed: true, site: ADAPTER.name };
-        }
-        const sent = await submit();
-        noteWakeResult(n, sent);
-        return { ok: sent, committed: true, resumed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+        return { ...(await submitWakeText()), resumed: true };
       }
 
       if (clearBeforeInsert) await clearComposer();
@@ -1419,18 +1480,7 @@ function normalizeHerdrMentionAlias(value) {
             selectedApps: appSelection.apps || [],
           };
         }
-        if (boundedBrowserActuation) {
-          const outcome = await submitBrowserActuationOnce({
-            creatingSession: data.browserSessionCreate === true,
-            expectedConvKey: data.expectedConvKey ?? null,
-            requiredApps,
-          });
-          noteWakeResult(n, outcome.ok);
-          return { ...outcome, committed: true, site: ADAPTER.name };
-        }
-        const sent = await submit();
-        noteWakeResult(n, sent);
-        return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+        return await submitWakeText();
       }
 
       const el = ADAPTER.getInputEl();
@@ -1439,10 +1489,9 @@ function normalizeHerdrMentionAlias(value) {
       el.style.opacity = "0";
       ADAPTER.fillInput(text);
       await wait(420); // React-controlled inputs commit value asynchronously.
-      const sent = await submit();
+      const submission = await submitWakeText();
       setTimeout(() => { if (el) el.style.opacity = oldOpacity ?? ""; }, 600);
-      noteWakeResult(n, sent);
-      return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+      return submission;
     } finally {
       wakeInFlight = false;
     }
@@ -1776,11 +1825,29 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
+  // The exact Unicode White_Space set Rust `str::trim()` / `split_whitespace()`
+  // use. It is written out because JS `String.prototype.trim()` and `\s` differ
+  // from Rust: JS trims U+FEFF but not U+0085 (NEL); Rust does the opposite.
+  // Keeping the two languages on one explicit class is what makes the reported
+  // acceptance digests comparable to the runtime's own hashes.
+  const ACCEPTANCE_WHITESPACE = "\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+  const ACCEPTANCE_WHITESPACE_CLASS = `[${ACCEPTANCE_WHITESPACE}]`;
+  const ACCEPTANCE_TRIM_RE = new RegExp(`^${ACCEPTANCE_WHITESPACE_CLASS}+|${ACCEPTANCE_WHITESPACE_CLASS}+$`, "g");
+  const ACCEPTANCE_SPLIT_RE = new RegExp(`${ACCEPTANCE_WHITESPACE_CLASS}+`, "gu");
+
+  // Acceptance trim. Mirrors Rust `str::trim()` exactly (see above); never use
+  // `String.prototype.trim()` for text whose digest must equal the runtime's.
+  function acceptanceTrim(text) {
+    return String(text ?? "").replace(ACCEPTANCE_TRIM_RE, "");
+  }
+
   // Whitespace-canonical comparison form for exact submit acceptance. Mirrors
   // the runtime `browser_readback_text_canonical` (crates/herdr-mcp/src/mcp.rs):
-  // NBSP/BOM become spaces and every whitespace run collapses to one space.
+  // NBSP/BOM become spaces and every Unicode White_Space run collapses to one
+  // space, using the same class Rust `split_whitespace()` uses.
   function canonicalAcceptanceText(text) {
-    return String(text || "").replace(/[\u00a0\ufeff]/g, " ").split(/\s+/u).filter(Boolean).join(" ");
+    return String(text || "").replace(/[\u00a0\ufeff]/g, " ")
+      .split(ACCEPTANCE_SPLIT_RE).filter(Boolean).join(" ");
   }
 
   // Strip only leading `@?<app>` mention tokens the caller named, matching the
@@ -1794,7 +1861,7 @@ function normalizeHerdrMentionAlias(value) {
     for (let changed = true; changed;) {
       changed = false;
       for (const name of names) {
-        const match = body.match(new RegExp(`^@?${name}(?:\\s+|$)`, "i"));
+        const match = body.match(new RegExp(`^@?${name}(?:${ACCEPTANCE_WHITESPACE_CLASS}+|$)`, "i"));
         if (match) { body = body.slice(match[0].length); changed = true; }
       }
     }
@@ -1825,8 +1892,8 @@ function normalizeHerdrMentionAlias(value) {
         "SHA-256",
         new TextEncoder().encode(text),
       ))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-      const full = String(observedText || "").trim();
-      const body = stripLeadingAppMentionTokens(full, apps).trim();
+      const full = acceptanceTrim(observedText);
+      const body = acceptanceTrim(stripLeadingAppMentionTokens(full, apps));
       if (!full || !body) return {};
       return {
         accepted_user_text_sha256: await hex(full),
@@ -2048,6 +2115,12 @@ function normalizeHerdrMentionAlias(value) {
     if (existing?.ok && existing?.body?.is_archived === true) {
       return { outcome: "applied", delivered: false, alreadyArchived: true };
     }
+    // A rate-limited preflight read is not evidence of current state, so the
+    // archive must not proceed to a mutation it could not verify afterwards.
+    // Reject before the one-shot claim is taken; nothing was mutated.
+    if (existing?.status === 429 || existing?.reason === "http-429") {
+      return { outcome: "rejected", delivered: false, rateLimited: true };
+    }
     // Some conversations (live: uncertain-create workers J1/K1/A1) never expose
     // the header options menu. Fall back to ChatGPT's own conversation PATCH
     // (the same endpoint title projection uses), under the same one-shot claim.
@@ -2075,14 +2148,34 @@ function normalizeHerdrMentionAlias(value) {
       if (viaApi) {
         const token = String(await readChatGptAccessToken(4000) || "");
         if (!token || token.length > 4096) return { outcome: "uncertain", delivered: true };
-        await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
-          method: "PATCH",
-          credentials: "include",
-          cache: "no-store",
-          redirect: "error",
-          headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${token}` },
-          body: JSON.stringify({ is_archived: true }),
-        });
+        let response = null;
+        try {
+          response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+            method: "PATCH",
+            credentials: "include",
+            cache: "no-store",
+            redirect: "error",
+            headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${token}` },
+            body: JSON.stringify({ is_archived: true }),
+          });
+        } catch (_) {
+          // The request may have reached the provider before the transport
+          // failed; the one-shot claim is already persisted, so stay uncertain
+          // and never re-mutate.
+          return { outcome: "uncertain", delivered: true };
+        }
+        if (response?.ok !== true) {
+          const status = Number(response?.status || 0);
+          // 429 and 5xx mean the provider may have applied the archive before
+          // throttling or failing the response: delivered but unproven. The
+          // one-shot claim keeps this terminal, so it is never re-mutated.
+          if (status === 429 || status >= 500 || status === 0) {
+            return { outcome: "uncertain", delivered: true };
+          }
+          // A definitive non-429 4xx rejection was not applied. The claim is
+          // already persisted, so the same logical archive is not replayed.
+          return { outcome: "rejected", delivered: true, rejectedStatus: status };
+        }
       } else {
         archive.click();
       }
@@ -2189,7 +2282,10 @@ function normalizeHerdrMentionAlias(value) {
       generation: registeredBrowserGeneration,
     }, { durableAuthority });
     if (attempt.outcome === "rejected") {
-      return browserRejectedEvidence(evidence, "browser_archive_control_unavailable");
+      return browserRejectedEvidence(
+        evidence,
+        attempt.rateLimited === true ? "rate_limited" : "browser_archive_control_unavailable",
+      );
     }
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
@@ -2272,24 +2368,29 @@ function normalizeHerdrMentionAlias(value) {
             // required-App tokens the runtime named, then trim.
             const apps = (Array.isArray(params.required_apps) ? params.required_apps : [])
               .filter((app) => typeof app === "string" && /^[a-z0-9_-]{1,64}$/.test(app));
-            const full = parts.join("").trim();
-            let body = full;
-            for (let changed = true; changed;) {
-              changed = false;
-              for (const app of apps) {
-                const match = body.match(new RegExp(`^@?${app}(?:\\s+|$)`, "i"));
-                if (match) { body = body.slice(match[0].length).trim(); changed = true; }
-              }
-            }
+            const full = acceptanceTrim(parts.join(""));
+            const body = acceptanceTrim(stripLeadingAppMentionTokens(full, apps));
             evidence.result.accepted_user_message_ref = users[0].id;
+            // App identity for late acceptance must come from the same accepted
+            // provider message as the ref and the digests above, and only from
+            // provider-owned inline mentions with a non-empty path. When it
+            // cannot be proven, the runtime keeps the reservation Uncertain
+            // rather than accepting an unverified App.
+            const acceptedApps = (typeof ADAPTER.getAcceptedUserAppIdentity === "function")
+              ? ADAPTER.getAcceptedUserAppIdentity(users[0].id)
+              : [];
+            evidence.required_apps_readback = Array.isArray(acceptedApps)
+              ? acceptedApps.map((app) => app.name)
+              : [];
+            if (acceptedApps.length) evidence.result.accepted_user_apps = acceptedApps;
             evidence.result.accepted_user_text_sha256 = await hex(full);
             evidence.result.accepted_user_body_sha256 = await hex(body);
             // Whitespace-canonical digests: ChatGPT re-renders composer line
             // breaks when storing the turn. Mirrors the runtime's
-            // browser_readback_text_canonical.
-            const canonical = (text) => text.replace(/[\u00a0\ufeff]/g, " ").split(/[\s]+/u).filter(Boolean).join(" ");
-            evidence.result.accepted_user_text_canonical_sha256 = await hex(canonical(full));
-            evidence.result.accepted_user_body_canonical_sha256 = await hex(canonical(body));
+            // browser_readback_text_canonical through the same shared helpers
+            // used for the submit acceptance digests.
+            evidence.result.accepted_user_text_canonical_sha256 = await hex(canonicalAcceptanceText(full));
+            evidence.result.accepted_user_body_canonical_sha256 = await hex(canonicalAcceptanceText(body));
             evidence.result.accepted_user_text_length = full.length;
             evidence.result.accepted_user_body_length = body.length;
           } catch (_) {}
@@ -2511,7 +2612,10 @@ function normalizeHerdrMentionAlias(value) {
           result: { error: appSelection.error, app_selection_probe: appSelection.app_selection_probe || null },
         };
       }
-      evidence.required_apps_readback = appSelection.apps;
+      // The selected-composer readback is intentionally not reported as
+      // delivery evidence: the App identity that satisfies the runtime must come
+      // from the accepted provider user message below, not from a pre-submit
+      // composer pill that may never have landed in the turn.
     }
 
     const exactChatGptDispatchIdentity = ADAPTER.name === "chatgpt"
@@ -2624,12 +2728,21 @@ function normalizeHerdrMentionAlias(value) {
           : (exactDomUserMessageRef || afterDom?.messageId || null));
       if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef) {
         // The existing actuation evidence.result object carries the exact
-        // provider user-message identity plus the digests of the accepted
-        // provider text, so the runtime re-verifies acceptance instead of
-        // trusting this content script. No new top-level field is added and no
-        // message text leaves the page.
+        // provider user-message identity, the App identity of that same
+        // provider message, and the digests of the accepted provider text, so
+        // the runtime re-verifies acceptance instead of trusting this content
+        // script. No new top-level field is added and no message text leaves the
+        // page.
+        const acceptedApps = (ADAPTER.name === "chatgpt"
+          && typeof ADAPTER.getAcceptedUserAppIdentity === "function")
+          ? ADAPTER.getAcceptedUserAppIdentity(acceptedUserMessageRef)
+          : [];
+        // A requested App is satisfied only by the identity of the accepted
+        // provider message; plain text and unlanded composer pills do not count.
+        evidence.required_apps_readback = acceptedApps.map((app) => app.name);
         evidence.result = {
           accepted_user_message_ref: acceptedUserMessageRef,
+          ...(acceptedApps.length ? { accepted_user_apps: acceptedApps } : {}),
           ...(await providerAcceptanceDigests(
             serverAdvanced ? afterServer.userText : afterDom.text,
             requiredApps,
@@ -3268,7 +3381,10 @@ function normalizeHerdrMentionAlias(value) {
             queueInsert: true,
             requiredApps: queuedSelectedApps.length > 0 ? queuedSelectedApps : currentHerdrRequiredApps(),
           });
-          if (result.ok) {
+          if (result.ok || result.uncertain === true) {
+            // An uncertain single-shot submit is terminal for this batch: the
+            // provider mutation was already dispatched, so remember the batch
+            // instead of letting a redelivery send a duplicate turn.
             rememberQueuedInsertBatch(convKey, batchId);
             if (CONVERSATION_HEALTH) {
               markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
@@ -4850,7 +4966,7 @@ function normalizeHerdrMentionAlias(value) {
       recovery: true,
       requiredApps: currentHerdrRequiredApps(),
     });
-    if (!result?.ok) {
+    if (!result?.ok && result?.uncertain !== true) {
       markConversationState({ ...conversationHealth, explicit_error_continue_attempt: 0 });
       return true;
     }
@@ -5038,7 +5154,17 @@ function normalizeHerdrMentionAlias(value) {
       recovery: true,
       requiredApps: currentHerdrRequiredApps(),
     });
-    if (!result?.ok) return false;
+    if (!result?.ok) {
+      if (result?.uncertain === true) {
+        // The single submit already dispatched and could not be confirmed. Never
+        // resend the same probe: treat it as sent so the reply/health watcher
+        // decides the next step instead of creating a duplicate provider turn.
+        markConversationState(RECOVERY_CONTROLLER.markRecoverySent(conversationHealth));
+        paintPageHud({});
+        return true;
+      }
+      return false;
+    }
     markConversationState(RECOVERY_CONTROLLER.markRecoverySent(conversationHealth));
     paintPageHud({});
     const confirm = await confirmReplyStarted(RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs);
@@ -5127,7 +5253,7 @@ function normalizeHerdrMentionAlias(value) {
         recovery: true,
         requiredApps: currentHerdrRequiredApps(),
       });
-      if (!result?.ok) return false;
+      if (!result?.ok && result?.uncertain !== true) return false;
       markConversationState(RECOVERY_CONTROLLER.markRecoverySent({
         ...conversationHealth,
         stale_activation_attempt: 1,

@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "description": "Shared acceptance-text digest parity fixture for the browser extension and the Rust runtime. Both languages must accept-trim and whitespace-canonicalize the same text the same way: Rust str::trim()/split_whitespace() Unicode White_Space semantics, with NBSP and BOM folded to a space before the split. JS String.prototype.trim()/\\s must not be used for these digests because they differ on U+FEFF and U+0085.",
+  "cases": [
+    {
+      "name": "plain ascii",
+      "text": "hello world",
+      "trimmed_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+      "canonical_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    },
+    {
+      "name": "outer whitespace",
+      "text": "   hello world   ",
+      "trimmed_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+      "canonical_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    },
+    {
+      "name": "blank line between paragraphs",
+      "text": "Line one\n\nLine two",
+      "trimmed_sha256": "29557cc1660e65689ac478c28b709cfc0d296d035ea9848ac382fbf8c43a6568",
+      "canonical_sha256": "c2f82367a1f05db83bc69b1f63e1a4aea26e4a509bfcc6c70fe4c7e5ec44c58e"
+    },
+    {
+      "name": "double spaces",
+      "text": "alpha  beta   gamma",
+      "trimmed_sha256": "4988caa40f9f80af2ac45db4bd4abe8b8fca09e2e736e413775f907a60b5d151",
+      "canonical_sha256": "64989ccbf3efa9c84e2afe7cee9bc5828bf0fcb91e44f8c1e591638a2c2e90e3"
+    },
+    {
+      "name": "leading tab and trailing newline",
+      "text": "\talpha beta\n",
+      "trimmed_sha256": "1a989ea86150171c687b0727f218eedbb94c4665a7da9b0add1bf5de607f2bf1",
+      "canonical_sha256": "1a989ea86150171c687b0727f218eedbb94c4665a7da9b0add1bf5de607f2bf1"
+    },
+    {
+      "name": "crlf line endings",
+      "text": "one\r\ntwo",
+      "trimmed_sha256": "29a776bb35efe730dabb1b1d3ad74dbf80cc3e9009e168241798ea73adca3dcf",
+      "canonical_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2"
+    },
+    {
+      "name": "nbsp as separator",
+      "text": "one two",
+      "trimmed_sha256": "d153e07702e5e90c726d3829656efc492593cbbeaa61ca3aac4b74ad77cd964a",
+      "canonical_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2"
+    },
+    {
+      "name": "leading nbsp",
+      "text": " one two",
+      "trimmed_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2",
+      "canonical_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2"
+    },
+    {
+      "name": "leading bom",
+      "text": "﻿one two",
+      "trimmed_sha256": "638628dab6689985cf68963d9e0c30f44cab07a5a8ee6ce1b3ca4701b59e961c",
+      "canonical_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2"
+    },
+    {
+      "name": "bom inside text",
+      "text": "one﻿two",
+      "trimmed_sha256": "7cd011936b43725158004c413f6f5a63672a6e275c2d263aa50d43d3c30f585b",
+      "canonical_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2"
+    },
+    {
+      "name": "nel separator",
+      "text": "onetwo",
+      "trimmed_sha256": "e8d53a4188661ee4c90f34d9469bfe23728cc4eb9cf2fd3e9309ade11ec68a66",
+      "canonical_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2"
+    },
+    {
+      "name": "leading nel",
+      "text": "one two",
+      "trimmed_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2",
+      "canonical_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2"
+    },
+    {
+      "name": "ideographic space",
+      "text": "one　two",
+      "trimmed_sha256": "c5f8c911a068d4767ab3990c817c8ca966fbf81fb55825f4da1cab184c065395",
+      "canonical_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2"
+    },
+    {
+      "name": "mixed separator run",
+      "text": "one  \t two",
+      "trimmed_sha256": "b91b65ba74d385a75afca83c0c26192b7c2de17d652c40bf87a433b4d2888ccb",
+      "canonical_sha256": "8ab63e29a4ba14e4e1688f9c15e5af90895421358c945b0431f85d66977bd3d2"
+    },
+    {
+      "name": "single line with app mention token",
+      "text": "@herdr hello there",
+      "trimmed_sha256": "167e9c244f373fbb73c3202f6285a0c9bbecc5024569aecb73f1cfdc0edf9f8b",
+      "canonical_sha256": "167e9c244f373fbb73c3202f6285a0c9bbecc5024569aecb73f1cfdc0edf9f8b"
+    },
+    {
+      "name": "multiline list",
+      "text": "Line one\n  - item\n\nLine two",
+      "trimmed_sha256": "f43bbc818a7384f41ef3439b19dc1e394b63ab1e5b1fe69fb6e8c5820249efda",
+      "canonical_sha256": "39727d9b141b4d737920fb00bd44b55dbc1901d7157fca38cf77c004429bdfef"
+    },
+    {
+      "name": "emoji and spaces",
+      "text": "hi  😀  there",
+      "trimmed_sha256": "a004b41c52cdbb9b216e094a5f802df833c0e670a1aec805c43f1bc5875d01e9",
+      "canonical_sha256": "1f6eefbcaeddf8c3665fa3645af00c38a7e7fc689372829cc2fac8742852faf1"
+    }
+  ]
+}

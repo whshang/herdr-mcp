@@ -100,10 +100,14 @@ const probes = {
       "async function queueCurrentComposerMessage()",
       "function ensureQueuedInsertButton",
     );
+    const resumeSubmitsOnce = resume.includes("submitWakeText()")
+      || resume.includes("await submit()");
     return enqueue.includes("selectedAppsBeforeQueue")
       && enqueue.includes("ensureRequiredComposerApps(selectedAppsBeforeQueue)")
       && resume.includes("ensureRequiredComposerApps(requiredApps)")
-      && resume.indexOf("ensureRequiredComposerApps(requiredApps)") < resume.indexOf("await submit()")
+      && resumeSubmitsOnce
+      && resume.indexOf("ensureRequiredComposerApps(requiredApps)")
+        < resume.indexOf(resume.includes("submitWakeText()") ? "submitWakeText()" : "await submit()")
       && source.background.includes("function learnedBindingRequiredApps(bindings)")
       && source.background.includes("async function handoffMessageWithRequiredApps")
       && source.background.includes("createParams = { ...params, required_apps: inheritedRequiredApps }")
@@ -132,10 +136,18 @@ const probes = {
   },
 
   picker_scope_and_search(source) {
-    return source.adapter.includes(
+    // Historical bounded form (0.1.128-0.1.129) and the current stricter form
+    // both keep the historical boundary closed: the broken 0.1.127 release
+    // scanned every popover/menu/listbox on the page and accepted substring
+    // text, while the current tree resolves only the popup the composer itself
+    // owns through its own association attributes.
+    const boundedMenuRoots = source.adapter.includes(
       "const menuRoots = [...document.querySelectorAll('.popover, [role=\"menu\"], [role=\"listbox\"]')]",
-    )
-      && source.adapter.includes("for (const root of menuRoots)")
+    ) && source.adapter.includes("for (const root of menuRoots)");
+    const ownedPopup = source.adapter.includes("getComposerOwnedPopup(input)")
+      && source.adapter.includes("if (!popup) return []")
+      && !source.adapter.includes("menuRoots");
+    return (boundedMenuRoots || ownedPopup)
       && (source.wake.includes("!composerModelVisibleText()")
         || source.wake.includes("ADAPTER.getComposerTextWithoutAppPills() !== ''"))
       && (

@@ -2864,10 +2864,21 @@ function selfArchiveHarness(overrides = {}) {
   const end = wakeSource.indexOf("async function performBrowserActuationCommand", start);
   assert.ok(start >= 0 && end > start, "deferred self-archive helper must remain extractable");
   const segment = wakeSource.slice(start, end);
+  // The acceptance trim/canonical helpers live earlier in the file than the
+  // deferred-self-archive block, so inject the real ones for the late readback.
+  const acceptanceStart = wakeSource.indexOf("  // The exact Unicode White_Space set Rust");
+  const acceptanceEnd = wakeSource.indexOf("\n  // Exact submit acceptance.", acceptanceStart);
+  assert.ok(acceptanceStart >= 0 && acceptanceEnd > acceptanceStart,
+    "acceptance canonicalization helpers must remain extractable");
+  const acceptanceSource = wakeSource.slice(acceptanceStart, acceptanceEnd);
   const api = new Function("ctx", "sessionStorage", "setTimeout", "Date", `
-    const ADAPTER = { name: "chatgpt" };
+    const ADAPTER = { name: "chatgpt", ...(ctx.adapter || {}) };
     const chatGptConversationId = () => ctx.conversationId;
     const isTurnInProgress = () => ctx.turnInProgress;
+    const fetch = ctx.fetch || (() => { throw new Error("unexpected fetch"); });
+    // The archive API fallback is opt-in: existing fixtures keep the historical
+    // "no provider token" behaviour unless a test supplies one.
+    const readChatGptAccessToken = async () => (ctx.accessToken === undefined ? null : ctx.accessToken);
     const openChatGptArchiveMenu = async () => {
       if (ctx.menuGate) await ctx.menuGate;
       return ctx.archiveAvailable
@@ -2881,10 +2892,14 @@ function selfArchiveHarness(overrides = {}) {
     };
     const fetchChatGptConversation = async () => {
       if (ctx.verifyGate && ctx.clicks.length > 0) await ctx.verifyGate;
+      if (ctx.readbackStatus) {
+        return { ok: false, status: ctx.readbackStatus, error: "conversation-http", reason: "http-" + ctx.readbackStatus };
+      }
       return ctx.archiveVerifies
         ? { ok: true, body: { is_archived: ctx.providerArchived === true } }
         : { ok: false };
     };
+    const fetchChatGptConversationDetail = async () => ctx.detail || { ok: false };
     const fetchChatGptArchivedConversationList = async () => ({
       ok: true,
       items: ctx.archiveListContains
@@ -2899,6 +2914,7 @@ function selfArchiveHarness(overrides = {}) {
     });
     let registeredBrowserSessionRef = ctx.sessionRef;
     let registeredBrowserGeneration = ctx.generation;
+    ${acceptanceSource}
     ${segment}
     return {
       performChatGptSessionArchive,
@@ -3463,7 +3479,11 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   );
   assert.doesNotMatch(createSegment, /reasoning != null \|\| requiredApps\.length > 0/);
   assert.match(createSegment, /ensureRequiredComposerApps\(requiredApps\)/);
-  assert.match(createSegment, /evidence\.required_apps_readback = appSelection\.apps/);
+  // The runtime-visible App readback must come from the accepted provider
+  // message, never from the pre-submit composer selection.
+  assert.match(createSegment, /evidence\.required_apps_readback = acceptedApps\.map\(\(app\) => app\.name\)/);
+  assert.match(createSegment, /getAcceptedUserAppIdentity\(acceptedUserMessageRef\)/);
+  assert.doesNotMatch(createSegment, /evidence\.required_apps_readback = appSelection\.apps/);
   assert.match(createSegment, /requiredApps,/);
 
   const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
@@ -3640,12 +3660,17 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(chatGptAdapterSource, /data-keyword/);
   // Direct @ typing triggers the provider suggestion list; a unique visible
   // candidate and a real selected pill are still mandatory before submit.
-  assert.match(chatGptAdapterSource, /getComposerAppCandidates\(keyword\)/);
-  assert.match(chatGptAdapterSource, /\[data-keyword\], \[data-value\]/);
-  assert.match(chatGptAdapterSource, /keywordMatches\(node\)/);
-  assert.match(chatGptAdapterSource, /visible\(node\)/);
-  assert.match(chatGptAdapterSource, /if \(!menuRoots\.length\) return \[\]/);
-  assert.match(chatGptAdapterSource, /for \(const root of menuRoots\)/);
+  // Candidates come only from the popup the composer itself owns through its
+  // own association attributes; a document-wide popup/menu scan is never a
+  // fallback and substring text is never a keyword match.
+  assert.match(chatGptAdapterSource, /getComposerOwnedPopup\(input\)/);
+  assert.match(chatGptAdapterSource, /aria-controls/);
+  assert.match(chatGptAdapterSource, /aria-owns/);
+  assert.match(chatGptAdapterSource, /if \(!popup\) return \[\]/);
+  assert.match(chatGptAdapterSource, /for \(const node of popup\.querySelectorAll\(selectors\.join\(','\)\)\)/);
+  assert.match(chatGptAdapterSource, /if \(!keywordMatches\(node\)\) continue/);
+  assert.doesNotMatch(chatGptAdapterSource, /text\.includes\(wanted\)/);
+  assert.doesNotMatch(chatGptAdapterSource, /menuRoots/);
   assert.match(chatGptAdapterSource, /return matches\.sort/);
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
@@ -3717,8 +3742,10 @@ test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conv
   assert.ok(resumeStart >= 0 && resumeEnd > resumeStart);
   const resume = wake.slice(resumeStart, resumeEnd);
   assert.match(resume, /ensureRequiredComposerApps\(requiredApps\)/);
-  assert.ok(resume.indexOf("ensureRequiredComposerApps(requiredApps)") < resume.indexOf("await submit()"),
-    "resume-only submission must restore the required App before submit");
+  assert.ok(resume.indexOf("ensureRequiredComposerApps(requiredApps)") < resume.indexOf("submitWakeText()"),
+    "resume-only submission must restore the required App before the single-shot submit");
+  assert.doesNotMatch(resume, /await submit\(\)/,
+    "resume-only must not fall back to the retrying submit loop");
   const clearBeforeInsert = wake.indexOf("if (clearBeforeInsert) await clearComposer()");
   const mainAppSelection = wake.indexOf("let appSelection = { ok: true, apps: [] }");
   assert.ok(clearBeforeInsert >= 0 && mainAppSelection > clearBeforeInsert,
@@ -4277,7 +4304,7 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
   const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart, "browser evidence helpers must remain extractable");
   assert.ok(commandStart >= 0 && commandEnd > commandStart, "browser actuation command must remain extractable");
-  const helperStart = wakeSource.indexOf("  // Whitespace-canonical comparison form for exact submit acceptance.");
+  const helperStart = wakeSource.indexOf("  // The exact Unicode White_Space set Rust");
   const helperEnd = wakeSource.indexOf("\n  function providerCanonicalConversationObserved()", helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart, "exact acceptance helpers must remain extractable");
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
@@ -4293,6 +4320,9 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
       getCanonicalConversationUrl: () => ctx.canonicalUrl === "" ? "" : "https://chatgpt.com/c/current",
       getInputEl: () => ({}),
       inputHasContent: () => ctx.inputHasContent === true,
+      getAcceptedUserAppIdentity: (messageId) => (typeof ctx.acceptedUserApps === "function"
+        ? ctx.acceptedUserApps(messageId)
+        : []),
     };
     const chatGptConversationId = () => {
       const match = String(ADAPTER.getConversationKey() || "").match(/\\/c\\/([^/?#]+)/);
@@ -4453,4 +4483,207 @@ test("user create does not adopt a foreign conversation | Given a Project-home t
   assert.equal(result.stable_resource_ref_observed, false);
   assert.equal(result.result, undefined, "a foreign conversation's latest turn is not this create's acceptance");
   assert.equal(ctx.registers || 0, 0, "the landed conversation must not be materialized as the new session");
+});
+
+test("user accepted message must carry the required app | Given the composer selected herdr but the accepted provider message carries no app identity | When acceptance is evaluated | Then the required-app readback is empty and no app is credited", async () => {
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn" },
+      { ok: true, userMessageId: "user-2", userText: "next turn" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "next turn", count: 2 },
+    assistantSnapshot: { messageId: "assistant-1", text: "previous answer", count: 1 },
+    turnInProgress: false,
+    acceptedUserApps: () => [],
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: ["herdr"] },
+  });
+
+  assert.equal(result.accepted_message_observed, true);
+  assert.equal(result.result.accepted_user_message_ref, "user-2");
+  assert.equal(
+    result.required_apps_readback.length,
+    0,
+    "a pre-submit composer pill must never satisfy the required app",
+  );
+  assert.equal(result.result.accepted_user_apps, undefined);
+
+  const credited = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn" },
+      { ok: true, userMessageId: "user-2", userText: "next turn" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "next turn", count: 2 },
+    assistantSnapshot: { messageId: "assistant-1", text: "previous answer", count: 1 },
+    turnInProgress: false,
+    acceptedUserApps: (messageId) => (messageId === "user-2"
+      ? [{ name: "herdr", path: "connectors/herdr" }]
+      : []),
+  });
+  const applied = await credited({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: ["herdr"] },
+  });
+  assert.deepEqual([...applied.required_apps_readback], ["herdr"]);
+  assert.deepEqual([...applied.result.accepted_user_apps].map((app) => ({
+    name: app.name,
+    path: app.path,
+  })), [{ name: "herdr", path: "connectors/herdr" }]);
+});
+
+test("user archive handles a rate-limited preflight | Given the preflight read returns HTTP 429 | When archive is requested | Then rate_limited is returned without any provider mutation", async () => {
+  const fetchCalls = [];
+  const { ctx, api } = selfArchiveHarness({
+    turnInProgress: false,
+    archiveAvailable: false,
+    readbackStatus: 429,
+    fetch: async (url, init = {}) => {
+      fetchCalls.push({ url, method: init.method || "GET" });
+      return { ok: false, status: 429 };
+    },
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      idempotency_key: "archive-preflight-rate-limited",
+    },
+  };
+  const evidence = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(evidence.rejected, true);
+  assert.equal(evidence.result.error, "rate_limited");
+  assert.equal(fetchCalls.length, 0, "nothing may be mutated while the preflight read is throttled");
+});
+
+test("user archive retry never repeats mutation | Given the archive PATCH is throttled with 429 | When the same key is retried | Then it stays unconfirmed and only one PATCH is dispatched", async () => {
+  const patches = [];
+  const { ctx, api } = selfArchiveHarness({
+    turnInProgress: false,
+    archiveAvailable: false,
+    accessToken: "archive-test-token",
+    fetch: async (url, init = {}) => {
+      if ((init.method || "GET") === "PATCH") {
+        patches.push(url);
+        return { ok: false, status: 429 };
+      }
+      return { ok: false, status: 500 };
+    },
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      idempotency_key: "archive-patch-rate-limited",
+    },
+  };
+  const first = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(first.command_accepted, true);
+  assert.equal(first.lifecycle_observed, false, "a throttled PATCH may have been applied: stay unconfirmed");
+  assert.equal(patches.length, 1);
+
+  const second = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(second.command_accepted, true);
+  assert.equal(second.lifecycle_observed, false);
+  assert.equal(patches.length, 1, "an uncertain archive is terminal and must never be re-mutated");
+});
+
+test("user archive treats a definitive provider rejection as not applied | Given the archive PATCH is rejected with HTTP 400 | When archive is requested | Then the provider is reported as rejecting it without a replay", async () => {
+  const patches = [];
+  const { ctx, api } = selfArchiveHarness({
+    turnInProgress: false,
+    archiveAvailable: false,
+    accessToken: "archive-test-token",
+    fetch: async (url, init = {}) => {
+      if ((init.method || "GET") === "PATCH") patches.push(url);
+      return { ok: false, status: 400 };
+    },
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      idempotency_key: "archive-patch-rejected",
+    },
+  };
+  const evidence = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(evidence.rejected, true);
+  assert.equal(evidence.result.error, "browser_archive_control_unavailable");
+  assert.equal(patches.length, 1);
+});
+
+test("user late acceptance verifies app identity | Given a matching message digest without the required App path | When the late readback runs | Then the app readback is empty and only the exact provider message identity is offered", async () => {
+  const detail = {
+    ok: true,
+    body: {
+      mapping: {
+        n1: {
+          message: {
+            id: "m1",
+            author: { role: "user" },
+            content: { content_type: "text", parts: ["late accepted turn"] },
+            metadata: {},
+          },
+        },
+      },
+    },
+  };
+  const commandFor = (ctx) => ({
+    operation: "herdr_mcp.browser_session.archive_status",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      readback_accepted: true,
+      required_apps: ["herdr"],
+    },
+  });
+
+  const withoutApps = selfArchiveHarness({
+    turnInProgress: false,
+    detail,
+    adapter: { getAcceptedUserAppIdentity: () => [] },
+  });
+  const plain = await withoutApps.api.performChatGptSessionArchiveStatus(
+    commandFor(withoutApps.ctx),
+    { observed_generation: 7 },
+  );
+  assert.equal(plain.result.accepted_user_message_ref, "m1");
+  assert.equal(plain.required_apps_readback.length, 0);
+  assert.equal(plain.result.accepted_user_apps, undefined, "a digest match without app proof stays app-less");
+
+  const withApps = selfArchiveHarness({
+    turnInProgress: false,
+    detail,
+    adapter: {
+      getAcceptedUserAppIdentity: (messageId) => (messageId === "m1"
+        ? [{ name: "herdr", path: "connectors/herdr" }]
+        : []),
+    },
+  });
+  const credited = await withApps.api.performChatGptSessionArchiveStatus(
+    commandFor(withApps.ctx),
+    { observed_generation: 7 },
+  );
+  assert.deepEqual([...credited.required_apps_readback], ["herdr"]);
+  assert.deepEqual([...credited.result.accepted_user_apps].map((app) => ({
+    name: app.name,
+    path: app.path,
+  })), [{ name: "herdr", path: "connectors/herdr" }]);
 });

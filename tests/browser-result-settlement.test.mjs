@@ -477,7 +477,7 @@ test("ChatGPT DOM fallback recognizes current data-turn structure without treati
 });
 
 test("ChatGPT dispatch accepts only a changed exact DOM user message identity when snapshot lookup is unavailable", () => {
-  const start = wakeSource.indexOf("  // Whitespace-canonical comparison form for exact submit acceptance.");
+  const start = wakeSource.indexOf("  // The exact Unicode White_Space set Rust");
   const end = wakeSource.indexOf("\n  function providerCanonicalConversationObserved()", start);
   assert.ok(start >= 0 && end > start, "exact DOM accepted-user helper must remain extractable");
   const helpers = new Function(
