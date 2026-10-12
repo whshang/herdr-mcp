@@ -176,9 +176,13 @@ public MCP contract migration
 
 ### 跨一个 epoch（N → N+1）
 
-普通 `herdr-mcp update` 自身从不跨 epoch：只有当发布清单的 `contract` identity `{epoch, hash, tool_count}` 与本机 Runtime 的 contract identity 完全一致时才会被接纳，epoch 不同则以 `release manifest contract identity mismatch` fail closed。因此任何已发布的 v1.0.x（epoch 4）都无法在任何通道上直接 update 到 epoch 5 的发布。
+选择一个发布包含两个独立步骤：发现（discovery）与接纳（admission）。
 
-只有目标发布清单在 `runtime-manifest.json` 中显式声明迁移时，才允许向前跨恰好一个 epoch：
+**发现**只回答“这台工作站应该看哪个发布”。它读取 GitHub releases 索引，选出唯一一个同时满足以下条件的最高版本：非 draft 的语义化版本、该 tag 发布了 release manifest、并且当前 update 通道接纳该版本。发现流程不读取 contract identity，所以它既不会退而选择更旧的发布，也不会把选择改写到某个中间 bridge；通道内最高的合格发布就是被选中的发布。
+
+**接纳**随后在下载任何东西之前校验被选中的 manifest。所有已发布的 updater 都只实现“完全相等”这一种接纳：manifest 的 `contract` identity `{epoch, hash, tool_count}` 必须等于本机 Runtime 的 contract identity，否则以 `release manifest contract identity mismatch` fail closed。因此任何已发布的 v1.0.x（epoch 4）都无法在任何通道上直接 update 到 epoch 5 的发布，而且结果是拒绝，不是回退到另一个发布。
+
+向前跨恰好一个 epoch 是**计划能力**，任何已发布的 updater 都尚未实现。它将来会写在 `runtime-manifest.json` 里：
 
 ```json
 "contract": { "epoch": 5, "hash": "sha256:<epoch-5>", "tool_count": 18 },
@@ -188,21 +192,49 @@ public MCP contract migration
 }
 ```
 
-这段声明属于 manifest 字节本身，因此被现有的 manifest digest GitHub artifact attestation 覆盖。
+这段声明属于 manifest 字节本身，因此会（在实现后）被现有的 manifest digest GitHub artifact attestation 覆盖。
 
-接纳规则（`L` 为本机 contract identity，`M` 为清单中的 `contract`）：
+计划中的接纳规则（`L` 为本机 contract identity，`M` 为清单中的 `contract`）：
 
 1. `M == L`：普通同 contract 更新，行为不变。
 2. `M != L`：仅当以下全部成立时接纳：`M.epoch == L.epoch + 1`；`contract_migration` 存在且格式合法；`contract_migration.from` 与 `L` 完全相等（epoch、hash、tool_count）；`contract_migration.state_schema_from` 等于本机 state schema；`manifest.state_schema` 等于本机 state schema。
 3. 其他情况在安装任何东西之前就拒绝，并报出本机与目标 epoch：跨多个 epoch、epoch 更低、`from` hash/tool_count 不匹配、声明缺失或格式错误、`contract_migration` 内出现未知字段。
 
-其余关卡全部保留并照常执行：manifest attestation、tag/source_ref identity、asset sha256、candidate probe、健康门控激活、update fence 与通道规则。跨 epoch 路径上，下载后的 candidate 按目标 contract `M`（而不是 `L`）验证。
+其余关卡全部保留并照常执行：manifest attestation、tag/source_ref identity、asset sha256、candidate probe、健康门控激活、update fence 与通道规则。在跨 epoch 更新中，下载后的 candidate 会按目标 contract `M`（而不是 `L`）验证。
 
-如果通道内最新发布不可接纳（例如 epoch +2），发现流程会 fail closed，并指向中间 bridge（`herdr-mcp update apply --manifest <url>`），而不是静默选择更旧的发布。`update auto` 可以按同一规则跨 epoch，且仍仅限 PROD + Stable。本协议不允许 state schema 迁移；schema 变更仍走显式的 major migration 路径。
+`update auto` 与交互命令使用同一套发现和同一套接纳检查，因此它可以在完全相同的规则下跨一个（计划中的）epoch，且仍仅限 PROD + Stable。本协议不允许 state schema 迁移；schema 变更仍走显式的 major migration 路径。
 
-因此常规的 v1.0.x → v1.1 路径是两步：先 `herdr-mcp update` 到 v1.0.4 epoch-4 bridge（contract identity 相同，属于普通同 contract 更新），再 `herdr-mcp update` 到第一个在 manifest 中声明 `contract_migration.from = epoch 4` 的 v1.1 发布（计划 v1.1.0-rc.2）。未声明该字段的 v1.1 预发布完全无法由 v1.0.x 到达。
+### v1.0.4 bridge 是计划中的发布，`herdr-mcp update` 目前无法到达它
 
-Rollback 语义：`herdr-mcp rollback` 重新激活上一个已安装的 generation（例如 1.1 → v1.0.4）。两侧都是 state schema 15，所以不需要数据库恢复。它仍然只是执行环境回滚：更新之后写入的持久状态不会被回退，依赖它之前要先检查真实 service/state。
+常规的 v1.0.x → v1.1 路径计划为两步：先 `herdr-mcp update` 到 v1.0.4 epoch-4 bridge（contract identity 相同，属于普通同 contract 更新），再 `herdr-mcp update` 到第一个在 manifest 中声明 `contract_migration.from = epoch 4` 的 v1.1 发布（计划 v1.1.0-rc.2）。但目前有两个事实限制了该计划：
+
+- v1.0.4 是**计划中**的 bridge 发布，尚不是已建立的已发布版本。当前没有任何 v1.0.x 工作站能安装它，v1.1.0-rc.1 也无法通过任何路径从 v1.0.x 到达。
+- 即使 v1.0.4 发布，已发布的 v1.0.0–v1.0.3 runtime 上的普通 `herdr-mcp update` 仍会在下载之后失败。这些 updater 把下载后 candidate probe 硬编码为字符串 `contract epoch 2 / 18 tools`；该 probe 读取下载下来的 candidate 自己的 `herdr-mcp version` 输出，并以 `staged update binary identity does not match release manifest` 拒绝它，因为 v1.0.x 或 v1.0.4 candidate 报告的是其真实的 epoch 4。需要后续的 updater 修正该 probe，普通 update 才能安装这个 bridge。该硬编码 probe 在当前的 1.1.0-rc.1 源码中仍然存在，所以修正它不只是 v1.0.x 的历史遗留问题，而是计划路径的前置条件。
+
+因此当前到 v1.0.4 的主要支持路径是**经过认证的手工安装** v1.0.4 release binary：
+
+1. 读取已发布 `runtime-manifest.json` 中对应目标的 asset 名称与 sha256；
+2. 从 release 下载该 asset 并校验其 sha256；
+3. 校验 release 的 artifact attestation，例如 `gh attestation verify <asset> --repo whshang/herdr-mcp`；
+4. 运行已完成校验的 binary 自带的安装器：
+
+```bash
+<binary> install
+```
+
+手工安装同样通过完整的 service lifecycle 安装一份不可变 generation；它不会绕过 contract identity、state schema、attestation 或健康门控。
+
+### 跨 epoch 之后的回滚
+
+`herdr-mcp rollback` 重新激活上一个已安装的 generation（例如 1.1 → v1.0.4）。它属于 service 回滚，因此平台边界很重要：
+
+- 在 macOS 上，一次成功的 install/activation 会记录一份 ready service rollback（上一份 service 定义和上一个 generation），`herdr-mcp rollback` 会重新校验并重新激活它；
+- 在 Linux 上，`herdr-mcp rollback` 没有作为公开操作暴露，也不会写入“成功之后”的 service rollback 记录；安装失败时改为按事务恢复上一个 generation。因此对一次已成功更新做跨 epoch 回滚仅限 macOS。
+
+两侧都是 state schema 15，所以不需要数据库恢复，但更新之后写入的持久状态不会被回退。在依赖它之前，先检查真实 service/state。共享状态里有两处 epoch 5 写入值得注意：
+
+- `browser_dispatches.message_canonical_digest` 是一个可空的前向新增列，不是编号迁移。schema 15 的 epoch 4 binary 会打开同一个数据库并忽略该列；更早写入的行保持 `NULL` 并只走 raw 比对，属 fail-closed，而不是伪造 canonical 匹配。
+- epoch 5 的 browser endpoint 注册写入会存 `webchat_control_allowed=1`，且重复注册会覆盖先前的 `0`。回滚后的 epoch 4 binary 会读到该持久值，并把 WebChat 控制视为已授权，因此回滚不会回退 1.1 做出的授权决定。
 
 ## 激活发生时会怎样
 
@@ -316,6 +348,8 @@ herdr-mcp update
 Worker name 与公网 origin 保持不变；Durable Objects、secrets、已知可选 binding、已 enrollment 设备、OAuth issuer 和 Connector records 都保留。同一次 update job 中可能自动打开 Cloudflare 授权页面。若多个可访问 Cloudflare Account 都存在同名 Worker，则 fail-closed，用户可用非秘密的 `CLOUDFLARE_ACCOUNT_ID` 消歧。如果 v0.4.8 前台 updater 的有界等待先结束，而浏览器授权仍在进行，detached migration 会继续执行；不要求用户再输入第二条 update 命令。
 
 迁移前会保存精确 v0.4.8 binary 与 schema-5 数据库 snapshot 作为 N-1 rollback material。如必须回退，显式使用 `herdr-mcp update major-rollback`。`update major-apply` 继续作为 bridge 内部及维护者恢复/UAT 的底层 primitive，不再是普通 v0.4.8 用户的升级步骤。
+
+这条一条命令路径只覆盖 schema-5 的 v0.4.8 → 1.0 边界。把已发布的 v1.0.x 迁移到计划中的 v1.0.4 epoch-4 bridge 属于另一个边界，普通 `herdr-mcp update` 目前无法完成，见上一节。
 
 ## `herdr-self-update` 适合做什么
 

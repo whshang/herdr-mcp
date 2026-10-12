@@ -151,9 +151,13 @@ contract migration は ChatGPT の tool snapshot、Edge compatibility、Link の
 
 ### 1 つの epoch をまたぐ（N → N+1）
 
-通常の `herdr-mcp update` が単独で epoch をまたぐことはありません。アップデータは manifest の `contract` identity `{epoch, hash, tool_count}` が実行中 Runtime の contract identity と一致する場合にのみ Release を受理し、epoch が異なれば `release manifest contract identity mismatch` で fail closed します。したがって公開済みの v1.0.x（epoch 4）は、どのチャネルでも epoch 5 の Release へ直接 update できません。
+Release の選択は 2 つの独立した段階、discovery と admission から成ります。
 
-前方にちょうど 1 つの epoch をまたげるのは、対象 Release の manifest が `runtime-manifest.json` 内で移行を明示的に宣言している場合だけです。
+**Discovery** は「このワークステーションがどの Release を見るべきか」だけを決めます。GitHub releases インデックスを読み、非 draft の semver であり、release manifest を公開しており、かつ設定された update チャネルが受理するもののうち、最も高い 1 つを選びます。Discovery は contract identity を読まないため、より古い Release に差し替えることも、選択を中間 bridge に書き換えることもありません。チャネル内で適格な最も高い Release がそのまま選択された Release です。
+
+**Admission** は、何かをダウンロードする前にその選択された manifest を検証します。公開済みのすべてのアップデータは admission を「完全一致」としてのみ実装しています。manifest の `contract` identity `{epoch, hash, tool_count}` が実行中 Runtime の contract identity と一致しなければ、`release manifest contract identity mismatch` で fail closed します。したがって公開済みの v1.0.x（epoch 4）は、どのチャネルでも epoch 5 の Release へ直接 update できず、その結果は拒否であって別の Release へのフォールバックではありません。
+
+前方にちょうど 1 つの epoch をまたぐことは**計画機能**であり、公開済みのどのアップデータにもまだ実装されていません。実装されると、`runtime-manifest.json` 内で次のように宣言されます:
 
 ```json
 "contract": { "epoch": 5, "hash": "sha256:<epoch-5>", "tool_count": 18 },
@@ -163,21 +167,49 @@ contract migration は ChatGPT の tool snapshot、Edge compatibility、Link の
 }
 ```
 
-この宣言は manifest のバイト列の一部であり、既存の manifest digest に対する GitHub artifact attestation の対象に含まれます。
+この宣言は manifest のバイト列の一部であり、（実装後は）既存の manifest digest に対する GitHub artifact attestation の対象に含まれます。
 
-受理規則（`L` をローカルの contract identity、`M` を manifest の `contract` とします）:
+計画中の受理規則（`L` をローカルの contract identity、`M` を manifest の `contract` とします）:
 
 1. `M == L` — 通常の同一 contract 更新。挙動は変わりません。
 2. `M != L` — 次がすべて成り立つ場合のみ受理します。`M.epoch == L.epoch + 1`、`contract_migration` が存在し形式が正しい、`contract_migration.from` が `L` と完全に一致（epoch, hash, tool_count）、`contract_migration.state_schema_from` がローカルの state schema と一致、`manifest.state_schema` がローカルの state schema と一致。
 3. それ以外は何もインストールする前に拒否し、ローカルと対象の epoch を明示したエラーを返します。複数 epoch のスキップ、より低い epoch、`from` の hash/tool_count 不一致、宣言の欠落または不正な形式、`contract_migration` 内の未知フィールドが該当します。
 
-その他のゲートはすべて変更なく実行されます。manifest attestation、tag/source_ref identity、asset sha256、candidate probe、health をゲートにした activation、update fence、チャネル規則です。cross-epoch 経路では、ダウンロードした candidate は `L` ではなく対象 contract `M` に対して検証されます。
+その他のゲートはすべて変更なく実行されます。manifest attestation、tag/source_ref identity、asset sha256、candidate probe、health をゲートにした activation、update fence、チャネル規則です。cross-epoch 更新では、ダウンロードした candidate は `L` ではなく対象 contract `M` に対して検証されます。
 
-チャネル内の最新 Release が受理できない場合（たとえば epoch +2）、discovery は fail closed し、古い Release を黙って選ぶ代わりに中間 bridge（`herdr-mcp update apply --manifest <url>`）を指し示します。`update auto` も同じ規則で epoch をまたげますが、PROD + Stable 限定のままです。このプロトコルは state schema の移行を許可しません。schema 変更は引き続き明示的な major migration 経路です。
+`update auto` は対話コマンドと同じ discovery と同じ admission チェックを使うため、まったく同じ規則で（計画上の）1 つの epoch をまたぐことができ、PROD + Stable 限定のままです。このプロトコルは state schema の移行を許可しません。schema 変更は引き続き明示的な major migration 経路です。
 
-したがって通常の v1.0.x → v1.1 経路は 2 段階です。まず `herdr-mcp update` で v1.0.4 epoch-4 bridge（contract identity が同一なので通常の同一 contract 更新）へ進み、次に `herdr-mcp update` で `contract_migration.from = epoch 4` を manifest で宣言した最初の v1.1 Release（予定は v1.1.0-rc.2）へ進みます。これを宣言していない v1.1 prerelease は v1.0.x からは到達できません。
+### v1.0.4 bridge は計画中の Release であり、`herdr-mcp update` では到達できない
 
-Rollback の意味: `herdr-mcp rollback` は直前のインストール済み generation を再アクティブ化します（例: 1.1 → v1.0.4）。両側とも state schema 15 なのでデータベースの復元は不要です。ただし実行環境の rollback であり、更新後に書き込まれた durable state は巻き戻りません。
+通常の v1.0.x → v1.1 経路は 2 段階を予定しています。まず `herdr-mcp update` で v1.0.4 epoch-4 bridge（contract identity が同一なので通常の同一 contract 更新）へ進み、次に `herdr-mcp update` で `contract_migration.from = epoch 4` を manifest で宣言した最初の v1.1 Release（予定は v1.1.0-rc.2）へ進みます。ただし現時点では 2 つの事実がこの計画を制限します:
+
+- v1.0.4 は**計画中**の bridge Release であり、確立された公開済み Release ではありません。現時点でどの v1.0.x ワークステーションもこれをインストールできず、v1.1.0-rc.1 はどの経路でも v1.0.x から到達できません。
+- v1.0.4 が公開された後でも、公開済みの v1.0.0–v1.0.3 runtime 上の通常の `herdr-mcp update` はダウンロード後に失敗します。これらのアップデータはダウンロード後の candidate probe を文字列 `contract epoch 2 / 18 tools` にハードコードしています。probe はダウンロードした candidate 自身の `herdr-mcp version` 出力を読み、`staged update binary identity does not match release manifest` で拒否します。v1.0.x や v1.0.4 の candidate は実際の epoch 4 を報告するためです。通常の update で bridge をインストールするには、後続のアップデータがこの probe を修正する必要があります。このハードコードされた probe は現在の 1.1.0-rc.1 ソースにも残っているため、その修正は v1.0.x だけの歴史的な問題ではなく、計画上の経路の前提条件です。
+
+したがって現在の v1.0.4 への主要な経路は、v1.0.4 release binary の**認証済み手動インストール**です:
+
+1. 対象ターゲットの公開された `runtime-manifest.json` を読み、asset 名と sha256 を取得する。
+2. Release からその asset をダウンロードし、sha256 を検証する。
+3. Release の artifact attestation を検証する。例: `gh attestation verify <asset> --repo whshang/herdr-mcp`
+4. 検証済み binary 自身のインストーラーを実行する:
+
+```bash
+<binary> install
+```
+
+手動インストールも同じ service lifecycle を通じて不変な generation を配置します。contract identity、state schema、attestation、health の各ゲートを迂回するものではありません。
+
+### epoch をまたいだ後の rollback
+
+`herdr-mcp rollback` は直前のインストール済み generation を再アクティブ化します（例: 1.1 → v1.0.4）。これは service rollback なのでプラットフォーム境界が重要です:
+
+- macOS では、成功した install/activation が ready な service rollback（以前の service 定義と以前の generation）を記録し、`herdr-mcp rollback` がそれを再検証して再アクティブ化します;
+- Linux では `herdr-mcp rollback` は公開操作として提供されておらず、成功後の service rollback レコードも書き込まれません。代わりに、インストール失敗時は直前の generation をトランザクション的に復元します。したがって、すでに成功した更新に対する cross-epoch rollback は macOS 限定です。
+
+両側とも state schema 15 なのでデータベースの復元は不要であり、更新後に書き込まれた durable state は巻き戻りません。依拠する前に実際の service/state を確認してください。その共有状態にある epoch 5 の 2 つの書き込みに注意してください:
+
+- `browser_dispatches.message_canonical_digest` は nullable な前向き追加列であり、番号付き migration ではありません。schema 15 の epoch 4 binary は同じデータベースを開き、この列を無視します。以前に書き込まれた行は `NULL` のままで raw のみで照合され、これは偽の canonical 一致ではなく fail-closed です。
+- epoch 5 の browser endpoint 登録書き込みは `webchat_control_allowed=1` を保存し、再登録は以前の `0` を上書きします。rollback 後の epoch 4 binary はその保存値を読み、WebChat 制御を許可済みとして扱います。つまり rollback は 1.1 が下した同意判断を巻き戻しません。
 
 ## トラフィックの切り替え
 
@@ -277,6 +309,8 @@ herdr-mcp update
 Worker name と public origin は変わらず、Durable Objects、secrets、既知の optional binding、enrolled devices、OAuth issuer、Connector records を保持します。同じ update job の中で Cloudflare authorization が browser に開く場合があります。複数の accessible Cloudflare account に同名 Worker がある場合は fail-closed し、non-secret の `CLOUDFLARE_ACCOUNT_ID` で明示的に disambiguate できます。v0.4.8 foreground updater の bounded watch が先に終了しても、authorization 中の detached migration は継続するため、2 回目の update command は不要です。
 
 migration 前には exact v0.4.8 binary と schema-5 database snapshot を N-1 rollback material として保存します。必要な場合の recovery command は `herdr-mcp update major-rollback` です。`update major-apply` は bridge 内部および maintainer recovery/UAT 用 primitive として残りますが、通常の v0.4.8 user の手順ではありません。
+
+この 1 コマンドの経路は schema-5 の v0.4.8 → 1.0 境界だけを対象とします。公開済み v1.0.x を計画中の v1.0.4 epoch-4 bridge へ移行するのは別の境界であり、通常の `herdr-mcp update` では現在完了できません。前述の節を参照してください。
 
 ## `herdr-self-update`
 
