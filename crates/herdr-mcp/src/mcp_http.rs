@@ -4049,6 +4049,7 @@ mod tests {
                     target_session_ref: &session.resource_ref,
                     request_digest: &digest("result-route-request"),
                     message_digest: &digest("result-route-message"),
+                    message_canonical_digest: None,
                     reasoning_effort: None,
                     required_apps: &required_apps,
                     expected_generation: 7,

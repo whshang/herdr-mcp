@@ -2333,6 +2333,42 @@ fn browser_required_apps_match_evidence(
             .eq(requested))
 }
 
+/// App identity read from one accepted provider user message. The extension
+/// reports it only from the same provider message as the accepted-user ref and
+/// the text digests, and only from provider-owned inline mentions carrying a
+/// non-empty path. A bare keyword, a plain-text mention, or a missing/ambiguous
+/// message therefore never satisfies a requested App.
+fn browser_accepted_user_apps_match(result: &Value, requested: &[&str]) -> bool {
+    let Some(apps) = result.get("accepted_user_apps").and_then(Value::as_array) else {
+        return false;
+    };
+    if apps.len() != requested.len() {
+        return false;
+    }
+    let mut names = Vec::with_capacity(apps.len());
+    for app in apps {
+        let Some(object) = app.as_object() else {
+            return false;
+        };
+        let name = object.get("name").and_then(Value::as_str).unwrap_or("");
+        let path = object.get("path").and_then(Value::as_str).unwrap_or("");
+        if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
+            return false;
+        }
+        if path.trim().is_empty() {
+            return false;
+        }
+        names.push(name.to_owned());
+    }
+    names.sort_unstable();
+    names.dedup();
+    names.len() == requested.len()
+        && names
+            .iter()
+            .map(String::as_str)
+            .eq(requested.iter().copied())
+}
+
 fn browser_delivery_state_from_postcondition(
     operation: BrowserOperation,
     params: &Value,
@@ -2483,14 +2519,22 @@ fn browser_evidence_accepted_text_matches(
         return Ok(false);
     };
     // The submit path carries the message text; the reconcile path only keeps
-    // the stored raw digest of that message.
+    // the stored raw digest of that message (plus its whitespace-canonical digest
+    // when the row is new enough to have one).
     let expected = if let Some(message) = params.get("message").and_then(Value::as_str) {
         vec![
             browser_sha256(message.trim()),
             browser_sha256(&browser_readback_text_canonical(message)),
         ]
     } else if let Some(digest) = params.get("message_sha256").and_then(Value::as_str) {
-        vec![digest.to_owned()]
+        let mut expected = vec![digest.to_owned()];
+        if let Some(canonical) = params
+            .get("message_canonical_sha256")
+            .and_then(Value::as_str)
+        {
+            expected.push(canonical.to_owned());
+        }
+        expected
     } else {
         return Ok(false);
     };
@@ -2558,6 +2602,10 @@ fn browser_dispatch_submit(
     let work_chain_id = params.get("work_chain_id").and_then(Value::as_str);
     let lane_id = params.get("lane_id").and_then(Value::as_str);
     let message_digest = browser_sha256(message);
+    // The provider re-renders composer line breaks, so the uncertain-dispatch
+    // reconcile must be able to compare the accepted provider text on the same
+    // whitespace-canonical form this submit path accepts.
+    let message_canonical_digest = browser_sha256(&browser_readback_text_canonical(message));
     let request_digest = browser_sha256(
         &json!({
             "operation": "browser_dispatch.submit",
@@ -2598,6 +2646,7 @@ fn browser_dispatch_submit(
         target_session_ref: session_ref,
         request_digest: &request_digest,
         message_digest: &message_digest,
+        message_canonical_digest: Some(&message_canonical_digest),
         reasoning_effort,
         required_apps: &required_apps,
         expected_generation,
@@ -2816,6 +2865,7 @@ fn browser_dispatch_stop(
         target_session_ref: &parent.target_session_ref,
         request_digest: &request_digest,
         message_digest: &empty_digest,
+        message_canonical_digest: Some(&empty_digest),
         reasoning_effort: None,
         required_apps: &[],
         expected_generation,
@@ -2981,9 +3031,17 @@ fn browser_dispatch_status(
             };
             let delivery_state = match browser_delivery_state_from_postcondition(
                 operation,
-                // The reconcile path has no message text, only the stored raw
-                // digest the accepted provider text must still match.
-                &json!({"message_sha256": dispatch.message_digest}),
+                // The reconcile path has no message text, only the stored raw and
+                // whitespace-canonical digests the accepted provider text must
+                // still match. Rows written before the canonical digest column
+                // existed stay raw-only (fail-closed), never a fabricated match.
+                &match dispatch.message_canonical_digest.as_deref() {
+                    Some(canonical) => json!({
+                        "message_sha256": dispatch.message_digest,
+                        "message_canonical_sha256": canonical,
+                    }),
+                    None => json!({"message_sha256": dispatch.message_digest}),
+                },
                 dispatch.expected_generation,
                 &evidence,
             ) {
@@ -3101,6 +3159,7 @@ fn browser_created_session_dispatch(
     let work_chain_id = params.get("work_chain_id").and_then(Value::as_str);
     let lane_id = params.get("lane_id").and_then(Value::as_str);
     let message_digest = browser_sha256(message);
+    let message_canonical_digest = browser_sha256(&browser_readback_text_canonical(message));
     let request_digest = browser_sha256(
         &json!({
             "operation": "browser_dispatch.submit",
@@ -3121,6 +3180,7 @@ fn browser_created_session_dispatch(
         target_session_ref: session_ref,
         request_digest: &request_digest,
         message_digest: &message_digest,
+        message_canonical_digest: Some(&message_canonical_digest),
         reasoning_effort,
         required_apps: &required_apps,
         expected_generation: reservation.expected_generation,
@@ -3504,6 +3564,14 @@ fn browser_session_create_late_acceptance_readback(
         .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected_canonical.as_str()));
     if !matches {
         return Err("readback_digest_mismatch");
+    }
+    // Late acceptance must also prove the requested App identity came from this
+    // same provider message. Without that proof the reservation stays
+    // Uncertain instead of promoting an unverified App to Applied.
+    let requested_apps =
+        browser_required_apps(params, true).map_err(|_| "readback_required_apps_invalid")?;
+    if !requested_apps.is_empty() && !browser_accepted_user_apps_match(result, &requested_apps) {
+        return Err("readback_app_identity_mismatch");
     }
     let mut guard = store.lock().map_err(|_| "store_unavailable")?;
     guard
@@ -4278,46 +4346,19 @@ fn browser_session_archive_params_from_current_turn(
     let idempotency_key = browser_required_idempotency_key(params)?;
     let source_user_text_sha256 = browser_sha256(current_user_message);
     let observed_at = browser_epoch_ms();
-    let (session_ref, expected_generation) = match store
-        .resolve_browser_source_turn(&source_user_text_sha256, observed_at)
-    {
-        Ok(value) => value,
-        Err(error) if error == "browser_current_turn_not_found" => {
-            if let (Some(authorization), Some(caller_session)) =
-                (caller_authorization, caller_browser_session)
-                && caller_session.provider == "chatgpt"
-            {
-                let bound_session_ref = store
-                    .resolve_browser_caller_session(
-                        &authorization.principal_ref,
-                        &caller_session.provider,
-                        &caller_session.opaque_session_id,
-                    )
-                    .map_err(browser_store_error)?;
-                if let Some(session_ref) = bound_session_ref {
-                    let session = match store.browser_resource(&session_ref) {
-                        Ok(Some(value)) => value,
-                        Ok(None) => {
-                            return Err(
-                                json!({"ok": false, "code": "browser_current_turn_not_found"}),
-                            );
-                        }
-                        Err(error) => return Err(browser_store_error(error)),
-                    };
-                    if session.kind != "session" || session.provider != "chatgpt" {
-                        return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
-                    }
-                    return Ok(Some(json!({
-                        "session_ref": session_ref,
-                        "expected_generation": session.observation_generation,
-                        "idempotency_key": idempotency_key,
-                    })));
-                }
+    let (session_ref, expected_generation) =
+        match store.resolve_browser_source_turn(&source_user_text_sha256, observed_at) {
+            Ok(value) => value,
+            Err(error) if error == "browser_current_turn_not_found" => {
+                // The exact current user message is the necessary evidence for the
+                // archive target. A previously bound caller session is not a
+                // substitute: after an account/Profile change it can name a
+                // different conversation, so an unresolved source turn must fail
+                // closed instead of archiving the wrong session.
+                return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
             }
-            return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
-        }
-        Err(error) => return Err(browser_store_error(error)),
-    };
+            Err(error) => return Err(browser_store_error(error)),
+        };
     let session = match store.browser_resource(&session_ref) {
         Ok(Some(value)) => value,
         Ok(None) => return Err(json!({"ok": false, "code": "browser_current_turn_not_found"})),
@@ -11076,9 +11117,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(drift["code"], "browser_current_turn_stale");
 
-        // Expire the source-turn row entirely. The durable opaque caller-session
-        // binding still resolves the same browser session and deliberately uses
-        // its latest observed generation instead of replaying stale generation 7.
+        // Expire the source-turn row entirely. The previously bound caller
+        // session is deliberately NOT a substitute for the exact current user
+        // message: after an account/Profile change that binding can name another
+        // conversation, so the archive target must stay unresolved instead of
+        // mutating the wrong session.
         assert_eq!(
             reopened
                 .resolve_browser_source_turn(
@@ -11088,7 +11131,14 @@ mod tests {
                 .unwrap_err(),
             "browser_current_turn_not_found"
         );
-        let rebound = browser_session_archive_params_from_current_turn(
+        let binding_before = reopened
+            .resolve_browser_caller_session(
+                &authorization.principal_ref,
+                "chatgpt",
+                &caller_session.opaque_session_id,
+            )
+            .unwrap();
+        let unresolved = browser_session_archive_params_from_current_turn(
             &mut reopened,
             &json!({
                 "current_user_message": "这条消息没有 source-turn 记录",
@@ -11098,14 +11148,71 @@ mod tests {
             Some(&authorization),
             Some(&caller_session),
         )
-        .unwrap()
-        .unwrap();
-        assert_eq!(rebound["session_ref"], session_ref);
-        assert_eq!(rebound["expected_generation"], 8);
+        .unwrap_err();
+        assert_eq!(unresolved["code"], "browser_current_turn_not_found");
+        assert_eq!(
+            reopened
+                .resolve_browser_caller_session(
+                    &authorization.principal_ref,
+                    "chatgpt",
+                    &caller_session.opaque_session_id,
+                )
+                .unwrap(),
+            binding_before,
+            "an unresolved current turn must not rebind or reuse the stale caller session"
+        );
         drop(reopened);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    /// The Rust half of the JS<->Rust acceptance-digest parity contract. The
+    /// extension reports these digests and this runtime re-verifies them, so a
+    /// divergent trim or canonicalization silently turns an accepted submit into
+    /// a permanent `uncertain`. `tests/browser-acceptance-digest-parity.test.mjs`
+    /// hashes the same fixture with the shipped extension helpers.
+    #[test]
+    fn browser_acceptance_digest_parity_with_extension_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/browser-acceptance-digest-parity.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture["schema_version"], 1);
+        let cases = fixture["cases"].as_array().unwrap();
+        assert!(
+            cases.len() >= 10,
+            "the shared fixture must pin a real whitespace matrix"
+        );
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let text = case["text"].as_str().unwrap();
+            assert_eq!(
+                browser_sha256(text.trim()),
+                case["trimmed_sha256"].as_str().unwrap(),
+                "{name}: trimmed digest must match the shared extension contract"
+            );
+            assert_eq!(
+                browser_sha256(&browser_readback_text_canonical(text)),
+                case["canonical_sha256"].as_str().unwrap(),
+                "{name}: canonical digest must match the shared extension contract"
+            );
+        }
+        // The two Unicode boundaries where the two languages historically
+        // diverged: Rust `str::trim()` keeps U+FEFF (not White_Space) and strips
+        // U+0085 (White_Space), the opposite of JS `String.prototype.trim()`.
+        assert_ne!(
+            browser_sha256("one two"),
+            browser_sha256("\u{feff}one two".trim())
+        );
+        assert_eq!(
+            browser_sha256("one two"),
+            browser_sha256("\u{0085}one two".trim())
+        );
+        assert_eq!(
+            browser_sha256(&browser_readback_text_canonical("one\u{0085}two")),
+            browser_sha256("one two")
+        );
     }
 
     #[test]
@@ -13685,6 +13792,479 @@ mod tests {
             match previous_config {
                 Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
                 None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+    }
+
+    /// Registers one endpoint/provider/account/session triple for dispatch
+    /// reconcile tests. No config directory or environment is touched: the tests
+    /// drive the durable store and `browser_dispatch_status` directly.
+    fn browser_dispatch_reconcile_fixture()
+    -> (std::sync::Arc<std::sync::Mutex<StateStore>>, String, String) {
+        use crate::state_store::{
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+        let mut store = StateStore::open(":memory:").unwrap();
+        let endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                profile_seed: "dispatch-reconcile-profile-seed",
+                browser_family: "chrome",
+                extension_version: "0.1.90",
+                observed_at: 10,
+            })
+            .unwrap();
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 7,
+                capabilities_json: r#"{"operations":["composer.submit","generation.stop"]}"#,
+                observed_at: 11,
+            })
+            .unwrap();
+        let account = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: "reconcile-account-hidden",
+                display_label: None,
+                observation_generation: 7,
+                observed_at: 12,
+            })
+            .unwrap();
+        let session = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&account.resource_ref),
+                native_identity: "reconcile-session-hidden",
+                display_label: None,
+                observation_generation: 7,
+                observed_at: 13,
+            })
+            .unwrap();
+        (
+            Arc::new(Mutex::new(store)),
+            endpoint.endpoint_ref,
+            session.resource_ref,
+        )
+    }
+
+    struct CanonicalOnlyReconcileActuator {
+        rendered: &'static str,
+    }
+
+    impl BrowserActuator for CanonicalOnlyReconcileActuator {
+        fn actuate(
+            &self,
+            _operation: &str,
+            _params: &Value,
+            expected_generation: i64,
+            _dispatch_id: Option<&str>,
+        ) -> Result<BrowserPostconditionEvidence, String> {
+            let mut evidence =
+                BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+            evidence.command_accepted = true;
+            evidence.resource_available = true;
+            Ok(evidence)
+        }
+
+        fn reconcile_dispatch(
+            &self,
+            _dispatch_id: &str,
+            expected_generation: i64,
+        ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+            // The provider only exposes its re-rendered turn: the whitespace
+            // layout differs from what the runtime submitted.
+            Ok(Some(BrowserPostconditionEvidence {
+                observed_generation: expected_generation,
+                command_accepted: true,
+                browser_online: true,
+                resource_available: true,
+                rejected: false,
+                stable_resource_ref_observed: true,
+                lifecycle_observed: true,
+                canonical_url_observed: true,
+                accepted_message_observed: true,
+                message_baseline_advanced: true,
+                reasoning_effort_readback: None,
+                required_apps_readback: Vec::new(),
+                generation_owner: Some(expected_generation),
+                generation_status_observed: true,
+                generation_stopped: false,
+                result: Some(accepted_result(self.rendered, "provider-user-canonical")),
+            }))
+        }
+    }
+
+    #[test]
+    fn browser_dispatch_status_reconciles_a_whitespace_canonical_message() {
+        use crate::state_store::{BrowserDispatchReserveInput, BrowserDispatchUpdateInput};
+
+        let submitted = "Line one\n\nLine two";
+        let rendered = "Line one Line two";
+        for (name, canonical_digest) in [
+            (
+                "new row",
+                Some(browser_sha256(&browser_readback_text_canonical(submitted))),
+            ),
+            ("legacy row", None),
+        ] {
+            let (store, endpoint_ref, session_ref) = browser_dispatch_reconcile_fixture();
+            let dispatch = {
+                let mut guard = store.lock().unwrap();
+                let reservation = guard
+                    .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        operation: "browser_dispatch.submit",
+                        target_session_ref: &session_ref,
+                        request_digest: &browser_sha256(&format!("request-{name}")),
+                        message_digest: &browser_sha256(submitted),
+                        message_canonical_digest: canonical_digest.as_deref(),
+                        reasoning_effort: None,
+                        required_apps: &[],
+                        expected_generation: 7,
+                        idempotency_key_digest: &browser_sha256(&format!("key-{name}")),
+                        parent_dispatch_id: None,
+                        authorization: None,
+                        work_chain_id: None,
+                        lane_id: None,
+                        created_at: 20,
+                    })
+                    .unwrap();
+                let dispatch = match reservation {
+                    crate::state_store::BrowserDispatchReservation::Reserved(record) => record,
+                    crate::state_store::BrowserDispatchReservation::Existing(_) => {
+                        panic!("fixture reservation must be new")
+                    }
+                };
+                assert_eq!(
+                    dispatch.message_canonical_digest, canonical_digest,
+                    "{name} must persist exactly the supplied canonical digest"
+                );
+                guard
+                    .update_browser_dispatch(BrowserDispatchUpdateInput {
+                        dispatch_id: &dispatch.dispatch_id,
+                        expected_generation: 7,
+                        delivery_state: BrowserDeliveryState::Uncertain,
+                        generation_owner: None,
+                        accepted_user_message_ref: None,
+                        updated_at: 21,
+                    })
+                    .unwrap()
+            };
+            assert_eq!(dispatch.delivery_state, BrowserDeliveryState::Uncertain);
+            let actuator = CanonicalOnlyReconcileActuator { rendered };
+            let status = browser_dispatch_status(&store, &dispatch.dispatch_id, Some(&actuator));
+            let state = status["dispatch"]["delivery_state"].as_str().unwrap();
+            if canonical_digest.is_some() {
+                assert_eq!(status["reconciled"], true, "{name}");
+                assert_eq!(
+                    state, "applied",
+                    "{name} must reconcile on the canonical digest"
+                );
+            } else {
+                // A legacy row has no canonical digest to compare: it stays
+                // raw-only and fail-closed instead of fabricating a match.
+                assert_eq!(status["reconciled"], false, "{name}");
+                assert_eq!(state, "uncertain", "{name}");
+                assert_eq!(status["reconciliation_code"], "uncertain", "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn browser_dispatch_canonical_digest_column_is_forward_additive() {
+        use crate::state_store::BrowserDispatchReserveInput;
+
+        let (store, endpoint_ref, session_ref) = browser_dispatch_reconcile_fixture();
+        // The additive ensure must not move the durable schema version: a pinned
+        // schema-15 PROD binary still has to be able to open this database.
+        let schema_version = {
+            let guard = store.lock().unwrap();
+            guard.schema_version().unwrap()
+        };
+        assert_eq!(schema_version, crate::state_store::SCHEMA_VERSION);
+        let has_column = {
+            let guard = store.lock().unwrap();
+            guard
+                .scalar_text(
+                    "SELECT name FROM pragma_table_info('browser_dispatches') \
+                     WHERE name = 'message_canonical_digest'",
+                )
+                .unwrap()
+        };
+        assert_eq!(has_column.as_deref(), Some("message_canonical_digest"));
+
+        let mut guard = store.lock().unwrap();
+        let legacy_message = "legacy\n\nmessage";
+        let legacy = match guard
+            .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                operation: "browser_dispatch.submit",
+                target_session_ref: &session_ref,
+                request_digest: &browser_sha256("legacy-request"),
+                message_digest: &browser_sha256(legacy_message),
+                message_canonical_digest: None,
+                reasoning_effort: None,
+                required_apps: &[],
+                expected_generation: 7,
+                idempotency_key_digest: &browser_sha256("legacy-key"),
+                parent_dispatch_id: None,
+                authorization: None,
+                work_chain_id: None,
+                lane_id: None,
+                created_at: 30,
+            })
+            .unwrap()
+        {
+            crate::state_store::BrowserDispatchReservation::Reserved(record) => record,
+            crate::state_store::BrowserDispatchReservation::Existing(_) => {
+                panic!("legacy reservation must be new")
+            }
+        };
+        assert_eq!(legacy.message_canonical_digest, None);
+
+        // Replaying the same request while now supplying a canonical digest must
+        // not be an idempotency conflict: the legacy row is reused unchanged.
+        let replay = match guard
+            .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                operation: "browser_dispatch.submit",
+                target_session_ref: &session_ref,
+                request_digest: &browser_sha256("legacy-request"),
+                message_digest: &browser_sha256(legacy_message),
+                message_canonical_digest: Some(&browser_sha256(&browser_readback_text_canonical(
+                    legacy_message,
+                ))),
+                reasoning_effort: None,
+                required_apps: &[],
+                expected_generation: 7,
+                idempotency_key_digest: &browser_sha256("legacy-key"),
+                parent_dispatch_id: None,
+                authorization: None,
+                work_chain_id: None,
+                lane_id: None,
+                created_at: 31,
+            })
+            .unwrap()
+        {
+            crate::state_store::BrowserDispatchReservation::Existing(record) => record,
+            crate::state_store::BrowserDispatchReservation::Reserved(_) => {
+                panic!("same-key replay must reuse the legacy row")
+            }
+        };
+        assert_eq!(replay.dispatch_id, legacy.dispatch_id);
+        assert_eq!(replay.message_canonical_digest, None);
+    }
+
+    #[test]
+    fn browser_accepted_user_apps_require_a_provider_path() {
+        let requested = ["herdr"];
+        // A bare keyword (plain text `@herdr`) and a pathless entry never count.
+        assert!(!browser_accepted_user_apps_match(&json!({}), &requested));
+        assert!(!browser_accepted_user_apps_match(
+            &json!({"accepted_user_apps": []}),
+            &requested
+        ));
+        assert!(!browser_accepted_user_apps_match(
+            &json!({"accepted_user_apps": [{"name": "herdr"}]}),
+            &requested
+        ));
+        assert!(!browser_accepted_user_apps_match(
+            &json!({"accepted_user_apps": [{"name": "herdr", "path": "   "}]}),
+            &requested
+        ));
+        assert!(!browser_accepted_user_apps_match(
+            &json!({"accepted_user_apps": [{"name": "other", "path": "a/b"}]}),
+            &requested
+        ));
+        assert!(!browser_accepted_user_apps_match(
+            &json!({"accepted_user_apps": [
+                {"name": "herdr", "path": "a/b"},
+                {"name": "extra", "path": "a/c"}
+            ]}),
+            &requested
+        ));
+        assert!(browser_accepted_user_apps_match(
+            &json!({"accepted_user_apps": [{"name": "herdr", "path": "a/b"}]}),
+            &requested
+        ));
+    }
+
+    struct LateAcceptanceReadbackActuator {
+        accepted_user_apps: Option<Value>,
+    }
+
+    impl BrowserActuator for LateAcceptanceReadbackActuator {
+        fn actuate(
+            &self,
+            _operation: &str,
+            _params: &Value,
+            _expected_generation: i64,
+            _dispatch_id: Option<&str>,
+        ) -> Result<BrowserPostconditionEvidence, String> {
+            Err("browser_actuation_unavailable".to_owned())
+        }
+
+        fn actuate_for_endpoint(
+            &self,
+            operation: &str,
+            _params: &Value,
+            expected_generation: i64,
+            _endpoint_ref: Option<&str>,
+            _dispatch_id: Option<&str>,
+        ) -> Result<BrowserPostconditionEvidence, String> {
+            assert_eq!(operation, BROWSER_SESSION_ARCHIVE_STATUS_METHOD);
+            let mut result = accepted_text_evidence("late accepted turn");
+            let object = result.as_object_mut().unwrap();
+            object.insert(
+                "accepted_user_message_ref".to_owned(),
+                json!("provider-late-user"),
+            );
+            if let Some(apps) = self.accepted_user_apps.clone() {
+                object.insert("accepted_user_apps".to_owned(), apps);
+            }
+            let mut evidence =
+                BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+            evidence.command_accepted = true;
+            evidence.resource_available = true;
+            evidence.stable_resource_ref_observed = true;
+            evidence.lifecycle_observed = true;
+            evidence.result = Some(result);
+            Ok(evidence)
+        }
+    }
+
+    #[test]
+    fn browser_late_acceptance_requires_app_identity_from_the_same_message() {
+        use crate::state_store::{
+            BrowserResourceObservationInput, BrowserSessionReservation,
+            BrowserSessionReservationInput,
+        };
+
+        for (name, apps, expected_applied) in [
+            ("no app identity", None, false),
+            (
+                "plain-text app mention",
+                Some(json!([{"name": "herdr"}])),
+                false,
+            ),
+            (
+                "provider app identity",
+                Some(json!([{"name": "herdr", "path": "connectors/herdr"}])),
+                true,
+            ),
+        ] {
+            let (store, endpoint_ref, observed_session_ref) = browser_dispatch_reconcile_fixture();
+            let (reservation, params) = {
+                let mut guard = store.lock().unwrap();
+                let account_ref = guard
+                    .browser_resource(&observed_session_ref)
+                    .unwrap()
+                    .unwrap()
+                    .parent_ref
+                    .unwrap();
+                let reservation = match guard
+                    .reserve_browser_session(BrowserSessionReservationInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        account_ref: &account_ref,
+                        space_ref: None,
+                        display_label: "Late acceptance",
+                        expected_generation: 7,
+                        idempotency_key_digest: &browser_sha256(&format!("late-key-{name}")),
+                        request_digest: &browser_sha256(&format!("late-request-{name}")),
+                        created_at: 40,
+                        expires_at: 4000,
+                    })
+                    .unwrap()
+                {
+                    BrowserSessionReservation::Reserved(record) => record,
+                    BrowserSessionReservation::Existing(_) => {
+                        panic!("fixture reservation must be new")
+                    }
+                };
+                let created = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        kind: "session",
+                        parent_ref: Some(&account_ref),
+                        native_identity: &format!("late-created-{name}"),
+                        display_label: None,
+                        observation_generation: 7,
+                        observed_at: 41,
+                    })
+                    .unwrap();
+                guard
+                    .upsert_browser_resource_locator(
+                        &created.resource_ref,
+                        &format!("https://chatgpt.com/c/late-{name}"),
+                        7,
+                        41,
+                    )
+                    .unwrap();
+                guard
+                    .materialize_browser_session_reservation(
+                        &reservation.reservation_ref,
+                        &created.resource_ref,
+                        42,
+                    )
+                    .unwrap();
+                guard
+                    .update_browser_session_reservation_delivery(
+                        &reservation.reservation_ref,
+                        7,
+                        BrowserDeliveryState::Uncertain,
+                        None,
+                        43,
+                    )
+                    .unwrap();
+                (
+                    guard
+                        .browser_session_reservation(&reservation.reservation_ref)
+                        .unwrap()
+                        .unwrap(),
+                    json!({
+                        "message": "late accepted turn",
+                        "required_apps": ["herdr"],
+                    }),
+                )
+            };
+            let actuator = LateAcceptanceReadbackActuator {
+                accepted_user_apps: apps,
+            };
+            let outcome = browser_session_create_late_acceptance_readback(
+                &store,
+                &reservation,
+                &params,
+                &actuator,
+                7,
+            );
+            if expected_applied {
+                let promoted = outcome
+                    .unwrap_or_else(|reason| panic!("{name} should promote, stayed {reason}"));
+                assert_eq!(
+                    promoted.delivery_state,
+                    BrowserDeliveryState::Applied.as_str()
+                );
+            } else {
+                assert_eq!(
+                    outcome.unwrap_err(),
+                    "readback_app_identity_mismatch",
+                    "{name}"
+                );
             }
         }
     }
