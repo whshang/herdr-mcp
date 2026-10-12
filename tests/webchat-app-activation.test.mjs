@@ -430,10 +430,13 @@ test("user dispatches with a required App | Given the native picker opens for th
     insertMainWorld,
     onTrustedMention(keyword) {
       composer.textContent = `@${keyword}`;
-      // The provider renders one suggestion row outside the composer; clicking
-      // it replaces the search text with the provider-owned App pill.
+      // The provider renders one suggestion row in the popup the composer owns
+      // (aria-controls); clicking it replaces the search text with the
+      // provider-owned App pill.
       const popover = document.createElement("div");
       popover.setAttribute("class", "popover");
+      popover.id = "composer-mention-popup";
+      composer.setAttribute("aria-controls", popover.id);
       document.body.appendChild(popover);
       const option = document.createElement("div");
       option.setAttribute("role", "option");
@@ -491,6 +494,8 @@ test("user dispatches with a required App | Given two native suggestions match t
       composer.textContent = `@${keyword}`;
       const popover = document.createElement("div");
       popover.setAttribute("class", "popover");
+      popover.id = "composer-mention-popup";
+      composer.setAttribute("aria-controls", popover.id);
       document.body.appendChild(popover);
       for (let index = 0; index < 2; index += 1) {
         const option = document.createElement("div");
