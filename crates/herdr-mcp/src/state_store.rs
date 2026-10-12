@@ -26,8 +26,9 @@ use std::path::{Path, PathBuf};
 mod schema;
 
 use schema::{
-    META_SCHEMA_VERSION, db_file_name, ensure_browser_archive_auxiliary_schema, ensure_parent_dirs,
-    migrate, open_connection, prepare_db_file, reject_symlink,
+    META_SCHEMA_VERSION, db_file_name, ensure_browser_archive_auxiliary_schema,
+    ensure_browser_dispatch_auxiliary_schema, ensure_parent_dirs, migrate, open_connection,
+    prepare_db_file, reject_symlink,
 };
 #[cfg(unix)]
 use schema::{secure_dir, set_mode};
@@ -569,6 +570,11 @@ pub struct BrowserDispatchReserveInput<'a> {
     pub target_session_ref: &'a str,
     pub request_digest: &'a str,
     pub message_digest: &'a str,
+    /// Whitespace-canonical digest of the same message. `Some` for new
+    /// reservations so a later uncertain-dispatch reconcile can compare the
+    /// accepted provider text the same way the live submit path does. Legacy
+    /// callers may pass `None`; their row then reconciles raw-only.
+    pub message_canonical_digest: Option<&'a str>,
     pub reasoning_effort: Option<&'a str>,
     pub required_apps: &'a [&'a str],
     pub expected_generation: i64,
@@ -601,6 +607,7 @@ pub struct BrowserDispatchRecord {
     pub target_session_ref: String,
     pub request_digest: String,
     pub message_digest: String,
+    pub message_canonical_digest: Option<String>,
     pub reasoning_effort: Option<String>,
     pub required_apps: Vec<String>,
     pub expected_generation: i64,
@@ -674,6 +681,7 @@ impl StateStore {
             let mut conn = open_connection(None)?;
             migrate(&mut conn)?;
             ensure_browser_archive_auxiliary_schema(&conn)?;
+            ensure_browser_dispatch_auxiliary_schema(&conn)?;
             return Ok(Self { path: None, conn });
         }
 
@@ -684,6 +692,7 @@ impl StateStore {
         set_mode(path, 0o600)?;
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
+        ensure_browser_dispatch_auxiliary_schema(&conn)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
             conn,
@@ -708,6 +717,7 @@ impl StateStore {
         set_mode(&path, 0o600)?;
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
+        ensure_browser_dispatch_auxiliary_schema(&conn)?;
         Ok(Self {
             path: Some(path),
             conn,
@@ -4590,6 +4600,9 @@ impl StateStore {
         validate_browser_resource_ref(input.target_session_ref)?;
         validate_browser_digest(input.request_digest, "request_digest")?;
         validate_browser_digest(input.message_digest, "message_digest")?;
+        if let Some(canonical_digest) = input.message_canonical_digest {
+            validate_browser_digest(canonical_digest, "message_canonical_digest")?;
+        }
         validate_browser_digest(input.idempotency_key_digest, "idempotency_key_digest")?;
         if let Some(parent_dispatch_id) = input.parent_dispatch_id {
             validate_browser_dispatch_id(parent_dispatch_id)?;
@@ -4665,6 +4678,14 @@ impl StateStore {
                 || existing.target_session_ref != input.target_session_ref
                 || existing.request_digest != input.request_digest
                 || existing.message_digest != input.message_digest
+                // A legacy row has no canonical digest. It is not a conflict for
+                // the same request to start supplying one: the legacy row is kept
+                // and reconciles raw-only rather than being treated as a
+                // different request.
+                || existing
+                    .message_canonical_digest
+                    .as_deref()
+                    .is_some_and(|existing| Some(existing) != input.message_canonical_digest)
                 || existing.reasoning_effort.as_deref() != input.reasoning_effort
                 || existing.required_apps_json != required_apps_json
                 || existing.expected_generation != input.expected_generation
@@ -4715,10 +4736,11 @@ impl StateStore {
                     idempotency_key_digest, parent_dispatch_id,
                     authorization_principal_ref, authorization_connector_id,
                     authorization_grant_generation, delivery_state, generation_owner,
-                    work_chain_id, lane_id, created_at, updated_at
+                    work_chain_id, lane_id, created_at, updated_at,
+                    message_canonical_digest
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, 'not_applied', NULL, ?16, ?17, ?18, ?18
+                    ?13, ?14, ?15, 'not_applied', NULL, ?16, ?17, ?18, ?18, ?19
                  )",
             params![
                 dispatch_id,
@@ -4739,6 +4761,7 @@ impl StateStore {
                 input.work_chain_id,
                 input.lane_id,
                 input.created_at,
+                input.message_canonical_digest,
             ],
         )
         .map_err(|error| format!("cannot reserve browser dispatch: {error}"))?;
@@ -5197,6 +5220,7 @@ struct StoredBrowserDispatch {
     target_session_ref: String,
     request_digest: String,
     message_digest: String,
+    message_canonical_digest: Option<String>,
     reasoning_effort: Option<String>,
     required_apps_json: String,
     expected_generation: i64,
@@ -5226,7 +5250,7 @@ const BROWSER_DISPATCH_SELECT: &str = "SELECT dispatch_id, endpoint_ref, provide
             accepted_user_message_ref, result_assistant_message_ref,
             result_turn_message_id, result_evidence_id, result_settled_at,
             authorization_principal_ref, authorization_connector_id,
-            authorization_grant_generation
+            authorization_grant_generation, message_canonical_digest
      FROM browser_dispatches";
 
 fn decode_stored_browser_dispatch(
@@ -5259,6 +5283,7 @@ fn decode_stored_browser_dispatch(
         authorization_principal_ref: row.get(23)?,
         authorization_connector_id: row.get(24)?,
         authorization_grant_generation: row.get(25)?,
+        message_canonical_digest: row.get(26)?,
     })
 }
 
@@ -5412,6 +5437,7 @@ fn decode_browser_dispatch(stored: StoredBrowserDispatch) -> Result<BrowserDispa
         target_session_ref: stored.target_session_ref,
         request_digest: stored.request_digest,
         message_digest: stored.message_digest,
+        message_canonical_digest: stored.message_canonical_digest,
         reasoning_effort: stored.reasoning_effort,
         required_apps,
         expected_generation: stored.expected_generation,
@@ -10349,6 +10375,7 @@ mod tests {
                 target_session_ref: &session_ref,
                 request_digest: &request_digest,
                 message_digest: &message_digest,
+                message_canonical_digest: None,
                 reasoning_effort: Some("balanced"),
                 required_apps: &required_apps,
                 expected_generation: 7,
@@ -10420,6 +10447,7 @@ mod tests {
                     target_session_ref: &session_ref,
                     request_digest: &request_digest,
                     message_digest: &message_digest,
+                    message_canonical_digest: None,
                     reasoning_effort: Some("balanced"),
                     required_apps: &required_apps,
                     expected_generation: 7,
@@ -10510,6 +10538,7 @@ mod tests {
                     target_session_ref: &session_ref,
                     request_digest: &request_digest,
                     message_digest: &message_digest,
+                    message_canonical_digest: None,
                     reasoning_effort: None,
                     required_apps: &required_apps,
                     expected_generation: 7,
@@ -10631,6 +10660,7 @@ mod tests {
                 target_session_ref: &session_ref,
                 request_digest: &request_digest,
                 message_digest: &message_digest,
+                message_canonical_digest: None,
                 reasoning_effort: Some("thorough"),
                 required_apps: &required_apps,
                 expected_generation: 7,
@@ -10706,6 +10736,7 @@ mod tests {
                         target_session_ref: &session_ref,
                         request_digest: &request_digest,
                         message_digest: &message_digest,
+                        message_canonical_digest: None,
                         reasoning_effort: Some("thorough"),
                         required_apps: &required_apps,
                         expected_generation: 7,
@@ -10757,6 +10788,7 @@ mod tests {
                 target_session_ref: &session_ref,
                 request_digest: &request_digest,
                 message_digest: &message_digest,
+                message_canonical_digest: None,
                 reasoning_effort: None,
                 required_apps: &required_apps,
                 expected_generation: 7,
@@ -11160,6 +11192,7 @@ mod tests {
                     target_session_ref: &session_ref,
                     request_digest: &request_digest,
                     message_digest: &message_digest,
+                    message_canonical_digest: None,
                     reasoning_effort: None,
                     required_apps: &required_apps,
                     expected_generation: 7,
@@ -11429,6 +11462,7 @@ mod tests {
                     target_session_ref: &session_ref,
                     request_digest: &request_digest,
                     message_digest: &message_digest,
+                    message_canonical_digest: None,
                     reasoning_effort: None,
                     required_apps: &required_apps,
                     expected_generation: 7,

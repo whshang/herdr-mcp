@@ -332,11 +332,14 @@ ok(wakeSource.includes("captureSubmitAckBaseline")
     && wakeSource.includes("waitForSubmitAck")
     && wakeSource.includes('ADAPTER.name !== "chatgpt") return !ADAPTER.inputHasContent()')
     && !wakeSource.includes("if (!ADAPTER.inputHasContent()) return true")
-    && wakeSource.includes("location.href !== baseline.href")
+    && wakeSource.includes("providerUserTextMatchesSubmitted(latestText, baseline)")
+    && !wakeSource.includes("location.href !== baseline.href")
+    && !wakeSource.includes("sentText.slice(0, 120)")
+    && !wakeSource.includes("latestText.slice(0, 120)")
     && !wakeSource.includes("baseline?.generating")
     && !wakeSource.includes("!baseline.sendButton.isConnected || !isSendButton(baseline.sendButton)")
     && wakeSource.includes('latestTurnForRole("user")')
-    && wakeSource.includes("latestUser !== baseline?.userTurn")
+    && wakeSource.includes("latestUser === baseline?.userTurn")
     && wakeSource.includes("ADAPTER.policy?.submitAckTimeoutMs ?? 4000")
     && chatGptAdapterSource.includes("submitAckTimeoutMs: 8000"),
   "ChatGPT submit acknowledgement requires strong provider evidence with adapter-owned timing policy");
@@ -2018,17 +2021,23 @@ ok(backgroundSource.includes('operation: "dispatch.result"')
 ok(wakeSource.includes("reportBrowserResultSettlement")
     && wakeSource.includes("accepted_user_message_ref")
     && wakeSource.includes('type: "h2w_browser_result"')
-    && wakeSource.includes("evidence.result = { accepted_user_message_ref: acceptedUserMessageRef }"),
-  "content reports exact settled-turn identity from provider snapshots and actuation evidence");
+    && wakeSource.includes("accepted_user_message_ref: acceptedUserMessageRef,")
+    && wakeSource.includes("await providerAcceptanceDigests("),
+  "content reports the exact settled-turn identity plus accepted-text digests the runtime re-verifies");
+ok(wakeSource.includes("providerAcceptanceDigests")
+    && wakeSource.includes("accepted_user_text_canonical_sha256")
+    && wakeSource.includes("accepted_user_body_canonical_sha256")
+    && /canonicalAcceptanceText\(stripLeadingAppMentionTokens\(observedText, baseline\.selectedApps\)\) === submitted/.test(wakeSource),
+  "exact submit acceptance compares whitespace-canonical text instead of a 120-character overlap");
 const settlementSegment = wakeSource.slice(
   wakeSource.indexOf("async function reportBrowserResultSettlement"),
   wakeSource.indexOf("// Browser Registry identity cached by the page script"),
 );
 ok(settlementSegment.length > 0
     && !/document\.hidden|chrome\.tabs|active: true/.test(settlementSegment)
-    && wakeSource.includes("const acceptedUserMessageRef = exactChatGptDispatchIdentity")
-    && wakeSource.includes("serverAdvanced ? afterServer.userMessageId : exactDomUserMessageRef")
-    && wakeSource.includes("exactDomAcceptedUserMessageRef(beforeDom, afterDom, message)")
+    && wakeSource.includes("const acceptedUserMessageRef = !evidence.accepted_message_observed")
+    && wakeSource.includes("serverAdvanced")
+    && wakeSource.includes("exactDomAcceptedUserMessageRef(beforeDom, afterDom, message, requiredApps)")
     && wakeSource.includes("afterDom?.exactMessageId !== true")
     && wakeSource.includes("afterDom.messageId === beforeDom?.messageId")
     && wakeSource.includes("!exactChatGptDispatchIdentity || Boolean(acceptedUserMessageRef)"),

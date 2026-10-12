@@ -893,7 +893,7 @@ function normalizeHerdrMentionAlias(value) {
   // ignored), so ChatGPT does not persist it as a Project new-chat draft.
   // A user-authored or different draft is never touched.
   async function clearAutomationDraft(message) {
-    const canonical = (text) => String(text || "").replace(/[\u00a0\ufeff]/g, " ").split(/\s+/u).filter(Boolean).join(" ");
+    const canonical = canonicalAcceptanceText;
     const expected = canonical(message);
     const ours = () => expected !== "" && canonical(ADAPTER.getComposerTextWithoutAppPills()) === expected;
     if (!ours()) return ADAPTER.getComposerTextWithoutAppPills() === "" ? "empty" : "not_ours";
@@ -1037,12 +1037,27 @@ function normalizeHerdrMentionAlias(value) {
     return { ok: requested.every((app) => selected.includes(app)), apps: selected };
   }
 
-  function captureSubmitAckBaseline(sendButton = null) {
+  function captureSubmitAckBaseline(sendButton = null, options = {}) {
+    const chatGpt = ADAPTER.name === "chatgpt";
+    const composer = composerNorm();
+    const messageText = chatGpt && typeof ADAPTER.getComposerTextWithoutAppPills === "function"
+      ? normText(ADAPTER.getComposerTextWithoutAppPills())
+      : "";
+    const selectedApps = chatGpt && typeof ADAPTER.getSelectedComposerApps === "function"
+      ? ADAPTER.getSelectedComposerApps()
+      : [];
+    const requiredApps = (Array.isArray(options.requiredApps) ? options.requiredApps : [])
+      .map((app) => String(app || "").trim().toLowerCase())
+      .filter(Boolean);
     return {
-      composer: composerNorm(),
+      composer,
+      messageText: messageText || composer,
+      selectedApps: [...new Set([...selectedApps, ...requiredApps])],
       sendButton,
-      href: location.href,
-      userTurn: ADAPTER.name === "chatgpt" ? latestTurnForRole("user") : null,
+      convKey: chatGpt ? ADAPTER.getConversationKey() : null,
+      creatingSession: options.creatingSession === true,
+      expectedConvKey: typeof options.expectedConvKey === "string" ? options.expectedConvKey : null,
+      userTurn: chatGpt ? latestTurnForRole("user") : null,
     };
   }
 
@@ -1051,21 +1066,23 @@ function normalizeHerdrMentionAlias(value) {
     // ChatGPT may transiently clear and restore the composer while a submit is
     // still rejected upstream, so empty input alone is not provider acceptance.
     // React may also replace the Send button while the composer is rerendering;
-    // that node transition alone is not provider acceptance. Require a stronger
-    // post-submit signal before stopping retries: navigation to the new ChatGPT
-    // conversation or a matching user turn. A transient busy/generating control
-    // is not sufficient because ChatGPT can show it before provider acceptance.
-    if (baseline?.href && location.href !== baseline.href) return true;
+    // that node transition alone is not provider acceptance, and neither is a
+    // URL change by itself: navigation only counts when the landed conversation
+    // holds exactly the turn this submit inserted.
     const latestUser = latestTurnForRole("user");
-    if (latestUser && latestUser !== baseline?.userTurn) {
-      const latestText = normText(latestUser.innerText || latestUser.textContent || "");
-      const sentText = String(baseline?.composer || "");
-      if (latestText && sentText
-        && (latestText.includes(sentText.slice(0, 120)) || sentText.includes(latestText.slice(0, 120)))) {
-        return true;
-      }
+    if (!latestUser || latestUser === baseline?.userTurn) return false;
+    const latestText = normText(latestUser.innerText || latestUser.textContent || "");
+    if (!providerUserTextMatchesSubmitted(latestText, baseline)) return false;
+    const convKey = ADAPTER.getConversationKey();
+    if (baseline?.expectedConvKey) {
+      // A runtime-targeted dispatch must still be on the conversation it named.
+      return convKey === baseline.expectedConvKey;
     }
-    return false;
+    if (baseline?.creatingSession) {
+      // A create leaves its launcher for a brand-new conversation by design.
+      return Boolean(convKey) && convKey !== baseline.convKey;
+    }
+    return true;
   }
 
   async function waitForSubmitAck(baseline, timeoutMs) {
@@ -1077,7 +1094,7 @@ function normalizeHerdrMentionAlias(value) {
     return submitWasAccepted(baseline);
   }
 
-  async function submitBrowserActuationOnce() {
+  async function submitBrowserActuationOnce(options = {}) {
     if (isComposerGenerating()) {
       return { ok: false, attempted: false, error: "composer-busy" };
     }
@@ -1096,7 +1113,7 @@ function normalizeHerdrMentionAlias(value) {
     if (!isSendButton(btn)) {
       return { ok: false, attempted: false, error: "submit-unavailable" };
     }
-    const baseline = captureSubmitAckBaseline(btn);
+    const baseline = captureSubmitAckBaseline(btn, options);
     const input = ADAPTER.getInputEl();
     if (!input) {
       return { ok: false, attempted: false, error: "submit-input-unavailable" };
@@ -1117,10 +1134,27 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
+  // ChatGPT must dispatch at most one provider mutation per wake invocation.
+  // `submitBrowserActuationOnce` performs exactly one Enter submit and reports
+  // `attempted`/`uncertain`, so every ChatGPT caller (MCP dispatch, handoff,
+  // queue, recovery, generic wake) can keep an unproven acknowledgement honest
+  // instead of retrying it into a duplicate provider user message. `submit()`, 
+  // `submitTextarea()`, and `submitAfterPermissionClick()` keep their bounded
+  // retry loop only for non-ChatGPT adapters.
+  async function submitChatGptOnce(options = {}) {
+    await waitForComposerIdle(4000);
+    return submitBrowserActuationOnce(options);
+  }
+
   // ---- Submission ----
   // For contenteditable sites, wait for an enabled send button because ProseMirror
   // often consumes synthetic keyboard events. ChatGPT success requires durable
   // conversation navigation or a matching new user turn, not transient composer UI.
+  //
+  // A permission click may already have submitted the turn. The single Send click
+  // below is the only dispatch; there is deliberately no Enter fallback, because a
+  // second submit primitive after an unproven acknowledgement can create a
+  // duplicate provider user message. An unconfirmed click stays unconfirmed.
   async function submitAfterPermissionClick() {
     if (!lastPermClickAt || Date.now() - lastPermClickAt > 6000) return false;
     await wait(1200);
@@ -1131,13 +1165,11 @@ function normalizeHerdrMentionAlias(value) {
       btn.click();
       if (await waitForSubmitAck(baseline, ADAPTER.policy?.submitAckTimeoutMs ?? 4000)) return true;
     }
-    const enterBaseline = captureSubmitAckBaseline(findSendButton());
-    dispatchEnterSubmit(ADAPTER.getInputEl());
-    if (await waitForSubmitAck(enterBaseline, 3000)) return true;
     return false;
   }
 
   async function submitTextarea() {
+    if (ADAPTER.name === "chatgpt") return (await submitChatGptOnce()).ok === true;
     await waitForComposerIdle();
     await wait(420);
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -1160,6 +1192,8 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function submit() {
+    // ChatGPT is single-shot: exactly one dispatch primitive per invocation.
+    if (ADAPTER.name === "chatgpt") return (await submitChatGptOnce()).ok === true;
     if (ADAPTER.needsMainWorldInsert) {
       await waitForComposerIdle();
       const postInsertMs = Math.min(1200, 350 + Math.floor((ADAPTER.getInputEl()?.innerText?.length || 0) / 40) * 50);
@@ -1268,6 +1302,13 @@ function normalizeHerdrMentionAlias(value) {
   let lastWakeNorm = "";
   let lastWakeAt = 0;
   let lastFailedWakeNorm = "";
+  // One ChatGPT submit that provably dispatched a provider mutation but could
+  // not be confirmed may already have created the user turn. Retrying that exact
+  // text would create a duplicate, so the uncertainty is terminal for this
+  // document until the page state is rebuilt (reload/navigation) or the turn is
+  // observed. The latch is the cross-caller guard for handoff, queue, recovery,
+  // and generic wake; an uncertain ack is never re-sent.
+  let uncertainSubmitWakeNorm = "";
   function noteWakeResult(textNorm, sent) {
     if (sent) {
       lastWakeNorm = textNorm;
@@ -1276,6 +1317,12 @@ function normalizeHerdrMentionAlias(value) {
     } else if (textNorm) {
       lastFailedWakeNorm = textNorm;
     }
+  }
+  function noteUncertainSubmit(textNorm) {
+    if (textNorm) uncertainSubmitWakeNorm = textNorm;
+  }
+  function clearUncertainSubmit(textNorm) {
+    if (!textNorm || uncertainSubmitWakeNorm === textNorm) uncertainSubmitWakeNorm = "";
   }
   async function performWake(data) {
     if (!runtimeAlive()) return { ok: false, error: "context-invalidated" };
@@ -1298,6 +1345,19 @@ function normalizeHerdrMentionAlias(value) {
       .map((app) => normalizeHerdrMentionAlias(app).toLowerCase())
       .filter(Boolean))];
     // Short-window deduplication prevents repeated insertion from retries or duplicate timers.
+    if (ADAPTER.name === "chatgpt" && uncertainSubmitWakeNorm && uncertainSubmitWakeNorm === n) {
+      // An earlier submit for this exact text dispatched without confirmation.
+      // Report the same uncertainty instead of sending a second provider turn.
+      return {
+        ok: false,
+        blocked: "submit-uncertain",
+        uncertain: true,
+        attempted: true,
+        committed: true,
+        site: ADAPTER.name,
+        error: "submit-unconfirmed",
+      };
+    }
     if (!data.queueInsert && n && n === lastWakeNorm && Date.now() - lastWakeAt < 8000) {
       return { ok: false, blocked: "dedupe" };
     }
@@ -1322,6 +1382,35 @@ function normalizeHerdrMentionAlias(value) {
       // leave a Herdr tool invocation waiting for a manual Allow click.
       startPermissionWatch();
 
+      // Route every ChatGPT submission through the single-shot path and return its
+      // honest outcome: `attempted` records that a provider mutation was
+      // dispatched and `uncertain` that it could not be confirmed. Non-ChatGPT
+      // adapters keep their bounded retry loop. An uncertain ChatGPT submit is
+      // latched so this exact text is never re-sent; handoff, queue, recovery, and
+      // generic wake all observe the same guard.
+      const submitWakeText = async () => {
+        if (ADAPTER.name === "chatgpt") {
+          const outcome = await submitChatGptOnce({
+            creatingSession: data.browserSessionCreate === true,
+            expectedConvKey: data.expectedConvKey ?? null,
+            requiredApps,
+          });
+          noteWakeResult(n, outcome.ok);
+          if (outcome.ok) {
+            clearUncertainSubmit(n);
+            return { ok: true, committed: true, site: ADAPTER.name };
+          }
+          if (outcome.attempted === true) {
+            noteUncertainSubmit(n);
+            return { ...outcome, uncertain: true, committed: true, site: ADAPTER.name };
+          }
+          return { ...outcome, committed: true, site: ADAPTER.name };
+        }
+        const sent = await submit();
+        noteWakeResult(n, sent);
+        return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+      };
+
       // z.ai/DeepSeek JSON bridge intentionally intercepts normal user submits
       // so it can add the Herdr tool protocol. Handoff prompts and seeds are
       // continuity-control messages, not agent tasks; send them through the
@@ -1345,14 +1434,7 @@ function normalizeHerdrMentionAlias(value) {
             };
           }
         }
-        if (boundedBrowserActuation) {
-          const outcome = await submitBrowserActuationOnce();
-          noteWakeResult(n, outcome.ok);
-          return { ...outcome, committed: true, resumed: true, site: ADAPTER.name };
-        }
-        const sent = await submit();
-        noteWakeResult(n, sent);
-        return { ok: sent, committed: true, resumed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+        return { ...(await submitWakeText()), resumed: true };
       }
 
       if (clearBeforeInsert) await clearComposer();
@@ -1398,14 +1480,7 @@ function normalizeHerdrMentionAlias(value) {
             selectedApps: appSelection.apps || [],
           };
         }
-        if (boundedBrowserActuation) {
-          const outcome = await submitBrowserActuationOnce();
-          noteWakeResult(n, outcome.ok);
-          return { ...outcome, committed: true, site: ADAPTER.name };
-        }
-        const sent = await submit();
-        noteWakeResult(n, sent);
-        return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+        return await submitWakeText();
       }
 
       const el = ADAPTER.getInputEl();
@@ -1414,10 +1489,9 @@ function normalizeHerdrMentionAlias(value) {
       el.style.opacity = "0";
       ADAPTER.fillInput(text);
       await wait(420); // React-controlled inputs commit value asynchronously.
-      const sent = await submit();
+      const submission = await submitWakeText();
       setTimeout(() => { if (el) el.style.opacity = oldOpacity ?? ""; }, 600);
-      noteWakeResult(n, sent);
-      return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+      return submission;
     } finally {
       wakeInFlight = false;
     }
@@ -1755,22 +1829,102 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
-  function exactDomAcceptedUserMessageRef(beforeDom, afterDom, message) {
+  // The exact Unicode White_Space set Rust `str::trim()` / `split_whitespace()`
+  // use. It is written out because JS `String.prototype.trim()` and `\s` differ
+  // from Rust: JS trims U+FEFF but not U+0085 (NEL); Rust does the opposite.
+  // Keeping the two languages on one explicit class is what makes the reported
+  // acceptance digests comparable to the runtime's own hashes.
+  const ACCEPTANCE_WHITESPACE = "\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+  const ACCEPTANCE_WHITESPACE_CLASS = `[${ACCEPTANCE_WHITESPACE}]`;
+  const ACCEPTANCE_TRIM_RE = new RegExp(`^${ACCEPTANCE_WHITESPACE_CLASS}+|${ACCEPTANCE_WHITESPACE_CLASS}+$`, "g");
+  const ACCEPTANCE_SPLIT_RE = new RegExp(`${ACCEPTANCE_WHITESPACE_CLASS}+`, "gu");
+
+  // Acceptance trim. Mirrors Rust `str::trim()` exactly (see above); never use
+  // `String.prototype.trim()` for text whose digest must equal the runtime's.
+  function acceptanceTrim(text) {
+    return String(text ?? "").replace(ACCEPTANCE_TRIM_RE, "");
+  }
+
+  // Whitespace-canonical comparison form for exact submit acceptance. Mirrors
+  // the runtime `browser_readback_text_canonical` (crates/herdr-mcp/src/mcp.rs):
+  // NBSP/BOM become spaces and every Unicode White_Space run collapses to one
+  // space, using the same class Rust `split_whitespace()` uses.
+  function canonicalAcceptanceText(text) {
+    return String(text || "").replace(/[\u00a0\ufeff]/g, " ")
+      .split(ACCEPTANCE_SPLIT_RE).filter(Boolean).join(" ");
+  }
+
+  // Strip only leading `@?<app>` mention tokens the caller named, matching the
+  // normalization the runtime late-acceptance readback applies to the stored
+  // body before hashing.
+  function stripLeadingAppMentionTokens(text, apps) {
+    let body = String(text || "");
+    const names = (Array.isArray(apps) ? apps : [])
+      .map((app) => String(app || "").trim().toLowerCase())
+      .filter((app) => /^[a-z0-9_-]{1,64}$/.test(app));
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const name of names) {
+        const match = body.match(new RegExp(`^@?${name}(?:${ACCEPTANCE_WHITESPACE_CLASS}+|$)`, "i"));
+        if (match) { body = body.slice(match[0].length); changed = true; }
+      }
+    }
+    return body;
+  }
+
+  // Exact submit acceptance. The provider user text must equal what was
+  // submitted on the whitespace-canonical form; a short prefix overlap is never
+  // enough because a foreign turn can occur inside the outgoing prompt.
+  function providerUserTextMatchesSubmitted(observedText, baseline) {
+    if (!baseline) return false;
+    const observed = canonicalAcceptanceText(observedText);
+    if (!observed) return false;
+    const submitted = canonicalAcceptanceText(baseline.messageText);
+    const composer = canonicalAcceptanceText(baseline.composer);
+    if (submitted && observed === submitted) return true;
+    if (composer && observed === composer) return true;
+    if (!submitted) return false;
+    return canonicalAcceptanceText(stripLeadingAppMentionTokens(observedText, baseline.selectedApps)) === submitted;
+  }
+
+  // sha256 digests of the exact accepted provider user text so the runtime can
+  // re-verify acceptance instead of trusting this content script's detection.
+  // Any failure returns no digests, and the runtime then stays uncertain.
+  async function providerAcceptanceDigests(observedText, apps) {
+    try {
+      const hex = async (text) => [...new Uint8Array(await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(text),
+      ))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      const full = acceptanceTrim(observedText);
+      const body = acceptanceTrim(stripLeadingAppMentionTokens(full, apps));
+      if (!full || !body) return {};
+      return {
+        accepted_user_text_sha256: await hex(full),
+        accepted_user_body_sha256: await hex(body),
+        accepted_user_text_canonical_sha256: await hex(canonicalAcceptanceText(full)),
+        accepted_user_body_canonical_sha256: await hex(canonicalAcceptanceText(body)),
+        accepted_user_text_length: full.length,
+        accepted_user_body_length: body.length,
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function exactDomAcceptedUserMessageRef(beforeDom, afterDom, message, requiredApps = []) {
     if (afterDom?.exactMessageId !== true
         || typeof afterDom.messageId !== "string"
         || !afterDom.messageId
         || afterDom.messageId === beforeDom?.messageId) {
       return null;
     }
-    const observed = String(afterDom.text || "").replace(/\s+/g, " ").trim();
-    const expected = String(message || "").replace(/\s+/g, " ").trim();
-    if (!observed || !expected) return null;
-    const expectedPrefix = expected.slice(0, 120);
-    const observedPrefix = observed.slice(0, 120);
-    if (!observed.includes(expectedPrefix) && !expected.includes(observedPrefix)) {
-      return null;
-    }
-    return afterDom.messageId;
+    const matches = providerUserTextMatchesSubmitted(afterDom.text, {
+      messageText: message,
+      composer: "",
+      selectedApps: requiredApps,
+    });
+    return matches ? afterDom.messageId : null;
   }
 
   function providerCanonicalConversationObserved() {
@@ -1965,6 +2119,12 @@ function normalizeHerdrMentionAlias(value) {
     if (existing?.ok && existing?.body?.is_archived === true) {
       return { outcome: "applied", delivered: false, alreadyArchived: true };
     }
+    // A rate-limited preflight read is not evidence of current state, so the
+    // archive must not proceed to a mutation it could not verify afterwards.
+    // Reject before the one-shot claim is taken; nothing was mutated.
+    if (existing?.status === 429 || existing?.reason === "http-429") {
+      return { outcome: "rejected", delivered: false, rateLimited: true };
+    }
     // Some conversations (live: uncertain-create workers J1/K1/A1) never expose
     // the header options menu. Fall back to ChatGPT's own conversation PATCH
     // (the same endpoint title projection uses), under the same one-shot claim.
@@ -1992,14 +2152,34 @@ function normalizeHerdrMentionAlias(value) {
       if (viaApi) {
         const token = String(await readChatGptAccessToken(4000) || "");
         if (!token || token.length > 4096) return { outcome: "uncertain", delivered: true };
-        await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
-          method: "PATCH",
-          credentials: "include",
-          cache: "no-store",
-          redirect: "error",
-          headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${token}` },
-          body: JSON.stringify({ is_archived: true }),
-        });
+        let response = null;
+        try {
+          response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+            method: "PATCH",
+            credentials: "include",
+            cache: "no-store",
+            redirect: "error",
+            headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${token}` },
+            body: JSON.stringify({ is_archived: true }),
+          });
+        } catch (_) {
+          // The request may have reached the provider before the transport
+          // failed; the one-shot claim is already persisted, so stay uncertain
+          // and never re-mutate.
+          return { outcome: "uncertain", delivered: true };
+        }
+        if (response?.ok !== true) {
+          const status = Number(response?.status || 0);
+          // 429 and 5xx mean the provider may have applied the archive before
+          // throttling or failing the response: delivered but unproven. The
+          // one-shot claim keeps this terminal, so it is never re-mutated.
+          if (status === 429 || status >= 500 || status === 0) {
+            return { outcome: "uncertain", delivered: true };
+          }
+          // A definitive non-429 4xx rejection was not applied. The claim is
+          // already persisted, so the same logical archive is not replayed.
+          return { outcome: "rejected", delivered: true, rejectedStatus: status };
+        }
       } else {
         archive.click();
       }
@@ -2106,7 +2286,10 @@ function normalizeHerdrMentionAlias(value) {
       generation: registeredBrowserGeneration,
     }, { durableAuthority });
     if (attempt.outcome === "rejected") {
-      return browserRejectedEvidence(evidence, "browser_archive_control_unavailable");
+      return browserRejectedEvidence(
+        evidence,
+        attempt.rateLimited === true ? "rate_limited" : "browser_archive_control_unavailable",
+      );
     }
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
@@ -2189,24 +2372,29 @@ function normalizeHerdrMentionAlias(value) {
             // required-App tokens the runtime named, then trim.
             const apps = (Array.isArray(params.required_apps) ? params.required_apps : [])
               .filter((app) => typeof app === "string" && /^[a-z0-9_-]{1,64}$/.test(app));
-            const full = parts.join("").trim();
-            let body = full;
-            for (let changed = true; changed;) {
-              changed = false;
-              for (const app of apps) {
-                const match = body.match(new RegExp(`^@?${app}(?:\\s+|$)`, "i"));
-                if (match) { body = body.slice(match[0].length).trim(); changed = true; }
-              }
-            }
+            const full = acceptanceTrim(parts.join(""));
+            const body = acceptanceTrim(stripLeadingAppMentionTokens(full, apps));
             evidence.result.accepted_user_message_ref = users[0].id;
+            // App identity for late acceptance must come from the same accepted
+            // provider message as the ref and the digests above, and only from
+            // provider-owned inline mentions with a non-empty path. When it
+            // cannot be proven, the runtime keeps the reservation Uncertain
+            // rather than accepting an unverified App.
+            const acceptedApps = (typeof ADAPTER.getAcceptedUserAppIdentity === "function")
+              ? ADAPTER.getAcceptedUserAppIdentity(users[0].id)
+              : [];
+            evidence.required_apps_readback = Array.isArray(acceptedApps)
+              ? acceptedApps.map((app) => app.name)
+              : [];
+            if (acceptedApps.length) evidence.result.accepted_user_apps = acceptedApps;
             evidence.result.accepted_user_text_sha256 = await hex(full);
             evidence.result.accepted_user_body_sha256 = await hex(body);
             // Whitespace-canonical digests: ChatGPT re-renders composer line
             // breaks when storing the turn. Mirrors the runtime's
-            // browser_readback_text_canonical.
-            const canonical = (text) => text.replace(/[\u00a0\ufeff]/g, " ").split(/[\s]+/u).filter(Boolean).join(" ");
-            evidence.result.accepted_user_text_canonical_sha256 = await hex(canonical(full));
-            evidence.result.accepted_user_body_canonical_sha256 = await hex(canonical(body));
+            // browser_readback_text_canonical through the same shared helpers
+            // used for the submit acceptance digests.
+            evidence.result.accepted_user_text_canonical_sha256 = await hex(canonicalAcceptanceText(full));
+            evidence.result.accepted_user_body_canonical_sha256 = await hex(canonicalAcceptanceText(body));
             evidence.result.accepted_user_text_length = full.length;
             evidence.result.accepted_user_body_length = body.length;
           } catch (_) {}
@@ -2428,7 +2616,10 @@ function normalizeHerdrMentionAlias(value) {
           result: { error: appSelection.error, app_selection_probe: appSelection.app_selection_probe || null },
         };
       }
-      evidence.required_apps_readback = appSelection.apps;
+      // The selected-composer readback is intentionally not reported as
+      // delivery evidence: the App identity that satisfies the runtime must come
+      // from the accepted provider user message below, not from a pre-submit
+      // composer pill that may never have landed in the turn.
     }
 
     const exactChatGptDispatchIdentity = ADAPTER.name === "chatgpt"
@@ -2443,10 +2634,13 @@ function normalizeHerdrMentionAlias(value) {
       : { ok: false };
     const beforeDom = providerMessageSnapshot("user");
     const beforeAssistant = providerMessageSnapshot("assistant");
+    const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
     const result = await performWake({
       template: message,
       autoAllow: false,
       browserActuation: boundedChatGptSubmit,
+      browserSessionCreate: creatingSession,
+      expectedConvKey: command?.expectedConvKey ?? null,
       requiredApps,
     });
     if (!result?.ok) {
@@ -2484,37 +2678,85 @@ function normalizeHerdrMentionAlias(value) {
         : { ok: false };
       const afterDom = providerMessageSnapshot("user");
       const afterAssistant = providerMessageSnapshot("assistant");
+      const currentConvKey = ADAPTER.getConversationKey();
+      // A dispatch must still be in the conversation the runtime targeted. A
+      // create leaves its launcher for a brand-new conversation by design, so it
+      // instead requires that new canonical conversation to be open.
+      const conversationStillExpected = command?.expectedConvKey
+        ? currentConvKey === command.expectedConvKey
+        : (!creatingSession
+          || (Boolean(currentConvKey)
+            && currentConvKey !== entryConvKey
+            && providerCanonicalConversationObserved()));
+      // Acceptance is exact provider-user-text equality with the submitted
+      // message (whitespace-canonical, named App mention tokens stripped). A URL
+      // change, a newer message id, or a larger message count is never proof on
+      // its own.
+      const acceptanceBaseline = { messageText: message, composer: "", selectedApps: requiredApps };
+      const serverAfterUserMessageId = afterServer?.ok
+        && typeof afterServer.userMessageId === "string" && afterServer.userMessageId
+        ? afterServer.userMessageId : null;
+      const serverBeforeUserMessageId = beforeServer?.ok
+        && typeof beforeServer.userMessageId === "string" && beforeServer.userMessageId
+        ? beforeServer.userMessageId : null;
+      // A missing or failed before-snapshot is missing evidence, not
+      // advancement: a dispatch with no pre-submit provider id has no server
+      // proof of a new turn, and only a create accepts the first user turn of a
+      // conversation that did not exist before the submit.
       const serverAdvanced = Boolean(
-        afterServer?.ok
-        && afterServer.userMessageId
-        && afterServer.userMessageId !== beforeServer?.userMessageId,
+        serverAfterUserMessageId
+        && providerUserTextMatchesSubmitted(afterServer.userText, acceptanceBaseline)
+        && (serverBeforeUserMessageId
+          ? serverAfterUserMessageId !== serverBeforeUserMessageId
+          : creatingSession),
       );
-      const domAdvanced = Boolean(
-        afterDom?.messageId
-        && afterDom.messageId !== beforeDom?.messageId,
-      ) || Boolean(
-        afterDom.count > beforeDom.count,
-      ) || Boolean(
-        afterDom?.text
-        && afterDom.text !== beforeDom?.text
-        && (afterDom.text.includes(message.slice(0, 120)) || message.includes(afterDom.text.slice(0, 120))),
-      );
-      evidence.accepted_message_observed = serverAdvanced || domAdvanced;
-      evidence.message_baseline_advanced = domAdvanced;
-      evidence.canonical_url_observed = providerCanonicalConversationObserved();
-      const exactDomUserMessageRef = exactChatGptDispatchIdentity
-        ? exactDomAcceptedUserMessageRef(beforeDom, afterDom, message)
+      const exactDomUserMessageRef = ADAPTER.name === "chatgpt"
+        ? exactDomAcceptedUserMessageRef(beforeDom, afterDom, message, requiredApps)
         : null;
-      const acceptedUserMessageRef = exactChatGptDispatchIdentity
-        ? (serverAdvanced ? afterServer.userMessageId : exactDomUserMessageRef)
-        : ((afterServer?.ok ? afterServer.userMessageId : null) || afterDom?.messageId || null);
+      const domTurnChanged = Boolean(
+        (afterDom?.messageId && afterDom.messageId !== beforeDom?.messageId)
+        || Number(afterDom?.count || 0) > Number(beforeDom?.count || 0),
+      );
+      const domAdvanced = ADAPTER.name === "chatgpt"
+        ? Boolean(exactDomUserMessageRef)
+        : Boolean(domTurnChanged && providerUserTextMatchesSubmitted(afterDom?.text, acceptanceBaseline));
+      evidence.accepted_message_observed = Boolean(
+        conversationStillExpected && (serverAdvanced || domAdvanced),
+      );
+      evidence.message_baseline_advanced = Boolean(conversationStillExpected && domAdvanced);
+      evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      const acceptedUserMessageRef = !evidence.accepted_message_observed
+        ? null
+        : (serverAdvanced
+          ? afterServer.userMessageId
+          : (exactDomUserMessageRef || afterDom?.messageId || null));
       if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef) {
         // The existing actuation evidence.result object carries the exact
-        // provider user-message identity; no new top-level field is added.
-        evidence.result = { accepted_user_message_ref: acceptedUserMessageRef };
+        // provider user-message identity, the App identity of that same
+        // provider message, and the digests of the accepted provider text, so
+        // the runtime re-verifies acceptance instead of trusting this content
+        // script. No new top-level field is added and no message text leaves the
+        // page.
+        const acceptedApps = (ADAPTER.name === "chatgpt"
+          && typeof ADAPTER.getAcceptedUserAppIdentity === "function")
+          ? ADAPTER.getAcceptedUserAppIdentity(acceptedUserMessageRef)
+          : [];
+        // A requested App is satisfied only by the identity of the accepted
+        // provider message; plain text and unlanded composer pills do not count.
+        evidence.required_apps_readback = acceptedApps.map((app) => app.name);
+        evidence.result = {
+          accepted_user_message_ref: acceptedUserMessageRef,
+          ...(acceptedApps.length ? { accepted_user_apps: acceptedApps } : {}),
+          ...(await providerAcceptanceDigests(
+            serverAdvanced ? afterServer.userText : afterDom.text,
+            requiredApps,
+          )),
+        };
       }
-      if (creatingSession && evidence.canonical_url_observed) {
-        const currentConvKey = ADAPTER.getConversationKey();
+      // Register the new conversation only once the accepted turn is exactly
+      // this create's message; otherwise a create that landed on an unrelated
+      // conversation would materialize it as the new session.
+      if (creatingSession && evidence.canonical_url_observed && evidence.accepted_message_observed) {
         if (currentConvKey && (registeredConvKey !== currentConvKey || !registeredBrowserSessionRef)) {
           await registerCurrentConversation("browser-session-create").catch(() => null);
         }
@@ -2558,11 +2800,10 @@ function normalizeHerdrMentionAlias(value) {
       );
       evidence.generation_status_observed = Boolean(
         isTurnInProgress()
-        || assistantAdvanced
-        || (afterServer?.ok && ["user", "assistant"].includes(afterServer.currentNodeRole)),
+        || assistantAdvanced,
       );
       if (evidence.accepted_message_observed
-          && evidence.generation_status_observed
+          && (creatingSession || evidence.generation_status_observed)
           && (!exactChatGptDispatchIdentity || Boolean(acceptedUserMessageRef))
           && (!creatingSession || (evidence.stable_resource_ref_observed && evidence.canonical_url_observed))) {
         evidence.generation_owner = expectedGeneration;
@@ -3144,7 +3385,10 @@ function normalizeHerdrMentionAlias(value) {
             queueInsert: true,
             requiredApps: queuedSelectedApps.length > 0 ? queuedSelectedApps : currentHerdrRequiredApps(),
           });
-          if (result.ok) {
+          if (result.ok || result.uncertain === true) {
+            // An uncertain single-shot submit is terminal for this batch: the
+            // provider mutation was already dispatched, so remember the batch
+            // instead of letting a redelivery send a duplicate turn.
             rememberQueuedInsertBatch(convKey, batchId);
             if (CONVERSATION_HEALTH) {
               markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
@@ -4726,7 +4970,7 @@ function normalizeHerdrMentionAlias(value) {
       recovery: true,
       requiredApps: currentHerdrRequiredApps(),
     });
-    if (!result?.ok) {
+    if (!result?.ok && result?.uncertain !== true) {
       markConversationState({ ...conversationHealth, explicit_error_continue_attempt: 0 });
       return true;
     }
@@ -4914,7 +5158,17 @@ function normalizeHerdrMentionAlias(value) {
       recovery: true,
       requiredApps: currentHerdrRequiredApps(),
     });
-    if (!result?.ok) return false;
+    if (!result?.ok) {
+      if (result?.uncertain === true) {
+        // The single submit already dispatched and could not be confirmed. Never
+        // resend the same probe: treat it as sent so the reply/health watcher
+        // decides the next step instead of creating a duplicate provider turn.
+        markConversationState(RECOVERY_CONTROLLER.markRecoverySent(conversationHealth));
+        paintPageHud({});
+        return true;
+      }
+      return false;
+    }
     markConversationState(RECOVERY_CONTROLLER.markRecoverySent(conversationHealth));
     paintPageHud({});
     const confirm = await confirmReplyStarted(RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs);
@@ -5003,7 +5257,7 @@ function normalizeHerdrMentionAlias(value) {
         recovery: true,
         requiredApps: currentHerdrRequiredApps(),
       });
-      if (!result?.ok) return false;
+      if (!result?.ok && result?.uncertain !== true) return false;
       markConversationState(RECOVERY_CONTROLLER.markRecoverySent({
         ...conversationHealth,
         stale_activation_attempt: 1,
