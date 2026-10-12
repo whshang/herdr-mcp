@@ -13268,7 +13268,7 @@ mod tests {
             fn actuate(
                 &self,
                 _operation: &str,
-                _params: &Value,
+                params: &Value,
                 expected_generation: i64,
                 _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
@@ -13281,8 +13281,12 @@ mod tests {
                 evidence.accepted_message_observed = true;
                 evidence.generation_owner = Some(expected_generation);
                 evidence.generation_status_observed = true;
-                evidence.result =
-                    Some(json!({"accepted_user_message_ref": "provider-user-required-apps"}));
+                // Echo the submitted text: Applied now also requires the
+                // accepted provider text to match the dispatched message.
+                evidence.result = Some(accepted_result(
+                    params["message"].as_str().unwrap_or_default(),
+                    "provider-user-required-apps",
+                ));
                 Ok(evidence)
             }
         }
