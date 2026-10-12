@@ -169,6 +169,13 @@ class ClaudeAdapter extends BaseAdapter {
     for (const selector of chains) {
       for (const element of document.querySelectorAll(selector)) {
         if (!this.elementVisible(element) || seen.has(element)) continue;
+        // `aria-label*="Stop"` also hits unrelated visible controls (2026-10-12
+        // probe: 2 such buttons on an idle chat made every submit composer_busy).
+        // Only an exact stop label or the stop-button test id counts.
+        if (selector.startsWith("button[aria-label")) {
+          const label = String(element.getAttribute?.("aria-label") || "").trim().replace(/\s+/g, " ");
+          if (!/^(?:stop|stop response|stop generating|stop streaming|停止|停止生成|停止回答)$/i.test(label)) continue;
+        }
         seen.add(element);
         out.push(element);
       }

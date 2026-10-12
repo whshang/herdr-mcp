@@ -329,3 +329,21 @@ test("user sends to a reloaded Claude chat | Given virtualized rows out of DOM o
   h.set('[aria-busy="true"]', [element({ attrs: { "aria-busy": "true" } })]);
   assert.equal(h.adapter.isGenerationInProgress(), false);
 });
+
+test("user sends to an idle Claude chat | Given visible buttons whose aria-label merely contains Stop | When generation progress is checked | Then they are not stop controls and the composer is idle", () => {
+  const h = harness();
+  const loose = element({ attrs: { "aria-label": "Stop dictation" } });
+  const loose2 = element({ attrs: { "aria-label": "Stopwatch tool" } });
+  h.set('button[aria-label*="Stop" i]', [loose, loose2]);
+  h.set('[data-is-streaming="true"]', []);
+  const idleRow = element({ attrs: { "data-perf-row": "assistant", "data-perf-row-streaming": "false", "data-index": "9" } });
+  idleRow.querySelectorAll = () => [];
+  h.set('[data-testid="transcript-row"]', [idleRow]);
+  assert.equal(h.adapter.getStopButtonCandidates().length, 0);
+  assert.equal(h.adapter.isGenerationInProgress(), false);
+
+  const real = element({ attrs: { "aria-label": "Stop response" } });
+  h.set('button[aria-label*="Stop" i]', [loose, real]);
+  assert.equal(h.adapter.getStopButtonCandidates().length, 1);
+  assert.equal(h.adapter.isGenerationInProgress(), true);
+});
