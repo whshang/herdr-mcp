@@ -1344,15 +1344,28 @@ export async function handleMcp(
     const idempotencyKey = validRelayIdempotencyKey(runtimeArgs.idempotency_key)
       ? runtimeArgs.idempotency_key
       : undefined;
-    const webchatControlGrants = isBrowserPrivateMethod && initialRouteDeviceId
-      ? (deps.client?.webchatControlGrants ?? [])
-        .filter((grant) => grant.device_id === initialRouteDeviceId)
-        .map((grant) => ({
-          endpoint_ref: grant.endpoint_ref,
-          provider: grant.provider,
-          account_ref: grant.account_ref,
-        }))
-      : [];
+    // A Page Assist endpoint grant implies WebChat control for every provider
+    // on that exact device+endpoint (provider "*"). Derived at forward time, so
+    // existing Page Assist grants work without migration and Page Assist deny
+    // revokes it; explicitly issued per-provider grants are unaffected.
+    const webchatControlGrants: Array<{ endpoint_ref: string; provider: string; account_ref: string }> = [];
+    if (isBrowserPrivateMethod && initialRouteDeviceId) {
+      const seen = new Set<string>();
+      const push = (grant: { endpoint_ref: string; provider: string; account_ref: string }) => {
+        const key = `${grant.endpoint_ref}\u0000${grant.provider}\u0000${grant.account_ref}`;
+        if (seen.has(key) || webchatControlGrants.length >= 32) return;
+        seen.add(key);
+        webchatControlGrants.push(grant);
+      };
+      for (const grant of deps.client?.webchatControlGrants ?? []) {
+        if (grant.device_id !== initialRouteDeviceId) continue;
+        push({ endpoint_ref: grant.endpoint_ref, provider: grant.provider, account_ref: grant.account_ref });
+      }
+      for (const grant of deps.client?.pageAssistGrants ?? []) {
+        if (grant.device_id !== initialRouteDeviceId) continue;
+        push({ endpoint_ref: grant.endpoint_ref, provider: "*", account_ref: "*" });
+      }
+    }
     const pageAssistGrants = isPageAssistPrivateMethod && initialRouteDeviceId
       ? (deps.client?.pageAssistGrants ?? [])
         .filter((grant) => grant.device_id === initialRouteDeviceId)
