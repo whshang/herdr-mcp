@@ -73,11 +73,14 @@
   let currentGenerationToken = "";
   const elementMap = new Map();
   const selectOptionMap = new Map();
+  // Refs whose observed option list was a truncated prefix of the live list.
+  const selectOptionTruncatedRefs = new Set();
 
   function invalidateGeneration() {
     currentGenerationToken = "";
     elementMap.clear();
     selectOptionMap.clear();
+    selectOptionTruncatedRefs.clear();
   }
 
   function isCrossOriginFrame() {
@@ -191,6 +194,7 @@
     currentGenerationToken = `pa_gen_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
     selectOptionMap.clear();
+    selectOptionTruncatedRefs.clear();
 
     const doc = global.document;
     if (!doc) return { ok: false, error: "document_unavailable" };
@@ -243,6 +247,9 @@
           value: String(option.value),
           label: String(option.label || option.textContent || "").trim(),
         })));
+        // Record a truncated observation window: absence from it is then not
+        // evidence that a requested option does not exist.
+        if (selectOptions.length > 24) selectOptionTruncatedRefs.add(ref);
       }
 
       elements.push({
@@ -318,6 +325,89 @@
     };
   }
 
+  const SCROLL_ANCESTOR_DEPTH = 10;
+  const SCROLL_OBSERVED_LIMIT = 32;
+  const SCROLL_CONTAINER_LIMIT = 3;
+
+  function computedStyleOf(el) {
+    try {
+      return global.getComputedStyle ? global.getComputedStyle(el) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function isScrollableOverflow(el) {
+    const overflowY = String(computedStyleOf(el)?.overflowY || "").toLowerCase();
+    return overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+  }
+
+  // Movement is decided on the raw finite position. Reported values are rounded
+  // separately, so a subpixel move is never mistaken for a boundary.
+  function viewportScrollPosition() {
+    const value = Number(global.scrollY);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  // A container only qualifies when it currently has scrollable overflow; the
+  // caller still measures the resulting position, so a wrong guess can never be
+  // reported as movement.
+  function scrollContainerState(el) {
+    if (!el) return null;
+    const style = computedStyleOf(el);
+    if (style && style.display === "none") return null;
+    const top = Number(el.scrollTop);
+    const scrollHeight = Number(el.scrollHeight);
+    const clientHeight = Number(el.clientHeight);
+    if (![top, scrollHeight, clientHeight].every(Number.isFinite)) return null;
+    if (scrollHeight <= clientHeight) return null;
+    return { top: Math.max(0, top) };
+  }
+
+  function nearestObservedScrollContainer(el) {
+    let node = el?.parentElement || null;
+    for (let depth = 0; node && depth < SCROLL_ANCESTOR_DEPTH; depth += 1) {
+      if (isScrollableOverflow(node) && scrollContainerState(node)) return node;
+      node = node.parentElement || null;
+    }
+    return null;
+  }
+
+  // Production scroll carries no element ref, so the inner container is derived
+  // from the current generation's observed elements: the scrollable ancestor
+  // shared by the most of them wins, then the scrolling element, then the body.
+  function observedScrollCandidates() {
+    const counts = new Map();
+    let inspected = 0;
+    for (const el of elementMap.values()) {
+      if (inspected++ >= SCROLL_OBSERVED_LIMIT) break;
+      if (!el || el.isConnected === false) continue;
+      const node = nearestObservedScrollContainer(el);
+      if (node) counts.set(node, (counts.get(node) || 0) + 1);
+    }
+    const candidates = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, SCROLL_CONTAINER_LIMIT)
+      .map(([node]) => node);
+    for (const node of [global.document?.scrollingElement, global.document?.body]) {
+      if (node && !candidates.includes(node)) candidates.push(node);
+    }
+    return candidates;
+  }
+
+  function attemptContainerScroll(container, delta) {
+    const before = scrollContainerState(container);
+    if (!before) return null;
+    if (typeof container.scrollBy === "function") {
+      container.scrollBy({ top: delta, behavior: "instant" });
+    } else {
+      container.scrollTop = before.top + delta;
+    }
+    const after = scrollContainerState(container);
+    if (!after || after.top === before.top) return null;
+    return { before: before.top, after: after.top };
+  }
+
   function executeScroll(params = {}) {
     if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
     if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
@@ -334,21 +424,67 @@
       return { ok: false, error: "scroll_params_invalid" };
     }
     if (typeof global.scrollBy !== "function") return { ok: false, error: "scroll_unavailable" };
-    const beforeY = Math.max(0, Math.round(Number(global.scrollY) || 0));
+    const beforeRaw = viewportScrollPosition();
+    const delta = direction === "down" ? amount : -amount;
     try {
-      global.scrollBy({ top: direction === "down" ? amount : -amount, behavior: "instant" });
-      const afterY = Math.max(0, Math.round(Number(global.scrollY) || 0));
-      invalidateGeneration();
-      return {
-        ok: true, direction, amount,
-        before_y: beforeY, after_y: afterY,
-        moved: afterY !== beforeY,
-        at_boundary: afterY === beforeY,
-        requires_verification: true,
-      };
+      global.scrollBy({ top: delta, behavior: "instant" });
     } catch (_) {
       return { ok: false, error: "scroll_delivery_unknown" };
     }
+    const afterRaw = viewportScrollPosition();
+    const beforeY = Math.max(0, Math.round(beforeRaw));
+    const afterY = Math.max(0, Math.round(afterRaw));
+
+    // The document viewport keeps its exact original semantics when it moves.
+    let movedContainer = afterRaw !== beforeRaw
+      ? { name: "viewport", before: Math.max(0, beforeRaw), after: Math.max(0, afterRaw) }
+      : null;
+
+    if (!movedContainer) {
+      // Applications that disable document scrolling move an inner container
+      // instead. Only containers that hold observed content are considered and
+      // every attempt is measured; nothing is reported without real movement.
+      let candidates = [];
+      try {
+        candidates = observedScrollCandidates();
+      } catch (_) {
+        candidates = [];
+      }
+      for (const candidate of candidates) {
+        let attempt = null;
+        try {
+          attempt = attemptContainerScroll(candidate, delta);
+        } catch (_) {
+          return { ok: false, error: "scroll_delivery_unknown" };
+        }
+        if (attempt) {
+          const isViewportOwner = candidate === global.document?.scrollingElement
+            || candidate === global.document?.body;
+          movedContainer = {
+            name: isViewportOwner ? "document_scrolling_element" : "observed_ancestor",
+            tag: String(candidate.tagName || "").toLowerCase().slice(0, 32),
+            before: attempt.before,
+            after: attempt.after,
+          };
+          break;
+        }
+      }
+    }
+
+    invalidateGeneration();
+    return {
+      ok: true, direction, amount,
+      before_y: beforeY, after_y: afterY,
+      moved: movedContainer !== null,
+      at_boundary: movedContainer === null,
+      ...(movedContainer ? {
+        scroll_container: movedContainer.name,
+        ...(movedContainer.tag ? { scroll_container_tag: movedContainer.tag } : {}),
+        scroll_container_before: movedContainer.before,
+        scroll_container_after: movedContainer.after,
+      } : {}),
+      requires_verification: true,
+    };
   }
 
   function executeClick(params = {}) {
@@ -483,10 +619,21 @@
       if (el.multiple === true) return { ok: false, error: "multiple_select_unsupported" };
       // Match only options offered in the latest observation. A page must not
       // introduce a new option after inspect and have it selected by old refs.
-      const matches = (selectOptionMap.get(ref) || []).filter((option) => (
+      const observedOptions = selectOptionMap.get(ref) || [];
+      const matches = observedOptions.filter((option) => (
         option.value === fillValue || option.label === fillValue
       ));
       if (matches.length !== 1) {
+        if (matches.length === 0 && selectOptionTruncatedRefs.has(ref)) {
+          // The observation held only a truncated prefix of the options, so the
+          // request cannot be proven absent. Never select an unobserved option;
+          // the caller must re-observe to widen the window.
+          return {
+            ok: false,
+            error: "select_option_not_observed",
+            options_observed: observedOptions.length,
+          };
+        }
         return { ok: false, error: matches.length ? "select_option_ambiguous" : "select_option_unavailable" };
       }
       const snapshot = matches[0];

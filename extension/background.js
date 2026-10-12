@@ -8148,6 +8148,7 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "value_required",
   "multiple_select_unsupported",
   "select_option_unavailable",
+  "select_option_not_observed",
   "select_option_ambiguous",
   "select_option_stale",
   "checkable_state_required",
