@@ -1532,12 +1532,14 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
         // self-reported identity proves nothing here. Validate against the
         // admitted manifest contract `M` the foreground updater verified and
         // persisted with this job, and bind this runtime's embedded identity
-        // to `M` as well.
+        // to `M` as well. Jobs staged by the released v1.0.0–v1.0.3
+        // foreground updaters carry no such record; see
+        // `admitted_contract_for_job` for that legacy path.
         let job_dir = binary
             .parent()
             .ok_or_else(|| "staged update binary has no job directory".to_owned())?;
-        let admitted = load_admitted_contract(job_dir)?;
         let own = contract::identity()?;
+        let admitted = admitted_contract_for_job(job_dir, &own)?;
         if own != admitted {
             return Err(format!(
                 "update worker runtime contract identity does not match the admitted manifest \
@@ -2213,21 +2215,29 @@ fn probe_candidate_binary(
     let expected_first = format!("herdr-mcp {expected}");
     // The candidate must report the admitted manifest contract `M`: identical
     // to the local identity on a same-contract update, one epoch ahead on the
-    // cross-epoch path. Epoch and tool count are always compared against `M`;
+    // cross-epoch path. Epoch, tool count, and state schema are matched as
+    // whole lines so the labeled `legacy probe compat` compatibility line in
+    // `herdr-mcp version` output can never satisfy an epoch or schema check;
     // the hash is the third binding field and is required on the cross-epoch
     // path, while same-contract candidates may predate the `contract hash`
     // version line and only a reported-but-different hash is refused.
+    let expected_epoch_line = format!(
+        "contract epoch {} / {} tools",
+        admitted.epoch, admitted.tool_count
+    );
+    let expected_schema_line = format!("state schema {SCHEMA_VERSION}");
     let identity_mismatch = format!(
         "staged update binary identity does not match release manifest (local contract epoch {}, \
          target contract epoch {})",
         local.epoch, admitted.epoch
     );
     if text.lines().next() != Some(expected_first.as_str())
-        || !text.contains(&format!(
-            "contract epoch {} / {} tools",
-            admitted.epoch, admitted.tool_count
-        ))
-        || !text.contains(&format!("state schema {SCHEMA_VERSION}"))
+        || !text
+            .lines()
+            .any(|line| line == expected_epoch_line.as_str())
+        || !text
+            .lines()
+            .any(|line| line == expected_schema_line.as_str())
     {
         return Err(identity_mismatch);
     }
@@ -2338,6 +2348,30 @@ fn load_admitted_contract(job_dir: &Path) -> Result<contract::ContractIdentity, 
         hash,
         tool_count,
     })
+}
+
+/// Admitted manifest contract for an update job directory.
+///
+/// Jobs staged by this release's foreground updater carry the persisted
+/// `admitted-contract.json` record and are bound to it. Jobs staged by the
+/// released v1.0.0–v1.0.3 foreground updaters predate that record: for those
+/// legacy jobs the durable job's manifest sha256 — already verified against
+/// the staged file by the caller — is the strongest foreground binding, so
+/// the worker falls back to its own embedded identity and the candidate
+/// probe still re-verifies the staged binary's version output line by line.
+/// A record that exists in any form is always parsed and still fails closed
+/// when unreadable or invalid; only a provably absent record takes the
+/// legacy path.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn admitted_contract_for_job(
+    job_dir: &Path,
+    own: &contract::ContractIdentity,
+) -> Result<contract::ContractIdentity, String> {
+    match fs::symlink_metadata(job_dir.join(ADMITTED_CONTRACT_RECORD)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(own.clone()),
+        Err(error) => Err(format!("cannot inspect admitted contract record: {error}")),
+        Ok(_) => load_admitted_contract(job_dir),
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -3797,6 +3831,130 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Verbatim replay of the released v1.0.0–v1.0.3 candidate probe check.
+    ///
+    /// Extracted verbatim from `git show v1.0.1:crates/herdr-mcp/src/updater.rs`
+    /// (`probe_candidate_binary`, lines 1926-1944, check at 1937-1942) —
+    /// byte-identical in `git show v1.0.3:crates/herdr-mcp/src/updater.rs`
+    /// (lines 2040-2058, check at 2051-2056) and in v1.0.0 — which refuses a
+    /// staged candidate unless the version output's first line is
+    /// `herdr-mcp {expected}`, the output contains the 0.4.x-era hardcoded
+    /// `contract epoch 2 / 18 tools` string, and it contains the live
+    /// `state schema {SCHEMA_VERSION}` (15 in every v1.0.x release).
+    fn released_v1_probe_rejects(text: &str, expected: &Version) -> bool {
+        let expected_first = format!("herdr-mcp {expected}");
+        text.lines().next() != Some(expected_first.as_str())
+            || !text.contains("contract epoch 2 / 18 tools")
+            || !text.contains(&format!("state schema {SCHEMA_VERSION}"))
+    }
+
+    #[test]
+    fn released_v1_updaters_admit_current_runtime_version_output() {
+        // The released v1.0.x binaries embed SCHEMA_VERSION 15; pin the live
+        // constant so a future schema bump forces this replay to be
+        // re-evaluated instead of silently still passing.
+        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(crate::runtime_meta::runtime_version(), "1.0.4");
+        let text = crate::version_output_text(&contract::identity().unwrap());
+        let expected = Version::parse("1.0.4").unwrap();
+
+        // v1.0.1 foreground probe (tag v1.0.1, updater.rs:1926-1944) admits
+        // the real 1.0.4 version output, which carries the labeled
+        // `legacy probe compat: contract epoch 2 / 18 tools` line.
+        assert!(!released_v1_probe_rejects(&text, &expected));
+        // v1.0.3 foreground probe (tag v1.0.3, updater.rs:2040-2058): the
+        // check is byte-identical across v1.0.0/v1.0.1/v1.0.3.
+        assert!(!released_v1_probe_rejects(&text, &expected));
+
+        // The same released check must still refuse a candidate whose
+        // manifest version does not match the version banner.
+        let wrong = Version::parse("1.0.5").unwrap();
+        assert!(released_v1_probe_rejects(&text, &wrong));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn candidate_reporting_only_legacy_compat_epoch_line_is_refused() {
+        // `herdr-mcp version` prints a labeled `legacy probe compat` line so
+        // the released v1.0.0–v1.0.3 foreground probes accept this runtime as
+        // an update candidate. This runtime's own probe must never treat that
+        // marker as the candidate's real epoch line: a candidate whose only
+        // epoch line is the compat marker is refused even when the admitted
+        // contract epoch equals the marker's epoch.
+        let dir = env::temp_dir().join(format!(
+            "herdr-updater-probe-legacy-line-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join("herdr-mcp-candidate");
+        let epoch2 = contract::ContractIdentity {
+            epoch: 2,
+            hash: format!("sha256:{}", "2".repeat(64)),
+            tool_count: 18,
+        };
+        let script = format!(
+            "#!/bin/sh\nprintf 'herdr-mcp 1.0.4\\nlegacy probe compat: contract epoch 2 / 18 tools\\n\
+             state schema {}\\ncontract hash {}\\n'\n",
+            SCHEMA_VERSION, epoch2.hash
+        );
+        fs::write(&candidate, script).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = probe_candidate_binary(
+            &candidate,
+            &Version::parse("1.0.4").unwrap(),
+            &epoch2,
+            &epoch2,
+        )
+        .unwrap_err();
+        assert!(error.contains("does not match release manifest"), "{error}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn worker_admits_legacy_job_without_admitted_contract_record() {
+        // A job staged by the released v1.0.0–v1.0.3 foreground updater has
+        // no persisted admitted-contract record. The worker must still admit
+        // it through the own-identity fallback and re-verify the staged
+        // binary with the line-exact probe.
+        let dir = env::temp_dir().join(format!(
+            "herdr-updater-legacy-job-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let own = contract::identity().unwrap();
+
+        // No record: the legacy fallback binds to the worker's own identity.
+        assert_eq!(admitted_contract_for_job(&dir, &own).unwrap(), own);
+        // A present record always wins and is parsed strictly.
+        let admitted = next_epoch_identity();
+        persist_admitted_contract(&dir, &admitted).unwrap();
+        assert_eq!(admitted_contract_for_job(&dir, &own).unwrap(), admitted);
+        // A corrupt record still fails closed; the fallback never bypasses a
+        // record that exists in any form.
+        fs::write(dir.join(ADMITTED_CONTRACT_RECORD), b"{not json").unwrap();
+        assert!(admitted_contract_for_job(&dir, &own).is_err());
+
+        // End-to-end shape of the legacy path: the staged 1.0.4 binary prints
+        // the real `herdr-mcp version` text (compat line included) and passes
+        // the worker's probe with the fallback identity.
+        let candidate = dir.join("herdr-mcp-candidate");
+        let script = format!("#!/bin/sh\nprintf '{}'\n", crate::version_output_text(&own));
+        fs::write(&candidate, script).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        probe_candidate_binary(
+            &candidate,
+            &Version::parse(crate::runtime_meta::runtime_version()).unwrap(),
+            &own,
+            &own,
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn admitted_contract_record_round_trips_and_fails_closed() {
@@ -3813,8 +3971,11 @@ mod tests {
         // The record is committed atomically: no temp file survives.
         assert!(!dir.join("admitted-contract.tmp").exists());
 
-        // A missing record (job staged by a foreground that predates this
-        // binding) must fail closed instead of falling back to a self-report.
+        // A missing record fails closed at this layer: this function never
+        // silently substitutes a self-report. The legacy-job decision (v1.0.0–
+        // v1.0.3 foregrounds staged no record) is made explicitly by
+        // `admitted_contract_for_job`, which falls back only on a provably
+        // absent record and still runs the candidate probe afterwards.
         let empty = dir.join("no-record");
         fs::create_dir_all(&empty).unwrap();
         assert!(
