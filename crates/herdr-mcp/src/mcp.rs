@@ -2325,12 +2325,15 @@ fn browser_required_apps_match_evidence(
     if requested.is_empty() {
         return Ok(true);
     }
-    Ok(evidence.required_apps_readback.len() == requested.len()
-        && evidence
-            .required_apps_readback
-            .iter()
-            .map(String::as_str)
-            .eq(requested))
+    // The readback lists Apps in provider DOM order; `requested` is sorted, so
+    // compare as sorted multisets to match the late-acceptance matcher.
+    let mut readback: Vec<&str> = evidence
+        .required_apps_readback
+        .iter()
+        .map(String::as_str)
+        .collect();
+    readback.sort_unstable();
+    Ok(readback.len() == requested.len() && readback.into_iter().eq(requested))
 }
 
 /// App identity read from one accepted provider user message. The extension
@@ -12858,6 +12861,39 @@ mod tests {
                 BrowserDeliveryState::Applied,
             );
             evidence.required_apps_readback.clear();
+        }
+    }
+
+    #[test]
+    fn user_submit_given_two_apps_in_dom_order_when_postcondition_checked_then_applied() {
+        let mut evidence = BrowserPostconditionEvidence::resource_unavailable(7);
+        evidence.browser_online = true;
+        evidence.resource_available = true;
+        evidence.command_accepted = true;
+        evidence.stable_resource_ref_observed = true;
+        evidence.lifecycle_observed = true;
+        evidence.canonical_url_observed = true;
+        evidence.accepted_message_observed = true;
+        evidence.generation_owner = Some(7);
+        evidence.generation_status_observed = true;
+        evidence.result = Some(accepted_result("worker turn", "provider-user-test"));
+        let params = json!({"message": "worker turn", "required_apps": ["alpha", "zeta"]});
+        for operation in [
+            BrowserOperation::SessionCreate,
+            BrowserOperation::DispatchSubmit,
+        ] {
+            evidence.required_apps_readback = vec!["zeta".to_owned(), "alpha".to_owned()];
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &params, 7, &evidence)
+                    .unwrap(),
+                BrowserDeliveryState::Applied,
+            );
+            evidence.required_apps_readback = vec!["zeta".to_owned(), "zeta".to_owned()];
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &params, 7, &evidence)
+                    .unwrap(),
+                BrowserDeliveryState::Uncertain,
+            );
         }
     }
 
