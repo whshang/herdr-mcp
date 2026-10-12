@@ -42,12 +42,26 @@ herdr-mcp webchat create \
 To make a WebChat child actually eligible to use the **provider-owned** Herdr App,
 pass `--required-app herdr` to `webchat create` or `webchat send`.
 The value is a provider App keyword, not Markdown text or a fabricated App pill.
-The Extension selects the *unique* matching provider App and reads its selected
-identity before submitting; absence, ambiguity or failed selection stops delivery.
+The Extension resolves candidates only inside the popup its own composer owns
+(`aria-controls` / `aria-owns`), requires an exact provider `data-keyword`
+identity, and stops delivery when that popup or a unique candidate is missing.
 The Runtime must not classify a required-App message as `applied` unless
-`required_apps_readback` matches exactly. This is **App selection evidence only**:
-confirm a real tool call and result inside the child before claiming execution.
+`required_apps_readback` matches exactly, and that readback now comes from the
+**accepted provider user message itself** (the same message as
+`accepted_user_message_ref` and its text digest), not from the pre-submit
+composer. A plain-text `@herdr` is never an App identity: only a provider-owned
+inline mention with a non-empty `app-mention-path` counts, and late create
+acceptance re-checks that identity from the same provider message. Expect `uncertain`
+when the accepted message cannot prove the requested App. This is **App identity
+evidence only**: confirm a real tool call and result inside the child before
+claiming execution.
 With `uncertain`, read back first; never resend with a new idempotency key.
+
+ChatGPT submission is **single-shot per wake**: one dispatch primitive is
+attempted, and an unconfirmed acknowledgement stays `uncertain` for every path
+(handoff, queue, recovery, generic wake, and the MCP `dispatch.submit` /
+`session.create` actuation). It is never re-sent, because a second Send click or
+Enter can create a duplicate provider user message.
 
 Dispatch and observe:
 
