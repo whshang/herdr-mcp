@@ -3951,7 +3951,10 @@ fn browser_create_caller_source_session_ref(
 ///
 /// The source-anchored `browser_session.create` normalization and the read-only canonical
 /// handoff preparation both use this one resolution so a source URL can never produce two
-/// different routes.
+/// different routes. Resolution is strict: a second distinct session observing the same
+/// canonical URL is ambiguous and fails closed as `browser_canonical_url_ambiguous`
+/// regardless of which observation is newer, so a browser-profile or account switch can
+/// never retarget work to another identity's session.
 struct BrowserSourceRoute {
     session_ref: String,
     provider: String,
@@ -3969,7 +3972,7 @@ fn browser_source_route(
     let source = browser_conversation_url_ref(source_url)
         .ok_or_else(|| "browser_source_url_invalid".to_owned())?;
     let session_ref = store
-        .browser_latest_session_ref_for_canonical_url(source_url)?
+        .browser_session_ref_for_canonical_url(source_url)?
         .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
     let session = store
         .browser_resource(&session_ref)?
@@ -4125,7 +4128,10 @@ fn browser_handoff_prepare(
         };
         // Route resolution stays best-effort: a handoff whose source conversation is not
         // currently registered still yields the canonical packet and Copy Prompt. Only the
-        // automatic delivery step needs this scope, and it fails closed without it.
+        // automatic delivery step needs this scope, and it fails closed without it. An
+        // ambiguous source (two distinct sessions on one canonical URL) resolves to no
+        // route and is therefore refused for automatic delivery while the manual packet
+        // still returns.
         let (route, route_error, route_session_ref) = match browser_source_route(&store, source_url)
         {
             Ok(route) => {
@@ -15178,7 +15184,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_handoff_prepare_reports_the_registered_source_route() {
+    fn user_source_route_given_one_session_when_resolved_then_exact_route_used() {
         use crate::state_store::{
             BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
             BrowserProviderObservationInput, BrowserResourceObservationInput, ContinuityTurnInput,
@@ -15348,6 +15354,227 @@ mod tests {
         assert_eq!(duplicate_app["code"], "browser_required_apps_invalid");
     }
 
+    /// Register one ChatGPT browser profile (endpoint + provider + consent + account +
+    /// session) whose single session observes `url`, and return the session ref. Used by
+    /// the strict source-route coverage so the only varying input is profile identity and
+    /// observation recency.
+    fn observe_chatgpt_source_profile(
+        store: &mut StateStore,
+        profile_seed: &str,
+        account_identity: &str,
+        session_identity: &str,
+        url: &str,
+        observed_at: i64,
+    ) -> String {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        let endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                profile_seed,
+                browser_family: "chrome",
+                extension_version: "0.1.101",
+                observed_at,
+            })
+            .unwrap();
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: observed_at,
+                capabilities_json: r#"{"operations":["session.create"]}"#,
+                observed_at,
+            })
+            .unwrap();
+        store
+            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                expected_revision: 0,
+                webchat_control_allowed: true,
+                tool_bridge_allowed: false,
+                tool_bridge_mutation_allowed: false,
+                observed_at,
+            })
+            .unwrap();
+        let account = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: account_identity,
+                display_label: None,
+                observation_generation: observed_at,
+                observed_at,
+            })
+            .unwrap();
+        let session = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&account.resource_ref),
+                native_identity: session_identity,
+                display_label: Some("Source"),
+                observation_generation: observed_at,
+                observed_at,
+            })
+            .unwrap();
+        store
+            .upsert_browser_resource_locator(&session.resource_ref, url, observed_at, observed_at)
+            .unwrap();
+        session.resource_ref
+    }
+
+    /// An actuator that must never run: any actuation of an ambiguous source is itself the
+    /// regression this fixture guards against.
+    struct UnreachableCreateActuator;
+
+    impl BrowserActuator for UnreachableCreateActuator {
+        fn actuate(
+            &self,
+            operation: &str,
+            _params: &Value,
+            _expected_generation: i64,
+            _dispatch_id: Option<&str>,
+        ) -> Result<BrowserPostconditionEvidence, String> {
+            panic!("ambiguous source must not actuate {operation}");
+        }
+    }
+
+    #[test]
+    fn user_create_given_two_sessions_on_one_url_when_sourced_then_ambiguous() {
+        use std::sync::{Arc, Mutex};
+
+        const URL: &str =
+            "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv";
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-mcp-ambiguous-source-create-{}-{suffix}.sqlite",
+            std::process::id()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&path).unwrap()));
+        {
+            let mut guard = store.lock().unwrap();
+            observe_chatgpt_source_profile(
+                &mut guard,
+                "ambiguous-source-profile-seed-a-0123456789",
+                "ambiguous-account-a",
+                "ambiguous-session-a",
+                URL,
+                100,
+            );
+            // A second profile observes the same canonical URL later, so a recency rule
+            // would silently route this create to the other identity's session.
+            observe_chatgpt_source_profile(
+                &mut guard,
+                "ambiguous-source-profile-seed-b-0123456789",
+                "ambiguous-account-b",
+                "ambiguous-session-b",
+                URL,
+                200,
+            );
+        }
+        let result = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &json!({
+                "source_url": URL,
+                "message": "continue from an ambiguous source",
+                "idempotency_key": "ambiguous-source-create-1",
+            }),
+            true,
+            Some(&UnreachableCreateActuator),
+        );
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "browser_canonical_url_ambiguous");
+        assert!(result.get("reservation_ref").is_none());
+        // Durable state proves the refusal happened before any reservation: the strict
+        // source lookup fails closed during normalization, so no create can be replayed
+        // against the wrong identity later.
+        drop(store);
+        let reservations: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM browser_session_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reservations, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn user_handoff_given_two_profiles_on_one_url_when_prepared_then_delivery_refused() {
+        use crate::state_store::ContinuityTurnInput;
+        use std::sync::{Arc, Mutex};
+
+        const URL: &str =
+            "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv";
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        {
+            let mut guard = store.lock().unwrap();
+            observe_chatgpt_source_profile(
+                &mut guard,
+                "ambiguous-handoff-profile-seed-a-0123456789",
+                "ambiguous-handoff-account-a",
+                "ambiguous-handoff-session-a",
+                URL,
+                100,
+            );
+            observe_chatgpt_source_profile(
+                &mut guard,
+                "ambiguous-handoff-profile-seed-b-0123456789",
+                "ambiguous-handoff-account-b",
+                "ambiguous-handoff-session-b",
+                URL,
+                200,
+            );
+            guard
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:ambiguous",
+                    conversation_id: "source-conv",
+                    workspace_id: Some("w-ambiguous"),
+                    project_id: Some("g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    title: Some("Ambiguous handoff"),
+                    message_id: "ambiguous-user-1",
+                    role: "user",
+                    text: "hand off from an ambiguous source",
+                    fingerprint: None,
+                    observed_at: 100,
+                })
+                .unwrap();
+        }
+        let prepared = browser_handoff_prepare(
+            &store,
+            &json!({"continuity_id": "hc:ambiguous", "source_url": URL}),
+        );
+        assert_eq!(prepared["ok"], true);
+        // No route means the CLI must refuse automatic delivery and report why. The manual
+        // packet stays intact so the handoff can still be completed by Copy Prompt.
+        assert_eq!(prepared["source_route"], Value::Null);
+        assert_eq!(
+            prepared["source_route_error"],
+            "browser_canonical_url_ambiguous"
+        );
+        assert_eq!(prepared["automatic_delivery"]["params"]["source_url"], URL);
+        assert_eq!(
+            prepared["handoff"]["message"],
+            prepared["manual_delivery"]["copy_prompt"]
+        );
+        assert_eq!(
+            prepared["handoff"]["message"],
+            prepared["automatic_delivery"]["params"]["message"]
+        );
+    }
+
     #[test]
     fn browser_session_create_reconciliation_stays_within_request_headroom() {
         let intervals = BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS.saturating_sub(1) as u64;
@@ -15355,7 +15582,7 @@ mod tests {
     }
 
     #[test]
-    fn user_source_route_resolve_is_local_only_latest_and_fail_closed_on_tie() {
+    fn user_source_route_given_two_sessions_on_one_url_when_resolved_then_fail_closed() {
         use crate::state_store::{
             BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
             BrowserProviderObservationInput, BrowserResourceObservationInput,
@@ -15440,6 +15667,11 @@ mod tests {
             browser_source_resolve(&store, &json!({"source_url": URL}), false)["code"],
             "trusted_local_ipc_required"
         );
+        // One registered session per canonical URL still resolves to that exact route.
+        let single = browser_source_resolve(&store, &json!({"source_url": URL}), true);
+        assert_eq!(single["ok"], true);
+        assert_eq!(single["route"]["endpoint_ref"], endpoint_a);
+        assert_eq!(single["route"]["account_ref"], account_a);
         let (endpoint_b, account_b) = {
             let mut guard = store.lock().unwrap();
             observe(
@@ -15450,12 +15682,12 @@ mod tests {
                 200,
             )
         };
+        // A second distinct session on the same canonical URL is ambiguous, and a more
+        // recent observation must never win the route: the resolver fails closed instead
+        // of associating work with another profile/account identity.
         let resolved = browser_source_resolve(&store, &json!({"source_url": URL}), true);
-        assert_eq!(resolved["ok"], true);
-        assert_eq!(resolved["route"]["endpoint_ref"], endpoint_b);
-        assert_eq!(resolved["route"]["account_ref"], account_b);
-        assert_ne!(resolved["route"]["endpoint_ref"], endpoint_a);
-        assert_ne!(resolved["route"]["account_ref"], account_a);
+        assert_eq!(resolved["ok"], false);
+        assert_eq!(resolved["code"], "browser_canonical_url_ambiguous");
         {
             let mut guard = store.lock().unwrap();
             guard
@@ -15491,22 +15723,6 @@ mod tests {
             .unwrap(),
             (false, Some("caller_grant_missing"))
         );
-        let exact_b_grant = [BrowserCallerGrant {
-            endpoint_ref: endpoint_b.clone(),
-            provider: "chatgpt".to_owned(),
-            account_ref: account_b.clone(),
-        }];
-        assert_eq!(
-            browser_resource_actuation_decision(
-                &store.lock().unwrap(),
-                "session.create",
-                &account_b_resource,
-                &exact_b_grant,
-                Some(200),
-            )
-            .unwrap(),
-            (true, None)
-        );
 
         {
             let mut guard = store.lock().unwrap();
@@ -15518,6 +15734,7 @@ mod tests {
                 200,
             );
         }
+        // A third session that ties the newest observation stays fail-closed too.
         assert_eq!(
             browser_source_resolve(&store, &json!({"source_url": URL}), true)["code"],
             "browser_canonical_url_ambiguous"

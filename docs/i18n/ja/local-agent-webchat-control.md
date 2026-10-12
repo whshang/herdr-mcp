@@ -273,7 +273,7 @@ herdr-mcp webchat handoff \
 
 **準備済みは配送済みではありません。** ソース会話が未登録、または browser control が利用できない場合でも packet と `manual_delivery.copy_prompt` は返り、`automatic_delivery.attempted=false` と runtime の理由が付きます。これは手動継続に使える結果ですが、**完了した handoff ではありません**。実際に会話が作成されたのは `automatic_delivery.completed=true`（つまり `delivery_state=applied`）のときだけです。`uncertain` はそのまま報告され、自動再試行はしません。
 
-`herdr-mcp webchat create --source-url URL` は、正確な source-window affinity のために source ベースの経路を利用し、呼び出し側が endpoint/provider/account ref を指定する必要はありません。ローカル CLI は trusted Unix IPC 経由で Runtime に同じ canonical source resolver を使わせ、最新の exact route から trusted local grant を作ります。create payload の route 入力は引き続き `source_url` だけで、Runtime は mutation 前にもう一度解決・検証します。その間に route が変われば exact grant が一致せず fail closed となり、古い endpoint へ誤配送しません。明示的な direct create では endpoint/provider/account と generation が引き続き必要です。
+`herdr-mcp webchat create --source-url URL` は、正確な source-window affinity のために source ベースの経路を利用し、呼び出し側が endpoint/provider/account ref を指定する必要はありません。ローカル CLI は trusted Unix IPC 経由で Runtime に同じ canonical source resolver を使わせ、exact route から trusted local grant を作ります。create payload の route 入力は引き続き `source_url` だけで、Runtime は mutation 前にもう一度解決・検証します。同じ canonical URL を複数の browser session が観測している場合は曖昧とみなし、`browser_canonical_url_ambiguous` で fail closed します（source-anchored create が別 profile/account の session に解決されることはありません）。その間に route が変われば exact grant が一致せず fail closed となり、古い endpoint へ誤配送しません。明示的な direct create では endpoint/provider/account と generation が引き続き必要です。
 
 ## 7. ローカル Agent の例
 
@@ -333,7 +333,7 @@ Agent は次の順で進めます。
 | endpoint はあるが `consent.webchat_control: false` | 廃止済みのローカルスイッチ意味論を持つ古い runtime/extension。現在の DEV またはリリース版へ更新／Reload して endpoint を再観測します |
 | account / Project が曖昧 | 再列挙し、返された ref で選ぶ。推測や「最新」での選択はしない |
 | `browser_resource_not_found` / session が古い | `herdr-mcp webchat resources` を再実行。会話が閉じられた、アーカイブされた、または新しい観測に置き換わった可能性 |
-| 同じ会話が 2 つの browser endpoint から観測された | canonical URL は**最新**の観測に解決されるため、ブラウザ profile / extension identity の切り替えで新鮮な会話が使えなくなることはありません。2 つの異なる session が同じ最新時刻を共有する場合だけ `browser_canonical_url_ambiguous` で fail closed します |
+| 同じ会話が 2 つの browser endpoint から観測された | canonical URL は必ず 1 つの登録済み session に解決される必要があります。2 つの異なる session が同じ URL を共有する場合は曖昧として `browser_canonical_url_ambiguous` で fail closed し、最新の観測を選ぶことはありません。source-anchored create と handoff が別 profile/account の session へ向き先を変えることはありません。再観測してももう一方の session の記録は消えないため、この URL は source-anchored create と handoff では曖昧なままです。代わりに endpoint、provider、account、generation を明示した direct create を使ってください |
 | dispatch タイムアウト | まず `herdr-mcp webchat dispatch-status DISPATCH_ID` を読み、次に会話を観測してから判断 |
 | 変更の delivery が不確実 | まず再観測。新しい idempotency key で再送しない |
 | `code: "caller_grant_missing"` | 信頼されたローカル経路にいない（例：生の TCP MCP クライアント）。`herdr-mcp` CLI を使う。grant は TCP で自称できません |
