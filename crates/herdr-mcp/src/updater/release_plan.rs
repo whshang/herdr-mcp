@@ -48,6 +48,7 @@ pub(super) struct ReleasePlan {
     pub(super) version: Version,
     pub(super) tag: String,
     pub(super) identity: ReleaseIdentity,
+    pub(super) contract: contract::ContractIdentity,
     pub(super) asset: ReleaseAsset,
 }
 
@@ -192,11 +193,7 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
     if value.get("product").and_then(Value::as_str) != Some("herdr-mcp") {
         return Err("release manifest product mismatch".to_owned());
     }
-    if value.get("state_schema").and_then(Value::as_i64) != Some(SCHEMA_VERSION) {
-        return Err(format!(
-            "release state schema is not rollback-compatible with local schema {SCHEMA_VERSION}"
-        ));
-    }
+    let target_contract = admit_release_contract(value, &contract::identity()?, SCHEMA_VERSION)?;
     let version_text = value
         .get("version")
         .and_then(Value::as_str)
@@ -210,19 +207,6 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
         .ok_or_else(|| "release manifest tag/version mismatch".to_owned())?
         .to_owned();
     let identity = release_trust::parse_manifest_identity(value, &tag)?;
-
-    let expected = contract::identity()?;
-    let contract = value
-        .get("contract")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "release manifest is missing contract identity".to_owned())?;
-    if contract.get("epoch").and_then(Value::as_u64) != Some(u64::from(expected.epoch))
-        || contract.get("hash").and_then(Value::as_str) != Some(expected.hash.as_str())
-        || contract.get("tool_count").and_then(Value::as_u64)
-            != Some(u64::from(expected.tool_count))
-    {
-        return Err("release manifest contract identity mismatch".to_owned());
-    }
 
     let assets = value
         .get("assets")
@@ -272,6 +256,7 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
         version,
         tag,
         identity,
+        contract: target_contract,
         asset: ReleaseAsset {
             target: target.to_owned(),
             name,
@@ -280,6 +265,80 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
             url,
         },
     })
+}
+
+fn parse_contract_identity(value: &Value) -> Option<contract::ContractIdentity> {
+    let hash = value.get("hash")?.as_str()?;
+    if !valid_sha256(hash.strip_prefix("sha256:")?) {
+        return None;
+    }
+    Some(contract::ContractIdentity {
+        epoch: u32::try_from(value.get("epoch")?.as_u64()?).ok()?,
+        hash: hash.to_owned(),
+        tool_count: u32::try_from(value.get("tool_count")?.as_u64()?)
+            .ok()
+            .filter(|count| *count > 0)?,
+    })
+}
+
+// Shared by explicit and scheduled updates before any candidate is staged.
+fn admit_release_contract(
+    value: &Value,
+    local: &contract::ContractIdentity,
+    state_schema: i64,
+) -> Result<contract::ContractIdentity, String> {
+    let target_epoch = value
+        .get("contract")
+        .and_then(|contract| contract.get("epoch"))
+        .map_or_else(|| "missing".to_owned(), Value::to_string);
+    let refuse = |reason: &str| {
+        format!(
+            "release manifest contract identity mismatch: local epoch {}, target epoch {target_epoch}: {reason}; update to the intermediate bridge via herdr-mcp update apply --manifest <url>",
+            local.epoch
+        )
+    };
+    let target = value
+        .get("contract")
+        .and_then(parse_contract_identity)
+        .ok_or_else(|| refuse("missing or malformed target contract"))?;
+    if target == *local {
+        if value.get("state_schema").and_then(Value::as_i64) != Some(state_schema) {
+            return Err(format!(
+                "release state schema is not rollback-compatible with local schema {state_schema}"
+            ));
+        }
+        return Ok(target);
+    }
+    if local.epoch.checked_add(1) != Some(target.epoch) {
+        return Err(refuse("only an adjacent forward epoch is admissible"));
+    }
+    let migration = value
+        .get("contract_migration")
+        .and_then(Value::as_object)
+        .filter(|object| {
+            object.len() == 2
+                && object.contains_key("from")
+                && object.contains_key("state_schema_from")
+        })
+        .ok_or_else(|| refuse("missing or malformed contract_migration"))?;
+    let from = migration
+        .get("from")
+        .filter(|from| from.as_object().is_some_and(|object| object.len() == 3))
+        .and_then(parse_contract_identity)
+        .ok_or_else(|| refuse("malformed contract_migration.from"))?;
+    if from != *local {
+        return Err(refuse(
+            "contract_migration.from does not match the local contract",
+        ));
+    }
+    if migration.get("state_schema_from").and_then(Value::as_i64) != Some(state_schema)
+        || value.get("state_schema").and_then(Value::as_i64) != Some(state_schema)
+    {
+        return Err(refuse(
+            "migration state schema is not rollback-compatible with the local schema",
+        ));
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -366,6 +425,118 @@ mod tests {
                 .contains("trusted repository")
         );
         assert!(parse_release_plan(&manifest_for(target, "9.9.9"), "other-target").is_err());
+    }
+
+    fn adjacent_manifest(local: &contract::ContractIdentity) -> Value {
+        let mut value = manifest_for(current_target().unwrap(), "9.9.9");
+        value["contract"] = json!({
+            "epoch": local.epoch + 1,
+            "hash": format!("sha256:{}", "c".repeat(64)),
+            "tool_count": local.tool_count,
+        });
+        value["contract_migration"] = json!({
+            "from": {"epoch": local.epoch, "hash": local.hash, "tool_count": local.tool_count},
+            "state_schema_from": SCHEMA_VERSION,
+        });
+        value
+    }
+
+    #[test]
+    fn adjacent_contract_updates_require_exact_declaration_and_unchanged_schema() {
+        // Exercise both the frozen bridge and a future epoch without a v5 special case.
+        for local in [
+            contract::previous_identity().unwrap(),
+            contract::identity().unwrap(),
+        ] {
+            let valid = adjacent_manifest(&local);
+            let admitted = admit_release_contract(&valid, &local, SCHEMA_VERSION).unwrap();
+            assert_eq!(admitted.epoch, local.epoch + 1);
+            assert_eq!(admitted.hash, format!("sha256:{}", "c".repeat(64)));
+
+            let mut cases = Vec::new();
+            let mut missing = valid.clone();
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove("contract_migration");
+            cases.push(missing);
+            for malformed in [Value::Null, json!([]), json!({}), json!("migration")] {
+                let mut bad = valid.clone();
+                bad["contract_migration"] = malformed;
+                cases.push(bad);
+            }
+            for (pointer, replacement) in [
+                ("/contract_migration/extra", json!(true)),
+                ("/contract_migration/from/extra", json!(true)),
+                ("/contract_migration/from/epoch", json!(local.epoch - 1)),
+                (
+                    "/contract_migration/from/hash",
+                    json!(format!("sha256:{}", "d".repeat(64))),
+                ),
+                (
+                    "/contract_migration/from/tool_count",
+                    json!(local.tool_count + 1),
+                ),
+                ("/contract_migration/from/hash", json!("sha256:malformed")),
+                ("/contract_migration/from", json!(null)),
+                (
+                    "/contract_migration/state_schema_from",
+                    json!(SCHEMA_VERSION + 1),
+                ),
+                ("/contract_migration/state_schema_from", json!("15")),
+                ("/state_schema", json!(SCHEMA_VERSION + 1)),
+                ("/contract/epoch", json!(local.epoch + 2)),
+                ("/contract/epoch", json!(local.epoch - 1)),
+                ("/contract/epoch", json!(local.epoch)),
+                ("/contract/hash", json!("sha256:malformed")),
+                ("/contract/tool_count", json!(0)),
+            ] {
+                let mut bad = valid.clone();
+                if let Some(slot) = bad.pointer_mut(pointer) {
+                    *slot = replacement;
+                } else if pointer.ends_with("/extra") {
+                    let parent = pointer.strip_suffix("/extra").unwrap();
+                    bad.pointer_mut(parent).unwrap()["extra"] = replacement;
+                }
+                cases.push(bad);
+            }
+            for bad in cases {
+                let error = admit_release_contract(&bad, &local, SCHEMA_VERSION).unwrap_err();
+                assert!(
+                    error.contains(&format!("local epoch {}", local.epoch)),
+                    "{error}"
+                );
+                assert!(error.contains("target epoch"), "{error}");
+                assert!(
+                    error.contains("herdr-mcp update apply --manifest <url>"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn same_contract_remains_admissible_without_a_migration_declaration() {
+        let local = contract::identity().unwrap();
+        let mut value = manifest_for(current_target().unwrap(), "9.9.9");
+        assert_eq!(
+            admit_release_contract(&value, &local, SCHEMA_VERSION).unwrap(),
+            local
+        );
+        value["contract_migration"] = json!({"ignored_on_same_contract": true});
+        assert_eq!(
+            admit_release_contract(&value, &local, SCHEMA_VERSION).unwrap(),
+            local
+        );
+    }
+
+    #[test]
+    fn release_plan_carries_the_admitted_target_contract_for_candidate_verification() {
+        let local = contract::identity().unwrap();
+        let plan =
+            parse_release_plan(&adjacent_manifest(&local), current_target().unwrap()).unwrap();
+        assert_eq!(plan.contract.epoch, local.epoch + 1);
+        assert_ne!(plan.contract, local);
     }
 
     #[test]

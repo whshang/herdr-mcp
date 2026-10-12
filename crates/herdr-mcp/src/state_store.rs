@@ -10521,6 +10521,135 @@ mod tests {
     }
 
     #[test]
+    fn schema15_epoch4_reader_preserves_epoch5_dispatch_evidence_on_writeback() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, session_ref, _) =
+            browser_dispatch_fixture(&mut store, 7, "epoch-rollback-native");
+        let request_digest = sha256_text("rollback-request");
+        let message_digest = sha256_text("rollback-message");
+        let canonical_digest = sha256_text("rollback canonical message");
+        let key_digest = sha256_text("rollback-key");
+        let BrowserDispatchReservation::Reserved(record) = store
+            .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                operation: "browser_dispatch.submit",
+                target_session_ref: &session_ref,
+                request_digest: &request_digest,
+                message_digest: &message_digest,
+                message_canonical_digest: Some(&canonical_digest),
+                reasoning_effort: None,
+                required_apps: &[],
+                expected_generation: 7,
+                idempotency_key_digest: &key_digest,
+                parent_dispatch_id: None,
+                authorization: None,
+                work_chain_id: None,
+                lane_id: None,
+                created_at: 10,
+            })
+            .unwrap()
+        else {
+            panic!("expected a new browser dispatch");
+        };
+
+        // Frozen v1.0.3/schema-15 read projection: old readers never SELECT *,
+        // and therefore do not interpret the new nullable canonical digest.
+        const EPOCH4_SELECT: &str = "SELECT dispatch_id, endpoint_ref, provider, operation,
+            target_session_ref, request_digest, message_digest,
+            reasoning_effort, required_apps_json, expected_generation,
+            idempotency_key_digest, parent_dispatch_id, delivery_state,
+            generation_owner, work_chain_id, lane_id, created_at, updated_at,
+            accepted_user_message_ref, result_assistant_message_ref,
+            result_turn_message_id, result_evidence_id, result_settled_at,
+            authorization_principal_ref, authorization_connector_id,
+            authorization_grant_generation
+            FROM browser_dispatches WHERE dispatch_id = ?1";
+        let (old_message_digest, old_delivery_state) = store
+            .conn
+            .query_row(EPOCH4_SELECT, [&record.dispatch_id], |row| {
+                Ok((row.get::<_, String>(6)?, row.get::<_, String>(12)?))
+            })
+            .unwrap();
+        assert_eq!(old_message_digest, message_digest);
+        assert_eq!(old_delivery_state, "not_applied");
+
+        // Frozen v1.0.3 update projection leaves newer settlement evidence intact.
+        store
+            .conn
+            .execute(
+                "UPDATE browser_dispatches
+                 SET delivery_state = ?1, generation_owner = ?2,
+                     accepted_user_message_ref = COALESCE(?3, accepted_user_message_ref),
+                     updated_at = ?4
+                 WHERE dispatch_id = ?5 AND expected_generation = ?6",
+                params![
+                    "uncertain",
+                    None::<i64>,
+                    None::<String>,
+                    11,
+                    record.dispatch_id,
+                    7
+                ],
+            )
+            .unwrap();
+        let after_rollback = store
+            .browser_dispatch(&record.dispatch_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_rollback.delivery_state,
+            BrowserDeliveryState::Uncertain
+        );
+        assert_eq!(
+            after_rollback.message_canonical_digest.as_deref(),
+            Some(canonical_digest.as_str())
+        );
+        assert_eq!(store.schema_version().unwrap(), 15);
+    }
+
+    #[test]
+    fn schema15_epoch4_pruning_and_readback_preserve_unbounded_epoch5_operations() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        assert_eq!(
+            store
+                .reserve_operation("herdr_exec", "epoch5-key", "request", "epoch5-op", 10, None)
+                .unwrap(),
+            OperationReservation::Reserved
+        );
+        // Frozen v1.0.3 pruning excludes NULL expiries; its decoder already
+        // reads expires_at as Option<i64> and result_json as opaque text.
+        store
+            .conn
+            .execute(
+                "DELETE FROM operations WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                [i64::MAX / 2],
+            )
+            .unwrap();
+        let (op_id, state, expiry) = store
+            .conn
+            .query_row(
+                "SELECT op_id, request_hash, phase, state, result_json,
+                        created_at, updated_at, expires_at
+                 FROM operations
+                 WHERE kind = ?1 AND idempotency_key = ?2",
+                params!["herdr_exec", "epoch5-key"],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(op_id, "epoch5-op");
+        assert_eq!(state, "pending");
+        assert_eq!(expiry, None);
+        assert_eq!(store.schema_version().unwrap(), 15);
+    }
+
+    #[test]
     fn late_dispatch_settlement_is_exact_generation_scoped_and_row_isolated() {
         let mut store = StateStore::open(":memory:").unwrap();
         let (endpoint_ref, session_ref, _) =

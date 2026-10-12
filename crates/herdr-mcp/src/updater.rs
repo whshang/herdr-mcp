@@ -514,7 +514,7 @@ fn apply_inner(
         progress.phase("Preparing a rollback-safe update job...");
         let (job_id, binary_path) = stage_release(&paths, &plan, &mut progress)?;
         progress.phase("Download verified. Probing candidate runtime identity...");
-        if let Err(error) = probe_candidate_binary(&binary_path, &plan.version) {
+        if let Err(error) = probe_candidate_binary(&binary_path, &plan.version, &plan.contract) {
             cleanup_staging(&binary_path);
             return Err(error);
         }
@@ -1492,6 +1492,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
             &binary,
             &Version::parse(&job.version)
                 .map_err(|_| "durable update job contains an invalid version".to_owned())?,
+            &crate::contract::identity()?,
         )?;
         store.update_update_job(
             job_id,
@@ -1786,7 +1787,11 @@ fn verify_staged_file(path: &Path, expected_sha256: &str) -> Result<(), String> 
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn probe_candidate_binary(path: &Path, expected: &Version) -> Result<(), String> {
+fn probe_candidate_binary(
+    path: &Path,
+    expected: &Version,
+    expected_contract: &crate::contract::ContractIdentity,
+) -> Result<(), String> {
     let output = Command::new(path)
         .arg("version")
         .stdin(Stdio::null())
@@ -1796,10 +1801,32 @@ fn probe_candidate_binary(path: &Path, expected: &Version) -> Result<(), String>
         return Err("staged update binary version probe failed".to_owned());
     }
     let text = String::from_utf8_lossy(&output.stdout);
+    verify_candidate_identity(&text, expected, expected_contract)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn verify_candidate_identity(
+    text: &str,
+    expected: &Version,
+    expected_contract: &crate::contract::ContractIdentity,
+) -> Result<(), String> {
     let expected_first = format!("herdr-mcp {expected}");
+    let expected_contract_line = format!(
+        "contract epoch {} / {} tools",
+        expected_contract.epoch, expected_contract.tool_count
+    );
+    let expected_hash = format!("contract hash {}", expected_contract.hash);
+    let expected_schema = format!("state schema {SCHEMA_VERSION}");
+    // Older same-contract releases did not print their hash. A new epoch must
+    // report it; the detached worker is already the attested target binary.
+    let hash_matches = match text.lines().find(|line| line.starts_with("contract hash ")) {
+        Some(line) => line == expected_hash,
+        None => *expected_contract == crate::contract::identity()?,
+    };
     if text.lines().next() != Some(expected_first.as_str())
-        || !text.contains("contract epoch 2 / 18 tools")
-        || !text.contains(&format!("state schema {SCHEMA_VERSION}"))
+        || !text.lines().any(|line| line == expected_contract_line)
+        || !hash_matches
+        || !text.lines().any(|line| line == expected_schema)
     {
         return Err("staged update binary identity does not match release manifest".to_owned());
     }
@@ -2145,6 +2172,57 @@ fn error_kind(error: &reqwest::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn candidate_probe_verifies_the_manifest_target_epoch_hash_count_and_schema() {
+        let local = crate::contract::identity().unwrap();
+        let target = crate::contract::ContractIdentity {
+            epoch: local.epoch + 1,
+            hash: format!("sha256:{}", "c".repeat(64)),
+            tool_count: local.tool_count + 1,
+        };
+        let version = Version::parse("9.9.9").unwrap();
+        let root = env::temp_dir().join(format!(
+            "herdr-candidate-probe-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        let binary = root.join("candidate");
+        let output = format!(
+            "herdr-mcp {version}\ncontract epoch {} / {} tools\nstate schema {SCHEMA_VERSION}\ncontract hash {}\n",
+            target.epoch, target.tool_count, target.hash
+        );
+        write_test_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{output}'\n"));
+        assert!(probe_candidate_binary(&binary, &version, &target).is_ok());
+        assert!(probe_candidate_binary(&binary, &version, &local).is_err());
+        for bad in [
+            output.replace(&target.hash, &local.hash),
+            output.replace(
+                &format!("epoch {}", target.epoch),
+                &format!("epoch {}", local.epoch),
+            ),
+            output.replace(
+                &format!("{} tools", target.tool_count),
+                &format!("{} tools", local.tool_count),
+            ),
+            output.replace(
+                &format!("state schema {SCHEMA_VERSION}"),
+                "state schema 999",
+            ),
+            output.replace(&format!("contract hash {}\n", target.hash), ""),
+            output.replace("herdr-mcp 9.9.9", "herdr-mcp 9.9.8"),
+        ] {
+            write_test_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{bad}'\n"));
+            assert!(probe_candidate_binary(&binary, &version, &target).is_err());
+        }
+        let legacy = format!(
+            "herdr-mcp {version}\ncontract epoch {} / {} tools\nstate schema {SCHEMA_VERSION}\n",
+            local.epoch, local.tool_count
+        );
+        write_test_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{legacy}'\n"));
+        assert!(probe_candidate_binary(&binary, &version, &local).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn test_runtime_paths(root: &Path) -> RuntimePaths {
