@@ -2931,11 +2931,12 @@ impl StateStore {
             if device_id != input.device_id {
                 return Err("browser_endpoint_identity_conflict".to_owned());
             }
+            // Registration observes identity, never grants legacy WebChat consent.
+            // Preserve both explicit deny and allow for schema-15 epoch-4 rollback.
             tx.execute(
                 "UPDATE browser_endpoints
                  SET browser_family = ?2,
                      extension_version = ?3,
-                     webchat_control_allowed = 1,
                      last_observed_at = MAX(last_observed_at, ?4)
                  WHERE endpoint_ref = ?1",
                 params![
@@ -2953,7 +2954,7 @@ impl StateStore {
                     webchat_control_allowed, tool_bridge_allowed,
                     tool_bridge_mutation_allowed, consent_revision,
                     first_observed_at, last_observed_at
-                 ) VALUES (?1, ?2, ?3, ?4, 1, 0, 0, 0, ?5, ?5)",
+                 ) VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, ?5, ?5)",
                 params![
                     endpoint_ref,
                     input.device_id,
@@ -2984,19 +2985,19 @@ impl StateStore {
         if input.observed_at < 0 {
             return Err("browser_observed_at_invalid".to_owned());
         }
+        // The WebChat switch was retired in 1.1. Its compatibility payload field
+        // is not a user grant: Tool Bridge changes must preserve the epoch-4 flag.
         let changed = self
             .conn
             .execute(
                 "UPDATE browser_endpoints
-                 SET webchat_control_allowed = ?2,
-                     tool_bridge_allowed = ?3,
-                     tool_bridge_mutation_allowed = ?4,
+                 SET tool_bridge_allowed = ?2,
+                     tool_bridge_mutation_allowed = ?3,
                      consent_revision = consent_revision + 1,
-                     last_observed_at = MAX(last_observed_at, ?5)
-                 WHERE endpoint_ref = ?1 AND consent_revision = ?6",
+                     last_observed_at = MAX(last_observed_at, ?4)
+                 WHERE endpoint_ref = ?1 AND consent_revision = ?5",
                 params![
                     input.endpoint_ref,
-                    1i64,
                     i64::from(input.tool_bridge_allowed),
                     i64::from(input.tool_bridge_mutation_allowed),
                     input.observed_at,
@@ -5466,7 +5467,10 @@ fn decode_browser_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserE
         device_id: row.get(1)?,
         browser_family: row.get(2)?,
         extension_version: row.get(3)?,
-        webchat_control_allowed: row.get::<_, i64>(4)? != 0,
+        // 1.1 removed this switch; derive its enabled projection without writing
+        // a grant. The stored flag remains epoch-4 consent (including 0 for fresh
+        // registrations), since rollback reads i64 != 0 without restoring the DB.
+        webchat_control_allowed: true,
         tool_bridge_allowed: row.get::<_, i64>(5)? != 0,
         tool_bridge_mutation_allowed: row.get::<_, i64>(6)? != 0,
         consent_revision: row.get(7)?,
@@ -11633,6 +11637,137 @@ mod tests {
     }
 
     #[test]
+    fn browser_registration_and_tool_bridge_changes_preserve_epoch_4_consent() {
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        for legacy_consent in [None, Some(false), Some(true)] {
+            let path = temp_db_path();
+            let endpoint_ref;
+            {
+                let mut store = StateStore::open(&path).unwrap();
+                let endpoint = store
+                    .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                        device_id: DEVICE,
+                        profile_seed: "rollback-consent-profile-seed",
+                        browser_family: "chrome",
+                        extension_version: "1.1.0",
+                        observed_at: 10,
+                    })
+                    .unwrap();
+                endpoint_ref = endpoint.endpoint_ref;
+                assert!(endpoint.webchat_control_allowed);
+
+                // Frozen v1.0.3 consent writer: only this legacy user action
+                // establishes an explicit WebChat grant or deny.
+                if let Some(allowed) = legacy_consent {
+                    assert_eq!(
+                        store
+                            .conn
+                            .execute(
+                                "UPDATE browser_endpoints
+                                 SET webchat_control_allowed = ?2,
+                                     tool_bridge_allowed = ?3,
+                                     tool_bridge_mutation_allowed = ?4,
+                                     consent_revision = consent_revision + 1,
+                                     last_observed_at = MAX(last_observed_at, ?5)
+                                 WHERE endpoint_ref = ?1 AND consent_revision = ?6",
+                                params![endpoint_ref, i64::from(allowed), 0, 0, 11, 0],
+                            )
+                            .unwrap(),
+                        1
+                    );
+                }
+                let expected_revision = i64::from(legacy_consent.is_some());
+                let registered = store
+                    .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                        device_id: DEVICE,
+                        profile_seed: "rollback-consent-profile-seed",
+                        browser_family: "ego",
+                        extension_version: "1.1.1",
+                        observed_at: 12,
+                    })
+                    .unwrap();
+                assert_eq!(registered.endpoint_ref, endpoint_ref);
+                assert_eq!(registered.browser_family, "ego");
+                assert_eq!(registered.extension_version, "1.1.1");
+                assert_eq!(registered.consent_revision, expected_revision);
+                assert!(registered.webchat_control_allowed);
+                let read_epoch_4 = || {
+                    store
+                        .conn
+                        .query_row(
+                            "SELECT webchat_control_allowed FROM browser_endpoints
+                             WHERE endpoint_ref = ?1",
+                            params![endpoint_ref],
+                            |row| Ok(row.get::<_, i64>(0)? != 0),
+                        )
+                        .unwrap()
+                };
+                assert_eq!(read_epoch_4(), legacy_consent.unwrap_or(false));
+
+                // Both compatibility payload values must leave rollback consent
+                // untouched while the supported 1.1 Tool Bridge switches work.
+                for (offset, compatibility_value) in [true, false].into_iter().enumerate() {
+                    let consent = store
+                        .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                            endpoint_ref: &endpoint_ref,
+                            expected_revision: expected_revision + offset as i64,
+                            webchat_control_allowed: compatibility_value,
+                            tool_bridge_allowed: compatibility_value,
+                            tool_bridge_mutation_allowed: compatibility_value,
+                            observed_at: 13 + offset as i64,
+                        })
+                        .unwrap();
+                    assert!(consent.webchat_control_allowed);
+                    assert_eq!(consent.tool_bridge_allowed, compatibility_value);
+                    assert_eq!(consent.tool_bridge_mutation_allowed, compatibility_value);
+                    assert_eq!(
+                        consent.consent_revision,
+                        expected_revision + offset as i64 + 1
+                    );
+                    assert_eq!(
+                        store
+                            .conn
+                            .query_row(
+                                "SELECT webchat_control_allowed FROM browser_endpoints
+                                 WHERE endpoint_ref = ?1",
+                                params![endpoint_ref],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .unwrap(),
+                        i64::from(legacy_consent.unwrap_or(false))
+                    );
+                }
+            }
+            // A separate SQLite connection represents rollback without a DB
+            // restore. Epoch 4 uses this exact boolean decoding rule.
+            let epoch_4 = Connection::open(&path).unwrap();
+            let allowed = epoch_4
+                .query_row(
+                    "SELECT webchat_control_allowed FROM browser_endpoints
+                     WHERE endpoint_ref = ?1",
+                    params![endpoint_ref],
+                    |row| Ok(row.get::<_, i64>(0)? != 0),
+                )
+                .unwrap();
+            assert_eq!(allowed, legacy_consent.unwrap_or(false));
+            drop(epoch_4);
+            let reopened = StateStore::open(&path).unwrap();
+            assert!(
+                reopened
+                    .browser_endpoint(&endpoint_ref)
+                    .unwrap()
+                    .unwrap()
+                    .webchat_control_allowed
+            );
+            assert!(reopened.browser_endpoints(64).unwrap()[0].webchat_control_allowed);
+            drop(reopened);
+            std::fs::remove_file(&path).ok();
+            std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+            std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+        }
+    }
+
+    #[test]
     fn browser_registry_is_local_opaque_fenced_and_fail_closed() {
         const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
         const PROFILE_SEED: &str = "profile-seed-0123456789abcdef";
@@ -11687,7 +11822,7 @@ mod tests {
         assert!(consent.tool_bridge_mutation_allowed);
         assert_eq!(consent.consent_revision, 1);
 
-        // A legacy false WebChat field is normalized to enabled at revision 2.
+        // A legacy false WebChat field leaves the 1.1 enabled projection unchanged.
         let consent_off = store
             .set_browser_endpoint_consent(BrowserEndpointConsentInput {
                 endpoint_ref: &endpoint.endpoint_ref,
