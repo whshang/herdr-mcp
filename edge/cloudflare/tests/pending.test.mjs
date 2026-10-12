@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { makeLimits, classifyOp, classifyRequestOp } from "../dist/limits.js";
 import {
   decodeStoredPendingRequest,
+  idempotencyRecordFor,
+  idempotencyScopeKey,
   PendingRequestRegistry,
   newRequestId,
 } from "../dist/pending.js";
@@ -59,13 +61,114 @@ test("registry: add -> markSent -> settle -> completedFor", () => {
   assert.deepEqual(r.completedFor("r1"), completion);
 });
 
-test("registry: idempotency key dedups mutating op", () => {
+test("user retries a settled mutation | Given one scoped idempotency record | When the same scope replays the same request hash | Then the recorded completion is returned and a different hash is rejected", () => {
   const r = new PendingRequestRegistry({ limits: makeLimits() });
-  r.add(pendingReq({ requestId: "r1", op: "herdr_prompt", opClass: "mutating", idempotencyKey: "k1" }));
+  const entry = pendingReq({
+    requestId: "r1",
+    op: "herdr_prompt",
+    opClass: "mutating",
+    idempotencyKey: "k1",
+    requestHash: "hash-1",
+  });
+  r.add(entry);
   r.settle("r1", { status: "ok", result: "done", servedAtMs: 300 });
-  const again = r.add(pendingReq({ requestId: "r2", op: "herdr_prompt", opClass: "mutating", idempotencyKey: "k1" }));
-  assert.equal(again.status, "idem_hit");
-  assert.equal(again.completion.status, "ok");
+  const scope = { principalRef: "principal:legacy", callerKey: "k1", requestHash: "hash-1" };
+  const replay = r.replay(scope, "herdr_prompt");
+  assert.equal(replay.status, "hit");
+  assert.equal(replay.completion.status, "ok");
+  // A reused key bound to a different payload must never be replayed.
+  const mismatch = r.replay({ ...scope, requestHash: "hash-2" }, "herdr_prompt");
+  assert.equal(mismatch.status, "payload_mismatch");
+});
+
+test("user is never served another connector's completion | Given a settled record for connector A | When another principal, device or grant generation replays it | Then no record is found and only the exact scope hits", () => {
+  const r = new PendingRequestRegistry({ limits: makeLimits() });
+  r.add(pendingReq({
+    requestId: "scoped-1",
+    op: "herdr_prompt",
+    opClass: "mutating",
+    resourcePrincipalRef: "principal:connectorA",
+    routeDeviceId: "dev_A",
+    grantGeneration: 7,
+    idempotencyKey: "shared-key",
+    requestHash: "hash-shared",
+  }));
+  r.settle("scoped-1", { status: "ok", result: { secret: "A-only" }, servedAtMs: 300 });
+
+  const base = { callerKey: "shared-key", requestHash: "hash-shared" };
+  assert.equal(r.replay({ ...base, principalRef: "principal:connectorB", routeDeviceId: "dev_A", grantGeneration: 7 }, "herdr_prompt").status, "none",
+    "a different principal must never read another connector's completion");
+  assert.equal(r.replay({ ...base, principalRef: "principal:connectorA", routeDeviceId: "dev_B", grantGeneration: 7 }, "herdr_prompt").status, "none",
+    "a different routed device must never replay");
+  assert.equal(r.replay({ ...base, principalRef: "principal:connectorA", routeDeviceId: "dev_A", grantGeneration: 8 }, "herdr_prompt").status, "none",
+    "a bumped connector grant generation must never replay");
+  assert.equal(r.replay({ ...base, principalRef: "principal:connectorA", routeDeviceId: "dev_A", grantGeneration: 7 }, "herdr_prompt").status, "hit");
+});
+
+test("user cannot read a revoked page completion | Given a settled page-scoped record | When the endpoint grant is absent | Then the replay is refused and only a still-granted endpoint replays", () => {
+  const r = new PendingRequestRegistry({ limits: makeLimits() });
+  r.add(pendingReq({
+    requestId: "page-1",
+    op: "herdr_call",
+    opClass: "mutating",
+    resourcePrincipalRef: "principal:connectorA",
+    routeDeviceId: "dev_A",
+    idempotencyKey: "page-key",
+    requestHash: "hash-page",
+    pageScopedEndpointRef: "be_endpoint_1",
+  }));
+  r.settle("page-1", { status: "ok", result: { text: "extracted page text" }, servedAtMs: 300 });
+  const scope = {
+    principalRef: "principal:connectorA",
+    routeDeviceId: "dev_A",
+    callerKey: "page-key",
+    requestHash: "hash-page",
+    pageScopedEndpointRef: "be_endpoint_1",
+  };
+  assert.equal(r.replay({ ...scope, authorizedPageAssistEndpoints: [] }, "herdr_call").status, "grant_required",
+    "a revoked endpoint grant must not replay the cached page completion");
+  const revoked = r.replay({ ...scope, authorizedPageAssistEndpoints: ["be_other"] }, "herdr_call");
+  assert.equal(revoked.status, "grant_required");
+  assert.equal(revoked.endpointRef, "be_endpoint_1");
+  assert.equal(r.replay({ ...scope, authorizedPageAssistEndpoints: ["be_endpoint_1"] }, "herdr_call").status, "hit");
+});
+
+test("user is refused instead of re-running a settled mutation | Given a persisted pre-scope idempotency record without a payload binding | When the key is presented again | Then the replay fails closed instead of being forwarded", () => {
+  const r = new PendingRequestRegistry({ limits: makeLimits() });
+  // Order matters and mirrors WorkstationDO init: `restore` clears the
+  // idempotency index, so it is seeded afterwards from durable `idem:` rows.
+  r.restore({ pending: [], completed: [{ requestId: "legacy-1", completion: { status: "ok", result: "legacy", servedAtMs: 5 } }] });
+  r.restoreIdem([{ idempotencyKey: "legacy-key", requestId: "legacy-1", op: "herdr_prompt", settledAtMs: 5 }]);
+  const replay = r.replay({ principalRef: "principal:legacy", callerKey: "legacy-key", requestHash: "any" }, "herdr_prompt");
+  assert.equal(replay.status, "binding_unavailable",
+    "an unbound record must never be reported as a miss, which would forward the mutation again");
+  assert.equal(replay.settledAtMs, 5, "the settled-at evidence is carried so the refusal is explainable");
+});
+
+test("user is refused instead of re-running a settled mutation | Given a scoped record settled without a request hash | When the same scoped identity retries with a binding | Then the retry fails closed and a different op still forwards", () => {
+  const r = new PendingRequestRegistry({ limits: makeLimits() });
+  const scope = { principalRef: "principal:connectorA", routeDeviceId: "dev_A", grantGeneration: 7, callerKey: "upgrade-key" };
+  r.restore({ pending: [], completed: [{ requestId: "upgrade-1", completion: { status: "ok", result: "settled", servedAtMs: 9 } }] });
+  r.restoreIdem([{
+    idempotencyKey: idempotencyScopeKey(scope),
+    callerKey: "upgrade-key",
+    requestId: "upgrade-1",
+    op: "herdr_prompt",
+    settledAtMs: 9,
+    principalRef: "principal:connectorA",
+    routeDeviceId: "dev_A",
+    grantGeneration: 7,
+  }]);
+  assert.equal(
+    r.replay({ ...scope, requestHash: "hash-from-new-edge" }, "herdr_prompt").status,
+    "binding_unavailable",
+    "an Edge that predates the replay binding must not let a same-key retry re-execute the mutation",
+  );
+  assert.equal(
+    r.replay({ ...scope, requestHash: "hash-from-new-edge" }, "herdr_inspect").status,
+    "none",
+    "a different op reusing the key is not the settled request",
+  );
 });
 
 test("registry: capacity bounds, evicts oldest queued, keeps sent", () => {
@@ -108,7 +211,7 @@ test("registry: queued eviction records completion/idem without re-occupying cap
   // First request occupies the single active slot and stays QUEUED (unsent) so
   // it is the evictable oldest-queued candidate. Do NOT markSent it — add() only
   // evicts a queued request, never a sent one.
-  const first = pendingReq({ requestId: "evicted-1", idempotencyKey: "idem-1" });
+  const first = pendingReq({ requestId: "evicted-1", idempotencyKey: "idem-1", requestHash: "hash-evicted-1" });
   const a1 = r.add(first);
   assert.equal(a1.status, "added");
 
@@ -138,17 +241,23 @@ test("registry: queued eviction records completion/idem without re-occupying cap
   assert.equal(snap.pending.some((p) => p.requestId === "new-1"), true);
   const r2 = new PendingRequestRegistry({ limits });
   r2.restore(snap);
-  r2.restoreIdem([
-    { idempotencyKey: "idem-1", requestId: "evicted-1", op: "herdr_inspect", settledAtMs: 5 },
-  ]);
+  r2.restoreIdem([idempotencyRecordFor(a2.evicted, completion.servedAtMs)]);
   assert.equal(r2.get("evicted-1"), undefined);
   assert.equal(r2.get("new-1").requestId, "new-1");
   assert.deepEqual(r2.completedFor("evicted-1"), completion);
-  assert.equal(r2.idempotencyKeyFor("evicted-1"), "idem-1");
+  assert.equal(
+    r2.idempotencyKeyFor("evicted-1"),
+    idempotencyScopeKey({ principalRef: "principal:legacy", callerKey: "idem-1" }),
+  );
 
-  // A replay of the evicted request's idempotency key returns the recorded completion.
-  const replay = r2.add(pendingReq({ requestId: "replay-1", op: "herdr_inspect", idempotencyKey: "idem-1" }));
-  assert.equal(replay.status, "idem_hit");
+  // An authorized same-request retry of the evicted request's key returns the
+  // recorded completion instead of re-executing.
+  const replay = r2.replay({
+    principalRef: "principal:legacy",
+    callerKey: "idem-1",
+    requestHash: "hash-evicted-1",
+  }, "herdr_inspect");
+  assert.equal(replay.status, "hit");
   assert.deepEqual(replay.completion, completion);
 });
 
@@ -185,16 +294,22 @@ test("registry: resumeSummaries never includes args values", () => {
 
 test("registry: snapshot/restore + restoreIdem round trip", () => {
   const a = new PendingRequestRegistry({ limits: makeLimits() });
-  a.add(pendingReq({ requestId: "a1", idempotencyKey: "kk" }));
+  const entry = pendingReq({
+    requestId: "a1",
+    op: "herdr_inspect",
+    idempotencyKey: "kk",
+    requestHash: "hash-kk",
+  });
+  a.add(entry);
   a.markSent("a1", 5);
   a.settle("a1", { status: "ok", result: 1, servedAtMs: 6 });
   const snap = a.snapshot();
   const b = new PendingRequestRegistry({ limits: makeLimits() });
   b.restore(snap);
-  b.restoreIdem([{ idempotencyKey: "kk", requestId: "a1", op: "herdr_inspect", settledAtMs: 6 }]);
+  b.restoreIdem([idempotencyRecordFor(entry, 6)]);
   assert.equal(b.completedFor("a1").status, "ok");
-  const again = b.add(pendingReq({ requestId: "b2", op: "herdr_inspect", idempotencyKey: "kk" }));
-  assert.equal(again.status, "idem_hit");
+  const replay = b.replay({ principalRef: "principal:legacy", callerKey: "kk", requestHash: "hash-kk" }, "herdr_inspect");
+  assert.equal(replay.status, "hit");
 });
 
 
@@ -221,7 +336,10 @@ test("registry: completion and idempotency retention stays bounded under multi-p
   assert.equal(r.completedFor("stress-39").status, "ok");
   assert.equal(r.idempotencyKeyFor("stress-0"), undefined,
     "evicted completion must not leave an unbounded idempotency index entry");
-  assert.equal(r.idempotencyKeyFor("stress-39"), "idem-39");
+  assert.equal(
+    r.idempotencyKeyFor("stress-39"),
+    idempotencyScopeKey({ principalRef: "principal:0", callerKey: "idem-39" }),
+  );
 });
 
 test("registry: completed TTL expiry + drop", () => {

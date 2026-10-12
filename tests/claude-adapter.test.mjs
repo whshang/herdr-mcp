@@ -297,3 +297,53 @@ test("Claude reuses the provider-neutral account and single-attempt browser actu
   assert.match(actuationSource, /adapterSupports\("stopGeneration"\)/);
   assert.doesNotMatch(actuationSource, /ADAPTER\.name\s*===\s*"claude"/);
 });
+
+test("user sends to a reloaded Claude chat | Given an idle transcript while an unrelated page region stays aria-busy | When generation progress is checked | Then only the latest assistant turn decides busy", () => {
+  const h = harness();
+  const pageLoader = element({ attrs: { "aria-busy": "true" } });
+  h.set('[aria-busy="true"]', [pageLoader]);
+  h.set('[data-is-streaming="true"]', []);
+  const idleRow = element({ attrs: { "data-perf-row": "assistant", "data-perf-row-streaming": "false" } });
+  idleRow.querySelectorAll = () => [];
+  h.set('[data-testid="transcript-row"]', [element({ attrs: { "data-perf-row": "human" } }), idleRow]);
+  assert.equal(h.adapter.isGenerationInProgress(), false);
+
+  const busyMarker = element({ attrs: { "data-is-streaming": "true" } });
+  idleRow.querySelectorAll = () => [busyMarker];
+  assert.equal(h.adapter.isGenerationInProgress(), true);
+
+  const streamingRow = element({ attrs: { "data-perf-row": "assistant", "data-perf-row-streaming": "true" } });
+  streamingRow.querySelectorAll = () => [];
+  h.set('[data-testid="transcript-row"]', [streamingRow]);
+  assert.equal(h.adapter.isGenerationInProgress(), true);
+});
+
+test("user sends to a reloaded Claude chat | Given virtualized rows out of DOM order and a lazy aria-busy marker on the idle newest turn | When generation progress is checked | Then the highest data-index row decides and aria-busy alone is not busy", () => {
+  const h = harness();
+  h.set('[data-is-streaming="true"]', []);
+  const newest = element({ attrs: { "data-index": "9", "data-perf-row": "assistant", "data-perf-row-streaming": "false" } });
+  newest.querySelectorAll = () => [];
+  const olderStreamingLooking = element({ attrs: { "data-index": "3", "data-perf-row": "assistant", "data-perf-row-streaming": "true" } });
+  olderStreamingLooking.querySelectorAll = () => [];
+  h.set('[data-testid="transcript-row"]', [newest, olderStreamingLooking]);
+  h.set('[aria-busy="true"]', [element({ attrs: { "aria-busy": "true" } })]);
+  assert.equal(h.adapter.isGenerationInProgress(), false);
+});
+
+test("user sends to an idle Claude chat | Given visible buttons whose aria-label merely contains Stop | When generation progress is checked | Then they are not stop controls and the composer is idle", () => {
+  const h = harness();
+  const loose = element({ attrs: { "aria-label": "Stop dictation" } });
+  const loose2 = element({ attrs: { "aria-label": "Stopwatch tool" } });
+  h.set('button[aria-label*="Stop" i]', [loose, loose2]);
+  h.set('[data-is-streaming="true"]', []);
+  const idleRow = element({ attrs: { "data-perf-row": "assistant", "data-perf-row-streaming": "false", "data-index": "9" } });
+  idleRow.querySelectorAll = () => [];
+  h.set('[data-testid="transcript-row"]', [idleRow]);
+  assert.equal(h.adapter.getStopButtonCandidates().length, 0);
+  assert.equal(h.adapter.isGenerationInProgress(), false);
+
+  const real = element({ attrs: { "aria-label": "Stop response" } });
+  h.set('button[aria-label*="Stop" i]', [loose, real]);
+  assert.equal(h.adapter.getStopButtonCandidates().length, 1);
+  assert.equal(h.adapter.isGenerationInProgress(), true);
+});

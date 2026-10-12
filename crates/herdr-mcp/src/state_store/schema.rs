@@ -626,6 +626,33 @@ pub(super) fn ensure_browser_archive_auxiliary_schema(conn: &Connection) -> Resu
     Ok(())
 }
 
+/// Forward-additive browser-dispatch settlement evidence.
+///
+/// `message_canonical_digest` is intentionally **not** a numbered migration: it
+/// is a nullable additive column. A schema-15 PROD binary reads and writes
+/// browser dispatches through explicit column lists, so it ignores the extra
+/// column and can still open the same database. That keeps `herdr-mcp dev
+/// rollback` to the pinned schema-15 PROD binary possible after DEV has written
+/// canonical digests. Legacy rows keep `NULL` and reconcile raw-only, which is
+/// fail-closed rather than a fabricated canonical match.
+pub(super) fn ensure_browser_dispatch_auxiliary_schema(conn: &Connection) -> Result<(), String> {
+    let has_canonical_digest = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('browser_dispatches') WHERE name = 'message_canonical_digest'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("cannot inspect browser dispatch auxiliary schema: {error}"))?;
+    if has_canonical_digest == 0 {
+        conn.execute(
+            "ALTER TABLE browser_dispatches ADD COLUMN message_canonical_digest TEXT",
+            [],
+        )
+        .map_err(|error| format!("cannot extend browser dispatch auxiliary schema: {error}"))?;
+    }
+    Ok(())
+}
+
 pub(super) fn migrate_to(
     conn: &mut Connection,
     target: i64,

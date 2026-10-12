@@ -5,6 +5,7 @@ import worker from "../dist/index.js";
 import { buildLinkAuthProtocol } from "../dist/auth.js";
 import { DeviceRegistryDO } from "../dist/device-registry-do.js";
 import { WorkstationDO } from "../dist/workstation-do.js";
+import { idempotencyScopeKey } from "../dist/pending.js";
 import { RUNTIME_EXECUTION_CONTRACT } from "../dist/contracts/runtime.js";
 import { resolveDeviceRoute } from "../dist/device-directory.js";
 
@@ -978,14 +979,24 @@ test("restart with completed-written/pending-not-deleted resolves via completed-
 /** Drive a tool_result settlement through a fault-injected storage and return
  *  the DO's durable row state exactly as the crash leaves it, plus the still-
  *  pending forwardInternal promise ({ inflight }) for later resolution. */
+const CRASH_PRINCIPAL = "principal:crash-recovery";
+const CRASH_CALLER_KEY = "crash-idem-key";
+const CRASH_REQUEST_HASH = "sha256:crash-idem-request";
+const CRASH_SCOPED_IDEM_KEY = idempotencyScopeKey({
+  principalRef: CRASH_PRINCIPAL,
+  callerKey: CRASH_CALLER_KEY,
+});
+
 async function settleWithFault(b, fault, toolResultValue) {
   const socket = await connectDevice(envFor(b), b);
   const inflight = b.ws.subject.forwardInternal({
     kind: "request",
     requestId: "crash-settle-mut",
+    resourcePrincipalRef: CRASH_PRINCIPAL,
     op: "herdr_prompt",
     opClass: "mutating",
-    idempotencyKey: "crash-idem-key",
+    idempotencyKey: CRASH_CALLER_KEY,
+    replayBinding: { requestHash: CRASH_REQUEST_HASH },
     deadlineMs: Date.now() + 3_000,
   });
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -1041,7 +1052,7 @@ test("crash recovery: completed-put failure retains pending + resolver; retry af
   const settled = await b.ws.subject.persistSettlement("crash-settle-mut", completion);
   assert.equal(settled, true, "retry settlement must succeed after fault clears");
   assert.equal(b.ws.storage.map.has("completed:crash-settle-mut"), true, "completed row persisted on retry");
-  assert.equal(b.ws.storage.map.has("idem:crash-idem-key"), true, "idempotency row persisted on retry");
+  assert.equal(b.ws.storage.map.has(`idem:${CRASH_SCOPED_IDEM_KEY}`), true, "idempotency row persisted on retry");
   assert.equal(b.ws.storage.map.has("pending:crash-settle-mut"), false, "pending removed on retry");
 
   const resp = await inflight;
@@ -1074,18 +1085,15 @@ test("crash recovery: idem-put failure after completed success -> restart recove
   assert.equal(rebuilt.storage.map.has("pending:crash-settle-mut"), false, "stale pending cleaned by completed-wins");
   assert.equal(rebuilt.storage.map.has("completed:crash-settle-mut"), true, "completed survives restart");
 
-  // Same-key retry returns the prior completion (idem_hit), never re-executes.
-  const add = rebuilt.subject.registry.add({
-    requestId: "crash-retry-new-request",
-    workstationId: b.workstation_id,
-    op: "herdr_prompt",
-    opClass: "mutating",
-    idempotencyKey: "crash-idem-key",
-    deadlineMs: Date.now() + 3_000,
-  });
-  assert.equal(add.status, "idem_hit", "same-key retry must hit the recovered binding");
-  assert.equal(add.completion.status, "ok");
-  assert.deepEqual(add.completion.result, { ok: "executed-once" }, "prior completion returned, no re-execution");
+  // Same-key retry returns the prior completion, never re-executes.
+  const replay = rebuilt.subject.registry.replay({
+    principalRef: CRASH_PRINCIPAL,
+    callerKey: CRASH_CALLER_KEY,
+    requestHash: CRASH_REQUEST_HASH,
+  }, "herdr_prompt");
+  assert.equal(replay.status, "hit", "same-key retry must hit the recovered binding");
+  assert.equal(replay.completion.status, "ok");
+  assert.deepEqual(replay.completion.result, { ok: "executed-once" }, "prior completion returned, no re-execution");
 
   // The original in-process waiter is gone with the old isolate; nothing pends.
   assert.equal(rebuilt.subject.registry.activeCount(), 0);
@@ -1102,7 +1110,7 @@ test("crash recovery: pending-delete failure after completed+idem success -> res
   // Crash state: completed + idem present, stale pending remains.
   const rows = snapshotRows(b.ws.storage);
   assert.deepEqual(rows.completed, ["crash-settle-mut"], "completed committed");
-  assert.deepEqual(rows.idem, ["crash-idem-key"], "idem committed before pending delete");
+  assert.deepEqual(rows.idem, [CRASH_SCOPED_IDEM_KEY], "idem committed before pending delete");
   assert.deepEqual(rows.pending, ["crash-settle-mut"], "pending delete failed -> stale row remains");
 
   // Clear the fault so the restart's best-effort stale-pending cleanup can run.
@@ -1114,19 +1122,16 @@ test("crash recovery: pending-delete failure after completed+idem success -> res
   assert.equal(rebuilt.subject.registry.activeCount(), 0, "completed request must not resurrect as pending");
   assert.equal(rebuilt.storage.map.has("pending:crash-settle-mut"), false, "stale pending cleaned on restart");
   assert.equal(rebuilt.storage.map.has("completed:crash-settle-mut"), true);
-  assert.equal(rebuilt.storage.map.has("idem:crash-idem-key"), true);
+  assert.equal(rebuilt.storage.map.has(`idem:${CRASH_SCOPED_IDEM_KEY}`), true);
 
   // Same-key retry returns the prior completion, no re-execution.
-  const add = rebuilt.subject.registry.add({
-    requestId: "crash-retry-new-request",
-    workstationId: b.workstation_id,
-    op: "herdr_prompt",
-    opClass: "mutating",
-    idempotencyKey: "crash-idem-key",
-    deadlineMs: Date.now() + 3_000,
-  });
-  assert.equal(add.status, "idem_hit");
-  assert.deepEqual(add.completion.result, { ok: "executed-once" });
+  const replay = rebuilt.subject.registry.replay({
+    principalRef: CRASH_PRINCIPAL,
+    callerKey: CRASH_CALLER_KEY,
+    requestHash: CRASH_REQUEST_HASH,
+  }, "herdr_prompt");
+  assert.equal(replay.status, "hit");
+  assert.deepEqual(replay.completion.result, { ok: "executed-once" });
   void inflight;
 });
 
@@ -1137,9 +1142,11 @@ test("crash recovery: same-idempotency forward retry after restart sends no tool
   const inflight = b.ws.subject.forwardInternal({
     kind: "request",
     requestId: "crash-no-resend-mut",
+    resourcePrincipalRef: CRASH_PRINCIPAL,
     op: "herdr_prompt",
     opClass: "mutating",
     idempotencyKey: "crash-no-resend-key",
+    replayBinding: { requestHash: "sha256:crash-no-resend-request" },
     deadlineMs: Date.now() + 3_000,
   });
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -1188,9 +1195,11 @@ test("crash recovery: same-idempotency forward retry after restart sends no tool
   const retryResp = await rebuilt.subject.forwardInternal({
     kind: "request",
     requestId: "crash-no-resend-retry",
+    resourcePrincipalRef: CRASH_PRINCIPAL,
     op: "herdr_prompt",
     opClass: "mutating",
     idempotencyKey: "crash-no-resend-key",
+    replayBinding: { requestHash: "sha256:crash-no-resend-request" },
     deadlineMs: Date.now() + 3_000,
   });
   const retryBody = await retryResp.json();

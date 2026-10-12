@@ -273,7 +273,7 @@ Idempotency：一次 logical handoff 只用一个 key。不传 `--idempotency-ke
 
 **准备完成不等于已投递。** 当源会话当前未注册、或 browser control 不可用时，packet 与 `manual_delivery.copy_prompt` 仍会返回，同时 `automatic_delivery.attempted=false` 并带上 runtime 的原因。这是可用于手工接力的结果，**不是**已完成的 handoff：只有 `automatic_delivery.completed=true`（即 `delivery_state=applied`）才代表真的新建了会话。`uncertain` 状态会如实返回，绝不会自动重试。
 
-`herdr-mcp webchat create --source-url URL` 现在也支持精确 source-window affinity，并且不再要求调用方传 endpoint/provider/account ref。本地 CLI 先通过 trusted Unix IPC 让 Runtime 用同一个 canonical source resolver 读取最新 exact route，再用该 route 附加 trusted local grant；create 请求体仍只把 `source_url` 作为路由输入，Runtime 在 mutation 前再次解析并校验。若两次解析之间 route 又变化，exact grant 会失配并 fail closed，不会把写操作误投到旧 endpoint。显式 direct create 仍要求 endpoint/provider/account 与 generation。
+`herdr-mcp webchat create --source-url URL` 现在也支持精确 source-window affinity，并且不再要求调用方传 endpoint/provider/account ref。本地 CLI 先通过 trusted Unix IPC 让 Runtime 用同一个 canonical source resolver 读取 exact route，再用该 route 附加 trusted local grant；create 请求体仍只把 `source_url` 作为路由输入，Runtime 在 mutation 前再次解析并校验。若两次解析之间 route 又变化，exact grant 会失配并 fail closed，不会把写操作误投到旧 endpoint。同一个 canonical URL 若被多个 browser session 观测过即视为歧义，直接返回 `browser_canonical_url_ambiguous`，source-anchored create 不会解析到其他 profile/account 的 session。显式 direct create 仍要求 endpoint/provider/account 与 generation。
 
 ## 7. 本地 Agent 示例
 
@@ -333,7 +333,7 @@ Agent 应按这个顺序做：
 | 有 endpoint，但 `consent.webchat_control: false` | 仍在使用带旧本地开关语义的 runtime/extension；更新或 Reload 当前 DEV/发布版本后重新观测 endpoint |
 | account / Project 有歧义 | 重新列举并按返回 ref 选择；不要猜，也不要按“最近一次”选 |
 | `browser_resource_not_found` / session 失效 | 重新执行 `herdr-mcp webchat resources`；会话可能已关闭、归档，或被更新的观测取代 |
-| 同一个会话被两个 browser endpoint 观测过 | canonical URL 会解析到**最新**的那次观测，因此切换浏览器 profile / 扩展 identity 不会让本来新鲜的会话变成不可用；只有当两个不同 session 的最新观测时间完全相同时才 fail closed（`browser_canonical_url_ambiguous`） |
+| 同一个会话被两个 browser endpoint 观测过 | canonical URL 必须唯一解析到一个已登记的 session。两个不同 session 共享同一 URL 即为歧义，直接返回 `browser_canonical_url_ambiguous`，不会按最新观测选择，source-anchored create 与 handoff 都不会改投到其他 profile/account 的 session。重新观测不会移除另一个 session 的记录，该 URL 对 source-anchored create 与 handoff 仍然有歧义；请改用显式指定 endpoint、provider、account 与 generation 的 direct create |
 | dispatch 超时 | 先读 `herdr-mcp webchat dispatch-status DISPATCH_ID`，再观测会话，然后才决策 |
 | 写操作 delivery 不确定 | 先重新观测。不要换新 idempotency key 重发 |
 | `code: "caller_grant_missing"` | 你不在受信任本地路径上（例如裸 TCP MCP 客户端）。请使用 `herdr-mcp` CLI，它自己附带本地 grant；grant 无法通过 TCP 自证 |

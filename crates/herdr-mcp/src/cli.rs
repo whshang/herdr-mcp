@@ -1396,18 +1396,22 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             Ok(Command::Worker(WorkerCommand::ConnectorPlannerControl { action, request_id }))
         }
         Some("webchat-control") => {
-            let [
-                action,
-                connector_id,
-                device_id,
-                endpoint_ref,
-                provider,
-                account_ref,
-                confirm,
-            ] = &args[1..]
-            else {
-                return Err("connector webchat-control requires: <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm".to_owned());
-            };
+            // account-ref is optional: grants are provider-scoped (endpoint +
+            // provider). A supplied account-ref is still accepted for
+            // backward compatibility and stored, but does not narrow the match.
+            let provider_scope = crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT.to_owned();
+            let (action, connector_id, device_id, endpoint_ref, provider, account_ref, confirm) =
+                match &args[1..] {
+                    [action, connector_id, device_id, endpoint_ref, provider, account_ref, confirm] => {
+                        (action, connector_id, device_id, endpoint_ref, provider, account_ref, confirm)
+                    }
+                    [action, connector_id, device_id, endpoint_ref, provider, confirm] => {
+                        (action, connector_id, device_id, endpoint_ref, provider, &provider_scope, confirm)
+                    }
+                    _ => {
+                        return Err("connector webchat-control requires: <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm".to_owned());
+                    }
+                };
             let allowed = match action.as_str() {
                 "allow" => true,
                 "deny" => false,
@@ -2365,7 +2369,7 @@ User path:\n\
   herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
   herdr-mcp connector revoke-client <client-id> --confirm  (legacy client/grant kill switch)\n\
   herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm  (enrolled owner device)\n\
-  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm  (macOS/Linux enrolled owner device)\n\
+  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
   herdr-mcp automation list\n\

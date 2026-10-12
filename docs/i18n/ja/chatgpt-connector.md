@@ -108,14 +108,14 @@ ChatGPT は、レビュー済みで凍結された MCP action 定義のスナッ
 
 Herdr 0.4.3 は、二つの contract を意図的に分離しました。
 
-**public ChatGPT contract（first-party DEV/PROD）：epoch 7 / 19 actions。workstation runtime execution contract：epoch 5 / 18 tools。** 追加された公開 action は Edge-local の `herdr_devices` であり、ワークステーションに転送されることはありません。直前の凍結された epoch-4 contract と凍結された epoch-2 catalog は、有界な rollback / compatibility のベースラインとしてのみ保持されます。epoch 3 は historical only であり、public Edge の epoch-3 identity は非 DEV/PROD の有界なベースラインとして残ります。
+**public ChatGPT contract（first-party DEV/PROD）：epoch 8 / 19 actions。workstation runtime execution contract：epoch 5 / 18 tools。** 追加された公開 action は Edge-local の `herdr_devices` であり、ワークステーションに転送されることはありません。直前の凍結された epoch-4 contract と凍結された epoch-2 catalog は、有界な rollback / compatibility のベースラインとしてのみ保持されます。epoch 3 は historical only であり、public Edge の epoch-3 identity は非 DEV/PROD の有界なベースラインとして残ります。
 
 例:
 
 ```text
-Server: public epoch 7 / 19 actions
+Server: public epoch 8 / 19 actions
 
-Refreshed action set   ✓ can expose epoch 7
+Refreshed action set   ✓ can expose epoch 8
 Old/frozen action set  → may remain on an older action set
 ```
 
@@ -125,6 +125,8 @@ runtime のアップグレード後:
 2. Runtime または既存 Worker がその場でアップグレードされたというだけで Connector を disconnect / 削除 / 再追加**しないでください**。Worker の reconcile は public OAuth origin と Connector 資格情報を保持します。
 3. Herdr の公開 action catalog が変わった場合は、そのアカウントで利用できる workspace の管理機能から app action を更新・レビュー・公開し、必要に応じて新しい action を明示的に有効にします。
 4. action snapshot が変わった後は新しい会話を使用します。新しい Edge 提供の description を得るには Worker コードの更新が必要ですが、すでにレビュー済みの ChatGPT action snapshot は、app action を更新するまで凍結されたままになり得ます。
+
+Epoch 8 の受け入れ確認：Connector が使用する Worker の `/info` で `publicContract.epoch=8` を確認します。Herdr actions を更新した後、新しい会話で 19 tools（11 read、8 write）と `Browser actions require an explicit device`、`shell scripts, pipes, or redirects` の説明を確認し、読み取り専用のファイル/Git 取得と短いコマンドを試します。ブラウザー拡張の Reload では MCP tool snapshot は更新されません。
 
 古い tool snapshot のためにワークステーションを再インストールしないでください。既存の v0.4.2 runtime は epoch-2 の 18-tool workstation contract を引き続き実行します。単に、アップグレードするまで v0.4.3 のマルチデバイス runtime 機能を得られないだけです。
 

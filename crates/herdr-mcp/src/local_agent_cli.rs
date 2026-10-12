@@ -955,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn user_source_route_result_builds_the_latest_exact_grant() {
+    fn user_source_route_result_builds_the_exact_grant() {
         let result = json!({
             "ok": true,
             "route": {
@@ -1169,6 +1169,43 @@ mod tests {
         assert_eq!(
             output["automatic_delivery"]["reason"],
             "browser_source_session_not_found"
+        );
+        assert_eq!(
+            output["manual_delivery"]["copy_prompt"],
+            canonical_handoff_message()
+        );
+        assert!(
+            output["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("not a completed handoff")
+        );
+    }
+
+    #[test]
+    fn user_handoff_given_ambiguous_source_when_cli_prepares_then_automatic_delivery_refused() {
+        let mut runtime = FakeRuntime::new(
+            canonical_prepare_response(Value::Null, json!("browser_canonical_url_ambiguous")),
+            applied_create_response(false),
+        );
+        let output = webchat_handoff(handoff_request(None, false), |method, params, grant| {
+            runtime.call(method, params, grant)
+        })
+        .unwrap();
+        // An ambiguous source never reaches automatic delivery; the reported reason is the
+        // runtime's fail-closed code so the caller can resolve the profile/account first.
+        assert_eq!(runtime.create_calls().len(), 0);
+        assert_eq!(output["ok"], true);
+        assert_eq!(output["source_route"], Value::Null);
+        assert_eq!(
+            output["source_route_error"],
+            "browser_canonical_url_ambiguous"
+        );
+        assert_eq!(output["automatic_delivery"]["attempted"], false);
+        assert_eq!(output["automatic_delivery"]["completed"], false);
+        assert_eq!(
+            output["automatic_delivery"]["reason"],
+            "browser_canonical_url_ambiguous"
         );
         assert_eq!(
             output["manual_delivery"]["copy_prompt"],

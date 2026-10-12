@@ -461,8 +461,8 @@ test("user receives normalized Vercel evaluation | Given a decision-vercel Jev r
 
 test("health and info expose the same explicit first-party public contract identity", async () => {
   for (const [edgeEnv, expectedEpoch] of [
-    ["dev", 7],
-    ["prod", 7],
+    ["dev", 8],
+    ["prod", 8],
     [undefined, 3],
     ["unknown", 3],
   ]) {

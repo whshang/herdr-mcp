@@ -27,6 +27,9 @@ export type RelayErrorCode =
   | "device_suspended"
   | "device_revoked"
   | "edge_capacity_exceeded"
+  | "idempotency_key_payload_mismatch"
+  | "idempotency_replay_unauthorized"
+  | "idempotency_replay_unavailable"
   | "edge_mcp_placeholder"
   | "internal_error";
 
