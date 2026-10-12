@@ -2948,6 +2948,8 @@ impl StateStore {
             )
             .map_err(|error| format!("cannot update browser endpoint: {error}"))?;
         } else {
+            // Explicit 0 preserves epoch-4 deny regardless of whether the
+            // installed table's historical migration default is 0 or 1.
             tx.execute(
                 "INSERT INTO browser_endpoints(
                     endpoint_ref, device_id, browser_family, extension_version,
