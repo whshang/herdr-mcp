@@ -2308,10 +2308,10 @@ fn browser_composer_busy_probe(evidence: &BrowserPostconditionEvidence) -> Value
         }
     }
     for (key, allowed) in ENUMS {
-        if let Some(value) = probe.get(*key).and_then(Value::as_str) {
-            if allowed.contains(&value) {
-                out.insert((*key).to_owned(), json!(value));
-            }
+        if let Some(value) = probe.get(*key).and_then(Value::as_str)
+            && allowed.contains(&value)
+        {
+            out.insert((*key).to_owned(), json!(value));
         }
     }
     if out.is_empty() {
