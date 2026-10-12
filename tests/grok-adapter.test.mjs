@@ -137,7 +137,7 @@ test("Grok adapter exposes concrete direct and project chat session identity", (
   assert.equal(invalidProjectChat.adapter.getConversationKey(), null);
 });
 
-test("Grok idle composer is not busy when only an unrelated page region is aria-busy", () => {
+test("user reads Grok generation state | Given only an unrelated page region is aria-busy | When the adapter checks generation status | Then the latest assistant turn or a Stop control is what reports in progress", () => {
   const h = harness();
   const sidebarLoader = element({ attrs: { "aria-busy": "true" } });
   const assistant = element({ text: "OK", attrs: { "data-message-id": "a1" } });
