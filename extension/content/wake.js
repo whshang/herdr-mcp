@@ -1716,6 +1716,10 @@ function normalizeHerdrMentionAlias(value) {
         stop_control: stopButtons().length > 0,
         assistant_streaming: Boolean(assistantStreaming()),
         assistant_tools_in_progress: Boolean(assistantToolsInProgress()),
+        busy_reason: composerBusyReason(),
+        stop_candidate_raw_count: typeof ADAPTER.getStopButtonCandidates === "function"
+          ? Math.min(ADAPTER.getStopButtonCandidates().length, 50) : null,
+        ...(typeof ADAPTER.composerBusyProbeDetail === "function" ? ADAPTER.composerBusyProbeDetail() : {}),
       };
     } catch (_) {
       return { probe_failed: true };

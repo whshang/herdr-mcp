@@ -2265,8 +2265,29 @@ fn browser_composer_busy_probe(evidence: &BrowserPostconditionEvidence) -> Value
         "assistant_streaming",
         "assistant_tools_in_progress",
         "probe_failed",
+        "claude_latest_row_streaming_attr",
     ];
-    const COUNTS: &[&str] = &["input_text_length", "app_pill_count"];
+    const COUNTS: &[&str] = &[
+        "input_text_length",
+        "app_pill_count",
+        "stop_candidate_raw_count",
+        "claude_stop_aria_label_count",
+        "claude_stop_testid_count",
+        "claude_stop_candidate_count",
+        "claude_transcript_row_count",
+        "claude_latest_row_index",
+        "claude_latest_row_is_streaming_count",
+        "claude_latest_row_aria_busy_count",
+        "claude_document_is_streaming_count",
+    ];
+    // Closed enums only; anything else is dropped (no page text).
+    const ENUMS: &[(&str, &[&str])] = &[
+        ("busy_reason", &["stop-control", "assistant-streaming"]),
+        (
+            "claude_latest_row_role",
+            &["assistant", "user", "other", "none"],
+        ),
+    ];
     let Some(probe) = evidence
         .result
         .as_ref()
@@ -2284,6 +2305,13 @@ fn browser_composer_busy_probe(evidence: &BrowserPostconditionEvidence) -> Value
     for key in COUNTS {
         if let Some(value) = probe.get(*key).and_then(Value::as_u64) {
             out.insert((*key).to_owned(), json!(value.min(10_000)));
+        }
+    }
+    for (key, allowed) in ENUMS {
+        if let Some(value) = probe.get(*key).and_then(Value::as_str) {
+            if allowed.contains(&value) {
+                out.insert((*key).to_owned(), json!(value));
+            }
         }
     }
     if out.is_empty() {
@@ -18408,5 +18436,50 @@ mod browser_stop_target_tests {
         assert_eq!(out["session_ref"], "br_claude");
         assert_eq!(out["provider"], "claude");
         assert!(out.get("canonical_url").is_none());
+    }
+}
+
+#[cfg(test)]
+mod claude_composer_busy_probe_tests {
+    use super::*;
+
+    /// user remote connector | Given a Claude busy rejection with adapter probe detail | When the runtime forwards the probe | Then only whitelisted counts, booleans and closed enums pass and free text is dropped
+    #[test]
+    fn user_connector_given_claude_probe_when_forwarded_then_only_safe_fields_pass() {
+        let evidence = BrowserPostconditionEvidence {
+            result: Some(json!({"composer_busy_probe": {
+                "stop_control": false,
+                "busy_reason": "assistant-streaming",
+                "claude_latest_row_role": "assistant",
+                "claude_latest_row_index": 7,
+                "claude_stop_aria_label_count": 1,
+                "claude_latest_row_streaming_attr": true,
+                "page_text": "secret",
+                "busy_reason_free": "x"
+            }})),
+            ..BrowserPostconditionEvidence::resource_unavailable(1)
+        };
+        let probe = browser_composer_busy_probe(&evidence);
+        assert_eq!(probe["busy_reason"], "assistant-streaming");
+        assert_eq!(probe["claude_latest_row_role"], "assistant");
+        assert_eq!(probe["claude_latest_row_index"], 7);
+        assert_eq!(probe["claude_stop_aria_label_count"], 1);
+        assert_eq!(probe["claude_latest_row_streaming_attr"], true);
+        assert!(probe.get("page_text").is_none());
+        assert!(probe.get("busy_reason_free").is_none());
+    }
+
+    /// user remote connector | Given a probe whose enum value is not in the closed set | When forwarded | Then the value is dropped
+    #[test]
+    fn user_connector_given_unknown_enum_when_forwarded_then_dropped() {
+        let evidence = BrowserPostconditionEvidence {
+            result: Some(
+                json!({"composer_busy_probe": {"stop_control": true, "busy_reason": "hello world"}}),
+            ),
+            ..BrowserPostconditionEvidence::resource_unavailable(1)
+        };
+        let probe = browser_composer_busy_probe(&evidence);
+        assert!(probe.get("busy_reason").is_none());
+        assert_eq!(probe["stop_control"], true);
     }
 }
