@@ -2,7 +2,7 @@
 
 ## v1.0.4 — 2026-10-12
 
-- v1.0.4 是 epoch 迁移桥（contract identity 与 v1.0.3 完全一致）：updater 现在接受"同契约"或"恰好跨一个 epoch 且清单声明结构合法 `contract_migration`（`from` 与本机 identity 完全相等、`state_schema_from` 与本机 schema 一致、无未知字段）"的发布清单；epoch 跨度大于 1、更低 epoch、声明缺失/畸形/不匹配在安装前拒绝并报出两侧 epoch。candidate probe 改为按清单声明的目标契约比对（修复历史前台 probe 遗留的 0.4.x 时代 `contract epoch 2` 硬编码，该缺陷使已发布的 v1.0.0–v1.0.3 前台更新在任何 1.0.x 候选上失败，受影响机器可手动下载本版本二进制并以 `<二进制> install` 安装）。1.0.x 用户先 `herdr-mcp update` 到本版本，之后即可普通更新到第一个声明 `contract_migration.from = epoch 4` 的 v1.1 发布。`update auto` 适用同一规则并保持 PROD + Stable；state schema 保持 15，本协议不允许伴随 schema 迁移。 [PR #601](https://github.com/whshang/herdr-mcp/pull/601)
+- v1.0.4 是 epoch 迁移桥（contract identity 与 v1.0.3 完全一致）：updater 现在接受"同契约"或"恰好跨一个 epoch 且清单声明结构合法 `contract_migration`（`from` 与本机 identity 完全相等、`state_schema_from` 与本机 schema 一致、无未知字段）"的发布清单；epoch 跨度大于 1、更低 epoch、声明缺失/畸形/不匹配在安装前拒绝，每条跨 epoch 拒绝消息均报出本机与目标两侧 epoch。candidate probe 绑定完整契约身份：`herdr-mcp version` 新增第四行 `contract hash <sha256:...>`，候选必须报告被接纳清单契约的 epoch/tool_count/hash 三者（跨 epoch 路径要求该行且一致；同契约路径接受旧格式无该行候选、拒绝任何被报告的不同 hash），修复历史前台 probe 遗留的 0.4.x 时代 `contract epoch 2` 硬编码。该缺陷使已发布的 v1.0.0–v1.0.3 前台更新在任何 1.0.x 候选（包括 v1.0.4）上失败：这些版本以认证手动安装进入本版本（从 GitHub Release 下载、按 runtime-manifest.json 校验 sha256、`gh attestation verify <file> -R whshang/herdr-mcp`、独立终端执行 `<二进制> install`），不能以普通 `herdr-mcp update` 到达 v1.0.4；v0.4.x 仍走 v0.4.9 migration bridge。已安装 v1.0.4 后，同契约与跨一个 epoch 更新（首个声明 `contract_migration.from = epoch 4` 的 v1.1 发布，计划 v1.1.0-rc.2，经 Preview channel 或显式 `--manifest` 进入 RC）恢复正常。`update auto` 适用同一规则并保持 PROD + Stable；state schema 保持 15，本协议不允许伴随 schema 迁移；`herdr-mcp rollback` 的 post-success 回滚记录保证目前仅 macOS 成立。 [PR #601](https://github.com/whshang/herdr-mcp/pull/601)
 
 ## v1.0.3 — 2026-09-24
 
