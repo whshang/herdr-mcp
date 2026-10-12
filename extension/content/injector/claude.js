@@ -130,6 +130,35 @@ class ClaudeAdapter extends BaseAdapter {
     return this.getSendButtonCandidates()[0] || null;
   }
 
+  /** Composer-busy probe detail: booleans/counts only, never page text. */
+  composerBusyProbeDetail() {
+    const visible = (el) => { try { return Boolean(this.elementVisible(el)); } catch (_) { return false; } };
+    const count = (selector, root = document) => {
+      try { return Math.min([...root.querySelectorAll(selector)].filter(visible).length, 50); } catch (_) { return -1; }
+    };
+    const rows = [...document.querySelectorAll('[data-testid="transcript-row"]')];
+    let latest = null;
+    let latestIndex = -1;
+    for (const row of rows) {
+      const raw = String(row.getAttribute?.("data-index") ?? "");
+      const index = /^(0|[1-9]\d*)$/.test(raw) ? Number(raw) : -1;
+      if (index > latestIndex) { latest = row; latestIndex = index; }
+    }
+    const role = String(latest?.getAttribute?.("data-perf-row") || "");
+    return {
+      claude_stop_aria_label_count: count('button[aria-label*="Stop" i]'),
+      claude_stop_testid_count: count('button[data-testid="stop-button"]'),
+      claude_stop_candidate_count: Math.min(this.getStopButtonCandidates().length, 50),
+      claude_transcript_row_count: Math.min(rows.length, 10000),
+      claude_latest_row_index: latestIndex,
+      claude_latest_row_role: role === "assistant" || role === "user" ? role : (role ? "other" : "none"),
+      claude_latest_row_streaming_attr: latest?.getAttribute?.("data-perf-row-streaming") === "true",
+      claude_latest_row_is_streaming_count: latest ? count('[data-is-streaming="true"]', latest) : 0,
+      claude_latest_row_aria_busy_count: latest ? count('[aria-busy="true"]', latest) : 0,
+      claude_document_is_streaming_count: count('[data-is-streaming="true"]'),
+    };
+  }
+
   getStopButtonCandidates() {
     const chains = [
       'button[aria-label*="Stop" i]',
