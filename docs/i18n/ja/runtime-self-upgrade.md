@@ -149,6 +149,36 @@ public MCP contract migration
 
 contract migration は ChatGPT の tool snapshot、Edge compatibility、Link の期待値に影響します。明示的な epoch migration プロセスが必要です。
 
+### 1 つの epoch をまたぐ（N → N+1）
+
+通常の `herdr-mcp update` が単独で epoch をまたぐことはありません。アップデータは manifest の `contract` identity `{epoch, hash, tool_count}` が実行中 Runtime の contract identity と一致する場合にのみ Release を受理し、epoch が異なれば `release manifest contract identity mismatch` で fail closed します。したがって公開済みの v1.0.x（epoch 4）は、どのチャネルでも epoch 5 の Release へ直接 update できません。
+
+前方にちょうど 1 つの epoch をまたげるのは、対象 Release の manifest が `runtime-manifest.json` 内で移行を明示的に宣言している場合だけです。
+
+```json
+"contract": { "epoch": 5, "hash": "sha256:<epoch-5>", "tool_count": 18 },
+"contract_migration": {
+  "from": { "epoch": 4, "hash": "sha256:<epoch-4>", "tool_count": 18 },
+  "state_schema_from": 15
+}
+```
+
+この宣言は manifest のバイト列の一部であり、既存の manifest digest に対する GitHub artifact attestation の対象に含まれます。
+
+受理規則（`L` をローカルの contract identity、`M` を manifest の `contract` とします）:
+
+1. `M == L` — 通常の同一 contract 更新。挙動は変わりません。
+2. `M != L` — 次がすべて成り立つ場合のみ受理します。`M.epoch == L.epoch + 1`、`contract_migration` が存在し形式が正しい、`contract_migration.from` が `L` と完全に一致（epoch, hash, tool_count）、`contract_migration.state_schema_from` がローカルの state schema と一致、`manifest.state_schema` がローカルの state schema と一致。
+3. それ以外は何もインストールする前に拒否し、ローカルと対象の epoch を明示したエラーを返します。複数 epoch のスキップ、より低い epoch、`from` の hash/tool_count 不一致、宣言の欠落または不正な形式、`contract_migration` 内の未知フィールドが該当します。
+
+その他のゲートはすべて変更なく実行されます。manifest attestation、tag/source_ref identity、asset sha256、candidate probe、health をゲートにした activation、update fence、チャネル規則です。cross-epoch 経路では、ダウンロードした candidate は `L` ではなく対象 contract `M` に対して検証されます。
+
+チャネル内の最新 Release が受理できない場合（たとえば epoch +2）、discovery は fail closed し、古い Release を黙って選ぶ代わりに中間 bridge（`herdr-mcp update apply --manifest <url>`）を指し示します。`update auto` も同じ規則で epoch をまたげますが、PROD + Stable 限定のままです。このプロトコルは state schema の移行を許可しません。schema 変更は引き続き明示的な major migration 経路です。
+
+したがって通常の v1.0.x → v1.1 経路は 2 段階です。まず `herdr-mcp update` で v1.0.4 epoch-4 bridge（contract identity が同一なので通常の同一 contract 更新）へ進み、次に `herdr-mcp update` で `contract_migration.from = epoch 4` を manifest で宣言した最初の v1.1 Release（予定は v1.1.0-rc.2）へ進みます。これを宣言していない v1.1 prerelease は v1.0.x からは到達できません。
+
+Rollback の意味: `herdr-mcp rollback` は直前のインストール済み generation を再アクティブ化します（例: 1.1 → v1.0.4）。両側とも state schema 15 なのでデータベースの復元は不要です。ただし実行環境の rollback であり、更新後に書き込まれた durable state は巻き戻りません。
+
 ## トラフィックの切り替え
 
 activation はローカルのルーティングポインタを変更します。

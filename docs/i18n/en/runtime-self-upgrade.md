@@ -149,6 +149,36 @@ public MCP contract migration
 
 Contract migrations affect ChatGPT tool snapshots, Edge compatibility and Link expectations. They require an explicit epoch migration process.
 
+### Crossing one epoch (N → N+1)
+
+An ordinary `herdr-mcp update` never crosses an epoch by itself. The updater admits a release only when the manifest `contract` identity `{epoch, hash, tool_count}` equals the running Runtime's contract identity; a different epoch fails closed with `release manifest contract identity mismatch`, so no released v1.0.x (epoch 4) can update directly to an epoch-5 release on any channel.
+
+Exactly one epoch forward is allowed only when the target release manifest declares the migration inside `runtime-manifest.json`:
+
+```json
+"contract": { "epoch": 5, "hash": "sha256:<epoch-5>", "tool_count": 18 },
+"contract_migration": {
+  "from": { "epoch": 4, "hash": "sha256:<epoch-4>", "tool_count": 18 },
+  "state_schema_from": 15
+}
+```
+
+The declaration is part of the manifest bytes covered by the existing GitHub artifact attestation of the manifest digest.
+
+Admission rule, with `L` the local contract identity and `M` the manifest `contract`:
+
+1. `M == L` — ordinary same-contract update, unchanged.
+2. `M != L` — accept only when all of the following hold: `M.epoch == L.epoch + 1`; `contract_migration` is present and well formed; `contract_migration.from` equals `L` exactly (epoch, hash, tool_count); `contract_migration.state_schema_from` equals the local state schema; and `manifest.state_schema` equals the local state schema.
+3. Everything else is refused before anything is installed, with an error naming the local and target epochs: an epoch skip greater than one, a lower epoch, a mismatched `from` hash or tool count, a missing or malformed declaration, or unknown extra fields inside `contract_migration`.
+
+All other gates are unchanged and still run: manifest attestation, tag/source_ref identity, asset sha256, candidate probe, health-gated activation, update fence and channel rules. On the cross-epoch path the downloaded candidate is probed against the target contract `M`, not `L`.
+
+If the newest release in the channel is not admissible (for example epoch +2), discovery fails closed and points at the intermediate bridge (`herdr-mcp update apply --manifest <url>`) instead of silently selecting an older release. `update auto` may cross the epoch under the same rule and remains PROD + Stable only. This protocol does not permit a state-schema migration; schema changes still need the explicit major-migration path.
+
+The ordinary v1.0.x → v1.1 path is therefore two steps: `herdr-mcp update` to the v1.0.4 epoch-4 bridge (identical contract identity, so it is an ordinary same-contract update), then `herdr-mcp update` to the first v1.1 release whose manifest declares `contract_migration` from epoch 4 (planned v1.1.0-rc.2). A v1.1 prerelease that does not declare it cannot be reached from v1.0.x at all.
+
+Rollback semantics: `herdr-mcp rollback` re-activates the previous installed generation (for example 1.1 → v1.0.4). Both sides use state schema 15, so no database restore is needed. It remains an execution-environment rollback: durable state written after the update is not rewound, so inspect real service/state before relying on it.
+
 ## Switching traffic
 
 Activation changes the local routing pointer:

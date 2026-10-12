@@ -61,6 +61,10 @@ Edge and Runtime remain separate release/rollback planes: publishing or deployin
 
 The public [platform and compatibility support matrix](i18n/en/platform-support-matrix.md) is the release-claim boundary for tested MCP versions, N/N-1/N+1 behavior, and macOS/Linux/Windows/WSL security status. A release must not broaden a platform or compatibility claim unless that matrix and its contract test are updated with the qualifying evidence.
 
+### Cross-epoch runtime updates (N → N+1)
+
+An ordinary `herdr-mcp update` admits a release only when the manifest `contract` identity equals the running Runtime's; a different epoch fails closed with `release manifest contract identity mismatch`, so v1.0.x (epoch 4) cannot update directly to an epoch-5 release. Crossing exactly one epoch requires the target `runtime-manifest.json` — and therefore its attested digest — to declare `contract_migration` whose `from` identity equals the local N contract and whose `state_schema_from` equals the local state schema. An epoch skip greater than one, a lower epoch, a mismatched `from` hash/tool count, a missing or malformed declaration, or unknown fields inside `contract_migration` is refused before install, and discovery fails closed toward the intermediate bridge rather than selecting an older release. This path never migrates the durable state schema. Consequently the supported v1.0.x → v1.1 path is `herdr-mcp update` to the v1.0.4 epoch-4 bridge, then `herdr-mcp update` to the first v1.1 release whose manifest declares `contract_migration` from epoch 4 (planned v1.1.0-rc.2). `herdr-mcp rollback` after such an update re-activates the previous installed generation; the shared state schema means no database restore, but durable state written after the update is not rewound. Full protocol details live in the locale `runtime-self-upgrade` guide.
+
 ### Major state-schema upgrades
 
 The ordinary `update apply` path remains fail-closed across incompatible runtime state schemas. A release that changes the durable state schema must provide an explicit qualified migration path instead of weakening the updater's manifest/candidate checks.

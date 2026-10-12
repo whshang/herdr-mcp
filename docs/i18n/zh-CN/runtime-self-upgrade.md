@@ -174,6 +174,36 @@ public MCP contract migration
 
 因此 `herdr-self-update` 不应该被用来偷偷跨 contract epoch。
 
+### 跨一个 epoch（N → N+1）
+
+普通 `herdr-mcp update` 自身从不跨 epoch：只有当发布清单的 `contract` identity `{epoch, hash, tool_count}` 与本机 Runtime 的 contract identity 完全一致时才会被接纳，epoch 不同则以 `release manifest contract identity mismatch` fail closed。因此任何已发布的 v1.0.x（epoch 4）都无法在任何通道上直接 update 到 epoch 5 的发布。
+
+只有目标发布清单在 `runtime-manifest.json` 中显式声明迁移时，才允许向前跨恰好一个 epoch：
+
+```json
+"contract": { "epoch": 5, "hash": "sha256:<epoch-5>", "tool_count": 18 },
+"contract_migration": {
+  "from": { "epoch": 4, "hash": "sha256:<epoch-4>", "tool_count": 18 },
+  "state_schema_from": 15
+}
+```
+
+这段声明属于 manifest 字节本身，因此被现有的 manifest digest GitHub artifact attestation 覆盖。
+
+接纳规则（`L` 为本机 contract identity，`M` 为清单中的 `contract`）：
+
+1. `M == L`：普通同 contract 更新，行为不变。
+2. `M != L`：仅当以下全部成立时接纳：`M.epoch == L.epoch + 1`；`contract_migration` 存在且格式合法；`contract_migration.from` 与 `L` 完全相等（epoch、hash、tool_count）；`contract_migration.state_schema_from` 等于本机 state schema；`manifest.state_schema` 等于本机 state schema。
+3. 其他情况在安装任何东西之前就拒绝，并报出本机与目标 epoch：跨多个 epoch、epoch 更低、`from` hash/tool_count 不匹配、声明缺失或格式错误、`contract_migration` 内出现未知字段。
+
+其余关卡全部保留并照常执行：manifest attestation、tag/source_ref identity、asset sha256、candidate probe、健康门控激活、update fence 与通道规则。跨 epoch 路径上，下载后的 candidate 按目标 contract `M`（而不是 `L`）验证。
+
+如果通道内最新发布不可接纳（例如 epoch +2），发现流程会 fail closed，并指向中间 bridge（`herdr-mcp update apply --manifest <url>`），而不是静默选择更旧的发布。`update auto` 可以按同一规则跨 epoch，且仍仅限 PROD + Stable。本协议不允许 state schema 迁移；schema 变更仍走显式的 major migration 路径。
+
+因此常规的 v1.0.x → v1.1 路径是两步：先 `herdr-mcp update` 到 v1.0.4 epoch-4 bridge（contract identity 相同，属于普通同 contract 更新），再 `herdr-mcp update` 到第一个在 manifest 中声明 `contract_migration.from = epoch 4` 的 v1.1 发布（计划 v1.1.0-rc.2）。未声明该字段的 v1.1 预发布完全无法由 v1.0.x 到达。
+
+Rollback 语义：`herdr-mcp rollback` 重新激活上一个已安装的 generation（例如 1.1 → v1.0.4）。两侧都是 state schema 15，所以不需要数据库恢复。它仍然只是执行环境回滚：更新之后写入的持久状态不会被回退，依赖它之前要先检查真实 service/state。
+
 ## 激活发生时会怎样
 
 可以把 active pointer 理解成一个本机路由开关：
