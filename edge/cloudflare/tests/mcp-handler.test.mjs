@@ -1902,6 +1902,10 @@ test("user stops a WebChat generation remotely | Given WebChat control and Page 
     endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     provider: "chatgpt",
     account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  }, {
+    endpoint_ref: DERIVED_E,
+    provider: "*",
+    account_ref: "*",
   }]);
   assert.equal(d.calls[0].trace?.page_assist_grants, undefined);
 });
