@@ -139,10 +139,11 @@ export function applyPlanIfFresh(
   currentRecords: Iterable<OAuthConnectorGrantRecord | null | undefined>,
   raw: Record<string, unknown>,
   plan: Extract<PlanResult, { ok: true }>,
+  deviceId?: string,
 ): { ok: true; record: Record<string, unknown> } | { ok: false; code: string } {
-  const fresh = planMigration(currentRecords, plan.from_connector_id, plan.to_connector_id);
+  const fresh = planMigration(currentRecords, plan.from_connector_id, plan.to_connector_id, deviceId);
   if (!fresh.ok) {
-    return { ok: false, code: fresh.code === "migrate_target_conflict" ? "migrate_target_conflict" : "migrate_plan_stale" };
+    return { ok: false, code: fresh.code === "migrate_target_conflict" || fresh.code === "migrate_cross_device_rows" ? fresh.code : "migrate_plan_stale" };
   }
   if (JSON.stringify(fresh) !== JSON.stringify(plan)) return { ok: false, code: "migrate_plan_stale" };
   return { ok: true, record: applyPlanToRawRecord(raw, plan) };
@@ -178,11 +179,20 @@ export function listAllOrphans(records: Iterable<OAuthConnectorGrantRecord | nul
   return out;
 }
 
-/** Dry run only. Fails closed on any missing or ambiguous selector. */
+/**
+ * Dry run only. Fails closed on any missing or ambiguous selector.
+ * Spec A device scope: when `deviceId` is given, moves are restricted to that
+ * device BEFORE conflict detection and digest computation, so the returned
+ * plan — and the digest the owner confirms — only ever covers the caller's own
+ * rows. Any cross-device row in the underlying data makes the plan fail with
+ * `migrate_cross_device_rows` when scoped; it is never silently dropped here
+ * because the confirm path must reject, not partially apply.
+ */
 export function planMigration(
   records: Iterable<OAuthConnectorGrantRecord | null | undefined>,
   from: unknown,
   to: unknown,
+  deviceId?: string,
 ): PlanResult {
   if (typeof from !== "string" || !from.trim()) return { ok: false, code: "migrate_from_required" };
   if (typeof to !== "string" || !to.trim()) return { ok: false, code: "migrate_to_required" };
@@ -197,8 +207,12 @@ export function planMigration(
   if (typeof generation !== "number" || !Number.isInteger(generation) || generation < 1) {
     return { ok: false, code: "grant_record_missing_field" };
   }
-  const moves = listOrphans(target)
-    .filter((row) => row.connector_id === from)
+  const matching = listOrphans(target).filter((row) => row.connector_id === from);
+  if (deviceId !== undefined) {
+    const crossDevice = matching.some((row) => row.device_id !== deviceId);
+    if (crossDevice) return { ok: false, code: "migrate_cross_device_rows" };
+  }
+  const moves = matching
     .map((row) => ({ kind: row.kind, from: row, to: { ...row, connector_id: to, grant_generation: generation } }));
   if (moves.length === 0) return { ok: false, code: "migrate_no_matching_rows" };
   // Target-side conflict: fail closed if a destination row already exists under the

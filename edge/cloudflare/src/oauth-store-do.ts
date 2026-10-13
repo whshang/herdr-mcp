@@ -873,10 +873,11 @@ export class OAuthStoreDO {
     const action = body?.action;
     if (action !== "list" && action !== "plan") return json({ ok: false, code: "bad_request" }, 400);
     const deviceId = body?.device_id;
-    if (action === "plan" && deviceId !== undefined) return json({ ok: false, code: "bad_request" }, 400);
-    // #626: listing is always device-scoped; no unscoped listing.
-    if (action === "list" && (typeof deviceId !== "string" || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId))) {
-      return json({ ok: false, code: "orphans_invalid_device_id" }, 400);
+    // #626/#630 spec A: the plan is device-scoped too. `list` stays device-scoped
+    // (no unscoped listing); `plan` REQUIRES a device id and returns the filtered
+    // plan plus its digest, so the owner confirms only their own rows.
+    if (typeof deviceId !== "string" || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)) {
+      return json({ ok: false, code: action === "list" ? "orphans_invalid_device_id" : "migrate_invalid_device_id" }, 400);
     }
     const rows = await this.state.storage.list<OAuthConnectorGrantRecord>({ prefix: GRANT_PREFIX });
     const records = [...rows.values()].map((raw) => normalizeConnectorGrant(raw));
@@ -886,8 +887,9 @@ export class OAuthStoreDO {
       const orphans = listAllOrphans(records).filter((row) => row.device_id === deviceId);
       return json({ ok: true, orphans, invalid_records: invalidRecords });
     }
-    const plan = planMigration(records, body?.from, body?.to);
-    return plan.ok ? json({ ...plan, dry_run: true }) : json(plan, 409);
+    const plan = planMigration(records, body?.from, body?.to, deviceId);
+    if (!plan.ok) return json({ ...plan, invalid_records: invalidRecords }, 409);
+    return json({ ...plan, plan_digest: await migrationPlanDigest(plan), dry_run: true, invalid_records: invalidRecords });
   }
 
   /**
@@ -944,23 +946,26 @@ export class OAuthStoreDO {
         const rawEntries = [...rows.entries()];
         const records = rawEntries.map(([, value]) => normalizeConnectorGrant(value));
 
-        // 3. Dry-run plan recompute from the records just read.
-        const fresh = planMigration(records, from, to);
+        // 3. Dry-run plan recompute from the records just read, device-scoped
+        //    (spec A): any cross-device row in the matching set rejects the
+        //    whole plan before digest comparison and before any write.
+        const fresh = planMigration(records, from, to, deviceId);
         if (!fresh.ok) {
-          outcome = { ok: false, status: 409, code: fresh.code === "migrate_target_conflict" ? "migrate_target_conflict" : "migrate_plan_stale" };
+          outcome = { ok: false, status: 409, code: fresh.code };
           return;
         }
 
-        // 4. Digest compare: the owner confirmed exactly this plan.
+        // 4. Device scope re-check on the filtered plan (defense in depth: the
+        //    plan is already scoped, so this never fires in practice).
+        if (fresh.moves.some((move) => move.from.device_id !== deviceId)) {
+          outcome = { ok: false, status: 409, code: "migrate_cross_device_rows" };
+          return;
+        }
+
+        // 5. Digest compare: the owner confirmed exactly this filtered plan.
         const freshDigest = await migrationPlanDigest(fresh);
         if (typeof planDigest !== "string" || !/^[0-9a-f]{64}$/.test(planDigest) || planDigest !== freshDigest) {
           outcome = { ok: false, status: 409, code: "migrate_plan_stale" };
-          return;
-        }
-
-        // 5. Device scope: reject the whole plan if any row belongs to another device.
-        if (fresh.moves.some((move) => move.from.device_id !== deviceId)) {
-          outcome = { ok: false, status: 409, code: "migrate_cross_device_rows" };
           return;
         }
 
@@ -978,7 +983,7 @@ export class OAuthStoreDO {
           outcome = { ok: false, status: 409, code: "migrate_plan_stale" };
           return;
         }
-        const applied = applyPlanIfFresh(records, rawTarget, fresh);
+        const applied = applyPlanIfFresh(records, rawTarget, fresh, deviceId);
         if (!applied.ok) {
           outcome = { ok: false, status: 409, code: applied.code };
           return;

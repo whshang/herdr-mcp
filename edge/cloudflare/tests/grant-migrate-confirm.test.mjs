@@ -98,15 +98,14 @@ function record(overrides = {}) {
 }
 
 async function planDigest(body) {
-  // The plan the server would recompute for this storage state, canonicalized
-  // exactly like the route: from, to, grant_generation, sorted moves.
+  // Spec A: the dry run is device-scoped and returns the filtered plan plus
+  // its digest. The test consumes exactly what the server returned.
   const h = harness();
-  const plan = await h.post("/internal/oauth/grant/page-assist-orphans", { action: "plan", from: body.from, to: body.to });
+  const plan = await h.post("/internal/oauth/grant/page-assist-orphans", { action: "plan", from: body.from, to: body.to, device_id: DEV });
   assert.equal(plan.body.ok, true, "dry-run plan for digest");
-  const { from_connector_id, to_connector_id, grant_generation, moves } = plan.body;
-  const sortKey = (m) => m.kind + m.from.device_id + m.from.endpoint_ref + (m.from.provider ?? "");
-  const canonical = { from_connector_id, to_connector_id, grant_generation, moves: [...moves].sort((a, b) => sortKey(a).localeCompare(sortKey(b))) };
-  return sha256Hex(JSON.stringify(canonical));
+  assert.equal(typeof plan.body.plan_digest, "string", "dry run returns plan_digest");
+  assert.ok(/^[0-9a-f]{64}$/.test(plan.body.plan_digest), "digest is sha256 hex");
+  return plan.body.plan_digest;
 }
 
 function harness(rec = record(), extra = {}) {
@@ -240,27 +239,16 @@ test("user Given a postcondition verification failure after the write When the c
   assert.equal(snapshot(h.storage), before, "storage byte-identical after rollback");
 });
 
-test("user Given a plan that contains another device's rows When the owner confirms from their own device Then it fails closed with migrate_cross_device_rows and writes nothing", async () => {
+test("user Given matching rows of two devices When the owner runs a device-scoped dry run Then the plan itself fails closed with migrate_cross_device_rows and nothing is written", async () => {
   const rec = record();
   rec.page_assist.push(pa(OLD, "ep5", OTHER));
   const storage = new StorageMock();
   storage.map.set("grant:c1", structuredClone(rec));
   const instance = new OAuthStoreDO({ storage }, { OAUTH_ISSUER: "https://issuer" });
-  const plan = await (async () => {
-    const resp = await instance.fetch(new Request(`https://do.internal/internal/oauth/grant/page-assist-orphans`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ action: "plan", from: OLD, to: NEW }),
-    }));
-    return await resp.json();
-  })();
-  assert.equal(plan.ok, true);
-  const { from_connector_id, to_connector_id, grant_generation, moves } = plan;
-  const sortKey = (m) => m.kind + m.from.device_id + m.from.endpoint_ref + (m.from.provider ?? "");
-  const digest = await sha256Hex(JSON.stringify({ from_connector_id, to_connector_id, grant_generation, moves: [...moves].sort((a, b) => sortKey(a).localeCompare(sortKey(b))) }));
   const before = snapshot(storage);
-  const resp = await instance.fetch(new Request(`https://do.internal${ROUTE}`, {
+  const resp = await instance.fetch(new Request(`https://do.internal/internal/oauth/grant/page-assist-orphans`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ from: OLD, to: NEW, plan_digest: digest, idempotency_key: IDEM, device_id: DEV, by: `device:${DEV}` }),
+    body: JSON.stringify({ action: "plan", from: OLD, to: NEW, device_id: DEV }),
   }));
   const res = { status: resp.status, body: await resp.json() };
   assert.equal(res.status, 409);
@@ -284,4 +272,34 @@ test("user Given a confirm without an idempotency key or with a malformed one Wh
   assert.equal(badDevice.status, 400);
   assert.equal(snapshot(h.storage), before);
   assert.equal(h.storage.writes, 0);
+});
+
+test("user Given an unfiltered digest computed over a plan that includes another device's rows When the owner confirms Then the cross-device check rejects first with zero grant writes", async () => {
+  const rec = record();
+  rec.page_assist.push(pa(OLD, "ep5", OTHER));
+  const storage = new StorageMock();
+  storage.map.set("grant:c1", structuredClone(rec));
+  const instance = new OAuthStoreDO({ storage }, { OAUTH_ISSUER: "https://issuer" });
+  // The client (pre-spec-A server, or a hand-rolled caller) computes a digest
+  // over the UNFILTERED plan, including OTHER's ep5 row. Spec A requires the
+  // confirm path's cross-device rejection to fire regardless of the digest.
+  const sortKey = (m) => m.kind + m.from.device_id + m.from.endpoint_ref + (m.from.provider ?? "");
+  const ownRows = [pa(OLD, "ep1"), { ...pa(OLD, "ep4"), provider: "chatgpt", account_ref: "*" }]
+    .map((row) => ({ kind: row.provider ? "webchat_control" : "page_assist", from: { ...row, client_id: "c1", current_connector_id: NEW }, to: {} }));
+  const unfiltered = { from_connector_id: OLD, to_connector_id: NEW, grant_generation: 1, moves: [
+    ...ownRows,
+    { kind: "page_assist", from: { ...pa(OLD, "ep5", OTHER), client_id: "c1", current_connector_id: NEW }, to: {} },
+  ].sort((a, b) => sortKey(a).localeCompare(sortKey(b))) };
+  const digest = await sha256Hex(JSON.stringify(unfiltered));
+  const grantWritesBefore = storage.writes;
+  const resp = await instance.fetch(new Request(`https://do.internal${ROUTE}`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ from: OLD, to: NEW, plan_digest: digest, idempotency_key: IDEM, device_id: DEV, by: `device:${DEV}` }),
+  }));
+  const res = { status: resp.status, body: await resp.json() };
+  assert.equal(res.status, 409, JSON.stringify(res.body));
+  assert.equal(res.body.code, "migrate_cross_device_rows");
+  assert.equal(storage.writes, grantWritesBefore, "zero writes after rejection");
+  const stored = storage.map.get("grant:c1");
+  assert.equal(stored.page_assist.find((row) => row.endpoint_ref === "ep5").connector_id, OLD, "other device row untouched");
 });

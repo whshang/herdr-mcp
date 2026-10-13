@@ -69,15 +69,18 @@ test("user Given a grant record with carried-forward rows When the owner lists o
   assert.equal(h.storage.writes, 0);
 });
 
-test("user Given orphan rows under --from When the owner runs a migrate dry run Then only --from rows are planned and storage stays byte-identical", async () => {
+test("user Given orphan rows under --from When the owner runs a device-scoped dry run Then only that device's --from rows are planned with a digest and storage stays byte-identical", async () => {
   const h = harness();
   const before = snapshot(h.storage);
-  const res = await h.post({ action: "plan", from: OLD, to: NEW });
+  const res = await h.post({ action: "plan", from: OLD, to: NEW, device_id: DEV });
   assert.equal(res.status, 200);
   assert.equal(res.body.dry_run, true);
   assert.equal(res.body.moves.length, 2);
+  assert.ok(/^[0-9a-f]{64}$/.test(res.body.plan_digest), "plan_digest present");
+  assert.equal(res.body.invalid_records, 0);
   for (const m of res.body.moves) {
     assert.equal(m.from.connector_id, OLD);
+    assert.equal(m.from.device_id, DEV);
     assert.equal(m.to.connector_id, NEW);
     assert.equal(m.to.grant_generation, 1);
     assert.equal(m.to.endpoint_ref, m.from.endpoint_ref);
@@ -85,26 +88,31 @@ test("user Given orphan rows under --from When the owner runs a migrate dry run 
   }
   assert.equal(snapshot(h.storage), before);
   assert.equal(h.storage.writes, 0);
+  // A plan without a device id is refused: no unscoped plan surface.
+  const unscoped = await h.post({ action: "plan", from: OLD, to: NEW });
+  assert.equal(unscoped.status, 400);
+  assert.equal(unscoped.body.code, "migrate_invalid_device_id");
 });
 
-test("user Given missing or ambiguous selectors When the owner runs a migrate dry run Then it fails closed with a stable code and no writes", async () => {
+test("user Given missing or ambiguous selectors When the owner runs a device-scoped dry run Then it fails closed with a stable code and no writes", async () => {
   const h = harness();
   const before = snapshot(h.storage);
   const cases = [
-    [{ action: "plan", to: NEW }, "migrate_from_required"],
-    [{ action: "plan", from: OLD }, "migrate_to_required"],
-    [{ action: "plan", from: "", to: NEW }, "migrate_from_required"],
-    [{ action: "plan", from: "bogus", to: NEW }, "migrate_invalid_connector_id"],
-    [{ action: "plan", from: NEW, to: NEW }, "migrate_source_is_current"],
-    [{ action: "plan", from: OLD, to: OLD2 }, "migrate_target_not_current"],
-    [{ action: "plan", from: "conn_unknown0001", to: NEW }, "migrate_no_matching_rows"],
+    [{ action: "plan", to: NEW, device_id: DEV }, "migrate_from_required"],
+    [{ action: "plan", from: OLD, device_id: DEV }, "migrate_to_required"],
+    [{ action: "plan", from: "", to: NEW, device_id: DEV }, "migrate_from_required"],
+    [{ action: "plan", from: "bogus", to: NEW, device_id: DEV }, "migrate_invalid_connector_id"],
+    [{ action: "plan", from: NEW, to: NEW, device_id: DEV }, "migrate_source_is_current"],
+    [{ action: "plan", from: OLD, to: OLD2, device_id: DEV }, "migrate_target_not_current"],
+    [{ action: "plan", from: "conn_unknown0001", to: NEW, device_id: DEV }, "migrate_no_matching_rows"],
   ];
   for (const [input, code] of cases) {
     const res = await h.post(input);
     assert.equal(res.status, 409, JSON.stringify(input));
-    assert.deepEqual(res.body, { ok: false, code });
+    assert.equal(res.body.ok, false);
+    assert.equal(res.body.code, code);
   }
-  assert.equal((await h.post({ action: "apply", from: OLD, to: NEW })).status, 400);
+  assert.equal((await h.post({ action: "apply", from: OLD, to: NEW, device_id: DEV })).status, 400);
   assert.equal(snapshot(h.storage), before);
   assert.equal(h.storage.writes, 0);
 });
@@ -130,7 +138,7 @@ test("user Given the target connector already holds the same device and endpoint
   rec.page_assist.push(pa(NEW, "ep1")); // target already holds the ep1 destination
   const h = harness(rec);
   const before = snapshot(h.storage);
-  const res = await h.post({ action: "plan", from: OLD, to: NEW });
+  const res = await h.post({ action: "plan", from: OLD, to: NEW, device_id: DEV });
   assert.equal(res.status, 409);
   assert.equal(res.body.ok, false);
   assert.equal(res.body.code, "migrate_target_conflict");
@@ -221,8 +229,11 @@ test("user Given an invalid device id When the owner lists orphans Then it fails
   const missing = await h.post({ action: "list" });
   assert.equal(missing.status, 400, "the DO never lists unscoped");
   assert.deepEqual(missing.body, { ok: false, code: "orphans_invalid_device_id" });
-  const plan = await h.post({ action: "plan", from: OLD, to: NEW, device_id: DEV });
-  assert.deepEqual(plan.body, { ok: false, code: "bad_request" });
+  // Spec A: plan REQUIRES a device id; an invalid one is refused the same way.
+  const plan = await h.post({ action: "plan", from: OLD, to: NEW, device_id: "bogus" });
+  assert.deepEqual(plan.body, { ok: false, code: "migrate_invalid_device_id" });
+  const unscopedPlan = await h.post({ action: "plan", from: OLD, to: NEW });
+  assert.deepEqual(unscopedPlan.body, { ok: false, code: "migrate_invalid_device_id" });
   assert.equal(snapshot(h.storage), before);
   assert.equal(h.storage.writes, 0);
 });

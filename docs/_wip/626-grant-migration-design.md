@@ -248,13 +248,18 @@ provider-facing `caller_grant_missing` body all stay unchanged.
       on the records just read (target is current, record active, generation,
       matching rows, target conflicts). It rejects with `migrate_plan_stale`,
       `migrate_target_conflict`, or the fresh plan's own code.
-   4. Require `digest(freshPlan) === plan_digest`, else `migrate_plan_stale`. This
-      way the owner confirms exactly what was shown.
-   5. **Device scope (decision):** apply only moves whose `device_id` equals the
-      authenticated device. If the fresh plan holds rows of other devices, reject
-      with `migrate_cross_device_rows` instead of a partial apply. The dry-run
-      `plan` action gains the same server-side device filter and digest, so a
-      plan shown for device A never covers device B. (Open question Q1.)
+   4. **Device scope first (spec A, supersedes the former ordering):** before any
+      digest comparison, reject the whole plan with
+      `migrate_cross_device_rows` if it holds any row whose `device_id` is not
+      the authenticated device. No grant record is written on this rejection.
+      `planMigration` itself takes a device scope (`grant-migration.ts`
+      `planMigration`, `oauth-store-do.ts` plan path), so the fresh plan — and
+      the digest — are already computed over the device-filtered move set.
+   5. Require `digest(filteredFreshPlan) === plan_digest`, else
+      `migrate_plan_stale`. The dry-run `plan` action applies the same
+      server-side device filter and returns the filtered plan plus its digest,
+      so the owner confirms exactly the rows of their own device and a plan
+      shown for device A never covers device B. (Q1: per-device only.)
    6. Write back with `applyPlanToRawRecord` on the **raw** stored value, so
       unknown keys are preserved. Append the audit entry (7.5) and store the
       idempotency entry. All of this is one `put` per touched key inside the
@@ -349,7 +354,9 @@ provider-facing `caller_grant_missing` body all stay unchanged.
 
 ### 7.7 Test plan
 
-Unit/DO (StorageMock with a write counter and an injectable `put` failure):
+Unit/DO (StorageMock whose `transaction` buffers writes and only applies them
+when the closure resolves — a throw discards the buffer, so rollback is
+exercised for real — plus a write counter and an injectable `put` failure):
 - A happy path moves only the planned rows. The other connectors' rows and the
   unknown keys and nulls are byte-identical, and exactly 1 record and 1
   idempotency entry are written.
@@ -357,8 +364,18 @@ Unit/DO (StorageMock with a write counter and an injectable `put` failure):
   generation bump, or revoke between dry run and confirm each give a fixed code
   and zero writes.
 - Digest mismatch gives `migrate_plan_stale`.
+- **Order (spec A):** a confirm presenting a digest computed over an unfiltered
+  plan that includes another device's rows is rejected with
+  `migrate_cross_device_rows` before any digest comparison, with zero grant
+  writes.
 - Idempotency: a replay gives the same result and no new writes. Same key with a
   different digest gives 409. A missing or malformed key gives 400.
+- **Idempotency gaps (spec A, to add):** an entry past its 24 h TTL is treated
+  as absent (deleted in the same transaction, request re-planned); a device at
+  the 256-entry cap evicts the oldest entry before inserting; the alarm sweep
+  deletes expired entries in batches; a replay after the grant record was
+  revoked returns the stored historical result and grants nothing, while any
+  new key re-plans and fails closed.
 - **Rollback:** inject a throw on the 2nd `put` (the audit or idem entry). The
   storage snapshot must equal the pre-confirm state. Inject a postcondition
   failure and check the same.
@@ -369,8 +386,10 @@ Unit/DO (StorageMock with a write counter and an injectable `put` failure):
 - Rejected confirm (each stage):
   - Exactly one new slim entry appears in `migrate-reject-audit:v1:<device_id>`.
     Its key set is exactly `{v, at_ms, code, stage, device_id, plan_digest,
-    idempotency_key_sha256_8}`, and no forbidden value (client_id, endpoint_ref,
-    account_ref, raw key) appears anywhere in it.
+    idempotency_key_sha256_8}` — the last field exists only for diagnostic
+    correlation of repeated rejects to one CLI invocation, never as input to
+    any authorization decision — and no forbidden value (client_id,
+    endpoint_ref, account_ref, raw key) appears anywhere in it.
   - All `grant:` records are byte-identical.
   - The success `audit[]` is unchanged.
   - No `migrate-idem:` key is written.
@@ -404,6 +423,16 @@ Real-usage verification (needed before enabling, on a staging Edge):
 - Replaying the same CLI command is a no-op.
 - Revoke after confirm still fails closed.
 - Check the audit entry via the owner diagnostics.
+
+### 7.7b Known limitations
+
+- Entries evicted from the reject ring (cap 64) are **not audited** and have
+  **no read surface**: eviction is silent, there is no diagnostics route that
+  returns evicted reject entries, and no event is emitted for the eviction
+  itself. Only the most recent 64 rejects per device are ever observable.
+- `idempotency_key_sha256_8` in the reject entry exists solely for diagnostic
+  correlation (grouping repeated rejects of one CLI invocation). It is never
+  an authorization input and never reconstructs the raw key.
 
 ### 7.8 Resolved questions
 
