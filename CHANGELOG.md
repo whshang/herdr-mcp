@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **#632 浏览器端点在线判定（先升级扩展）：** Runtime 不再把「只轮询 `/push/events`、但未在本 Runtime generation 注册」的 browser endpoint 判为在线；SSE hello 新增 `endpoint_registered`。22s 超时时若命令仍在队列中、从未被扩展取走，则原子移出队列并返回可重试的 `not_delivered`，只有已交给扩展的命令才保留 `delivery_unknown`。**升级顺序：先升级浏览器扩展，再切换 Runtime。** 旧扩展在 Runtime generation 切换后会显示离线，直到其 service worker 重启（chrome://extensions 中重载扩展 service worker，无需重启 Chrome）。 [#632](https://github.com/whshang/herdr-mcp/issues/632)
+
 ## v1.1.0-rc.2 — 2026-10-12
 
 - **1.1 第二个预发布（仅 preview 通道）：** 包含 N → N+1 跨 epoch updater 和迁移文档。跨 epoch 接纳要求签名发布清单中的 `contract_migration` 精确匹配来源 contract identity，且两侧 state schema 相同；v1.0.x 升级路径为先到 v1.0.4 epoch-4 bridge，再进入本 RC（epoch 5），bridge 与 RC 发布后该路径才可用，v1.0.x 无法直接更新到本 RC。stable 用户继续留在 1.0.x；成功升级后的 `herdr-mcp rollback` 仅限 macOS，重新激活已安装的上一 generation，不恢复数据库。重新注册保留 WebChat 显式拒绝授权。 [PR #605](https://github.com/whshang/herdr-mcp/pull/605) [PR #607](https://github.com/whshang/herdr-mcp/pull/607)
