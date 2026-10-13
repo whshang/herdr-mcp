@@ -1,11 +1,72 @@
-// #626 grant migration: read-only orphan listing and migrate dry-run planning.
-// Pure functions: they never mutate their input. No write path exists here;
-// `--confirm` is refused by the CLI. The caller grant check
-// (verifiedControlGrantSnapshot) is not touched.
+// #626 grant migration: read-only orphan listing, migrate dry-run planning,
+// and the #630 confirm transaction core helpers. Pure functions never mutate
+// their input. The caller grant check (verifiedControlGrantSnapshot) is not
+// touched by anything in this module.
 import type { OAuthConnectorGrantRecord } from "./oauth-records.js";
+import { sha256Hex } from "./device-crypto.js";
 
 export type GrantKind = "page_assist" | "webchat_control";
+export type MigrationPlan = Extract<PlanResult, { ok: true }>;
+export type MigrationAuditEntry = {
+  at_ms: number;
+  by: string;
+  action: "migrate";
+  audit_id: string;
+  from_connector_id: string;
+  to_connector_id: string;
+  rows: Array<{ device_id: string; endpoint_ref: string; provider?: string; account_ref?: string }>;
+};
+export const MIGRATE_AUDIT_RING = 64;
 
+/** Canonical plan digest (#630 §7.3): SHA-256 over {from, to, generation, sorted moves}. */
+export async function migrationPlanDigest(plan: MigrationPlan): Promise<string> {
+  const moves = [...plan.moves].sort((a, b) =>
+    (a.kind + a.from.device_id + a.from.endpoint_ref + (a.from.provider ?? "")).localeCompare(
+      b.kind + b.from.device_id + b.from.endpoint_ref + (b.from.provider ?? "")));
+  return sha256Hex(JSON.stringify({
+    from_connector_id: plan.from_connector_id,
+    to_connector_id: plan.to_connector_id,
+    grant_generation: plan.grant_generation,
+    moves,
+  }));
+}
+
+/** Append the success audit entry to the RAW record (bounded ring, oldest dropped). */
+export function appendMigrateAudit(
+  raw: Record<string, unknown>,
+  plan: MigrationPlan,
+  by: string,
+  nowMs: number,
+  auditId: string,
+): Record<string, unknown> {
+  const entry: MigrationAuditEntry = {
+    at_ms: nowMs,
+    by,
+    action: "migrate",
+    audit_id: auditId,
+    from_connector_id: plan.from_connector_id,
+    to_connector_id: plan.to_connector_id,
+    rows: plan.moves.map((m) => ({
+      device_id: m.from.device_id,
+      endpoint_ref: m.from.endpoint_ref,
+      ...("provider" in m.from ? { provider: m.from.provider, account_ref: m.from.account_ref } : {}),
+    })),
+  };
+  const prior = Array.isArray(raw.audit) ? raw.audit.filter((e): e is Record<string, unknown> => !!e && typeof e === "object") : [];
+  const next = [...prior, entry];
+  return { ...raw, audit: next.length > MIGRATE_AUDIT_RING ? next.slice(next.length - MIGRATE_AUDIT_RING) : next };
+}
+
+/**
+ * Post-write verification (#630 §7.2): after applying the plan, no planned row
+ * may remain an orphan under the source connector, and the plan must recompute
+ * cleanly (empty) against the applied record.
+ */
+export function migratePostconditionSatisfied(applied: OAuthConnectorGrantRecord | null, plan: MigrationPlan): boolean {
+  if (!applied) return false;
+  const orphans = listOrphans(applied).filter((row) => row.connector_id === plan.from_connector_id);
+  return orphans.length === 0;
+}
 export interface OrphanRow {
   kind: GrantKind;
   client_id: string;

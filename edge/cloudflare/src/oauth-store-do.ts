@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
-import { listAllOrphans, planMigration } from "./grant-migration.js";
+import type { MigrationPlan } from "./grant-migration.js";
+import { appendMigrateAudit, applyPlanIfFresh, listAllOrphans, listOrphans, migratePostconditionSatisfied, migrationPlanDigest, planMigration } from "./grant-migration.js";
 import { createOAuthIdentity, createRs256AccessTokenVerifier, hashOpaqueToken } from "./oauth-edge.js";
 import { issueRs256AccessJwt, randomBase64UrlToken } from "./oauth-token-crypto.js";
 import {
@@ -182,6 +183,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/webchat-control") return this.setWebChatControlGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist") return this.setPageAssistGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-orphans") return this.pageAssistOrphans(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-migrate") return this.pageAssistMigrate(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/get") return this.getConnector(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/find-active") return this.findActiveConnectorByClient(request);
@@ -886,6 +888,127 @@ export class OAuthStoreDO {
     }
     const plan = planMigration(records, body?.from, body?.to);
     return plan.ok ? json({ ...plan, dry_run: true }) : json(plan, 409);
+  }
+
+  /**
+   * #630 `--confirm` transaction core (design doc §7.1-7.5), DO-internal only.
+   * One storage.transaction: idempotency lookup, re-read, fresh-plan recompute,
+   * digest compare, per-device scope, raw-record patch + audit, idempotency
+   * entry, post-write verification. Any throw rolls everything back. Nothing
+   * here relaxes verifiedControlGrantSnapshot or any grant check.
+   */
+  private async pageAssistMigrate(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const from = body?.from;
+    const to = body?.to;
+    const planDigest = body?.plan_digest;
+    const idempotencyKey = body?.idempotency_key;
+    const deviceId = body?.device_id;
+    const by = typeof body?.by === "string" && body.by.length > 0 && body.by.length <= 128 ? body.by : null;
+    if (typeof deviceId !== "string" || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)) {
+      return json({ ok: false, code: "migrate_invalid_device_id" }, 400);
+    }
+    if (idempotencyKey === undefined || idempotencyKey === null || idempotencyKey === "") {
+      return json({ ok: false, code: "migrate_idempotency_key_required" }, 400);
+    }
+    if (typeof idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(idempotencyKey)) {
+      return json({ ok: false, code: "migrate_idempotency_key_invalid" }, 400);
+    }
+    if (typeof from !== "string" || typeof to !== "string") {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    const idemKey = `migrate-idem:v1:${deviceId}:${idempotencyKey}`;
+
+    type Outcome =
+      | { ok: true; action: "connector_page_assist_migrated"; moved: number; audit_id: string }
+      | { ok: false; status: number; code: string };
+    let outcome: Outcome = { ok: false, status: 500, code: "migrate_storage_failed" };
+
+    try {
+      await this.state.storage.transaction(async (tx) => {
+        // 1. Idempotent replay: same key + same digest returns the stored
+        //    result with no further work. Same key + different digest is 409.
+        const stored = await tx.get<{ v: number; plan_digest: string; result: unknown; created_at_ms: number; expires_at_ms: number }>(idemKey);
+        if (stored && typeof stored.expires_at_ms === "number" && stored.expires_at_ms > Date.now()) {
+          if (stored.plan_digest === planDigest) {
+            outcome = stored.result as { ok: true; action: "connector_page_assist_migrated"; moved: number; audit_id: string };
+            return;
+          }
+          outcome = { ok: false, status: 409, code: "migrate_idempotency_conflict" };
+          return;
+        }
+        if (stored) await tx.delete(idemKey); // expired: treat as absent
+
+        // 2. Re-read every grant record inside the transaction.
+        const rows = await tx.list<OAuthConnectorGrantRecord>({ prefix: GRANT_PREFIX });
+        const rawEntries = [...rows.entries()];
+        const records = rawEntries.map(([, value]) => normalizeConnectorGrant(value));
+
+        // 3. Dry-run plan recompute from the records just read.
+        const fresh = planMigration(records, from, to);
+        if (!fresh.ok) {
+          outcome = { ok: false, status: 409, code: fresh.code === "migrate_target_conflict" ? "migrate_target_conflict" : "migrate_plan_stale" };
+          return;
+        }
+
+        // 4. Digest compare: the owner confirmed exactly this plan.
+        const freshDigest = await migrationPlanDigest(fresh);
+        if (typeof planDigest !== "string" || !/^[0-9a-f]{64}$/.test(planDigest) || planDigest !== freshDigest) {
+          outcome = { ok: false, status: 409, code: "migrate_plan_stale" };
+          return;
+        }
+
+        // 5. Device scope: reject the whole plan if any row belongs to another device.
+        if (fresh.moves.some((move) => move.from.device_id !== deviceId)) {
+          outcome = { ok: false, status: 409, code: "migrate_cross_device_rows" };
+          return;
+        }
+
+        // 6. Patch the RAW stored record of the plan target (unknown keys survive).
+        const targetKey = rawEntries.find(([key]) => {
+          const normalized = normalizeConnectorGrant(rows.get(key));
+          return normalized !== null && normalized.connector_id === to;
+        })?.[0];
+        if (targetKey === undefined) {
+          outcome = { ok: false, status: 409, code: "migrate_plan_stale" };
+          return;
+        }
+        const rawTarget = await tx.get<Record<string, unknown>>(targetKey);
+        if (!rawTarget || typeof rawTarget !== "object") {
+          outcome = { ok: false, status: 409, code: "migrate_plan_stale" };
+          return;
+        }
+        const applied = applyPlanIfFresh(records, rawTarget, fresh);
+        if (!applied.ok) {
+          outcome = { ok: false, status: 409, code: applied.code };
+          return;
+        }
+        const auditId = `mgr_${randomBase64UrlToken().slice(0, 22)}`;
+        const nowMs = Date.now();
+        const withAudit = appendMigrateAudit(applied.record, fresh, by ?? `device:${deviceId}`, nowMs, auditId);
+
+        await tx.put(targetKey, withAudit);
+
+        // 7. Post-write verification inside the same transaction.
+        const reread = normalizeConnectorGrant(await tx.get<OAuthConnectorGrantRecord>(targetKey));
+        if (!migratePostconditionSatisfied(reread, fresh)) {
+          throw new Error("migrate_postcondition_failed");
+        }
+
+        // 8. Idempotency entry in the same transaction (24h TTL).
+        const result = { ok: true as const, action: "connector_page_assist_migrated" as const, moved: fresh.moves.length, audit_id: auditId };
+        await tx.put(idemKey, { v: 1, plan_digest: planDigest, result, created_at_ms: nowMs, expires_at_ms: nowMs + 24 * 60 * 60_000 });
+        outcome = result;
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      outcome = message === "migrate_postcondition_failed"
+        ? { ok: false, status: 500, code: "migrate_postcondition_failed" }
+        : { ok: false, status: 500, code: "migrate_storage_failed" };
+    }
+
+    if (!outcome.ok) return json({ ok: false, code: outcome.code }, outcome.status);
+    return json(outcome);
   }
 
   private async setPageAssistGrant(request: Request): Promise<Response> {
