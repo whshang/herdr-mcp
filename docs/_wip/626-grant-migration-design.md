@@ -509,10 +509,15 @@ Real-usage verification (needed before enabling, on a staging Edge):
 - ~~256-entry per-device idempotency cap and alarm sweep~~ — done in 9c9d6246
   (cap eviction on insert; `/internal/oauth/grant/page-assist-migrate-alarm`
   sweeps expired entries in batches of 128 and re-arms hourly).
-- Q4 slim reject ring: `migrate-reject-audit:v1:<device_id>` (bounded 64,
-  oldest evicted, no grant-record rewrite) is not implemented yet.
-- Structured reject log line (`page_assist_migrate_rejected` with stage/code)
-  is not emitted yet.
+- ~~Q4 slim reject ring: `migrate-reject-audit:v1:<device_id>` (bounded 64,
+  oldest evicted, no grant-record rewrite) is not implemented yet.~~ — done in
+  the #630 Q4 reject-audit change (separate `storage.transaction` after the main
+  confirm transaction; Edge-level request-shape 400s that never reach the DO
+  transaction stay unaudited, and auth failures get the log line only).
+- ~~Structured reject log line (`page_assist_migrate_rejected` with stage/code)
+  is not emitted yet.~~ — done in the #630 Q4 reject-audit change (DO rejections
+  carry the fixed Q4 fields plus `reject_audit_write_failed`; the Edge route logs
+  401/403 auth failures with null device/digest/key fields).
 - `by` enforcement: the DO currently defaults `by` to `device:<device_id>`
   when absent and accepts any bounded string when present; it must require
   exactly `device:<authenticated device_id>` once the Edge route lands.

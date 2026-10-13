@@ -76,6 +76,22 @@ export { DeviceRegistryDO, OAuthStoreDO, WorkstationDO };
 const logger = createLogger("edge-worker");
 const mcpMinuteAttribution = new McpMinuteAttribution(logger);
 
+/**
+ * #630 §7.8 Q4: an auth failure has no authenticated device to key the reject
+ * ring on, so it gets the structured log line only — never a fabricated id and
+ * never a stored write (the flag therefore reports no failed write).
+ */
+function logMigrateRejectWithoutDevice(code: string): void {
+  logger.warn("page_assist_migrate_rejected", {
+    code,
+    stage: "validate",
+    device_id: null,
+    plan_digest: null,
+    idempotency_key_sha256_8: null,
+    reject_audit_write_failed: false,
+  });
+}
+
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
     status,
@@ -496,9 +512,15 @@ export default {
       // authenticated registry device scopes the whole migration (the DO
       // rejects cross-device rows before any digest comparison).
       const owner = await authenticateOwnerDeviceIdentity(request, env);
-      if (!owner) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      if (!owner) {
+        logMigrateRejectWithoutDevice("connector_owner_device_required");
+        return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      }
       const authDevice = owner.deviceId === null ? null : normalizeDeviceId(owner.deviceId);
-      if (!authDevice) return noStoreJsonResponse({ ok: false, code: "migrate_device_unresolved" }, 403);
+      if (!authDevice) {
+        logMigrateRejectWithoutDevice("migrate_device_unresolved");
+        return noStoreJsonResponse({ ok: false, code: "migrate_device_unresolved" }, 403);
+      }
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)
         || Object.keys(parsed.value).some((key) => key !== "from" && key !== "to" && key !== "plan_digest" && key !== "idempotency_key")) {
