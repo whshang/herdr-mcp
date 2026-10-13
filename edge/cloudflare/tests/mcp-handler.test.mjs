@@ -1913,7 +1913,7 @@ test("user stops a WebChat generation remotely | Given WebChat control and Page 
   assert.equal(d.calls[0].trace?.page_assist_grants, undefined);
 });
 
-test("user sees the runtime fail-closed refusal | Given no WebChat control grant and no Page Assist grant for the routed device | When herdr_mcp.browser_dispatch.stop is forwarded | Then the stop is still delivered, the trace carries no grant keys at all, and the caller sees caller_grant_missing", async () => {
+test("user sees the runtime refusal relayed unchanged | Given no WebChat control grant and no Page Assist grant for the routed device | When herdr_mcp.browser_dispatch.stop is forwarded | Then the trace carries no grant keys at all and the device-returned caller_grant_missing reaches the caller", async () => {
   const STOP_TARGET_DEVICE = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
   const UNGRANTED_DEVICE = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW";
   const d = deps({
@@ -1966,6 +1966,7 @@ test("user sees the runtime fail-closed refusal | Given no WebChat control grant
   assert.equal(res.body.error, undefined);
   assert.equal(d.calls.length, 1, "a stop with no grant for the routed device must still reach the runtime");
   assert.equal(d.calls[0].args.method, "herdr_mcp.browser_dispatch.stop");
+  assert.ok(d.calls[0].trace, "the forwarded stop call must carry a trace");
   assert.equal(
     d.calls[0].trace?.webchat_control_grants, undefined,
     "no WebChat control grant may be forwarded for the routed device",
@@ -1974,6 +1975,7 @@ test("user sees the runtime fail-closed refusal | Given no WebChat control grant
     d.calls[0].trace?.page_assist_grants, undefined,
     "no Page Assist grant may be forwarded or derived for the routed device",
   );
+  // The refusal is the fake device reply; runtime enforcement is pinned by the Rust test browser_dispatch_stop_fails_closed_without_a_caller_webchat_control_grant.
   assert.equal(
     res.body.result.structuredContent.code, "caller_grant_missing",
     "the runtime refusal must reach the caller unchanged",
@@ -2041,6 +2043,7 @@ test("user stops a WebChat generation on one of two granted devices | Given WebC
     assert.equal(res.body.result.isError, undefined);
     assert.equal(d.calls.length, 1);
     assert.equal(d.calls[0].args.method, "herdr_mcp.browser_dispatch.stop");
+    assert.ok(d.calls[0].trace, "the forwarded stop call must carry a trace");
     assert.deepEqual(d.calls[0].trace?.webchat_control_grants, expectedGrants);
     assert.equal(d.calls[0].trace?.page_assist_grants, undefined);
     for (const ref of forbiddenRefs) {
