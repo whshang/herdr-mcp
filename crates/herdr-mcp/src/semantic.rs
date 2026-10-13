@@ -1759,6 +1759,10 @@ fn valid_semantic_value(value: &str) -> bool {
 }
 
 #[cfg(test)]
+#[path = "semantic_bench.rs"]
+mod semantic_bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
