@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { OAuthStoreDO } from "../dist/oauth-store-do.js";
-import { listOrphans, planMigration } from "../dist/grant-migration.js";
+import { listOrphans, planMigration, applyPlanToRawRecord } from "../dist/grant-migration.js";
 
 class StorageMock {
   map = new Map();
@@ -55,7 +55,7 @@ function harness(rec = record()) {
 
 const snapshot = (storage) => JSON.stringify([...storage.map.entries()]);
 
-test("orphans list returns only rows not under the current connector, read-only", async () => {
+test("user Given a grant record with carried-forward rows When the owner lists orphans Then only rows not under the current connector are returned and nothing is written", async () => {
   const h = harness();
   const before = snapshot(h.storage);
   const res = await h.post({ action: "list" });
@@ -69,7 +69,7 @@ test("orphans list returns only rows not under the current connector, read-only"
   assert.equal(h.storage.writes, 0);
 });
 
-test("migrate dry run plans only --from rows and leaves storage byte-identical", async () => {
+test("user Given orphan rows under --from When the owner runs a migrate dry run Then only --from rows are planned and storage stays byte-identical", async () => {
   const h = harness();
   const before = snapshot(h.storage);
   const res = await h.post({ action: "plan", from: OLD, to: NEW });
@@ -87,7 +87,7 @@ test("migrate dry run plans only --from rows and leaves storage byte-identical",
   assert.equal(h.storage.writes, 0);
 });
 
-test("missing or ambiguous selectors fail closed without writes", async () => {
+test("user Given missing or ambiguous selectors When the owner runs a migrate dry run Then it fails closed with a stable code and no writes", async () => {
   const h = harness();
   const before = snapshot(h.storage);
   const cases = [
@@ -109,18 +109,79 @@ test("missing or ambiguous selectors fail closed without writes", async () => {
   assert.equal(h.storage.writes, 0);
 });
 
-test("two records claiming the same current connector is ambiguous", () => {
+test("user Given two records claiming the same current connector When a migration is planned Then it fails closed as ambiguous", () => {
   const res = planMigration([record(), record({ client_id: "c2" })], OLD, NEW);
   assert.deepEqual(res, { ok: false, code: "migrate_target_ambiguous" });
 });
 
-test("revoked record yields no orphans and no plan", async () => {
+test("user Given a revoked grant record When the owner lists orphans or plans a migration Then nothing is offered", async () => {
   const h = harness(record({ status: "revoked" }));
   const list = await h.post({ action: "list" });
-  assert.deepEqual(list.body, { ok: true, orphans: [] });
+  assert.deepEqual(list.body, { ok: true, orphans: [], invalid_records: 0 });
   const plan = await h.post({ action: "plan", from: OLD, to: NEW });
   assert.equal(plan.body.ok, false);
   assert.equal(h.storage.writes, 0);
   assert.deepEqual(listOrphans(record({ status: "revoked" })), []);
   assert.deepEqual(listOrphans(null), []);
+});
+
+test("user Given the target connector already holds the same device and endpoint When a migration is planned Then it fails closed with migrate_target_conflict and writes nothing", async () => {
+  const rec = record();
+  rec.page_assist.push(pa(NEW, "ep1")); // target already holds the ep1 destination
+  const h = harness(rec);
+  const before = snapshot(h.storage);
+  const res = await h.post({ action: "plan", from: OLD, to: NEW });
+  assert.equal(res.status, 409);
+  assert.equal(res.body.ok, false);
+  assert.equal(res.body.code, "migrate_target_conflict");
+  assert.deepEqual(res.body.conflicts.map((c) => [c.kind, c.endpoint_ref]), [["page_assist", "ep1"]]);
+  assert.equal(snapshot(h.storage), before);
+  assert.equal(h.storage.writes, 0);
+  // Non-conflicting different endpoint on target is fine.
+  const ok = planMigration([record({ page_assist: [pa(OLD, "ep1"), pa(NEW, "ep9")] })], OLD, NEW);
+  assert.equal(ok.ok, true);
+});
+
+test("user Given two source rows that land on the same destination When a migration is planned Then it fails closed with migrate_target_conflict", () => {
+  const dup = { ...pa(OLD, "ep1"), grant_generation: 2 };
+  const res = planMigration([record({ page_assist: [pa(OLD, "ep1"), dup], webchat_control: [] })], OLD, NEW);
+  assert.equal(res.code, "migrate_target_conflict");
+});
+
+test("user Given a stored record with unknown fields When the plan is applied to the raw record Then unknown fields are preserved and the input is not mutated", () => {
+  const raw = {
+    ...record(),
+    audit: [{ at_ms: 1, by: "device:x", action: "allow" }],
+    future_field: { nested: true },
+  };
+  raw.page_assist[0] = { ...raw.page_assist[0], note: "keep-me" };
+  const frozen = JSON.stringify(raw);
+  const plan = planMigration([record()], OLD, NEW);
+  assert.equal(plan.ok, true);
+  const next = applyPlanToRawRecord(raw, plan);
+  assert.equal(JSON.stringify(raw), frozen, "input unchanged");
+  assert.deepEqual(next.audit, raw.audit);
+  assert.deepEqual(next.future_field, raw.future_field);
+  assert.equal(next.page_assist[0].note, "keep-me");
+  assert.equal(next.page_assist[0].connector_id, NEW);
+  assert.equal(next.page_assist[2].connector_id, OLD2, "rows of other connectors untouched");
+  assert.equal(next.webchat_control[0].connector_id, NEW);
+  assert.equal(next.webchat_control[0].provider, "chatgpt");
+  // Everything except the rewritten rows is identical.
+  const strip = (r) => ({ ...r, page_assist: undefined, webchat_control: undefined });
+  assert.deepEqual(strip(next), strip(raw));
+});
+
+test("user Given records with missing fields When the owner lists or plans Then a fixed code is returned and invalid records are counted, never offered", async () => {
+  const rec = record();
+  delete rec.grant_generation;
+  assert.deepEqual(planMigration([rec], OLD, NEW), { ok: false, code: "grant_record_missing_field" });
+  const h = harness(record());
+  h.storage.map.set("grant:broken", { client_id: "broken", status: "active" }); // missing approved_* -> invalid
+  const before = snapshot(h.storage);
+  const res = await h.post({ action: "list" });
+  assert.equal(res.body.invalid_records, 1);
+  assert.ok(res.body.orphans.every((o) => o.client_id === "c1"));
+  assert.equal(snapshot(h.storage), before);
+  assert.equal(h.storage.writes, 0);
 });

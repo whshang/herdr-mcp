@@ -872,7 +872,9 @@ export class OAuthStoreDO {
     if (action !== "list" && action !== "plan") return json({ ok: false, code: "bad_request" }, 400);
     const rows = await this.state.storage.list<OAuthConnectorGrantRecord>({ prefix: GRANT_PREFIX });
     const records = [...rows.values()].map((raw) => normalizeConnectorGrant(raw));
-    if (action === "list") return json({ ok: true, orphans: listAllOrphans(records) });
+    // Records that fail normalization are never offered; report the count (fixed field).
+    const invalidRecords = records.filter((r) => r === null).length;
+    if (action === "list") return json({ ok: true, orphans: listAllOrphans(records), invalid_records: invalidRecords });
     const plan = planMigration(records, body?.from, body?.to);
     return plan.ok ? json({ ...plan, dry_run: true }) : json(plan, 409);
   }

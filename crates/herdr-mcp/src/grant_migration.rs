@@ -21,20 +21,28 @@ pub struct GrantRow {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_ref: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantRecord {
     pub status: String,
-    pub connector_id: String,
-    pub grant_generation: u64,
+    /// Optional on the Edge (TS) side; absence is reported as a fixed error
+    /// code by `plan_migration`, never a deserialization panic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_generation: Option<u64>,
     #[serde(default)]
     pub page_assist: Vec<GrantRow>,
     #[serde(default)]
     pub webchat_control: Vec<GrantRow>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantKind {
     PageAssist,
@@ -70,6 +78,9 @@ pub enum MigrationError {
     TargetNotCurrent,
     SourceIsCurrent,
     NoMatchingRows,
+    TargetConflict,
+    RecordMissingField,
+    RecordInvalid,
     ConfirmNotImplemented,
 }
 
@@ -83,6 +94,9 @@ impl MigrationError {
             Self::TargetNotCurrent => "migrate_target_not_current",
             Self::SourceIsCurrent => "migrate_source_is_current",
             Self::NoMatchingRows => "migrate_no_matching_rows",
+            Self::TargetConflict => "migrate_target_conflict",
+            Self::RecordMissingField => "grant_record_missing_field",
+            Self::RecordInvalid => "grant_record_invalid",
             Self::ConfirmNotImplemented => "migrate_confirm_not_implemented",
         }
     }
@@ -134,13 +148,23 @@ fn all_rows(record: &GrantRecord) -> impl Iterator<Item = (GrantKind, &GrantRow)
         )
 }
 
+/// Parse a stored grant record. Unknown fields are kept (`extra`, flattened) so a
+/// later whole-record write-back cannot erase Edge fields; malformed input maps to
+/// the fixed code `grant_record_invalid` instead of a raw serde error.
+pub fn parse_grant_record(json: &str) -> Result<GrantRecord, MigrationError> {
+    serde_json::from_str(json).map_err(|_| MigrationError::RecordInvalid)
+}
+
 /// Read-only orphan listing. A non-active (e.g. revoked) record offers nothing.
 pub fn list_orphans(record: &GrantRecord) -> Vec<OrphanRow<'_>> {
     if record.status != "active" {
         return Vec::new();
     }
+    let Some(current) = record.connector_id.as_deref() else {
+        return Vec::new();
+    };
     all_rows(record)
-        .filter(|(_, row)| row.connector_id != record.connector_id)
+        .filter(|(_, row)| row.connector_id != current)
         .map(|(kind, row)| OrphanRow { kind, row })
         .collect()
 }
@@ -160,10 +184,18 @@ pub fn plan_migration(
     if record.status != "active" {
         return Err(MigrationError::RecordNotActive);
     }
-    if to != record.connector_id {
+    let (Some(current), Some(generation)) =
+        (record.connector_id.as_deref(), record.grant_generation)
+    else {
+        return Err(MigrationError::RecordMissingField);
+    };
+    if generation == 0 {
+        return Err(MigrationError::RecordMissingField);
+    }
+    if to != current {
         return Err(MigrationError::TargetNotCurrent);
     }
-    if from == record.connector_id {
+    if from == current {
         return Err(MigrationError::SourceIsCurrent);
     }
     let moves: Vec<PlannedMove> = list_orphans(record)
@@ -174,18 +206,36 @@ pub fn plan_migration(
             from: o.row.clone(),
             to: GrantRow {
                 connector_id: to.to_owned(),
-                grant_generation: record.grant_generation,
+                grant_generation: generation,
                 ..o.row.clone()
             },
         })
         .collect();
+    // Fail closed before returning any plan if a destination already exists
+    // under `to` for the same kind (§1 (a)/(c)), or if two moves would land on
+    // the same destination key.
+    // Review item 3: key is (kind, device_id, endpoint_ref), regardless of provider/account.
+    let mut seen: std::collections::HashSet<(GrantKind, String, String)> =
+        std::collections::HashSet::new();
+    for m in &moves {
+        let collides_with_existing = all_rows(record).any(|(kind, row)| {
+            kind == m.kind
+                && row.connector_id == to
+                && row.device_id == m.to.device_id
+                && row.endpoint_ref == m.to.endpoint_ref
+        });
+        let duplicate = !seen.insert((m.kind, m.to.device_id.clone(), m.to.endpoint_ref.clone()));
+        if collides_with_existing || duplicate {
+            return Err(MigrationError::TargetConflict);
+        }
+    }
     if moves.is_empty() {
         return Err(MigrationError::NoMatchingRows);
     }
     Ok(MigrationPlan {
         from_connector_id: from.to_owned(),
         to_connector_id: to.to_owned(),
-        grant_generation: record.grant_generation,
+        grant_generation: generation,
         moves,
     })
 }
@@ -315,20 +365,22 @@ mod tests {
             endpoint_ref: ep.into(),
             provider: None,
             account_ref: None,
+            extra: Default::default(),
         }
     }
 
     fn record() -> GrantRecord {
         GrantRecord {
             status: "active".into(),
-            connector_id: NEW.into(),
-            grant_generation: 1,
+            connector_id: Some(NEW.into()),
+            grant_generation: Some(1),
             page_assist: vec![
                 row(OLD, "d1", "e1"),
                 row(NEW, "d1", "e2"),
                 row(OLD2, "d2", "e3"),
             ],
             webchat_control: vec![row(OLD, "d1", "e4")],
+            extra: Default::default(),
         }
     }
 
@@ -365,7 +417,7 @@ mod tests {
         for m in &p.moves {
             assert_eq!(m.from.connector_id, OLD);
             assert_eq!(m.to.connector_id, NEW);
-            assert_eq!(m.to.grant_generation, r.grant_generation);
+            assert_eq!(Some(m.to.grant_generation), r.grant_generation);
             assert_eq!(
                 m.to.endpoint_ref, m.from.endpoint_ref,
                 "no endpoint remapping"
@@ -411,6 +463,116 @@ mod tests {
         let _ = plan_migration(&r, Some("conn_unknown00001"), Some(NEW));
         let _ = list_orphans(&r);
         assert_eq!(before, serde_json::to_vec(&r).unwrap());
+    }
+
+    #[test]
+    fn target_conflict_fails_closed() {
+        // A row already carried under NEW with the same destination key as an
+        // OLD row means migrating would overwrite existing authority.
+        let mut r = record();
+        r.page_assist.push(row(NEW, "d1", "e1"));
+        let before = serde_json::to_vec(&r).unwrap();
+        assert_eq!(
+            plan_migration(&r, Some(OLD), Some(NEW)),
+            Err(MigrationError::TargetConflict)
+        );
+        assert_eq!(before, serde_json::to_vec(&r).unwrap());
+    }
+
+    #[test]
+    fn unknown_fields_round_trip() {
+        let raw = r#"{
+            "status": "active",
+            "connector_id": "conn_new000000001",
+            "grant_generation": 1,
+            "page_assist": [
+                {
+                    "connector_id": "conn_old000000001",
+                    "grant_generation": 1,
+                    "device_id": "d1",
+                    "endpoint_ref": "e1",
+                    "note": "n"
+                }
+            ],
+            "webchat_control": [],
+            "audit": [{"by": "x"}],
+            "future_field": 7
+        }"#;
+        let rec: GrantRecord = serde_json::from_str(raw).unwrap();
+        let round = serde_json::to_string(&rec).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&round).unwrap();
+        assert_eq!(expected, actual);
+
+        let plan = plan_migration(&rec, Some(OLD), Some(NEW)).unwrap();
+        assert_eq!(plan.moves.len(), 1);
+        assert_eq!(
+            plan.moves[0].to.extra.get("note"),
+            Some(&serde_json::Value::String("n".into()))
+        );
+    }
+
+    #[test]
+    fn target_conflict_ignores_provider_and_account() {
+        // Review item 3 key is (device_id, endpoint_ref): a webchat row under NEW
+        // for the same device/endpoint conflicts even with another provider.
+        let mut r = record();
+        let mut existing = row(NEW, "d1", "e4");
+        existing.provider = Some("other".into());
+        r.webchat_control.push(existing);
+        assert_eq!(
+            plan_migration(&r, Some(OLD), Some(NEW)),
+            Err(MigrationError::TargetConflict)
+        );
+        // A different endpoint on the target is not a conflict.
+        let mut ok = record();
+        ok.page_assist.push(row(NEW, "d1", "e9"));
+        assert!(plan_migration(&ok, Some(OLD), Some(NEW)).is_ok());
+    }
+
+    #[test]
+    fn edge_shaped_record_round_trips_and_missing_fields_get_fixed_code() {
+        // Real Edge record: client_id, approved_at_ms, revocation_scope etc. are
+        // not modelled and must survive; connector_id/grant_generation absent.
+        let raw = r#"{"status":"active","client_id":"https://chatgpt.example/client","approved_at_ms":1000,"approved_by":"device:owner","revocation_scope":"client","resource":"https://issuer/mcp","scope":"mcp","page_assist":[{"connector_id":"conn_old000000001","grant_generation":1,"device_id":"d1","endpoint_ref":"e1"}],"webchat_control":[]}"#;
+        let rec = parse_grant_record(raw).unwrap();
+        assert_eq!(rec.connector_id, None);
+        let once = serde_json::to_string(&rec).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&once).unwrap(),
+            expected
+        );
+        // Re-serialisation is byte-stable (idempotent).
+        let twice = serde_json::to_string(&parse_grant_record(&once).unwrap()).unwrap();
+        assert_eq!(once.as_bytes(), twice.as_bytes());
+        assert!(list_orphans(&rec).is_empty());
+        assert_eq!(
+            plan_migration(&rec, Some(OLD), Some(NEW)),
+            Err(MigrationError::RecordMissingField)
+        );
+        assert_eq!(
+            MigrationError::RecordMissingField.code(),
+            "grant_record_missing_field"
+        );
+        let mut zero = record();
+        zero.grant_generation = Some(0);
+        assert_eq!(
+            plan_migration(&zero, Some(OLD), Some(NEW)),
+            Err(MigrationError::RecordMissingField)
+        );
+        // Malformed input -> fixed code, not a raw serde error.
+        for bad in [
+            r#"{"connector_id":"conn_new000000001"}"#,
+            "not json",
+            r#"{"status":"active","grant_generation":"x"}"#,
+        ] {
+            assert_eq!(
+                parse_grant_record(bad),
+                Err(MigrationError::RecordInvalid),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -20,7 +20,54 @@ export interface OrphanRow {
 
 export type PlanResult =
   | { ok: true; from_connector_id: string; to_connector_id: string; grant_generation: number; moves: Array<{ kind: GrantKind; from: OrphanRow; to: OrphanRow }> }
-  | { ok: false; code: string };
+  | { ok: false; code: string; conflicts?: OrphanRow[] };
+
+function destinationKey(row: { kind?: GrantKind; device_id: string; endpoint_ref: string; provider?: string; account_ref?: string }, kind: GrantKind): string {
+  // Per review item 3: a target row with the same (device_id, endpoint_ref) conflicts,
+  // regardless of provider/account (stricter = fail closed).
+  return JSON.stringify([kind, row.device_id, row.endpoint_ref]);
+}
+
+/** Destination rows that collide with an existing target row or with each other. */
+export function findTargetConflicts(record: OAuthConnectorGrantRecord, to: string, destinations: OrphanRow[]): OrphanRow[] {
+  const existing = new Set<string>();
+  for (const [kind, rows] of [["page_assist", record.page_assist ?? []], ["webchat_control", record.webchat_control ?? []]] as const) {
+    for (const row of rows) if (row.connector_id === to) existing.add(destinationKey(row, kind));
+  }
+  const seen = new Set<string>();
+  const conflicts: OrphanRow[] = [];
+  for (const dest of destinations) {
+    const key = destinationKey(dest, dest.kind);
+    if (existing.has(key) || seen.has(key)) conflicts.push(dest);
+    seen.add(key);
+  }
+  return conflicts;
+}
+
+/**
+ * Whole-record write-back for a future --confirm: start from the RAW stored record so
+ * fields this writer does not know (top-level and per-row) are preserved, and rewrite
+ * only the planned rows. Pure: returns a new object, never mutates `raw`. Not called by
+ * any write path yet (confirm is refused).
+ */
+export function applyPlanToRawRecord(raw: Record<string, unknown>, plan: Extract<PlanResult, { ok: true }>): Record<string, unknown> {
+  const rewrite = (kind: GrantKind, rows: unknown): unknown => {
+    if (!Array.isArray(rows)) return rows;
+    return rows.map((row) => {
+      if (!row || typeof row !== "object") return row;
+      const r = row as Record<string, unknown>;
+      const hit = plan.moves.some((m) => m.kind === kind
+        && r.connector_id === m.from.connector_id && r.grant_generation === m.from.grant_generation
+        && r.device_id === m.from.device_id && r.endpoint_ref === m.from.endpoint_ref
+        && (kind !== "webchat_control" || (r.provider === m.from.provider && r.account_ref === m.from.account_ref)));
+      return hit ? { ...r, connector_id: plan.to_connector_id, grant_generation: plan.grant_generation } : { ...r };
+    });
+  };
+  const out: Record<string, unknown> = structuredClone(raw);
+  if ("page_assist" in raw) out.page_assist = rewrite("page_assist", structuredClone(raw.page_assist));
+  if ("webchat_control" in raw) out.webchat_control = rewrite("webchat_control", structuredClone(raw.webchat_control));
+  return out;
+}
 
 const CONNECTOR_ID = /^conn_[A-Za-z0-9_-]{8,128}$/;
 
@@ -69,11 +116,15 @@ export function planMigration(
   if (target.status !== "active") return { ok: false, code: "grant_record_not_active" };
   const generation = target.grant_generation;
   if (typeof generation !== "number" || !Number.isInteger(generation) || generation < 1) {
-    return { ok: false, code: "grant_record_not_active" };
+    return { ok: false, code: "grant_record_missing_field" };
   }
   const moves = listOrphans(target)
     .filter((row) => row.connector_id === from)
     .map((row) => ({ kind: row.kind, from: row, to: { ...row, connector_id: to, grant_generation: generation } }));
   if (moves.length === 0) return { ok: false, code: "migrate_no_matching_rows" };
+  // Target-side conflict: fail closed if a destination row already exists under the
+  // target connector, or two source rows would land on the same destination.
+  const conflicts = findTargetConflicts(target, to, moves.map((m) => m.to));
+  if (conflicts.length > 0) return { ok: false, code: "migrate_target_conflict", conflicts };
   return { ok: true, from_connector_id: from, to_connector_id: to, grant_generation: generation, moves };
 }
