@@ -461,15 +461,21 @@ export default {
       if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)
-        || Object.keys(parsed.value).some((key) => key !== "action" && key !== "from" && key !== "to")
-        || (parsed.value.action !== "list" && parsed.value.action !== "plan")) {
+        || Object.keys(parsed.value).some((key) => key !== "action" && key !== "from" && key !== "to" && key !== "device_id")
+        || (parsed.value.action !== "list" && parsed.value.action !== "plan")
+        || (parsed.value.device_id !== undefined && parsed.value.action !== "list")) {
         return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
+      if (parsed.value.device_id !== undefined
+        && (typeof parsed.value.device_id !== "string" || normalizeDeviceId(parsed.value.device_id) !== parsed.value.device_id)) {
+        return noStoreJsonResponse({ ok: false, code: "orphans_invalid_device_id" }, 400);
       }
       const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
       const result = await createOAuthPublicStore(stub).pageAssistOrphans({
         action: parsed.value.action,
         ...(typeof parsed.value.from === "string" ? { from: parsed.value.from } : {}),
         ...(typeof parsed.value.to === "string" ? { to: parsed.value.to } : {}),
+        ...(typeof parsed.value.device_id === "string" ? { device_id: parsed.value.device_id } : {}),
       });
       return noStoreJsonResponse(result.body, result.status);
     }

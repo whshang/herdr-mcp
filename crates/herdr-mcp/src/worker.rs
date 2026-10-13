@@ -378,9 +378,16 @@ pub fn run(command: WorkerCommand, language: Locale) -> Result<ExitCode, String>
             &account_ref,
             allowed,
         ),
-        WorkerCommand::ConnectorPageAssistOrphans { from, to } => {
-            connector_page_assist_orphans(&paths, from.as_deref(), to.as_deref())
-        }
+        WorkerCommand::ConnectorPageAssistOrphans {
+            from,
+            to,
+            device_id,
+        } => connector_page_assist_orphans(
+            &paths,
+            from.as_deref(),
+            to.as_deref(),
+            device_id.as_deref(),
+        ),
         WorkerCommand::ConnectorPageAssist {
             connector_id,
             device_id,
@@ -1483,6 +1490,7 @@ fn connector_page_assist_orphans(
     _paths: &RuntimePaths,
     _from: Option<&str>,
     _to: Option<&str>,
+    _device_id: Option<&str>,
 ) -> Result<ExitCode, String> {
     Err(
         "connector Page Assist orphans requires a supported enrolled-owner credential backend"
@@ -1497,8 +1505,13 @@ fn connector_page_assist_orphans(
     paths: &RuntimePaths,
     from: Option<&str>,
     to: Option<&str>,
+    device_id: Option<&str>,
 ) -> Result<ExitCode, String> {
-    let body = crate::grant_migration::orphans_request_body(from, to)?;
+    let body = match (from, to, device_id) {
+        (None, None, device_id) => crate::grant_migration::orphans_list_body(device_id)?,
+        (_, _, None) => crate::grant_migration::orphans_request_body(from, to)?,
+        _ => return Err("--device-id applies only to `connector page-assist orphans`".to_owned()),
+    };
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_owner_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;

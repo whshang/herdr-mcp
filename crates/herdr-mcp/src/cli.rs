@@ -217,6 +217,8 @@ pub enum WorkerCommand {
     ConnectorPageAssistOrphans {
         from: Option<String>,
         to: Option<String>,
+        /// Optional orphans-list filter (validated `dev_…`); never set for migrate.
+        device_id: Option<String>,
     },
     ConnectorPageAssist {
         connector_id: String,
@@ -1476,10 +1478,18 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                         Ok(Command::Worker(WorkerCommand::ConnectorPageAssistOrphans {
                             from: Some(from),
                             to: Some(to),
+                            device_id: None,
                         }))
                     }
                     crate::grant_migration::MigrateCli::Orphans => {
-                        Ok(Command::Worker(WorkerCommand::ConnectorPageAssistOrphans { from: None, to: None }))
+                        Ok(Command::Worker(WorkerCommand::ConnectorPageAssistOrphans { from: None, to: None, device_id: None }))
+                    }
+                    crate::grant_migration::MigrateCli::OrphansForDevice { device_id } => {
+                        Ok(Command::Worker(WorkerCommand::ConnectorPageAssistOrphans {
+                            from: None,
+                            to: None,
+                            device_id: Some(device_id),
+                        }))
                     }
                 };
             }
@@ -2394,7 +2404,7 @@ User path:\n\
   herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm  (enrolled owner device)\n\
   herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
-  herdr-mcp connector page-assist orphans [list]  (read-only: grant rows left under a previous connector)\n\
+  herdr-mcp connector page-assist orphans [list] [--device-id <device-id>]  (read-only: grant rows left under a previous connector)\n\
   herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id>  (dry run only; --confirm not implemented yet)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
   herdr-mcp automation list\n\
@@ -4070,7 +4080,8 @@ mod tests {
                 .command,
             Command::Worker(WorkerCommand::ConnectorPageAssistOrphans {
                 from: None,
-                to: None
+                to: None,
+                device_id: None
             })
         );
         assert_eq!(
@@ -4079,7 +4090,8 @@ mod tests {
                 .command,
             Command::Worker(WorkerCommand::ConnectorPageAssistOrphans {
                 from: None,
-                to: None
+                to: None,
+                device_id: None
             })
         );
         assert_eq!(
@@ -4097,6 +4109,7 @@ mod tests {
             Command::Worker(WorkerCommand::ConnectorPageAssistOrphans {
                 from: Some("conn_old000000001".to_owned()),
                 to: Some("conn_new000000001".to_owned()),
+                device_id: None,
             })
         );
         // --confirm write path refuses; missing selectors fail closed.

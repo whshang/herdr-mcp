@@ -251,6 +251,10 @@ pub fn apply_migration(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MigrateCli {
     Orphans,
+    /// `orphans [list] --device-id <dev_…>`: list only rows of that device.
+    OrphansForDevice {
+        device_id: String,
+    },
     Migrate {
         from: String,
         to: String,
@@ -275,6 +279,17 @@ pub fn parse_cli(args: &[String]) -> Option<Result<MigrateCli, String>> {
         Some("orphans") => Some(match &args[1..] {
             [] => Ok(MigrateCli::Orphans),
             [list] if list == "list" => Ok(MigrateCli::Orphans),
+            [flag, id] | [_, flag, id]
+                if flag == "--device-id" && (args.len() == 3 || args[1] == "list") =>
+            {
+                if valid_device_id(id) {
+                    Ok(MigrateCli::OrphansForDevice {
+                        device_id: id.clone(),
+                    })
+                } else {
+                    Err("connector page-assist orphans: --device-id requires a valid device id (orphans_invalid_device_id)".to_owned())
+                }
+            }
             _ => Err("connector page-assist orphans takes no arguments (only `list`)".to_owned()),
         }),
         Some("migrate") => Some(parse_migrate(&args[1..])),
@@ -322,6 +337,32 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
         return Err("connector page-assist migrate: --from and --to must differ".to_owned());
     }
     Ok(MigrateCli::Migrate { from, to, confirm })
+}
+
+/// Canonical device id: `dev_` + 26-char Crockford ULID (same rule as the Edge DO).
+pub fn valid_device_id(id: &str) -> bool {
+    id.strip_prefix("dev_").is_some_and(|ulid| {
+        ulid.len() == 26
+            && ulid.bytes().all(|b| {
+                b.is_ascii_digit()
+                    || (b.is_ascii_alphabetic()
+                        && !matches!(b.to_ascii_uppercase(), b'I' | b'L' | b'O' | b'U'))
+            })
+    })
+}
+
+/// Orphans list body, optionally filtered by device id. Fails closed on an invalid id.
+pub fn orphans_list_body(device_id: Option<&str>) -> Result<serde_json::Value, String> {
+    match device_id {
+        None => Ok(serde_json::json!({ "action": "list" })),
+        Some(id) if valid_device_id(id) => {
+            Ok(serde_json::json!({ "action": "list", "device_id": id }))
+        }
+        Some(_) => Err(
+            "connector page-assist orphans: invalid device id (orphans_invalid_device_id)"
+                .to_owned(),
+        ),
+    }
 }
 
 /// Request body for the read-only Edge route `/connectors/page-assist/orphans`.
@@ -624,6 +665,42 @@ mod tests {
         assert!(orphans_request_body(None, Some(NEW)).is_err());
         assert!(orphans_request_body(Some(NEW), Some(NEW)).is_err());
         assert!(orphans_request_body(Some("bogus"), Some(NEW)).is_err());
+    }
+
+    #[test]
+    fn orphans_device_filter_parses_and_fails_closed() {
+        const DEV: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        assert_eq!(
+            parse_cli(&s(&["orphans", "--device-id", DEV])),
+            Some(Ok(MigrateCli::OrphansForDevice {
+                device_id: DEV.into()
+            }))
+        );
+        assert_eq!(
+            parse_cli(&s(&["orphans", "list", "--device-id", DEV])),
+            Some(Ok(MigrateCli::OrphansForDevice {
+                device_id: DEV.into()
+            }))
+        );
+        for bad in [
+            vec!["orphans", "--device-id"],
+            vec!["orphans", "--device-id", "dev_short"],
+            vec!["orphans", "--device-id", "dev_01ARZ3NDEKTSV4RRFFQ69G5FAI"],
+            vec!["orphans", "--device-id", "-x"],
+            vec!["orphans", "x", "--device-id", DEV],
+            vec!["orphans", "--device-id", DEV, "extra"],
+        ] {
+            assert!(matches!(parse_cli(&s(&bad)), Some(Err(_))), "{bad:?}");
+        }
+        assert_eq!(
+            orphans_list_body(Some(DEV)).unwrap(),
+            serde_json::json!({"action": "list", "device_id": DEV})
+        );
+        assert_eq!(
+            orphans_list_body(None).unwrap(),
+            serde_json::json!({"action": "list"})
+        );
+        assert!(orphans_list_body(Some("bogus")).is_err());
     }
 
     #[test]

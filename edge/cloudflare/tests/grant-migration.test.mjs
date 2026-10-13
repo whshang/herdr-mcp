@@ -185,3 +185,41 @@ test("user Given records with missing fields When the owner lists or plans Then 
   assert.equal(snapshot(h.storage), before);
   assert.equal(h.storage.writes, 0);
 });
+
+test("user Given orphans on two devices When the owner lists orphans with --device-id Then only that device's rows are returned and nothing is written", async () => {
+  const OTHER = "dev_01HYYYYYYYYYYYYYYYYYYYYYYY";
+  const rec = record();
+  rec.page_assist.push({ ...pa(OLD, "ep5"), device_id: OTHER });
+  const h = harness(rec);
+  const before = snapshot(h.storage);
+  const mine = await h.post({ action: "list", device_id: DEV });
+  assert.equal(mine.status, 200);
+  assert.equal(mine.body.orphans.length, 3);
+  assert.ok(mine.body.orphans.every((o) => o.device_id === DEV));
+  const other = await h.post({ action: "list", device_id: OTHER });
+  assert.deepEqual(other.body.orphans.map((o) => o.endpoint_ref), ["ep5"]);
+  assert.equal(snapshot(h.storage), before);
+  assert.equal(h.storage.writes, 0);
+});
+
+test("user Given no orphans on a device When the owner lists orphans for that device Then the list is empty", async () => {
+  const h = harness();
+  const res = await h.post({ action: "list", device_id: "dev_01HXXXXXXXXXXXXXXXXXXXXXXX" });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.orphans, []);
+  assert.equal(h.storage.writes, 0);
+});
+
+test("user Given an invalid device id When the owner lists orphans Then it fails closed with orphans_invalid_device_id and writes nothing", async () => {
+  const h = harness();
+  const before = snapshot(h.storage);
+  for (const device_id of ["dev_short", "bogus", "dev_01HZZZZZZZZZZZZZZZZZZZZZZI", 7, null, ""]) {
+    const res = await h.post({ action: "list", device_id });
+    assert.equal(res.status, 400, JSON.stringify(device_id));
+    assert.deepEqual(res.body, { ok: false, code: "orphans_invalid_device_id" });
+  }
+  const plan = await h.post({ action: "plan", from: OLD, to: NEW, device_id: DEV });
+  assert.deepEqual(plan.body, { ok: false, code: "bad_request" });
+  assert.equal(snapshot(h.storage), before);
+  assert.equal(h.storage.writes, 0);
+});

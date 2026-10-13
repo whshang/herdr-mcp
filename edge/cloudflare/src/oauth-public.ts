@@ -150,7 +150,7 @@ export interface OAuthPublicStore {
     allowed: boolean;
     changed_by: string;
   }): Promise<OAuthConnectorGrantRecord | null>;
-  pageAssistOrphans(input: { action: "list" | "plan"; from?: string; to?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
+  pageAssistOrphans(input: { action: "list" | "plan"; from?: string; to?: string; device_id?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
   setPageAssistGrant(input: {
     connector_id: string;
     device_id: string;
