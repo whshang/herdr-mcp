@@ -107,7 +107,7 @@ as Conclusion / Change / Acceptance.
 
 ### (e) Proposals: bounded, keyed, expiring, and revoke-aware
 
-> **Superseded by §7 (decided, pending herdr ack):** #630 uses plan digest +
+> **Superseded by §7 (decided):** #630 uses plan digest +
 > idempotency key (§7.3) instead of stored two-step proposals. The text below is kept
 > for history only.
 
@@ -304,8 +304,8 @@ provider-facing `caller_grant_missing` body all stay unchanged.
   plus `audit_id`.
 - Written in the same transaction as the rows, so the rows and their audit entry
   always commit or roll back together.
-- Rejected confirms are not stored. The route returns the fixed code and logs it,
-  with no record write.
+- Rejected confirms never touch the grant record. They go to a separate slim reject
+  ring (see 7.8 Q4).
 - `normalizeConnectorGrant` must not drop `audit` on unrelated write-backs. This
   overlaps with item 7.6(1).
 
@@ -366,6 +366,20 @@ Unit/DO (StorageMock with a write counter and an injectable `put` failure):
   `migrate_cross_device_rows` and zero writes. An unresolved legacy device gets
   403. A non-owner gets 401.
 - Audit entries are appended, bounded at 64, and carry `by=device:<id>`.
+- Rejected confirm (each stage):
+  - Exactly one new slim entry appears in `migrate-reject-audit:v1:<device_id>`.
+    Its key set is exactly `{v, at_ms, code, stage, device_id, plan_digest,
+    idempotency_key_sha256_8}`, and no forbidden value (client_id, endpoint_ref,
+    account_ref, raw key) appears anywhere in it.
+  - All `grant:` records are byte-identical.
+  - The success `audit[]` is unchanged.
+  - No `migrate-idem:` key is written.
+  - Exactly one log line is emitted.
+- Reject ring cap: 65 rejects leave 64 entries, and the oldest is evicted. 100
+  rejects followed by a success: the success audit entry is present and the
+  earlier success entries are intact.
+- Auth-failure rejects write nothing (log only).
+- A reject-audit write failure (injected) still returns the original code.
 - Round-trip and check-order parity fixtures (7.6) pass in both Rust and Edge.
 
 Route level (`device-pairing-worker.test.mjs`): the auth matrix
@@ -391,13 +405,13 @@ Real-usage verification (needed before enabling, on a staging Edge):
 - Revoke after confirm still fails closed.
 - Check the audit entry via the owner diagnostics.
 
-### 7.8 Resolved questions (decided, pending herdr ack)
+### 7.8 Resolved questions
 
-- **Q1 — per-device only.** Confirm applies only rows whose `device_id` equals the
+- **Q1 — per-device only.** _(decided)_ Confirm applies only rows whose `device_id` equals the
   authenticated owner device (§7.1 step 5). There is no `--all-devices` in #630.
   Future: a cross-device migrate would need fleet-admin auth plus an explicit
   `--all-devices` flag and a separate design; it is out of scope.
-- **Q2 — separate DO keys.**
+- **Q2 — separate DO keys.** _(decided)_
   - Key format: `migrate-idem:v1:<device_id>:<idempotency_key>`.
     `device_id` matches `^dev_[0-9A-HJKMNP-TV-Z]{26}$` and `idempotency_key`
     matches `^[A-Za-z0-9_-]{16,64}$`. Both are validated before the key is built,
@@ -415,40 +429,39 @@ Real-usage verification (needed before enabling, on a staging Edge):
   - Revoke of a grant record does not need to touch these entries. A replay after
     revoke returns the stored past result, which reports a historical success and
     grants nothing; any new key re-plans and fails closed.
-- **Q3 — digest + idempotency replaces §1(e).** There are no stored proposals. The
+- **Q3 — digest + idempotency replaces §1(e).** _(decided)_ There are no stored proposals. The
   dry run returns `plan_digest`; confirm must present it, and the server recomputes
   the plan in-transaction. §1(e) is marked superseded.
-- **Q4 — rejected confirms: logged only, no stored audit.** A rejection performs
-  **zero storage writes**: no audit entry, no idempotency entry, and no counter. The
-  route emits exactly one structured log line (`console.log` JSON, one object):
-  ```
-  { "event": "page_assist_migrate_rejected",
-    "v": 1,
-    "at_ms": <number>,
-    "code": "<fixed code, e.g. migrate_plan_stale>",
-    "status": <http status>,
-    "stage": "auth|validate|idempotency|replan|digest|device_scope|postcondition|storage",
-    "by": "device:<dev_…>" | null,
-    "from_connector_id": "<conn_…>" | null,
-    "to_connector_id": "<conn_…>" | null,
-    "idempotency_key_sha256_8": "<first 8 hex of sha256(key)>" | null,
-    "plan_digest_8": "<first 8 hex of client digest>" | null,
-    "invalid_records": <number> | null,
-    "rows_in_fresh_plan": <number> | null }
-  ```
-  - The line never includes `client_id`, `endpoint_ref`, `provider`, `account_ref`,
-    the raw idempotency key, credentials, or request bodies. Connector ids are
-    included only after validation (else `null`).
-  - `by` is `null` when auth failed.
-  - Successful confirms emit `page_assist_migrate_applied` with the same fields
-    plus `audit_id` and `moved`; their durable record is the stored audit entry
-    (§7.5).
-  - Tests assert:
-    - a rejected confirm produces zero writes and exactly one log line with this
-      key set;
-    - no forbidden field ever appears in that line;
-    - stored audit is unchanged after a rejection.
-- **Q5 — hand-written three-state deserializer, no new dependency.**
+- **Q4 — rejected confirms: slim stored audit + log line.** _(decided (herdr))_
+  - Grant rows untouched: the main confirm transaction is rolled back (or never
+    writes), and no idempotency entry is stored for a reject.
+  - **Slim reject audit entry**, written in a *separate* `storage.transaction`
+    started only after the main transaction has rolled back or returned. It holds
+    exactly these fields:
+    `{v: 1, at_ms, code, stage, device_id, plan_digest, idempotency_key_sha256_8}`.
+    - `code` is a fixed code. `stage` is one of
+      `validate|idempotency|replan|digest|device_scope|postcondition|storage`.
+    - `device_id` is the authenticated `dev_…`.
+    - `plan_digest` is the client-supplied digest, but only if it matches
+      `^[0-9a-f]{64}$`; otherwise `null`.
+    - `idempotency_key_sha256_8` is the first 8 hex characters of SHA-256 of the
+      key, or `null`.
+    - It never contains record contents, `client_id`, `endpoint_ref`, `provider`,
+      `account_ref`, the raw idempotency key, credentials, or the request body.
+  - **Separate bounded ring:** DO key `migrate-reject-audit:v1:<device_id>`.
+    - Value: `{v: 1, entries: [...]}`, at most 64 entries per device. The oldest
+      entry is evicted first.
+    - It is stored apart from the grant record's success `audit[]`. Reject spam
+      therefore can never evict success audit entries, and it never rewrites a
+      grant record.
+  - **When it is written:**
+    - It is written only when an authenticated device id exists. Auth failures
+      (401/403 unresolved) have no device to key on, so they get the log line only.
+    - If writing the reject audit itself fails, the original rejection code is
+      still returned and the log line records `reject_audit_write_failed: true`.
+  - The structured log line (`page_assist_migrate_rejected`, fields above) is kept
+    in addition to the stored entry.
+- **Q5 — hand-written three-state deserializer, no new dependency.** _(decided)_
   - In `grant_migration.rs`, add `enum Field<T> { Absent, Null, Value(T) }` with
     `Default = Absent`.
   - A manual `Deserialize` maps JSON `null` to `Null` and a value to `Value`.
