@@ -372,7 +372,12 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
     if from == to {
         return Err("connector page-assist migrate: --from and --to must differ".to_owned());
     }
-    Ok(MigrateCli::Migrate { from, to, confirm, idempotency_key })
+    Ok(MigrateCli::Migrate {
+        from,
+        to,
+        confirm,
+        idempotency_key,
+    })
 }
 
 /// #630 §7.3: client idempotency key charset/length, same rule as the Edge DO.
@@ -741,7 +746,10 @@ mod tests {
         // #630 review: the dry-run body never carries a client device_id — the
         // Edge injects the authenticated registry device server-side.
         let plan_body = orphans_request_body(Some(OLD), Some(NEW)).unwrap();
-        assert_eq!(plan_body, serde_json::json!({"action": "plan", "from": OLD, "to": NEW}));
+        assert_eq!(
+            plan_body,
+            serde_json::json!({"action": "plan", "from": OLD, "to": NEW})
+        );
         assert!(plan_body.get("device_id").is_none());
         assert!(orphans_request_body(Some(OLD), None).is_err());
         assert!(orphans_request_body(None, Some(NEW)).is_err());
@@ -805,7 +813,14 @@ mod tests {
         );
         assert_eq!(
             parse_cli(&s(&[
-                "migrate", "--from", OLD, "--to", NEW, "--idempotency-key", "rust-key-00000001", "--confirm"
+                "migrate",
+                "--from",
+                OLD,
+                "--to",
+                NEW,
+                "--idempotency-key",
+                "rust-key-00000001",
+                "--confirm"
             ])),
             Some(Ok(MigrateCli::Migrate {
                 from: OLD.into(),

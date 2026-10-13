@@ -392,12 +392,7 @@ pub fn run(command: WorkerCommand, language: Locale) -> Result<ExitCode, String>
             from,
             to,
             idempotency_key,
-        } => connector_page_assist_migrate(
-            &paths,
-            &from,
-            &to,
-            idempotency_key.as_deref(),
-        ),
+        } => connector_page_assist_migrate(&paths, &from, &to, idempotency_key.as_deref()),
         WorkerCommand::ConnectorPageAssist {
             connector_id,
             device_id,
@@ -1584,7 +1579,10 @@ fn connector_page_assist_migrate(
     // 1. Device-scoped dry run: the plan and its digest cover only this device.
     let plan_body = crate::grant_migration::orphans_request_body(Some(from), Some(to))?;
     let plan_response = client
-        .post(endpoint(&identity.edge_origin, "/connectors/page-assist/orphans")?)
+        .post(endpoint(
+            &identity.edge_origin,
+            "/connectors/page-assist/orphans",
+        )?)
         .headers(headers.clone())
         .json(&plan_body)
         .send()
@@ -1617,7 +1615,10 @@ fn connector_page_assist_migrate(
         "idempotency_key": key,
     });
     let response = client
-        .post(endpoint(&identity.edge_origin, "/connectors/page-assist/migrate")?)
+        .post(endpoint(
+            &identity.edge_origin,
+            "/connectors/page-assist/migrate",
+        )?)
         .headers(headers)
         .json(&confirm_body)
         .send()
@@ -1628,16 +1629,18 @@ fn connector_page_assist_migrate(
         serde_json::to_string_pretty(&payload)
             .map_err(|error| format!("cannot encode migrate result: {error}"))?
     );
-    Ok(if payload.get("ok") == Some(&serde_json::Value::Bool(true)) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(
+        if payload.get("ok") == Some(&serde_json::Value::Bool(true)) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        },
+    )
 }
 
 /// Random idempotency key from time + pid (hex subset of the allowed charset,
-/// >=16 chars). No new dependency; uniqueness within a CLI invocation stream is
-/// sufficient for the 24h server TTL.
+/// at least 16 chars). No new dependency; uniqueness within a CLI invocation
+/// stream is sufficient for the 24h server TTL.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn generate_idempotency_key() -> String {
     let nanos = std::time::SystemTime::now()
