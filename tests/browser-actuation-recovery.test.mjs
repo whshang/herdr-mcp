@@ -11,6 +11,18 @@ const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "b
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
+function backgroundConstantNumber(name) {
+  const match = backgroundSource.match(new RegExp(`const\\s+${name}\\s*=\\s*(\\d[\\d_]*)\\s*;`));
+  assert.ok(match, `${name} must remain declared in extension/background.js`);
+  return Number(match[1].replaceAll("_", ""));
+}
+
+const BROWSER_CREATE_CONTENT_TIMEOUT_MS = backgroundConstantNumber("BROWSER_CREATE_CONTENT_TIMEOUT_MS");
+const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = backgroundConstantNumber("BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS");
+// The late-content-script scenario uses a ready delay that must stay inside the
+// production handshake window; the assertions below pin both bounds.
+const LATE_CONTENT_SCRIPT_READY_MS = 12_000;
+
 test("user scrolls a browser page | Given a typed Rust actuation payload | When the extension bridge forwards it | Then direction and amount reach the normal Page Assist action path", () => {
   const start = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
   const end = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', start);
@@ -458,7 +470,7 @@ const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteW
 assert.ok(registrationStart >= 0 && registrationEnd > registrationStart, "registration helper must remain extractable");
 const registrationSource = wakeSource.slice(registrationStart, registrationEnd);
 const projectIdentityEnd = wakeSource.indexOf(
-  '\n  async function registerCurrentConversation(reason = "startup")',
+  "\n  const registrationInFlight = new Map();",
   projectIdentityStart,
 );
 assert.ok(projectIdentityStart >= 0 && projectIdentityEnd > projectIdentityStart, "provider project identity helper must remain extractable");
@@ -2218,7 +2230,7 @@ test("page identity handshake lazily recovers only opaque Browser Registry ident
     wakeSource.indexOf('if (msg?.type === "h2w_get_convkey")'),
     wakeSource.indexOf('if (msg?.type === "h2w_snapshot_turn")'),
   );
-  assert.match(identitySegment, /registerCurrentConversation\("identity-recovery"\)/);
+  assert.match(identitySegment, /registerCurrentConversation\("identity-recovery", \{ refreshObservation \}\)/);
   assert.match(identitySegment, /return true;/);
   assert.match(identitySegment, /const identityMatchesRoute = Boolean\(convKey && registeredConvKey === convKey\)/);
   assert.match(identitySegment, /browserSessionRef:\s*identityMatchesRoute \? registeredBrowserSessionRef : null/);
@@ -2298,27 +2310,23 @@ test("conversation registration fences route changes before and after async back
   assert.ok(fences[1] > send, "stale registration response must not overwrite the current route identity");
 });
 
-test("newer same-route browser registration wins when responses arrive out of order", async () => {
+test("user shares one in-flight registration per conversation | Given concurrent same-route registration callers | When both callers await | Then exactly one h2w_register is sent and both receive the same result", async () => {
   const harness = registrationHarness();
   const first = harness.register("first");
-  await flushRegistrationToSend(harness);
   const second = harness.register("second");
-  for (let i = 0; i < 4; i += 1) await Promise.resolve();
-  assert.equal(harness.pending.length, 2);
+  await flushRegistrationToSend(harness);
+  assert.equal(harness.pending.length, 1, "concurrent same-route callers must not start a second attempt");
 
-  harness.pending[1].resolve({ browser_session_ref: "br_new", browser_generation: 9, bound: false });
-  await second;
+  harness.pending[0].resolve({ browser_session_ref: "br_one", browser_generation: 9, bound: false });
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(firstResult, secondResult, "both callers share the same registration result");
+  assert.equal(firstResult?.browser_session_ref, "br_one");
   assert.deepEqual(harness.state(), {
     convKey: "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-    sessionRef: "br_new",
+    sessionRef: "br_one",
     generation: 9,
-    attempt: 2,
+    attempt: 1,
   });
-
-  harness.pending[0].resolve({ browser_session_ref: "br_old_late", browser_generation: 8, bound: false });
-  await first;
-  assert.equal(harness.state().sessionRef, "br_new");
-  assert.equal(harness.state().generation, 9);
 });
 
 test("A to B to A registration cannot resurrect an older A response", async () => {
@@ -3741,7 +3749,7 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.doesNotMatch(createSegment, /evidence\.required_apps_readback = appSelection\.apps/);
   assert.match(createSegment, /requiredApps,/);
 
-  const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
+  const registrationStart = wakeSource.indexOf('async function runConversationRegistration');
   const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch", registrationStart);
   assert.ok(registrationStart >= 0 && registrationEnd > registrationStart);
   const registrationSegment = wakeSource.slice(registrationStart, registrationEnd);
@@ -4067,9 +4075,11 @@ function createActuationBranchHarness({
   publishOnProbe = true,
   publishOnProbeAttempt = 1,
   contentMode = "success",
+  probeReadyAfterMs = 0,
 } = {}) {
-  // Virtual clock: the old 8s scope-gate deadline must elapse immediately so a
-  // harness that models the no-probe failure returns fast.
+  // Virtual clock: each 200ms handshake-loop tick advances the clock, so the
+  // scope-gate deadline (BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS) elapses
+  // after a bounded number of cheap synchronous iterations.
   const clock = { value: 1_000_000 };
   const dateShim = { now: () => clock.value };
   const setTimeoutShim = (fn) => { clock.value += 200; fn(); return 0; };
@@ -4082,6 +4092,7 @@ function createActuationBranchHarness({
   const removedTabs = [];
   let nextTabId = 100;
   let identityProbeAttempts = 0;
+  let firstIdentityProbeAt = 0;
   const liveScopesByTab = new Map();
 
   const chrome = {
@@ -4107,6 +4118,13 @@ function createActuationBranchHarness({
       async sendMessage(tabId, message) {
         if (message?.type === "h2w_get_convkey") {
           identityProbeAttempts += 1;
+          if (!firstIdentityProbeAt) firstIdentityProbeAt = clock.value;
+          // Content scripts inject at document_idle: on a slow network the
+          // identity handshake rejects until the content script becomes ready.
+          if (probeReadyAfterMs > 0
+              && clock.value - firstIdentityProbeAt < probeReadyAfterMs) {
+            throw new Error("Could not establish connection. Receiving end does not exist.");
+          }
           if (publishOnProbe && identityProbeAttempts >= publishOnProbeAttempt) {
             // The content-script identity handshake drives lazy registration,
             // which publishes the tab's Browser Registry scope on the next poll.
@@ -4188,7 +4206,8 @@ function createActuationBranchHarness({
     "browserConversationInfo", "browserConversationInfoFromSupportedUrl",
     "sendTabMessageWithTimeout",
     "postBrowserActuationEvidence", "protectBoundTab", "sendBrowserActuationTabMessage",
-    "unavailableBrowserActuationEvidence", "BROWSER_CREATE_CONTENT_TIMEOUT_MS", "Date", "setTimeout",
+    "unavailableBrowserActuationEvidence", "BROWSER_CREATE_CONTENT_TIMEOUT_MS",
+    "BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS", "Date", "setTimeout",
     `async function __actuate(command) {\n` +
     `const actuationId = String(command?.actuation_id || "");\n` +
     `const dispatchId = String(command?.dispatch_id || "");\n` +
@@ -4200,7 +4219,7 @@ function createActuationBranchHarness({
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
     sendTabMessageWithTimeout,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
-    unavailable, 43_000, dateShim, setTimeoutShim);
+    unavailable, BROWSER_CREATE_CONTENT_TIMEOUT_MS, BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS, dateShim, setTimeoutShim);
 
   return {
     actuate,
@@ -4307,6 +4326,116 @@ test("user Given a late ChatGPT content script When create retries read-only ide
     harness.postCalls.some((call) => call.evidence?.result?.error === "browser_create_scope_unavailable"),
     false,
   );
+});
+
+test("user keeps the create-scope handshake window ahead of a slow content script | Given the create-scope handshake timeout declared in background.js | When the 12s-ready scenario is compared with the fixed bounds | Then the handshake timeout is at least 25s and the scenario is strictly between 8s and that timeout", () => {
+  assert.ok(
+    BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS >= 25_000,
+    `create-scope handshake timeout must stay >= 25_000ms, got ${BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS}`,
+  );
+  assert.ok(
+    LATE_CONTENT_SCRIPT_READY_MS > 8000
+      && LATE_CONTENT_SCRIPT_READY_MS < BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS,
+    `the 12s-ready scenario (${LATE_CONTENT_SCRIPT_READY_MS}ms) must lie strictly between 8000ms and ${BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS}ms`,
+  );
+});
+
+test("user create still completes after document_idle injection | Given a freshly created tab whose identity probes reject and whose scope is not registered until ~12s after tab creation | When the content script becomes ready and publishes the matching scope | Then the create command is delivered to that tab instead of failing with scope_unavailable", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness({ probeReadyAfterMs: LATE_CONTENT_SCRIPT_READY_MS });
+  const sourceTabId = 71;
+  harness.browserTabScopes.set(sourceTabId, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(sourceTabId, { id: sourceTabId, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+  // The freshly-created tab (id 100) publishes its scope only once its content
+  // script becomes ready ~12s after tab creation, after many rejected probes.
+  harness.liveScopesByTab.set(100, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "c".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "c".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+
+  assert.ok(
+    harness.identityProbeAttempts() >= 20,
+    "the handshake must keep probing on a bounded cadence while the content script is not ready",
+  );
+  assert.deepEqual(
+    harness.actuationMessages.map((message) => message.tabId),
+    [100],
+    "the create command must be delivered to the freshly-created tab once the scope arrives",
+  );
+  assert.equal(
+    harness.actuationMessages[0].message.command.operation,
+    "herdr_mcp.browser_session.create",
+  );
+  const success = harness.postCalls.find((call) => call.evidence?.resource_available === true);
+  assert.ok(success, "a scope published ~12s after tab creation must still complete the create actuation");
+  assert.equal(success.evidence.command_accepted, true);
+  assert.equal(
+    harness.postCalls.some((call) => call.evidence?.result?.error === "browser_create_scope_unavailable"),
+    false,
+  );
+});
+
+test("user create fails closed at the extended handshake deadline | Given the fresh tab's content script never becomes ready and no scope is published before the 30s scope deadline | When the create actuation settles | Then browser_create_scope_unavailable is reported with phase scope_handshake, nothing submitted, and the tab removed", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness({ probeReadyAfterMs: 60_000 });
+  const sourceTabId = 71;
+  harness.browserTabScopes.set(sourceTabId, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(sourceTabId, { id: sourceTabId, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+  harness.liveScopesByTab.set(100, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "d".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "d".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+
+  assert.equal(harness.actuationMessages.length, 0, "no create command may be submitted without a matching scope");
+  const failure = harness.postCalls.find((call) => call.evidence?.resource_available === false);
+  assert.ok(failure, "a scope that never arrives before the deadline must fail closed");
+  assert.equal(failure.evidence.command_accepted, false);
+  assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
+  assert.equal(failure.evidence.result?.phase, "scope_handshake");
+  assert.equal(failure.evidence.result?.scope_failure, "content_script_unavailable");
+  assert.equal(failure.evidence.result?.message_submitted, false);
+  assert.equal(failure.evidence.result?.tab_opened, true);
+  assert.equal(failure.evidence.result?.tab_closed, true);
+  assert.equal(failure.evidence.result?.tab_cleanup_verified, true);
+  assert.deepEqual(harness.removedTabs, [100]);
+  assert.equal(harness.tabs.has(100), false);
+  assert.equal(harness.tabs.has(sourceTabId), true, "scope cleanup must not close the user's anchor tab");
 });
 
 test("user receives a precise boundary reason | Given fresh create content reports unavailable without a reason | When background settles the actuation | Then the missing content reason is classified", async () => {

@@ -56,8 +56,9 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.200";
+const H2W_SCRIPT_VERSION = "0.1.202";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
+const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -3726,7 +3727,7 @@ async function handleBrowserActuation(command) {
     let lastObservedScope = null;
     let identityProbeResponded = false;
     let identityProbeFailed = false;
-    const scopeDeadline = Date.now() + 8000;
+    const scopeDeadline = Date.now() + BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS;
     let nextProbeAt = 0;
     let probeInFlight = false;
     do {
@@ -3743,7 +3744,7 @@ async function handleBrowserActuation(command) {
       // A freshly-created ChatGPT tab publishes its Browser Registry scope only
       // after its content script registers the current conversation. The first
       // identity probe can legitimately race content-script injection, so retry
-      // this read-only handshake on a bounded cadence until the existing 8s
+      // this read-only handshake on a bounded cadence until the 30s
       // scope deadline. Never overlap probes and never retry the create/message
       // mutation itself. The create command remains gated on the exact
       // account/space/generation equality checks above.

@@ -13,12 +13,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-// Edge's default tool-request deadline is 30s. Keep one browser actuation wait
-// above the 15s extension heartbeat while leaving room for bounded create
-// reconciliation plus HTTP/serialization overhead before the outer request
-// can turn a durable reservation/dispatch into an ambiguous gateway timeout.
+// The 22s wait covers ordinary browser actuation inside Edge's 30s default
+// tool-request deadline (above the 15s extension heartbeat, with room for
+// HTTP/serialization overhead). The session-create wait instead bounds the
+// extension's full create worst case: the 30s create-scope content-script
+// handshake plus the 43s content acceptance leg. It deliberately exceeds the
+// Edge/Link public request budgets; a create that settles after the caller's
+// budget returns `uncertain` and is reconciled by same-key replay (readback),
+// never re-dispatched. Late completions arriving after this wait stay
+// retained for BROWSER_LATE_COMPLETION_TTL so the replay can promote them.
 const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(22);
-const BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT: Duration = Duration::from_secs(53);
+const BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT: Duration = Duration::from_secs(80);
 const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
 const BROWSER_ACTUATION_ENDPOINT_PARAM: &str = "__herdr_browser_endpoint_ref";
 // The extension polls for browser actuation on the shared SSE heartbeat. Keep
@@ -437,13 +442,18 @@ mod tests {
     }
 
     #[test]
-    fn browser_actuation_timeout_leaves_edge_request_headroom() {
+    fn browser_actuation_timeouts_cover_ordinary_edge_and_create_budgets() {
         assert!(BROWSER_EXTENSION_LIVE_WINDOW > SSE_HEARTBEAT);
         assert!(BROWSER_ACTUATION_TIMEOUT > SSE_HEARTBEAT);
         assert!(BROWSER_ACTUATION_TIMEOUT <= Duration::from_secs(22));
         assert!(BROWSER_ACTUATION_TIMEOUT < Duration::from_secs(30));
         assert!(BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT > BROWSER_ACTUATION_TIMEOUT);
-        assert!(BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT < Duration::from_secs(60));
+        // The create wait bounds the extension-side create worst case: the 30s
+        // create-scope content-script handshake plus the 43s content acceptance
+        // leg (see BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS and
+        // BROWSER_CREATE_CONTENT_TIMEOUT_MS in extension/background.js).
+        assert!(BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT > Duration::from_secs(30 + 43));
+        assert!(BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT <= Duration::from_secs(80));
     }
 
     #[tokio::test]

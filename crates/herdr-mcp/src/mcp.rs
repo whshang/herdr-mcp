@@ -3482,10 +3482,12 @@ fn browser_session_create_success(
     })
 }
 
-// Keep the whole create call inside the upstream 30s request budget after the
-// browser broker's bounded actuation wait. Twenty intervals add at most 5s,
-// leaving the caller enough time to receive the durable reservation/session
-// identity instead of seeing an outer gateway timeout first.
+// Bound the post-wait dispatch-reconciliation sweep to ~5s after the browser
+// broker's 80s create actuation wait. Callers that budget for the create
+// (local CLI 90s) must stay above the actuation wait plus this sweep so the
+// durable reservation/session identity is returned instead of a caller-side
+// timeout; Edge/Link callers already cap below the wait and reconcile by
+// same-key replay.
 const BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS: usize = 21;
 const BROWSER_SESSION_CREATE_PRODUCTION_RECONCILE_INTERVAL_MS: u64 = 250;
 #[cfg(not(test))]

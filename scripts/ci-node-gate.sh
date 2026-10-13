@@ -31,7 +31,8 @@ case "${MODE}" in
       tests/pack-extension.test.mjs \
       tests/page-assist-content.test.mjs \
       tests/page-assist-core.test.mjs \
-      tests/queued-insert.test.mjs
+      tests/queued-insert.test.mjs \
+      tests/registration-single-flight.test.mjs
     node tests/manual/extension_smoke.mjs
     node tests/manual/background_bind_test.mjs
     ;;

@@ -764,9 +764,16 @@ fn call_private_with_context(
     }
 }
 
+// browser_session.create waits out the runtime broker's 80s create actuation
+// plus a 22s late-acceptance readback actuation (BROWSER_ACTUATION_TIMEOUT,
+// mcp.rs browser_session_create_late_acceptance_readback) and the ~5.25s
+// post-wait reconciliation sweep; 115s keeps the local caller alive to receive
+// the settled reservation instead of a client-side timeout that would force a
+// same-key replay. It stays under LOCAL_MCP_MAX_TIMEOUT_MS (120s) in
+// link/local_mcp.rs. Other private calls keep the 30s default.
 fn local_private_timeout_ms(method: &str) -> u64 {
     if method == "herdr_mcp.browser_session.create" {
-        60_000
+        115_000
     } else {
         30_000
     }
@@ -918,7 +925,7 @@ mod tests {
     fn browser_session_create_gets_the_extended_local_call_budget_only() {
         assert_eq!(
             local_private_timeout_ms("herdr_mcp.browser_session.create"),
-            60_000
+            115_000
         );
         assert_eq!(
             local_private_timeout_ms("herdr_mcp.browser_session.open"),
