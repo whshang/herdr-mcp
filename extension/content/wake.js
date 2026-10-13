@@ -2669,7 +2669,7 @@ function normalizeHerdrMentionAlias(value) {
     // session.create waits longer for the exact accepted user-message ref: the
     // first provider snapshot of a brand-new conversation can lag (live Phase 2
     // A1 returned uncertain at 6s and was never promoted). The runtime create
-    // actuation timeout (53s) bounds this; a response after the caller's budget
+    // actuation timeout (80s) bounds this; a response after the caller's budget
     // becomes a late completion that a same-key replay reconciles to applied.
     const deadline = Date.now() + (creatingSession ? 20000 : 6000);
     do {

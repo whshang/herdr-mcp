@@ -4344,7 +4344,7 @@ test("user keeps the create-scope handshake window ahead of a slow content scrip
   );
 });
 
-test("user's create still completes after document_idle injection | Given a freshly created tab whose identity probes reject and whose scope is not registered until ~12s after tab creation | When the content script becomes ready and publishes the matching scope | Then the create command is delivered to that tab instead of failing with scope_unavailable", async () => {
+test("user create still completes after document_idle injection | Given a freshly created tab whose identity probes reject and whose scope is not registered until ~12s after tab creation | When the content script becomes ready and publishes the matching scope | Then the create command is delivered to that tab instead of failing with scope_unavailable", async () => {
   const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
   const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
@@ -4397,7 +4397,7 @@ test("user's create still completes after document_idle injection | Given a fres
   );
 });
 
-test("user's create fails closed at the extended handshake deadline | Given the fresh tab's content script never becomes ready and no scope is published before the 30s scope deadline | When the create actuation settles | Then browser_create_scope_unavailable is reported with phase scope_handshake, nothing submitted, and the tab removed", async () => {
+test("user create fails closed at the extended handshake deadline | Given the fresh tab's content script never becomes ready and no scope is published before the 30s scope deadline | When the create actuation settles | Then browser_create_scope_unavailable is reported with phase scope_handshake, nothing submitted, and the tab removed", async () => {
   const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
   const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
