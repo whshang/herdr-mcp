@@ -24,6 +24,25 @@
     "cc-csc",
   ]);
 
+  // Fixed single-key vocabulary shared with the Runtime validation. No text,
+  // no modifier combos, no caller-controlled raw key codes.
+  const PRESS_KEY_EVENTS = {
+    Enter: { key: "Enter", code: "Enter", keyCode: 13 },
+    Escape: { key: "Escape", code: "Escape", keyCode: 27 },
+    Tab: { key: "Tab", code: "Tab", keyCode: 9 },
+    Backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+    Delete: { key: "Delete", code: "Delete", keyCode: 46 },
+    ArrowUp: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+    ArrowDown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+    ArrowLeft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+    ArrowRight: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+    Home: { key: "Home", code: "Home", keyCode: 36 },
+    End: { key: "End", code: "End", keyCode: 35 },
+    PageUp: { key: "PageUp", code: "PageUp", keyCode: 33 },
+    PageDown: { key: "PageDown", code: "PageDown", keyCode: 34 },
+    Space: { key: " ", code: "Space", keyCode: 32 },
+  };
+
   function isSensitiveField(el) {
     if (!el) return false;
     const tag = (el.tagName || "").toLowerCase();
@@ -200,7 +219,7 @@
     if (!doc) return { ok: false, error: "document_unavailable" };
 
     const candidates = doc.querySelectorAll(
-      'button, a[href], input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
+      'button, a[href], input, textarea, select, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
     );
 
     const elements = [];
@@ -322,6 +341,73 @@
       ok: true, ref, generation,
       text: cleanText(raw, maxChars),
       truncated: raw.length > maxChars,
+    };
+  }
+
+  const MAX_TABLE_CELL_CHARS = 200;
+  const MAX_TABLE_COLUMNS = 32;
+
+  function executeExtractTable(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const generation = String(params.generation || "").trim();
+    if (!generation || generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    const ref = String(params.ref || "");
+    if (!ref.startsWith(`ref_${generation}_`)) return { ok: false, error: "invalid_ref" };
+    const maxRows = params.maxRows === undefined ? 25 : params.maxRows;
+    if (!Number.isInteger(maxRows) || maxRows < 1 || maxRows > 100) {
+      return { ok: false, error: "extract_table_params_invalid" };
+    }
+    const el = elementMap.get(ref);
+    if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+    if ((el.tagName || "").toLowerCase() !== "table") return { ok: false, error: "unsupported_element" };
+    if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
+      return { ok: false, error: "unsupported_element" };
+    }
+
+    // Visible cell text only, through the same projection as extract: no raw
+    // textContent fallback, so an unrendered cell cannot leak its markup text
+    // and hidden/aria-hidden/sensitive/form-control descendants are skipped.
+    // An excluded cell yields an empty string so column positions stay aligned.
+    const cellText = (cell) => {
+      if (isSensitiveField(cell) || isElementHidden(cell)) return "";
+      return cleanText(collectVisibleText(cell, MAX_TABLE_CELL_CHARS + 1), MAX_TABLE_CELL_CHARS);
+    };
+    const rowCells = (row) => [...(row.children || [])]
+      .filter((cell) => ["td", "th"].includes(String(cell.tagName || "").toLowerCase()))
+      .slice(0, MAX_TABLE_COLUMNS)
+      .map(cellText);
+    // Hidden rows (display:none placeholders, aria-hidden templates) are not
+    // rendered content, so they are neither counted against max_rows nor returned.
+    const trList = [...(el.querySelectorAll?.("tr") || [])]
+      .filter((row) => !isSensitiveField(row) && !isElementHidden(row));
+    const allRows = trList.map(rowCells).filter((cells) => cells.length > 0);
+    let headers = [];
+    let dataRows = allRows;
+    const firstRowCells = trList.length ? [...(trList[0].children || [])] : [];
+    const firstRowHeaders = firstRowCells
+      .filter((cell) => String(cell.tagName || "").toLowerCase() === "th")
+      .slice(0, MAX_TABLE_COLUMNS)
+      .map(cellText);
+    const firstRowDataCells = firstRowCells
+      .filter((cell) => ["td", "th"].includes(String(cell.tagName || "").toLowerCase()));
+    if (firstRowHeaders.length > 0 && firstRowHeaders.length === firstRowDataCells.length) {
+      headers = firstRowHeaders;
+      dataRows = allRows.slice(1);
+    }
+    const rows_truncated = dataRows.length > maxRows;
+    return {
+      ok: true,
+      ref,
+      generation,
+      headers,
+      rows: dataRows.slice(0, maxRows),
+      rows_truncated,
+      requires_verification: true,
     };
   }
 
@@ -485,6 +571,64 @@
       } : {}),
       requires_verification: true,
     };
+  }
+
+  function executePress(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const generation = String(params.generation || "").trim();
+    if (!generation || generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    if (params.value !== undefined) return { ok: false, error: "press_params_invalid" };
+    const keyName = String(params.key || "");
+    const spec = PRESS_KEY_EVENTS[keyName];
+    if (!spec) return { ok: false, error: "press_params_invalid" };
+
+    let target = null;
+    let ref = "";
+    if (params.ref !== undefined && params.ref !== null) {
+      ref = String(params.ref);
+      if (!ref.startsWith(`ref_${generation}_`)) return { ok: false, error: "invalid_ref" };
+      const el = elementMap.get(ref);
+      if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+      if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
+        return { ok: false, error: "unsupported_element" };
+      }
+      target = el;
+    }
+    if (!target) {
+      const doc = global.document;
+      const active = doc?.activeElement;
+      target = active && active.isConnected ? active : doc?.body;
+    }
+    if (!target || typeof target.dispatchEvent !== "function") {
+      return { ok: false, error: "press_unavailable" };
+    }
+
+    try {
+      target.focus?.();
+      // Synthetic events reach page key handlers (SPA composers, feeds) but
+      // never browser default actions; text input belongs to fill.
+      for (const type of ["keydown", "keypress", "keyup"]) {
+        target.dispatchEvent(new KeyboardEvent(type, {
+          key: spec.key, code: spec.code, keyCode: spec.keyCode, which: spec.keyCode,
+          bubbles: true, cancelable: true,
+        }));
+      }
+      invalidateGeneration();
+      return {
+        ok: true,
+        key: keyName,
+        ...(ref ? { ref } : {}),
+        generation,
+        requires_verification: true,
+      };
+    } catch (_) {
+      return { ok: false, error: "press_delivery_unknown" };
+    }
   }
 
   function executeClick(params = {}) {
@@ -842,7 +986,9 @@
     if (action === "click") return executeClick(msg);
     if (action === "fill") return executeFill(msg);
     if (action === "extract") return executeExtract(msg);
+    if (action === "extract_table") return executeExtractTable(msg);
     if (action === "scroll") return executeScroll(msg);
+    if (action === "press") return executePress(msg);
     if (action === "expect") return executeExpect(msg);
     return { ok: false, error: "unsupported_action" };
   }
