@@ -14341,6 +14341,241 @@ mod tests {
         }
     }
 
+    #[test]
+    fn browser_dispatch_stop_fails_closed_without_a_caller_webchat_control_grant() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let _env_guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = std::env::temp_dir().join(format!(
+            "herdr-browser-stop-grantless-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&config_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, account_ref, session_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "stop-grantless-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["composer.submit","generation.stop"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "stop-grantless-account-hidden",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "stop-grantless-session-hidden",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            (
+                endpoint.endpoint_ref,
+                account.resource_ref,
+                session.resource_ref,
+            )
+        };
+
+        struct AppliedSubmitActuator;
+        impl BrowserActuator for AppliedSubmitActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                    result: Some(accepted_result(
+                        params["message"].as_str().unwrap(),
+                        "provider-user-stop-grantless",
+                    )),
+                })
+            }
+        }
+
+        let submit_params = json!({
+            "session_ref": session_ref,
+            "message": "dispatch that must survive a grantless stop attempt",
+            "expected_generation": 7,
+            "idempotency_key": "stop-grantless-submit-1"
+        });
+        let applied = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &submit_params,
+            true,
+            Some(&AppliedSubmitActuator),
+        );
+        assert_eq!(applied["ok"], true);
+        assert_eq!(applied["dispatch"]["delivery_state"], "applied");
+        let dispatch_id = applied["dispatch"]["dispatch_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        struct CountingStopActuator {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl BrowserActuator for CountingStopActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::DispatchStop.method());
+                assert!(dispatch_id.is_some_and(|value| value.starts_with("bd_")));
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: true,
+                    result: None,
+                })
+            }
+        }
+        let stop_actuator = CountingStopActuator {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let stop_params = json!({
+            "dispatch_id": dispatch_id,
+            "expected_generation": 7,
+            "idempotency_key": "stop-grantless-attempt-1"
+        });
+
+        let no_grants = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.stop",
+            &stop_params,
+            false,
+            Some(&stop_actuator),
+        );
+        assert_eq!(no_grants["ok"], false);
+        assert_eq!(no_grants["code"], "caller_grant_missing");
+        assert_eq!(no_grants["actuation_available"], false);
+
+        let other_endpoint_grants = [BrowserCallerGrant {
+            endpoint_ref: format!("be_{}", "9".repeat(64)),
+            provider: "chatgpt".to_owned(),
+            account_ref: account_ref.clone(),
+        }];
+        assert_ne!(other_endpoint_grants[0].endpoint_ref, endpoint_ref);
+        let wrong_endpoint = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_dispatch.stop",
+            &stop_params,
+            &other_endpoint_grants,
+            Some(&stop_actuator),
+            None,
+        );
+        assert_eq!(wrong_endpoint["ok"], false);
+        assert_eq!(wrong_endpoint["code"], "caller_grant_missing");
+        assert_eq!(wrong_endpoint["actuation_available"], false);
+
+        assert_eq!(
+            stop_actuator
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a grantless stop must be refused before any browser actuation",
+        );
+        let status = browser_operation_call(
+            &store,
+            "herdr_mcp.browser_dispatch.status",
+            &json!({"dispatch_id": dispatch_id}),
+        );
+        assert_eq!(status["ok"], true);
+        assert_eq!(
+            status["dispatch"]["delivery_state"], "applied",
+            "the target dispatch must not be marked stopped by a grantless stop",
+        );
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+    }
+
     /// Registers one endpoint/provider/account/session triple for dispatch
     /// reconcile tests. No config directory or environment is touched: the tests
     /// drive the durable store and `browser_dispatch_status` directly.
