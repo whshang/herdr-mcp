@@ -22,6 +22,7 @@ mod exec_compact;
 mod exec_evidence;
 mod exec_sessions;
 mod exec_tools;
+mod grant_migration;
 mod extension_ipc;
 mod fs_mutation;
 mod fs_patch;

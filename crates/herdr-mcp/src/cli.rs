@@ -1460,6 +1460,16 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             }))
         }
         Some("page-assist") => {
+            if let Some(parsed) = crate::grant_migration::parse_cli(&args[1..]) {
+                // #626 checkpoint 1: arguments are validated (fail closed), but the
+                // Edge read and the --confirm write are not wired yet.
+                return match parsed? {
+                    crate::grant_migration::MigrateCli::Migrate { confirm: true, .. } => Err(
+                        "connector page-assist migrate --confirm is not implemented yet; nothing was written".to_owned(),
+                    ),
+                    _ => Err("connector page-assist orphans/migrate (dry run) is not yet wired to Edge; nothing was read or written".to_owned()),
+                };
+            }
             let [action, connector_id, device_id, endpoint_ref, confirm] = &args[1..] else {
                 return Err("connector page-assist requires: <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm".to_owned());
             };
