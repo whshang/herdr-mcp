@@ -312,6 +312,14 @@ Additional rules:
 - **Mutations are serialized per account scope** by the runtime; do not try to parallelize conflicting mutations.
 - **Do not create a second state authority.** The page, the Project, and the conversation are not substitutes for Continuity/Work Memory.
 
+### Browser endpoint liveness and runtime switches
+
+See [#632](https://github.com/whshang/herdr-mcp/issues/632).
+
+- **Liveness rule.** A browser endpoint counts as online only if it is registered in the registry of the **current runtime generation** (registered or re-observed since this runtime started) and its extension is polling `/push/events`. An endpoint that only polls but is unregistered, or whose registration is stale from a previous generation, is offline: browser mutations return a retryable `not_delivered` (for example `browser_page_unavailable`) immediately instead of waiting for a timeout. The push `hello` frame reports `endpoint_registered`.
+- **Timeout outcome.** If a browser command is still queued when the actuation timeout fires and no extension ever took it, the runtime removes it from the queue (it can never be delivered late) and returns `not_delivered` with `retry_safe: true`; retrying the original intent is safe. Only a command that was actually handed to the extension keeps `delivery_unknown`: re-observe, never blind-retry.
+- **Upgrade order.** Upgrade the browser extension to `0.1.203` or later **before** switching the runtime. Extension `0.1.203` re-registers its endpoint automatically when the runtime `boot_id` changes or `hello` carries `endpoint_registered: false`. Older extensions show offline after a runtime switch until their service worker restarts; workaround: reload only the extension's service worker in `chrome://extensions` (no Chrome restart).
+
 ## 9. Continuity vs Work Memory vs Browser session
 
 | Concept | Owns | Not to be confused with |

@@ -312,6 +312,14 @@ Agent は次の順で進めます。
 - **変更は account スコープで直列化**されます。競合する変更を並列化しないでください。
 - **第二の状態権威を作らない。** ページ、Project、会話は Continuity/Work Memory の代替になりません。
 
+### ブラウザ endpoint の生存判定と Runtime 切り替え
+
+[#632](https://github.com/whshang/herdr-mcp/issues/632) を参照。
+
+- **生存判定。** browser endpoint がオンラインと見なされるのは、**現在の Runtime generation** のレジストリに登録されている（この Runtime の起動以降に登録または再観測された）うえで、拡張機能が `/push/events` をポーリングしている場合だけです。ポーリングしているだけで未登録の endpoint や、前の generation の古い登録しかない endpoint はオフライン扱いになり、ブラウザ操作はタイムアウトを待たずに再試行可能な `not_delivered`（例: `browser_page_unavailable`）を即座に返します。push の `hello` フレームは `endpoint_registered` を報告します。
+- **タイムアウト時の結果。** actuation のタイムアウト時点でコマンドがまだキューにあり、どの拡張機能にも取り出されていない場合、Runtime はそれをキューから取り除き（後から配送されることはありません）、`retry_safe: true` 付きの `not_delivered` を返します。元の意図を再試行して安全です。実際に拡張機能へ渡されたコマンドだけが `delivery_unknown` のままです。その場合は再観測し、盲目的に再試行しないでください。
+- **アップグレード順序。** Runtime を切り替える**前に**、ブラウザ拡張機能を `0.1.203` 以降へ更新してください。拡張機能 `0.1.203` は Runtime の `boot_id` が変わったとき、または `hello` が `endpoint_registered: false` を返したときに endpoint を自動で再登録します。古い拡張機能は Runtime 切り替え後、service worker が再起動するまでオフライン表示になります。回避策: `chrome://extensions` で拡張機能の service worker だけを再読み込みします（Chrome の再起動は不要）。
+
 ## 9. Continuity / Work Memory / Browser session の違い
 
 | 概念 | 役割 | 混同しやすいもの |

@@ -312,6 +312,14 @@ Agent 应按这个顺序做：
 - **写操作按账号范围串行化**，不要试图并行执行互相冲突的修改。
 - **不要创建第二套状态权威。** 页面、Project、会话都不能替代 Continuity/Work Memory。
 
+### 浏览器 endpoint 在线判定与 Runtime 切换
+
+参见 [#632](https://github.com/whshang/herdr-mcp/issues/632)。
+
+- **在线规则。** 只有在**当前 Runtime generation** 的注册表中已注册（本次 Runtime 启动后注册或重新观察过），并且扩展正在轮询 `/push/events` 的 browser endpoint 才算在线。只轮询但未注册、或只有上一个 generation 遗留的陈旧注册的 endpoint 一律视为离线：浏览器变更会立刻返回可重试的 `not_delivered`（例如 `browser_page_unavailable`），而不是等到超时。push 的 `hello` 帧会报告 `endpoint_registered`。
+- **超时结果。** actuation 超时时，如果命令仍在队列中、从未被任何扩展取走，Runtime 会把它移出队列（之后不可能再被投递），并返回带 `retry_safe: true` 的 `not_delivered`，可以安全地重试原意图。只有已经交给扩展的命令才保留 `delivery_unknown`：先重新观察，不要盲目重试。
+- **升级顺序。** 切换 Runtime **之前**，先把浏览器扩展升级到 `0.1.203` 或更高版本。扩展 `0.1.203` 在 Runtime 的 `boot_id` 变化、或 `hello` 携带 `endpoint_registered: false` 时会自动重新注册 endpoint。旧扩展在 Runtime 切换后会显示离线，直到其 service worker 重启；临时办法：在 `chrome://extensions` 中只重载扩展的 service worker（无需重启 Chrome）。
+
 ## 9. Continuity / Work Memory / Browser session 的区别
 
 | 概念 | 负责什么 | 不要混淆成 |
