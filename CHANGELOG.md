@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.1.0-rc.2 — 2026-10-12
+
+- **1.1 第二个预发布（仅 preview 通道）：** 包含 N → N+1 跨 epoch updater 和迁移文档。跨 epoch 接纳要求签名发布清单中的 `contract_migration` 精确匹配来源 contract identity，且两侧 state schema 相同；v1.0.x 升级路径为先到 v1.0.4 epoch-4 bridge，再进入本 RC（epoch 5），bridge 与 RC 发布后该路径才可用，v1.0.x 无法直接更新到本 RC。stable 用户继续留在 1.0.x；成功升级后的 `herdr-mcp rollback` 仅限 macOS，重新激活已安装的上一 generation，不恢复数据库。重新注册保留 WebChat 显式拒绝授权。 [PR #605](https://github.com/whshang/herdr-mcp/pull/605) [PR #607](https://github.com/whshang/herdr-mcp/pull/607)
+
+## v1.1.0-rc.1 — 2026-10-12
+
+- **1.1 预发布（仅 preview 通道）：** Browser Adapter Platform——通用 BrowserPage 控制内核（open/claim/observe/typed mutation/expect/finalize，Runtime 统一幂等与投递）、Bilibili/X/豆包参考 Adapter、项目 Skill Adapter 模型；WebChat 控制授权按 endpoint + provider 并支持由 Page Assist 推导的 `*`；ChatGPT 全路径只提交一次、App 激活与精确候选匹配；Grok/Claude stop 定位目标会话；relay 重放缓存按 Connector 限定。Runtime contract epoch 5、Edge epoch 8、state schema 15。stable 通道不受影响；本版本 manifest 未声明 `contract_migration`，且 v1.0.x updater 拒绝不同 contract epoch，因此 v1.0.x 无法通过普通 `herdr-mcp update` 到达本预发布（计划路径为尚未发布的 v1.0.4 bridge：其 `version` 还会打印包含 `contract epoch 2 / 18 tools` 的兼容行，因此已发布的 v1.0.0–v1.0.3 可经前台 `herdr-mcp update` 与 macOS 后台 stable scheduler（`update auto`）正常更新到该 bridge，无需手工安装；再由声明 `contract_migration` 的首个 v1.1 发布跨到 epoch 5。`contract_migration` 接纳规则尚未在已发布 updater 中实现）。正式 v1.1.0 在 PROD 升级/回滚 UAT 后发布。 [PR #570](https://github.com/whshang/herdr-mcp/pull/570) [PR #588](https://github.com/whshang/herdr-mcp/pull/588) [PR #595](https://github.com/whshang/herdr-mcp/pull/595) [PR #601](https://github.com/whshang/herdr-mcp/pull/601)
+
 ## v1.0.3 — 2026-09-24
 
 - 修复早期 v0.4.x 安装无法经 v0.4.9 migration bridge 升级到 1.x：`worker update` 现在可以原地更新 wrangler 模板部署的旧 Worker；通用 `herdr-edge` 身份在 workers.dev 下由主机名证明脚本名，在自定义域名下则必须通过 Cloudflare Custom Domains API 精确证明 `hostname → service(script)` 后才允许 mutation；未登记 device id 时还要求本机 Link 与 Worker 的 `DEFAULT_WORKSTATION_ID` 一致并原值保留。并修复 Worker 地址只存在于 Link plist 时的静默跳过。1.x 不再改名 0.4.x 的 `config.toml`，大版本回滚会恢复被 v1.0.0–v1.0.2 改名的配置；若配置恢复不完整则保留 rollback material 并报告失败。major-apply 失败原因完整写入 `~/.config/herdr-mcp/major-upgrade-last-failure.log`。同时包含 major migration 已提交后 sidecar 失败改为可恢复警告的修复。 [PR #566](https://github.com/whshang/herdr-mcp/pull/566) [PR #561](https://github.com/whshang/herdr-mcp/pull/561)
