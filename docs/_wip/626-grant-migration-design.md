@@ -503,3 +503,22 @@ Real-usage verification (needed before enabling, on a staging Edge):
   - Acceptance: byte-identical round trip for absent / null / value fixtures,
     planning treats `Null` the same as `Absent`, and both Rust and Edge pass the
     shared check-order fixtures (§7.6(2)).
+
+### 7.9 TODO (non-blocking, not in this change)
+
+- ~~256-entry per-device idempotency cap and alarm sweep~~ — done in 9c9d6246
+  (cap eviction on insert; `/internal/oauth/grant/page-assist-migrate-alarm`
+  sweeps expired entries in batches of 128 and re-arms hourly).
+- Q4 slim reject ring: `migrate-reject-audit:v1:<device_id>` (bounded 64,
+  oldest evicted, no grant-record rewrite) is not implemented yet.
+- Structured reject log line (`page_assist_migrate_rejected` with stage/code)
+  is not emitted yet.
+- `by` enforcement: the DO currently defaults `by` to `device:<device_id>`
+  when absent and accepts any bounded string when present; it must require
+  exactly `device:<authenticated device_id>` once the Edge route lands.
+- Malformed `from`/`to` request validation: today they surface as the plan's
+  own 409 codes (`migrate_from_required` etc.); §7.1 step 2 wants 400 with a
+  fixed code before any storage work.
+- Mutation-test suite: §7.7's mutation list was exercised manually during
+  development (fresh-check, digest-compare, device-filter removals each broke
+  tests; restored); a repeatable automated suite is not wired up yet.

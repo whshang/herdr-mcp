@@ -375,3 +375,38 @@ test("user Given a revoked grant record after a successful confirm When the same
   assert.equal(newKey.status, 409);
   assert.equal(newKey.body.code, "grant_record_not_active", "a new key re-plans and fails closed");
 });
+
+test("user Given a migrated record carrying a success audit entry When allow, deny, or revoke write-backs run Then the audit entry survives each write", async () => {
+  const h = harness(record(), {
+    [`connector:${NEW}`]: {
+      connector_id: NEW, client_id: "c1", status: "active", principal_type: "connector",
+      capabilities: ["mcp_access"], resource: "https://issuer/mcp", scope: "mcp",
+      redirect_uri: "https://app.example/cb", auth_source: "legacy", grant_generation: 1,
+      approved_at_ms: 1000, approved_by: "device:owner",
+    },
+  });
+  const digest = await planDigest({ from: OLD, to: NEW });
+  const confirmed = await h.confirm({ plan_digest: digest });
+  assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+  const auditId = confirmed.body.audit_id;
+  const auditSurvives = () => (h.storage.map.get("grant:c1").audit ?? []).some((entry) => entry.audit_id === auditId);
+  assert.equal(auditSurvives(), true, "confirm wrote the audit entry");
+
+  const allow = await h.post("/internal/oauth/grant/page-assist", {
+    connector_id: NEW, device_id: DEV, endpoint_ref: "ep9", allowed: true, changed_by: `device:${DEV}`,
+  });
+  assert.equal(allow.status, 200, JSON.stringify(allow.body));
+  assert.equal(allow.body.record.page_assist.some((row) => row.endpoint_ref === "ep9" && row.connector_id === NEW), true, "allow applied");
+  assert.equal(auditSurvives(), true, "audit survives the allow write-back");
+
+  const deny = await h.post("/internal/oauth/grant/page-assist", {
+    connector_id: NEW, device_id: DEV, endpoint_ref: "ep9", allowed: false, changed_by: `device:${DEV}`,
+  });
+  assert.equal(deny.status, 200, JSON.stringify(deny.body));
+  assert.equal(auditSurvives(), true, "audit survives the deny write-back");
+
+  const revoke = await h.post("/internal/oauth/grant/revoke", { client_id: "c1", revoked_by: `device:${DEV}` });
+  assert.equal(revoke.status, 200, JSON.stringify(revoke.body));
+  assert.equal(h.storage.map.get("grant:c1").status, "revoked", "revoke applied");
+  assert.equal(auditSurvives(), true, "audit survives the revoke write-back");
+});
