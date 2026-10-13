@@ -260,7 +260,7 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
             other => {
                 return Err(format!(
                     "connector page-assist migrate: unexpected argument '{other}'"
-                ))
+                ));
             }
         }
     }
@@ -272,6 +272,31 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
         return Err("connector page-assist migrate: --from and --to must differ".to_owned());
     }
     Ok(MigrateCli::Migrate { from, to, confirm })
+}
+
+/// Request body for the read-only Edge route `/connectors/page-assist/orphans`.
+/// Fails closed unless both selectors are absent (list) or both present (plan).
+pub fn orphans_request_body(
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    match (from, to) {
+        (None, None) => Ok(serde_json::json!({ "action": "list" })),
+        (Some(from), Some(to))
+            if valid_connector_id(from) && valid_connector_id(to) && from != to =>
+        {
+            Ok(serde_json::json!({ "action": "plan", "from": from, "to": to }))
+        }
+        (None, Some(_)) => {
+            Err("connector page-assist migrate requires --from <connector-id>".to_owned())
+        }
+        (Some(_), None) => {
+            Err("connector page-assist migrate requires --to <connector-id>".to_owned())
+        }
+        _ => {
+            Err("connector page-assist migrate requires distinct valid --from and --to".to_owned())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -421,6 +446,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(back.to_connector_id, None);
+    }
+
+    #[test]
+    fn orphans_request_body_is_read_only_and_fails_closed() {
+        assert_eq!(
+            orphans_request_body(None, None).unwrap(),
+            serde_json::json!({"action": "list"})
+        );
+        assert_eq!(
+            orphans_request_body(Some(OLD), Some(NEW)).unwrap(),
+            serde_json::json!({"action": "plan", "from": OLD, "to": NEW})
+        );
+        assert!(orphans_request_body(Some(OLD), None).is_err());
+        assert!(orphans_request_body(None, Some(NEW)).is_err());
+        assert!(orphans_request_body(Some(NEW), Some(NEW)).is_err());
+        assert!(orphans_request_body(Some("bogus"), Some(NEW)).is_err());
     }
 
     #[test]

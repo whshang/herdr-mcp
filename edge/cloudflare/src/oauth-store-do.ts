@@ -1,4 +1,5 @@
 import type { Env } from "./env.js";
+import { listAllOrphans, planMigration } from "./grant-migration.js";
 import { createOAuthIdentity, createRs256AccessTokenVerifier, hashOpaqueToken } from "./oauth-edge.js";
 import { issueRs256AccessJwt, randomBase64UrlToken } from "./oauth-token-crypto.js";
 import {
@@ -180,6 +181,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/get") return this.getGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/webchat-control") return this.setWebChatControlGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist") return this.setPageAssistGrant(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-orphans") return this.pageAssistOrphans(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/get") return this.getConnector(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/find-active") return this.findActiveConnectorByClient(request);
@@ -861,6 +863,18 @@ export class OAuthStoreDO {
       return json({ ok: false, code: result.code }, status);
     }
     return json({ ok: true, record: result.record });
+  }
+
+  /** #626: read-only. Lists orphan rows or plans a migrate dry run; never writes. */
+  private async pageAssistOrphans(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const action = body?.action;
+    if (action !== "list" && action !== "plan") return json({ ok: false, code: "bad_request" }, 400);
+    const rows = await this.state.storage.list<OAuthConnectorGrantRecord>({ prefix: GRANT_PREFIX });
+    const records = [...rows.values()].map((raw) => normalizeConnectorGrant(raw));
+    if (action === "list") return json({ ok: true, orphans: listAllOrphans(records) });
+    const plan = planMigration(records, body?.from, body?.to);
+    return plan.ok ? json({ ...plan, dry_run: true }) : json(plan, 409);
   }
 
   private async setPageAssistGrant(request: Request): Promise<Response> {

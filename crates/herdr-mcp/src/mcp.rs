@@ -20284,6 +20284,40 @@ mod tests {
         assert_eq!(terminal["status"], "complete");
         assert_eq!(terminal["reconciled"], false);
         assert_eq!(actuator.status_calls.load(Ordering::SeqCst), 1);
+
+        // #626 (g) snapshot through the real call path: the provider-facing
+        // caller_grant_missing bodies must stay byte-identical.
+        // (1) Caller holds a grant for a different endpoint than the one that
+        //     owns op_id (the `retryable:false` body in doubao_image_status_call).
+        let other_grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_other".to_owned(),
+        }];
+        let mismatch = doubao_image_status_call(
+            &store,
+            &json!({"endpoint_ref": "bep_other", "op_id": op_id}),
+            &other_grants,
+            Some(&actuator),
+        );
+        assert_eq!(
+            serde_json::to_string(&mismatch).unwrap(),
+            r#"{"code":"caller_grant_missing","ok":false,"retryable":false}"#
+        );
+        // (2) Caller holds no grant at all for the endpoint.
+        let no_grant = doubao_image_status_call(
+            &store,
+            &json!({"endpoint_ref": "bep_doubao", "op_id": op_id}),
+            &[],
+            Some(&actuator),
+        );
+        assert_eq!(
+            serde_json::to_string(&no_grant).unwrap(),
+            r#"{"code":"caller_grant_missing","delivery_state":"not_delivered","ok":false,"retryable":false}"#
+        );
+        assert_eq!(
+            actuator.status_calls.load(Ordering::SeqCst),
+            1,
+            "no actuation on grant miss"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@
 **Caller grant 检查不放宽、不绕过、不替代。** `verifiedControlGrantSnapshot`
 (`oauth-store-do.ts:1616-1640`) 继续只返回 `grant.status === "active"` 记录中
 `connector_id` 和 `grant_generation` 都精确匹配的行。Rust 侧的 fail-closed 检查
-(`mcp.rs:6157`, `mcp.rs:9419`) 不变。本设计里所有迁移都是**所有者显式执行**的写操作,
+(`mcp.rs:6157`, `mcp.rs:9469`) 不变。本设计里所有迁移都是**所有者显式执行**的写操作,
 走和 `connector page-assist allow --confirm` 同等的所有者设备认证;不存在任何
 自动推断、自动迁移或自动扩权的路径。
 
@@ -150,7 +150,7 @@ as Conclusion / Change / Acceptance.
     the new fields (audit and proposals), or the new Edge detects the loss and
     fails closed. Test it with a record written by the old normalize path.
   - Snapshot test: the provider-facing `caller_grant_missing` body
-    (`mcp.rs:9419`, `{"ok":false,"code":"caller_grant_missing","retryable":false}`)
+    (`mcp.rs:9469`, `{"ok":false,"code":"caller_grant_missing","retryable":false}`)
     stays byte-identical.
 
 ## 2. Problem

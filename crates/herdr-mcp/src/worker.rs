@@ -378,6 +378,9 @@ pub fn run(command: WorkerCommand, language: Locale) -> Result<ExitCode, String>
             &account_ref,
             allowed,
         ),
+        WorkerCommand::ConnectorPageAssistOrphans { from, to } => {
+            connector_page_assist_orphans(&paths, from.as_deref(), to.as_deref())
+        }
         WorkerCommand::ConnectorPageAssist {
             connector_id,
             device_id,
@@ -1471,6 +1474,54 @@ fn connector_planner_control(
         "{}",
         serde_json::to_string_pretty(&payload)
             .map_err(|error| format!("cannot encode planner control result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn connector_page_assist_orphans(
+    _paths: &RuntimePaths,
+    _from: Option<&str>,
+    _to: Option<&str>,
+) -> Result<ExitCode, String> {
+    Err(
+        "connector Page Assist orphans requires a supported enrolled-owner credential backend"
+            .to_owned(),
+    )
+}
+
+/// #626: read-only. Lists orphan grant rows, or with `from`/`to` prints a migrate
+/// dry-run plan. Uses the same owner-device authentication as `page-assist allow`.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn connector_page_assist_orphans(
+    paths: &RuntimePaths,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<ExitCode, String> {
+    let body = crate::grant_migration::orphans_request_body(from, to)?;
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(
+            &identity.edge_origin,
+            "/connectors/page-assist/orphans",
+        )?)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .map_err(|error| format!("cannot read Connector Page Assist orphans: {error}"))?;
+    let payload = parse_json_response(response, "connector Page Assist orphans")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).map_err(|error| format!(
+            "cannot encode Connector Page Assist orphans result: {error}"
+        ))?
     );
     Ok(ExitCode::SUCCESS)
 }

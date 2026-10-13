@@ -213,6 +213,11 @@ pub enum WorkerCommand {
         action: String,
         request_id: Option<String>,
     },
+    /// #626 read-only: `from`/`to` both None = orphans list; both Some = migrate dry run.
+    ConnectorPageAssistOrphans {
+        from: Option<String>,
+        to: Option<String>,
+    },
     ConnectorPageAssist {
         connector_id: String,
         device_id: String,
@@ -1461,13 +1466,21 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
         }
         Some("page-assist") => {
             if let Some(parsed) = crate::grant_migration::parse_cli(&args[1..]) {
-                // #626 checkpoint 1: arguments are validated (fail closed), but the
-                // Edge read and the --confirm write are not wired yet.
+                // #626: orphans list and migrate dry run are read-only Edge reads.
+                // The --confirm write path is not implemented and refuses.
                 return match parsed? {
                     crate::grant_migration::MigrateCli::Migrate { confirm: true, .. } => Err(
                         "connector page-assist migrate --confirm is not implemented yet; nothing was written".to_owned(),
                     ),
-                    _ => Err("connector page-assist orphans/migrate (dry run) is not yet wired to Edge; nothing was read or written".to_owned()),
+                    crate::grant_migration::MigrateCli::Migrate { from, to, .. } => {
+                        Ok(Command::Worker(WorkerCommand::ConnectorPageAssistOrphans {
+                            from: Some(from),
+                            to: Some(to),
+                        }))
+                    }
+                    crate::grant_migration::MigrateCli::Orphans => {
+                        Ok(Command::Worker(WorkerCommand::ConnectorPageAssistOrphans { from: None, to: None }))
+                    }
                 };
             }
             let [action, connector_id, device_id, endpoint_ref, confirm] = &args[1..] else {
@@ -2381,6 +2394,8 @@ User path:\n\
   herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm  (enrolled owner device)\n\
   herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
+  herdr-mcp connector page-assist orphans [list]  (read-only: grant rows left under a previous connector)\n\
+  herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id>  (dry run only; --confirm not implemented yet)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
   herdr-mcp automation list\n\
   herdr-mcp automation rotate <client-id> --confirm\n\
@@ -4045,6 +4060,75 @@ mod tests {
         assert!(parse(args(&["connector", "revoke", "conn_abc"])).is_err());
         assert!(parse(args(&["connector", "revoke-client", "legacy"])).is_err());
         assert!(parse(args(&["connector", "list", "--unknown"])).is_err());
+    }
+
+    #[test]
+    fn parses_connector_page_assist_orphans_and_migrate_dry_run() {
+        assert_eq!(
+            parse(args(&["connector", "page-assist", "orphans"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorPageAssistOrphans {
+                from: None,
+                to: None
+            })
+        );
+        assert_eq!(
+            parse(args(&["connector", "page-assist", "orphans", "list"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorPageAssistOrphans {
+                from: None,
+                to: None
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "connector",
+                "page-assist",
+                "migrate",
+                "--from",
+                "conn_old000000001",
+                "--to",
+                "conn_new000000001"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::ConnectorPageAssistOrphans {
+                from: Some("conn_old000000001".to_owned()),
+                to: Some("conn_new000000001".to_owned()),
+            })
+        );
+        // --confirm write path refuses; missing selectors fail closed.
+        for bad in [
+            &[
+                "connector",
+                "page-assist",
+                "migrate",
+                "--from",
+                "conn_old000000001",
+                "--to",
+                "conn_new000000001",
+                "--confirm",
+            ][..],
+            &[
+                "connector",
+                "page-assist",
+                "migrate",
+                "--from",
+                "conn_old000000001",
+            ][..],
+            &[
+                "connector",
+                "page-assist",
+                "migrate",
+                "--to",
+                "conn_new000000001",
+            ][..],
+            &["connector", "page-assist", "migrate"][..],
+        ] {
+            assert!(parse(args(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -455,6 +455,25 @@ export default {
         : noStoreJsonResponse({ ok: false, code: "webchat_control_grant_update_failed" }, 409);
     }
 
+    if (request.method === "POST" && url.pathname === "/connectors/page-assist/orphans") {
+      // #626: read-only orphan list / migrate dry run. Same owner-device auth as allow.
+      const ownerDevice = await authenticateOwnerDevice(request, env);
+      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)
+        || Object.keys(parsed.value).some((key) => key !== "action" && key !== "from" && key !== "to")
+        || (parsed.value.action !== "list" && parsed.value.action !== "plan")) {
+        return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
+      const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+      const result = await createOAuthPublicStore(stub).pageAssistOrphans({
+        action: parsed.value.action,
+        ...(typeof parsed.value.from === "string" ? { from: parsed.value.from } : {}),
+        ...(typeof parsed.value.to === "string" ? { to: parsed.value.to } : {}),
+      });
+      return noStoreJsonResponse(result.body, result.status);
+    }
+
     if (request.method === "POST" && url.pathname === "/connectors/page-assist") {
       const ownerDevice = await authenticateOwnerDevice(request, env);
       if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
