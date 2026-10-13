@@ -72,7 +72,7 @@ impl Default for BrowserActuationBroker {
 
 impl BrowserActuationBroker {
     #[cfg(test)]
-    fn with_durations(timeout: Duration, late_completion_ttl: Duration) -> Self {
+    pub(super) fn with_durations(timeout: Duration, late_completion_ttl: Duration) -> Self {
         let (wake_tx, _) = tokio::sync::watch::channel(0_u64);
         Self {
             inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),

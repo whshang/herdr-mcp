@@ -3163,6 +3163,21 @@ fn persistent_sse_response() -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Test-only constructor for the real browser actuation broker. The mcp-level
+/// `browser_page_action_call` tests need the actual queue/timeout settlement
+/// behaviour rather than a fake actuator, so this exposes the private
+/// short-duration constructor and marks `endpoint_ref` live before returning
+/// the broker behind the `BrowserActuator` trait object the handler accepts.
+#[cfg(test)]
+pub(crate) fn test_browser_actuation_broker(
+    timeout: Duration,
+    endpoint_ref: &str,
+) -> Arc<dyn crate::mcp::BrowserActuator> {
+    let broker = BrowserActuationBroker::with_durations(timeout, timeout);
+    broker.note_extension_poll(Some(endpoint_ref));
+    Arc::new(broker)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
