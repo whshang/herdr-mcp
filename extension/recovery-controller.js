@@ -15,6 +15,7 @@ const DEFAULT_RECOVERY_POLICY = Object.freeze({
   maxRecoveryAttempts: 1,
   maxReloadAttempts: 1,
   maxBackgroundReloadAttempts: 1,
+  probeCorrelationWindowMs: 60000,
 });
 
 function classifyViewFreshness({ dom = {}, server = {}, now = Date.now() } = {}, policy = DEFAULT_RECOVERY_POLICY) {
@@ -54,9 +55,42 @@ function classifyViewFreshness({ dom = {}, server = {}, now = Date.now() } = {},
   return { state: "synced", deltaMs, serverLatestAt, pageLatestAt };
 }
 
-function shouldSendRecovery(record, policy = DEFAULT_RECOVERY_POLICY, now = Date.now()) {
+// Recovery probe authorization.
+//
+// A recovery probe is a NEW user turn in the live conversation, so timing alone
+// must never authorize one: a long-thinking model, a pending tool call, and a
+// dropped turn all look alike to a timer, and the current turn's provider node
+// can still be the user message while the model reasons. The single authorizing
+// fact is a provider-closed current turn that produced no assistant output
+// anywhere. Everything else - busy page, unreadable snapshot, still-open turn, a
+// provider tip that is not the current turn's assistant - fails closed. Explicit
+// provider error surfaces (ChatGPT send timeout / disconnected / thread error
+// cards) keep their own bounded recovery paths and do not depend on this gate.
+function recoveryProbeAllowed(evidence, since = 0) {
+  if (!evidence) return null;
+  const { dom = {}, server = {} } = evidence;
+  if (dom.streaming || dom.toolRunning || dom.composerBusy || dom.permissionCardActive) return null;
+  if (server?.ok !== true || server.finished !== true) return null;
+  // The snapshot walks back from the provider tip, so a terminal assistant
+  // message is only this turn's outcome when the assistant node IS the tip.
+  if (String(server.currentNodeRole || "") !== "assistant" || !String(server.messageId || "")) return null;
+  // It must also belong to the turn this record waits for. Without that link a
+  // failed or uncertain Send leaves the previous terminal turn as the tip, and
+  // its emptiness would authorize a second user turn.
+  const submittedAt = Number(since || 0);
+  const userAt = Number(server.userCreatedAt || 0);
+  if (!submittedAt || !userAt || !String(server.userMessageId || "")
+    || Math.abs(userAt - submittedAt) > DEFAULT_RECOVERY_POLICY.probeCorrelationWindowMs) return null;
+  if (String(dom.assistantText || "").trim() || String(server.text || "").trim()) return null;
+  return "provider_settled_without_output";
+}
+
+function shouldSendRecovery(record, policy = DEFAULT_RECOVERY_POLICY, now = Date.now(), evidence = null) {
   if (!record || record.state !== RECOVERY_STATES.REPLY_SUSPECT) return false;
   if ((record.recovery_attempt || 0) >= policy.maxRecoveryAttempts) return false;
+  // Re-checked at send time: a suspect state persisted by an earlier build must
+  // not authorize a probe against fresher live evidence.
+  if (!recoveryProbeAllowed(evidence, record.last_user_submit_at)) return false;
   return Boolean(record.last_user_submit_at && now - record.last_user_submit_at >= policy.replyTimeoutMs);
 }
 
@@ -110,8 +144,14 @@ function canRolloverSafely(record, {
   return true;
 }
 
-function classifyReplyTimeout(record, now = Date.now(), timeoutMs = DEFAULT_RECOVERY_POLICY.replyTimeoutMs) {
+function classifyReplyTimeout(record, now = Date.now(), timeoutMs = DEFAULT_RECOVERY_POLICY.replyTimeoutMs, evidence = null) {
   if (!record) return record;
+  const allowed = recoveryProbeAllowed(evidence, record.last_user_submit_at);
+  // Keep the suspect label only while the proof still holds, so the HUD stops
+  // reporting a reply timeout as soon as the turn is proven live again.
+  if (record.state === RECOVERY_STATES.REPLY_SUSPECT) {
+    return allowed ? record : { ...record, state: RECOVERY_STATES.REPLY_WAITING, suspect_reason: null };
+  }
   let startedAt = null;
   let reason = "reply_timeout";
   if (record.state === RECOVERY_STATES.REPLY_WAITING) {
@@ -123,6 +163,7 @@ function classifyReplyTimeout(record, now = Date.now(), timeoutMs = DEFAULT_RECO
     return record;
   }
   if (!startedAt || now - startedAt < timeoutMs) return record;
+  if (!recoveryProbeAllowed(evidence, startedAt)) return record;
   return recoveryMarkReplySuspect(record, reason);
 }
 
@@ -203,6 +244,7 @@ async function runAfterDurablePersistence({
 
 globalThis.H2W_RECOVERY_CONTROLLER = {
   DEFAULT_RECOVERY_POLICY,
+  recoveryProbeAllowed,
   shouldSendRecovery,
   markRecoverySent,
   markRecovering,
