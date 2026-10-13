@@ -212,3 +212,192 @@ different from the authenticated device -> 403 `orphans_device_mismatch`; no res
 device identity -> 403 `orphans_device_unresolved`. The DO internal route refuses
 unscoped listing. Any future `--confirm` must go through a fresh-plan recheck
 (`applyPlanIfFresh` / `apply_migration` -> `migrate_plan_stale` / `migrate_target_conflict`).
+
+## 7. #630 `--confirm` write path (design, not implemented)
+
+Status: design only. Today confirm is refused (`migrate_confirm_not_implemented`) and
+every migration path is read-only. Nothing in this section relaxes a grant check:
+`verifiedControlGrantSnapshot`, the `status === "active"` and exact
+`{connector_id, grant_generation}` matching, owner-device auth, and the
+provider-facing `caller_grant_missing` body all stay unchanged.
+
+### 7.1 Flow
+
+1. CLI `connector page-assist migrate --from <old> --to <new> --confirm
+   [--idempotency-key <k>]`. Without `--confirm` it stays a dry run. The CLI first
+   fetches the dry-run plan, prints it, and sends the confirm request with
+   `plan_digest` (see 7.3). It never sends rows. The server only applies rows it
+   recomputes itself.
+2. Edge route `POST /connectors/page-assist/migrate` (new; the orphans route stays
+   read-only):
+   - Auth: `authenticateOwnerDeviceIdentity`. This needs a resolved registry
+     `device_id`, otherwise 403 `migrate_device_unresolved`. 401 when no owner.
+   - Body keys: exactly `{from, to, plan_digest, idempotency_key}`. Unknown keys
+     get 400 `bad_request`, and malformed ids get 400 with a fixed code.
+   - Calls the DO internal route `/internal/oauth/grant/page-assist-migrate` with
+     `{from, to, plan_digest, idempotency_key, device_id: <authenticated>, by: "device:<id>"}`.
+3. DO, inside **one** `storage.transaction`:
+   1. Read the idempotency entry (7.3). On a hit, return the stored result with no
+      further work.
+   2. List every `grant:` record and normalize it.
+   3. Run `applyPlanIfFresh(records, raw, plan)`. This recomputes `planMigration`
+      on the records just read (target is current, record active, generation,
+      matching rows, target conflicts). It rejects with `migrate_plan_stale`,
+      `migrate_target_conflict`, or the fresh plan's own code.
+   4. Require `digest(freshPlan) === plan_digest`, else `migrate_plan_stale`. This
+      way the owner confirms exactly what was shown.
+   5. **Device scope (decision):** apply only moves whose `device_id` equals the
+      authenticated device. If the fresh plan holds rows of other devices, reject
+      with `migrate_cross_device_rows` instead of a partial apply. The dry-run
+      `plan` action gains the same server-side device filter and digest, so a
+      plan shown for device A never covers device B. (Open question Q1.)
+   6. Write back with `applyPlanToRawRecord` on the **raw** stored value, so
+      unknown keys are preserved. Append the audit entry (7.5) and store the
+      idempotency entry. All of this is one `put` per touched key inside the
+      transaction.
+4. The response holds a fixed shape: `{ok, action: "connector_page_assist_migrated", moved: n, audit_id}`
+   or `{ok:false, code, invalid_records?}`.
+
+### 7.2 Atomicity and rollback
+
+- Every read, recheck, and write runs inside a single DO `storage.transaction`.
+  A throw anywhere (including after the first `put`) rolls the whole thing back.
+  The DO runs one request at a time, and the transaction gives all-or-nothing writes.
+- Today a plan touches exactly one record (the single record whose current
+  `connector_id === to`). The write is still built as "compute all new values,
+  then put", so a later multi-record plan stays atomic.
+- After the write, re-read inside the transaction and run `listOrphans` on the new
+  record. If any planned row is still an orphan, or a row outside the plan
+  changed, throw `migrate_postcondition_failed`, which causes a rollback.
+- There is no compensating "undo" command in #630. Reversal is the normal
+  `page-assist deny` / revoke, and it is audited.
+
+### 7.3 Idempotency
+
+- Key = client-supplied `idempotency_key` (`^[A-Za-z0-9_-]{16,64}$`). The CLI
+  generates a random one per invocation and prints it. Without a key the request
+  is rejected (`migrate_idempotency_key_required`).
+- Stored at `migrate-idem:<device_id>:<key>` as `{plan_digest, result, at_ms}`,
+  with a 24 h TTL, swept lazily and by alarm, and a bounded count (e.g. 256).
+- Same key with the same digest returns the stored result and writes nothing.
+  Same key with a different digest gets 409 `migrate_idempotency_conflict`.
+- `plan_digest` = SHA-256 of the canonical JSON of the fresh plan (`from`, `to`,
+  `grant_generation`, sorted `moves`).
+
+### 7.4 Per-device scoping
+
+- Identity always comes from `authenticateOwnerDeviceIdentity`. A client
+  `device_id` is never trusted for the write; the route does not accept one.
+- The legacy shared-secret owner path resolves the device only through the
+  read-only registry lookup. With no record, the request fails closed.
+- Audit `by` = `device:<device_id>`.
+
+### 7.5 Audit
+
+- Stored in the record's `audit[]` ring (64 entries, oldest dropped first; the
+  drop itself is not audited). Shape is §1(d):
+  `{at_ms, by, action: "migrate", from_connector_id, to_connector_id, rows:[{device_id, endpoint_ref, provider?, account_ref?}]}`
+  plus `audit_id`.
+- Written in the same transaction as the rows, so the rows and their audit entry
+  always commit or roll back together.
+- Rejected confirms are not stored. The route returns the fixed code and logs it,
+  with no record write.
+- `normalizeConnectorGrant` must not drop `audit` on unrelated write-backs. This
+  overlaps with item 7.6(1).
+
+### 7.6 Deferred review items 1-3
+
+1. **Round-trip fidelity.** Today Edge `normalizeConnectorGrant` fills a missing
+   `page_assist`/`webchat_control` with `[]` and drops explicit-null known keys.
+   Rust `GrantRecord` likewise has `#[serde(default)] Vec` (missing becomes `[]`)
+   and `Option` + `skip_serializing_if` (an explicit `null` disappears).
+   Decision:
+   - The write path never serializes a normalized record. It always patches the
+     raw stored value (`applyPlanToRawRecord`), touches only the planned rows, and
+     only adds `audit`.
+   - A key absent in raw stays absent. An explicit `null` stays `null`, which then
+     makes the record unplannable with `grant_record_missing_field`.
+   - Rust: switch the known array/option fields to a tri-state (absent / null /
+     value, e.g. `Option<Option<T>>` with `serde_with::rust::double_option`), or
+     keep a `serde_json::Value` alongside the record and patch that. Acceptance:
+     `parse -> serialize` is byte-identical for records with missing arrays,
+     `null` arrays, `null` connector_id, and unknown keys.
+2. **Check order for a missing `connector_id`.** Rust returns
+   `grant_record_missing_field` (it checks status and fields before the target),
+   while Edge returns `migrate_target_not_current` (records without
+   `connector_id` never match the target).
+   - Unified order for both: selectors present → selectors valid → `from != to`
+     → target lookup (`connector_id` non-empty and `=== to`; zero matches give
+     `migrate_target_not_current`, more than one gives `migrate_target_ambiguous`)
+     → `status === "active"` → `grant_generation` valid (`grant_record_missing_field`)
+     → matching rows → conflicts.
+   - Rust therefore returns `migrate_target_not_current` for a missing or empty
+     `connector_id`, and checks status after the target.
+   - Add parity tests: one shared fixture table (JSON) consumed by both the Rust
+     and Edge tests, asserting identical codes.
+3. **`invalid_records` on plan failure.** In `oauth-store-do.ts` `pageAssistOrphans`,
+   the plan branch returns `json(plan, 409)` without `invalid_records`. Decision:
+   - Every plan response (ok or not) and every confirm failure includes
+     `invalid_records: <count>`. That is only a count, with no ids and no contents.
+   - When `invalid_records > 0` and the result is `migrate_target_not_current`,
+     the owner can tell the target may be unreadable rather than absent.
+   - Confirm itself still refuses whenever the target record is invalid.
+
+### 7.7 Test plan
+
+Unit/DO (StorageMock with a write counter and an injectable `put` failure):
+- A happy path moves only the planned rows. The other connectors' rows and the
+  unknown keys and nulls are byte-identical, and exactly 1 record and 1
+  idempotency entry are written.
+- Stale plan: a conflicting target row, an added or removed source row, a
+  generation bump, or revoke between dry run and confirm each give a fixed code
+  and zero writes.
+- Digest mismatch gives `migrate_plan_stale`.
+- Idempotency: a replay gives the same result and no new writes. Same key with a
+  different digest gives 409. A missing or malformed key gives 400.
+- **Rollback:** inject a throw on the 2nd `put` (the audit or idem entry). The
+  storage snapshot must equal the pre-confirm state. Inject a postcondition
+  failure and check the same.
+- Device scope: device A confirming a plan containing B's rows gets
+  `migrate_cross_device_rows` and zero writes. An unresolved legacy device gets
+  403. A non-owner gets 401.
+- Audit entries are appended, bounded at 64, and carry `by=device:<id>`.
+- Round-trip and check-order parity fixtures (7.6) pass in both Rust and Edge.
+
+Route level (`device-pairing-worker.test.mjs`): the auth matrix
+(owner device / legacy / non-owner / generic bearer), unknown keys, and the
+end-to-end dry run → confirm → `orphans` list is empty for the moved rows →
+`verifiedControlGrantSnapshot` now resolves the moved row.
+
+Mutation tests (must each fail ≥1 test):
+- removing the `applyPlanIfFresh` call;
+- removing the digest compare;
+- removing the device filter;
+- dropping the transaction wrapper (simulate it by using non-transactional puts);
+- removing `status === "active"` / `grant_generation` checks in
+  `verifiedControlGrantSnapshot`.
+
+Real-usage verification (needed before enabling, on a staging Edge):
+- Re-authorize a real connector (ChatGPT web) and confirm the orphans show up.
+- Run the dry run and then confirm from the owner device. A Page Assist call
+  through the new connector then succeeds where it previously returned
+  `caller_grant_missing`.
+- A second device cannot see or migrate the first device's rows.
+- Replaying the same CLI command is a no-op.
+- Revoke after confirm still fails closed.
+- Check the audit entry via the owner diagnostics.
+
+### 7.8 Open questions
+
+- Q1: Should confirm be strictly per-device (as decided above) or allow an owner to
+  migrate all devices' rows with an explicit `--all-devices` plus fleet-admin?
+  The default is per-device only.
+- Q2: Should the idempotency entries live in the grant record (one write) or as
+  separate keys? Separate keys are proposed; both are inside the same transaction.
+- Q3: Should we keep the two-step proposal model of §1(e), or does digest +
+  idempotency key replace it? The proposal is that digest + key replaces stored
+  proposals for #630, and §1(e) is deferred.
+- Q4: Should audit entries for rejected confirms be persisted (that is a write on
+  failure)? The proposal is no, logs only.
+- Q5: For the Rust tri-state, should we use `serde_with` or a hand-written
+  deserializer? This touches dependency policy.
