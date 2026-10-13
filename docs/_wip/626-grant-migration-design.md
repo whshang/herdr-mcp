@@ -107,6 +107,10 @@ as Conclusion / Change / Acceptance.
 
 ### (e) Proposals: bounded, keyed, expiring, and revoke-aware
 
+> **Superseded by §7 (decided, pending herdr ack):** #630 uses plan digest +
+> idempotency key (§7.3) instead of stored two-step proposals. The text below is kept
+> for history only.
+
 - **Conclusion:** If a two-step flow is used (`migrate` creates a proposal and
   `migrate confirm` applies it), proposals need a defined lifecycle.
 - **Change:** Proposals live in a bounded map keyed by
@@ -277,7 +281,7 @@ provider-facing `caller_grant_missing` body all stay unchanged.
 - Key = client-supplied `idempotency_key` (`^[A-Za-z0-9_-]{16,64}$`). The CLI
   generates a random one per invocation and prints it. Without a key the request
   is rejected (`migrate_idempotency_key_required`).
-- Stored at `migrate-idem:<device_id>:<key>` as `{plan_digest, result, at_ms}`,
+- Stored at `migrate-idem:v1:<device_id>:<key>` (see 7.8 Q2) as `{plan_digest, result, at_ms}`,
   with a 24 h TTL, swept lazily and by alarm, and a bounded count (e.g. 256).
 - Same key with the same digest returns the stored result and writes nothing.
   Same key with a different digest gets 409 `migrate_idempotency_conflict`.
@@ -387,17 +391,73 @@ Real-usage verification (needed before enabling, on a staging Edge):
 - Revoke after confirm still fails closed.
 - Check the audit entry via the owner diagnostics.
 
-### 7.8 Open questions
+### 7.8 Resolved questions (decided, pending herdr ack)
 
-- Q1: Should confirm be strictly per-device (as decided above) or allow an owner to
-  migrate all devices' rows with an explicit `--all-devices` plus fleet-admin?
-  The default is per-device only.
-- Q2: Should the idempotency entries live in the grant record (one write) or as
-  separate keys? Separate keys are proposed; both are inside the same transaction.
-- Q3: Should we keep the two-step proposal model of §1(e), or does digest +
-  idempotency key replace it? The proposal is that digest + key replaces stored
-  proposals for #630, and §1(e) is deferred.
-- Q4: Should audit entries for rejected confirms be persisted (that is a write on
-  failure)? The proposal is no, logs only.
-- Q5: For the Rust tri-state, should we use `serde_with` or a hand-written
-  deserializer? This touches dependency policy.
+- **Q1 — per-device only.** Confirm applies only rows whose `device_id` equals the
+  authenticated owner device (§7.1 step 5). There is no `--all-devices` in #630.
+  Future: a cross-device migrate would need fleet-admin auth plus an explicit
+  `--all-devices` flag and a separate design; it is out of scope.
+- **Q2 — separate DO keys.**
+  - Key format: `migrate-idem:v1:<device_id>:<idempotency_key>`.
+    `device_id` matches `^dev_[0-9A-HJKMNP-TV-Z]{26}$` and `idempotency_key`
+    matches `^[A-Za-z0-9_-]{16,64}$`. Both are validated before the key is built,
+    so there is no delimiter injection.
+  - Value: `{v: 1, plan_digest, result, created_at_ms, expires_at_ms}`, where
+    `expires_at_ms` is `created_at_ms + 24h`.
+  - The entry is written in the same transaction as the grant record write. It is
+    never written for a rejected confirm.
+  - TTL 24 h. Lazy check: an expired entry found on lookup is treated as absent
+    and deleted in that same transaction.
+  - Cleanup: a DO alarm (re-armed while entries exist, at most hourly) lists the
+    `migrate-idem:v1:` prefix and deletes expired entries in batches of 128.
+  - Hard cap of 256 entries per device. When it is reached, the oldest entry is
+    evicted before a new one is inserted.
+  - Revoke of a grant record does not need to touch these entries. A replay after
+    revoke returns the stored past result, which reports a historical success and
+    grants nothing; any new key re-plans and fails closed.
+- **Q3 — digest + idempotency replaces §1(e).** There are no stored proposals. The
+  dry run returns `plan_digest`; confirm must present it, and the server recomputes
+  the plan in-transaction. §1(e) is marked superseded.
+- **Q4 — rejected confirms: logged only, no stored audit.** A rejection performs
+  **zero storage writes**: no audit entry, no idempotency entry, and no counter. The
+  route emits exactly one structured log line (`console.log` JSON, one object):
+  ```
+  { "event": "page_assist_migrate_rejected",
+    "v": 1,
+    "at_ms": <number>,
+    "code": "<fixed code, e.g. migrate_plan_stale>",
+    "status": <http status>,
+    "stage": "auth|validate|idempotency|replan|digest|device_scope|postcondition|storage",
+    "by": "device:<dev_…>" | null,
+    "from_connector_id": "<conn_…>" | null,
+    "to_connector_id": "<conn_…>" | null,
+    "idempotency_key_sha256_8": "<first 8 hex of sha256(key)>" | null,
+    "plan_digest_8": "<first 8 hex of client digest>" | null,
+    "invalid_records": <number> | null,
+    "rows_in_fresh_plan": <number> | null }
+  ```
+  - The line never includes `client_id`, `endpoint_ref`, `provider`, `account_ref`,
+    the raw idempotency key, credentials, or request bodies. Connector ids are
+    included only after validation (else `null`).
+  - `by` is `null` when auth failed.
+  - Successful confirms emit `page_assist_migrate_applied` with the same fields
+    plus `audit_id` and `moved`; their durable record is the stored audit entry
+    (§7.5).
+  - Tests assert:
+    - a rejected confirm produces zero writes and exactly one log line with this
+      key set;
+    - no forbidden field ever appears in that line;
+    - stored audit is unchanged after a rejection.
+- **Q5 — hand-written three-state deserializer, no new dependency.**
+  - In `grant_migration.rs`, add `enum Field<T> { Absent, Null, Value(T) }` with
+    `Default = Absent`.
+  - A manual `Deserialize` maps JSON `null` to `Null` and a value to `Value`.
+    Fields use `#[serde(default)]`, so a missing key gives `Absent`.
+  - `Serialize` writes `Null` as `null`. `skip_serializing_if = "Field::is_absent"`
+    keeps `Absent` absent.
+  - The type is used for `connector_id`, `grant_generation`, `page_assist`, and
+    `webchat_control`.
+  - No `serde_with`; `Cargo.toml` is unchanged.
+  - Acceptance: byte-identical round trip for absent / null / value fixtures,
+    planning treats `Null` the same as `Absent`, and both Rust and Edge pass the
+    shared check-order fixtures (§7.6(2)).
