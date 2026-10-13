@@ -336,7 +336,7 @@ Agent は次の順で進めます。
 | 同じ会話が 2 つの browser endpoint から観測された | canonical URL は必ず 1 つの登録済み session に解決される必要があります。2 つの異なる session が同じ URL を共有する場合は曖昧として `browser_canonical_url_ambiguous` で fail closed し、最新の観測を選ぶことはありません。source-anchored create と handoff が別 profile/account の session へ向き先を変えることはありません。再観測してももう一方の session の記録は消えないため、この URL は source-anchored create と handoff では曖昧なままです。代わりに endpoint、provider、account、generation を明示した direct create を使ってください |
 | dispatch タイムアウト | まず `herdr-mcp webchat dispatch-status DISPATCH_ID` を読み、次に会話を観測してから判断 |
 | 変更の delivery が不確実 | まず再観測。新しい idempotency key で再送しない |
-| `code: "caller_grant_missing"` | 信頼されたローカル経路にいない（例：生の TCP MCP クライアント）。`herdr-mcp` CLI を使う。grant は TCP で自称できません |
+| `code: "caller_grant_missing"` | 2 つの原因のどちらか。(1) 信頼されたローカル経路にいない（例：生の TCP MCP クライアント）。grant は TCP で自称できないため、自分でローカル grant を付ける `herdr-mcp` CLI を使う。(2) 呼び出し元がリモート connector で、その Page Assist grant が存在しない／失効済み。Page Assist grant は `{connector_id, grant_generation, device_id, endpoint_ref}` にバインドされ、ChatGPT の再承認（新しい `connector_id`）や拡張 ID の変化（新しい `endpoint_ref`）で旧 grant は通知なく失効する。ワークステーション所有者が順に復旧する：`herdr-mcp connector list` → `browser_endpoint.list`（CLI：`herdr-mcp webchat endpoints`。live かつ最新バージョンの endpoint を選ぶ）→ `herdr-mcp connector page-assist allow CONNECTOR_ID DEVICE_ID ENDPOINT_REF --confirm` |
 | `code: "unsupported"` | 現在の対応マトリクス外の操作（「能力の検出」参照）。模擬せず報告する |
 | continuity は見つかるが browser session が無い | 先に永続状態を解決（`continuity resume`）し、対象セッションを作成／オープンする。ページ消失を履歴喪失とみなさない |
 | session はあるが `work_memory` が `null` | Continuity 層で止まる。使える `project_ref`/`repo_id`/`work_chain_id` は無く、合成もできない |
