@@ -348,7 +348,7 @@ fn is_extension_dir(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn require_extension_dir(path: &Path, context: &str) -> Result<PathBuf, String> {
+pub(crate) fn require_extension_dir(path: &Path, context: &str) -> Result<PathBuf, String> {
     if is_extension_dir(path) {
         Ok(path.to_path_buf())
     } else {
@@ -360,7 +360,7 @@ fn require_extension_dir(path: &Path, context: &str) -> Result<PathBuf, String> 
 }
 
 #[cfg(unix)]
-fn validate_extension_origin(origin: &str) -> Result<&str, String> {
+pub(crate) fn validate_extension_origin(origin: &str) -> Result<&str, String> {
     let Some(id) = origin
         .strip_prefix("chrome-extension://")
         .and_then(|value| value.strip_suffix('/'))
@@ -374,7 +374,7 @@ fn validate_extension_origin(origin: &str) -> Result<&str, String> {
 }
 
 #[cfg(unix)]
-fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {

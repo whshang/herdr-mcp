@@ -202,6 +202,14 @@ pub trait BrowserActuator: Send + Sync {
     ) -> Result<Option<BrowserPostconditionEvidence>, String> {
         Ok(None)
     }
+
+    /// Whether a browser endpoint is currently live per this actuator's
+    /// connection/heartbeat window — not its historical `last_observed_at`.
+    /// `None` means the actuator has no liveness signal for the endpoint and
+    /// callers must not infer either liveness or staleness from it.
+    fn endpoint_live(&self, _endpoint_ref: &str) -> Option<bool> {
+        None
+    }
 }
 
 pub fn handle(request: &Value, context: &RuntimeContext<'_>) -> Option<Value> {
@@ -437,6 +445,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     method,
                     &params,
                     context.caller_webchat_control_grants,
+                    context.browser_actuator,
                 )
             } else if method == EXEC_WAIT_METHOD {
                 exec_tools::wait(context.exec, &params)
@@ -6740,7 +6749,17 @@ fn browser_registry_call(
     method: &str,
     params: &Value,
 ) -> Value {
-    browser_registry_call_with_grants(store, method, params, &[])
+    browser_registry_call_with_liveness(store, method, params, None)
+}
+
+#[cfg(test)]
+fn browser_registry_call_with_liveness(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    browser_registry_call_with_grants(store, method, params, &[], browser_actuator)
 }
 
 #[cfg(test)]
@@ -6755,7 +6774,7 @@ fn browser_registry_call_with_grant(
     } else {
         Vec::new()
     };
-    browser_registry_call_with_grants(store, method, params, &grants)
+    browser_registry_call_with_grants(store, method, params, &grants, None)
 }
 
 fn browser_registry_call_with_grants(
@@ -6763,6 +6782,7 @@ fn browser_registry_call_with_grants(
     method: &str,
     params: &Value,
     caller_webchat_control_grants: &[BrowserCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
 ) -> Value {
     let Some(object) = params.as_object() else {
         return json!({"ok": false, "code": "browser_registry_params_invalid"});
@@ -6782,7 +6802,12 @@ fn browser_registry_call_with_grants(
             match store.browser_endpoints(limit) {
                 Ok(endpoints) => json!({
                     "ok": true,
-                    "endpoints": endpoints.into_iter().map(browser_endpoint_json).collect::<Vec<_>>()
+                    "endpoints": endpoints
+                        .into_iter()
+                        .map(|endpoint| {
+                            browser_endpoint_json_with_liveness(endpoint, browser_actuator)
+                        })
+                        .collect::<Vec<_>>()
                 }),
                 Err(error) => browser_store_error(error),
             }
@@ -6799,7 +6824,7 @@ fn browser_registry_call_with_grants(
                 Ok(Some(endpoint)) => match store.browser_provider_states(endpoint_ref) {
                     Ok(provider_states) => json!({
                         "ok": true,
-                        "endpoint": browser_endpoint_json(endpoint),
+                        "endpoint": browser_endpoint_json_with_liveness(endpoint, browser_actuator),
                         "provider_states": provider_states.into_iter().map(|state| {
                             json!({
                                 "provider": state.provider,
@@ -7143,6 +7168,31 @@ fn browser_endpoint_json(endpoint: crate::state_store::BrowserEndpointRecord) ->
         "first_observed_at": endpoint.first_observed_at,
         "last_observed_at": endpoint.last_observed_at,
     })
+}
+
+/// Issue #626: the registry list/inspect views must distinguish endpoints
+/// whose extension heartbeat is currently live from historical entries whose
+/// `last_observed_at` only records a past registration. Liveness comes from
+/// the actuator's connection/heartbeat window; without an actuator there is no
+/// signal and the endpoint is reported `unknown`, never optimistically live
+/// or stale. The historical fields are preserved for backward compatibility.
+fn browser_endpoint_json_with_liveness(
+    endpoint: crate::state_store::BrowserEndpointRecord,
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let live = browser_actuator.and_then(|actuator| actuator.endpoint_live(&endpoint.endpoint_ref));
+    let mut view = browser_endpoint_json(endpoint);
+    view["live"] = match live {
+        Some(true) => json!(true),
+        Some(false) => json!(false),
+        None => Value::Null,
+    };
+    view["status"] = match live {
+        Some(true) => json!("live"),
+        Some(false) => json!("stale"),
+        None => json!("unknown"),
+    };
+    view
 }
 
 fn browser_resource_json(resource: crate::state_store::BrowserResourceRecord) -> Value {
@@ -12459,6 +12509,104 @@ mod tests {
         let identity = contract::identity().unwrap();
         assert_eq!(identity.epoch, 5);
         assert_eq!(identity.tool_count, 18);
+    }
+
+    #[test]
+    fn browser_endpoint_list_and_inspect_mark_liveness_from_extension_heartbeat() {
+        use crate::state_store::BrowserEndpointRegistrationInput;
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (live_ref, stale_ref) = {
+            let mut guard = store.lock().unwrap();
+            let live = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "endpoint-liveness-live-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.202",
+                    observed_at: 200,
+                })
+                .unwrap();
+            let stale = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "endpoint-liveness-stale-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.190",
+                    observed_at: 5,
+                })
+                .unwrap();
+            (live.endpoint_ref, stale.endpoint_ref)
+        };
+
+        // A small fake at the actuator boundary: it observes the same
+        // heartbeat contract the real SSE broker exposes.
+        struct HeartbeatActuator {
+            live_endpoint_ref: String,
+        }
+        impl BrowserActuator for HeartbeatActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Err("browser_actuation_unsupported_in_liveness_test".to_owned())
+            }
+            fn endpoint_live(&self, endpoint_ref: &str) -> Option<bool> {
+                Some(endpoint_ref == self.live_endpoint_ref)
+            }
+        }
+        let actuator = HeartbeatActuator {
+            live_endpoint_ref: live_ref.clone(),
+        };
+
+        let listed = browser_registry_call_with_liveness(
+            &store,
+            "herdr_mcp.browser_endpoint.list",
+            &json!({}),
+            Some(&actuator),
+        );
+        assert_eq!(listed["ok"], true);
+        let endpoints = listed["endpoints"].as_array().unwrap();
+        assert_eq!(endpoints.len(), 2);
+        for endpoint in endpoints {
+            // Backward compatibility: the historical fields stay unchanged.
+            assert!(endpoint["endpoint_ref"].is_string());
+            assert!(endpoint["last_observed_at"].is_i64());
+            assert_eq!(endpoint["consent"]["webchat_control"], true);
+            match endpoint["endpoint_ref"].as_str().unwrap() {
+                value if value == live_ref => {
+                    assert_eq!(endpoint["live"], true);
+                    assert_eq!(endpoint["status"], "live");
+                }
+                value if value == stale_ref => {
+                    assert_eq!(endpoint["live"], false);
+                    assert_eq!(endpoint["status"], "stale");
+                }
+                other => panic!("unexpected endpoint in list: {other}"),
+            }
+        }
+
+        let inspected = browser_registry_call_with_liveness(
+            &store,
+            "herdr_mcp.browser_endpoint.inspect",
+            &json!({"endpoint_ref": stale_ref}),
+            Some(&actuator),
+        );
+        assert_eq!(inspected["ok"], true);
+        assert_eq!(inspected["endpoint"]["live"], false);
+        assert_eq!(inspected["endpoint"]["status"], "stale");
+
+        // Without an actuator there is no heartbeat signal at all: the
+        // liveness is unknown and must not be misreported as stale.
+        let unknown = browser_registry_call(&store, "herdr_mcp.browser_endpoint.list", &json!({}));
+        for endpoint in unknown["endpoints"].as_array().unwrap() {
+            assert!(endpoint["live"].is_null());
+            assert_eq!(endpoint["status"], "unknown");
+        }
     }
 
     #[test]
@@ -20136,6 +20284,40 @@ mod tests {
         assert_eq!(terminal["status"], "complete");
         assert_eq!(terminal["reconciled"], false);
         assert_eq!(actuator.status_calls.load(Ordering::SeqCst), 1);
+
+        // #626 (g) snapshot through the real call path: the provider-facing
+        // caller_grant_missing bodies must stay byte-identical.
+        // (1) Caller holds a grant for a different endpoint than the one that
+        //     owns op_id (the `retryable:false` body in doubao_image_status_call).
+        let other_grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_other".to_owned(),
+        }];
+        let mismatch = doubao_image_status_call(
+            &store,
+            &json!({"endpoint_ref": "bep_other", "op_id": op_id}),
+            &other_grants,
+            Some(&actuator),
+        );
+        assert_eq!(
+            serde_json::to_string(&mismatch).unwrap(),
+            r#"{"code":"caller_grant_missing","ok":false,"retryable":false}"#
+        );
+        // (2) Caller holds no grant at all for the endpoint.
+        let no_grant = doubao_image_status_call(
+            &store,
+            &json!({"endpoint_ref": "bep_doubao", "op_id": op_id}),
+            &[],
+            Some(&actuator),
+        );
+        assert_eq!(
+            serde_json::to_string(&no_grant).unwrap(),
+            r#"{"code":"caller_grant_missing","delivery_state":"not_delivered","ok":false,"retryable":false}"#
+        );
+        assert_eq!(
+            actuator.status_calls.load(Ordering::SeqCst),
+            1,
+            "no actuation on grant miss"
+        );
     }
 
     #[test]
