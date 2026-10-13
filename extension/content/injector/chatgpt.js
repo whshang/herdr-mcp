@@ -393,6 +393,14 @@ class ChatGPTAdapter extends BaseAdapter {
     };
   }
 
+  getWatchMainWorldSelector() {
+    const input = this.getInputEl();
+    if (!input) return null;
+    return input.id === 'prompt-textarea'
+      ? '#prompt-textarea[contenteditable="true"]'
+      : 'div.ProseMirror[role="textbox"][contenteditable="true"]';
+  }
+
   // Page-level generation authority. The composer-scoped candidate list can miss
   // the stop control during thinking/tool phases, while the page-wide control is
   // still present. Any visible, strictly validated stop control on the
@@ -420,14 +428,6 @@ class ChatGPTAdapter extends BaseAdapter {
       }
     }
     return false;
-  }
-
-  getWatchMainWorldSelector() {
-    const input = this.getInputEl();
-    if (!input) return null;
-    return input.id === 'prompt-textarea'
-      ? '#prompt-textarea[contenteditable="true"]'
-      : 'div.ProseMirror[role="textbox"][contenteditable="true"]';
   }
 
   getSendButtonCandidates() {
