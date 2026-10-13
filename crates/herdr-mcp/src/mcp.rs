@@ -20787,6 +20787,43 @@ mod tests {
         assert_eq!(replay["idempotent_replay"], true);
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
     }
+
+    /// #632: the real browser actuation broker times out while the command is
+    /// still queued and no extension ever took it. The mcp-level handler must
+    /// surface that provable non-delivery as a retryable `not_delivered`
+    /// refusal, never as `delivery_unknown`, so the caller can safely retry.
+    #[test]
+    fn browser_page_action_queued_untaken_timeout_is_retryable_not_delivered() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let endpoint_ref = format!("bep_{}", "f".repeat(64));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: endpoint_ref.clone(),
+        }];
+        let actuator = crate::mcp_http::test_browser_actuation_broker(
+            Duration::from_millis(150),
+            &endpoint_ref,
+        );
+        let params = json!({
+            "endpoint_ref": endpoint_ref,
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "click",
+            "generation": "pa_gen_queued_untaken",
+            "ref": "ref_pa_gen_queued_untaken_0",
+            "idempotency_key": "page-action-queued-untaken-1",
+        });
+
+        let result = browser_page_action_call(&store, &params, &grants, Some(actuator.as_ref()));
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "browser_page_unavailable", "{result}");
+        assert_eq!(result["delivery_state"], "not_delivered", "{result}");
+        assert_ne!(result["delivery_state"], "delivery_unknown", "{result}");
+        assert_eq!(result["retry_safe"], true, "{result}");
+        assert_eq!(result["retryable"], true, "{result}");
+    }
 }
 
 #[cfg(test)]

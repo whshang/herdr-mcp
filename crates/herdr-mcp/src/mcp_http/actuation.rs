@@ -72,7 +72,7 @@ impl Default for BrowserActuationBroker {
 
 impl BrowserActuationBroker {
     #[cfg(test)]
-    fn with_durations(timeout: Duration, late_completion_ttl: Duration) -> Self {
+    pub(super) fn with_durations(timeout: Duration, late_completion_ttl: Duration) -> Self {
         let (wake_tx, _) = tokio::sync::watch::channel(0_u64);
         Self {
             inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
@@ -266,6 +266,48 @@ impl BrowserActuator for BrowserActuationBroker {
             }
             let now = Instant::now();
             if now >= deadline {
+                // A command still present in `queued` was never taken by an
+                // extension poll, because `take_next_for_extension` uses this
+                // same mutex: this check-and-remove is atomic and a concurrent
+                // take cannot interleave. mcp.rs maps command_accepted=false to
+                // a retryable not_delivered response (e.g.
+                // browser_page_unavailable delivery_state not_delivered), safe to
+                // retry because the command provably never crossed the SSE
+                // boundary.
+                let queued_position = state.queued.iter().position(|command| {
+                    command.get("actuation_id").and_then(Value::as_str)
+                        == Some(actuation_id.as_str())
+                });
+                if let Some(position) = queued_position {
+                    state.queued.remove(position);
+                    state.pending.remove(&actuation_id);
+                    eprintln!(
+                        "herdr-mcp browser actuation not_delivered actuation_id={} operation={} target_endpoint_ref={} dispatch_id={} timeout_ms={} reason=queued_untaken_at_timeout",
+                        actuation_id,
+                        operation,
+                        target_endpoint_ref.unwrap_or("-"),
+                        dispatch_id.unwrap_or("-"),
+                        timeout.as_millis(),
+                    );
+                    return Ok(BrowserPostconditionEvidence {
+                        observed_generation: expected_generation,
+                        command_accepted: false,
+                        browser_online: true,
+                        resource_available: true,
+                        rejected: false,
+                        stable_resource_ref_observed: false,
+                        lifecycle_observed: false,
+                        canonical_url_observed: false,
+                        accepted_message_observed: false,
+                        message_baseline_advanced: false,
+                        reasoning_effort_readback: None,
+                        required_apps_readback: Vec::new(),
+                        generation_owner: None,
+                        generation_status_observed: false,
+                        generation_stopped: false,
+                        result: None,
+                    });
+                }
                 if dispatch_id.is_some() {
                     if let Some(pending) = state.pending.get_mut(&actuation_id) {
                         pending.timed_out_at = Some(now);
@@ -277,6 +319,14 @@ impl BrowserActuator for BrowserActuationBroker {
                     command.get("actuation_id").and_then(Value::as_str)
                         != Some(actuation_id.as_str())
                 });
+                eprintln!(
+                    "herdr-mcp browser actuation delivery_unknown actuation_id={} operation={} target_endpoint_ref={} dispatch_id={} timeout_ms={} reason=handed_out_unacknowledged",
+                    actuation_id,
+                    operation,
+                    target_endpoint_ref.unwrap_or("-"),
+                    dispatch_id.unwrap_or("-"),
+                    timeout.as_millis(),
+                );
                 // Once a command may have crossed the SSE boundary, a missing
                 // acknowledgement is delivery-uncertain and must never invite replay.
                 return Ok(BrowserPostconditionEvidence {
@@ -378,6 +428,106 @@ mod tests {
         let (lock, _) = &*broker.inner;
         let state = lock.lock().unwrap();
         assert!(BrowserActuationBroker::extension_live(&state, None));
+    }
+
+    fn issue_632_actuate_in_background(
+        broker: &BrowserActuationBroker,
+        endpoint_ref: &str,
+        dispatch_id: Option<&'static str>,
+    ) -> tokio::task::JoinHandle<Result<BrowserPostconditionEvidence, String>> {
+        let task_broker = broker.clone();
+        let endpoint_ref = endpoint_ref.to_owned();
+        tokio::task::spawn_blocking(move || {
+            task_broker.actuate_for_endpoint(
+                "herdr_mcp.browser_page.action",
+                &json!({"page_ref":"bp_test","action":"open"}),
+                3,
+                Some(&endpoint_ref),
+                dispatch_id,
+            )
+        })
+    }
+
+    /// #632: a command that no extension poll ever took is provably not delivered.
+    #[tokio::test]
+    async fn queued_untaken_timeout_is_not_delivered_and_retryable() {
+        for dispatch_id in [None, Some("op:issue632:untaken")] {
+            let broker = BrowserActuationBroker::with_durations(
+                Duration::from_millis(150),
+                Duration::from_millis(150),
+            );
+            let endpoint_ref = format!("bep_{}", "c".repeat(64));
+            broker.note_extension_poll(Some(&endpoint_ref));
+            let evidence = issue_632_actuate_in_background(&broker, &endpoint_ref, dispatch_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !evidence.command_accepted,
+                "queued-untaken timeout must be not_delivered (command_accepted=false), dispatch={dispatch_id:?}"
+            );
+            assert!(evidence.browser_online);
+            assert!(evidence.result.is_none());
+        }
+    }
+
+    /// #632: after a queued-untaken timeout the command is gone from the queue,
+    /// so it can never be delivered late (which would make the retry a duplicate).
+    #[tokio::test]
+    async fn timed_out_untaken_command_is_never_delivered_late() {
+        let broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(150),
+            Duration::from_millis(150),
+        );
+        let endpoint_ref = format!("bep_{}", "d".repeat(64));
+        broker.note_extension_poll(Some(&endpoint_ref));
+        let evidence =
+            issue_632_actuate_in_background(&broker, &endpoint_ref, Some("op:issue632:late"))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!evidence.command_accepted);
+        assert!(
+            broker
+                .take_next_for_extension(Some(&endpoint_ref))
+                .is_none()
+        );
+        assert!(broker.take_next_for_extension(None).is_none());
+        let (lock, _) = &*broker.inner;
+        let state = lock.lock().unwrap();
+        assert!(state.queued.is_empty());
+        assert!(
+            state.pending.is_empty(),
+            "a never-delivered command leaves no pending entry for a late completion"
+        );
+    }
+
+    /// #632: once an extension poll took the command, a missing acknowledgement
+    /// stays delivery-uncertain (command_accepted=true) and must not invite replay.
+    #[tokio::test]
+    async fn handed_out_command_timeout_stays_delivery_unknown() {
+        let broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        );
+        let endpoint_ref = format!("bep_{}", "e".repeat(64));
+        broker.note_extension_poll(Some(&endpoint_ref));
+        let mut wake_rx = broker.subscribe_wake();
+        let task = issue_632_actuate_in_background(&broker, &endpoint_ref, None);
+        tokio::time::timeout(Duration::from_millis(200), wake_rx.changed())
+            .await
+            .expect("enqueue wakes push")
+            .expect("wake channel open");
+        let command = broker
+            .take_next_for_extension(Some(&endpoint_ref))
+            .expect("extension takes the command");
+        assert_eq!(command["target_endpoint_ref"], endpoint_ref);
+        let evidence = task.await.unwrap().unwrap();
+        assert!(
+            evidence.command_accepted,
+            "handed-out command keeps delivery_unknown"
+        );
+        assert!(evidence.browser_online);
     }
 
     #[tokio::test]
