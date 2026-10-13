@@ -281,6 +281,7 @@ pub enum MigrateCli {
         from: String,
         to: String,
         confirm: bool,
+        idempotency_key: Option<String>,
     },
 }
 
@@ -323,6 +324,7 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
     let mut from = None;
     let mut to = None;
     let mut confirm = false;
+    let mut idempotency_key: Option<String> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -343,6 +345,18 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
                 }
                 *slot = Some(value.clone());
             }
+            "--idempotency-key" if idempotency_key.is_none() => {
+                let value = iter.next().filter(|v| !v.starts_with('-')).ok_or_else(|| {
+                    "connector page-assist migrate: --idempotency-key requires a value".to_owned()
+                })?;
+                if !valid_idempotency_key(value) {
+                    return Err(
+                        "connector page-assist migrate: --idempotency-key requires 16-64 chars of A-Za-z0-9_-"
+                            .to_owned(),
+                    );
+                }
+                idempotency_key = Some(value.clone());
+            }
             "--confirm" if !confirm => confirm = true,
             other => {
                 return Err(format!(
@@ -358,7 +372,15 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
     if from == to {
         return Err("connector page-assist migrate: --from and --to must differ".to_owned());
     }
-    Ok(MigrateCli::Migrate { from, to, confirm })
+    Ok(MigrateCli::Migrate { from, to, confirm, idempotency_key })
+}
+
+/// #630 §7.3: client idempotency key charset/length, same rule as the Edge DO.
+pub fn valid_idempotency_key(key: &str) -> bool {
+    (16..=64).contains(&key.len())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
 /// Canonical device id: `dev_` + 26-char Crockford ULID (same rule as the Edge DO).
@@ -776,7 +798,19 @@ mod tests {
             Some(Ok(MigrateCli::Migrate {
                 from: OLD.into(),
                 to: NEW.into(),
-                confirm: false
+                confirm: false,
+                idempotency_key: None,
+            }))
+        );
+        assert_eq!(
+            parse_cli(&s(&[
+                "migrate", "--from", OLD, "--to", NEW, "--idempotency-key", "rust-key-00000001", "--confirm"
+            ])),
+            Some(Ok(MigrateCli::Migrate {
+                from: OLD.into(),
+                to: NEW.into(),
+                confirm: true,
+                idempotency_key: Some("rust-key-00000001".into()),
             }))
         );
     }

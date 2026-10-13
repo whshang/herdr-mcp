@@ -473,9 +473,9 @@ export default {
         return noStoreJsonResponse({ ok: false, code: "orphans_invalid_device_id" }, 400);
       }
       let scopedDeviceId: string | undefined;
-      if (parsed.value.action === "list") {
+      if (parsed.value.action === "list" || parsed.value.action === "plan") {
         const authDevice = owner.deviceId === null ? null : normalizeDeviceId(owner.deviceId);
-        // Fail closed: no registry device identity (legacy shared-secret auth) -> no listing.
+        // Fail closed: no registry device identity (legacy shared-secret auth) -> no listing, no plan.
         if (!authDevice) return noStoreJsonResponse({ ok: false, code: "orphans_device_unresolved" }, 403);
         if (parsed.value.device_id !== undefined && parsed.value.device_id !== authDevice) {
           return noStoreJsonResponse({ ok: false, code: "orphans_device_mismatch" }, 403);
@@ -488,6 +488,41 @@ export default {
         ...(typeof parsed.value.from === "string" ? { from: parsed.value.from } : {}),
         ...(typeof parsed.value.to === "string" ? { to: parsed.value.to } : {}),
         ...(scopedDeviceId !== undefined ? { device_id: scopedDeviceId } : {}),
+      });
+      return noStoreJsonResponse(result.body, result.status);
+    }
+
+    if (request.method === "POST" && url.pathname === "/connectors/page-assist/migrate") {
+      // #630: --confirm write path. Same owner-device auth as allow; the
+      // authenticated registry device scopes the whole migration (the DO
+      // rejects cross-device rows before any digest comparison).
+      const owner = await authenticateOwnerDeviceIdentity(request, env);
+      if (!owner) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const authDevice = owner.deviceId === null ? null : normalizeDeviceId(owner.deviceId);
+      if (!authDevice) return noStoreJsonResponse({ ok: false, code: "migrate_device_unresolved" }, 403);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)
+        || Object.keys(parsed.value).some((key) => key !== "from" && key !== "to" && key !== "plan_digest" && key !== "idempotency_key")) {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const from = typeof parsed.value.from === "string" ? parsed.value.from : "";
+      const to = typeof parsed.value.to === "string" ? parsed.value.to : "";
+      const planDigest = typeof parsed.value.plan_digest === "string" ? parsed.value.plan_digest : "";
+      const idempotencyKey = typeof parsed.value.idempotency_key === "string" ? parsed.value.idempotency_key : "";
+      if (!/^conn_[A-Za-z0-9_-]{8,128}$/.test(from) || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(to) || from === to) {
+        return noStoreJsonResponse({ ok: false, code: "migrate_invalid_connector_id" }, 400);
+      }
+      if (!/^[0-9a-f]{64}$/.test(planDigest)) {
+        return noStoreJsonResponse({ ok: false, code: "migrate_invalid_plan_digest" }, 400);
+      }
+      if (!/^[A-Za-z0-9_-]{16,64}$/.test(idempotencyKey)) {
+        return noStoreJsonResponse({ ok: false, code: idempotencyKey === "" ? "migrate_idempotency_key_required" : "migrate_idempotency_key_invalid" }, 400);
+      }
+      const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+      const result = await createOAuthPublicStore(stub).pageAssistMigrate({
+        from, to, plan_digest: planDigest, idempotency_key: idempotencyKey,
+        device_id: authDevice, by: `device:${authDevice}`,
       });
       return noStoreJsonResponse(result.body, result.status);
     }

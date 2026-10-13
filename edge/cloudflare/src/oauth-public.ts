@@ -151,6 +151,7 @@ export interface OAuthPublicStore {
     changed_by: string;
   }): Promise<OAuthConnectorGrantRecord | null>;
   pageAssistOrphans(input: { action: "list" | "plan"; from?: string; to?: string; device_id?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
+  pageAssistMigrate(input: { from: string; to: string; plan_digest: string; idempotency_key: string; device_id: string; by: string }): Promise<{ status: number; body: Record<string, unknown> }>;
   setPageAssistGrant(input: {
     connector_id: string;
     device_id: string;
@@ -1675,6 +1676,11 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
     },
     async pageAssistOrphans(input) {
       const resp = await internal("/internal/oauth/grant/page-assist-orphans", input);
+      const body = (await resp.json().catch(() => ({ ok: false, code: "invalid_response" }))) as Record<string, unknown>;
+      return { status: resp.status, body };
+    },
+    async pageAssistMigrate(input) {
+      const resp = await internal("/internal/oauth/grant/page-assist-migrate", input);
       const body = (await resp.json().catch(() => ({ ok: false, code: "invalid_response" }))) as Record<string, unknown>;
       return { status: resp.status, body };
     },

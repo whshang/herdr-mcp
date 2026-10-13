@@ -221,6 +221,13 @@ pub enum WorkerCommand {
         /// authenticated owner device and rejects a mismatch. Never set for migrate.
         device_id: Option<String>,
     },
+    /// #630 `--confirm`: fetch the device-scoped dry-run plan, then apply it
+    /// with its digest through the public migrate route.
+    ConnectorPageAssistMigrate {
+        from: String,
+        to: String,
+        idempotency_key: Option<String>,
+    },
     ConnectorPageAssist {
         connector_id: String,
         device_id: String,
@@ -1469,12 +1476,16 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
         }
         Some("page-assist") => {
             if let Some(parsed) = crate::grant_migration::parse_cli(&args[1..]) {
-                // #626: orphans list and migrate dry run are read-only Edge reads.
-                // The --confirm write path is not implemented and refuses.
+                // #626/#630: orphans list and migrate dry run are read-only Edge
+                // reads; --confirm runs the device-scoped write path.
                 return match parsed? {
-                    crate::grant_migration::MigrateCli::Migrate { confirm: true, .. } => Err(
-                        "connector page-assist migrate --confirm is not implemented yet; nothing was written".to_owned(),
-                    ),
+                    crate::grant_migration::MigrateCli::Migrate { from, to, confirm: true, idempotency_key } => {
+                        Ok(Command::Worker(WorkerCommand::ConnectorPageAssistMigrate {
+                            from,
+                            to,
+                            idempotency_key,
+                        }))
+                    }
                     crate::grant_migration::MigrateCli::Migrate { from, to, .. } => {
                         Ok(Command::Worker(WorkerCommand::ConnectorPageAssistOrphans {
                             from: Some(from),
@@ -2406,7 +2417,7 @@ User path:\n\
   herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp connector page-assist orphans [list] [--device-id <device-id>]  (read-only: grant rows left under a previous connector; always scoped server-side to the authenticated owner device; --device-id is only an assertion and must match it, else 403 orphans_device_mismatch)\n\
-  herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id>  (dry run only; --confirm not implemented yet)\n\
+  herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id> [--idempotency-key <key>] [--confirm]  (dry run without --confirm; with --confirm fetches the device-scoped plan, prints it plus the idempotency key, and applies it by plan_digest)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
   herdr-mcp automation list\n\
   herdr-mcp automation rotate <client-id> --confirm\n\
@@ -4113,9 +4124,9 @@ mod tests {
                 device_id: None,
             })
         );
-        // --confirm write path refuses; missing selectors fail closed.
-        for bad in [
-            &[
+        // --confirm now runs the device-scoped write path; an explicit key rides along.
+        assert_eq!(
+            parse(args(&[
                 "connector",
                 "page-assist",
                 "migrate",
@@ -4124,7 +4135,38 @@ mod tests {
                 "--to",
                 "conn_new000000001",
                 "--confirm",
-            ][..],
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::ConnectorPageAssistMigrate {
+                from: "conn_old000000001".to_owned(),
+                to: "conn_new000000001".to_owned(),
+                idempotency_key: None,
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "connector",
+                "page-assist",
+                "migrate",
+                "--from",
+                "conn_old000000001",
+                "--to",
+                "conn_new000000001",
+                "--idempotency-key",
+                "cli-key-000000000001",
+                "--confirm",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::ConnectorPageAssistMigrate {
+                from: "conn_old000000001".to_owned(),
+                to: "conn_new000000001".to_owned(),
+                idempotency_key: Some("cli-key-000000000001".to_owned()),
+            })
+        );
+        // Missing selectors or a malformed idempotency key fail closed.
+        for bad in [
             &[
                 "connector",
                 "page-assist",
@@ -4140,6 +4182,18 @@ mod tests {
                 "conn_new000000001",
             ][..],
             &["connector", "page-assist", "migrate"][..],
+            &[
+                "connector",
+                "page-assist",
+                "migrate",
+                "--from",
+                "conn_old000000001",
+                "--to",
+                "conn_new000000001",
+                "--idempotency-key",
+                "short",
+                "--confirm",
+            ][..],
         ] {
             assert!(parse(args(bad)).is_err(), "{bad:?}");
         }
