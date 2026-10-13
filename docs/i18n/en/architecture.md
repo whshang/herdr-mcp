@@ -99,7 +99,7 @@ native Herdr method
 
 This preserves native reachability without turning every Herdr method into a permanent public MCP ABI.
 
-The workstation Runtime Execution Contract is **epoch 5 / 18 tools**. The current first-party DEV/PROD public Edge contract is **epoch 7 / 19 actions**; workstation tool-catalog changes remain explicit contract migrations, not incidental runtime changes. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are kept only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline.
+The workstation Runtime Execution Contract is **epoch 5 / 18 tools**. The current first-party DEV/PROD public Edge contract is **epoch 8 / 19 actions**; workstation tool-catalog changes remain explicit contract migrations, not incidental runtime changes. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are kept only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline.
 
 ## Progressive skills and capability truth
 

@@ -61,7 +61,7 @@ long-tail native Herdr operations
   → herdr_methods + herdr_call
 ```
 
-The workstation Runtime Execution Contract is **epoch 5 / 18 tools**. The current first-party DEV/PROD public Edge contract is **epoch 7 / 19 actions**, whose action set includes Edge-local `herdr_devices`. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline. Future catalog changes require explicit contract epochs rather than incidental runtime changes.
+The workstation Runtime Execution Contract is **epoch 5 / 18 tools**. The current first-party DEV/PROD public Edge contract is **epoch 8 / 19 actions**, whose action set includes Edge-local `herdr_devices`. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline. Future catalog changes require explicit contract epochs rather than incidental runtime changes.
 
 ## Choice 2: files, Git and shell are first-class
 

@@ -46,6 +46,7 @@ function createElement({
       return attributes.get(name) ?? null;
     },
     hasAttribute(name) { return attributes.has(name); },
+    setAttribute(name, value) { attributes.set(name, String(value)); },
     getBoundingClientRect() {
       return visible ? { width: 120, height: 28 } : { width: 0, height: 0 };
     },
@@ -67,6 +68,8 @@ function harness({
   elements = [],
   topOrigin = null,
   scrollMax = 0,
+  scrollY = 0,
+  scrollingElement = null,
 } = {}) {
   let listener = null;
   const location = new URL(url);
@@ -75,6 +78,7 @@ function harness({
     readyState: "complete",
     body: { innerText: bodyText, textContent: bodyText },
     documentElement: { scrollHeight: scrollMax + 600 },
+    scrollingElement,
     querySelectorAll() { return elements; },
   };
   for (const element of elements) element.ownerDocument = document;
@@ -87,7 +91,7 @@ function harness({
     setTimeout,
     document,
     location,
-    scrollY: 0,
+    scrollY,
     innerHeight: 600,
     scrollBy({ top }) {
       this.scrollY = Math.max(0, Math.min(scrollMax, this.scrollY + top));
@@ -106,6 +110,7 @@ function harness({
         visibility: hidden ? "hidden" : "visible",
         opacity: hidden ? "0" : "1",
         position: "static",
+        overflowY: element.overflowY || "visible",
       };
     },
   });
@@ -549,4 +554,228 @@ test("Page Assist fails closed inside a cross-origin iframe", () => {
   const result = h.send({ type: "h2w_page_assist", action: "inspect" });
   assert.equal(result.ok, false);
   assert.equal(result.error, "cross_origin_iframe_blocked");
+});
+
+test("user extracts only visible text | Given an observed container with hidden, aria-hidden and password descendants | When extract runs on the container ref | Then only visible descendant text is returned", () => {
+  const container = createElement({ tag: "div", text: "Visible SECRET_HIDDEN SECRET_ARIA" });
+  const h = harness({ elements: [container] });
+  const doc = container.ownerDocument;
+  const textNode = (value) => ({ nodeType: 3, nodeValue: value });
+  const child = (opts, kids) => Object.assign(createElement(opts), { nodeType: 1, ownerDocument: doc, childNodes: kids });
+  container.nodeType = 1;
+  container.childNodes = [
+    textNode("Visible "),
+    child({ tag: "span", visible: false }, [textNode("SECRET_HIDDEN")]),
+    child({ tag: "span", attrs: { "aria-hidden": "true" } }, [textNode("SECRET_ARIA")]),
+    child({ tag: "input", type: "password", value: "SECRET_PW" }, []),
+    child({ tag: "b" }, [textNode("tail")]),
+  ];
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const ref = observed.elements[0].ref;
+  const result = h.send({ type: "h2w_page_assist", action: "extract", expectedOrigin: "https://app.test", generation: observed.generation, ref });
+  assert.equal(result.ok, true);
+  assert.equal(result.text, "Visible tail");
+  assert.doesNotMatch(result.text, /SECRET/);
+});
+
+test("user sets a framework-managed checkbox | Given a checkbox whose native click toggles state and one whose state cannot change | When fill sets checked true | Then the click path is used and ok is reported only when the final state matches", () => {
+  const live = createElement({ tag: "input", type: "checkbox", attrs: { "aria-label": "Live" } });
+  live.checked = false;
+  live.click = function () { this.clicked += 1; this.checked = !this.checked; this.events.push("click"); };
+  const stuck = createElement({ tag: "input", type: "checkbox", attrs: { "aria-label": "Stuck" } });
+  let stuckValue = false;
+  Object.defineProperty(stuck, "checked", { get: () => stuckValue, set: () => {}, configurable: true });
+  const h = harness({ elements: [live, stuck] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const refFor = (label) => observed.elements.find((e) => e.type === "checkbox" && JSON.stringify(e).includes(label)).ref;
+  const liveRef = refFor("Live");
+  const stuckRef = refFor("Stuck");
+  const fill = (ref, generation) => h.send({ type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test", generation, ref, value: "true" });
+  const ok = fill(liveRef, observed.generation);
+  assert.equal(ok.ok, true);
+  assert.equal(live.checked, true);
+  assert.equal(live.clicked, 1);
+  assert.deepEqual(live.events, ["click"]);
+  const again = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const failed = fill(again.elements.find((e) => e.type === "checkbox" && JSON.stringify(e).includes("Stuck")).ref, again.generation);
+  assert.equal(failed.ok, false);
+  assert.equal(failed.error, "control_state_not_applied");
+  assert.equal(stuckValue, false);
+  void stuckRef;
+});
+
+test("user distinguishes a truncated dropdown observation from an absent option | Given a select whose observed option list was cut at the observation window | When fill asks for an option outside that window | Then it fails closed with a truncation-specific error and never selects the live option", () => {
+  const dropdown = createElement({ tag: "select", attrs: { "aria-label": "Region" }, value: "" });
+  dropdown.options = [
+    { value: "", textContent: "Choose region", disabled: true },
+    ...Array.from({ length: 30 }, (_, i) => ({ value: `r${i}`, textContent: `Region ${i}`, disabled: false })),
+  ];
+  const h = harness({ elements: [dropdown] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements[0].options.length, 24);
+  assert.equal(observed.elements[0].options_truncated, true);
+  const choose = (value) => h.send({
+    type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[0].ref, value,
+  });
+
+  // "Region 27" exists in the live control but was never observed.
+  const beyondWindow = choose("Region 27");
+  assert.equal(beyondWindow.ok, false);
+  assert.equal(beyondWindow.error, "select_option_not_observed");
+  assert.equal(beyondWindow.options_observed, 24);
+  assert.equal(dropdown.value, "");
+  assert.deepEqual(dropdown.events, []);
+  assert.equal(dropdown.focused, 0);
+
+  // The rejection happened before any mutation, so the generation still stands.
+  assert.equal(choose("Region 3").ok, true);
+  assert.equal(dropdown.value, "r3");
+  assert.equal(choose("Region 28").error, "stale_generation");
+
+  // A complete observation keeps reporting an option that is genuinely absent.
+  const small = createElement({ tag: "select", attrs: { "aria-label": "Small" }, value: "" });
+  small.options = [{ value: "alpha", textContent: "Alpha", disabled: false }];
+  const full = harness({ elements: [small] });
+  const seen = full.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(seen.elements[0].options_truncated, undefined);
+  const absent = full.send({
+    type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+    generation: seen.generation, ref: seen.elements[0].ref, value: "Omega",
+  });
+  assert.equal(absent.error, "select_option_unavailable");
+  assert.equal(small.value, "");
+});
+
+test("user scrolls an inner scroll container | Given a page whose window cannot move but whose observed content sits in a scrollable container | When scroll down is requested | Then the container moves, the result names it, and verification is still required", () => {
+  const container = createElement({ tag: "div", attrs: { class: "feed-scroll" } });
+  container.overflowY = "auto";
+  container.scrollTop = 0;
+  container.scrollHeight = 2000;
+  container.clientHeight = 500;
+  container.scrollBy = function ({ top }) {
+    this.scrollTop = Math.max(0, Math.min(this.scrollHeight - this.clientHeight, this.scrollTop + top));
+  };
+  const button = createElement({ tag: "button", text: "Load more" });
+  button.parentElement = container;
+  const h = harness({ elements: [button], scrollMax: 0 });
+  let observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.scroll.max_y, 0);
+  const scroll = (direction, amount) => h.send({
+    type: "h2w_page_assist", action: "scroll", expectedOrigin: "https://app.test",
+    generation: observed.generation, direction, amount,
+  });
+
+  const moved = scroll("down", 400);
+  assert.equal(moved.ok, true);
+  assert.deepEqual([moved.before_y, moved.after_y, moved.moved, moved.at_boundary], [0, 0, true, false]);
+  assert.equal(moved.scroll_container, "observed_ancestor");
+  assert.equal(moved.scroll_container_tag, "div");
+  assert.deepEqual([moved.scroll_container_before, moved.scroll_container_after], [0, 400]);
+  assert.equal(moved.requires_verification, true);
+  assert.equal(container.scrollTop, 400);
+  assert.equal(scroll("down", 400).error, "stale_generation");
+
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(scroll("down", 1500).scroll_container_after, 1500);
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const boundary = scroll("down", 500);
+  assert.equal(boundary.ok, true);
+  assert.equal(boundary.moved, false);
+  assert.equal(boundary.at_boundary, true);
+  assert.equal(boundary.scroll_container, undefined);
+  assert.equal(container.scrollTop, 1500);
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(scroll("up", 200).scroll_container_after, 1300);
+  assert.equal(container.scrollTop, 1300);
+});
+
+test("user scrolls a clipped document | Given a page whose only scrollable box is document.scrollingElement | When scroll down is requested | Then that element moves and is reported as the container", () => {
+  const scroller = createElement({ tag: "html" });
+  scroller.scrollTop = 0;
+  scroller.scrollHeight = 1800;
+  scroller.clientHeight = 600;
+  scroller.scrollBy = function ({ top }) {
+    this.scrollTop = Math.max(0, Math.min(this.scrollHeight - this.clientHeight, this.scrollTop + top));
+  };
+  const label = createElement({ tag: "button", text: "Deep content" });
+  const h = harness({ elements: [label], scrollMax: 0, scrollingElement: scroller });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const moved = h.send({
+    type: "h2w_page_assist", action: "scroll", expectedOrigin: "https://app.test",
+    generation: observed.generation, direction: "down", amount: 300,
+  });
+  assert.equal(moved.ok, true);
+  assert.deepEqual([moved.before_y, moved.after_y, moved.moved, moved.at_boundary], [0, 0, true, false]);
+  assert.equal(moved.scroll_container, "document_scrolling_element");
+  assert.equal(moved.scroll_container_tag, "html");
+  assert.deepEqual([moved.scroll_container_before, moved.scroll_container_after], [0, 300]);
+  assert.equal(moved.requires_verification, true);
+  assert.equal(scroller.scrollTop, 300);
+});
+
+test("user gets one effective scroll | Given a viewport whose subpixel movement rounds to the same reported position | When scroll down is requested | Then the viewport counts as moved and no observed container is also scrolled", () => {
+  const container = createElement({ tag: "div", attrs: { class: "feed-scroll" } });
+  container.overflowY = "auto";
+  container.scrollTop = 0;
+  container.scrollHeight = 2000;
+  container.clientHeight = 500;
+  container.scrollBy = function ({ top }) {
+    this.scrollTop = Math.max(0, Math.min(this.scrollHeight - this.clientHeight, this.scrollTop + top));
+  };
+  const button = createElement({ tag: "button", text: "Load more" });
+  button.parentElement = container;
+  const h = harness({ elements: [button], scrollMax: 0.4, scrollY: 0.2 });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.scroll.y, 0);
+  const moved = h.send({
+    type: "h2w_page_assist", action: "scroll", expectedOrigin: "https://app.test",
+    generation: observed.generation, direction: "down", amount: 500,
+  });
+  assert.equal(moved.ok, true);
+  assert.deepEqual([moved.before_y, moved.after_y], [0, 0]);
+  assert.equal(moved.moved, true);
+  assert.equal(moved.at_boundary, false);
+  assert.equal(moved.scroll_container, "viewport");
+  assert.deepEqual([moved.scroll_container_before, moved.scroll_container_after], [0.2, 0.4]);
+  assert.equal(container.scrollTop, 0);
+});
+
+test("user fills a rich-text composer | Given a contenteditable editor that may ignore raw text writes | When fill runs | Then success is reported only after the text reads back", () => {
+  const value = "hello  claude\u00a0composer";
+  function fillOnly(element) {
+    const h = harness({ elements: [element] });
+    const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+    assert.equal(observed.elements.length, 1);
+    return h.send({
+      type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+      generation: observed.generation, ref: observed.elements[0].ref, value,
+    });
+  }
+  // ProseMirror-like: re-renders its own model and drops a raw innerText write.
+  const prose = createElement({ tag: "div", contentEditable: true, attrs: { "aria-label": "Prose editor" } });
+  Object.defineProperty(prose, "innerText", { get: () => "", set: () => {}, configurable: true });
+  Object.defineProperty(prose, "textContent", { get: () => "", set: () => {}, configurable: true });
+  const rejected = fillOnly(prose);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.error, "fill_not_applied");
+  assert.equal(rejected.applied, false);
+
+  const plain = createElement({ tag: "div", contentEditable: true, attrs: { "aria-label": "Plain editor" } });
+  assert.equal(fillOnly(plain).ok, true);
+});
+
+test("user fills a rich-text composer through the extension | Given the extension requests a MAIN-world fill | When fill targets a contenteditable editor | Then the kernel only tags the element and hands the value back without writing", () => {
+  const editor = createElement({ tag: "div", contentEditable: true, attrs: { "aria-label": "Prose editor" } });
+  const h = harness({ elements: [editor] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const handoff = h.send({
+    type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[0].ref, value: "hello claude", mainWorldFill: true,
+  });
+  assert.equal(handoff.ok, true);
+  assert.match(handoff.main_world_fill_token, /^f[0-9a-z]+$/);
+  assert.equal(handoff.value, "hello claude");
+  assert.equal(editor.getAttribute("data-h2w-fill-token"), handoff.main_world_fill_token);
+  assert.notEqual(editor.innerText, "hello claude");
 });

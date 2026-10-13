@@ -181,18 +181,38 @@ class ChatGPTAdapter extends BaseAdapter {
     return this.getComposerTextWithoutAppPills() === '';
   }
 
+  // The composer's own native mention popup, resolved only through the
+  // provider's own association attributes (aria-controls / aria-owns). There is
+  // deliberately no document-wide fallback: when the composer does not own a
+  // visible popup, App selection fails closed instead of clicking an unrelated
+  // control that happens to share the keyword.
+  getComposerOwnedPopup(input = this.getInputEl()) {
+    if (!input) return null;
+    const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
+    for (const attribute of ['aria-controls', 'aria-owns']) {
+      const id = String(input.getAttribute(attribute) || '').trim();
+      if (!id) continue;
+      const popup = document.getElementById(id);
+      if (popup && !input.contains(popup) && visible(popup)) return popup;
+    }
+    return null;
+  }
+
   // Live 0.1.168 evidence: after trusted `@herdr` keys ChatGPT renders the
-  // mention suggestion as plain <button> rows (no menu/listbox role, outside
-  // the composer form). Return visible buttons whose text is exactly the
+  // mention suggestion rows inside the composer-owned popup (no menu/listbox
+  // role). Return visible buttons in that popup whose text is exactly the
   // keyword; callers must subtract the pre-typing baseline so only buttons
-  // that appeared because of this search are candidates.
+  // that appeared because of this search are candidates. No owned popup means
+  // no candidates.
   getComposerAppSuggestionButtons(keyword) {
     const wanted = String(keyword || '').trim().toLowerCase();
     const input = this.getInputEl();
     if (!wanted || !input) return [];
+    const popup = this.getComposerOwnedPopup(input);
+    if (!popup) return [];
     const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
     const out = new Set();
-    for (const button of document.querySelectorAll('button, [role="button"]')) {
+    for (const button of popup.querySelectorAll('button, [role="button"]')) {
       if (!visible(button) || input.contains(button) || button.disabled) continue;
       const exactLabel = [button, ...button.querySelectorAll('span, div')].some((node) => (
         String(node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase() === wanted
@@ -208,9 +228,11 @@ class ChatGPTAdapter extends BaseAdapter {
     const input = this.getInputEl();
     if (!wanted || !input) return [];
     const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
-    const menuRoots = [...document.querySelectorAll('.popover, [role="menu"], [role="listbox"]')]
-      .filter((node) => visible(node) && !input.contains(node));
-    if (!menuRoots.length) return [];
+    // Only the popup the composer itself owns is searched. A document-wide
+    // popover/menu/listbox scan can pick a sidebar or unrelated control with
+    // the same keyword, so it is never used as a fallback.
+    const popup = this.getComposerOwnedPopup(input);
+    if (!popup) return [];
     const keywordMatches = (element) => {
       const nodes = [
         element,
@@ -229,18 +251,13 @@ class ChatGPTAdapter extends BaseAdapter {
       '[data-testid*="app"]',
       '[tabindex="0"]',
     ];
-    for (const root of menuRoots) {
-      for (const node of root.querySelectorAll(selectors.join(','))) {
-        if (!visible(node) || input.contains(node) || seen.has(node)) continue;
-        const text = [
-          node.textContent,
-          node.getAttribute('aria-label'),
-          node.getAttribute('data-value'),
-        ].filter(Boolean).join(' ').trim().toLowerCase();
-        if (!keywordMatches(node) && !text.includes(wanted)) continue;
-        seen.add(node);
-        matches.push(node);
-      }
+    for (const node of popup.querySelectorAll(selectors.join(','))) {
+      if (!visible(node) || input.contains(node) || seen.has(node)) continue;
+      // Exact provider keyword identity only. A text substring match is never
+      // enough to activate an App.
+      if (!keywordMatches(node)) continue;
+      seen.add(node);
+      matches.push(node);
     }
     return matches.sort((a, b) => {
       const score = (node) => {
@@ -256,6 +273,35 @@ class ChatGPTAdapter extends BaseAdapter {
       return score(b) - score(a);
     });
   }
+
+  // App identity carried by one exact accepted provider user message. Only the
+  // provider's own inline mention nodes with a non-empty app-mention-path count:
+  // plain text (including a typed `@herdr`) never selected an App, and a
+  // composer pill that never landed in the turn is not delivery proof. Any
+  // ambiguity (zero or several carriers of the same id) fails closed.
+  getAcceptedUserAppIdentity(messageId) {
+    const id = String(messageId || '').trim();
+    if (!id) return [];
+    const carriers = [...document.querySelectorAll('[data-message-id]')]
+      .filter((node) => String(node.getAttribute('data-message-id') || '') === id);
+    if (carriers.length !== 1) return [];
+    const carrier = carriers[0];
+    const turn = (carrier.matches?.('[data-message-author-role="user"]') ? carrier : null)
+      || carrier.querySelector?.('[data-message-author-role="user"]')
+      || carrier.closest?.('[data-message-author-role="user"]')
+      || carrier;
+    const seen = new Set();
+    const out = [];
+    for (const mention of this.getInlineAppMentionNodes(turn)) {
+      const name = String(mention.getAttribute('app-mention-name') || '').trim().toLowerCase();
+      const path = String(mention.getAttribute('app-mention-path') || '').trim();
+      if (!/^[a-z0-9_-]{1,64}$/.test(name) || !path || seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name, path: path.slice(0, 240) });
+    }
+    return out;
+  }
+
 
   // Fixed-shape, non-sensitive App search diagnostics. Returns only booleans
   // and small counts derived from DOM structure; never page or draft text.
@@ -285,6 +331,7 @@ class ChatGPTAdapter extends BaseAdapter {
       composer_aria_expanded: input?.getAttribute?.('aria-expanded') === 'true',
       composer_aria_controls_present: Boolean(controlsId),
       composer_aria_controls_visible: visible(controlsTarget),
+      composer_owned_popup_visible: Boolean(this.getComposerOwnedPopup(input)),
       visible_popover_roots: clamp(count('.popover')),
       visible_menu_roots: clamp(count('[role="menu"]')),
       visible_listbox_roots: clamp(count('[role="listbox"]')),

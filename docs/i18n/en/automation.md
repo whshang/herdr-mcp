@@ -81,7 +81,7 @@ CI proves that a commit does not break other planes. Typical gates include:
 - package dry-run;
 - `git diff --check`.
 
-The public Edge contract is intentionally more stable than runtime implementation. The current first-party DEV/PROD public contract is **epoch 7 / 19 actions**, while the workstation Runtime Execution Contract is **epoch 5 / 18 tools**. The extra public action, `herdr_devices`, executes at Edge and is never forwarded to a workstation. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines, not as the current DEV/PROD contract; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline. Compatibility tests for those baselines exist, but normal runtime changes should not silently change either contract.
+The public Edge contract is intentionally more stable than runtime implementation. The current first-party DEV/PROD public contract is **epoch 8 / 19 actions**, while the workstation Runtime Execution Contract is **epoch 5 / 18 tools**. The extra public action, `herdr_devices`, executes at Edge and is never forwarded to a workstation. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines, not as the current DEV/PROD contract; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline. Compatibility tests for those baselines exist, but normal runtime changes should not silently change either contract.
 
 ### GitLab CI and other unattended MCP callers
 

@@ -108,14 +108,14 @@ ChatGPT uses a reviewed/frozen snapshot of MCP action definitions. A runtime or 
 
 Herdr 0.4.3 introduced the intentional separation of the two contracts:
 
-**public ChatGPT contract (first-party DEV/PROD): epoch 7 / 19 actions; workstation runtime execution contract: epoch 5 / 18 tools.** The extra public action is Edge-local `herdr_devices`; it is never forwarded to a workstation. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline.
+**public ChatGPT contract (first-party DEV/PROD): epoch 8 / 19 actions; workstation runtime execution contract: epoch 5 / 18 tools.** The extra public action is Edge-local `herdr_devices`; it is never forwarded to a workstation. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline.
 
 Example:
 
 ```text
-Server: public epoch 7 / 19 actions
+Server: public epoch 8 / 19 actions
 
-Refreshed action set   ✓ can expose epoch 7
+Refreshed action set   ✓ can expose epoch 8
 Old/frozen action set  → may remain on an older action set
 ```
 
@@ -125,6 +125,8 @@ After runtime upgrades:
 2. do **not** disconnect/delete/re-add the Connector merely because either Runtime or the existing Worker was upgraded in place; Worker reconciliation preserves the public OAuth origin and Connector credentials;
 3. when the Herdr public action catalog changed, refresh/review/publish the app actions through the workspace controls available on the account, and explicitly enable new actions when required;
 4. use a fresh conversation after the action snapshot changes. Updating Worker code is necessary for new Edge-provided descriptions, but an already-reviewed ChatGPT action snapshot can still remain frozen until the app actions are refreshed.
+
+Epoch 8 acceptance: check `publicContract.epoch=8` in `/info` at the Worker's URL used by the Connector. After refreshing Herdr actions, use a new conversation to verify 19 tools (11 read, 8 write) and the `Browser actions require an explicit device` and `shell scripts, pipes, or redirects` descriptions. Exercise a read-only file/Git query and a short command. Reloading the browser extension does not refresh MCP tool snapshots.
 
 Do not reinstall the workstation for a stale tool snapshot. Existing v0.4.2 runtimes continue to execute the epoch-2 18-tool workstation contract; they simply do not gain the v0.4.3 multi-device runtime features until upgraded.
 

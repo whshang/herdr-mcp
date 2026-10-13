@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.187";
+const H2W_SCRIPT_VERSION = "0.1.198";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -4361,6 +4361,17 @@ async function handleBrowserActuation(command) {
           expectedGeneration,
           projectId: archiveProjectId,
         });
+        // A WebChat create leaves its own tab on the conversation; a later
+        // owned page re-binds the session target, so only that newer tab was
+        // closed. Close every other tab still showing the archived conversation.
+        try {
+          const others = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+          for (const other of others) {
+            if (!other?.id || other.id === target.tabId) continue;
+            if (chatGptConversationInfo(other.url || "")?.conversation_id !== target.conversationId) continue;
+            try { await chrome.tabs.remove(other.id); } catch (_) {}
+          }
+        } catch (_) {}
       } catch (error) {
         // Archive authority has already been persisted above. Cleanup must not
         // downgrade a proven provider archive into an uncertain mutation.
@@ -7760,6 +7771,20 @@ function browserPageClaimKey(rawUrl, targetOrigin = null) {
   return parsed.href;
 }
 
+// Cleanup is verified against live chrome.tabs state by id AND URL: another
+// tab still showing the same page (e.g. the tab a WebChat create opened) means
+// the URL is not actually gone even when the recorded tab id is.
+async function browserPageSameUrlTabIds(page) {
+  const key = browserPageClaimKey(page?.canonical_url, page?.origin);
+  if (!key) return [];
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({}); } catch (_) { return []; }
+  return tabs
+    .filter((tab) => tab?.id && tab.id !== page.tab_id
+      && browserPageClaimKey(tab.url || tab.pendingUrl, page.origin) === key)
+    .map((tab) => tab.id);
+}
+
 function browserPageView(page, extra = {}) {
   if (!page) return null;
   return {
@@ -8053,11 +8078,13 @@ async function performBrowserPageLifecycleRequest(msg) {
     if (!await removeBrowserPageRecord(pageRef)) {
       return { ok: false, error: "browser_page_storage_unavailable" };
     }
+    const sameUrlTabs = await browserPageSameUrlTabIds(page);
     return browserPageView(page, {
       finalized: true,
       tab_closed: true,
-      tab_cleanup_verified: true,
+      tab_cleanup_verified: sameUrlTabs.length === 0,
       already_closed: true,
+      same_url_tabs_open: sameUrlTabs.length,
     });
   }
 
@@ -8088,10 +8115,12 @@ async function performBrowserPageLifecycleRequest(msg) {
       tab_cleanup_verified: true,
     });
   }
+  const sameUrlTabs = await browserPageSameUrlTabIds(page);
   return browserPageView(page, {
     finalized: true,
     tab_closed: true,
-    tab_cleanup_verified: true,
+    tab_cleanup_verified: sameUrlTabs.length === 0,
+    same_url_tabs_open: sameUrlTabs.length,
   });
 }
 
@@ -8119,6 +8148,7 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "value_required",
   "multiple_select_unsupported",
   "select_option_unavailable",
+  "select_option_not_observed",
   "select_option_ambiguous",
   "select_option_stale",
   "checkable_state_required",
@@ -8406,6 +8436,7 @@ async function performBrowserPageActionRequest(msg) {
     timeoutMs: msg?.timeoutMs,
     direction: msg?.direction,
     amount: msg?.amount,
+    ...(action === "fill" ? { mainWorldFill: true } : {}),
   };
 
   const mutation = action === "click" || action === "fill" || action === "scroll";
@@ -8419,6 +8450,9 @@ async function performBrowserPageActionRequest(msg) {
     const response = await send();
     if (mutation) {
       let mutationResponse = response;
+      if (action === "fill" && response?.ok === true && typeof response?.main_world_fill_token === "string") {
+        mutationResponse = await browserPageMainWorldFill(tabId, response, { page, tab: resolved.tab });
+      }
       if (action === "click" && response?.ok === true && typeof response?.navigation_url === "string") {
         await adoptAppliedBrowserPageNavigation(page, tabId, response.navigation_url);
         mutationResponse = { ...response };
@@ -8484,6 +8518,166 @@ async function performBrowserPageActionRequest(msg) {
       page,
     );
   }
+}
+
+// MAIN-world rich-editor insertion shared by WebChat composer insert and
+// browser_page fill. Must stay self-contained (runs via executeScript).
+function h2wMainWorldInsertText(text, selector, append) {
+  try {
+    const all = [...document.querySelectorAll(selector)];
+    const el = all.reverse().find((e) => e.offsetParent !== null) || all[0] || null;
+    if (!el) return { ok: false, error: "no-input" };
+    el.focus();
+    const sel = window.getSelection();
+    const range = document.createRange();
+    if (append) {
+      // Preserve provider-owned composer nodes such as app mention pills.
+      // Do not select the editor contents after a pill was inserted. Some
+      // provider editors rebuild the whole composer from that selection
+      // and drop the app reference. Place the caret after the current
+      // editor tree instead.
+      const tail = el.lastChild;
+      if (tail) {
+        range.selectNodeContents(tail);
+        range.collapse(false);
+      } else {
+        range.selectNodeContents(el);
+        range.collapse(false);
+      }
+    } else {
+      // Normal insertion replaces the current composer content.
+      range.selectNodeContents(el);
+    }
+    sel.removeAllRanges();
+    sel.addRange(range);
+    const ok = document.execCommand("insertText", false, text);
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+    const got = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+    const want = String(text || "").replace(/\s+/g, " ").trim();
+    return { ok: !!ok, committed: got.includes(want), text: got.slice(0, 40) };
+  } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+// Commit a contenteditable fill and report applied only on a real
+// before/after transition. Rich editors (Claude tiptap/ProseMirror) can show
+// restored draft text in the DOM while the model is empty, and isolated or
+// MAIN-world execCommand may not enable Send. On an automation-owned tab in an
+// unpacked DEV build the fill uses trusted input via chrome.debugger (same
+// path as h2w_type_trusted_mention): focus own tab, select-all + Backspace,
+// verify the editor is empty, Input.insertText, detach immediately.
+function h2wFillTargetProbe(selector, mode) {
+  const el = document.querySelector(selector);
+  if (!el) return { ok: false, error: "no-input" };
+  if (mode === "focus") {
+    el.focus();
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  return {
+    ok: true,
+    text: String(el.innerText || el.textContent || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim(),
+    focused: document.activeElement === el || el.contains(document.activeElement),
+    visible: document.visibilityState === "visible",
+  };
+}
+
+function browserPageFillNormalize(value) {
+  return String(value || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function browserPageTrustedFillAllowed(page) {
+  return Boolean(chrome.debugger) && !chrome.runtime.getManifest().update_url && page?.ownership === "owned";
+}
+
+async function browserPageFillProbe(tabId, selector, mode) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId }, world: "MAIN", func: h2wFillTargetProbe, args: [selector, mode],
+  });
+  return res?.[0]?.result || { ok: false, error: "no-result" };
+}
+
+async function browserPageTrustedFill(tabId, selector, text) {
+  const target = { tabId };
+  const send = (method, params) => chrome.debugger.sendCommand(target, method, params);
+  let attached = false;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    const focus = await browserPageFillProbe(tabId, selector, "focus");
+    if (!focus.ok || !focus.focused) return { ok: false, error: "fill_focus_failed" };
+    const mod = { modifiers: 4, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 };
+    await send("Input.dispatchKeyEvent", { type: "keyDown", commands: ["selectAll"], ...mod });
+    await send("Input.dispatchKeyEvent", { type: "keyUp", ...mod });
+    const del = { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 };
+    await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...del });
+    await send("Input.dispatchKeyEvent", { type: "keyUp", ...del });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const cleared = await browserPageFillProbe(tabId, selector, "read");
+    if (!cleared.ok || cleared.text !== "") return { ok: false, error: "fill_clear_not_applied" };
+    if (text) await send("Input.insertText", { text });
+    return { ok: true, cleared: true };
+  } catch (error) {
+    return { ok: false, error: `trusted_fill_failed:${String(error?.message || error).slice(0, 80)}` };
+  } finally {
+    if (attached) { try { await chrome.debugger.detach(target); } catch (_) {} }
+  }
+}
+
+async function browserPageMainWorldFill(tabId, response, context = {}) {
+  const token = response.main_world_fill_token;
+  const selector = `[data-h2w-fill-token="${token.replace(/[^a-z0-9]/gi, "")}"]`;
+  const want = browserPageFillNormalize(response.value);
+  const base = { ...response };
+  delete base.main_world_fill_token;
+  delete base.value;
+  let method = "main_world_insert_text";
+  let result = null;
+  let before = null;
+  try {
+    before = await browserPageFillProbe(tabId, selector, "read");
+    if (browserPageTrustedFillAllowed(context.page)) {
+      method = "trusted_input";
+      if (context.tab?.windowId != null) {
+        try { await chrome.windows.update(context.tab.windowId, { focused: true }); } catch (_) {}
+      }
+      try { await chrome.tabs.update(tabId, { active: true }); } catch (_) {}
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      result = await browserPageTrustedFill(tabId, selector, String(response.value || ""));
+    } else {
+      const res = await chrome.scripting.executeScript({
+        target: { tabId }, world: "MAIN", func: h2wMainWorldInsertText, args: [response.value, selector, false],
+      });
+      result = res?.[0]?.result || null;
+    }
+  } catch (error) {
+    result = { ok: false, error: String(error?.message || error || "") };
+  }
+  let after = null;
+  try { after = await browserPageFillProbe(tabId, selector, "read"); } catch (_) {}
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId }, world: "ISOLATED",
+      func: (sel) => { for (const el of document.querySelectorAll(sel)) el.removeAttribute("data-h2w-fill-token"); },
+      args: [selector],
+    });
+  } catch (_) {}
+  const verdict = browserPageFillVerdict({ before, after, want, result });
+  if (verdict.applied) return { ...base, method, before_matched: verdict.beforeMatched };
+  return { ok: false, error: verdict.error, applied: false, method };
+}
+
+// Applied only when the insert step succeeded and the after-text equals the
+// request; if the before-text already matched (restored draft), the step must
+// have proven a clear first, otherwise success is unverifiable.
+function browserPageFillVerdict({ before, after, want, result }) {
+  const beforeMatched = Boolean(before?.ok && before.text === want);
+  if (!result?.ok) return { applied: false, error: result?.error || "fill_not_applied", beforeMatched };
+  if (beforeMatched && result.cleared !== true) return { applied: false, error: "fill_unverifiable_same_text", beforeMatched };
+  if (!after?.ok || after.text !== want) return { applied: false, error: "fill_not_applied", beforeMatched };
+  return { applied: true, beforeMatched };
 }
 
 function withBrowserPageIdentity(result, page) {
@@ -10160,41 +10354,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.scripting.executeScript({
       target: { tabId: sender.tab.id },
       world: "MAIN",
-      func: (text, selector, append) => {
-        try {
-          const all = [...document.querySelectorAll(selector)];
-          const el = all.reverse().find((e) => e.offsetParent !== null) || all[0] || null;
-          if (!el) return { ok: false, error: "no-input" };
-          el.focus();
-          const sel = window.getSelection();
-          const range = document.createRange();
-          if (append) {
-            // Preserve provider-owned composer nodes such as app mention pills.
-            // Do not select the editor contents after a pill was inserted. Some
-            // provider editors rebuild the whole composer from that selection
-            // and drop the app reference. Place the caret after the current
-            // editor tree instead.
-            const tail = el.lastChild;
-            if (tail) {
-              range.selectNodeContents(tail);
-              range.collapse(false);
-            } else {
-              range.selectNodeContents(el);
-              range.collapse(false);
-            }
-          } else {
-            // Normal insertion replaces the current composer content.
-            range.selectNodeContents(el);
-          }
-          sel.removeAllRanges();
-          sel.addRange(range);
-          const ok = document.execCommand("insertText", false, text);
-          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
-          const got = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-          const want = String(text || "").replace(/\s+/g, " ").trim();
-          return { ok: !!ok, committed: got.includes(want), text: got.slice(0, 40) };
-        } catch (e) { return { ok: false, error: String(e) }; }
-      },
+      func: h2wMainWorldInsertText,
       args: [msg.text, msg.selector, Boolean(msg.append)],
     }).then((res) => {
       const r = res && res[0] && res[0].result;
