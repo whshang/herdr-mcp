@@ -74,6 +74,10 @@ const MAX_ACTIVE_PENDING_TOTAL = 128;
 const MAX_ACTIVE_PENDING_PER_CLIENT = 4;
 const MAX_UNAPPROVED_DCR_CLIENTS = 256;
 const UNAPPROVED_DCR_TTL_MS = 60 * 60_000;
+const MIGRATE_IDEM_PREFIX = "migrate-idem:v1:";
+const MIGRATE_IDEM_TTL_MS = 24 * 60 * 60_000;
+const MIGRATE_IDEM_CAP = 256;
+const MIGRATE_IDEM_SWEEP_BATCH = 128;
 const CONNECTOR_USAGE_TOUCH_MS = 24 * 60 * 60_000;
 
 type StoredJwk = JsonWebKey & { kid?: string; alg?: string; use?: string };
@@ -184,6 +188,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist") return this.setPageAssistGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-orphans") return this.pageAssistOrphans(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-migrate") return this.pageAssistMigrate(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-migrate-alarm") return this.pageAssistMigrateAlarm();
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/get") return this.getConnector(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/find-active") return this.findActiveConnectorByClient(request);
@@ -919,7 +924,7 @@ export class OAuthStoreDO {
     if (typeof from !== "string" || typeof to !== "string") {
       return json({ ok: false, code: "bad_request" }, 400);
     }
-    const idemKey = `migrate-idem:v1:${deviceId}:${idempotencyKey}`;
+    const idemKey = MIGRATE_IDEM_PREFIX + deviceId + ":" + idempotencyKey;
 
     type Outcome =
       | { ok: true; action: "connector_page_assist_migrated"; moved: number; audit_id: string }
@@ -1000,9 +1005,18 @@ export class OAuthStoreDO {
           throw new Error("migrate_postcondition_failed");
         }
 
-        // 8. Idempotency entry in the same transaction (24h TTL).
+        // 8. Idempotency entry in the same transaction (24h TTL, 256 per device;
+        //    the oldest entry is evicted first when the cap is reached).
         const result = { ok: true as const, action: "connector_page_assist_migrated" as const, moved: fresh.moves.length, audit_id: auditId };
-        await tx.put(idemKey, { v: 1, plan_digest: planDigest, result, created_at_ms: nowMs, expires_at_ms: nowMs + 24 * 60 * 60_000 });
+        const idemPrefix = MIGRATE_IDEM_PREFIX + deviceId + ":";
+        const existing = await tx.list<{ created_at_ms?: number; expires_at_ms?: number }>({ prefix: idemPrefix });
+        if (existing.size >= MIGRATE_IDEM_CAP) {
+          const byAge = [...existing.entries()].sort((a, b) => (a[1].created_at_ms ?? 0) - (b[1].created_at_ms ?? 0));
+          for (const [key] of byAge.slice(0, Math.max(1, existing.size - MIGRATE_IDEM_CAP + 1))) {
+            await tx.delete(key);
+          }
+        }
+        await tx.put(idemKey, { v: 1, plan_digest: planDigest, result, created_at_ms: nowMs, expires_at_ms: nowMs + MIGRATE_IDEM_TTL_MS });
         outcome = result;
       });
     } catch (error) {
@@ -1014,6 +1028,38 @@ export class OAuthStoreDO {
 
     if (!outcome.ok) return json({ ok: false, code: outcome.code }, outcome.status);
     return json(outcome);
+  }
+
+  /**
+   * #630 idempotency sweep (design §7.3 Q2): delete expired `migrate-idem:v1:`
+   * entries in batches; re-arm while any entry remains. DO-internal route the
+   * platform alarm contract calls; never touches grant records.
+   */
+  private async pageAssistMigrateAlarm(): Promise<Response> {
+    const now = Date.now();
+    let deleted = 0;
+    let live = 0;
+    await this.state.storage.transaction(async (tx) => {
+      const entries = await tx.list<{ created_at_ms?: number; expires_at_ms?: number }>({ prefix: MIGRATE_IDEM_PREFIX });
+      for (const [key, value] of entries) {
+        if (typeof value?.expires_at_ms === "number" && value.expires_at_ms <= now) {
+          if (deleted < MIGRATE_IDEM_SWEEP_BATCH) {
+            await tx.delete(key);
+            deleted += 1;
+          } else {
+            live += 1; // batch full; next sweep run gets the rest
+          }
+        } else {
+          live += 1;
+        }
+      }
+    });
+    // Re-arm while unexpired (or not-yet-swept) entries remain so the alarm
+    // stays periodic; nothing to arm when the prefix is empty.
+    if (live > 0 && typeof this.state.storage.setAlarm === "function") {
+      await this.state.storage.setAlarm(now + 60 * 60_000);
+    }
+    return json({ ok: true, deleted, live });
   }
 
   private async setPageAssistGrant(request: Request): Promise<Response> {

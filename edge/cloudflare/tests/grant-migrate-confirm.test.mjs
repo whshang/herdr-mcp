@@ -12,6 +12,8 @@ const ROUTE = "/internal/oauth/grant/page-assist-migrate";
 class StorageMock {
   map = new Map();
   writes = 0;
+  alarmSetAt = undefined;
+  async setAlarm(at) { this.alarmSetAt = at; }
   putFailures = []; // queued failures injected on the Nth put
   readCorruption = null; // { afterWrites } -> post-write reads return pre-write bytes
   async get(key) { return structuredClone(this.map.get(key)); }
@@ -302,4 +304,74 @@ test("user Given an unfiltered digest computed over a plan that includes another
   assert.equal(storage.writes, grantWritesBefore, "zero writes after rejection");
   const stored = storage.map.get("grant:c1");
   assert.equal(stored.page_assist.find((row) => row.endpoint_ref === "ep5").connector_id, OLD, "other device row untouched");
+});
+
+test("user Given an expired idempotency entry When the same key is replayed Then the entry is treated as absent, deleted, and the request re-plans", async () => {
+  const h = harness();
+  const digest = await planDigest({ from: OLD, to: NEW });
+  const first = await h.confirm({ plan_digest: digest });
+  assert.equal(first.status, 200);
+  // Age the stored entry past its TTL.
+  const idemKey = `migrate-idem:v1:${DEV}:${IDEM}`;
+  const aged = h.storage.map.get(idemKey);
+  aged.expires_at_ms = Date.now() - 1;
+  h.storage.map.set(idemKey, aged);
+  // The rows already moved: a re-plan now fails closed with a stable code
+  // (no matching rows under OLD anymore) instead of returning the stale result.
+  const res = await h.confirm({ plan_digest: digest });
+  assert.equal(res.status, 409);
+  assert.equal(res.body.code, "migrate_no_matching_rows");
+  assert.equal(h.storage.map.has(idemKey), false, "expired entry deleted in the same transaction");
+});
+
+test("user Given a device at the 256-entry idempotency cap When a new confirm succeeds Then the oldest entry is evicted and the new one stored", async () => {
+  const h = harness();
+  // Pre-fill 256 entries, oldest first.
+  const oldestKey = `migrate-idem:v1:${DEV}:prefill000000000001`;
+  for (let i = 1; i <= 256; i += 1) {
+    h.storage.map.set(`migrate-idem:v1:${DEV}:prefill${String(i).padStart(12, "0")}`, {
+      v: 1, plan_digest: "0".repeat(64), result: { ok: true }, created_at_ms: i, expires_at_ms: Date.now() + 60_000,
+    });
+  }
+  const digest = await planDigest({ from: OLD, to: NEW });
+  const res = await h.confirm({ plan_digest: digest });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(h.storage.map.has(oldestKey), false, "oldest entry evicted at cap");
+  assert.notEqual(h.storage.map.has(`migrate-idem:v1:${DEV}:${IDEM}`), false, "new entry stored");
+  let count = 0;
+  for (const key of h.storage.map.keys()) if (key.startsWith(`migrate-idem:v1:${DEV}:`)) count += 1;
+  assert.equal(count, 256, "cap still holds 256 entries");
+});
+
+test("user Given expired idempotency entries When the alarm sweep runs Then expired entries are deleted and the alarm stays armed while any remain", async () => {
+  const h = harness();
+  h.storage.map.set(`migrate-idem:v1:${DEV}:expired0000000001`, { v: 1, plan_digest: "0".repeat(64), result: { ok: true }, created_at_ms: 1, expires_at_ms: Date.now() - 1000 });
+  h.storage.map.set(`migrate-idem:v1:${DEV}:live000000000001`, { v: 1, plan_digest: "0".repeat(64), result: { ok: true }, created_at_ms: 2, expires_at_ms: Date.now() + 60_000 });
+  const res = await h.post("/internal/oauth/grant/page-assist-migrate-alarm", {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.deleted, 1);
+  assert.equal(h.storage.map.has(`migrate-idem:v1:${DEV}:expired0000000001`), false, "expired deleted");
+  assert.equal(h.storage.map.has(`migrate-idem:v1:${DEV}:live000000000001`), true, "live kept");
+  assert.ok(h.storage.alarmSetAt !== undefined, "alarm re-armed while live entries remain");
+});
+
+test("user Given a revoked grant record after a successful confirm When the same key is replayed Then the stored result is returned and any new key fails closed", async () => {
+  const h = harness();
+  const digest = await planDigest({ from: OLD, to: NEW });
+  const first = await h.confirm({ plan_digest: digest });
+  assert.equal(first.status, 200);
+  // Revoke the record after the successful confirm.
+  const revoked = h.storage.map.get("grant:c1");
+  revoked.status = "revoked";
+  revoked.revoked_at_ms = Date.now();
+  h.storage.map.set("grant:c1", revoked);
+  const writesBeforeReplay = h.storage.writes;
+  const replay = await h.confirm({ plan_digest: digest });
+  assert.equal(replay.status, 200, "stored past result replayed");
+  assert.deepEqual(replay.body, first.body);
+  assert.equal(h.storage.writes, writesBeforeReplay, "replay grants nothing and writes nothing");
+  const newKey = await h.confirm({ plan_digest: digest, idempotency_key: "fresh-key-000000000001" });
+  assert.equal(newKey.status, 409);
+  assert.equal(newKey.body.code, "grant_record_not_active", "a new key re-plans and fails closed");
 });
