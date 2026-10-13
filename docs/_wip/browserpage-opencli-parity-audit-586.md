@@ -29,12 +29,13 @@ Classification:
 | Wait text / URL / element | `wait` | `action expect` | verified-real | element_present/absent 0.1.154 |
 | Viewport scroll | `scroll` | `action scroll` | verified-real | 0.1.157, 9/9 UAT |
 | Targeted text extract | `get text`, `extract` | `action extract` | verified-real | 0.1.156, generation + ref bound |
+| Table extract | `extract` (table reads) | `action extract_table` (0.1.192) | unit-test-only | observed table refs, bounded headers/rows (max_rows 1..100, 32 cols, 200 chars/cell), visible-only cell text, hidden rows dropped, rowspan/colspan flattened per occurrence; Chrome UAT script ready in `v1.1-browser-adapter-platform.md` pending section |
 | Screenshot | `screenshot` | `action screenshot` | verified-real | earlier UAT |
 | Navigate / goto | `goto`, `navigate` | (in progress on `feat/v11-next-navigation-20261009`, another lane) | missing-needed-for-1.1 | needed for post-submit route recovery; must reuse the mutation ledger |
 | Reload | `reload` | none | missing-needed-for-1.1 | the page-reload-mid-dispatch recovery test is still blocked; add next to `navigate` in the same lane |
 | Back / forward | `back`, `forward` | none | later | SPA navigation is covered by click + reopen; no 1.1 workflow needs history yet |
 | Tab list / select | `tab list` | `webchat resources`, claim by URL | unit-test-only | no generic tab enumeration action; claim needs an exact URL |
-| Keyboard press / hotkeys | `press`, `keys` | none (DEV-only trusted typing for the `@app` mention) | missing-needed-for-1.1 | forms and lazy-loaded feeds; trusted input stays scoped to the DEV build |
+| Keyboard press / hotkeys | `press`, `keys` | `action press` (single-key vocabulary, 0.1.192) | unit-test-only | fixed 14-key vocabulary, optional observed ref to focus; no text/modifier combos; Chrome UAT script ready in `v1.1-browser-adapter-platform.md` pending section |
 | Hover / double-click / drag | `hover`, `dblclick`, `drag` | none | later | |
 | Nested scroll containers | `scroll --selector` | none | site-adapter-insufficient | feeds such as X use their own containers; adapters handle it |
 | HTML / attributes | `get html/attr` | none | later | redaction review first |
@@ -76,7 +77,16 @@ Classification:
 1. `navigate` + `reload` in the existing action path (coordinate with the
    navigation lane, which has uncommitted `navigate` work) -> then the
    page-reload-mid-dispatch recovery UAT.
-2. Keyboard `press` for forms and feeds.
+2. Keyboard `press` for forms and feeds: implemented as a unit-test-only
+   bounded single-key action (0.1.192); the live Chrome proof script (form
+   control, page-owned key handler, vocabulary and unsafe-target negatives)
+   is in `v1.1-browser-adapter-platform.md`, and any hotkey/modifier
+   decision remains open.
 3. Live proofs: late-acceptance promotion, SPA-return settlement (0.1.181),
    handoff, App-selection-failure cleanup.
 4. Cross-provider dispatch UAT (Grok, Claude) using the same envelope.
+5. Bounded `extract_table` (0.1.192) is unit-test-only; live proof on a
+   real table-bearing page (including hidden-cell exclusion and the
+   rowspan/colspan per-occurrence flattening behavior) still needs Chrome
+   UAT. The exact pages, steps and expected results are written down in
+   `v1.1-browser-adapter-platform.md` under the pending-UAT section.
