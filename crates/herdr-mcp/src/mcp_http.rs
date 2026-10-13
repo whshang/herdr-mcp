@@ -250,6 +250,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
         &exec_state_dir,
         "state",
     )?));
+    runtime_started_at_ms();
     let exec = ExecRegistry::new_with_client(exec_state_dir, Some(client.clone()))?;
     let prompt = PromptRegistry::with_runtime(state_store.clone(), cache.clone(), client.clone());
     let skill = SkillService::new();
@@ -1671,6 +1672,22 @@ struct PushStreamState {
     browser_actuation: BrowserActuationBroker,
     trusted_extension_ipc: bool,
     browser_endpoint_ref: Option<String>,
+    endpoint_registered: bool,
+}
+
+impl PushStreamState {
+    /// #632: a browser_endpoint_ref names a specific extension endpoint; only
+    /// one that registered in this runtime generation counts as actively
+    /// polling. Without an endpoint ref the stream is the global extension
+    /// poll and keeps its previous behaviour. An endpoint ref that was supplied
+    /// but did not register in this generation must neither note a poll nor
+    /// receive actuation, because the broker records a poll on take.
+    fn should_count_extension_poll(&self) -> bool {
+        match self.browser_endpoint_ref.as_deref() {
+            Some(_) => self.endpoint_registered,
+            None => true,
+        }
+    }
 }
 
 async fn push_state(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1782,12 +1799,16 @@ async fn push_events(
     } else {
         None
     };
+    let endpoint_registered = browser_endpoint_ref
+        .as_deref()
+        .is_some_and(|value| browser_endpoint_registered_this_generation(&state, value));
     push_events_response(
         state.cache,
         filters,
         state.browser_actuation,
         state.trusted_extension_ipc,
         browser_endpoint_ref,
+        endpoint_registered,
     )
 }
 
@@ -1890,6 +1911,7 @@ fn push_events_response(
     browser_actuation: BrowserActuationBroker,
     trusted_extension_ipc: bool,
     browser_endpoint_ref: Option<String>,
+    endpoint_registered: bool,
 ) -> Response {
     // Subscribe before reading the initial digest so an event racing this setup
     // cannot be missed. At worst an already-included event causes one harmless
@@ -1919,15 +1941,18 @@ fn push_events_response(
         browser_actuation,
         trusted_extension_ipc,
         browser_endpoint_ref,
+        endpoint_registered,
     };
     let events = stream::unfold(state, |mut state| async move {
         if state.first {
             state.first = false;
-            if state.trusted_extension_ipc {
+            if state.trusted_extension_ipc && state.should_count_extension_poll() {
                 // The trusted Extension has already established the SSE stream.
                 // Treat that initial hello request as live immediately instead
                 // of forcing browser mutations to wait for the first 15s
-                // heartbeat before the broker records a poll.
+                // heartbeat before the broker records a poll. A specific
+                // endpoint ref only counts once it registered in this runtime
+                // generation; an unregistered ref must not note any poll.
                 state
                     .browser_actuation
                     .note_extension_poll(state.browser_endpoint_ref.as_deref());
@@ -1946,7 +1971,7 @@ fn push_events_response(
                 .into_iter()
                 .filter(|agent| push_filter_matches(&state.filters, agent))
                 .collect::<Vec<_>>();
-            let hello = json!({
+            let mut hello = json!({
                 "protocol": "herdr-mcp-push/v1",
                 "boot_id": state.cache.boot_id(),
                 "server_time": iso_now(),
@@ -1954,8 +1979,12 @@ fn push_events_response(
                 "agents": agents,
                 "workspaces": workspaces,
             });
+            if state.trusted_extension_ipc && state.browser_endpoint_ref.is_some() {
+                hello["endpoint_registered"] = json!(state.endpoint_registered);
+            }
             let mut body = format!("retry: 2000\n\n{}", sse_event("hello", &hello));
             if state.trusted_extension_ipc
+                && state.should_count_extension_poll()
                 && let Some(command) = state
                     .browser_actuation
                     .take_next_for_extension(state.browser_endpoint_ref.as_deref())
@@ -1991,12 +2020,15 @@ fn push_events_response(
                 // liveness on every stream poll/heartbeat so an idle healthy stream
                 // cannot age past the actuation broker's liveness window and be
                 // misclassified as browser_offline between mutations.
-                state
-                    .browser_actuation
-                    .note_extension_poll(state.browser_endpoint_ref.as_deref());
-                if let Some(command) = state
-                    .browser_actuation
-                    .take_next_for_extension(state.browser_endpoint_ref.as_deref())
+                if state.should_count_extension_poll() {
+                    state
+                        .browser_actuation
+                        .note_extension_poll(state.browser_endpoint_ref.as_deref());
+                }
+                if state.should_count_extension_poll()
+                    && let Some(command) = state
+                        .browser_actuation
+                        .take_next_for_extension(state.browser_endpoint_ref.as_deref())
                 {
                     body.push_str(&sse_event("browser_actuation", &command));
                 }
@@ -2413,6 +2445,34 @@ fn epoch_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+/// Process-wide start timestamp of this runtime generation.
+static RUNTIME_STARTED_AT_MS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+fn runtime_started_at_ms() -> i64 {
+    *RUNTIME_STARTED_AT_MS.get_or_init(|| i64::try_from(epoch_ms()).unwrap_or(i64::MAX))
+}
+
+/// Tolerated clock skew between an extension-supplied `observed_at` and the
+/// runtime clock. Equals `BROWSER_EXTENSION_LIVE_WINDOW` (20s,
+/// `mcp_http/actuation.rs:32`).
+const BROWSER_ENDPOINT_OBSERVATION_SKEW_MS: i64 = 20_000;
+
+/// #632: the state DB persists across runtime generations, so membership alone
+/// is not enough; the endpoint must have been registered/observed in this
+/// runtime generation.
+fn browser_endpoint_registered_this_generation(state: &AppState, endpoint_ref: &str) -> bool {
+    let Ok(store) = state.state_store.lock() else {
+        return false;
+    };
+    match store.browser_endpoint(endpoint_ref) {
+        Ok(Some(record)) => {
+            record.last_observed_at
+                >= runtime_started_at_ms() - BROWSER_ENDPOINT_OBSERVATION_SKEW_MS
+        }
+        _ => false,
+    }
 }
 
 fn iso_from_ms(value: u64) -> String {
@@ -3289,6 +3349,7 @@ mod tests {
     }
 
     fn test_state_with_snapshot(root: &std::path::Path, snapshot: Value) -> AppState {
+        runtime_started_at_ms();
         AppState {
             client: HerdrClient::new(root.join("missing-herdr.sock")),
             cache: Arc::new(EventCache::from_snapshot_for_test(snapshot)),
@@ -4632,6 +4693,7 @@ mod tests {
             browser_actuation,
             trusted_extension_ipc: false,
             browser_endpoint_ref: None,
+            endpoint_registered: false,
         };
         let working = json!({
             "agent":"pi","pane":"w1:p1","status":"working","workspace":"w1"
@@ -4711,7 +4773,7 @@ mod tests {
         let response = extension.clone().oneshot(state_request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let endpoint_ref = format!("bep_{}", "a".repeat(64));
+        let endpoint_ref = issue_632_register_endpoint(extension.clone(), None).await;
         let events_request = Request::builder()
             .method(Method::GET)
             .uri(format!("/push/events?browser_endpoint_ref={endpoint_ref}"))
@@ -4732,6 +4794,99 @@ mod tests {
         assert!(text.contains("herdr-mcp-push/v1"));
         assert!(text.contains("\"boot_id\":"));
         assert!(browser_actuation.extension_live_for_endpoint(&endpoint_ref));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// #632: open `/push/events` on the trusted extension route and return the
+    /// first SSE frame text (the hello frame).
+    async fn issue_632_open_push_stream(router: Router, endpoint_ref: &str) -> String {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/push/events?browser_endpoint_ref={endpoint_ref}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let frame = body.frame().await.unwrap().unwrap();
+        String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap()
+    }
+
+    /// #632: register a browser endpoint through the real registry route and
+    /// return its endpoint_ref. `observed_at` None = server clock.
+    async fn issue_632_register_endpoint(router: Router, observed_at: Option<i64>) -> String {
+        let mut payload = json!({
+            "operation": "endpoint.register",
+            "profile_seed": "issue-632-profile-seed",
+            "browser_family": "chrome",
+            "extension_version": "0.1.202",
+        });
+        if let Some(observed_at) = observed_at {
+            payload["observed_at"] = json!(observed_at);
+        }
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/extension/browser/registry")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::OK, "{value}");
+        value["endpoint"]["endpoint_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn issue_632_extension_state(name: &str) -> (std::path::PathBuf, AppState) {
+        let root = test_root(name);
+        let snapshot = json!({"workspaces": [], "panes": [], "agents": []});
+        let mut state = test_state_with_snapshot(&root, snapshot);
+        state.trusted_extension_ipc = true;
+        (root, state)
+    }
+
+    #[tokio::test]
+    async fn unregistered_endpoint_poll_only_stream_is_not_live() {
+        let (root, state) = issue_632_extension_state("issue-632-unregistered");
+        let broker = state.browser_actuation.clone();
+        let router = candidate_router(state);
+        let endpoint_ref = format!("bep_{}", "b".repeat(64));
+        let hello = issue_632_open_push_stream(router, &endpoint_ref).await;
+        assert!(hello.contains("event: hello"));
+        assert!(
+            !broker.extension_live_for_endpoint(&endpoint_ref),
+            "an endpoint that only polls /push/events but is not registered must not be live"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn registered_endpoint_poll_stream_is_live() {
+        let (root, state) = issue_632_extension_state("issue-632-registered");
+        let broker = state.browser_actuation.clone();
+        let router = candidate_router(state);
+        let endpoint_ref = issue_632_register_endpoint(router.clone(), None).await;
+        let hello = issue_632_open_push_stream(router, &endpoint_ref).await;
+        assert!(hello.contains("\"endpoint_registered\":true"), "{hello}");
+        assert!(broker.extension_live_for_endpoint(&endpoint_ref));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_observation_endpoint_is_not_live() {
+        let (root, state) = issue_632_extension_state("issue-632-stale");
+        let broker = state.browser_actuation.clone();
+        let router = candidate_router(state);
+        // Registered long before this runtime generation started (epoch 0):
+        // the row exists in the persistent registry but was never re-observed.
+        let endpoint_ref = issue_632_register_endpoint(router.clone(), Some(0)).await;
+        let hello = issue_632_open_push_stream(router, &endpoint_ref).await;
+        assert!(hello.contains("\"endpoint_registered\":false"), "{hello}");
+        assert!(!broker.extension_live_for_endpoint(&endpoint_ref));
         std::fs::remove_dir_all(root).ok();
     }
 
