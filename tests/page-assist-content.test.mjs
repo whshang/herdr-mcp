@@ -68,6 +68,8 @@ function harness({
   elements = [],
   topOrigin = null,
   scrollMax = 0,
+  activeElement = null,
+  extraGlobals = {},
   scrollY = 0,
   scrollingElement = null,
 } = {}) {
@@ -76,6 +78,7 @@ function harness({
   const document = {
     title,
     readyState: "complete",
+    activeElement,
     body: { innerText: bodyText, textContent: bodyText },
     documentElement: { scrollHeight: scrollMax + 600 },
     scrollingElement,
@@ -91,6 +94,7 @@ function harness({
     setTimeout,
     document,
     location,
+    ...extraGlobals,
     scrollY,
     innerHeight: 600,
     scrollBy({ top }) {
@@ -253,6 +257,513 @@ test("user extracts text from one observed control | Given a bounded safe DOM el
   const next = h.send({ type: "h2w_page_assist", action: "inspect" });
   assert.notEqual(next.generation, observed.generation);
   assert.equal(extraction().error, "stale_generation");
+});
+
+// extract_table inspects rendered content, so its fixtures need a small DOM
+// model: nodes carry the harness document (the kernel refuses nodes without
+// one), a real childNodes tree for the visible-text projection, and
+// offsetParent / bounding boxes for the visibility checks.
+function tableDomNode({ doc, tag = "td", type = "", text = "", attrs = {}, visible = true, children = [] }) {
+  const node = createElement({ tag, type, text: "", attrs, visible });
+  node.ownerDocument = doc;
+  node.nodeType = 1;
+  node.childNodes = [...(text ? [{ nodeType: 3, nodeValue: text }] : []), ...children];
+  if (children.length > 0) node.children = children;
+  if (!visible) {
+    // An unrendered element reports its markup text through innerText; that
+    // fallback is exactly what the visible-only projection must not use.
+    node.innerText = tableRenderedText(node);
+    node.textContent = node.innerText;
+  }
+  return node;
+}
+
+function tableDomRow({ doc, cells, visible = true, attrs = {} }) {
+  const row = tableDomNode({ doc, tag: "tr", visible, attrs });
+  row.children = cells;
+  return row;
+}
+
+function tableRenderedText(node) {
+  return (node.childNodes || []).map((child) => child.nodeValue ?? tableRenderedText(child)).join("");
+}
+
+function attachTableRows(table, rows) {
+  table.nodeType = 1;
+  table.childNodes = [];
+  table.querySelectorAll = (selector) => (selector === "tr" ? rows : []);
+  table.innerText = rows.map((row) => row.children.map(tableRenderedText).join(" ")).join("\n");
+  return table;
+}
+
+function tableHarness({ rows, extraElements = [] }) {
+  const table = createElement({ tag: "table", text: "", visible: true });
+  const hiddenTable = createElement({ tag: "table", text: "hidden", visible: false });
+  const h = harness({ elements: [table, hiddenTable, ...extraElements] });
+  attachTableRows(table, rows(table.ownerDocument));
+  return { h, table };
+}
+
+test("user extracts one observed table | Given a page with a visible table ref | When extract_table requests bounded rows | Then headers and cell text return without markup or hidden values", () => {
+  const longCell = "v".repeat(400);
+  const button = createElement({ tag: "button", text: "Filter" });
+  const { h } = tableHarness({
+    extraElements: [button],
+    rows: (doc) => [
+      tableDomRow({ doc, cells: [tableDomNode({ doc, tag: "th", text: "Name" }), tableDomNode({ doc, tag: "th", text: "Qty" })] }),
+      tableDomRow({ doc, cells: [tableDomNode({ doc, text: "Widget" }), tableDomNode({ doc, text: "3" })] }),
+      tableDomRow({ doc, cells: [tableDomNode({ doc, text: longCell }), tableDomNode({ doc, text: "0" })] }),
+      tableDomRow({ doc, cells: [tableDomNode({ doc, text: "Gadget" }), tableDomNode({ doc, text: "7" })] }),
+    ],
+  });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 2);
+  const tableRef = observed.elements.find((item) => item.tag === "table")?.ref;
+  const buttonRef = observed.elements.find((item) => item.tag === "button")?.ref;
+  assert.ok(tableRef);
+
+  const extractTable = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: tableRef, ...params,
+  });
+  const result = extractTable();
+  assert.equal(result.ok, true);
+  assert.deepEqual(Array.from(result.headers), ["Name", "Qty"]);
+  assert.equal(result.rows.length, 3);
+  assert.deepEqual(Array.from(result.rows[0]), ["Widget", "3"]);
+  assert.equal(result.rows[1][0].length, 200);
+  assert.equal(result.rows_truncated, false);
+  assert.ok(!Object.hasOwn(result, "outerHTML"));
+  assert.ok(!Object.hasOwn(result, "attributes"));
+
+  const clipped = extractTable({ maxRows: 2 });
+  assert.equal(clipped.rows.length, 2);
+  assert.equal(clipped.rows_truncated, true);
+
+  assert.equal(extractTable({ maxRows: 101 }).error, "extract_table_params_invalid");
+  assert.equal(extractTable({ maxRows: 0 }).error, "extract_table_params_invalid");
+  assert.equal(extractTable({ selector: "table" }).error, "disallowed_parameter");
+  assert.equal(extractTable({ expectedOrigin: "https://other.test" }).error, "origin_mismatch");
+  assert.equal(extractTable({ generation: "old" }).error, "stale_generation");
+  assert.equal(extractTable({ ref: `ref_${observed.generation}_999` }).error, "element_detached");
+  assert.equal(h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: buttonRef,
+  }).error, "unsupported_element");
+
+  const reobserved = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.notEqual(reobserved.generation, observed.generation);
+  assert.equal(extractTable().error, "stale_generation");
+});
+
+test("user relies on table extraction rejecting every non-row parameter | Given an observed visible table | When extract_table receives a query-shaped, script-shaped or mutation parameter | Then each is rejected before any read", () => {
+  const { h } = tableHarness({
+    rows: (doc) => [
+      tableDomRow({ doc, cells: [tableDomNode({ doc, tag: "th", text: "Name" })] }),
+      tableDomRow({ doc, cells: [tableDomNode({ doc, text: "Widget" })] }),
+    ],
+  });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const tableRef = observed.elements.find((item) => item.tag === "table")?.ref;
+  const extractTable = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: tableRef, ...params,
+  });
+  const forbidden = ["selector", "css", "xpath", "js", "script", "eval", "code", "cookie", "storage", "cdp"];
+  const rejected = forbidden.map((key) => extractTable({ [key]: "table td" }));
+  assert.deepEqual(Array.from(rejected, (entry) => entry.error), forbidden.map(() => "disallowed_parameter"));
+  // The kernel owns the query/script surface only; mutation, condition and
+  // idempotency parameters are rejected by the Runtime before this route, so an
+  // extra field can never widen the read here.
+  const bounded = extractTable({ maxRows: 1, unknownField: "ignored" });
+  assert.equal(bounded.ok, true);
+  assert.equal(bounded.rows.length, 1);
+  assert.ok(!Object.hasOwn(bounded, "op_id"));
+  assert.ok(!Object.hasOwn(bounded, "delivery_state"));
+  assert.ok(!Object.hasOwn(bounded, "value"));
+});
+
+test("user reads merged table cells once per occurrence | Given rows with rowspan and colspan cells | When extract_table returns bounded rows | Then each spanned cell appears only in the row that declares it", () => {
+  const { h } = tableHarness({
+    rows: (doc) => [
+      tableDomRow({ doc, cells: [tableDomNode({ doc, tag: "th", text: "Item" }), tableDomNode({ doc, tag: "th", text: "Qty" })] }),
+      tableDomRow({
+        doc,
+        cells: [
+          tableDomNode({ doc, text: "Group", attrs: { rowspan: "2" } }),
+          tableDomNode({ doc, text: "Widget" }),
+          tableDomNode({ doc, text: "3" }),
+        ],
+      }),
+      tableDomRow({ doc, cells: [tableDomNode({ doc, text: "Gadget" }), tableDomNode({ doc, text: "7" })] }),
+      tableDomRow({ doc, cells: [tableDomNode({ doc, text: "Spanning note", attrs: { colspan: "2" } })] }),
+    ],
+  });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const tableRef = observed.elements.find((item) => item.tag === "table")?.ref;
+  const result = h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: tableRef,
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(Array.from(result.headers), ["Item", "Qty"]);
+  assert.equal(result.rows.length, 3);
+  assert.deepEqual(Array.from(result.rows[0]), ["Group", "Widget", "3"]);
+  assert.deepEqual(Array.from(result.rows[1]), ["Gadget", "7"]);
+  assert.deepEqual(Array.from(result.rows[2]), ["Spanning note"]);
+  assert.deepEqual(Array.from(result.rows, (row) => row.length), [3, 2, 1], "spanned cells are not replicated into later rows");
+  assert.equal(result.rows[1].includes("Group"), false);
+  assert.equal(result.rows_truncated, false);
+});
+
+test("user reads only rendered table cells | Given a visible table with hidden, aria-hidden, sensitive and password content | When extract_table returns rows | Then excluded cells are empty, hidden rows are absent and no secret text is returned", () => {
+  const { h } = tableHarness({
+    rows: (doc) => [
+      tableDomRow({ doc, cells: [tableDomNode({ doc, tag: "th", text: "Name" }), tableDomNode({ doc, tag: "th", text: "Qty" })] }),
+      tableDomRow({ doc, cells: [tableDomNode({ doc, text: "Widget" }), tableDomNode({ doc, text: "SECRET_HIDDEN_CELL", visible: false })] }),
+      tableDomRow({ doc, cells: [tableDomNode({ doc, text: "SECRET_ARIA_CELL", attrs: { "aria-hidden": "true" } }), tableDomNode({ doc, text: "9" })] }),
+      tableDomRow({
+        doc,
+        cells: [
+          tableDomNode({
+            doc,
+            text: "Visible",
+            children: [
+              { nodeType: 3, nodeValue: " " },
+              tableDomNode({ doc, tag: "span", text: "SECRET_HIDDEN_DESC", visible: false }),
+              tableDomNode({ doc, tag: "span", text: "SECRET_ARIA_DESC", attrs: { "aria-hidden": "true" } }),
+              tableDomNode({ doc, tag: "input", type: "password", text: "SECRET_PASSWORD" }),
+              tableDomNode({ doc, tag: "b", text: "tail" }),
+            ],
+          }),
+          tableDomNode({ doc, text: "1" }),
+        ],
+      }),
+      tableDomRow({ doc, visible: false, cells: [tableDomNode({ doc, text: "SECRET_HIDDEN_ROW" }), tableDomNode({ doc, text: "4" })] }),
+      tableDomRow({ doc, cells: [tableDomNode({ doc, text: "SECRET_SENSITIVE_CELL", attrs: { autocomplete: "current-password" } }), tableDomNode({ doc, text: "2" })] }),
+    ],
+  });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const tableRef = observed.elements.find((item) => item.tag === "table")?.ref;
+  const result = h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: tableRef,
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(Array.from(result.headers), ["Name", "Qty"]);
+  assert.equal(result.rows.length, 4, "the hidden row is not returned");
+  assert.deepEqual(Array.from(result.rows[0]), ["Widget", ""], "a hidden cell keeps its column position");
+  assert.deepEqual(Array.from(result.rows[1]), ["", "9"]);
+  assert.deepEqual(Array.from(result.rows[2]), ["Visible tail", "1"]);
+  assert.deepEqual(Array.from(result.rows[3]), ["", "2"]);
+  assert.doesNotMatch(JSON.stringify(result), /SECRET/);
+});
+
+test("user clips a long observed table | Given a table with more data rows than max_rows | When extract_table requests bounded rows | Then only max_rows rows return and rows_truncated states whether more exist", () => {
+  const { h } = tableHarness({
+    rows: (doc) => [
+      tableDomRow({ doc, cells: [tableDomNode({ doc, tag: "th", text: "Name" })] }),
+      ...Array.from({ length: 4 }, (_unused, index) => tableDomRow({
+        doc, cells: [tableDomNode({ doc, text: `row-${index}` })],
+      })),
+    ],
+  });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const tableRef = observed.elements.find((item) => item.tag === "table")?.ref;
+  const extractTable = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: tableRef, ...params,
+  });
+  const full = extractTable();
+  assert.equal(full.rows.length, 4);
+  assert.equal(full.rows_truncated, false, "the header row is not a data row");
+  const exact = extractTable({ maxRows: 4 });
+  assert.equal(exact.rows.length, 4);
+  assert.equal(exact.rows_truncated, false, "an exact fit is not truncated");
+  const clipped = extractTable({ maxRows: 3 });
+  assert.equal(clipped.rows.length, 3);
+  assert.equal(clipped.rows_truncated, true);
+  assert.deepEqual(Array.from(clipped.rows[2]), ["row-2"]);
+  const single = extractTable({ maxRows: 1 });
+  assert.equal(single.rows.length, 1);
+  assert.equal(single.rows_truncated, true);
+  assert.deepEqual(Array.from(single.rows[0]), ["row-0"]);
+});
+
+test("user presses one bounded key | Given an observed page with a focused control | When a vocabulary key is pressed with or without a ref | Then key events reach one target and the generation expires", () => {
+  class FakeKeyboardEvent {
+    constructor(type, options = {}) {
+      this.type = type;
+      this.key = options.key;
+      this.code = options.code;
+    }
+  }
+  const events = [];
+  const record = (label, element) => ({
+    ...element,
+    label,
+    dispatchEvent(event) {
+      events.push({ target: label, type: event.type, key: event.key, code: event.code });
+      return true;
+    },
+  });
+  const composer = record("composer", createElement({
+    tag: "div", text: "", contentEditable: true, attrs: { "aria-label": "Composer" },
+  }));
+  const focused = record("focused", createElement({
+    tag: "input", type: "text", attrs: { placeholder: "Search" },
+  }));
+  const h = harness({
+    elements: [composer],
+    activeElement: focused,
+    extraGlobals: { KeyboardEvent: FakeKeyboardEvent },
+  });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 1);
+
+  const press = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: observed.generation, key: "Enter", ...params,
+  });
+  const withoutRef = press();
+  assert.equal(withoutRef.ok, true);
+  assert.equal(withoutRef.key, "Enter");
+  assert.ok(!Object.hasOwn(withoutRef, "ref"));
+  assert.deepEqual(events.map((event) => `${event.target}:${event.type}`), [
+    "focused:keydown", "focused:keypress", "focused:keyup",
+  ]);
+  assert.deepEqual(
+    events.filter((event) => event.type === "keydown").map((event) => `${event.key}/${event.code}`),
+    ["Enter/Enter"],
+  );
+  assert.equal(withoutRef.requires_verification, true);
+
+  const reobserved = h.send({ type: "h2w_page_assist", action: "inspect" });
+  events.length = 0;
+  const withRef = press({ generation: reobserved.generation, ref: reobserved.elements[0].ref, key: "ArrowDown" });
+  assert.equal(withRef.ok, true);
+  assert.equal(withRef.ref, reobserved.elements[0].ref);
+  assert.deepEqual(events.map((event) => `${event.target}:${event.type}:${event.key}`), [
+    "composer:keydown:ArrowDown", "composer:keypress:ArrowDown", "composer:keyup:ArrowDown",
+  ]);
+
+  const fresh = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const invalid = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: fresh.generation, ...params,
+  });
+  assert.equal(invalid({ key: "ctrl+a" }).error, "press_params_invalid");
+  assert.equal(invalid({ key: "enter" }).error, "press_params_invalid");
+  assert.equal(invalid({ key: "" }).error, "press_params_invalid");
+  assert.equal(invalid({ key: "Enter", value: "text" }).error, "press_params_invalid");
+  assert.equal(invalid({ key: "Enter", selector: "input" }).error, "disallowed_parameter");
+  assert.equal(invalid({ key: "Enter", expectedOrigin: "https://other.test" }).error, "origin_mismatch");
+  assert.equal(invalid({ key: "Enter", generation: "old" }).error, "stale_generation");
+  assert.equal(invalid({ key: "Enter", ref: `ref_${fresh.generation}_999` }).error, "element_detached");
+  events.length = 0;
+  const afterPress = press({ generation: fresh.generation });
+  assert.equal(afterPress.ok, true);
+  assert.ok(!Object.hasOwn(afterPress, "value"));
+  assert.equal(press({ generation: fresh.generation }).error, "stale_generation");
+});
+
+test("user presses every documented key | Given an observed focused control | When each vocabulary key is pressed | Then the exact key and code pair reaches that control once", () => {
+  class FakeKeyboardEvent {
+    constructor(type, options = {}) {
+      this.type = type;
+      this.key = options.key;
+      this.code = options.code;
+    }
+  }
+  const events = [];
+  const focused = createElement({ tag: "input", type: "text", attrs: { placeholder: "Search" } });
+  focused.dispatchEvent = (event) => {
+    events.push(`${event.type}:${event.key}/${event.code}`);
+    return true;
+  };
+  const h = harness({
+    elements: [],
+    activeElement: focused,
+    extraGlobals: { KeyboardEvent: FakeKeyboardEvent },
+  });
+  const vocabulary = {
+    Enter: ["Enter", "Enter"],
+    Escape: ["Escape", "Escape"],
+    Tab: ["Tab", "Tab"],
+    Backspace: ["Backspace", "Backspace"],
+    Delete: ["Delete", "Delete"],
+    ArrowUp: ["ArrowUp", "ArrowUp"],
+    ArrowDown: ["ArrowDown", "ArrowDown"],
+    ArrowLeft: ["ArrowLeft", "ArrowLeft"],
+    ArrowRight: ["ArrowRight", "ArrowRight"],
+    Home: ["Home", "Home"],
+    End: ["End", "End"],
+    PageUp: ["PageUp", "PageUp"],
+    PageDown: ["PageDown", "PageDown"],
+    Space: [" ", "Space"],
+  };
+  for (const [key, [expectedKey, expectedCode]] of Object.entries(vocabulary)) {
+    events.length = 0;
+    const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+    const result = h.send({
+      type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+      generation: observed.generation, key,
+    });
+    assert.equal(result.ok, true, `${key} must be inside the fixed vocabulary`);
+    assert.equal(result.key, key);
+    assert.deepEqual(events, [
+      `keydown:${expectedKey}/${expectedCode}`,
+      `keypress:${expectedKey}/${expectedCode}`,
+      `keyup:${expectedKey}/${expectedCode}`,
+    ]);
+  }
+  assert.ok(focused.focused >= Object.keys(vocabulary).length, "each press focuses the target before dispatching");
+});
+
+test("user cannot press an out-of-vocabulary key | Given an observed focused control | When press receives anything outside the fixed vocabulary | Then nothing is dispatched and the observation stays valid", () => {
+  const events = [];
+  const focused = createElement({ tag: "input", type: "text", attrs: { placeholder: "Search" } });
+  focused.dispatchEvent = (event) => {
+    events.push(event.type);
+    return true;
+  };
+  const h = harness({
+    elements: [],
+    activeElement: focused,
+    extraGlobals: {
+      KeyboardEvent: class {
+        constructor(type, options = {}) {
+          this.type = type;
+          this.key = options.key;
+        }
+      },
+    },
+  });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const press = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: observed.generation, ...params,
+  });
+  const rejected = [
+    "a", "F5", "ENTER", "enter", "Enter ", " Enter", "Space ", "Ctrl+Enter",
+    "Shift+Tab", "Meta+A", "PageDown2", 13, null, {}, true, "",
+  ];
+  for (const key of rejected) {
+    assert.equal(press({ key }).error, "press_params_invalid", `${String(key)} must be rejected`);
+  }
+  assert.equal(press().error, "press_params_invalid", "a missing key is rejected");
+  assert.equal(press({ key: "Enter", value: "typed text" }).error, "press_params_invalid");
+  assert.deepEqual(events, [], "no key event reaches the page for a rejected key");
+  assert.equal(press({ key: "Escape" }).ok, true, "the observation survives every rejected key");
+  assert.deepEqual(events, ["keydown", "keypress", "keyup"]);
+});
+
+test("user cannot press through an unsafe target | Given an observed page whose refs later become hidden, disabled, sensitive or detached | When press targets each ref | Then every rejection is reported before any key event", () => {
+  const events = [];
+  const target = {
+    ...createElement({ tag: "button", text: "Next" }),
+    dispatchEvent(event) {
+      events.push(event.type);
+      return true;
+    },
+  };
+  const hide = createElement({ tag: "button", text: "Hide me" });
+  const disable = createElement({ tag: "button", text: "Disable me" });
+  const sensitive = createElement({ tag: "input", type: "text", attrs: { placeholder: "Search" } });
+  const detach = createElement({ tag: "button", text: "Detach me" });
+  const h = harness({
+    elements: [target, hide, disable, sensitive, detach],
+    extraGlobals: {
+      KeyboardEvent: class {
+        constructor(type, options = {}) {
+          this.type = type;
+          this.key = options.key;
+        }
+      },
+    },
+  });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 5);
+  const refFor = (tag) => observed.elements.find((item) => item.tag === tag)?.ref;
+  const refs = {
+    target: refFor("button"),
+    hide: observed.elements.filter((item) => item.tag === "button")[1].ref,
+    disable: observed.elements.filter((item) => item.tag === "button")[2].ref,
+    sensitive: refFor("input"),
+    detach: observed.elements.filter((item) => item.tag === "button")[3].ref,
+  };
+  const press = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: observed.generation, key: "Enter", ...params,
+  });
+
+  hide.offsetParent = null;
+  assert.equal(press({ ref: refs.hide }).error, "unsupported_element");
+  disable.disabled = true;
+  assert.equal(press({ ref: refs.disable }).error, "unsupported_element");
+  sensitive.type = "password";
+  assert.equal(press({ ref: refs.sensitive }).error, "unsupported_element");
+  detach.isConnected = false;
+  assert.equal(press({ ref: refs.detach }).error, "element_detached");
+  assert.equal(press({ ref: `ref_${observed.generation}_999` }).error, "element_detached");
+
+  const reobserved = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.notEqual(reobserved.generation, observed.generation);
+  assert.equal(h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: reobserved.generation, key: "Enter", ref: refs.target,
+  }).error, "invalid_ref");
+  assert.deepEqual(events, []);
+
+  const delivered = h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: reobserved.generation, key: "Enter",
+    ref: reobserved.elements.find((item) => item.tag === "button")?.ref,
+  });
+  assert.equal(delivered.ok, true);
+  assert.deepEqual(events, ["keydown", "keypress", "keyup"]);
+  assert.equal(h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: reobserved.generation, key: "Enter",
+  }).error, "stale_generation", "a delivered press expires the observation");
+});
+
+test("user cannot press without a key target | Given a page with no focused control and a cross-origin frame | When press runs without a usable ref | Then press_unavailable or cross_origin_iframe_blocked is reported", () => {
+  const h = harness({ elements: [] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: observed.generation, key: "Enter",
+  }).error, "press_unavailable", "a body without dispatchEvent is not a key target");
+
+  const crossFrame = harness({ elements: [], topOrigin: "https://other.test" });
+  assert.equal(crossFrame.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: "pa_any_1", key: "Enter",
+  }).error, "cross_origin_iframe_blocked");
+});
+
+test("user sees an uncertain press | Given a focused control whose key dispatch throws | When press runs | Then delivery is unknown and the observation is not expired", () => {
+  const focused = createElement({ tag: "input", type: "text", attrs: { placeholder: "Search" } });
+  const h = harness({
+    elements: [],
+    activeElement: focused,
+    extraGlobals: {
+      KeyboardEvent: class {
+        constructor() {
+          throw new Error("page blocked synthetic keys");
+        }
+      },
+    },
+  });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const press = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "press", expectedOrigin: "https://app.test",
+    generation: observed.generation, key: "Enter", ...params,
+  });
+  assert.equal(press().error, "press_delivery_unknown");
+  assert.equal(press({ key: "not-a-key" }).error, "press_params_invalid",
+    "the unconfirmed press leaves the generation current so the caller can re-observe instead of replaying");
 });
 
 test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMirror textbox | When observing DOM structure | Then only bounded structural attributes are returned", () => {

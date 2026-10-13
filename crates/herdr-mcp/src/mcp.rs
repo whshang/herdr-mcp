@@ -8181,6 +8181,8 @@ fn browser_page_action_call(
         "objective",
         "direction",
         "amount",
+        "key",
+        "max_rows",
     ];
     if let Some(key) = object
         .keys()
@@ -8244,13 +8246,14 @@ fn browser_page_action_call(
     };
     let action = match object.get("action").and_then(Value::as_str) {
         Some(
-            value @ ("observe" | "click" | "fill" | "expect" | "screenshot" | "scroll" | "extract"),
+            value @ ("observe" | "click" | "fill" | "expect" | "screenshot" | "scroll" | "extract"
+            | "extract_table" | "press"),
         ) => value,
         _ => {
             return json!({
                 "ok": false,
                 "code": "invalid_params",
-                "message": "action must be observe, click, fill, expect, screenshot, scroll, or extract",
+                "message": "action must be observe, click, fill, expect, screenshot, scroll, extract, extract_table, or press",
             });
         }
     };
@@ -8267,7 +8270,7 @@ fn browser_page_action_call(
         "page_ref": page_ref,
         "action": action,
     });
-    let mutation = matches!(action, "click" | "fill" | "scroll");
+    let mutation = matches!(action, "click" | "fill" | "scroll" | "press");
     let mut mutation_key: Option<&str> = None;
     let mut semantic_objective: Option<&str> = None;
 
@@ -8456,7 +8459,56 @@ fn browser_page_action_call(
             bridge_params["ref"] = json!(element_ref);
             bridge_params["max_chars"] = json!(max_chars);
         }
-        "click" | "fill" | "scroll" => {
+        "extract_table" => {
+            for disallowed in [
+                "value",
+                "condition",
+                "timeout_ms",
+                "idempotency_key",
+                "objective",
+                "key",
+                "max_chars",
+            ] {
+                if object.contains_key(disallowed) {
+                    return json!({"ok": false, "code": "invalid_params", "message": format!("{disallowed} is not accepted for extract_table")});
+                }
+            }
+            let generation = match object.get("generation").and_then(Value::as_str) {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 256
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "generation is required for extract_table"});
+                }
+            };
+            let element_ref = match object.get("ref").and_then(Value::as_str) {
+                Some(value)
+                    if value.starts_with(&format!("ref_{generation}_")) && value.len() <= 256 =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "current table ref is required for extract_table"});
+                }
+            };
+            let max_rows = match object.get("max_rows") {
+                None => 25,
+                Some(value) => match value.as_u64() {
+                    Some(value) if (1..=100).contains(&value) => value,
+                    _ => {
+                        return json!({"ok": false, "code": "invalid_params", "message": "extract_table max_rows must be an integer between 1 and 100"});
+                    }
+                },
+            };
+            bridge_params["generation"] = json!(generation);
+            bridge_params["ref"] = json!(element_ref);
+            bridge_params["max_rows"] = json!(max_rows);
+        }
+        "click" | "fill" | "scroll" | "press" => {
             for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
                 if object.contains_key(disallowed) {
                     return json!({
@@ -8482,7 +8534,7 @@ fn browser_page_action_call(
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
-                        "message": "generation is required for click/fill/scroll",
+                        "message": "generation is required for click/fill/scroll/press",
                     });
                 }
             };
@@ -8491,6 +8543,23 @@ fn browser_page_action_call(
                     return json!({"ok": false, "code": "invalid_params", "message": "ref/value are not accepted for scroll"});
                 }
                 None
+            } else if action == "press" {
+                if object.contains_key("value") {
+                    return json!({"ok": false, "code": "invalid_params", "message": "value is not accepted for press; use fill for text input"});
+                }
+                match object.get("ref").and_then(Value::as_str).map(str::trim) {
+                    None => None,
+                    Some(value)
+                        if !value.is_empty()
+                            && value.len() <= 256
+                            && !value.chars().any(char::is_control) =>
+                    {
+                        Some(value)
+                    }
+                    Some(_) => {
+                        return json!({"ok": false, "code": "invalid_params", "message": "ref must be a bounded non-empty string for press"});
+                    }
+                }
             } else {
                 match object.get("ref").and_then(Value::as_str).map(str::trim) {
                     Some(value)
@@ -8547,6 +8616,36 @@ fn browser_page_action_call(
                     "code": "invalid_params",
                     "message": "value is not accepted for click",
                 });
+            }
+            if action == "press" {
+                // Fixed single-key vocabulary only: no text, no modifier combos,
+                // no caller-controlled raw key codes.
+                const PRESS_KEYS: &[&str] = &[
+                    "Enter",
+                    "Escape",
+                    "Tab",
+                    "Backspace",
+                    "Delete",
+                    "ArrowUp",
+                    "ArrowDown",
+                    "ArrowLeft",
+                    "ArrowRight",
+                    "Home",
+                    "End",
+                    "PageUp",
+                    "PageDown",
+                    "Space",
+                ];
+                let key = match object.get("key").and_then(Value::as_str) {
+                    Some(value) if PRESS_KEYS.contains(&value) => value,
+                    _ => {
+                        let allowed = PRESS_KEYS.join(", ");
+                        return json!({"ok": false, "code": "invalid_params", "message": format!("press key must be one of {allowed}")});
+                    }
+                };
+                bridge_params["key"] = json!(key);
+            } else if object.contains_key("key") {
+                return json!({"ok": false, "code": "invalid_params", "message": "key is accepted only for press"});
             }
             if action == "scroll" {
                 let direction = match object.get("direction").and_then(Value::as_str) {
@@ -8651,6 +8750,16 @@ fn browser_page_action_call(
             "generation": bridge_params["generation"],
             "direction": bridge_params["direction"],
             "amount": bridge_params["amount"],
+        })
+    } else if action == "press" {
+        json!({
+            "operation": BROWSER_PAGE_ACTION_METHOD,
+            "endpoint_ref": endpoint_ref,
+            "page_ref": page_ref,
+            "action": action,
+            "generation": bridge_params["generation"],
+            "ref": bridge_params.get("ref"),
+            "key": bridge_params["key"],
         })
     } else {
         // Keep the preexisting click/fill hash identical across upgrades.
@@ -19236,6 +19345,126 @@ mod tests {
     }
 
     #[test]
+    fn browser_page_press_requires_bounded_vocabulary_idempotent_mutation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct PressActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for PressActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("press must use the exact browser endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert!(dispatch_id.is_some());
+                assert_eq!(params["action"], "press");
+                assert_eq!(params["key"], "Enter");
+                assert!(params.get("ref").is_none() || params["ref"] == "ref_pa_gen_press_1_0");
+                assert!(params.get("value").is_none());
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true, "delivery_state": "applied",
+                    "retry_safe": false, "mutation_submitted": true,
+                    "key": "Enter", "requires_verification": true,
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = PressActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "press",
+            "generation": "pa_gen_press_1",
+            "key": "Enter",
+            "idempotency_key": "press-once-1",
+        });
+        for (field, invalid) in [
+            ("key", json!("ctrl+a")),
+            ("key", json!("enter")),
+            ("key", json!("")),
+            ("key", json!(13)),
+            ("value", json!("typed text")),
+            ("direction", json!("down")),
+            ("amount", json!(500)),
+            ("max_chars", json!(100)),
+            ("condition", json!("visible")),
+            ("timeout_ms", json!(1000)),
+            ("objective", json!("press Enter")),
+            ("idempotency_key", json!("")),
+            ("ref", json!("   ")),
+        ] {
+            let mut request = params.clone();
+            request[field] = invalid;
+            assert_eq!(
+                browser_page_action_call(&store, &request, &grants, Some(&actuator))["code"],
+                "invalid_params"
+            );
+        }
+        let mut missing_key = params.clone();
+        missing_key
+            .as_object_mut()
+            .unwrap()
+            .remove("idempotency_key");
+        assert_eq!(
+            browser_page_action_call(&store, &missing_key, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 0);
+
+        let applied = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(applied["ok"], true);
+        assert_eq!(applied["delivery_state"], "applied");
+        let replay = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        let mut changed_key = params.clone();
+        changed_key["key"] = json!("Escape");
+        assert_eq!(
+            browser_page_action_call(&store, &changed_key, &grants, Some(&actuator))["code"],
+            "idempotency_key_conflict"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        // An observed ref is accepted and forwarded for focused-key dispatch.
+        let mut with_ref = params.clone();
+        with_ref["ref"] = json!("ref_pa_gen_press_1_0");
+        with_ref["idempotency_key"] = json!("press-focused-1");
+        let focused = browser_page_action_call(&store, &with_ref, &grants, Some(&actuator));
+        assert_eq!(focused["ok"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn browser_page_element_wait_conditions_use_existing_read_only_actuator() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
@@ -19407,6 +19636,108 @@ mod tests {
             assert!(read.get("op_id").is_none());
         }
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn browser_page_extract_table_routes_bounded_read_only_ref_without_mutation_reservation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct TableExtractActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for TableExtractActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("extract_table must route through the exact browser endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_table"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(params["action"], "extract_table");
+                assert_eq!(params["generation"], "pa_gen_table_1");
+                assert_eq!(params["ref"], "ref_pa_gen_table_1_0");
+                assert!(params["max_rows"] == 25 || params["max_rows"] == 10);
+                assert!(params.get("idempotency_key").is_none());
+                assert!(params.get("max_chars").is_none());
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "headers": ["Name", "Qty"],
+                    "rows": [["Widget", "3"]],
+                    "rows_truncated": false,
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_table".to_owned(),
+        }];
+        let actuator = TableExtractActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let params = json!({
+            "endpoint_ref": "bep_table",
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "extract_table",
+            "generation": "pa_gen_table_1",
+            "ref": "ref_pa_gen_table_1_0",
+        });
+        for (key, invalid) in [
+            ("max_rows", json!(101)),
+            ("max_rows", json!(0)),
+            ("max_rows", json!("25")),
+            ("max_chars", json!(4000)),
+            ("key", json!("Enter")),
+            ("value", json!("x")),
+            ("idempotency_key", json!("not_for_reads")),
+            ("condition", json!("visible")),
+            ("timeout_ms", json!(1000)),
+            ("objective", json!("read the table")),
+            ("ref", json!("ref_pa_gen_other_0")),
+        ] {
+            let mut bad = params.clone();
+            bad[key] = invalid;
+            assert_eq!(
+                browser_page_action_call(&store, &bad, &grants, Some(&actuator))["code"],
+                "invalid_params"
+            );
+        }
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 0);
+        for _ in 0..2 {
+            let read = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+            assert_eq!(read["ok"], true);
+            assert_eq!(read["rows"][0][1], "3");
+            assert!(read.get("op_id").is_none());
+        }
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+
+        let mut bounded = params.clone();
+        bounded["max_rows"] = json!(10);
+        let read = browser_page_action_call(&store, &bounded, &grants, Some(&actuator));
+        assert_eq!(read["ok"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
