@@ -67,6 +67,10 @@ had Edge derive a wildcard grant from each Page Assist endpoint grant.
 - `docs/history/architecture/v1.0-alpha8-page-assist.md`
 - `assets/local-agent-skill/herdr-mcp/references/webchat-control.md`
 
-## Rationale and alternatives (STUB)
+## Rationale and alternatives
 
-> STUB: rationale and alternatives considered were not found in the repo, PR bodies or issues; owner to fill in.
+Recorded by the release owner (herdr), 2026-10-13.
+
+- **Decision:** an external connector (for example ChatGPT or Cursor) controlling a page requires an explicit grant by the owner on the CLI. Pairing or installing never widens the permission automatically.
+- **Rationale:** these actions operate the user's real signed-in accounts, so a remote caller must not silently gain that capability.
+- **Why #593 / #594 were rolled back, and alternatives considered:** not recorded; to be confirmed by the owner (理由未成文，由所有者确认).
