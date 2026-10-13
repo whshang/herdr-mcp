@@ -5211,6 +5211,15 @@ function normalizeHerdrMentionAlias(value) {
   // unreadable provider snapshot, and a still-open turn all fail closed here.
   async function observeRecoveryEvidence(record = conversationHealth) {
     if (typeof RECOVERY_CONTROLLER?.recoveryProbeAllowed !== "function") return null;
+    // Gate the authenticated provider fetch before it happens. The 5s health
+    // watch and the post-load reconcile both land here, and last_user_submit_at
+    // survives markTurnEnded(), so a settled conversation used to keep fetching
+    // the provider snapshot indefinitely. Only a pending, evidence-due reply is
+    // fetched; an ended, Auto-off, or not-yet-due conversation stops here.
+    if (typeof RECOVERY_CONTROLLER.shouldObserveRecoveryEvidence !== "function"
+      || !RECOVERY_CONTROLLER.shouldObserveRecoveryEvidence(record, { automationEnabled, now: Date.now() })) {
+      return null;
+    }
     const safety = recoverySafetySnapshot();
     const dom = {
       streaming: safety.streaming,
@@ -5222,9 +5231,6 @@ function normalizeHerdrMentionAlias(value) {
     if (safety.streaming || safety.toolRunning || safety.composerBusy || safety.permissionCardActive) {
       return { dom };
     }
-    const startedAt = Number(record?.last_user_submit_at || 0);
-    const dueAt = startedAt + RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs - 5000;
-    if (!startedAt || Date.now() < dueAt) return null;
     const server = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
     return { dom, server };
   }

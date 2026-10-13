@@ -85,6 +85,37 @@ function recoveryProbeAllowed(evidence, since = 0) {
   return "provider_settled_without_output";
 }
 
+// Pre-gate for the provider-evidence fetch.
+//
+// observeRecoveryEvidence() runs on a 5s health watch and the snapshot it
+// fetches is an authenticated provider request, so it may only run while a reply
+// is genuinely pending. last_user_submit_at survives markTurnEnded(), so without
+// this gate a settled conversation kept refetching forever. Only a pending state
+// that has reached its evidence-due point may reach the provider; an ended,
+// non-automated, or not-yet-due conversation fails closed here.
+function shouldObserveRecoveryEvidence(
+  record,
+  { automationEnabled = false, now = Date.now() } = {},
+  policy = DEFAULT_RECOVERY_POLICY,
+) {
+  if (!record || automationEnabled !== true) return false;
+  const state = String(record.state || "");
+  let startedAt = 0;
+  if (state === RECOVERY_STATES.REPLY_WAITING || state === RECOVERY_STATES.REPLY_SUSPECT) {
+    startedAt = Number(record.last_user_submit_at || 0);
+  } else if (state === RECOVERY_STATES.RECOVERY_MESSAGE_SENT) {
+    // A sent recovery probe is its own user turn; the reply it waits for is
+    // timed from when the probe went out, not from the original submit.
+    startedAt = Number(record.recovery_sent_at || 0);
+  } else {
+    return false;
+  }
+  if (!startedAt) return false;
+  // Fetch a little before the turn's timeout so the escalation decision has a
+  // fresh snapshot at the exact due moment.
+  return now >= startedAt + policy.replyTimeoutMs - 5000;
+}
+
 function shouldSendRecovery(record, policy = DEFAULT_RECOVERY_POLICY, now = Date.now(), evidence = null) {
   if (!record || record.state !== RECOVERY_STATES.REPLY_SUSPECT) return false;
   if ((record.recovery_attempt || 0) >= policy.maxRecoveryAttempts) return false;
@@ -245,6 +276,7 @@ async function runAfterDurablePersistence({
 globalThis.H2W_RECOVERY_CONTROLLER = {
   DEFAULT_RECOVERY_POLICY,
   recoveryProbeAllowed,
+  shouldObserveRecoveryEvidence,
   shouldSendRecovery,
   markRecoverySent,
   markRecovering,

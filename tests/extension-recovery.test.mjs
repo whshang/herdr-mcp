@@ -557,6 +557,21 @@ test("reply timeout, recovery attempt, reload gate, and rollover remain fail-clo
   record = recovery.markRecoverySent(record, 2001);
   assert.equal(record.recovery_attempt, 1);
   assert.equal(recovery.shouldSendRecovery(record, policy, 3000, settledEmpty), false);
+  // Only the correlation check may reject this one: the tip IS a terminal empty
+  // assistant with a message id and a carrying user message id, but the user
+  // message is far outside the submit window, so it belongs to another turn.
+  assert.equal(recovery.recoveryProbeAllowed({
+    dom: { assistantText: "" },
+    server: {
+      ok: true,
+      currentNodeRole: "assistant",
+      messageId: "assistant-old",
+      text: "",
+      finished: true,
+      userMessageId: "user-old",
+      userCreatedAt: 1000 + 300000,
+    },
+  }, 1000), null, "a terminal tip whose user message is outside the submit window must not authorize a probe");
 
   const safe = {
     composerBusy: false,
@@ -710,6 +725,27 @@ test("user recovers a ChatGPT reply that never produced output | Given the provi
   assert.equal(recovery.shouldSendRecovery(classified, policy, at, settledEmpty), true);
   const sent = recovery.markRecoverySent(classified, at + 1);
   assert.equal(recovery.shouldSendRecovery(sent, policy, at + 2, settledEmpty), false, "a probe is never resent");
+
+  // Provider evidence may only be fetched while a reply is genuinely pending.
+  // A settled turn keeps last_user_submit_at, so the ended record and Auto-off
+  // both have to fail closed before any authenticated snapshot request.
+  assert.equal(
+    recovery.shouldObserveRecoveryEvidence(classified, { automationEnabled: true, now: at }),
+    true,
+    "a pending, due reply is what the evidence fetch exists for",
+  );
+  const endedTurn = health.markTurnEnded(classified, at + 2);
+  assert.equal(endedTurn.last_user_submit_at, submittedAt, "markTurnEnded keeps the submit timestamp");
+  assert.equal(
+    recovery.shouldObserveRecoveryEvidence(endedTurn, { automationEnabled: true, now: at + 10 * 60 * 1000 }),
+    false,
+    "an ended turn must not keep fetching the provider snapshot",
+  );
+  assert.equal(
+    recovery.shouldObserveRecoveryEvidence(classified, { automationEnabled: false, now: at }),
+    false,
+    "Auto off must not fetch the provider snapshot",
+  );
 
   // Satisfied output already reached the user: a probe would create a needless
   // second user turn.
