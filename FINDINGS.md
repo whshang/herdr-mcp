@@ -1,7 +1,8 @@
 # Findings
 
 Lessons from daily commit reviews. Each entry uses the template below. When the
-same lesson is seen on 3 different review days, move it to RULES.md.
+same lesson is recorded on 3 distinct review dates, move it to RULES.md
+(see the maintenance rules in AGENTS.md). `Seen N×` counts distinct review dates.
 
 Template:
 
@@ -13,11 +14,11 @@ Template:
 
 ---
 
-**A release that must not reach the stable channel needs a prerelease-suffixed version, not only the GitHub prerelease flag.**
+**A build that must not reach the stable channel needs a prerelease-suffixed version (`-rc.N`), not only the GitHub prerelease flag.**
 - v1.0.4 was tagged from 0c840628 (#606) with version `1.0.4`; the release was then flagged prerelease on GitHub, but the stable updater selects by semver only. `herdr-mcp update check` on a 1.0.1 PROD machine (2026-10-13) reported `tag v1.0.4`, `update_channel stable`, so stable installs can pick it up.
-- Fix: none needed for v1.0.4 itself; on 2026-10-13 asu accepted v1.0.4 as stable after PROD UAT (1.0.1 → 1.0.4 → rollback → 1.0.4) and it was promoted to latest. Future UAT-only builds must use `-rc.N` versions.
+- Fix: no code fix. v1.0.4 is an accepted exception: on 2026-10-13 asu accepted it as stable after PROD UAT (1.0.1 → 1.0.4 → rollback → 1.0.4) and it was promoted to latest. The rule stands for future UAT-only builds.
 - Done right: v1.1.0-rc.1 (#604) used `1.1.0-rc.1`; the workflow adds `--prerelease` for `*-*` tags and the stable channel rejects it.
-- Seen 1× (2026-10-12).
+- Seen 1× (2026-10-13).
 
 **Release notes must not claim an upgrade path that was not exercised end to end.**
 - #604 (v1.1.0-rc.1 notes) said 1.0.x could update directly to rc.1; released 1.0.x updaters refuse it with `release manifest contract identity mismatch` (epoch 4 vs 5), found during PROD UAT.
