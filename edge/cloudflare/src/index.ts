@@ -509,8 +509,12 @@ export default {
       const to = typeof parsed.value.to === "string" ? parsed.value.to : "";
       const planDigest = typeof parsed.value.plan_digest === "string" ? parsed.value.plan_digest : "";
       const idempotencyKey = typeof parsed.value.idempotency_key === "string" ? parsed.value.idempotency_key : "";
-      if (!/^conn_[A-Za-z0-9_-]{8,128}$/.test(from) || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(to) || from === to) {
+      if (!/^conn_[A-Za-z0-9_-]{8,128}$/.test(from) || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(to)) {
         return noStoreJsonResponse({ ok: false, code: "migrate_invalid_connector_id" }, 400);
+      }
+      if (from === to) {
+        // B1: same fixed code as the DO confirm path for from === to.
+        return noStoreJsonResponse({ ok: false, code: "migrate_source_is_current" }, 400);
       }
       if (!/^[0-9a-f]{64}$/.test(planDigest)) {
         return noStoreJsonResponse({ ok: false, code: "migrate_invalid_plan_digest" }, 400);

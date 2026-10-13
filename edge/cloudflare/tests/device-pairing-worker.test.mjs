@@ -27,9 +27,9 @@ class FakeStorage {
     this._queue = run.then(() => undefined, () => undefined);
     return run;
   }
-  async getAlarm() { return null; }
-  async setAlarm() { throw new Error("pairing flow must not schedule alarms"); }
-  async deleteAlarm() {}
+  async getAlarm() { return this.alarmSetAt ?? null; }
+  async setAlarm(at) { this.alarmSetAt = at; } // #630 migrate confirm first-schedules the idempotency sweep
+  async deleteAlarm() { this.alarmSetAt = undefined; }
 }
 
 function namespace(stub) {
@@ -2221,5 +2221,17 @@ test("user Given owner device A authenticated When it runs a migrate dry run ass
   const mismatch = await h.dryRun({ action: "plan", from: MIG_OLD, to: MIG_NEW, device_id: h.deviceB });
   assert.equal(mismatch.status, 403);
   assert.deepEqual(mismatch.body, { ok: false, code: "orphans_device_mismatch" });
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
+
+test("user Given a migrate request where from equals to When it passes the public route validation Then both layers agree on migrate_source_is_current", async () => {
+  const h = await migrateHarness();
+  const same = await h.confirm({ from: MIG_NEW, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000006" });
+  assert.equal(same.status, 400);
+  assert.deepEqual(same.body, { ok: false, code: "migrate_source_is_current" }, "public layer returns the DO's code");
+  // Malformed ids keep their own fixed code.
+  const malformed = await h.confirm({ from: "bogus", to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000007" });
+  assert.equal(malformed.status, 400);
+  assert.deepEqual(malformed.body, { ok: false, code: "migrate_invalid_connector_id" });
   assert.equal(h.oauthStorage.writeCount, 0);
 });

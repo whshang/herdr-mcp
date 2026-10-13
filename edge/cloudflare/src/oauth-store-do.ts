@@ -76,6 +76,7 @@ const MAX_UNAPPROVED_DCR_CLIENTS = 256;
 const UNAPPROVED_DCR_TTL_MS = 60 * 60_000;
 const MIGRATE_IDEM_PREFIX = "migrate-idem:v1:";
 const MIGRATE_IDEM_TTL_MS = 24 * 60 * 60_000;
+const MIGRATE_IDEM_SWEEP_INTERVAL_MS = 60 * 60_000;
 const MIGRATE_IDEM_CAP = 256;
 const MIGRATE_IDEM_SWEEP_BATCH = 128;
 const CONNECTOR_USAGE_TOUCH_MS = 24 * 60 * 60_000;
@@ -1031,6 +1032,15 @@ export class OAuthStoreDO {
         ? { ok: false, status: 500, code: "migrate_postcondition_failed" }
         : { ok: false, status: 500, code: "migrate_storage_failed" };
     }
+    // B1: the committed idempotency entry must be covered by a scheduled alarm.
+    // The sweep can only re-arm an existing alarm, so first-schedule here —
+    // only after the transaction committed, and only when none is pending.
+    if (outcome.ok
+      && typeof this.state.storage.getAlarm === "function"
+      && typeof this.state.storage.setAlarm === "function"
+      && await this.state.storage.getAlarm() === null) {
+      await this.state.storage.setAlarm(Date.now() + MIGRATE_IDEM_SWEEP_INTERVAL_MS);
+    }
 
     if (!outcome.ok) return json({ ok: false, code: outcome.code }, outcome.status);
     return json(outcome);
@@ -1063,7 +1073,7 @@ export class OAuthStoreDO {
     // Re-arm while unexpired (or not-yet-swept) entries remain so the alarm
     // stays periodic; nothing to arm when the prefix is empty.
     if (live > 0 && typeof this.state.storage.setAlarm === "function") {
-      await this.state.storage.setAlarm(now + 60 * 60_000);
+      await this.state.storage.setAlarm(now + MIGRATE_IDEM_SWEEP_INTERVAL_MS);
     }
     return { deleted, live };
   }

@@ -13,6 +13,7 @@ class StorageMock {
   map = new Map();
   writes = 0;
   alarmSetAt = undefined;
+  async getAlarm() { return this.alarmSetAt ?? null; }
   async setAlarm(at) { this.alarmSetAt = at; }
   putFailures = []; // queued failures injected on the Nth put
   readCorruption = null; // { afterWrites } -> post-write reads return pre-write bytes
@@ -443,4 +444,35 @@ test("user Given a confirm with malformed from or to When the DO transaction run
   }
   assert.equal(snapshot(h.storage), before);
   assert.equal(h.storage.writes, 0);
+});
+
+test("user Given a successful confirm When the idempotency entry is written Then an alarm is already scheduled and firing it sweeps the expired entry", async () => {
+  const h = harness();
+  const digest = await planDigest({ from: OLD, to: NEW });
+  const res = await h.confirm({ plan_digest: digest });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  // B1: the confirm itself must first-schedule the alarm (the sweep can only
+  // re-arm an alarm that exists).
+  assert.ok(Number.isFinite(h.storage.alarmSetAt), `alarm scheduled by confirm (got ${h.storage.alarmSetAt})`);
+  assert.ok(h.storage.alarmSetAt > Date.now(), "alarm is in the future");
+  const writesAfterConfirm = h.storage.writes;
+  // Age the entry past its TTL and fire the scheduled handler.
+  const idemKey = `migrate-idem:v1:${DEV}:${IDEM}`;
+  const aged = h.storage.map.get(idemKey);
+  aged.expires_at_ms = Date.now() - 1;
+  h.storage.map.set(idemKey, aged);
+  await h.instance.alarm();
+  assert.equal(h.storage.map.has(idemKey), false, "expired entry swept");
+  assert.ok(h.storage.alarmSetAt !== undefined, "alarm re-armed while entries remain");
+  assert.equal(h.storage.writes, writesAfterConfirm + 1, "exactly the sweep delete wrote");
+});
+
+test("user Given a replay while an alarm is already pending When the stored result is returned Then the existing alarm is not rescheduled", async () => {
+  const h = harness();
+  const digest = await planDigest({ from: OLD, to: NEW });
+  assert.equal((await h.confirm({ plan_digest: digest })).status, 200);
+  const firstAlarm = h.storage.alarmSetAt;
+  assert.ok(Number.isFinite(firstAlarm));
+  assert.equal((await h.confirm({ plan_digest: digest })).status, 200);
+  assert.equal(h.storage.alarmSetAt, firstAlarm, "pending alarm untouched");
 });
