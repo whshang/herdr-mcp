@@ -977,6 +977,142 @@ test("user reads a table without claiming a mutation | Given a claimed page and 
   }
 });
 
+// ---- Native actuation entry path ----
+//
+// The Page Assist tests above call performBrowserPageActionRequest directly
+// with camelCase arguments, which skips the snake_case native entry hop the
+// Rust runtime actually drives. These tests extract the real
+// handleBrowserActuation handler (the same function the push stream invokes
+// for protocol "herdr-browser-actuation/v1" commands) together with the real
+// evidence helpers, wire it to the real lifecycle bridge, and fake only the
+// localhost evidence boundary so the exact posted evidence stays observable.
+
+const nativeActuationEntrySources = (() => {
+  const postEvidenceStart = backgroundSource.indexOf("async function postBrowserActuationEvidence(");
+  const postEvidenceEnd = backgroundSource.indexOf("\nfunction contentActuationEvidenceWithReason", postEvidenceStart);
+  const unavailableStart = backgroundSource.indexOf("function unavailableBrowserActuationEvidence(");
+  const unavailableEnd = backgroundSource.indexOf("\nfunction shouldCloseArchivedChatGptTab", unavailableStart);
+  const handlerStart = backgroundSource.indexOf("async function handleBrowserActuation(");
+  const handlerEnd = backgroundSource.indexOf("\nasync function handlePushBlock", handlerStart);
+  assert.ok(postEvidenceStart >= 0 && postEvidenceEnd > postEvidenceStart,
+    "actuation evidence poster must remain extractable");
+  assert.ok(unavailableStart >= 0 && unavailableEnd > unavailableStart,
+    "unavailable evidence helper must remain extractable");
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart,
+    "native actuation entry handler must remain extractable");
+  return {
+    postEvidenceSource: backgroundSource.slice(postEvidenceStart, postEvidenceEnd),
+    unavailableEvidenceSource: backgroundSource.slice(unavailableStart, unavailableEnd),
+    handlerSource: backgroundSource.slice(handlerStart, handlerEnd),
+  };
+})();
+
+function nativeActuationEntryHarness({ lifecycle } = {}) {
+  const postedEvidence = [];
+  const handleBrowserActuation = new Function(
+    "performBrowserPageActionRequest",
+    "performBrowserPageLifecycleRequest",
+    "localHerdrFetch",
+    "browserActuationUrl",
+    "STATE_FETCH_MS",
+    [
+      nativeActuationEntrySources.postEvidenceSource,
+      nativeActuationEntrySources.unavailableEvidenceSource,
+      nativeActuationEntrySources.handlerSource,
+      "return handleBrowserActuation;",
+    ].join("\n"),
+  )(
+    lifecycle.performBrowserPageActionRequest,
+    lifecycle.performBrowserPageLifecycleRequest,
+    async (_url, init = {}) => {
+      postedEvidence.push(JSON.parse(init.body));
+      return { ok: true, json: async () => ({}) };
+    },
+    () => "http://127.0.0.1:1/browser-actuation",
+    2000,
+  );
+  return { handleBrowserActuation, postedEvidence };
+}
+
+test("user presses a bound key through the native entry | Given a claimed BrowserPage and a herdr-browser-actuation/v1 press command with snake_case params | When the native entry handler forwards it | Then the content kernel receives key Escape", async () => {
+  const tabs = new Map([[78, { id: 78, url: "https://example.com/panel", active: true }]]);
+  const delivered = [];
+  const lifecycle = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      delivered.push(payload);
+      // Mirror the real content kernel: a press without a key is invalid.
+      if (payload.action === "press" && typeof payload.key !== "string") {
+        return { ok: false, error: "press_params_invalid" };
+      }
+      return { ok: true, key: payload.key };
+    },
+  });
+  const page = await lifecycle.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/panel",
+    idempotencyKey: "claim-native-entry-press",
+  });
+  assert.equal(page.ok, true);
+  const native = nativeActuationEntryHarness({ lifecycle });
+  await native.handleBrowserActuation({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: `ba_${"ab".repeat(8)}`,
+    dispatch_id: `bd_${"cd".repeat(8)}`,
+    operation: "herdr_mcp.browser_page.action",
+    expected_generation: 17,
+    params: {
+      page_ref: page.page_ref,
+      action: "press",
+      generation: "pa_native_entry_1",
+      ref: "ref_pa_native_entry_1_0",
+      key: "Escape",
+    },
+  });
+  assert.equal(native.postedEvidence.length, 1, "the native entry must post exactly one actuation evidence");
+  assert.equal(native.postedEvidence[0].command_accepted, true);
+  const press = delivered.find((payload) => payload.action === "press");
+  assert.ok(press, "press must reach chrome.tabs.sendMessage");
+  assert.equal(press.key, "Escape");
+  assert.equal(native.postedEvidence[0].result.ok, true);
+});
+
+test("user bounds a native table extraction | Given a claimed BrowserPage and a herdr-browser-actuation/v1 extract_table command with max_rows 1 | When the native entry handler forwards it | Then the content kernel receives maxRows 1", async () => {
+  const tabs = new Map([[79, { id: 79, url: "https://example.com/report", active: true }]]);
+  const delivered = [];
+  const lifecycle = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      delivered.push(payload);
+      return { ok: true, headers: ["Name"], rows: [["Widget"]], rows_truncated: payload.maxRows === 1 };
+    },
+  });
+  const page = await lifecycle.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/report",
+    idempotencyKey: "claim-native-entry-table",
+  });
+  assert.equal(page.ok, true);
+  const native = nativeActuationEntryHarness({ lifecycle });
+  await native.handleBrowserActuation({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: `ba_${"ef".repeat(8)}`,
+    dispatch_id: `bd_${"ab".repeat(8)}`,
+    operation: "herdr_mcp.browser_page.action",
+    expected_generation: 17,
+    params: {
+      page_ref: page.page_ref,
+      action: "extract_table",
+      generation: "pa_native_entry_table_1",
+      ref: "ref_pa_native_entry_table_1_0",
+      max_rows: 1,
+    },
+  });
+  assert.equal(native.postedEvidence.length, 1, "the native entry must post exactly one actuation evidence");
+  assert.equal(native.postedEvidence[0].command_accepted, true);
+  const table = delivered.find((payload) => payload.action === "extract_table");
+  assert.ok(table, "extract_table must reach chrome.tabs.sendMessage");
+  assert.equal(table.maxRows, 1);
+});
+
 test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {
   const sessionStorage = {};
   const tabs = new Map([

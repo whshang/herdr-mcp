@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.199";
+const H2W_SCRIPT_VERSION = "0.1.200";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -3461,6 +3461,8 @@ async function handleBrowserActuation(command) {
         timeoutMs: params.timeout_ms,
         direction: params.direction,
         amount: params.amount,
+        key: params.key,
+        maxRows: params.max_rows,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
