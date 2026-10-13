@@ -18,6 +18,81 @@ export type MigrationAuditEntry = {
 };
 export const MIGRATE_AUDIT_RING = 64;
 
+/** #630 Q4 reject audit (design §7.8 Q4): slim, per-device, separate from the success `audit[]`. */
+export type MigrateRejectStage =
+  | "validate"
+  | "idempotency"
+  | "replan"
+  | "digest"
+  | "device_scope"
+  | "postcondition"
+  | "storage";
+
+export const MIGRATE_REJECT_AUDIT_PREFIX = "migrate-reject-audit:v1:";
+export const MIGRATE_REJECT_AUDIT_RING = 64;
+
+/** Exactly the fixed Q4 field set: no record contents, raw key, body, or credentials. */
+export type MigrateRejectAuditEntry = {
+  v: 1;
+  at_ms: number;
+  code: string;
+  stage: MigrateRejectStage;
+  device_id: string;
+  plan_digest: string | null;
+  idempotency_key_sha256_8: string | null;
+};
+
+export function migrateRejectAuditKey(deviceId: string): string {
+  return MIGRATE_REJECT_AUDIT_PREFIX + deviceId;
+}
+
+/**
+ * Build one reject entry. The raw idempotency key and the raw client digest
+ * never leave this function: the key becomes its first 8 SHA-256 hex chars
+ * (only for a well-formed key) and the digest is kept only when it is a
+ * lowercase 64-hex string.
+ */
+export async function migrateRejectAuditEntry(args: {
+  atMs: number;
+  code: string;
+  stage: MigrateRejectStage;
+  deviceId: string;
+  planDigest: unknown;
+  idempotencyKey: unknown;
+}): Promise<MigrateRejectAuditEntry> {
+  const planDigest = typeof args.planDigest === "string" && /^[0-9a-f]{64}$/.test(args.planDigest)
+    ? args.planDigest
+    : null;
+  const idempotencyKeySha256_8 = typeof args.idempotencyKey === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(args.idempotencyKey)
+    ? (await sha256Hex(args.idempotencyKey)).slice(0, 8)
+    : null;
+  return {
+    v: 1,
+    at_ms: args.atMs,
+    code: args.code,
+    stage: args.stage,
+    device_id: args.deviceId,
+    plan_digest: planDigest,
+    idempotency_key_sha256_8: idempotencyKeySha256_8,
+  };
+}
+
+/** Append to the bounded per-device reject ring; the oldest entry is evicted first. */
+export function appendMigrateRejectAudit(
+  existing: unknown,
+  entry: MigrateRejectAuditEntry,
+): { v: 1; entries: MigrateRejectAuditEntry[] } {
+  const raw = existing && typeof existing === "object" && Array.isArray((existing as { entries?: unknown }).entries)
+    ? (existing as { entries: unknown[] }).entries
+    : [];
+  const prior = raw.filter((value): value is MigrateRejectAuditEntry => !!value && typeof value === "object");
+  const next = [...prior, entry];
+  return {
+    v: 1,
+    entries: next.length > MIGRATE_REJECT_AUDIT_RING ? next.slice(next.length - MIGRATE_REJECT_AUDIT_RING) : next,
+  };
+}
+
 /** Canonical plan digest (#630 §7.3): SHA-256 over {from, to, generation, sorted moves}. */
 export async function migrationPlanDigest(plan: MigrationPlan): Promise<string> {
   const moves = [...plan.moves].sort((a, b) =>

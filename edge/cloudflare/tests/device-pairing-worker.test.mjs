@@ -2176,7 +2176,7 @@ test("user Given a dry-run digest from the public route When the owner confirms 
   assert.equal(h.oauthStorage.writeCount, writesAfterFirst, "replay writes nothing");
 });
 
-test("user Given a shared record holding device B rows under the same source When device A dry-runs or confirms through the public route Then both reject the whole plan with migrate_cross_device_rows and write nothing", async () => {
+test("user Given a shared record holding device B rows under the same source When device A dry-runs or confirms through the public route Then both reject the whole plan with migrate_cross_device_rows and no grant or idempotency state changes", async () => {
   const h = await migrateHarness(true);
   const dry = await h.dryRun({ action: "plan", from: MIG_OLD, to: MIG_NEW });
   assert.equal(dry.status, 409);
@@ -2184,7 +2184,13 @@ test("user Given a shared record holding device B rows under the same source Whe
   const res = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "1".repeat(64), idempotency_key: "route-key-0000000003" });
   assert.equal(res.status, 409);
   assert.equal(res.body.code, "migrate_cross_device_rows");
-  assert.equal(h.oauthStorage.writeCount, 0);
+  // #630 Q4: the rejection writes only the separate per-device reject ring.
+  assert.equal(h.oauthStorage.writeCount, 1, "only the reject ring wrote");
+  assert.deepEqual(
+    h.oauthStorage.map.get(`migrate-reject-audit:v1:${h.deviceA}`).entries.map((entry) => [entry.code, entry.stage, entry.device_id]),
+    [["migrate_cross_device_rows", "device_scope", h.deviceA]],
+  );
+  assert.equal([...h.oauthStorage.map.keys()].some((key) => key.startsWith("migrate-idem:")), false, "no idempotency entry for a reject");
   assert.equal(h.oauthStorage.map.get("grant:c1").page_assist.find((r) => r.endpoint_ref === "epB").connector_id, MIG_OLD);
 });
 
