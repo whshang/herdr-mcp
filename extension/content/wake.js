@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.201";
+const H2W_CONTENT_VERSION = "0.1.202";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3184,7 +3184,7 @@ function normalizeHerdrMentionAlias(value) {
             // account / space / session facts through the existing h2w_register
             // path. Callers that need those facts trigger this handshake rather
             // than receiving raw account identity here.
-            await registerCurrentConversation("identity-recovery").catch(() => null);
+            await registerCurrentConversation("identity-recovery", { refreshObservation }).catch(() => null);
             convKey = ADAPTER.getConversationKey();
           }
           const identityMatchesRoute = Boolean(convKey && registeredConvKey === convKey);
@@ -3545,6 +3545,7 @@ function normalizeHerdrMentionAlias(value) {
     const projects = [];
     const seen = new Set();
     let cursor = null;
+    let fetchFailed = false;
     for (let page = 0; page < 5; page += 1) {
       const query = new URLSearchParams({
         owned_only: "true",
@@ -3559,13 +3560,17 @@ function normalizeHerdrMentionAlias(value) {
           cache: "no-store",
           redirect: "error",
           headers: { accept: "application/json", authorization: `Bearer ${accessToken}` },
+          // A hung sidebar response must not stall conversation registration
+          // forever (registry_handshake_delay): give up after 3 seconds.
+          signal: AbortSignal.timeout(3000),
         });
       } catch (_) {
+        fetchFailed = true;
         break;
       }
-      if (!response.ok) break;
+      if (!response.ok) { fetchFailed = true; break; }
       let body;
-      try { body = await response.json(); } catch (_) { break; }
+      try { body = await response.json(); } catch (_) { fetchFailed = true; break; }
       for (const item of Array.isArray(body?.items) ? body.items : []) {
         const project = item?.gizmo?.gizmo;
         const id = typeof project?.id === "string" ? project.id.trim() : "";
@@ -3577,7 +3582,13 @@ function normalizeHerdrMentionAlias(value) {
       cursor = body?.cursor ?? null;
       if (cursor == null || String(cursor) === "") break;
     }
-    chatGptProjectCatalogCache = { accountNativeIdentity, fetchedAt: now, projects };
+    // Only a completed catalog read may refresh the cache: an aborted or
+    // errored sidebar fetch must not poison the catalog with [] for the
+    // next 5 minutes (a slow-but-valid response would otherwise drop the
+    // conversation's Project until a route change or app-identity trigger).
+    if (!fetchFailed) {
+      chatGptProjectCatalogCache = { accountNativeIdentity, fetchedAt: now, projects };
+    }
     return projects;
   }
 
@@ -3600,19 +3611,9 @@ function normalizeHerdrMentionAlias(value) {
     return ADAPTER.resolveProjectIdentity(convKey);
   }
 
-  async function registerCurrentConversation(reason = "startup") {
-    if (!runtimeAlive()) return null;
-    const registrationAttempt = ++browserRegistrationAttempt;
-    const convKey = ADAPTER.getConversationKey();
-    if (!convKey) return null;
-    if (registeredConvKey !== null && registeredConvKey !== convKey) {
-      // Never let a route change advertise the previous conversation's stable
-      // Browser Registry target while the new route is still registering.
-      registeredBrowserSessionRef = null;
-      registeredBrowserGeneration = null;
-      registeredHerdrAppKeyword = null;
-      registeredConversationBound = false;
-    }
+  const registrationInFlight = new Map();
+
+  async function runConversationRegistration(reason, convKey, registrationAttempt) {
     const accountNativeIdentity = await browserAccountNativeIdentity();
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
@@ -3644,8 +3645,8 @@ function normalizeHerdrMentionAlias(value) {
       const stored = sessionStorage.getItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY);
       browserSessionReservationRef = /^bsr_[0-9a-f]{64}$/.test(String(stored || "")) ? stored : null;
       // A tab that already materialized a session and then moved (SPA) to a
-      // different conversation must not carry that create reservation onto
-      // the new conversation (live: G1's tab on E1 never rebound to E1).
+      // different conversation must not carry that create reservation onto the
+      // new conversation (live: G1's tab on E1 never rebound to E1).
       if (browserSessionReservationRef && registeredBrowserSessionRef
           && registeredConvKey !== null && registeredConvKey !== convKey) {
         sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY);
@@ -3740,8 +3741,58 @@ function normalizeHerdrMentionAlias(value) {
     return response;
   }
 
+  async function registerCurrentConversation(reason = "startup", options = null) {
+    if (!runtimeAlive()) return null;
+    const convKey = ADAPTER.getConversationKey();
+    if (!convKey) return null;
+    if (registeredConvKey !== null && registeredConvKey !== convKey) {
+      // Never let a route change advertise the previous conversation's stable
+      // Browser Registry target while the new route is still registering.
+      registeredBrowserSessionRef = null;
+      registeredBrowserGeneration = null;
+      registeredHerdrAppKeyword = null;
+      registeredConversationBound = false;
+    }
+    // One registration in flight per conversation key: later callers for the
+    // same conversation share it instead of cancelling it, so repeated
+    // h2w_get_convkey handshake probes and the 1s route poll cannot starve
+    // the h2w_register send (registry_handshake_delay).
+    const inFlight = registrationInFlight.get(convKey);
+    if (inFlight && inFlight.attempt === browserRegistrationAttempt) {
+      if (options?.refreshObservation === true) {
+        if (!inFlight.refreshQueued) {
+          // A refreshObservation request chains one fresh run after the
+          // current one; it never cancels the in-flight registration. The
+          // chained run belongs to the conversation that requested it: if
+          // the route moved on while the current run was in flight, skip
+          // the refresh instead of registering a redundant new key.
+          inFlight.refreshQueued = true;
+          const chainedRefresh = () => (ADAPTER.getConversationKey() === convKey
+            ? registerCurrentConversation(reason)
+            : null);
+          inFlight.refreshChain = inFlight.promise.then(chainedRefresh, chainedRefresh);
+        }
+        return inFlight.refreshChain;
+      }
+      return inFlight.promise;
+    }
+    // A registration for a different conversation key still supersedes older
+    // in-flight ones: newest attempt wins across route changes, and the
+    // route-drift fences in runConversationRegistration stay authoritative.
+    const registrationAttempt = ++browserRegistrationAttempt;
+    const entry = { attempt: registrationAttempt, promise: null, refreshQueued: false, refreshChain: null };
+    entry.promise = runConversationRegistration(reason, convKey, registrationAttempt);
+    registrationInFlight.set(convKey, entry);
+    entry.promise.then(
+      () => { if (registrationInFlight.get(convKey) === entry) registrationInFlight.delete(convKey); },
+      () => { if (registrationInFlight.get(convKey) === entry) registrationInFlight.delete(convKey); },
+    );
+    return entry.promise;
+  }
+
   function startConversationRouteWatch() {
     let hiddenRouteRegistrationInFlight = false;
+    let visibleRouteRegistrationKey = null;
     // One second is fast enough for UI binding while keeping route detection
     // negligible compared with the existing 5s HUD reconciliation interval.
     setInterval(() => {
@@ -3770,7 +3821,16 @@ function normalizeHerdrMentionAlias(value) {
         : [];
       const shouldLearnAppIdentity = convKey === registeredConvKey && observedApps.length === 1;
       if (convKey && (convKey !== registeredConvKey || shouldLearnAppIdentity)) {
-        void registerCurrentConversation(shouldLearnAppIdentity ? "app-identity" : "poll");
+        // One registration at a time per conversation key: the visible poll
+        // must not stack attempts (and cancel the in-flight one) while the
+        // pre-h2w_register work is still running. A different conversation
+        // key may still register immediately (route-change supersede).
+        if (visibleRouteRegistrationKey !== convKey) {
+          visibleRouteRegistrationKey = convKey;
+          void registerCurrentConversation(shouldLearnAppIdentity ? "app-identity" : "poll")
+            .catch(() => {})
+            .finally(() => { if (visibleRouteRegistrationKey === convKey) visibleRouteRegistrationKey = null; });
+        }
       }
       if (ADAPTER.name === "chatgpt") ensureQueuedInsertButton();
     }, 1000);

@@ -21,6 +21,7 @@ const EXTENSION_TESTS = new Set([
   "tests/page-assist-content.test.mjs",
   "tests/page-assist-core.test.mjs",
   "tests/queued-insert.test.mjs",
+  "tests/registration-single-flight.test.mjs",
 ]);
 
 const EDGE_TESTS = new Set([

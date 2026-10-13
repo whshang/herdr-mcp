@@ -470,7 +470,7 @@ const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteW
 assert.ok(registrationStart >= 0 && registrationEnd > registrationStart, "registration helper must remain extractable");
 const registrationSource = wakeSource.slice(registrationStart, registrationEnd);
 const projectIdentityEnd = wakeSource.indexOf(
-  '\n  async function registerCurrentConversation(reason = "startup")',
+  "\n  const registrationInFlight = new Map();",
   projectIdentityStart,
 );
 assert.ok(projectIdentityStart >= 0 && projectIdentityEnd > projectIdentityStart, "provider project identity helper must remain extractable");
@@ -2230,7 +2230,7 @@ test("page identity handshake lazily recovers only opaque Browser Registry ident
     wakeSource.indexOf('if (msg?.type === "h2w_get_convkey")'),
     wakeSource.indexOf('if (msg?.type === "h2w_snapshot_turn")'),
   );
-  assert.match(identitySegment, /registerCurrentConversation\("identity-recovery"\)/);
+  assert.match(identitySegment, /registerCurrentConversation\("identity-recovery", \{ refreshObservation \}\)/);
   assert.match(identitySegment, /return true;/);
   assert.match(identitySegment, /const identityMatchesRoute = Boolean\(convKey && registeredConvKey === convKey\)/);
   assert.match(identitySegment, /browserSessionRef:\s*identityMatchesRoute \? registeredBrowserSessionRef : null/);
@@ -2310,27 +2310,23 @@ test("conversation registration fences route changes before and after async back
   assert.ok(fences[1] > send, "stale registration response must not overwrite the current route identity");
 });
 
-test("newer same-route browser registration wins when responses arrive out of order", async () => {
+test("user shares one in-flight registration per conversation | Given concurrent same-route registration callers | When both callers await | Then exactly one h2w_register is sent and both receive the same result", async () => {
   const harness = registrationHarness();
   const first = harness.register("first");
-  await flushRegistrationToSend(harness);
   const second = harness.register("second");
-  for (let i = 0; i < 4; i += 1) await Promise.resolve();
-  assert.equal(harness.pending.length, 2);
+  await flushRegistrationToSend(harness);
+  assert.equal(harness.pending.length, 1, "concurrent same-route callers must not start a second attempt");
 
-  harness.pending[1].resolve({ browser_session_ref: "br_new", browser_generation: 9, bound: false });
-  await second;
+  harness.pending[0].resolve({ browser_session_ref: "br_one", browser_generation: 9, bound: false });
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(firstResult, secondResult, "both callers share the same registration result");
+  assert.equal(firstResult?.browser_session_ref, "br_one");
   assert.deepEqual(harness.state(), {
     convKey: "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-    sessionRef: "br_new",
+    sessionRef: "br_one",
     generation: 9,
-    attempt: 2,
+    attempt: 1,
   });
-
-  harness.pending[0].resolve({ browser_session_ref: "br_old_late", browser_generation: 8, bound: false });
-  await first;
-  assert.equal(harness.state().sessionRef, "br_new");
-  assert.equal(harness.state().generation, 9);
 });
 
 test("A to B to A registration cannot resurrect an older A response", async () => {
@@ -3753,7 +3749,7 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.doesNotMatch(createSegment, /evidence\.required_apps_readback = appSelection\.apps/);
   assert.match(createSegment, /requiredApps,/);
 
-  const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
+  const registrationStart = wakeSource.indexOf('async function runConversationRegistration');
   const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch", registrationStart);
   assert.ok(registrationStart >= 0 && registrationEnd > registrationStart);
   const registrationSegment = wakeSource.slice(registrationStart, registrationEnd);
