@@ -15,6 +15,15 @@ Classification:
 - **later**: absent and deliberately deferred (security review or no 1.1
   workflow).
 
+## #586 checklist correction (2026-10-13)
+
+The #586 'Generic form actions' item's checkbox/radio set/unset part is done
+(real Chrome UAT passed on extension 0.1.153 for checked on/off, radio set,
+no-op and unsupported-state rejection, see
+`v1.1-browser-adapter-platform.md`); native select also passed
+(0.1.151/0.1.152); keyboard press is unit-test-only and hover/drag/double-click
+remain open, so the parent item stays open.
+
 ## A. Generic primitives (BrowserPage kernel, `browser_page.*`)
 
 | Capability | OpenCLI / opencli-mcp equivalent | Herdr surface | Class | Evidence / note |
