@@ -464,8 +464,7 @@ export default {
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)
         || Object.keys(parsed.value).some((key) => key !== "action" && key !== "from" && key !== "to" && key !== "device_id")
-        || (parsed.value.action !== "list" && parsed.value.action !== "plan")
-        || (parsed.value.device_id !== undefined && parsed.value.action !== "list")) {
+        || (parsed.value.action !== "list" && parsed.value.action !== "plan")) {
         return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
       }
       if (parsed.value.device_id !== undefined

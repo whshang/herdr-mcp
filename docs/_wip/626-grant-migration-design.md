@@ -516,9 +516,16 @@ Real-usage verification (needed before enabling, on a staging Edge):
 - `by` enforcement: the DO currently defaults `by` to `device:<device_id>`
   when absent and accepts any bounded string when present; it must require
   exactly `device:<authenticated device_id>` once the Edge route lands.
-- Malformed `from`/`to` request validation: today they surface as the plan's
-  own 409 codes (`migrate_from_required` etc.); §7.1 step 2 wants 400 with a
-  fixed code before any storage work.
+- ~~Malformed `from`/`to` request validation~~ — done: the DO confirm path now
+  returns 400 with the fixed code for request-shape selector errors
+  (missing/invalid/duplicate ids); state-dependent plan failures stay 409.
 - Mutation-test suite: §7.7's mutation list was exercised manually during
   development (fresh-check, digest-compare, device-filter removals each broke
   tests; restored); a repeatable automated suite is not wired up yet.
+- `by` field: the DO accepts any bounded string (≤128 chars) when present and
+  defaults it — see the `by === device:<id>` enforcement item above.
+- The audit ring size 64 is hardcoded in two places that must stay in sync:
+  `MIGRATE_AUDIT_RING` (grant-migration.ts) and the `slice(-64)` bound in
+  `normalizeConnectorGrant` (oauth-records.ts). Unify on one shared constant
+  (oauth-records cannot import grant-migration without a module cycle; move
+  the constant to a leaf module when touched next).

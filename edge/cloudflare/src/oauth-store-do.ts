@@ -956,7 +956,13 @@ export class OAuthStoreDO {
         //    whole plan before digest comparison and before any write.
         const fresh = planMigration(records, from, to, deviceId);
         if (!fresh.ok) {
-          outcome = { ok: false, status: 409, code: fresh.code };
+          // §7.1 step 2: request-shape selector errors are 400; state-dependent
+          // plan failures (target/conflict/cross-device) stay 409.
+          const requestShape = fresh.code === "migrate_from_required"
+            || fresh.code === "migrate_to_required"
+            || fresh.code === "migrate_invalid_connector_id"
+            || fresh.code === "migrate_source_is_current";
+          outcome = { ok: false, status: requestShape ? 400 : 409, code: fresh.code };
           return;
         }
 
@@ -1032,10 +1038,10 @@ export class OAuthStoreDO {
 
   /**
    * #630 idempotency sweep (design §7.3 Q2): delete expired `migrate-idem:v1:`
-   * entries in batches; re-arm while any entry remains. DO-internal route the
-   * platform alarm contract calls; never touches grant records.
+   * entries in batches; re-arm while any entry remains. Shared by the platform
+   * `alarm()` handler and the DO-internal route; never touches grant records.
    */
-  private async pageAssistMigrateAlarm(): Promise<Response> {
+  private async sweepMigrateIdempotencyEntries(): Promise<{ deleted: number; live: number }> {
     const now = Date.now();
     let deleted = 0;
     let live = 0;
@@ -1059,6 +1065,16 @@ export class OAuthStoreDO {
     if (live > 0 && typeof this.state.storage.setAlarm === "function") {
       await this.state.storage.setAlarm(now + 60 * 60_000);
     }
+    return { deleted, live };
+  }
+
+  /** Platform DO alarm contract: the scheduled alarm performs the TTL sweep. */
+  async alarm(): Promise<void> {
+    await this.sweepMigrateIdempotencyEntries();
+  }
+
+  private async pageAssistMigrateAlarm(): Promise<Response> {
+    const { deleted, live } = await this.sweepMigrateIdempotencyEntries();
     return json({ ok: true, deleted, live });
   }
 

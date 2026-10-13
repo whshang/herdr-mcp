@@ -738,10 +738,11 @@ mod tests {
             orphans_request_body(None, None).unwrap(),
             serde_json::json!({"action": "list"})
         );
-        assert_eq!(
-            orphans_request_body(Some(OLD), Some(NEW)).unwrap(),
-            serde_json::json!({"action": "plan", "from": OLD, "to": NEW})
-        );
+        // #630 review: the dry-run body never carries a client device_id — the
+        // Edge injects the authenticated registry device server-side.
+        let plan_body = orphans_request_body(Some(OLD), Some(NEW)).unwrap();
+        assert_eq!(plan_body, serde_json::json!({"action": "plan", "from": OLD, "to": NEW}));
+        assert!(plan_body.get("device_id").is_none());
         assert!(orphans_request_body(Some(OLD), None).is_err());
         assert!(orphans_request_body(None, Some(NEW)).is_err());
         assert!(orphans_request_body(Some(NEW), Some(NEW)).is_err());

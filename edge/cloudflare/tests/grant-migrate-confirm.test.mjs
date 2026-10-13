@@ -124,7 +124,7 @@ function harness(rec = record(), extra = {}) {
   const confirm = (over = {}) => post(ROUTE, {
     from: OLD, to: NEW, device_id: DEV, idempotency_key: IDEM, ...over,
   });
-  return { storage, post, confirm };
+  return { storage, post, confirm, instance };
 }
 
 const snapshot = (storage) => JSON.stringify([...storage.map.entries()]);
@@ -409,4 +409,38 @@ test("user Given a migrated record carrying a success audit entry When allow, de
   assert.equal(revoke.status, 200, JSON.stringify(revoke.body));
   assert.equal(h.storage.map.get("grant:c1").status, "revoked", "revoke applied");
   assert.equal(auditSurvives(), true, "audit survives the revoke write-back");
+});
+
+test("user Given expired idempotency entries When the DO alarm handler fires Then expired entries are swept and the alarm re-arms while live entries remain", async () => {
+  const h = harness();
+  h.storage.map.set(`migrate-idem:v1:${DEV}:expired0000000001`, { v: 1, plan_digest: "0".repeat(64), result: { ok: true }, created_at_ms: 1, expires_at_ms: Date.now() - 1000 });
+  h.storage.map.set(`migrate-idem:v1:${DEV}:live000000000001`, { v: 1, plan_digest: "0".repeat(64), result: { ok: true }, created_at_ms: 2, expires_at_ms: Date.now() + 60_000 });
+  await h.instance.alarm();
+  assert.equal(h.storage.map.has(`migrate-idem:v1:${DEV}:expired0000000001`), false, "expired swept");
+  assert.equal(h.storage.map.has(`migrate-idem:v1:${DEV}:live000000000001`), true, "live kept");
+  assert.ok(h.storage.alarmSetAt !== undefined && h.storage.alarmSetAt > Date.now(), "alarm re-armed");
+  // With nothing left to keep, a fully-expired prefix disarms after sweeping.
+  h.storage.map.set(`migrate-idem:v1:${DEV}:expired0000000002`, { v: 1, plan_digest: "0".repeat(64), result: { ok: true }, created_at_ms: 3, expires_at_ms: Date.now() - 1 });
+  h.storage.alarmSetAt = undefined;
+  await h.instance.alarm();
+  assert.equal(h.storage.map.has(`migrate-idem:v1:${DEV}:expired0000000002`), false);
+  assert.equal(h.storage.map.has(`migrate-idem:v1:${DEV}:live000000000001`), true, "live still kept");
+});
+
+test("user Given a confirm with malformed from or to When the DO transaction runs Then it fails closed with 400 and the fixed request-shape code", async () => {
+  const h = harness();
+  const before = snapshot(h.storage);
+  const cases = [
+    [{ from: "" }, "migrate_from_required"],
+    [{ to: "" }, "migrate_to_required"],
+    [{ from: "bogus" }, "migrate_invalid_connector_id"],
+    [{ from: NEW, to: NEW }, "migrate_source_is_current"],
+  ];
+  for (const [over, code] of cases) {
+    const res = await h.confirm({ plan_digest: "a".repeat(64), ...over });
+    assert.equal(res.status, 400, JSON.stringify(res.body));
+    assert.equal(res.body.code, code);
+  }
+  assert.equal(snapshot(h.storage), before);
+  assert.equal(h.storage.writes, 0);
 });

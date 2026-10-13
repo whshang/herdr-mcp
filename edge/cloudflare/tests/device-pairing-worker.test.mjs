@@ -2208,3 +2208,18 @@ test("user Given confirm calls without owner auth, an unresolved legacy device, 
   assert.deepEqual(badKey.body, { ok: false, code: "migrate_idempotency_key_invalid" });
   assert.equal(h.oauthStorage.writeCount, 0);
 });
+
+test("user Given owner device A authenticated When it runs a migrate dry run asserting its own device_id Then the plan is device-scoped and succeeds", async () => {
+  const h = await migrateHarness();
+  const res = await h.dryRun({ action: "plan", from: MIG_OLD, to: MIG_NEW, device_id: h.deviceA });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.dry_run, true);
+  assert.deepEqual(res.body.moves.map((m) => m.from.endpoint_ref), ["epA"]);
+  assert.ok(res.body.moves.every((m) => m.from.device_id === h.deviceA));
+  assert.match(res.body.plan_digest, /^[0-9a-f]{64}$/);
+  // The assertion must match: B's device_id is refused with the fixed mismatch code.
+  const mismatch = await h.dryRun({ action: "plan", from: MIG_OLD, to: MIG_NEW, device_id: h.deviceB });
+  assert.equal(mismatch.status, 403);
+  assert.deepEqual(mismatch.body, { ok: false, code: "orphans_device_mismatch" });
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
