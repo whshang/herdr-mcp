@@ -48,7 +48,7 @@ export function findTargetConflicts(record: OAuthConnectorGrantRecord, to: strin
  * Whole-record write-back for a future --confirm: start from the RAW stored record so
  * fields this writer does not know (top-level and per-row) are preserved, and rewrite
  * only the planned rows. Pure: returns a new object, never mutates `raw`. Not called by
- * any write path yet (confirm is refused).
+ * any write path yet (confirm is refused). Callers must go through applyPlanIfFresh.
  */
 export function applyPlanToRawRecord(raw: Record<string, unknown>, plan: Extract<PlanResult, { ok: true }>): Record<string, unknown> {
   const rewrite = (kind: GrantKind, rows: unknown): unknown => {
@@ -67,6 +67,24 @@ export function applyPlanToRawRecord(raw: Record<string, unknown>, plan: Extract
   if ("page_assist" in raw) out.page_assist = rewrite("page_assist", structuredClone(raw.page_assist));
   if ("webchat_control" in raw) out.webchat_control = rewrite("webchat_control", structuredClone(raw.webchat_control));
   return out;
+}
+
+/**
+ * Guarded apply for any future --confirm: recompute a fresh plan against the CURRENT
+ * records (re-running target/conflict detection) and refuse unless it equals `plan`.
+ * Pure; returns the rewritten raw record only when the plan is still exact.
+ */
+export function applyPlanIfFresh(
+  currentRecords: Iterable<OAuthConnectorGrantRecord | null | undefined>,
+  raw: Record<string, unknown>,
+  plan: Extract<PlanResult, { ok: true }>,
+): { ok: true; record: Record<string, unknown> } | { ok: false; code: string } {
+  const fresh = planMigration(currentRecords, plan.from_connector_id, plan.to_connector_id);
+  if (!fresh.ok) {
+    return { ok: false, code: fresh.code === "migrate_target_conflict" ? "migrate_target_conflict" : "migrate_plan_stale" };
+  }
+  if (JSON.stringify(fresh) !== JSON.stringify(plan)) return { ok: false, code: "migrate_plan_stale" };
+  return { ok: true, record: applyPlanToRawRecord(raw, plan) };
 }
 
 const CONNECTOR_ID = /^conn_[A-Za-z0-9_-]{8,128}$/;

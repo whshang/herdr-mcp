@@ -217,7 +217,8 @@ pub enum WorkerCommand {
     ConnectorPageAssistOrphans {
         from: Option<String>,
         to: Option<String>,
-        /// Optional orphans-list filter (validated `dev_…`); never set for migrate.
+        /// Optional assertion (validated `dev_…`); Edge always scopes the list to the
+        /// authenticated owner device and rejects a mismatch. Never set for migrate.
         device_id: Option<String>,
     },
     ConnectorPageAssist {
@@ -2404,7 +2405,7 @@ User path:\n\
   herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm  (enrolled owner device)\n\
   herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
-  herdr-mcp connector page-assist orphans [list] [--device-id <device-id>]  (read-only: grant rows left under a previous connector)\n\
+  herdr-mcp connector page-assist orphans [list] [--device-id <device-id>]  (read-only: grant rows left under a previous connector; always scoped server-side to the authenticated owner device; --device-id is only an assertion and must match it, else 403 orphans_device_mismatch)\n\
   herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id>  (dry run only; --confirm not implemented yet)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
   herdr-mcp automation list\n\

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { OAuthStoreDO } from "../dist/oauth-store-do.js";
-import { listOrphans, planMigration, applyPlanToRawRecord } from "../dist/grant-migration.js";
+import { listOrphans, planMigration, applyPlanToRawRecord, applyPlanIfFresh } from "../dist/grant-migration.js";
 
 class StorageMock {
   map = new Map();
@@ -58,7 +58,7 @@ const snapshot = (storage) => JSON.stringify([...storage.map.entries()]);
 test("user Given a grant record with carried-forward rows When the owner lists orphans Then only rows not under the current connector are returned and nothing is written", async () => {
   const h = harness();
   const before = snapshot(h.storage);
-  const res = await h.post({ action: "list" });
+  const res = await h.post({ action: "list", device_id: DEV });
   assert.equal(res.status, 200);
   assert.equal(res.body.ok, true);
   assert.deepEqual(res.body.orphans.map((o) => [o.kind, o.connector_id, o.endpoint_ref]), [
@@ -116,7 +116,7 @@ test("user Given two records claiming the same current connector When a migratio
 
 test("user Given a revoked grant record When the owner lists orphans or plans a migration Then nothing is offered", async () => {
   const h = harness(record({ status: "revoked" }));
-  const list = await h.post({ action: "list" });
+  const list = await h.post({ action: "list", device_id: DEV });
   assert.deepEqual(list.body, { ok: true, orphans: [], invalid_records: 0 });
   const plan = await h.post({ action: "plan", from: OLD, to: NEW });
   assert.equal(plan.body.ok, false);
@@ -179,7 +179,7 @@ test("user Given records with missing fields When the owner lists or plans Then 
   const h = harness(record());
   h.storage.map.set("grant:broken", { client_id: "broken", status: "active" }); // missing approved_* -> invalid
   const before = snapshot(h.storage);
-  const res = await h.post({ action: "list" });
+  const res = await h.post({ action: "list", device_id: DEV });
   assert.equal(res.body.invalid_records, 1);
   assert.ok(res.body.orphans.every((o) => o.client_id === "c1"));
   assert.equal(snapshot(h.storage), before);
@@ -218,8 +218,37 @@ test("user Given an invalid device id When the owner lists orphans Then it fails
     assert.equal(res.status, 400, JSON.stringify(device_id));
     assert.deepEqual(res.body, { ok: false, code: "orphans_invalid_device_id" });
   }
+  const missing = await h.post({ action: "list" });
+  assert.equal(missing.status, 400, "the DO never lists unscoped");
+  assert.deepEqual(missing.body, { ok: false, code: "orphans_invalid_device_id" });
   const plan = await h.post({ action: "plan", from: OLD, to: NEW, device_id: DEV });
   assert.deepEqual(plan.body, { ok: false, code: "bad_request" });
   assert.equal(snapshot(h.storage), before);
   assert.equal(h.storage.writes, 0);
+});
+
+test("user Given a dry-run plan When a conflicting target row appears before apply Then the guarded apply rejects with migrate_target_conflict and returns no record", () => {
+  const plan = planMigration([record()], OLD, NEW);
+  assert.equal(plan.ok, true);
+  const fresh = applyPlanIfFresh([record()], record(), plan);
+  assert.equal(fresh.ok, true);
+  const changed = record();
+  changed.page_assist.push(pa(NEW, "ep1"));
+  const raw = structuredClone(changed);
+  const res = applyPlanIfFresh([changed], raw, plan);
+  assert.deepEqual(res, { ok: false, code: "migrate_target_conflict" });
+  assert.deepEqual(raw, changed, "input untouched");
+});
+
+test("user Given a dry-run plan When the source rows change before apply Then the guarded apply rejects with migrate_plan_stale", () => {
+  const plan = planMigration([record()], OLD, NEW);
+  const changed = record();
+  changed.page_assist.push(pa(OLD, "ep9"));
+  assert.deepEqual(applyPlanIfFresh([changed], changed, plan), { ok: false, code: "migrate_plan_stale" });
+  const gone = record({ page_assist: [pa(NEW, "ep2")], webchat_control: [] });
+  assert.deepEqual(applyPlanIfFresh([gone], gone, plan), { ok: false, code: "migrate_plan_stale" });
+});
+
+test("user Given a record whose current connector_id is empty When orphans are listed Then nothing is offered", () => {
+  assert.deepEqual(listOrphans(record({ connector_id: "" })), []);
 });

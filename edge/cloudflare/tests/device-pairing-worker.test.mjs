@@ -2024,3 +2024,81 @@ test("approved OAuth Connector is ordinary MCP only and cannot administer the fl
   assert.equal(badKeyBody.result.isError, true);
   assert.equal(badKeyBody.result.structuredContent.code, "invalid_params");
 });
+
+// #626: the public orphans route is scoped server-side to the authenticated owner device.
+async function orphansHarness() {
+  const h = makeEnv();
+  const oauthStorage = new FakeStorage();
+  const oauth = new OAuthStoreDO({ storage: oauthStorage }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+  const legacyUnregistered = await worker.fetch(postAsWorkstation(
+    "/connectors/page-assist/orphans", { action: "list" }, "prod-real-runtime", "legacy-secret",
+  ), h.env);
+  const connect = await worker.fetch(wsRequest("prod-real-runtime", "legacy-secret"), h.env);
+  assert.equal(connect.status, 200);
+  const list = await h.registry.fetch(new Request("https://registry.internal/internal/devices"));
+  const deviceA = (await list.json()).devices.find((d) => d.workstation_id === "prod-real-runtime").device_id;
+  const deviceB = (await pair(h.env, "orphans-b")).device_id;
+  assert.match(deviceA, /^dev_/);
+  assert.notEqual(deviceA, deviceB);
+  const row = (connector_id, device_id, endpoint_ref) => ({ connector_id, grant_generation: 1, device_id, endpoint_ref });
+  oauthStorage.map.set("grant:c1", {
+    client_id: "c1", status: "active", principal_type: "connector", resource: "https://edge.example/mcp", scope: "mcp",
+    approved_at_ms: 1000, approved_by: "device:owner", connector_id: "conn_new00000001", grant_generation: 1,
+    page_assist: [row("conn_old00000001", deviceA, "epA"), row("conn_old00000001", deviceB, "epB")],
+    webchat_control: [{ ...row("conn_old00000001", deviceB, "epB2"), provider: "chatgpt", account_ref: "*" }],
+  });
+  oauthStorage.writeCount = 0;
+  const call = async (body) => {
+    const resp = await worker.fetch(postAsWorkstation(
+      "/connectors/page-assist/orphans", body, "prod-real-runtime", "legacy-secret",
+    ), h.env);
+    return { status: resp.status, body: await resp.json() };
+  };
+  return { oauthStorage, deviceA, deviceB, call, legacyUnregistered };
+}
+
+test("user Given orphans on owner device A and device B When A lists orphans without device_id Then only A's rows are returned and nothing is written", async () => {
+  const h = await orphansHarness();
+  const res = await h.call({ action: "list" });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.orphans.map((o) => o.endpoint_ref), ["epA"]);
+  assert.ok(res.body.orphans.every((o) => o.device_id === h.deviceA));
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
+
+test("user Given owner device A authenticated When it asks for device B's orphans Then it gets 403 orphans_device_mismatch, none of B's rows, and zero writes", async () => {
+  const h = await orphansHarness();
+  const res = await h.call({ action: "list", device_id: h.deviceB });
+  assert.equal(res.status, 403);
+  assert.deepEqual(res.body, { ok: false, code: "orphans_device_mismatch" });
+  assert.ok(!JSON.stringify(res.body).includes(h.deviceB));
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
+
+test("user Given owner device A authenticated When it lists orphans with its own device_id Then the request succeeds scoped to A", async () => {
+  const h = await orphansHarness();
+  const res = await h.call({ action: "list", device_id: h.deviceA });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.deepEqual(res.body.orphans.map((o) => [o.device_id, o.endpoint_ref]), [[h.deviceA, "epA"]]);
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
+
+test("user Given owner auth When orphans are listed with a malformed device_id, an unknown key, no auth, or no registry device identity Then it fails closed and writes nothing", async () => {
+  const h = await orphansHarness();
+  const bad = await h.call({ action: "list", device_id: "dev_short" });
+  assert.equal(bad.status, 400);
+  assert.deepEqual(bad.body, { ok: false, code: "orphans_invalid_device_id" });
+  const unknown = await h.call({ action: "list", extra: 1 });
+  assert.equal(unknown.status, 400);
+  assert.deepEqual(unknown.body, { ok: false, code: "bad_request" });
+  assert.equal(h.legacyUnregistered.status, 403);
+  assert.deepEqual(await h.legacyUnregistered.json(), { ok: false, code: "orphans_device_unresolved" });
+  const generic = await worker.fetch(post("/connectors/page-assist/orphans", { action: "list" }, "owner-secret"), {
+    ...makeEnv().env,
+  });
+  assert.equal(generic.status, 401);
+  assert.equal(h.oauthStorage.writeCount, 0);
+});

@@ -457,8 +457,10 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/connectors/page-assist/orphans") {
       // #626: read-only orphan list / migrate dry run. Same owner-device auth as allow.
-      const ownerDevice = await authenticateOwnerDevice(request, env);
-      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      // Listing is always scoped server-side to the authenticated owner device; a client
+      // device_id is only an assertion and must match it.
+      const owner = await authenticateOwnerDeviceIdentity(request, env);
+      if (!owner) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)
         || Object.keys(parsed.value).some((key) => key !== "action" && key !== "from" && key !== "to" && key !== "device_id")
@@ -470,12 +472,22 @@ export default {
         && (typeof parsed.value.device_id !== "string" || normalizeDeviceId(parsed.value.device_id) !== parsed.value.device_id)) {
         return noStoreJsonResponse({ ok: false, code: "orphans_invalid_device_id" }, 400);
       }
+      let scopedDeviceId: string | undefined;
+      if (parsed.value.action === "list") {
+        const authDevice = owner.deviceId === null ? null : normalizeDeviceId(owner.deviceId);
+        // Fail closed: no registry device identity (legacy shared-secret auth) -> no listing.
+        if (!authDevice) return noStoreJsonResponse({ ok: false, code: "orphans_device_unresolved" }, 403);
+        if (parsed.value.device_id !== undefined && parsed.value.device_id !== authDevice) {
+          return noStoreJsonResponse({ ok: false, code: "orphans_device_mismatch" }, 403);
+        }
+        scopedDeviceId = authDevice;
+      }
       const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
       const result = await createOAuthPublicStore(stub).pageAssistOrphans({
         action: parsed.value.action,
         ...(typeof parsed.value.from === "string" ? { from: parsed.value.from } : {}),
         ...(typeof parsed.value.to === "string" ? { to: parsed.value.to } : {}),
-        ...(typeof parsed.value.device_id === "string" ? { device_id: parsed.value.device_id } : {}),
+        ...(scopedDeviceId !== undefined ? { device_id: scopedDeviceId } : {}),
       });
       return noStoreJsonResponse(result.body, result.status);
     }
@@ -1298,6 +1310,18 @@ async function authenticateFleetDevice(request: Request, env: Env): Promise<stri
 // the configured owner device. Keep this check distinct from
 // authenticateFleetDevice/authenticateFleetAdmin.
 async function authenticateOwnerDevice(request: Request, env: Env): Promise<string | null> {
+  return (await authenticateOwnerDeviceIdentity(request, env))?.workstationId ?? null;
+}
+
+/**
+ * Same checks as authenticateOwnerDevice (it delegates here), but also returns the registry
+ * device_id when the owner authenticated with a device credential. Legacy shared-secret owner
+ * auth has no device identity: device_id is null.
+ */
+async function authenticateOwnerDeviceIdentity(
+  request: Request,
+  env: Env,
+): Promise<{ workstationId: string; deviceId: string | null } | null> {
   const workstationId = request.headers.get("x-herdr-workstation")?.trim() ?? "";
   const ownerWorkstationId = env.DEFAULT_WORKSTATION_ID?.trim() ?? "";
   if (!ownerWorkstationId || !workstationId) return null;
@@ -1307,16 +1331,32 @@ async function authenticateOwnerDevice(request: Request, env: Env): Promise<stri
   const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
   const deviceAuth = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
   if (deviceAuth.ok) {
-    if (workstationId === ownerWorkstationId) return workstationId;
+    if (workstationId === ownerWorkstationId) return { workstationId, deviceId: deviceAuth.device_id };
     const ownerAliasAuth = await authenticateDeviceCredential(registry, ownerWorkstationId, extracted.credential);
-    return ownerAliasAuth.ok && ownerAliasAuth.device_id === deviceAuth.device_id ? workstationId : null;
+    return ownerAliasAuth.ok && ownerAliasAuth.device_id === deviceAuth.device_id
+      ? { workstationId, deviceId: deviceAuth.device_id }
+      : null;
   }
   if (workstationId !== ownerWorkstationId) return null;
   if (deviceAuth.code !== "device_not_found" && deviceAuth.code !== "device_credential_missing") {
     return null;
   }
   const legacy = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
-  return legacy.authenticate(request, workstationId, Date.now()).ok ? workstationId : null;
+  if (!legacy.authenticate(request, workstationId, Date.now()).ok) return null;
+  return { workstationId, deviceId: await lookupLegacyDeviceId(registry, workstationId) };
+}
+
+/** Read-only: the registry device_id already recorded for a legacy workstation, else null. */
+async function lookupLegacyDeviceId(registry: { fetch(request: Request): Promise<Response> }, workstationId: string): Promise<string | null> {
+  try {
+    const resp = await registry.fetch(new Request("https://registry.internal/internal/devices"));
+    if (!resp.ok) return null;
+    const body = await resp.json() as { devices?: Array<{ workstation_id?: unknown; device_id?: unknown }> };
+    const hits = (body.devices ?? []).filter((d) => d.workstation_id === workstationId && typeof d.device_id === "string");
+    return hits.length === 1 ? hits[0].device_id as string : null;
+  } catch {
+    return null;
+  }
 }
 
 async function oauthInternal(env: Env, path: string, body: Record<string, unknown>): Promise<Response> {

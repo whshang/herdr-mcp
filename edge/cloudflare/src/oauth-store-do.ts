@@ -871,18 +871,17 @@ export class OAuthStoreDO {
     const action = body?.action;
     if (action !== "list" && action !== "plan") return json({ ok: false, code: "bad_request" }, 400);
     const deviceId = body?.device_id;
-    if (deviceId !== undefined) {
-      if (action !== "list") return json({ ok: false, code: "bad_request" }, 400);
-      if (typeof deviceId !== "string" || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)) {
-        return json({ ok: false, code: "orphans_invalid_device_id" }, 400);
-      }
+    if (action === "plan" && deviceId !== undefined) return json({ ok: false, code: "bad_request" }, 400);
+    // #626: listing is always device-scoped; no unscoped listing.
+    if (action === "list" && (typeof deviceId !== "string" || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId))) {
+      return json({ ok: false, code: "orphans_invalid_device_id" }, 400);
     }
     const rows = await this.state.storage.list<OAuthConnectorGrantRecord>({ prefix: GRANT_PREFIX });
     const records = [...rows.values()].map((raw) => normalizeConnectorGrant(raw));
     // Records that fail normalization are never offered; report the count (fixed field).
     const invalidRecords = records.filter((r) => r === null).length;
     if (action === "list") {
-      const orphans = listAllOrphans(records).filter((row) => deviceId === undefined || row.device_id === deviceId);
+      const orphans = listAllOrphans(records).filter((row) => row.device_id === deviceId);
       return json({ ok: true, orphans, invalid_records: invalidRecords });
     }
     const plan = planMigration(records, body?.from, body?.to);

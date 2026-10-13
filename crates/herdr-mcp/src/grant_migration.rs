@@ -82,6 +82,7 @@ pub enum MigrationError {
     RecordMissingField,
     RecordInvalid,
     ConfirmNotImplemented,
+    PlanStale,
 }
 
 impl MigrationError {
@@ -98,6 +99,7 @@ impl MigrationError {
             Self::RecordMissingField => "grant_record_missing_field",
             Self::RecordInvalid => "grant_record_invalid",
             Self::ConfirmNotImplemented => "migrate_confirm_not_implemented",
+            Self::PlanStale => "migrate_plan_stale",
         }
     }
 }
@@ -160,7 +162,8 @@ pub fn list_orphans(record: &GrantRecord) -> Vec<OrphanRow<'_>> {
     if record.status != "active" {
         return Vec::new();
     }
-    let Some(current) = record.connector_id.as_deref() else {
+    // An empty current connector_id is treated exactly like a missing one.
+    let Some(current) = record.connector_id.as_deref().filter(|c| !c.is_empty()) else {
         return Vec::new();
     };
     all_rows(record)
@@ -184,9 +187,10 @@ pub fn plan_migration(
     if record.status != "active" {
         return Err(MigrationError::RecordNotActive);
     }
-    let (Some(current), Some(generation)) =
-        (record.connector_id.as_deref(), record.grant_generation)
-    else {
+    let (Some(current), Some(generation)) = (
+        record.connector_id.as_deref().filter(|c| !c.is_empty()),
+        record.grant_generation,
+    ) else {
         return Err(MigrationError::RecordMissingField);
     };
     if generation == 0 {
@@ -241,17 +245,35 @@ pub fn plan_migration(
 }
 
 /// `--confirm` write path: not implemented in checkpoint 1; always refuses.
+/// Fail closed first: the plan must equal a fresh plan recomputed against the current
+/// record (conflict/target detection re-run), else `migrate_target_conflict` /
+/// `migrate_plan_stale` (or the fresh plan's own error). Never writes.
 pub fn apply_migration(
-    _record: &mut GrantRecord,
-    _plan: &MigrationPlan,
+    record: &mut GrantRecord,
+    plan: &MigrationPlan,
 ) -> Result<(), MigrationError> {
+    revalidate_plan(record, plan)?;
     Err(MigrationError::ConfirmNotImplemented)
+}
+
+/// Recompute the plan against `record` and require it to be identical to `plan`.
+pub fn revalidate_plan(record: &GrantRecord, plan: &MigrationPlan) -> Result<(), MigrationError> {
+    let fresh = plan_migration(
+        record,
+        Some(&plan.from_connector_id),
+        Some(&plan.to_connector_id),
+    )?;
+    if &fresh != plan {
+        return Err(MigrationError::PlanStale);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MigrateCli {
     Orphans,
-    /// `orphans [list] --device-id <dev_…>`: list only rows of that device.
+    /// `orphans [list] --device-id <dev_…>`: assert the authenticated device. Edge scopes
+    /// results to the authenticated owner device server-side regardless.
     OrphansForDevice {
         device_id: String,
     },
@@ -626,6 +648,43 @@ mod tests {
             Err(MigrationError::ConfirmNotImplemented)
         );
         assert_eq!(before, serde_json::to_vec(&r).unwrap());
+    }
+
+    #[test]
+    fn stale_plan_is_rejected_after_a_conflicting_row_appears() {
+        let mut r = record();
+        let p = plan_migration(&r, Some(OLD), Some(NEW)).unwrap();
+        let dest = p.moves[0].to.clone();
+        match p.moves[0].kind {
+            GrantKind::PageAssist => r.page_assist.push(dest),
+            GrantKind::WebchatControl => r.webchat_control.push(dest),
+        }
+        let before = serde_json::to_vec(&r).unwrap();
+        assert_eq!(
+            apply_migration(&mut r, &p),
+            Err(MigrationError::TargetConflict)
+        );
+        assert_eq!(before, serde_json::to_vec(&r).unwrap());
+        // A plan that no longer matches the record (e.g. rows changed) is stale.
+        let mut r2 = record();
+        let mut p2 = plan_migration(&r2, Some(OLD), Some(NEW)).unwrap();
+        p2.moves.pop();
+        assert_eq!(
+            apply_migration(&mut r2, &p2),
+            Err(MigrationError::PlanStale)
+        );
+        assert_eq!(MigrationError::PlanStale.code(), "migrate_plan_stale");
+    }
+
+    #[test]
+    fn empty_current_connector_id_is_treated_as_missing() {
+        let mut r = record();
+        r.connector_id = Some(String::new());
+        assert!(list_orphans(&r).is_empty());
+        assert_eq!(
+            plan_migration(&r, Some(OLD), Some(NEW)),
+            Err(MigrationError::RecordMissingField)
+        );
     }
 
     #[test]

@@ -201,3 +201,14 @@ the owner explicitly re-attach them.
 - [ ] Proposals are bounded, keyed, expiring, single-use, and invalidated by revoke (e).
 - [ ] No endpoint remapping; suggestions are info only (f).
 - [ ] `caller_grant_missing` provider-facing body is byte-identical (snapshot) (g).
+
+## Orphan listing scope (server-side)
+
+`POST /connectors/page-assist/orphans` with `action: "list"` is always scoped to the
+device_id of the authenticated owner device (device credential, or the registry record
+already bound to the legacy default workstation). A client `device_id` (CLI
+`--device-id`) is only an assertion: malformed -> 400 `orphans_invalid_device_id`;
+different from the authenticated device -> 403 `orphans_device_mismatch`; no resolvable
+device identity -> 403 `orphans_device_unresolved`. The DO internal route refuses
+unscoped listing. Any future `--confirm` must go through a fresh-plan recheck
+(`applyPlanIfFresh` / `apply_migration` -> `migrate_plan_stale` / `migrate_target_conflict`).
