@@ -32,7 +32,7 @@ function harness() {
     "\nasync function ensurePushStream(",
     "push stream runtime reconciliation",
   );
-  const calls = { registers: [], recoveries: 0, stops: 0, ensures: 0, logs: [] };
+  const calls = { registers: [], recoveries: 0, stops: 0, ensures: 0, logs: [], failNextRegister: 0 };
   const gates = [];
   const api = new Function(
     "calls",
@@ -55,6 +55,10 @@ function harness() {
     const localHerdrFetch = async (_url, init) => {
       const body = JSON.parse(init.body);
       calls.registers.push(body.operation);
+      if (calls.failNextRegister) {
+        calls.failNextRegister -= 1;
+        throw new Error("native-fetch-failed");
+      }
       if (gates.length) await gates.shift();
       nextRef += 1;
       const endpoint = { endpoint_ref: "bep_" + String(nextRef).padStart(64, "0"), consent_revision: 0 };
@@ -114,6 +118,32 @@ test("user re-registers when the runtime reports the endpoint unregistered | Giv
   assert.equal(calls.registers.length, 2);
   assert.ok(calls.recoveries >= 2, "open ChatGPT tabs are re-observed after re-register");
   assert.equal(calls.stops, 1, "stream reconnects with the fresh endpoint_ref");
+  assert.equal(calls.ensures, 1);
+});
+
+test("user recovers browser delivery when the first re-registration fails | Given a shared push stream the runtime reported as endpoint_registered false | When the first re-registration attempt fails and a later keepalive registration succeeds | Then that stream is replaced so the runtime evaluates the registered endpoint again", async () => {
+  const { api, calls } = harness();
+  const ctrl = {};
+  api.setPushStream({ ctrl, bootId: "boot-a" });
+  await api.register();
+  assert.equal(calls.registers.length, 1);
+  // Runtime generation switch: the hello for boot-b reports the endpoint as
+  // unregistered, and that first re-registration attempt fails at the native
+  // boundary (runtime restarting, native fetch refused).
+  calls.failNextRegister = 1;
+  await api.hello({ boot_id: "boot-b", endpoint_registered: false }, ctrl);
+  await flush();
+  assert.equal(calls.registers.length, 2, "the first re-registration attempt is sent");
+  assert.equal(api.endpoint, null, "a failed registration must not keep a cached endpoint");
+  assert.equal(calls.stops, 0, "no stream refresh is claimed for a failed registration");
+  // The keepalive path re-registers later and succeeds; the stream the runtime
+  // opened as unregistered can still never receive actuation, so it must be
+  // replaced once a registration actually succeeded.
+  const endpoint = await api.current();
+  await flush();
+  assert.equal(calls.registers.length, 3);
+  assert.ok(endpoint?.endpoint_ref, "the later registration returns an endpoint");
+  assert.equal(calls.stops, 1, "the stream opened as unregistered is replaced");
   assert.equal(calls.ensures, 1);
 });
 
