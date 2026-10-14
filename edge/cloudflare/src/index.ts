@@ -76,6 +76,26 @@ export { DeviceRegistryDO, OAuthStoreDO, WorkstationDO };
 const logger = createLogger("edge-worker");
 const mcpMinuteAttribution = new McpMinuteAttribution(logger);
 
+/**
+ * #630 §7.8 Q4: an auth failure has no authenticated device to key the reject
+ * ring on, so it gets the structured log line only — never a fabricated id and
+ * never a stored write (the flag therefore reports no failed write).
+ */
+function logMigrateRejectWithoutDevice(code: string): void {
+  try {
+    logger.warn("page_assist_migrate_rejected", {
+      code,
+      stage: "validate",
+      device_id: null,
+      plan_digest: null,
+      idempotency_key_sha256_8: null,
+      reject_audit_write_failed: false,
+    });
+  } catch {
+    // Logging is best effort: it must never change the rejection response.
+  }
+}
+
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
     status,
@@ -496,31 +516,60 @@ export default {
       // authenticated registry device scopes the whole migration (the DO
       // rejects cross-device rows before any digest comparison).
       const owner = await authenticateOwnerDeviceIdentity(request, env);
-      if (!owner) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      if (!owner) {
+        logMigrateRejectWithoutDevice("connector_owner_device_required");
+        return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      }
       const authDevice = owner.deviceId === null ? null : normalizeDeviceId(owner.deviceId);
-      if (!authDevice) return noStoreJsonResponse({ ok: false, code: "migrate_device_unresolved" }, 403);
+      if (!authDevice) {
+        logMigrateRejectWithoutDevice("migrate_device_unresolved");
+        return noStoreJsonResponse({ ok: false, code: "migrate_device_unresolved" }, 403);
+      }
       const parsed = await readBodyBounded(request, 8 * 1024);
+      // #630 §7.6/§7.8 Q4: an authenticated shape rejection is still one slim
+      // reject entry, recorded in the DO (§7.9 applies to nothing else). Only
+      // the two fields the route would otherwise validate are forwarded, and
+      // the DO normalizes them; the original status/code/body are untouched.
+      const supplied: Record<string, unknown> = parsed.ok && isRecord(parsed.value) ? parsed.value : {};
+      const suppliedDigest = typeof supplied.plan_digest === "string" ? supplied.plan_digest : "";
+      const suppliedKey = typeof supplied.idempotency_key === "string" ? supplied.idempotency_key : "";
+      const rejectMigrate = async (status: number, code: string): Promise<Response> => {
+        try {
+          const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+          await createOAuthPublicStore(stub).pageAssistMigrateReject({
+            device_id: authDevice,
+            code,
+            stage: "validate",
+            plan_digest: suppliedDigest,
+            idempotency_key: suppliedKey,
+          });
+        } catch {
+          // Best effort: an unreachable or failing audit write must never change
+          // the rejection status, code, or response bytes.
+        }
+        return noStoreJsonResponse({ ok: false, code }, status);
+      };
       if (!parsed.ok || !isRecord(parsed.value)
         || Object.keys(parsed.value).some((key) => key !== "from" && key !== "to" && key !== "plan_digest" && key !== "idempotency_key")) {
         const code = parsed.ok ? "bad_request" : parsed.code;
-        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+        return rejectMigrate(!parsed.ok && parsed.code === "payload_too_large" ? 413 : 400, code);
       }
       const from = typeof parsed.value.from === "string" ? parsed.value.from : "";
       const to = typeof parsed.value.to === "string" ? parsed.value.to : "";
       const planDigest = typeof parsed.value.plan_digest === "string" ? parsed.value.plan_digest : "";
       const idempotencyKey = typeof parsed.value.idempotency_key === "string" ? parsed.value.idempotency_key : "";
       if (!/^conn_[A-Za-z0-9_-]{8,128}$/.test(from) || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(to)) {
-        return noStoreJsonResponse({ ok: false, code: "migrate_invalid_connector_id" }, 400);
+        return rejectMigrate(400, "migrate_invalid_connector_id");
       }
       if (from === to) {
         // B1: same fixed code as the DO confirm path for from === to.
-        return noStoreJsonResponse({ ok: false, code: "migrate_source_is_current" }, 400);
+        return rejectMigrate(400, "migrate_source_is_current");
       }
       if (!/^[0-9a-f]{64}$/.test(planDigest)) {
-        return noStoreJsonResponse({ ok: false, code: "migrate_invalid_plan_digest" }, 400);
+        return rejectMigrate(400, "migrate_invalid_plan_digest");
       }
       if (!/^[A-Za-z0-9_-]{16,64}$/.test(idempotencyKey)) {
-        return noStoreJsonResponse({ ok: false, code: idempotencyKey === "" ? "migrate_idempotency_key_required" : "migrate_idempotency_key_invalid" }, 400);
+        return rejectMigrate(400, idempotencyKey === "" ? "migrate_idempotency_key_required" : "migrate_idempotency_key_invalid");
       }
       const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
       const result = await createOAuthPublicStore(stub).pageAssistMigrate({
