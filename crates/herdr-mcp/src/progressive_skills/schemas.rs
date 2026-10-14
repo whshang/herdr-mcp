@@ -757,7 +757,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "generation": {"type": ["string", "null"], "maxLength": 256},
                     "ref": {"type": ["string", "null"], "maxLength": 256},
                     "value": {"type": ["string", "null"], "maxLength": 10000},
-                    "condition": {"type": ["string", "null"], "enum": ["document_ready", "url_equals", "text_present", "text_absent", "element_present", "element_absent", "input_value_equals", "input_value_contains", "element_checked", "element_selected", "element_visible", "element_enabled", null]},
+                    "condition": {"type": ["string", "null"], "enum": ["document_ready", "url_equals", "text_present", "text_absent", "element_present", "element_absent", "input_value_equals", "input_value_contains", "element_checked", "element_selected", "element_class_contains", "element_visible", "element_enabled", null]},
                     "timeout_ms": {"type": ["integer", "null"], "minimum": 0, "maximum": 5000},
                     "idempotency_key": {"type": ["string", "null"], "maxLength": 256},
                     "direction": {"type": ["string", "null"], "enum": ["up", "down", null]},
@@ -785,7 +785,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                         "oneOf": [
                             {"properties": {"condition": {"enum": ["document_ready"]}}},
                             {"properties": {"condition": {"enum": ["url_equals", "text_present", "text_absent", "element_present", "element_absent"]}}, "required": ["value"]},
-                            {"properties": {"condition": {"enum": ["input_value_equals", "input_value_contains"]}}, "required": ["generation", "ref", "value"]},
+                            {"properties": {"condition": {"enum": ["input_value_equals", "input_value_contains", "element_class_contains"]}}, "required": ["generation", "ref", "value"]},
                             {"properties": {"condition": {"enum": ["element_checked", "element_selected", "element_visible", "element_enabled"]}}, "required": ["generation", "ref"]}
                         ],
                     },

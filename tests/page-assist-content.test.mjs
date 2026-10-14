@@ -1296,17 +1296,19 @@ test("user verifies observed controls | Given a textarea and semantic radio | Wh
   const input = createElement({ tag: "textarea", value: "actual draft" });
   const radio = createElement({ tag: "div", attrs: { role: "radio", "aria-checked": "true" } });
   const option = createElement({ tag: "div", attrs: { role: "option", "aria-selected": "true" } });
-  const focusable = createElement({ tag: "div", attrs: { tabindex: "0" } });
+  const focusable = createElement({ tag: "div", attrs: { tabindex: "0", class: "custom-tag-selected" } });
   const pointer = Object.assign(createElement({ tag: "span", text: "Safe action" }), { cursor: "pointer" });
   const label = Object.assign(createElement({ tag: "label", text: "Choice" }), { control: radio });
   const h = harness({ elements: [input, radio, option, focusable, pointer, label, createElement({ tag: "div", text: "Broad ancestor" }), createElement({ tag: "input", type: "password" })] });
   const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
   assert.equal(observed.elements.length, 6);
-  for (const [condition, ref, value] of [["input_value_equals", observed.elements[0].ref, "actual draft"], ["input_value_contains", observed.elements[0].ref, "draft"], ["element_checked", observed.elements[1].ref, undefined], ["element_selected", observed.elements[2].ref, undefined], ["element_visible", observed.elements[0].ref, undefined], ["element_enabled", observed.elements[0].ref, undefined]]) {
+  for (const [condition, ref, value] of [["input_value_equals", observed.elements[0].ref, "actual draft"], ["input_value_contains", observed.elements[0].ref, "draft"], ["element_checked", observed.elements[1].ref, undefined], ["element_selected", observed.elements[2].ref, undefined], ["element_class_contains", observed.elements[3].ref, "custom-tag-selected"], ["element_visible", observed.elements[0].ref, undefined], ["element_enabled", observed.elements[0].ref, undefined]]) {
     const result = await h.sendAsync({ type: "h2w_page_assist", action: "expect", generation: observed.generation, ref, condition, value });
     assert.equal(result.ok, true);
     assert.equal(result.value, undefined);
   }
+  const invalid = await h.sendAsync({ type: "h2w_page_assist", action: "expect", generation: observed.generation, ref: observed.elements[3].ref, condition: "element_class_contains", value: "span.tag" });
+  assert.equal(invalid.error, "expect_value_invalid");
 });
 test("user rejects expired control assertions | Given an observed input whose generation has been replaced | When scoped expect uses its old ref | Then it fails closed", async () => {
   const h = harness({ elements: [createElement({ tag: "input", value: "draft" })] });
