@@ -98,7 +98,7 @@
   })();
 
   const OBSERVABLE_CONTROL_SELECTOR =
-    'button, a[href], input, textarea, select, option, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="option"], [tabindex], label, span, [contenteditable="true"]';
+    'button, a[href], input, textarea, select, option, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="option"], [tabindex], label, span, div[class], [contenteditable="true"]';
 
   let generationSeq = 0;
   let currentGenerationToken = "";
@@ -224,10 +224,17 @@
     const focusable = el.hasAttribute("tabindex") && Number(el.getAttribute("tabindex")) >= 0
       && String(el.innerText || "").length <= 256 && (el.children?.length || 0) <= 4;
     const labelControl = tag === "label" && el.control && !isSensitiveField(el.control);
-    const pointer = tag === "span" && global.getComputedStyle?.(el)?.cursor === "pointer"
-      && String(el.innerText || "").trim().length > 0
-      && String(el.innerText || "").length <= 256 && (el.children?.length || 0) === 0;
-    return native || semantic || focusable || labelControl || pointer || el.isContentEditable;
+    if (native || semantic || focusable || labelControl || el.isContentEditable) return true;
+    if (!["span", "div"].includes(tag)) return false;
+    // Framework choice tags often delegate clicks to a form/dialog ancestor.
+    const choice = /(?:^|[\s_-])(?:chip|choice|tag|option)(?:$|[\s_-])/i.test(el.getAttribute("class") || "")
+      && !!el.closest?.('form, dialog, [role="dialog"]');
+    if (!choice && global.getComputedStyle?.(el)?.cursor !== "pointer") return false;
+    const text = String(el.innerText || "").trim();
+    if (!text.length || text.length > 256 || (el.children?.length || 0) > 4) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.width <= 600 && rect.height > 0 && rect.height <= 120
+      && !el.querySelector?.("input, textarea, select, button, a[href], [contenteditable], [role]");
   }
 
   function scanDocument(options = {}) {
