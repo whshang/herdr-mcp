@@ -3083,6 +3083,15 @@ async function runPushStream(ctrl) {
     let relayAbort = null;
     try {
       const endpoint = await currentBrowserEndpoint();
+      // #633: a stream replacement can abort this controller while the lookup
+      // above is still awaiting a (re-)registration that then succeeds:
+      // refreshPushStreamAfterEndpointRegistration() calls stopPushStream(),
+      // which aborts ctrl, and then schedules the replacement stream. Resuming
+      // here would open a second live push transport beside that replacement,
+      // so the loop must stop before opening a stream. The controller is
+      // re-checked after the await because the abort listener can only be
+      // attached once a stream exists.
+      if (ctrl.signal.aborted) break;
       const browserEndpointRef = String(endpoint?.endpoint_ref || "").trim();
       if (!browserEndpointRef) throw new Error("browser-endpoint-unavailable");
       const decoder = new TextDecoder();
