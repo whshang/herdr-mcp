@@ -19,14 +19,20 @@ export type MigrationAuditEntry = {
 export const MIGRATE_AUDIT_RING = 64;
 
 /** #630 Q4 reject audit (design §7.8 Q4): slim, per-device, separate from the success `audit[]`. */
-export type MigrateRejectStage =
-  | "validate"
-  | "idempotency"
-  | "replan"
-  | "digest"
-  | "device_scope"
-  | "postcondition"
-  | "storage";
+export const MIGRATE_REJECT_STAGES = [
+  "validate",
+  "idempotency",
+  "replan",
+  "digest",
+  "device_scope",
+  "postcondition",
+  "storage",
+] as const;
+export type MigrateRejectStage = typeof MIGRATE_REJECT_STAGES[number];
+
+export function isMigrateRejectStage(value: unknown): value is MigrateRejectStage {
+  return typeof value === "string" && (MIGRATE_REJECT_STAGES as readonly string[]).includes(value);
+}
 
 export const MIGRATE_REJECT_AUDIT_PREFIX = "migrate-reject-audit:v1:";
 export const MIGRATE_REJECT_AUDIT_RING = 64;

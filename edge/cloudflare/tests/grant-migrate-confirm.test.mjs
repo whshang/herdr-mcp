@@ -578,4 +578,23 @@ test("user Given a reject ring at its cap and a failing reject write When confir
   assert.equal(logged.fields.code, "migrate_plan_stale");
   assert.equal(logged.fields.stage, "digest");
   assert.equal(logged.fields.idempotency_key_sha256_8, (await sha256Hex(IDEM)).slice(0, 8));
+
+  // The Edge-side reject route records only the fixed Q4 entry: an unknown
+  // stage, an out-of-shape code, or a malformed device id is refused without
+  // touching any ring.
+  const hRoute = harness();
+  const rejected = async (body) => {
+    const resp = await hRoute.instance.fetch(new Request("https://do.internal/internal/oauth/grant/page-assist-migrate-reject", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    }));
+    return { status: resp.status, body: await resp.json() };
+  };
+  assert.equal((await rejected({ device_id: DEV, code: "bad_request", stage: "not_a_stage" })).status, 400);
+  assert.equal((await rejected({ device_id: DEV, code: "Bad Code", stage: "validate" })).status, 400);
+  assert.equal((await rejected({ device_id: "bogus", code: "bad_request", stage: "validate" })).status, 400);
+  assert.equal(hRoute.storage.map.has(`${REJECT_PREFIX}${DEV}`), false, "invalid internal reject input writes nothing");
+  assert.equal((await rejected({ device_id: DEV, code: "migrate_invalid_plan_digest", stage: "validate", plan_digest: "nothex", idempotency_key: "short" })).status, 200);
+  assert.deepEqual(rejectEntries(hRoute.storage).map((entry) => [entry.code, entry.stage, entry.plan_digest, entry.idempotency_key_sha256_8]), [
+    ["migrate_invalid_plan_digest", "validate", null, null],
+  ]);
 });

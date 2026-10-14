@@ -2194,25 +2194,72 @@ test("user Given a shared record holding device B rows under the same source Whe
   assert.equal(h.oauthStorage.map.get("grant:c1").page_assist.find((r) => r.endpoint_ref === "epB").connector_id, MIG_OLD);
 });
 
-test("user Given confirm calls without owner auth, an unresolved legacy device, unknown keys, or malformed fields When the public migrate route is called Then it fails closed with fixed codes and writes nothing", async () => {
-  const h = await migrateHarness();
+test("user Given confirm calls without owner auth, an unresolved legacy device, unknown keys, or malformed fields When the public migrate route is called Then it fails closed with fixed codes, audits every authenticated shape reject, and keeps auth failures log-only", async () => {
+  // #630 §7.6 "Rejected confirm (each stage)" + §7.8 Q4: every authenticated
+  // rejection — including the Edge route's own shape rejects that never reach
+  // the DO confirm transaction — is one slim per-device reject entry plus one
+  // structured log line. Only 401/403 auth failures have no device to key on.
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (line) => logs.push(line);
+  let h;
+  let generic;
+  let bad;
+  let badDigest;
+  let badKey;
+  let tooLarge;
+  try {
+    h = await migrateHarness();
+    generic = await worker.fetch(post("/connectors/page-assist/migrate", {
+      from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000004",
+    }, "owner-secret"), { ...makeEnv().env });
+    bad = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000004", extra: 1 });
+    badDigest = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "nothex", idempotency_key: "route-key-0000000005" });
+    badKey = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "short" });
+    tooLarge = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000007", extra: "x".repeat(9000) });
+  } finally {
+    console.log = originalLog;
+  }
   assert.equal(h.legacyUnregistered.status, 403);
   assert.deepEqual(await h.legacyUnregistered.json(), { ok: false, code: "migrate_device_unresolved" });
-  const generic = await worker.fetch(post("/connectors/page-assist/migrate", {
-    from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000004",
-  }, "owner-secret"), { ...makeEnv().env });
   assert.equal(generic.status, 401);
   assert.deepEqual(await generic.json(), { ok: false, code: "connector_owner_device_required" });
-  const bad = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000004", extra: 1 });
   assert.equal(bad.status, 400);
   assert.deepEqual(bad.body, { ok: false, code: "bad_request" });
-  const badDigest = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "nothex", idempotency_key: "route-key-0000000005" });
   assert.equal(badDigest.status, 400);
   assert.deepEqual(badDigest.body, { ok: false, code: "migrate_invalid_plan_digest" });
-  const badKey = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "short" });
   assert.equal(badKey.status, 400);
   assert.deepEqual(badKey.body, { ok: false, code: "migrate_idempotency_key_invalid" });
-  assert.equal(h.oauthStorage.writeCount, 0);
+  assert.equal(tooLarge.status, 413);
+  assert.deepEqual(tooLarge.body, { ok: false, code: "payload_too_large" });
+  // Only the reject ring wrote: no grant or idempotency change at all.
+  assert.equal(h.oauthStorage.writeCount, 4, "one reject-ring write per authenticated shape reject");
+  assert.equal([...h.oauthStorage.map.keys()].some((key) => key.startsWith("migrate-idem:")), false, "no idempotency entry for a reject");
+  assert.equal(h.oauthStorage.map.get("grant:c1").page_assist.find((r) => r.endpoint_ref === "epA").connector_id, MIG_OLD, "grant rows untouched");
+  assert.deepEqual(
+    h.oauthStorage.map.get(`migrate-reject-audit:v1:${h.deviceA}`).entries.map((entry) => [entry.code, entry.stage, entry.device_id]),
+    [
+      ["bad_request", "validate", h.deviceA],
+      ["migrate_invalid_plan_digest", "validate", h.deviceA],
+      ["migrate_idempotency_key_invalid", "validate", h.deviceA],
+      ["payload_too_large", "validate", h.deviceA],
+    ],
+  );
+  const rejectLines = logs.map((line) => JSON.parse(line)).filter((entry) => entry.event === "page_assist_migrate_rejected");
+  assert.deepEqual(
+    rejectLines.filter((line) => line.fields.device_id === h.deviceA).map((line) => [line.fields.code, line.fields.stage]),
+    [
+      ["bad_request", "validate"],
+      ["migrate_invalid_plan_digest", "validate"],
+      ["migrate_idempotency_key_invalid", "validate"],
+      ["payload_too_large", "validate"],
+    ],
+  );
+  // Auth failures: log line only, null device/digest/key, and no ring entry.
+  const authLines = rejectLines.filter((line) => line.fields.device_id === null);
+  assert.deepEqual(authLines.map((line) => line.fields.code).sort(), ["connector_owner_device_required", "migrate_device_unresolved"]);
+  assert.deepEqual(authLines.map((line) => [line.fields.plan_digest, line.fields.idempotency_key_sha256_8]), [[null, null], [null, null]]);
+  assert.equal(h.oauthStorage.map.has(`migrate-reject-audit:v1:${h.deviceB}`), false, "no ring for a device that never authenticated");
 });
 
 test("user Given owner device A authenticated When it runs a migrate dry run asserting its own device_id Then the plan is device-scoped and succeeds", async () => {
@@ -2239,5 +2286,11 @@ test("user Given a migrate request where from equals to When it passes the publi
   const malformed = await h.confirm({ from: "bogus", to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000007" });
   assert.equal(malformed.status, 400);
   assert.deepEqual(malformed.body, { ok: false, code: "migrate_invalid_connector_id" });
-  assert.equal(h.oauthStorage.writeCount, 0);
+  // #630 Q4: both authenticated shape rejects are audited; nothing else wrote.
+  assert.equal(h.oauthStorage.writeCount, 2, "one reject-ring write per authenticated shape reject");
+  assert.deepEqual(
+    h.oauthStorage.map.get(`migrate-reject-audit:v1:${h.deviceA}`).entries.map((entry) => [entry.code, entry.stage]),
+    [["migrate_source_is_current", "validate"], ["migrate_invalid_connector_id", "validate"]],
+  );
+  assert.equal(h.oauthStorage.map.get("grant:c1").page_assist.find((r) => r.endpoint_ref === "epA").connector_id, MIG_OLD, "grant rows untouched");
 });

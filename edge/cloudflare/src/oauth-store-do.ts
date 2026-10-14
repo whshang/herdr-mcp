@@ -4,6 +4,7 @@ import {
   appendMigrateAudit,
   appendMigrateRejectAudit,
   applyPlanIfFresh,
+  isMigrateRejectStage,
   listAllOrphans,
   listOrphans,
   migratePostconditionSatisfied,
@@ -202,6 +203,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist") return this.setPageAssistGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-orphans") return this.pageAssistOrphans(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-migrate") return this.pageAssistMigrate(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-migrate-reject") return this.pageAssistMigrateReject(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-migrate-alarm") return this.pageAssistMigrateAlarm();
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/get") return this.getConnector(request);
@@ -1120,14 +1122,47 @@ export class OAuthStoreDO {
       // status/code and only flag the failed write.
       rejectAuditWriteFailed = true;
     }
-    this.logger.warn("page_assist_migrate_rejected", {
-      code: args.code,
-      stage: args.stage,
-      device_id: args.deviceId,
-      plan_digest: planDigest,
-      idempotency_key_sha256_8: idempotencyKeySha256_8,
-      reject_audit_write_failed: rejectAuditWriteFailed,
+    try {
+      this.logger.warn("page_assist_migrate_rejected", {
+        code: args.code,
+        stage: args.stage,
+        device_id: args.deviceId,
+        plan_digest: planDigest,
+        idempotency_key_sha256_8: idempotencyKeySha256_8,
+        reject_audit_write_failed: rejectAuditWriteFailed,
+      });
+    } catch {
+      // Logging is best effort too: it must never change the rejection outcome.
+    }
+  }
+
+  /**
+   * #630 §7.6/§7.8 Q4: record the reject entry for a confirm that the Edge
+   * route rejected after owner auth but before the confirm transaction (shape,
+   * selector, digest, or idempotency-key validation). Internal route only: it
+   * carries no request body, reads no grant record, and mutates nothing beyond
+   * the caller's own reject ring. The device id comes from the Edge route's
+   * authenticated identity, and the entry shape is still the fixed Q4 set.
+   */
+  private async pageAssistMigrateReject(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const deviceId = body?.device_id;
+    const code = body?.code;
+    const stage = body?.stage;
+    if (typeof deviceId !== "string" || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)) {
+      return json({ ok: false, code: "migrate_invalid_device_id" }, 400);
+    }
+    if (typeof code !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(code) || !isMigrateRejectStage(stage)) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    await this.recordMigrateReject({
+      code,
+      stage,
+      deviceId,
+      planDigest: body?.plan_digest,
+      idempotencyKey: body?.idempotency_key,
     });
+    return json({ ok: true });
   }
 
   /**

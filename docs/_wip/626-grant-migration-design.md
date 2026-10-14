@@ -510,14 +510,20 @@ Real-usage verification (needed before enabling, on a staging Edge):
   (cap eviction on insert; `/internal/oauth/grant/page-assist-migrate-alarm`
   sweeps expired entries in batches of 128 and re-arms hourly).
 - ~~Q4 slim reject ring: `migrate-reject-audit:v1:<device_id>` (bounded 64,
-  oldest evicted, no grant-record rewrite) is not implemented yet.~~ — done in
-  the #630 Q4 reject-audit change (separate `storage.transaction` after the main
-  confirm transaction; Edge-level request-shape 400s that never reach the DO
-  transaction stay unaudited, and auth failures get the log line only).
+  oldest evicted, no grant-record rewrite) is not implemented yet.~~ — done (#630
+  Q4 reject audit): every authenticated rejection appends exactly one slim entry
+  in its own `storage.transaction` started after the main confirm transaction —
+  both the DO-stage rejects and the Edge route's own shape/selector/digest/
+  idempotency-key rejects, which reach the DO through the internal
+  `/internal/oauth/grant/page-assist-migrate-reject` route (§7.6 "Rejected
+  confirm (each stage)"). Only 401/403 auth failures, which have no
+  authenticated device, are log-only.
 - ~~Structured reject log line (`page_assist_migrate_rejected` with stage/code)
-  is not emitted yet.~~ — done in the #630 Q4 reject-audit change (DO rejections
-  carry the fixed Q4 fields plus `reject_audit_write_failed`; the Edge route logs
-  401/403 auth failures with null device/digest/key fields).
+  is not emitted yet.~~ — done (#630 Q4 reject audit): the stored entry and the
+  log line carry the same fixed fields plus `reject_audit_write_failed`; the Edge
+  route logs 401/403 auth failures with null device/digest/key fields and writes
+  no ring entry. A failing reject write or log call keeps the original rejection
+  status/code.
 - `by` enforcement: the DO currently defaults `by` to `device:<device_id>`
   when absent and accepts any bounded string when present; it must require
   exactly `device:<authenticated device_id>` once the Edge route lands.
