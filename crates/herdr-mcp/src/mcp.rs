@@ -8235,6 +8235,7 @@ fn browser_page_action_call(
         "amount",
         "key",
         "max_rows",
+        "expected_url",
     ];
     if let Some(key) = object
         .keys()
@@ -8316,6 +8317,10 @@ fn browser_page_action_call(
             "code": "invalid_params",
             "message": "direction/amount are accepted only for scroll",
         });
+    }
+
+    if action != "click" && object.contains_key("expected_url") {
+        return json!({"ok": false, "code": "invalid_params", "message": "expected_url is accepted only for click"});
     }
 
     let mut bridge_params = json!({
@@ -8698,6 +8703,29 @@ fn browser_page_action_call(
             bridge_params["generation"] = json!(generation);
             if let Some(element_ref) = element_ref {
                 bridge_params["ref"] = json!(element_ref);
+            }
+            if action == "click"
+                && let Some(raw_expected) = object.get("expected_url")
+            {
+                let valid_expected_url = || -> Option<url::Url> {
+                    let raw = raw_expected.as_str()?;
+                    if raw.len() > 4096 || raw.chars().any(char::is_control) {
+                        return None;
+                    }
+                    let url = url::Url::parse(raw).ok()?;
+                    if !matches!(url.scheme(), "http" | "https")
+                        || !url.username().is_empty()
+                        || url.password().is_some()
+                        || url.host_str().is_none()
+                    {
+                        return None;
+                    }
+                    Some(url)
+                };
+                let Some(expected) = valid_expected_url() else {
+                    return json!({"ok": false, "code": "invalid_params", "message": "expected_url must be a bounded absolute http(s) URL"});
+                };
+                bridge_params["expected_url"] = json!(expected.to_string());
             }
             if action == "fill" {
                 let value = match object.get("value").and_then(Value::as_str) {
@@ -19430,6 +19458,14 @@ mod tests {
         conflict["ref"] = json!("ref_pa_gen_1_test_1");
         let conflict = browser_page_action_call(&store, &conflict, &grants, Some(&actuator));
         assert_eq!(conflict["code"], "idempotency_key_conflict");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+
+        let mut invalid_navigation = params.clone();
+        invalid_navigation["idempotency_key"] = json!("page-click-history-invalid");
+        invalid_navigation["expected_url"] = json!("javascript:alert(1)");
+        let denied =
+            browser_page_action_call(&store, &invalid_navigation, &grants, Some(&actuator));
+        assert_eq!(denied["code"], "invalid_params");
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
     }
 

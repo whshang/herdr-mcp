@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.206";
+const H2W_SCRIPT_VERSION = "0.1.207";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -3528,6 +3528,7 @@ async function handleBrowserActuation(command) {
         amount: params.amount,
         key: params.key,
         maxRows: params.max_rows,
+        expectedUrl: params.expected_url,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -8496,6 +8497,15 @@ async function performBrowserPageActionRequest(msg) {
     return captureBrowserPageScreenshot(page, resolved.tab);
   }
   const tabId = resolved.tab.id;
+  const rawExpectedUrl = msg?.expectedUrl;
+  const expectedUrl = rawExpectedUrl == null
+    ? null
+    : browserPageCanonicalUrl(rawExpectedUrl, page.origin);
+  if (rawExpectedUrl != null && (action !== "click" || !expectedUrl || expectedUrl === page.canonical_url)) {
+    return browserPageMutationEnvelope(
+      { ok: false, error: "navigation_expectation_invalid" }, page, false,
+    );
+  }
   const payload = {
     type: "h2w_page_assist",
     action,
@@ -8527,10 +8537,26 @@ async function performBrowserPageActionRequest(msg) {
       if (action === "fill" && response?.ok === true && typeof response?.main_world_fill_token === "string") {
         mutationResponse = await browserPageMainWorldFill(tabId, response, { page, tab: resolved.tab });
       }
-      if (action === "click" && response?.ok === true && typeof response?.navigation_url === "string") {
-        await adoptAppliedBrowserPageNavigation(page, tabId, response.navigation_url);
-        mutationResponse = { ...response };
-        delete mutationResponse.navigation_url;
+      if (action === "click" && response?.ok === true) {
+        const observedNavigationUrl = typeof response.navigation_url === "string"
+          ? browserPageCanonicalUrl(response.navigation_url, page.origin)
+          : null;
+        if (expectedUrl && observedNavigationUrl && expectedUrl !== observedNavigationUrl) {
+          return browserPageMutationEnvelope(
+            { ok: false, error: "navigation_expectation_mismatch" }, page, true,
+          );
+        }
+        const navigationUrl = expectedUrl || observedNavigationUrl;
+        if (navigationUrl) {
+          const confirmed = await adoptAppliedBrowserPageNavigation(page, tabId, navigationUrl);
+          if (expectedUrl && !confirmed) {
+            return browserPageMutationEnvelope(
+              { ok: false, error: "navigation_postcondition_unverified" }, page, true,
+            );
+          }
+          mutationResponse = { ...response };
+          delete mutationResponse.navigation_url;
+        }
       }
       return browserPageMutationEnvelope(mutationResponse, page, true);
     }

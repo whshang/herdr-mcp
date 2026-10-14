@@ -763,6 +763,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "direction": {"type": ["string", "null"], "enum": ["up", "down", null]},
                     "amount": {"type": ["integer", "null"], "minimum": 1, "maximum": 1500},
                     "max_rows": {"type": ["integer", "null"], "minimum": 1, "maximum": 100},
+                    "expected_url": {"type": "string", "maxLength": 4096, "description": "Click only: explicit absolute same-origin destination to verify after a button-triggered navigation, including history back/forward. Never auto-retry an unverified click."},
                     "key": {"type": ["string", "null"], "enum": ["Enter", "Escape", "Tab", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Space", null]},
                     "objective": {"type": ["string", "null"], "maxLength": 1024},
                 },
