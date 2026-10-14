@@ -194,6 +194,18 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
     let mut recovered_from_stale_dev = false;
     let mut accepted_verified_dev_drift = false;
     if let Some(state) = existing.as_mut()
+        && state.channel == "prod"
+    {
+        let active_binary = runtime.config_dir.join("runtime/current/herdr-mcp");
+        let active_version = binary_version(&active_binary)?;
+        if is_dev_runtime_version(&active_version) {
+            recover_stale_prod_channel(state, &paths, &active_before, &active_binary, || {
+                verify_runtime_activation(&runtime, &active_before).map(|_| ())
+            })?;
+            accepted_verified_dev_drift = true;
+        }
+    }
+    if let Some(state) = existing.as_mut()
         && state.channel == "dev"
         && state.dev_generation.as_deref() != Some(active_before.as_str())
     {
@@ -1603,6 +1615,37 @@ fn validate_stale_dev_resync_snapshot(
     Ok(())
 }
 
+fn recover_stale_prod_channel(
+    state: &mut DevRuntimeState,
+    paths: &DevPaths,
+    active_generation: &str,
+    active_binary: &Path,
+    verify_activation: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let proven_previous = state.last_transaction.as_ref().is_some_and(|transaction| {
+        transaction.phase == DevSyncPhase::Succeeded
+            && transaction.completed_at_ms.is_some()
+            && transaction.error.is_none()
+            && transaction.active_generation_before == active_generation
+    });
+    if state.channel != "prod" || !proven_previous {
+        return Err("refusing stale PROD channel recovery: no successful DEV sync proves this previous active generation".to_owned());
+    }
+    validate_stale_dev_resync_snapshot(state, paths)?;
+    if is_dev_runtime_version(&state.prod_version)
+        || generation_from_sha256(&state.prod_snapshot_sha256)? != state.prod_generation
+        || generation_from_sha256(&file_sha256(active_binary)?)? != active_generation
+    {
+        return Err("refusing stale PROD channel recovery: pinned PROD or active DEV content identity mismatch".to_owned());
+    }
+    verify_activation()?;
+    // Reconcile only the in-memory transaction base. Retain prior source provenance
+    // and the pinned PROD bytes; persistence belongs to the normal sync transaction.
+    state.channel = "dev".to_owned();
+    state.dev_generation = Some(active_generation.to_owned());
+    Ok(())
+}
+
 fn dev_paths(runtime: &RuntimePaths) -> DevPaths {
     let runtime_root = runtime.config_dir.join("runtime");
     let prod_dir = runtime_root.join("channels").join("prod");
@@ -2653,6 +2696,100 @@ mod tests {
                 .contains("fails SHA-256 validation")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn stale_prod_fixture(name: &str) -> (DevRuntimeState, DevPaths, PathBuf, String) {
+        let root = env::temp_dir().join(format!("herdr-stale-prod-{name}-{}", now_ms()));
+        let prod_dir = root.join("channels/prod");
+        fs::create_dir_all(&prod_dir).unwrap();
+        let prod_binary = prod_dir.join(executable_name("herdr-mcp"));
+        fs::write(&prod_binary, b"prod").unwrap();
+        let active_binary = root.join("dev-binary");
+        fs::write(&active_binary, b"dev").unwrap();
+        let generation = generation_from_sha256(&file_sha256(&active_binary).unwrap()).unwrap();
+        let sha = file_sha256(&prod_binary).unwrap();
+        let mut state = dev_sync_base_state(
+            None,
+            "1.0.0-dev",
+            &generation_from_sha256(&sha).unwrap(),
+            "1.0.0",
+            &prod_binary,
+            &sha,
+            1,
+        );
+        state.source_commit = Some("prior-source".to_owned());
+        let source = SourceIdentity {
+            branch: None,
+            commit: "candidate".to_owned(),
+            dirty: false,
+        };
+        let mut tx = new_dev_sync_transaction(
+            Path::new("/candidate"),
+            &source,
+            "1.0.0-dev",
+            &generation,
+            1,
+        );
+        tx.phase = DevSyncPhase::Succeeded;
+        tx.completed_at_ms = Some(2);
+        state.last_transaction = Some(tx);
+        state.dev_generation = Some("rust-stale-candidate".to_owned());
+        (
+            state,
+            DevPaths {
+                state: root.join("channel.json"),
+                prod_dir,
+                prod_binary,
+            },
+            active_binary,
+            generation,
+        )
+    }
+
+    #[test]
+    fn stale_prod_channel_recovers_transaction_base_without_replacing_provenance_or_snapshot() {
+        let (mut state, paths, binary, generation) = stale_prod_fixture("success");
+        let before = state.clone();
+        recover_stale_prod_channel(&mut state, &paths, &generation, &binary, || Ok(())).unwrap();
+        let mut expected = before;
+        expected.channel = "dev".to_owned();
+        expected.dev_generation = Some(generation);
+        assert_eq!(state, expected);
+        assert!(!paths.state.exists());
+        assert_eq!(fs::read(&paths.prod_binary).unwrap(), b"prod");
+        fs::remove_dir_all(binary.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn stale_prod_channel_rejects_unproven_generation_or_activation_without_state_write() {
+        let (mut state, paths, binary, generation) = stale_prod_fixture("failure");
+        let before = state.clone();
+        assert!(
+            recover_stale_prod_channel(&mut state, &paths, "rust-other", &binary, || panic!(
+                "unproven history must reject before activation probe"
+            ))
+            .is_err()
+        );
+        assert_eq!(state, before);
+        assert!(
+            recover_stale_prod_channel(&mut state, &paths, &generation, &binary, || Err(
+                "Link generation mismatch".to_owned()
+            ))
+            .unwrap_err()
+            .contains("Link generation mismatch")
+        );
+        assert_eq!(state, before);
+        state.prod_generation = "rust-other".to_owned();
+        let invalid = state.clone();
+        assert!(
+            recover_stale_prod_channel(&mut state, &paths, &generation, &binary, || panic!(
+                "invalid snapshot identity must reject before activation probe"
+            ))
+            .is_err()
+        );
+        assert_eq!(state, invalid);
+        assert!(!paths.state.exists());
+        fs::remove_dir_all(binary.parent().unwrap()).unwrap();
     }
 
     #[test]
