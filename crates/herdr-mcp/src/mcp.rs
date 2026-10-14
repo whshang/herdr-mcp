@@ -8413,6 +8413,7 @@ fn browser_page_action_call(
                     | "input_value_contains"
                     | "element_checked"
                     | "element_selected"
+                    | "element_class_contains"
                     | "element_visible"
                     | "element_enabled"),
                 ) => value,
@@ -8430,6 +8431,7 @@ fn browser_page_action_call(
                     | "input_value_contains"
                     | "element_checked"
                     | "element_selected"
+                    | "element_class_contains"
                     | "element_visible"
                     | "element_enabled"
             );
@@ -8499,6 +8501,14 @@ fn browser_page_action_call(
                             });
                         }
                     };
+                    if condition == "element_class_contains"
+                        && (value.len() > 48
+                            || !value
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                    {
+                        return json!({"ok": false, "code": "invalid_params", "message": "value must be a bounded class token"});
+                    }
                     bridge_params["value"] = json!(value);
                 }
             }
@@ -19688,8 +19698,13 @@ mod tests {
                     params["condition"] == "element_present"
                         || params["condition"] == "element_absent"
                         || params["condition"] == "input_value_equals"
+                        || params["condition"] == "element_class_contains"
                 );
-                assert_eq!(params["value"], "Next step");
+                if params["condition"] == "element_class_contains" {
+                    assert_eq!(params["value"], "custom-selected");
+                } else {
+                    assert_eq!(params["value"], "Next step");
+                }
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let mut evidence =
                     BrowserPostconditionEvidence::resource_unavailable(expected_generation);
@@ -19708,14 +19723,22 @@ mod tests {
         let actuator = ElementWaitActuator {
             calls: AtomicUsize::new(0),
         };
-        for condition in ["element_present", "element_absent", "input_value_equals"] {
+        for condition in [
+            "element_present",
+            "element_absent",
+            "input_value_equals",
+            "element_class_contains",
+        ] {
             let mut params = json!({
                 "endpoint_ref": "bep_test", "page_ref": format!("bp_{}", "a".repeat(64)),
                 "action": "expect", "condition": condition, "value": "Next step", "timeout_ms": 250
             });
-            if condition == "input_value_equals" {
+            if condition == "input_value_equals" || condition == "element_class_contains" {
                 params["generation"] = json!("pa_gen_1");
                 params["ref"] = json!("ref_pa_gen_1_0");
+            }
+            if condition == "element_class_contains" {
+                params["value"] = json!("custom-selected");
             }
             let result = browser_page_action_call(&store, &params, &grants, Some(&actuator));
             assert_eq!(result["ok"], true);
@@ -19744,7 +19767,18 @@ mod tests {
             Some(&actuator),
         );
         assert_eq!(missing_ref["code"], "invalid_params");
-        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
+        let unsafe_token = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_test", "page_ref": format!("bp_{}", "a".repeat(64)),
+                "action": "expect", "condition": "element_class_contains",
+                "generation": "pa_gen_1", "ref": "ref_pa_gen_1_0", "value": "span.tag"
+            }),
+            &grants,
+            Some(&actuator),
+        );
+        assert_eq!(unsafe_token["code"], "invalid_params");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]

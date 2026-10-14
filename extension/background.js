@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.204";
+const H2W_SCRIPT_VERSION = "0.1.205";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";

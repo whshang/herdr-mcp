@@ -933,7 +933,7 @@
 
     const condition = String(params.condition || "").toLowerCase();
     const value = typeof params.value === "string" ? params.value : "";
-    const scoped = ["input_value_equals", "input_value_contains", "element_checked", "element_selected", "element_visible", "element_enabled"];
+    const scoped = ["input_value_equals", "input_value_contains", "element_checked", "element_selected", "element_class_contains", "element_visible", "element_enabled"];
     if (scoped.includes(condition)) {
       if (!params.generation || params.generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
       const el = elementMap.get(params.ref);
@@ -947,6 +947,12 @@
         if (!["input", "textarea"].includes((el.tagName || "").toLowerCase())) return { ok: false, error: "unsupported_element" };
         if (typeof params.value !== "string" || params.value.length > 4096) return { ok: false, error: "expect_value_invalid" };
         return { ok: condition === "input_value_equals" ? el.value === params.value : String(el.value).includes(params.value), condition };
+      }
+      if (condition === "element_class_contains") {
+        if (typeof params.value !== "string" || !/^[A-Za-z0-9_-]{1,48}$/.test(params.value)) {
+          return { ok: false, error: "expect_value_invalid" };
+        }
+        return { ok: String(el.getAttribute("class") || "").split(/\s+/).includes(params.value), condition };
       }
       const attribute = condition === "element_checked" ? "aria-checked" : "aria-selected";
       const property = condition === "element_checked" ? "checked" : "selected";
