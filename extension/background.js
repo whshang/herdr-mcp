@@ -2358,6 +2358,12 @@ async function recoverOpenChatGptBrowserRegistry() {
 let browserEndpointRegistration = null;
 let browserEndpointHelloBootId = null;
 let browserEndpointReregisteredBootId = null;
+// #632: the runtime evaluates endpoint registration when the push stream opens,
+// so a stream it opened while reporting endpoint_registered:false keeps refusing
+// actuation even after the same derived endpoint_ref is re-registered. This
+// demand survives a failed registration attempt and is cleared once one actually
+// succeeded, so the refresh is claimed at most once per boot_id.
+let browserEndpointStreamRefreshPending = false;
 
 function registerLocalBrowserEndpoint() {
   if (!browserEndpointRegistration) {
@@ -2384,8 +2390,31 @@ function invalidateBrowserEndpointForRuntime(bootId, reason) {
   if (id && browserEndpointReregisteredBootId === id) return null;
   if (id) browserEndpointReregisteredBootId = id;
   callLog(`browser endpoint re-register (${reason}) boot=${id || "-"}`);
+  browserEndpointStreamRefreshPending = true;
   browserEndpoint = null;
   return registerLocalBrowserEndpoint();
+}
+
+/**
+ * #632: the runtime only re-evaluates registration when the push stream opens,
+ * so a stream opened before the endpoint's registration became visible must be
+ * replaced. A failed registration attempt leaves the demand pending for the next
+ * trigger (keepalive, control center) instead of dropping the recovery, and the
+ * demand is cleared only once the replacement is actually scheduled.
+ */
+async function refreshPushStreamAfterEndpointRegistration() {
+  if (!browserEndpointStreamRefreshPending) return false;
+  if (!pushStream) {
+    // No stream was opened as unregistered, so nothing has to be replaced.
+    browserEndpointStreamRefreshPending = false;
+    return false;
+  }
+  const bindings = await loadBindings();
+  browserEndpointStreamRefreshPending = false;
+  callLog("push stream refreshed after browser endpoint re-register");
+  stopPushStream();
+  ensurePushStream(bindings);
+  return true;
 }
 
 /** Push hello: detect a runtime switch or a missing registration and self-heal. */
@@ -2430,6 +2459,14 @@ async function registerLocalBrowserEndpointOnce() {
       browserEndpoint = parsed.endpoint;
       await getBrowserObservationGeneration();
       await recoverOpenChatGptBrowserRegistry();
+      await refreshPushStreamAfterEndpointRegistration().catch((error) => {
+        // The endpoint is registered; a failed stream replacement must keep the
+        // pending demand for the next trigger, not fail the registration.
+        callLog(
+          "push stream refresh after browser endpoint re-register failed:",
+          error?.message || String(error),
+        );
+      });
       return browserEndpoint;
     }
     callLog(
@@ -3046,6 +3083,15 @@ async function runPushStream(ctrl) {
     let relayAbort = null;
     try {
       const endpoint = await currentBrowserEndpoint();
+      // #633: a stream replacement can abort this controller while the lookup
+      // above is still awaiting a (re-)registration that then succeeds:
+      // refreshPushStreamAfterEndpointRegistration() calls stopPushStream(),
+      // which aborts ctrl, and then schedules the replacement stream. Resuming
+      // here would open a second live push transport beside that replacement,
+      // so the loop must stop before opening a stream. The controller is
+      // re-checked after the await because the abort listener can only be
+      // attached once a stream exists.
+      if (ctrl.signal.aborted) break;
       const browserEndpointRef = String(endpoint?.endpoint_ref || "").trim();
       if (!browserEndpointRef) throw new Error("browser-endpoint-unavailable");
       const decoder = new TextDecoder();
