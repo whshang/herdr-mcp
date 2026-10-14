@@ -1337,3 +1337,39 @@ test("user cannot reuse refs across documents | Given two page instances observe
   assert.equal(result.error, "stale_generation");
   assert.equal(target.clicked, 0);
 });
+
+test("user clicks a nested custom choice | Given a bounded generic tag in a dialog | When its observed ref is clicked | Then the delegated choice handler receives the click", async () => {
+  const dialog = createElement({ tag: "div", attrs: { role: "dialog" } });
+  const choice = createElement({ tag: "span", text: "Experience mismatch", attrs: { class: "ui__tag outlined" } });
+  choice.children = [createElement({ tag: "span", text: "Experience mismatch" })];
+  choice.closest = (selector) => selector === 'form, dialog, [role="dialog"]' ? dialog : null;
+  choice.querySelector = () => null;
+  choice.click = function () { this.clicked += 1; dialog.clicked += 1; };
+  const h = harness({ elements: [choice] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 1);
+  assert.equal(observed.elements[0].text, "Experience mismatch");
+  const present = await h.sendAsync({ type: "h2w_page_assist", action: "expect", condition: "element_present", value: "Experience mismatch" });
+  assert.equal(present.ok, true);
+  const result = h.send({ type: "h2w_page_assist", action: "click", generation: observed.generation, ref: observed.elements[0].ref });
+  assert.equal(result.ok, true);
+  assert.equal(dialog.clicked, 1);
+  h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(h.send({ type: "h2w_page_assist", action: "click", generation: observed.generation, ref: observed.elements[0].ref }).error, "stale_generation");
+});
+
+test("user observes only bounded choice controls | Given inert tags and unsafe custom containers | When inspect scans them before Cancel | Then they receive no refs and do not consume the control budget", () => {
+  const inert = Array.from({ length: 128 }, () => createElement({ tag: "span", text: "Decorative", attrs: { class: "tag" } }));
+  const inertDiv = createElement({ tag: "div", text: "Inert", attrs: { class: "layout-container" } });
+  inertDiv.getBoundingClientRect = () => { throw new Error("inert div must not trigger geometry checks"); };
+  inertDiv.querySelector = () => { throw new Error("inert div must not trigger descendant checks"); };
+  const broad = createElement({ tag: "div", text: "Broad choice", attrs: { class: "choice" } });
+  broad.closest = () => ({});
+  broad.getBoundingClientRect = () => ({ width: 900, height: 300 });
+  const sensitive = createElement({ tag: "span", text: "Sensitive choice", attrs: { class: "chip" } });
+  sensitive.closest = () => ({});
+  sensitive.querySelector = () => createElement({ tag: "input", type: "password" });
+  const h = harness({ elements: [...inert, inertDiv, broad, sensitive, createElement({ text: "Cancel" })] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.deepEqual(Array.from(observed.elements, (el) => el.text), ["Cancel"]);
+});
