@@ -88,6 +88,18 @@
     return parts.join("").replace(/\s+/g, " ");
   }
 
+  const documentNonce = (() => {
+    if (global.crypto?.getRandomValues) {
+      const bytes = new Uint8Array(8);
+      global.crypto.getRandomValues(bytes);
+      return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+    return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  })();
+
+  const OBSERVABLE_CONTROL_SELECTOR =
+    'button, a[href], input, textarea, select, option, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="option"], [tabindex], label, span, [contenteditable="true"]';
+
   let generationSeq = 0;
   let currentGenerationToken = "";
   const elementMap = new Map();
@@ -204,13 +216,27 @@
     return false;
   }
 
+  function isObservableControlCandidate(el) {
+    const tag = (el.tagName || "").toLowerCase();
+    const role = el.getAttribute("role");
+    const native = ["button", "a", "input", "textarea", "select", "option", "table"].includes(tag);
+    const semantic = ["button", "link", "textbox", "checkbox", "radio", "option"].includes(role);
+    const focusable = el.hasAttribute("tabindex") && Number(el.getAttribute("tabindex")) >= 0
+      && String(el.innerText || "").length <= 256 && (el.children?.length || 0) <= 4;
+    const labelControl = tag === "label" && el.control && !isSensitiveField(el.control);
+    const pointer = tag === "span" && global.getComputedStyle?.(el)?.cursor === "pointer"
+      && String(el.innerText || "").trim().length > 0
+      && String(el.innerText || "").length <= 256 && (el.children?.length || 0) === 0;
+    return native || semantic || focusable || labelControl || pointer || el.isContentEditable;
+  }
+
   function scanDocument(options = {}) {
     if (isCrossOriginFrame()) {
       return { ok: false, error: "cross_origin_iframe_blocked" };
     }
 
     generationSeq += 1;
-    currentGenerationToken = `pa_gen_${generationSeq}_${Date.now().toString(36)}`;
+    currentGenerationToken = `pa_gen_${documentNonce}_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
     selectOptionMap.clear();
     selectOptionTruncatedRefs.clear();
@@ -218,9 +244,7 @@
     const doc = global.document;
     if (!doc) return { ok: false, error: "document_unavailable" };
 
-    const candidates = doc.querySelectorAll(
-      'button, a[href], input, textarea, select, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
-    );
+    const candidates = doc.querySelectorAll(OBSERVABLE_CONTROL_SELECTOR);
 
     const elements = [];
     let elementIndex = 0;
@@ -229,8 +253,10 @@
       if (elements.length >= MAX_ELEMENTS) break;
       const tag = (el.tagName || "").toLowerCase();
 
+      if (!isObservableControlCandidate(el)) continue;
+
       // Exclude prohibited inputs and sensitive autocomplete fields
-      if (isSensitiveField(el)) continue;
+      if (isSensitiveField(el) || el.closest?.('[hidden], [aria-hidden="true"], [inert]')) continue;
 
       // Exclude hidden or disabled elements
       if (isElementHidden(el)) continue;
@@ -240,7 +266,7 @@
       elementMap.set(ref, el);
 
       const roleAttr = el.getAttribute("role");
-      const role = roleAttr || (tag === "a" ? "link" : tag);
+      const observedRole = roleAttr || (tag === "a" ? "link" : tag);
       const label = (
         el.getAttribute("aria-label") ||
         el.getAttribute("placeholder") ||
@@ -274,7 +300,7 @@
       elements.push({
         ref: ref.slice(0, 256),
         tag,
-        role: String(role || "").slice(0, 64),
+        role: String(observedRole || "").slice(0, 64),
         id: structuralToken(el.getAttribute("id")),
         data_testid: structuralToken(el.getAttribute("data-testid")),
         classes: classes.length ? classes : undefined,
@@ -900,6 +926,26 @@
 
     const condition = String(params.condition || "").toLowerCase();
     const value = typeof params.value === "string" ? params.value : "";
+    const scoped = ["input_value_equals", "input_value_contains", "element_checked", "element_selected", "element_visible", "element_enabled"];
+    if (scoped.includes(condition)) {
+      if (!params.generation || params.generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+      const el = elementMap.get(params.ref);
+      if (!el) return { ok: false, error: "invalid_ref" };
+      if (!el.isConnected) return { ok: false, error: "element_detached" };
+      if (isSensitiveField(el)) return { ok: false, error: "sensitive_field_blocked" };
+      if (condition === "element_visible") return { ok: !isElementHidden(el), condition };
+      if (isElementHidden(el)) return { ok: false, error: "element_hidden" };
+      if (condition === "element_enabled") return { ok: !isElementDisabled(el), condition };
+      if (condition.startsWith("input_value_")) {
+        if (!["input", "textarea"].includes((el.tagName || "").toLowerCase())) return { ok: false, error: "unsupported_element" };
+        if (typeof params.value !== "string" || params.value.length > 4096) return { ok: false, error: "expect_value_invalid" };
+        return { ok: condition === "input_value_equals" ? el.value === params.value : String(el.value).includes(params.value), condition };
+      }
+      const attribute = condition === "element_checked" ? "aria-checked" : "aria-selected";
+      const property = condition === "element_checked" ? "checked" : "selected";
+      if (typeof el[property] !== "boolean" && el.getAttribute(attribute) === null) return { ok: false, error: "unsupported_element" };
+      return { ok: el[property] === true || el.getAttribute(attribute) === "true", condition };
+    }
     if (!["document_ready", "url_equals", "text_present", "text_absent", "element_present", "element_absent"].includes(condition)) {
       return { ok: false, error: "unsupported_expect_condition" };
     }
@@ -922,15 +968,18 @@
       if (value.length > 256 || value !== value.trim()) {
         return { ok: false, error: "expect_value_invalid", condition };
       }
-      const controls = global.document?.querySelectorAll?.(
-        'button, a[href], input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
-      ) || [];
-      const truncated = controls.length > MAX_ELEMENTS;
+      const controls = global.document?.querySelectorAll?.(OBSERVABLE_CONTROL_SELECTOR) || [];
+      let truncated = false;
       let found = false;
       let inspected = 0;
       for (const el of controls) {
-        if (++inspected > MAX_ELEMENTS) break;
-        if (!el.isConnected || isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) continue;
+        if (!el.isConnected || !isObservableControlCandidate(el)
+          || isSensitiveField(el) || el.closest?.('[hidden], [aria-hidden="true"], [inert]')
+          || isElementHidden(el) || isElementDisabled(el)) continue;
+        if (++inspected > MAX_ELEMENTS) {
+          truncated = true;
+          break;
+        }
         const exactLabels = [
           el.getAttribute?.("aria-label"),
           el.getAttribute?.("placeholder"),

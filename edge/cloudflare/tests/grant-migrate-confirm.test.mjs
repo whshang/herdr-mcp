@@ -129,6 +129,24 @@ function harness(rec = record(), extra = {}) {
 }
 
 const snapshot = (storage) => JSON.stringify([...storage.map.entries()]);
+// #630 Q4: rejected confirms may append to the per-device reject ring, but
+// must never touch grant records or idempotency entries.
+const REJECT_PREFIX = "migrate-reject-audit:v1:";
+const rejectEntries = (storage, deviceId = DEV) => storage.map.get(`${REJECT_PREFIX}${deviceId}`)?.entries ?? [];
+const stateWithoutRejects = (storage) => JSON.stringify([...storage.map.entries()].filter(([key]) => !key.startsWith(REJECT_PREFIX)));
+const capturedLogs = async (fn) => {
+  const lines = [];
+  const original = console.log;
+  console.log = (line) => lines.push(line);
+  try {
+    return { result: await fn(), lines };
+  } finally {
+    console.log = original;
+  }
+};
+const rejectLogLines = (lines) => lines
+  .map((line) => JSON.parse(line))
+  .filter((entry) => entry.event === "page_assist_migrate_rejected");
 
 test("user Given a fresh dry-run plan When the owner confirms the migrate Then only planned rows move, an audit entry and idempotency entry are written in one transaction", async () => {
   const h = harness();
@@ -169,23 +187,55 @@ test("user Given a plan whose target record changed before confirm When the owne
   const digest = await planDigest({ from: OLD, to: NEW });
   const stale = record({ grant_generation: 2 });
   const h = harness(stale);
-  const before = snapshot(h.storage);
+  const before = stateWithoutRejects(h.storage);
   const res = await h.confirm({ plan_digest: digest });
   assert.equal(res.status, 409);
   assert.equal(res.body.ok, false);
   assert.equal(res.body.code, "migrate_plan_stale");
-  assert.equal(snapshot(h.storage), before);
-  assert.equal(h.storage.writes, 0);
+  assert.equal(stateWithoutRejects(h.storage), before, "grant + idempotency state untouched");
+  assert.equal(h.storage.writes, 1, "only the reject ring wrote");
 });
 
-test("user Given a confirm with the wrong plan_digest When the owner confirms Then it fails closed with migrate_plan_stale and writes nothing", async () => {
+test("user Given a confirm with a stale plan digest When the owner confirms Then the rejection is recorded once in the device reject ring and no grant or idempotency state changes", async () => {
   const h = harness();
-  const before = snapshot(h.storage);
-  const res = await h.confirm({ plan_digest: await sha256Hex("not-the-plan") });
+  const before = stateWithoutRejects(h.storage);
+  const staleDigest = await sha256Hex("not-the-plan");
+  const { result: res, lines } = await capturedLogs(() => h.confirm({ plan_digest: staleDigest }));
   assert.equal(res.status, 409);
   assert.deepEqual(res.body, { ok: false, code: "migrate_plan_stale" });
-  assert.equal(snapshot(h.storage), before);
-  assert.equal(h.storage.writes, 0);
+  // The rejection never writes a grant record or an idempotency entry; the only
+  // delta is the separate per-device reject ring (one put, no other writes).
+  assert.equal(stateWithoutRejects(h.storage), before, "grant + idempotency storage byte-identical");
+
+  const ring = h.storage.map.get(`${REJECT_PREFIX}${DEV}`);
+  assert.ok(ring, "per-device reject ring written");
+  assert.equal(h.storage.writes, 1, "exactly one reject-ring put wrote");
+  assert.equal(ring.v, 1);
+  assert.equal(ring.entries.length, 1);
+  const entry = ring.entries[0];
+  assert.deepEqual(Object.keys(entry).sort(), [
+    "at_ms", "code", "device_id", "idempotency_key_sha256_8", "plan_digest", "stage", "v",
+  ]);
+  assert.equal(entry.v, 1);
+  assert.equal(typeof entry.at_ms, "number");
+  assert.equal(entry.code, "migrate_plan_stale");
+  assert.equal(entry.stage, "digest");
+  assert.equal(entry.device_id, DEV);
+  assert.equal(entry.plan_digest, staleDigest, "client digest kept when it is lowercase 64-hex");
+  assert.equal(entry.idempotency_key_sha256_8, (await sha256Hex(IDEM)).slice(0, 8));
+  assert.equal(JSON.stringify(ring).includes(IDEM), false, "raw idempotency key is never stored");
+
+  // One structured reject log line carrying the same fixed fields.
+  const logged = rejectLogLines(lines);
+  assert.equal(logged.length, 1, "one structured reject log line");
+  const fields = logged[0].fields;
+  assert.equal(fields.code, "migrate_plan_stale");
+  assert.equal(fields.stage, "digest");
+  assert.equal(fields.device_id, DEV);
+  assert.equal(fields.plan_digest, staleDigest);
+  assert.equal(fields.idempotency_key_sha256_8, entry.idempotency_key_sha256_8);
+  assert.equal(fields.reject_audit_write_failed, false);
+  assert.equal(JSON.stringify(fields).includes(IDEM), false, "raw idempotency key is never logged");
 });
 
 test("user Given a successful confirm When the same idempotency key and digest are replayed Then the stored result is returned with zero writes", async () => {
@@ -208,30 +258,32 @@ test("user Given a stored idempotency entry When the same key is reused with a d
   const first = await h.confirm({ plan_digest: digest });
   assert.equal(first.status, 200);
   const writesAfterFirst = h.storage.writes;
-  const before = snapshot(h.storage);
+  const before = stateWithoutRejects(h.storage);
   const res = await h.confirm({ plan_digest: await sha256Hex("different-plan") });
   assert.equal(res.status, 409);
   assert.equal(res.body.code, "migrate_idempotency_conflict");
-  assert.equal(snapshot(h.storage), before);
-  assert.equal(h.storage.writes, writesAfterFirst, "conflict performs no writes");
+  assert.equal(stateWithoutRejects(h.storage), before, "grant + idempotency state untouched");
+  assert.equal(h.storage.writes, writesAfterFirst + 1, "conflict writes only the reject ring");
 });
 
 test("user Given an injected failure on the write after the grant record When the confirm transaction runs Then everything rolls back and storage is byte-identical", async () => {
   const digest = await planDigest({ from: OLD, to: NEW });
   const h = harness();
-  const before = snapshot(h.storage);
+  const before = stateWithoutRejects(h.storage);
   h.storage.putFailures = [false, true]; // 1st put (grant) ok, 2nd put (idem/audit) throws
   const res = await h.confirm({ plan_digest: digest });
   assert.equal(res.status, 500, JSON.stringify(res.body));
   assert.equal(res.body.ok, false);
   assert.equal(res.body.code, "migrate_storage_failed");
-  assert.equal(snapshot(h.storage), before, "storage byte-identical after rollback");
+  assert.equal(stateWithoutRejects(h.storage), before, "grant + idempotency storage byte-identical after rollback");
+  // The failed confirm is still audited, after the rolled-back transaction.
+  assert.deepEqual(rejectEntries(h.storage).map((entry) => [entry.code, entry.stage]), [["migrate_storage_failed", "storage"]]);
 });
 
 test("user Given a postcondition verification failure after the write When the confirm transaction runs Then the transaction rolls back with migrate_postcondition_failed", async () => {
   const digest = await planDigest({ from: OLD, to: NEW });
   const h = harness();
-  const before = snapshot(h.storage);
+  const before = stateWithoutRejects(h.storage);
   // Corrupt the in-transaction re-read of the grant record after the first
   // write, so post-write verification still sees the unmigrated rows.
   h.storage.readCorruption = { afterWrites: 1 };
@@ -239,7 +291,8 @@ test("user Given a postcondition verification failure after the write When the c
   assert.equal(res.status, 500, JSON.stringify(res.body));
   assert.equal(res.body.ok, false);
   assert.equal(res.body.code, "migrate_postcondition_failed");
-  assert.equal(snapshot(h.storage), before, "storage byte-identical after rollback");
+  assert.equal(stateWithoutRejects(h.storage), before, "grant + idempotency storage byte-identical after rollback");
+  assert.deepEqual(rejectEntries(h.storage).map((entry) => entry.stage), ["postcondition"]);
 });
 
 test("user Given matching rows of two devices When the owner runs a device-scoped dry run Then the plan itself fails closed with migrate_cross_device_rows and nothing is written", async () => {
@@ -262,7 +315,7 @@ test("user Given matching rows of two devices When the owner runs a device-scope
 
 test("user Given a confirm without an idempotency key or with a malformed one When the owner confirms Then it fails closed with 400 and writes nothing", async () => {
   const h = harness();
-  const before = snapshot(h.storage);
+  const before = stateWithoutRejects(h.storage);
   const missing = await h.confirm({ plan_digest: await sha256Hex("x"), idempotency_key: undefined });
   assert.equal(missing.status, 400);
   assert.equal(missing.body.code, "migrate_idempotency_key_required");
@@ -273,8 +326,16 @@ test("user Given a confirm without an idempotency key or with a malformed one Wh
   }
   const badDevice = await h.confirm({ plan_digest: await sha256Hex("x"), device_id: "bogus" });
   assert.equal(badDevice.status, 400);
-  assert.equal(snapshot(h.storage), before);
-  assert.equal(h.storage.writes, 0);
+  assert.equal(stateWithoutRejects(h.storage), before, "grant + idempotency state untouched");
+  // The four rejections with an authenticated device are audited; a request with
+  // no valid device id is logged only, so it can never create a ring.
+  assert.equal(h.storage.writes, 4);
+  assert.deepEqual(rejectEntries(h.storage).map((entry) => [entry.code, entry.stage]), [
+    ["migrate_idempotency_key_required", "validate"],
+    ["migrate_idempotency_key_invalid", "validate"],
+    ["migrate_idempotency_key_invalid", "validate"],
+    ["migrate_idempotency_key_invalid", "validate"],
+  ]);
 });
 
 test("user Given an unfiltered digest computed over a plan that includes another device's rows When the owner confirms Then the cross-device check rejects first with zero grant writes", async () => {
@@ -302,7 +363,8 @@ test("user Given an unfiltered digest computed over a plan that includes another
   const res = { status: resp.status, body: await resp.json() };
   assert.equal(res.status, 409, JSON.stringify(res.body));
   assert.equal(res.body.code, "migrate_cross_device_rows");
-  assert.equal(storage.writes, grantWritesBefore, "zero writes after rejection");
+  assert.equal(storage.writes, grantWritesBefore + 1, "only the reject ring wrote");
+  assert.deepEqual(rejectEntries(storage).map((entry) => [entry.code, entry.stage]), [["migrate_cross_device_rows", "device_scope"]]);
   const stored = storage.map.get("grant:c1");
   assert.equal(stored.page_assist.find((row) => row.endpoint_ref === "ep5").connector_id, OLD, "other device row untouched");
 });
@@ -430,7 +492,7 @@ test("user Given expired idempotency entries When the DO alarm handler fires The
 
 test("user Given a confirm with malformed from or to When the DO transaction runs Then it fails closed with 400 and the fixed request-shape code", async () => {
   const h = harness();
-  const before = snapshot(h.storage);
+  const before = stateWithoutRejects(h.storage);
   const cases = [
     [{ from: "" }, "migrate_from_required"],
     [{ to: "" }, "migrate_to_required"],
@@ -442,8 +504,8 @@ test("user Given a confirm with malformed from or to When the DO transaction run
     assert.equal(res.status, 400, JSON.stringify(res.body));
     assert.equal(res.body.code, code);
   }
-  assert.equal(snapshot(h.storage), before);
-  assert.equal(h.storage.writes, 0);
+  assert.equal(stateWithoutRejects(h.storage), before, "grant + idempotency state untouched");
+  assert.equal(h.storage.writes, 4, "one reject ring entry per rejected confirm");
 });
 
 test("user Given a successful confirm When the idempotency entry is written Then an alarm is already scheduled and firing it sweeps the expired entry", async () => {
@@ -475,4 +537,64 @@ test("user Given a replay while an alarm is already pending When the stored resu
   assert.ok(Number.isFinite(firstAlarm));
   assert.equal((await h.confirm({ plan_digest: digest })).status, 200);
   assert.equal(h.storage.alarmSetAt, firstAlarm, "pending alarm untouched");
+});
+
+test("user Given a reject ring at its cap and a failing reject write When confirms are rejected Then the ring evicts oldest per device and the original rejection is returned", async () => {
+  const staleDigest = await sha256Hex("stale");
+
+  // Cap 64 per device, oldest evicted first.
+  const h = harness();
+  const prefill = [];
+  for (let i = 1; i <= 64; i += 1) {
+    prefill.push({ v: 1, at_ms: i, code: "migrate_plan_stale", stage: "digest", device_id: DEV, plan_digest: null, idempotency_key_sha256_8: null });
+  }
+  h.storage.map.set(`${REJECT_PREFIX}${DEV}`, { v: 1, entries: prefill });
+  assert.equal((await h.confirm({ plan_digest: staleDigest })).status, 409);
+  const capped = rejectEntries(h.storage);
+  assert.equal(capped.length, 64, "cap holds 64 entries");
+  assert.equal(capped[0].at_ms, 2, "oldest entry evicted first");
+  assert.equal(capped[63].at_ms > 0, true, "newest entry kept");
+  assert.equal(capped[63].code, "migrate_plan_stale");
+
+  // Per-device isolation: another device's rejection goes to its own ring.
+  const hOther = harness();
+  const other = await hOther.confirm({ plan_digest: staleDigest, device_id: OTHER });
+  assert.equal(other.status, 409);
+  assert.equal(other.body.code, "migrate_cross_device_rows");
+  assert.equal(hOther.storage.map.has(`${REJECT_PREFIX}${DEV}`), false, "no entry under the other device's ring");
+  assert.deepEqual(rejectEntries(hOther.storage, OTHER).map((entry) => [entry.device_id, entry.stage]), [[OTHER, "device_scope"]]);
+
+  // A failing reject-ring write keeps the original rejection and only flags it.
+  const hFail = harness();
+  const before = stateWithoutRejects(hFail.storage);
+  hFail.storage.putFailures = [true];
+  const { result: failed, lines } = await capturedLogs(() => hFail.confirm({ plan_digest: staleDigest }));
+  assert.equal(failed.status, 409);
+  assert.deepEqual(failed.body, { ok: false, code: "migrate_plan_stale" });
+  assert.equal(stateWithoutRejects(hFail.storage), before, "a failed reject write never touches grant or idempotency state");
+  assert.equal(hFail.storage.map.has(`${REJECT_PREFIX}${DEV}`), false, "no partial ring written");
+  const [logged] = rejectLogLines(lines);
+  assert.equal(logged.fields.reject_audit_write_failed, true);
+  assert.equal(logged.fields.code, "migrate_plan_stale");
+  assert.equal(logged.fields.stage, "digest");
+  assert.equal(logged.fields.idempotency_key_sha256_8, (await sha256Hex(IDEM)).slice(0, 8));
+
+  // The Edge-side reject route records only the fixed Q4 entry: an unknown
+  // stage, an out-of-shape code, or a malformed device id is refused without
+  // touching any ring.
+  const hRoute = harness();
+  const rejected = async (body) => {
+    const resp = await hRoute.instance.fetch(new Request("https://do.internal/internal/oauth/grant/page-assist-migrate-reject", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    }));
+    return { status: resp.status, body: await resp.json() };
+  };
+  assert.equal((await rejected({ device_id: DEV, code: "bad_request", stage: "not_a_stage" })).status, 400);
+  assert.equal((await rejected({ device_id: DEV, code: "Bad Code", stage: "validate" })).status, 400);
+  assert.equal((await rejected({ device_id: "bogus", code: "bad_request", stage: "validate" })).status, 400);
+  assert.equal(hRoute.storage.map.has(`${REJECT_PREFIX}${DEV}`), false, "invalid internal reject input writes nothing");
+  assert.equal((await rejected({ device_id: DEV, code: "migrate_invalid_plan_digest", stage: "validate", plan_digest: "nothex", idempotency_key: "short" })).status, 200);
+  assert.deepEqual(rejectEntries(hRoute.storage).map((entry) => [entry.code, entry.stage, entry.plan_digest, entry.idempotency_key_sha256_8]), [
+    ["migrate_invalid_plan_digest", "validate", null, null],
+  ]);
 });

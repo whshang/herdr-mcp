@@ -115,6 +115,7 @@ function harness({
         opacity: hidden ? "0" : "1",
         position: "static",
         overflowY: element.overflowY || "visible",
+        cursor: element.cursor || "auto",
       };
     },
   });
@@ -1068,7 +1069,7 @@ test("Page Assist fails closed inside a cross-origin iframe", () => {
 });
 
 test("user extracts only visible text | Given an observed container with hidden, aria-hidden and password descendants | When extract runs on the container ref | Then only visible descendant text is returned", () => {
-  const container = createElement({ tag: "div", text: "Visible SECRET_HIDDEN SECRET_ARIA" });
+  const container = createElement({ tag: "div", attrs: { role: "button" }, text: "Visible SECRET_HIDDEN SECRET_ARIA" });
   const h = harness({ elements: [container] });
   const doc = container.ownerDocument;
   const textNode = (value) => ({ nodeType: 3, nodeValue: value });
@@ -1289,4 +1290,50 @@ test("user fills a rich-text composer through the extension | Given the extensio
   assert.equal(handoff.value, "hello claude");
   assert.equal(editor.getAttribute("data-h2w-fill-token"), handoff.main_world_fill_token);
   assert.notEqual(editor.innerText, "hello claude");
+});
+
+test("user verifies observed controls | Given a textarea and semantic radio | When ref-scoped expect reads their actual state | Then values and checked state are verified without returning field contents", async () => {
+  const input = createElement({ tag: "textarea", value: "actual draft" });
+  const radio = createElement({ tag: "div", attrs: { role: "radio", "aria-checked": "true" } });
+  const option = createElement({ tag: "div", attrs: { role: "option", "aria-selected": "true" } });
+  const focusable = createElement({ tag: "div", attrs: { tabindex: "0" } });
+  const pointer = Object.assign(createElement({ tag: "span", text: "Safe action" }), { cursor: "pointer" });
+  const label = Object.assign(createElement({ tag: "label", text: "Choice" }), { control: radio });
+  const h = harness({ elements: [input, radio, option, focusable, pointer, label, createElement({ tag: "div", text: "Broad ancestor" }), createElement({ tag: "input", type: "password" })] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 6);
+  for (const [condition, ref, value] of [["input_value_equals", observed.elements[0].ref, "actual draft"], ["input_value_contains", observed.elements[0].ref, "draft"], ["element_checked", observed.elements[1].ref, undefined], ["element_selected", observed.elements[2].ref, undefined], ["element_visible", observed.elements[0].ref, undefined], ["element_enabled", observed.elements[0].ref, undefined]]) {
+    const result = await h.sendAsync({ type: "h2w_page_assist", action: "expect", generation: observed.generation, ref, condition, value });
+    assert.equal(result.ok, true);
+    assert.equal(result.value, undefined);
+  }
+});
+test("user rejects expired control assertions | Given an observed input whose generation has been replaced | When scoped expect uses its old ref | Then it fails closed", async () => {
+  const h = harness({ elements: [createElement({ tag: "input", value: "draft" })] });
+  const old = h.send({ type: "h2w_page_assist", action: "inspect" });
+  h.send({ type: "h2w_page_assist", action: "inspect" });
+  const result = await h.sendAsync({ type: "h2w_page_assist", action: "expect", generation: old.generation, ref: old.elements[0].ref, condition: "input_value_equals", value: "draft" });
+  assert.equal(result.error, "stale_generation");
+});
+
+test("user finds controls after inert markup | Given 128 inert spans before a visible Cancel button | When element presence and absence are checked | Then inert candidates do not consume the control budget", async () => {
+  const inert = Array.from({ length: 128 }, () => createElement({ tag: "span", text: "inert" }));
+  const h = harness({ elements: [...inert, createElement({ text: "Cancel" }), createElement({ tag: "input", type: "password", attrs: { "aria-label": "Secret" } })] });
+  for (const [condition, value] of [["element_present", "Cancel"], ["element_absent", "Missing"], ["element_absent", "Secret"]]) {
+    const result = await h.sendAsync({ type: "h2w_page_assist", action: "expect", condition, value });
+    assert.equal(result.ok, true);
+  }
+});
+
+test("user cannot reuse refs across documents | Given two page instances observed in the same millisecond | When a ref from the first is clicked in the second | Then generation fencing rejects it", () => {
+  class FixedDate extends Date { static now() { return 123456789; } }
+  const a = harness({ elements: [createElement({ text: "First" })], extraGlobals: { Date: FixedDate } });
+  const target = createElement({ text: "Second" });
+  const b = harness({ elements: [target], extraGlobals: { Date: FixedDate } });
+  const first = a.send({ type: "h2w_page_assist", action: "inspect" });
+  const second = b.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.notEqual(first.generation, second.generation);
+  const result = b.send({ type: "h2w_page_assist", action: "click", generation: first.generation, ref: first.elements[0].ref });
+  assert.equal(result.error, "stale_generation");
+  assert.equal(target.clicked, 0);
 });

@@ -8392,13 +8392,7 @@ fn browser_page_action_call(
             }
         }
         "expect" => {
-            for disallowed in [
-                "generation",
-                "ref",
-                "max_chars",
-                "idempotency_key",
-                "objective",
-            ] {
+            for disallowed in ["max_chars", "idempotency_key", "objective"] {
                 if object.contains_key(disallowed) {
                     return json!({
                         "ok": false,
@@ -8409,17 +8403,61 @@ fn browser_page_action_call(
             }
             let condition = match object.get("condition").and_then(Value::as_str) {
                 Some(
-                    value @ ("document_ready" | "url_equals" | "text_present" | "text_absent"
-                    | "element_present" | "element_absent"),
+                    value @ ("document_ready"
+                    | "url_equals"
+                    | "text_present"
+                    | "text_absent"
+                    | "element_present"
+                    | "element_absent"
+                    | "input_value_equals"
+                    | "input_value_contains"
+                    | "element_checked"
+                    | "element_selected"
+                    | "element_visible"
+                    | "element_enabled"),
                 ) => value,
                 _ => {
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
-                        "message": "condition must be document_ready, url_equals, text_present, text_absent, element_present, or element_absent",
+                        "message": "unsupported expect condition",
                     });
                 }
             };
+            let scoped = matches!(
+                condition,
+                "input_value_equals"
+                    | "input_value_contains"
+                    | "element_checked"
+                    | "element_selected"
+                    | "element_visible"
+                    | "element_enabled"
+            );
+            for key in ["generation", "ref"] {
+                if scoped {
+                    match object.get(key).and_then(Value::as_str) {
+                        Some(value)
+                            if !value.is_empty()
+                                && value.len() <= 256
+                                && !value.chars().any(char::is_control)
+                                && (key != "ref"
+                                    || object
+                                        .get("generation")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|generation| {
+                                            value.starts_with(&format!("ref_{generation}_"))
+                                        })) =>
+                        {
+                            bridge_params[key] = json!(value)
+                        }
+                        _ => {
+                            return json!({"ok": false, "code": "invalid_params", "message": format!("{key} is required for scoped expect")});
+                        }
+                    }
+                } else if object.contains_key(key) {
+                    return json!({"ok": false, "code": "invalid_params", "message": format!("{key} is not accepted for page expect")});
+                }
+            }
             bridge_params["condition"] = json!(condition);
             match object.get("timeout_ms") {
                 None | Some(Value::Null) => {}
@@ -8434,19 +8472,20 @@ fn browser_page_action_call(
                 }
             }
             match condition {
-                "document_ready" => {
+                "document_ready" | "element_checked" | "element_selected" | "element_visible"
+                | "element_enabled" => {
                     if object.contains_key("value") {
                         return json!({
                             "ok": false,
                             "code": "invalid_params",
-                            "message": "value is not accepted for document_ready",
+                            "message": "value is not accepted for this expect condition",
                         });
                     }
                 }
                 _ => {
                     let value = match object.get("value").and_then(Value::as_str) {
                         Some(value)
-                            if !value.is_empty()
+                            if (condition == "input_value_equals" || !value.is_empty())
                                 && value.len() <= 4096
                                 && !value.chars().any(char::is_control) =>
                         {
@@ -19648,6 +19687,7 @@ mod tests {
                 assert!(
                     params["condition"] == "element_present"
                         || params["condition"] == "element_absent"
+                        || params["condition"] == "input_value_equals"
                 );
                 assert_eq!(params["value"], "Next step");
                 self.calls.fetch_add(1, Ordering::SeqCst);
@@ -19668,20 +19708,16 @@ mod tests {
         let actuator = ElementWaitActuator {
             calls: AtomicUsize::new(0),
         };
-        for condition in ["element_present", "element_absent"] {
-            let result = browser_page_action_call(
-                &store,
-                &json!({
-                    "endpoint_ref": "bep_test",
-                    "page_ref": format!("bp_{}", "a".repeat(64)),
-                    "action": "expect",
-                    "condition": condition,
-                    "value": "Next step",
-                    "timeout_ms": 250,
-                }),
-                &grants,
-                Some(&actuator),
-            );
+        for condition in ["element_present", "element_absent", "input_value_equals"] {
+            let mut params = json!({
+                "endpoint_ref": "bep_test", "page_ref": format!("bp_{}", "a".repeat(64)),
+                "action": "expect", "condition": condition, "value": "Next step", "timeout_ms": 250
+            });
+            if condition == "input_value_equals" {
+                params["generation"] = json!("pa_gen_1");
+                params["ref"] = json!("ref_pa_gen_1_0");
+            }
+            let result = browser_page_action_call(&store, &params, &grants, Some(&actuator));
             assert_eq!(result["ok"], true);
             assert_eq!(result["condition"], condition);
         }
@@ -19698,7 +19734,17 @@ mod tests {
             Some(&actuator),
         );
         assert_eq!(invalid["code"], "invalid_params");
-        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+        let missing_ref = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_test", "page_ref": format!("bp_{}", "a".repeat(64)),
+                "action": "expect", "condition": "input_value_equals", "value": "Next step"
+            }),
+            &grants,
+            Some(&actuator),
+        );
+        assert_eq!(missing_ref["code"], "invalid_params");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
