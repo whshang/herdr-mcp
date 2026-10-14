@@ -4367,6 +4367,7 @@ mod tests {
             json!([
                 "observe",
                 "click",
+                "hover",
                 "fill",
                 "expect",
                 "screenshot",
@@ -4380,7 +4381,7 @@ mod tests {
             methods[20]["params"]["properties"]["objective"]["maxLength"],
             1024
         );
-        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 8);
+        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 9);
         assert_eq!(methods[21]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
         assert_eq!(methods[21]["access"], "read_only");
         assert_eq!(

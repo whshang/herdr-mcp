@@ -50,6 +50,7 @@ function browserPageLifecycleHarness({
   artifactResponder = null,
   fetchResponder = null,
   scriptResponder = null,
+  hoverResponder = null,
   deferredCreate = false,
   windowFocused = true,
   documentFocused = true,
@@ -64,6 +65,11 @@ function browserPageLifecycleHarness({
   };
   const chrome = {
     storage: { session: storageArea },
+    debugger: hoverResponder ? {
+      attach: (target, version) => hoverResponder("attach", target, version),
+      sendCommand: (target, method, params) => hoverResponder("command", target, { method, params }),
+      detach: (target) => hoverResponder("detach", target),
+    } : undefined,
     tabs: {
       async get(tabId) {
         const tab = tabs.get(tabId);
@@ -841,6 +847,82 @@ test("user verifies an explicit same-origin history target | Given an observed b
   assert.equal(uncertain.mutation_submitted, true);
   assert.equal(unmatchedTab.url, "https://example.com/route-unexpected");
   assert.equal(failing.browserPagesByRef.get(initial.page_ref).canonical_url, "https://example.com/route-two");
+});
+
+test("user reveals controls with a trusted hover | Given one owned generic page with a scoped card ref | When the debugger moves the virtual mouse | Then observe sees the edit button, focus stays unchanged, and debugger detaches", async () => {
+  let revealed = false;
+  let failAttach = false;
+  let failCommand = false;
+  const events = [];
+  const h = browserPageLifecycleHarness({
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_hover_1", origin: "https://example.com",
+        url: "https://example.com/card",
+        elements: revealed
+          ? [{ ref: "ref_pa_gen_hover_1_1", text: "Edit", tag: "button" }]
+          : [{ ref: "ref_pa_gen_hover_1_0", text: "Existing evaluation", hover_only: true }],
+      };
+      if (payload.action === "hover") return {
+        ok: true, generation: payload.generation, ref: payload.ref,
+        hover_point: { x: 94, y: 71 },
+      };
+      throw new Error("unexpected action");
+    },
+    hoverResponder(phase, target, data) {
+      events.push(phase);
+      if (phase === "attach" && failAttach) throw new Error("debugger in use");
+      if (phase === "command") {
+        if (failCommand) throw new Error("mouse dispatch uncertain");
+        assert.equal(data.method, "Input.dispatchMouseEvent");
+        assert.equal(data.params.type, "mouseMoved");
+        assert.equal(data.params.x, 94);
+        assert.equal(data.params.y, 71);
+        revealed = true;
+      }
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/card", idempotencyKey: "hover-owned-1",
+  });
+  assert.equal(opened.ok, true);
+  const before = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  assert.equal(before.elements[0].hover_only, true);
+  const applied = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: before.generation,
+    ref: before.elements[0].ref,
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.delivery_state, "applied");
+  assert.equal(applied.postcondition_observed, false);
+  assert.equal(applied.hover_requires_observe, true);
+  assert.equal(Object.hasOwn(applied, "hover_point"), false);
+  assert.deepEqual(events, ["attach", "command", "detach"]);
+  const after = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  assert.equal(after.elements[0].text, "Edit");
+
+  failAttach = true;
+  const unavailable = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: after.generation,
+    ref: after.elements[0].ref,
+  });
+  assert.equal(unavailable.error, "browser_page_hover_unavailable");
+  assert.equal(unavailable.delivery_state, "not_applied");
+  assert.equal(unavailable.mutation_submitted, false);
+  assert.deepEqual(events.slice(-1), ["attach"]);
+
+  failAttach = false;
+  failCommand = true;
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: after.generation,
+    ref: after.elements[0].ref,
+  });
+  assert.equal(uncertain.error, "hover_delivery_unconfirmed");
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  assert.equal(uncertain.mutation_submitted, true);
+  assert.deepEqual(events.slice(-3), ["attach", "command", "detach"]);
 });
 
 test("user rejects invalid native form states | Given unavailable dropdown or unsupported checkable state | When fill checks the observed control | Then delivery is not_applied and retry-safe", async () => {

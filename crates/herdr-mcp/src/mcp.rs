@@ -8299,14 +8299,14 @@ fn browser_page_action_call(
     };
     let action = match object.get("action").and_then(Value::as_str) {
         Some(
-            value @ ("observe" | "click" | "fill" | "expect" | "screenshot" | "scroll" | "extract"
-            | "extract_table" | "press"),
+            value @ ("observe" | "click" | "hover" | "fill" | "expect" | "screenshot" | "scroll"
+            | "extract" | "extract_table" | "press"),
         ) => value,
         _ => {
             return json!({
                 "ok": false,
                 "code": "invalid_params",
-                "message": "action must be observe, click, fill, expect, screenshot, scroll, extract, extract_table, or press",
+                "message": "action must be observe, click, hover, fill, expect, screenshot, scroll, extract, extract_table, or press",
             });
         }
     };
@@ -8327,7 +8327,7 @@ fn browser_page_action_call(
         "page_ref": page_ref,
         "action": action,
     });
-    let mutation = matches!(action, "click" | "fill" | "scroll" | "press");
+    let mutation = matches!(action, "click" | "hover" | "fill" | "scroll" | "press");
     let mut mutation_key: Option<&str> = None;
     let mut semantic_objective: Option<&str> = None;
 
@@ -8614,7 +8614,7 @@ fn browser_page_action_call(
             bridge_params["ref"] = json!(element_ref);
             bridge_params["max_rows"] = json!(max_rows);
         }
-        "click" | "fill" | "scroll" | "press" => {
+        "click" | "hover" | "fill" | "scroll" | "press" => {
             for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
                 if object.contains_key(disallowed) {
                     return json!({
@@ -8640,7 +8640,7 @@ fn browser_page_action_call(
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
-                        "message": "generation is required for click/fill/scroll/press",
+                        "message": "generation is required for click/hover/fill/scroll/press",
                     });
                 }
             };
@@ -8676,7 +8676,7 @@ fn browser_page_action_call(
                         Some(value)
                     }
                     _ => {
-                        return json!({"ok": false, "code": "invalid_params", "message": "ref is required for click/fill"});
+                        return json!({"ok": false, "code": "invalid_params", "message": "ref is required for click/hover/fill"});
                     }
                 }
             };
@@ -8739,11 +8739,11 @@ fn browser_page_action_call(
                     }
                 };
                 bridge_params["value"] = json!(value);
-            } else if action == "click" && object.contains_key("value") {
+            } else if matches!(action, "click" | "hover") && object.contains_key("value") {
                 return json!({
                     "ok": false,
                     "code": "invalid_params",
-                    "message": "value is not accepted for click",
+                    "message": format!("value is not accepted for {action}"),
                 });
             }
             if action == "press" {
@@ -19382,7 +19382,7 @@ mod tests {
                 assert_eq!(endpoint_ref, Some("bep_test"));
                 assert_eq!(expected_generation, 1);
                 assert!(dispatch_id.is_some());
-                assert_eq!(params["action"], "click");
+                assert!(matches!(params["action"].as_str(), Some("click" | "hover")));
                 assert!(params.get("endpoint_ref").is_none());
 
                 let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -19467,6 +19467,22 @@ mod tests {
             browser_page_action_call(&store, &invalid_navigation, &grants, Some(&actuator));
         assert_eq!(denied["code"], "invalid_params");
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+
+        let mut hover = params.clone();
+        hover["action"] = json!("hover");
+        hover["idempotency_key"] = json!("page-hover-1");
+        let hovered = browser_page_action_call(&store, &hover, &grants, Some(&actuator));
+        assert_eq!(hovered["ok"], true, "{hovered}");
+        assert_eq!(hovered["delivery_state"], "applied");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
+        let replay = browser_page_action_call(&store, &hover, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
+        hover["value"] = json!("unallowed");
+        hover["idempotency_key"] = json!("page-hover-invalid");
+        let refused = browser_page_action_call(&store, &hover, &grants, Some(&actuator));
+        assert_eq!(refused["code"], "invalid_params");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
