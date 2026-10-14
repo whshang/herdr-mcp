@@ -1315,3 +1315,25 @@ test("user rejects expired control assertions | Given an observed input whose ge
   const result = await h.sendAsync({ type: "h2w_page_assist", action: "expect", generation: old.generation, ref: old.elements[0].ref, condition: "input_value_equals", value: "draft" });
   assert.equal(result.error, "stale_generation");
 });
+
+test("user finds controls after inert markup | Given 128 inert spans before a visible Cancel button | When element presence and absence are checked | Then inert candidates do not consume the control budget", async () => {
+  const inert = Array.from({ length: 128 }, () => createElement({ tag: "span", text: "inert" }));
+  const h = harness({ elements: [...inert, createElement({ text: "Cancel" }), createElement({ tag: "input", type: "password", attrs: { "aria-label": "Secret" } })] });
+  for (const [condition, value] of [["element_present", "Cancel"], ["element_absent", "Missing"], ["element_absent", "Secret"]]) {
+    const result = await h.sendAsync({ type: "h2w_page_assist", action: "expect", condition, value });
+    assert.equal(result.ok, true);
+  }
+});
+
+test("user cannot reuse refs across documents | Given two page instances observed in the same millisecond | When a ref from the first is clicked in the second | Then generation fencing rejects it", () => {
+  class FixedDate extends Date { static now() { return 123456789; } }
+  const a = harness({ elements: [createElement({ text: "First" })], extraGlobals: { Date: FixedDate } });
+  const target = createElement({ text: "Second" });
+  const b = harness({ elements: [target], extraGlobals: { Date: FixedDate } });
+  const first = a.send({ type: "h2w_page_assist", action: "inspect" });
+  const second = b.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.notEqual(first.generation, second.generation);
+  const result = b.send({ type: "h2w_page_assist", action: "click", generation: first.generation, ref: first.elements[0].ref });
+  assert.equal(result.error, "stale_generation");
+  assert.equal(target.clicked, 0);
+});

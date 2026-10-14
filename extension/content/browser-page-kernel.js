@@ -88,6 +88,18 @@
     return parts.join("").replace(/\s+/g, " ");
   }
 
+  const documentNonce = (() => {
+    if (global.crypto?.getRandomValues) {
+      const bytes = new Uint8Array(8);
+      global.crypto.getRandomValues(bytes);
+      return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+    return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  })();
+
+  const OBSERVABLE_CONTROL_SELECTOR =
+    'button, a[href], input, textarea, select, option, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="option"], [tabindex], label, span, [contenteditable="true"]';
+
   let generationSeq = 0;
   let currentGenerationToken = "";
   const elementMap = new Map();
@@ -204,13 +216,27 @@
     return false;
   }
 
+  function isObservableControlCandidate(el) {
+    const tag = (el.tagName || "").toLowerCase();
+    const role = el.getAttribute("role");
+    const native = ["button", "a", "input", "textarea", "select", "option", "table"].includes(tag);
+    const semantic = ["button", "link", "textbox", "checkbox", "radio", "option"].includes(role);
+    const focusable = el.hasAttribute("tabindex") && Number(el.getAttribute("tabindex")) >= 0
+      && String(el.innerText || "").length <= 256 && (el.children?.length || 0) <= 4;
+    const labelControl = tag === "label" && el.control && !isSensitiveField(el.control);
+    const pointer = tag === "span" && global.getComputedStyle?.(el)?.cursor === "pointer"
+      && String(el.innerText || "").trim().length > 0
+      && String(el.innerText || "").length <= 256 && (el.children?.length || 0) === 0;
+    return native || semantic || focusable || labelControl || pointer || el.isContentEditable;
+  }
+
   function scanDocument(options = {}) {
     if (isCrossOriginFrame()) {
       return { ok: false, error: "cross_origin_iframe_blocked" };
     }
 
     generationSeq += 1;
-    currentGenerationToken = `pa_gen_${generationSeq}_${Date.now().toString(36)}`;
+    currentGenerationToken = `pa_gen_${documentNonce}_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
     selectOptionMap.clear();
     selectOptionTruncatedRefs.clear();
@@ -218,9 +244,7 @@
     const doc = global.document;
     if (!doc) return { ok: false, error: "document_unavailable" };
 
-    const candidates = doc.querySelectorAll(
-      'button, a[href], input, textarea, select, option, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="option"], [tabindex], label, span, [contenteditable="true"]'
-    );
+    const candidates = doc.querySelectorAll(OBSERVABLE_CONTROL_SELECTOR);
 
     const elements = [];
     let elementIndex = 0;
@@ -229,16 +253,7 @@
       if (elements.length >= MAX_ELEMENTS) break;
       const tag = (el.tagName || "").toLowerCase();
 
-      const role = el.getAttribute("role");
-      const native = ["button", "a", "input", "textarea", "select", "option", "table"].includes(tag);
-      const semantic = ["button", "link", "textbox", "checkbox", "radio", "option"].includes(role);
-      const focusable = el.hasAttribute("tabindex") && Number(el.getAttribute("tabindex")) >= 0
-        && String(el.innerText || "").length <= 256 && (el.children?.length || 0) <= 4;
-      const labelControl = tag === "label" && el.control && !isSensitiveField(el.control);
-      const pointer = tag === "span" && global.getComputedStyle?.(el)?.cursor === "pointer"
-        && String(el.innerText || "").trim().length > 0
-        && String(el.innerText || "").length <= 256 && (el.children?.length || 0) === 0;
-      if (!native && !semantic && !focusable && !labelControl && !pointer && !el.isContentEditable) continue;
+      if (!isObservableControlCandidate(el)) continue;
 
       // Exclude prohibited inputs and sensitive autocomplete fields
       if (isSensitiveField(el) || el.closest?.('[hidden], [aria-hidden="true"], [inert]')) continue;
@@ -953,15 +968,18 @@
       if (value.length > 256 || value !== value.trim()) {
         return { ok: false, error: "expect_value_invalid", condition };
       }
-      const controls = global.document?.querySelectorAll?.(
-        'button, a[href], input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="option"], [tabindex], label, span, [contenteditable="true"]'
-      ) || [];
-      const truncated = controls.length > MAX_ELEMENTS;
+      const controls = global.document?.querySelectorAll?.(OBSERVABLE_CONTROL_SELECTOR) || [];
+      let truncated = false;
       let found = false;
       let inspected = 0;
       for (const el of controls) {
-        if (++inspected > MAX_ELEMENTS) break;
-        if (!el.isConnected || isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) continue;
+        if (!el.isConnected || !isObservableControlCandidate(el)
+          || isSensitiveField(el) || el.closest?.('[hidden], [aria-hidden="true"], [inert]')
+          || isElementHidden(el) || isElementDisabled(el)) continue;
+        if (++inspected > MAX_ELEMENTS) {
+          truncated = true;
+          break;
+        }
         const exactLabels = [
           el.getAttribute?.("aria-label"),
           el.getAttribute?.("placeholder"),
