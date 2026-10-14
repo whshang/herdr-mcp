@@ -771,6 +771,78 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(uncertain.mutation_submitted, true);
 });
 
+test("user verifies an explicit same-origin history target | Given an observed button with no link URL | When click supplies a bounded expected URL | Then only the confirmed destination can retain page ownership", async () => {
+  const tab = { id: 83, url: "https://example.com/route-two", status: "complete", active: true };
+  const tabs = new Map([[tab.id, tab]]);
+  let clicks = 0;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_history_1", origin: "https://example.com",
+        url: tab.url, elements: [{ ref: "ref_pa_gen_history_1_0", text: "History back" }],
+      };
+      if (payload.action === "click") {
+        clicks++;
+        tab.url = "https://example.com/route-one";
+        return { ok: true, generation: payload.generation, ref: payload.ref };
+      }
+      throw new Error("unexpected action");
+    },
+  });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com",
+    url: tab.url, idempotencyKey: "history-claim-1",
+  });
+  assert.equal(claimed.ok, true);
+
+  const denied = await h.performBrowserPageActionRequest({
+    action: "click", pageRef: claimed.page_ref, generation: "pa_gen_history_1",
+    ref: "ref_pa_gen_history_1_0", expectedUrl: "https://other.example/path",
+  });
+  assert.equal(denied.error, "navigation_expectation_invalid");
+  assert.equal(denied.delivery_state, "not_applied");
+  assert.equal(denied.mutation_submitted, false);
+  assert.equal(clicks, 0);
+
+  const applied = await h.performBrowserPageActionRequest({
+    action: "click", pageRef: claimed.page_ref, generation: "pa_gen_history_1",
+    ref: "ref_pa_gen_history_1_0", expectedUrl: "https://example.com/route-one",
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.delivery_state, "applied");
+  assert.equal(applied.page_generation, 2);
+  assert.equal(h.browserPagesByRef.get(claimed.page_ref).canonical_url, "https://example.com/route-one");
+  assert.equal(clicks, 1);
+  const observed = await h.performBrowserPageActionRequest({ action: "observe", pageRef: claimed.page_ref });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.url, "https://example.com/route-one");
+
+  const unmatchedTab = { id: 84, url: "https://example.com/route-two", status: "complete", active: true };
+  const failing = browserPageLifecycleHarness({
+    tabs: new Map([[unmatchedTab.id, unmatchedTab]]),
+    contentResponder: (_tabId, payload) => {
+      unmatchedTab.url = "https://example.com/route-unexpected";
+      return { ok: true, generation: payload.generation, ref: payload.ref };
+    },
+  });
+  const initial = await failing.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com",
+    url: unmatchedTab.url, idempotencyKey: "history-claim-2",
+  });
+  const uncertain = await failing.performBrowserPageActionRequest({
+    action: "click", pageRef: initial.page_ref, generation: "pa_gen_history_1",
+    ref: "ref_pa_gen_history_1_0", expectedUrl: "https://example.com/route-one",
+  });
+  assert.equal(uncertain.ok, false);
+  assert.equal(uncertain.error, "navigation_postcondition_unverified");
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  assert.equal(uncertain.mutation_submitted, true);
+  assert.equal(unmatchedTab.url, "https://example.com/route-unexpected");
+  assert.equal(failing.browserPagesByRef.get(initial.page_ref).canonical_url, "https://example.com/route-two");
+});
+
 test("user rejects invalid native form states | Given unavailable dropdown or unsupported checkable state | When fill checks the observed control | Then delivery is not_applied and retry-safe", async () => {
   const tabs = new Map([[71, { id: 71, url: "https://example.com/form", active: true }]]);
   let rejection = "select_option_unavailable";
