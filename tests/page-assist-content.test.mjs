@@ -48,7 +48,9 @@ function createElement({
     hasAttribute(name) { return attributes.has(name); },
     setAttribute(name, value) { attributes.set(name, String(value)); },
     getBoundingClientRect() {
-      return visible ? { width: 120, height: 28 } : { width: 0, height: 0 };
+      return this.offsetParent
+        ? { left: 20, top: 30, right: 140, bottom: 58, width: 120, height: 28 }
+        : { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
     },
     scrollIntoView() {},
     focus() { this.focused += 1; },
@@ -97,6 +99,7 @@ function harness({
     ...extraGlobals,
     scrollY,
     innerHeight: 600,
+    innerWidth: 1000,
     scrollBy({ top }) {
       this.scrollY = Math.max(0, Math.min(scrollMax, this.scrollY + top));
     },
@@ -203,6 +206,50 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   });
   assert.equal(linkClick.ok, true);
   assert.equal(linkClick.navigation_url, "https://app.test/details");
+});
+
+test("user hovers a bounded visible card | Given a CSS-hidden edit button | When an observed hover-only ref is prepared | Then the revealed button receives its own ref only after a new observation", () => {
+  const card = createElement({
+    tag: "div", text: "Existing evaluation", attrs: { class: "evaluationCard__sample" },
+  });
+  const edit = createElement({ tag: "button", text: "Edit evaluation", visible: false });
+  const password = createElement({ tag: "input", type: "password", value: "private" });
+  const h = harness({ elements: [card, edit, password] });
+  const first = h.send({ type: "h2w_page_assist", action: "observe" });
+  assert.equal(first.ok, true);
+  assert.equal(first.elements.length, 1);
+  assert.equal(first.elements[0].hover_only, true);
+  assert.equal(first.elements[0].text, "Existing evaluation");
+  assert.equal(JSON.stringify(first).includes("Edit evaluation"), false);
+  assert.equal(JSON.stringify(first).includes("private"), false);
+  const rejected = h.send({
+    type: "h2w_page_assist", action: "click", generation: first.generation,
+    ref: first.elements[0].ref,
+  });
+  assert.equal(rejected.error, "hover_only_target");
+  assert.equal(card.clicked, 0);
+  const pressed = h.send({
+    type: "h2w_page_assist", action: "press", generation: first.generation,
+    ref: first.elements[0].ref, key: "Enter",
+  });
+  assert.equal(pressed.error, "hover_only_target");
+  const prepared = h.send({
+    type: "h2w_page_assist", action: "hover", generation: first.generation,
+    ref: first.elements[0].ref,
+  });
+  assert.equal(prepared.ok, true);
+  assert.equal(prepared.hover_point.x, 80);
+  assert.equal(prepared.hover_point.y, 44);
+  assert.equal(h.send({
+    type: "h2w_page_assist", action: "hover", generation: first.generation,
+    ref: first.elements[0].ref,
+  }).error, "stale_generation");
+  edit.offsetParent = {};
+  const after = h.send({ type: "h2w_page_assist", action: "observe" });
+  assert.equal(after.elements.length, 2);
+  const editable = after.elements.find((element) => element.text === "Edit evaluation");
+  assert.ok(editable?.ref);
+  assert.equal(editable.hover_only, undefined);
 });
 
 test("user scrolls the viewport | Given a bounded observed page | When scrolling by direction and pixels | Then movement and a boundary are reported without reusing stale generation", () => {

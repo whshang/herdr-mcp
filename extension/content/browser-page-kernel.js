@@ -11,6 +11,7 @@
   const MAX_CHARS_CEILING = 100000;
   const MAX_FILL_CHARS = 10000;
   const MAX_ELEMENTS = 128;
+  const MAX_HOVER_TARGETS = 32;
   const DISALLOWED_INPUT_TYPES = new Set(["password", "file", "hidden"]);
   const FORBIDDEN_PARAM_KEYS = new Set([
     "selector", "css", "xpath", "js", "script", "eval", "code", "cookie", "storage", "cdp"
@@ -98,11 +99,12 @@
   })();
 
   const OBSERVABLE_CONTROL_SELECTOR =
-    'button, a[href], input, textarea, select, option, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="option"], [tabindex], label, span, div[class], [contenteditable="true"]';
+    'button, a[href], input, textarea, select, option, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="option"], [role="group"], [role="listitem"], [tabindex], label, span, div[class], article, section[class], li[class], [contenteditable="true"]';
 
   let generationSeq = 0;
   let currentGenerationToken = "";
   const elementMap = new Map();
+  const hoverOnlyRefs = new Set();
   const selectOptionMap = new Map();
   // Refs whose observed option list was a truncated prefix of the live list.
   const selectOptionTruncatedRefs = new Set();
@@ -110,6 +112,7 @@
   function invalidateGeneration() {
     currentGenerationToken = "";
     elementMap.clear();
+    hoverOnlyRefs.clear();
     selectOptionMap.clear();
     selectOptionTruncatedRefs.clear();
   }
@@ -237,6 +240,17 @@
       && !el.querySelector?.("input, textarea, select, button, a[href], [contenteditable], [role]");
   }
 
+  function isHoverOnlyCandidate(el) {
+    const tag = (el.tagName || "").toLowerCase();
+    if (!["div", "article", "section", "li"].includes(tag)) return false;
+    const role = String(el.getAttribute("role") || "");
+    const classes = String(el.getAttribute("class") || "");
+    if (!/(?:card|tile|row|item)/i.test(classes) && !["group", "listitem"].includes(role)) return false;
+    const rect = el.getBoundingClientRect?.();
+    if (!rect || rect.width < 16 || rect.height < 16 || rect.width > 1600 || rect.height > 800) return false;
+    return cleanText(collectVisibleText(el, 121), 120).length > 0;
+  }
+
   function scanDocument(options = {}) {
     if (isCrossOriginFrame()) {
       return { ok: false, error: "cross_origin_iframe_blocked" };
@@ -245,6 +259,7 @@
     generationSeq += 1;
     currentGenerationToken = `pa_gen_${documentNonce}_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
+    hoverOnlyRefs.clear();
     selectOptionMap.clear();
     selectOptionTruncatedRefs.clear();
 
@@ -255,12 +270,15 @@
 
     const elements = [];
     let elementIndex = 0;
+    let hoverTargets = 0;
 
     for (const el of candidates) {
       if (elements.length >= MAX_ELEMENTS) break;
       const tag = (el.tagName || "").toLowerCase();
 
-      if (!isObservableControlCandidate(el)) continue;
+      const clickable = isObservableControlCandidate(el);
+      const hoverOnly = !clickable && hoverTargets < MAX_HOVER_TARGETS && isHoverOnlyCandidate(el);
+      if (!clickable && !hoverOnly) continue;
 
       // Exclude prohibited inputs and sensitive autocomplete fields
       if (isSensitiveField(el) || el.closest?.('[hidden], [aria-hidden="true"], [inert]')) continue;
@@ -271,10 +289,14 @@
 
       const ref = `ref_${currentGenerationToken}_${elementIndex++}`;
       elementMap.set(ref, el);
+      if (hoverOnly) {
+        hoverOnlyRefs.add(ref);
+        hoverTargets += 1;
+      }
 
       const roleAttr = el.getAttribute("role");
       const observedRole = roleAttr || (tag === "a" ? "link" : tag);
-      const label = (
+      const label = hoverOnly ? cleanText(collectVisibleText(el, 121), 121) : (
         el.getAttribute("aria-label") ||
         el.getAttribute("placeholder") ||
         el.innerText ||
@@ -308,6 +330,7 @@
         ref: ref.slice(0, 256),
         tag,
         role: String(observedRole || "").slice(0, 64),
+        hover_only: hoverOnly || undefined,
         id: structuralToken(el.getAttribute("id")),
         data_testid: structuralToken(el.getAttribute("data-testid")),
         classes: classes.length ? classes : undefined,
@@ -328,7 +351,7 @@
           ? cleanText((selectOptions || []).find((option) => option.value === el.value)?.label
             || (selectOptions || []).find((option) => option.value === el.value)?.textContent, 80) || undefined
           : undefined,
-        fast_path: fastPathActionClass(el, tag),
+        fast_path: hoverOnly ? undefined : fastPathActionClass(el, tag),
       });
     }
 
@@ -628,6 +651,7 @@
       if (!ref.startsWith(`ref_${generation}_`)) return { ok: false, error: "invalid_ref" };
       const el = elementMap.get(ref);
       if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+      if (hoverOnlyRefs.has(ref)) return { ok: false, error: "hover_only_target" };
       if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
         return { ok: false, error: "unsupported_element" };
       }
@@ -665,6 +689,45 @@
     }
   }
 
+  function executeHover(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const gen = String(params.generation || "").trim();
+    if (!gen || gen !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    const ref = String(params.ref || "").trim();
+    if (!ref.startsWith(`ref_${gen}_`)) return { ok: false, error: "invalid_ref" };
+    const el = elementMap.get(ref);
+    if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+    if (isSensitiveField(el) || el.closest?.('[hidden], [aria-hidden="true"], [inert]')) {
+      return { ok: false, error: "unsupported_element" };
+    }
+    if (isElementHidden(el) || isElementDisabled(el)) return { ok: false, error: "element_hidden" };
+    try { el.scrollIntoView?.({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
+    const rect = el.getBoundingClientRect?.();
+    const width = Number(global.innerWidth || global.document?.documentElement?.clientWidth);
+    const height = Number(global.innerHeight || global.document?.documentElement?.clientHeight);
+    if (!rect || !Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1) {
+      return { ok: false, error: "hover_target_offscreen" };
+    }
+    const left = Math.max(0, rect.left), top = Math.max(0, rect.top);
+    const right = Math.min(width, rect.right), bottom = Math.min(height, rect.bottom);
+    if (!(right > left + 1 && bottom > top + 1)) {
+      return { ok: false, error: "hover_target_offscreen" };
+    }
+    const x = Math.round((left + right) / 2);
+    const y = Math.round((top + bottom) / 2);
+    const hit = global.document?.elementFromPoint?.(x, y);
+    if (hit && hit !== el && !el.contains?.(hit)) {
+      return { ok: false, error: "hover_target_obscured" };
+    }
+    invalidateGeneration();
+    return { ok: true, ref, generation: gen, hover_point: { x, y } };
+  }
+
   function executeClick(params = {}) {
     if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
     if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
@@ -689,6 +752,7 @@
     if (!el || !el.isConnected) {
       return { ok: false, error: "element_detached" };
     }
+    if (hoverOnlyRefs.has(ref)) return { ok: false, error: "hover_only_target" };
 
     if (isElementDisabled(el)) {
       return { ok: false, error: "element_disabled" };
@@ -1047,6 +1111,7 @@
     const action = String(msg?.action || "").toLowerCase();
     if (action === "inspect" || action === "observe") return scanDocument(msg);
     if (action === "click") return executeClick(msg);
+    if (action === "hover") return executeHover(msg);
     if (action === "fill") return executeFill(msg);
     if (action === "extract") return executeExtract(msg);
     if (action === "extract_table") return executeExtractTable(msg);

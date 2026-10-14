@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.207";
+const H2W_SCRIPT_VERSION = "0.1.208";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -8229,6 +8229,9 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "scroll_unavailable",
   "press_params_invalid",
   "press_unavailable",
+  "hover_only_target",
+  "hover_target_offscreen",
+  "hover_target_obscured",
 ]);
 
 function browserPageMutationEnvelope(result, page, sendAttempted) {
@@ -8445,7 +8448,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table"].includes(action)) {
+  if (!["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -8455,7 +8458,7 @@ async function performBrowserPageActionRequest(msg) {
 
   const pageRef = String(msg?.pageRef || "");
   if (!validBrowserPageRef(pageRef)) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
       : { ok: false, error: "browser_page_ref_invalid" };
   }
@@ -8463,12 +8466,12 @@ async function performBrowserPageActionRequest(msg) {
   await loadBrowserPages();
   const record = browserPagesByRef.get(pageRef);
   if (!record) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
       : { ok: false, error: "browser_page_not_found" };
   }
   if (record.endpoint_ref !== endpointRef) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
       : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
   }
@@ -8481,14 +8484,14 @@ async function performBrowserPageActionRequest(msg) {
       reason: "host_permission_missing",
       origin: record.origin,
     };
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope(denied, record, false)
       : withBrowserPageIdentity(denied, record);
   }
 
   const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
   if (!resolved.ok) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope(resolved, record, false)
       : withBrowserPageIdentity(resolved, record);
   }
@@ -8497,6 +8500,9 @@ async function performBrowserPageActionRequest(msg) {
     return captureBrowserPageScreenshot(page, resolved.tab);
   }
   const tabId = resolved.tab.id;
+  if (action === "hover" && (page.ownership !== "owned" || !chrome.debugger)) {
+    return browserPageMutationEnvelope({ ok: false, error: "browser_page_hover_unavailable" }, page, false);
+  }
   const rawExpectedUrl = msg?.expectedUrl;
   const expectedUrl = rawExpectedUrl == null
     ? null
@@ -8523,7 +8529,7 @@ async function performBrowserPageActionRequest(msg) {
     ...(action === "fill" ? { mainWorldFill: true } : {}),
   };
 
-  const mutation = action === "click" || action === "fill" || action === "scroll" || action === "press";
+  const mutation = action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press";
   let sendAttempted = false;
   const send = async () => {
     sendAttempted = true;
@@ -8533,6 +8539,11 @@ async function performBrowserPageActionRequest(msg) {
   try {
     const response = await send();
     if (mutation) {
+      if (action === "hover") {
+        if (response?.ok !== true) return browserPageMutationEnvelope(response, page, false);
+        const hover = await browserPageTrustedHover(tabId, response.hover_point);
+        return browserPageMutationEnvelope(hover.result, page, hover.dispatched);
+      }
       let mutationResponse = response;
       if (action === "fill" && response?.ok === true && typeof response?.main_world_fill_token === "string") {
         mutationResponse = await browserPageMainWorldFill(tabId, response, { page, tab: resolved.tab });
@@ -8686,6 +8697,43 @@ function h2wFillTargetProbe(selector, mode) {
 
 function browserPageFillNormalize(value) {
   return String(value || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+async function browserPageTrustedHover(tabId, point) {
+  const x = Number(point?.x);
+  const y = Number(point?.y);
+  if (!Number.isInteger(x) || !Number.isInteger(y)
+      || x < 0 || y < 0 || x > 10000 || y > 10000) {
+    return { result: { ok: false, error: "hover_target_invalid" }, dispatched: false };
+  }
+  const target = { tabId };
+  let attached = false;
+  let dispatched = false;
+  let result = { ok: false, error: "browser_page_hover_unavailable" };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    dispatched = true;
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse",
+    });
+    result = { ok: true, hover_dispatched: true, hover_requires_observe: true };
+  } catch (_) {
+    result = { ok: false, error: dispatched ? "hover_delivery_unconfirmed" : "browser_page_hover_unavailable" };
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_) {
+        try {
+          await chrome.debugger.detach(target);
+        } catch (_) {
+          result = { ok: false, error: "hover_debugger_detach_unverified" };
+        }
+      }
+    }
+  }
+  return { result, dispatched };
 }
 
 function browserPageTrustedFillAllowed(page) {

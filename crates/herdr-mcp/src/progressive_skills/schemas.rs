@@ -752,7 +752,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 "properties": {
                     "endpoint_ref": {"type": "string", "maxLength": 96},
                     "page_ref": {"type": "string", "maxLength": 67},
-                    "action": {"type": "string", "enum": ["observe", "click", "fill", "expect", "screenshot", "scroll", "extract", "extract_table", "press"]},
+                    "action": {"type": "string",  "enum": ["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "extract", "extract_table", "press"]},
                     "max_chars": {"type": ["integer", "null"], "minimum": 1, "maximum": 100000},
                     "generation": {"type": ["string", "null"], "maxLength": 256},
                     "ref": {"type": ["string", "null"], "maxLength": 256},
@@ -774,6 +774,10 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     },
                     {
                         "properties": {"action": {"enum": ["click"]}},
+                        "required": ["generation", "ref", "idempotency_key"],
+                    },
+                    {
+                        "properties": {"action": {"enum": ["hover"]}},
                         "required": ["generation", "ref", "idempotency_key"],
                     },
                     {
