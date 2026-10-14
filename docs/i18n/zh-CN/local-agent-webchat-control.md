@@ -344,7 +344,7 @@ Agent 应按这个顺序做：
 | 同一个会话被两个 browser endpoint 观测过 | canonical URL 必须唯一解析到一个已登记的 session。两个不同 session 共享同一 URL 即为歧义，直接返回 `browser_canonical_url_ambiguous`，不会按最新观测选择，source-anchored create 与 handoff 都不会改投到其他 profile/account 的 session。重新观测不会移除另一个 session 的记录，该 URL 对 source-anchored create 与 handoff 仍然有歧义；请改用显式指定 endpoint、provider、account 与 generation 的 direct create |
 | dispatch 超时 | 先读 `herdr-mcp webchat dispatch-status DISPATCH_ID`，再观测会话，然后才决策 |
 | 写操作 delivery 不确定 | 先重新观测。不要换新 idempotency key 重发 |
-| `code: "caller_grant_missing"` | 你不在受信任本地路径上（例如裸 TCP MCP 客户端）。请使用 `herdr-mcp` CLI，它自己附带本地 grant；grant 无法通过 TCP 自证 |
+| `code: "caller_grant_missing"` | 两种原因之一。(1) 你不在受信任本地路径上（例如裸 TCP MCP 客户端）：请改用 `herdr-mcp` CLI，它自己附带本地 grant——grant 无法通过 TCP 自证。(2) 调用方是远程 connector，其 Page Assist grant 缺失或已失效：Page Assist grant 绑定 `{connector_id, grant_generation, device_id, endpoint_ref}`，ChatGPT 重新授权（产生新 `connector_id`）或扩展 ID 变化（产生新 `endpoint_ref`）都会使旧 grant 静默失效。由 workstation 所有者按顺序恢复：`herdr-mcp connector list` → `browser_endpoint.list`（CLI：`herdr-mcp webchat endpoints`；选在线且版本最新的端点）→ `herdr-mcp connector page-assist allow CONNECTOR_ID DEVICE_ID ENDPOINT_REF --confirm` |
 | `code: "unsupported"` | 该操作不在当前支持矩阵内（见“能力发现”），请如实报告而不是模拟实现 |
 | 能找到 continuity，但 browser session 已不在 | 先解析持久状态（`continuity resume`），再创建/打开目标会话；不要把页面消失当成历史丢失 |
 | session 存在但 `work_memory` 为 `null` | 停在 Continuity 层。没有可用的 `project_ref`/`repo_id`/`work_chain_id`，也不允许合成 |

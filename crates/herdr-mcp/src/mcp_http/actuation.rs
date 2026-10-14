@@ -180,14 +180,20 @@ impl BrowserActuationBroker {
     /// test asserts that the stream refreshed extension liveness without
     /// exposing the broker's lock or state to the parent module.
     pub(super) fn extension_live_for_endpoint(&self, endpoint_ref: &str) -> bool {
-        let Ok(state) = self.inner.0.lock() else {
-            return false;
-        };
-        Self::extension_live(&state, Some(endpoint_ref))
+        self.endpoint_live(endpoint_ref).unwrap_or(false)
     }
 }
 
 impl BrowserActuator for BrowserActuationBroker {
+    /// Liveness from the live extension SSE heartbeat window, not from the
+    /// endpoint's historical `last_observed_at`. `None` (unknown) is reserved
+    /// for a broken broker lock; an endpoint without a fresh heartbeat is
+    /// `Some(false)` (stale).
+    fn endpoint_live(&self, endpoint_ref: &str) -> Option<bool> {
+        let state = self.inner.0.lock().ok()?;
+        Some(Self::extension_live(&state, Some(endpoint_ref)))
+    }
+
     fn actuate(
         &self,
         operation: &str,
@@ -411,6 +417,42 @@ impl BrowserActuator for BrowserActuationBroker {
 mod tests {
     use super::super::SSE_HEARTBEAT;
     use super::*;
+
+    #[test]
+    fn endpoint_live_reports_per_endpoint_heartbeat_liveness() {
+        let broker = BrowserActuationBroker::default();
+        let endpoint_a = format!("bep_{}", "a".repeat(64));
+        let endpoint_b = format!("bep_{}", "b".repeat(64));
+
+        assert_eq!(
+            broker.endpoint_live(&endpoint_a),
+            Some(false),
+            "an endpoint that never sent an extension heartbeat is stale, not unknown"
+        );
+
+        broker.note_extension_poll(Some(&endpoint_a));
+        assert_eq!(broker.endpoint_live(&endpoint_a), Some(true));
+        assert_eq!(
+            broker.endpoint_live(&endpoint_b),
+            Some(false),
+            "liveness is per endpoint and must not leak across endpoints"
+        );
+
+        // Force the heartbeat past the live window without sleeping.
+        {
+            let (lock, _) = &*broker.inner;
+            let mut state = lock.lock().unwrap();
+            state.last_endpoint_polls.insert(
+                endpoint_a.clone(),
+                Instant::now() - BROWSER_EXTENSION_LIVE_WINDOW - Duration::from_secs(1),
+            );
+        }
+        assert_eq!(
+            broker.endpoint_live(&endpoint_a),
+            Some(false),
+            "an endpoint whose heartbeat aged past the live window must be stale"
+        );
+    }
 
     #[test]
     fn browser_actuation_liveness_refreshes_on_idle_sse_heartbeat() {

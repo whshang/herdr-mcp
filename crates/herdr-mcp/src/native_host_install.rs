@@ -1449,6 +1449,28 @@ fn status_with_active_runtime(paths: &InstallPaths, active_runtime: Option<&Path
     } else {
         "dev"
     };
+    // Issue #626: when the unpacked development extension Chrome actually
+    // loaded is not accepted by any installed manifest allowlist, the
+    // extension cannot launch the native host at all, so status must say so
+    // with the loaded id, the current allowlist, and the exact repair command.
+    // An unusable environment input only skips the advisory check; the rest of
+    // the read-only status report stays authoritative.
+    let extension_id_allowlist_warning =
+        crate::native_host_origin_check::loaded_dev_extension_identity(
+            env::var_os("HERDR_EXTENSION_ORIGIN").as_deref(),
+            env::var_os("HERDR_EXTENSION_PATH").as_deref(),
+        )
+        .ok()
+        .flatten()
+        .and_then(|identity| {
+            let allowed_origins =
+                crate::native_host_origin_check::collect_allowed_origins(&manifests);
+            crate::native_host_origin_check::dev_origin_allowlist_warning(
+                &identity.extension_id,
+                &allowed_origins,
+                &identity.fix_command,
+            )
+        });
     json!({
         "ok": runtime_binary_ok && wrapper_ok && owned_count > 0,
         "implementation": "rust",
@@ -1465,6 +1487,7 @@ fn status_with_active_runtime(paths: &InstallPaths, active_runtime: Option<&Path
         "dev_enabled": paths.dev_extension_origin.is_some(),
         "registered_dev_extension_id": registered_dev_extension_id,
         "registered_dev_extension_origin": paths.dev_extension_origin,
+        "extension_id_allowlist_warning": extension_id_allowlist_warning,
         "runtime_binary": paths.runtime_binary,
         "runtime_binary_ok": runtime_binary_ok,
         "runtime_matches_current": runtime_matches_current,
@@ -2703,13 +2726,13 @@ fn manifest_status(path: &Path, paths: &InstallPaths) -> Value {
         Err(_) => return json!({"path": path, "invalid": true}),
     };
     let host_path = manifest.get("path").and_then(Value::as_str);
-    let allowed = manifest
+    let allowed_origins: Vec<&str> = manifest
         .get("allowed_origins")
         .and_then(Value::as_array)
-        .is_some_and(|origins| {
-            origins.len() == 1
-                && origins.first().and_then(Value::as_str) == Some(paths.extension_origin.as_str())
-        });
+        .map(|origins| origins.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let allowed = allowed_origins.len() == 1
+        && allowed_origins.first().copied() == Some(paths.extension_origin.as_str());
     let rust_wrapper = wrapper_is_rust(&paths.wrapper);
     let wrapper_identity_match = wrapper_identity_matches(&paths.wrapper, paths);
     let owned = rust_wrapper
@@ -2722,6 +2745,7 @@ fn manifest_status(path: &Path, paths: &InstallPaths) -> Value {
         "path": path,
         "host_path": host_path,
         "allowed": allowed,
+        "allowed_origins": allowed_origins,
         "rust_wrapper": rust_wrapper,
         "wrapper_identity_match": wrapper_identity_match,
         "owned": owned,
@@ -3087,12 +3111,85 @@ mod tests {
             view["registered_dev_extension_origin"],
             paths.extension_origin
         );
+        // No HERDR_EXTENSION_PATH is set in this test, so status has no
+        // loaded-dev identity to check and reports no allowlist warning.
+        if env::var_os("HERDR_EXTENSION_PATH").is_none()
+            && env::var_os("HERDR_EXTENSION_ORIGIN").is_none()
+        {
+            assert_eq!(view["extension_id_allowlist_warning"], Value::Null);
+        }
 
         let removed = uninstall(&paths).unwrap();
         assert_eq!(removed["ok"], true);
         assert!(!stable_manifest.exists());
         assert!(!paths.wrapper.exists());
         assert!(!paths.runtime_binary.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn status_warns_when_loaded_dev_extension_id_misses_installed_allowlist() {
+        let (root, paths) = fixture();
+        install(&paths).unwrap();
+        // Issue #626 repro: Chrome loads a rebuilt unpacked extension under a
+        // different directory id while every installed manifest still only
+        // allows the previously registered dev origin.
+        let rebuilt = root.join("repo").join("extension-rebuilt");
+        fs::create_dir_all(&rebuilt).unwrap();
+        fs::write(rebuilt.join("manifest.json"), b"{}").unwrap();
+        let loaded_id = crate::native_host::chromium_id_for_path(&rebuilt).unwrap();
+        assert_ne!(
+            loaded_id, paths.extension_id,
+            "fixture must install an allowlist that excludes the rebuilt id"
+        );
+
+        let previous_path = env::var_os("HERDR_EXTENSION_PATH");
+        let previous_origin = env::var_os("HERDR_EXTENSION_ORIGIN");
+        unsafe {
+            env::set_var("HERDR_EXTENSION_PATH", &rebuilt);
+            env::remove_var("HERDR_EXTENSION_ORIGIN");
+        }
+        let view = status_with_active_runtime(&paths, None);
+        unsafe {
+            match previous_origin.as_ref() {
+                Some(value) => env::set_var("HERDR_EXTENSION_ORIGIN", value),
+                None => env::remove_var("HERDR_EXTENSION_ORIGIN"),
+            }
+            match previous_path.as_ref() {
+                Some(value) => env::set_var("HERDR_EXTENSION_PATH", value),
+                None => env::remove_var("HERDR_EXTENSION_PATH"),
+            }
+        }
+
+        let warning = &view["extension_id_allowlist_warning"];
+        assert_eq!(
+            warning["code"],
+            "loaded_extension_id_not_in_allowed_origins"
+        );
+        assert_eq!(warning["loaded_extension_id"], loaded_id);
+        assert_eq!(warning["allowed_origins"], json!([paths.extension_origin]));
+        let fix_command = warning["fix_command"].as_str().unwrap();
+        assert!(fix_command.contains("HERDR_EXTENSION_PATH="));
+        assert!(fix_command.contains("herdr-mcp native-host install"));
+        let message = warning["message"].as_str().unwrap();
+        assert!(message.contains(&loaded_id));
+        assert!(message.contains(&paths.extension_id));
+        assert!(message.contains(fix_command));
+
+        // With the installed dev origin named explicitly, the loaded id is
+        // allowed again and status stays quiet.
+        unsafe {
+            env::set_var("HERDR_EXTENSION_ORIGIN", &paths.extension_origin);
+        }
+        let quiet = status_with_active_runtime(&paths, None);
+        unsafe {
+            match previous_origin.as_ref() {
+                Some(value) => env::set_var("HERDR_EXTENSION_ORIGIN", value),
+                None => env::remove_var("HERDR_EXTENSION_ORIGIN"),
+            }
+        }
+        assert_eq!(quiet["extension_id_allowlist_warning"], Value::Null);
+
         fs::remove_dir_all(root).unwrap();
     }
 
