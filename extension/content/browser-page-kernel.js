@@ -281,7 +281,7 @@
         el.textContent ||
         el.value ||
         ""
-      ).trim().slice(0, 120);
+      ).trim();
       const classes = String(el.getAttribute("class") || "")
         .split(/\s+/)
         .map((value) => structuralToken(value, 48))
@@ -318,7 +318,8 @@
         checked: tag === "input" && ["checkbox", "radio"].includes(String(el.type || "").toLowerCase())
           ? el.checked === true
           : undefined,
-        text: label,
+        text: label.slice(0, 120),
+        text_truncated: label.length > 120 || undefined,
         options: selectOptions ? selectOptions.slice(0, 24).map((option) => (
           cleanText(option.label || option.textContent, 80)
         )) : undefined,

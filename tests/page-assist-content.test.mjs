@@ -1310,6 +1310,30 @@ test("user verifies observed controls | Given a textarea and semantic radio | Wh
   const invalid = await h.sendAsync({ type: "h2w_page_assist", action: "expect", generation: observed.generation, ref: observed.elements[3].ref, condition: "element_class_contains", value: "span.tag" });
   assert.equal(invalid.error, "expect_value_invalid");
 });
+test("user distinguishes clipped input preview from full input value | Given a long safe textarea value | When observe and scoped expect run | Then only the preview is exposed and the exact full value is verified", async () => {
+  const fullValue = `Draft ${"x".repeat(220)} final`;
+  const long = createElement({ tag: "textarea", value: fullValue });
+  const short = createElement({ tag: "textarea", value: "Short draft" });
+  const password = createElement({ tag: "input", type: "password", value: "private-value" });
+  const h = harness({ elements: [long, short, password] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+
+  assert.equal(observed.elements.length, 2);
+  assert.equal(observed.elements[0].text, fullValue.slice(0, 120));
+  assert.equal(observed.elements[0].text_truncated, true);
+  assert.equal(observed.elements[1].text, "Short draft");
+  assert.equal(observed.elements[1].text_truncated, undefined);
+  assert.equal(JSON.stringify(observed).includes("final"), false);
+  assert.equal(JSON.stringify(observed).includes("private-value"), false);
+
+  const matched = await h.sendAsync({
+    type: "h2w_page_assist", action: "expect", condition: "input_value_equals",
+    generation: observed.generation, ref: observed.elements[0].ref, value: fullValue,
+  });
+  assert.equal(matched.ok, true);
+  assert.equal(matched.value, undefined);
+});
+
 test("user rejects expired control assertions | Given an observed input whose generation has been replaced | When scoped expect uses its old ref | Then it fails closed", async () => {
   const h = harness({ elements: [createElement({ tag: "input", value: "draft" })] });
   const old = h.send({ type: "h2w_page_assist", action: "inspect" });
