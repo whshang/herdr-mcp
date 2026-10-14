@@ -308,7 +308,7 @@
         .split(/\s+/)
         .map((value) => structuralToken(value, 48))
         .filter(Boolean)
-        .slice(0, 4);
+        .slice(0, 8);
       // Expose bounded visible labels only; never an option's raw value.
       const selectOptions = tag === "select"
         ? [...(el.options || [])].filter((option) => (

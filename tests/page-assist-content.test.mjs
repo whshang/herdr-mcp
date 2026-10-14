@@ -212,7 +212,10 @@ test("user hovers a bounded visible card | Given a CSS-hidden edit button | When
   const card = createElement({
     tag: "div", text: "Existing evaluation", attrs: { class: "evaluationCard__sample" },
   });
-  const edit = createElement({ tag: "button", text: "Edit evaluation", visible: false });
+  const edit = createElement({
+    tag: "button", text: "Edit evaluation", visible: false,
+    attrs: { class: "ui-button ui-button-icon ui-button-default ui-button-sm edit-icon" },
+  });
   const password = createElement({ tag: "input", type: "password", value: "private" });
   const h = harness({ elements: [card, edit, password] });
   const first = h.send({ type: "h2w_page_assist", action: "observe" });
@@ -250,6 +253,7 @@ test("user hovers a bounded visible card | Given a CSS-hidden edit button | When
   const editable = after.elements.find((element) => element.text === "Edit evaluation");
   assert.ok(editable?.ref);
   assert.equal(editable.hover_only, undefined);
+  assert.ok(editable.classes.includes("edit-icon"));
 });
 
 test("user scrolls the viewport | Given a bounded observed page | When scrolling by direction and pixels | Then movement and a boundary are reported without reusing stale generation", () => {
@@ -822,7 +826,7 @@ test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMi
     attrs: {
       role: "textbox",
       "aria-label": "New chat",
-      class: "ProseMirror editor another other fifth",
+      class: "ProseMirror editor another other fifth sixth seventh eighth ninth",
       "data-testid": "chat-composer",
       id: "invalid:raw-id",
     },
@@ -835,7 +839,7 @@ test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMi
   assert.equal(observed.elements[0].contenteditable, true);
   assert.equal(observed.elements[0].id, undefined);
   assert.equal(observed.elements[0].data_testid, "chat-composer");
-  assert.deepEqual(Array.from(observed.elements[0].classes), ["ProseMirror", "editor", "another", "other"]);
+  assert.deepEqual(Array.from(observed.elements[0].classes), ["ProseMirror", "editor", "another", "other", "fifth", "sixth", "seventh", "eighth"]);
   assert.ok(!Object.hasOwn(observed.elements[0], "outerHTML"));
   assert.ok(!Object.hasOwn(observed.elements[0], "selector"));
 });
