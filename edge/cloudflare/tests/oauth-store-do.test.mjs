@@ -382,7 +382,7 @@ test("WebChat Control grants normalize legacy records and add/remove one exact t
   assert.deepEqual(disabled.record.webchat_control, []);
 });
 
-test("owner grants and revokes one device-wide WebChat scope without changing endpoint grants", async () => {
+test("user owner | Given an active Connector and an endpoint grant | When device-wide WebChat control is allowed and denied | Then only the device-wide tuple changes", async () => {
   const h = harness();
   const connectorId = "conn_device_scope_1";
   h.storage.map.set("grant:device-scope-client", {
