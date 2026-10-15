@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.210";
+const H2W_SCRIPT_VERSION = "0.1.211";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -8268,9 +8268,18 @@ async function captureOwnedBackgroundScreenshot(page, tab) {
       return false;
     }
   };
-  if (!await exactTab()) {
+  if (!chrome.tabs?.onUpdated?.addListener || !chrome.tabs?.onUpdated?.removeListener
+      || !await exactTab()) {
     return { ok: false, error: "browser_page_screenshot_view_changed", retryable: true };
   }
+  let navigationSeen = false;
+  const onTabUpdated = (updatedTabId, changeInfo) => {
+    if (updatedTabId === tab.id
+        && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+      navigationSeen = true;
+    }
+  };
+  chrome.tabs.onUpdated.addListener(onTabUpdated);
 
   let attached = false;
   let detachVerified = true;
@@ -8279,14 +8288,30 @@ async function captureOwnedBackgroundScreenshot(page, tab) {
   try {
     await chrome.debugger.attach(target, "1.3");
     attached = true;
-    const captured = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
-      format: "jpeg", quality: 80, fromSurface: true, captureBeyondViewport: false,
-    });
-    imageData = captured?.data;
-    if (!await exactTab()) error = "browser_page_screenshot_view_changed";
+    const frameIdentity = async () => {
+      const tree = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+      const frame = tree?.frameTree?.frame;
+      if (!frame?.id || !frame?.loaderId
+          || browserPageCanonicalUrl(frame.url, page.origin) !== page.canonical_url) return null;
+      return `${frame.id}:${frame.loaderId}`;
+    };
+    const before = await frameIdentity();
+    if (!before || navigationSeen) {
+      error = "browser_page_screenshot_view_changed";
+    } else {
+      const captured = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+        format: "jpeg", quality: 80, fromSurface: true, captureBeyondViewport: false,
+      });
+      imageData = captured?.data;
+      const after = await frameIdentity();
+      if (navigationSeen || !after || after !== before || !await exactTab()) {
+        error = "browser_page_screenshot_view_changed";
+      }
+    }
   } catch (_) {
     error = "browser_page_screenshot_failed";
   } finally {
+    try { chrome.tabs.onUpdated.removeListener(onTabUpdated); } catch (_) {}
     if (attached) {
       detachVerified = false;
       for (let attempt = 0; attempt < 2 && !detachVerified; attempt += 1) {
