@@ -917,7 +917,7 @@ test("user reveals controls with a trusted hover | Given one owned generic page 
   assert.equal(applied.postcondition_observed, false);
   assert.equal(applied.hover_requires_observe, true);
   assert.equal(Object.hasOwn(applied, "hover_point"), false);
-  assert.deepEqual(events, ["attach", "command", "command", "detach"]);
+  assert.deepEqual(events, ["attach", "command", "command", "command", "detach"]);
   const after = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
   assert.equal(after.elements[0].text, "Edit");
 
@@ -941,7 +941,7 @@ test("user reveals controls with a trusted hover | Given one owned generic page 
   assert.equal(uncertain.delivery_state, "delivery_unknown");
   assert.equal(uncertain.retry_safe, false);
   assert.equal(uncertain.mutation_submitted, true);
-  assert.deepEqual(events.slice(-4), ["attach", "command", "command", "detach"]);
+  assert.deepEqual(events.slice(-5), ["attach", "command", "command", "command", "detach"]);
 });
 
 test("user hovers with a fenced dispatch | Given the document navigates between hover-point preparation and the debugger dispatch | When the post-attach fence sees a different live document | Then no mouse event is dispatched and the hover fails closed retryably", async () => {
@@ -1004,6 +1004,67 @@ test("user hovers with a fenced dispatch | Given the document navigates between 
   assert.equal(fenced.delivery_state, "not_applied");
   assert.equal(fenced.mutation_submitted, false);
   assert.equal(mouseDispatches, 0, "no mouse event may be dispatched after a navigation");
+});
+
+test("user hovers with a fenced dispatch | Given a navigation fires while the final awaited fence leg is in flight | When the post-await gate re-reads the navigation flag | Then no mouse event is dispatched", async () => {
+  let mouseDispatches = 0;
+  let frameReads = 0;
+  const harness = browserPageLifecycleHarness({
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_hovgate_1", origin: "https://example.com",
+        url: "https://example.com/list",
+        elements: [{ ref: "ref_pa_gen_hovgate_1_0", text: "Row", hover_only: true }],
+      };
+      if (payload.action === "hover") return {
+        ok: true, generation: payload.generation, ref: payload.ref,
+        hover_point: { x: 40, y: 40 },
+      };
+      throw new Error("unexpected action");
+    },
+    hoverResponder(phase, target, data) {
+      if (phase === "command" && data.method === "Page.getFrameTree") {
+        frameReads += 1;
+        // Navigation commits during the final awaited leg: the tab-update
+        // listener fires after the tab query resolves but before the gate.
+        if (frameReads === 2) harness.emitTabUpdated(target.tabId, { status: "loading" });
+        return { frameTree: { frame: {
+          id: "frame-gate-1", loaderId: "loader-gate-1", url: "https://example.com/list",
+        } } };
+      }
+      if (phase === "command" && data.method === "Input.dispatchMouseEvent") mouseDispatches += 1;
+    },
+  });
+  const opened = await harness.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/list", idempotencyKey: "hover-gate-1",
+  });
+  assert.equal(opened.ok, true);
+  const observed = await harness.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  const fenced = await harness.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: observed.generation,
+    ref: observed.elements[0].ref,
+  });
+  assert.equal(fenced.ok, false);
+  assert.equal(fenced.error, "browser_page_hover_view_changed");
+  assert.equal(fenced.mutation_submitted, false);
+  assert.equal(mouseDispatches, 0, "navigation during the final await must yield zero mouse events");
+});
+
+test("user probes the hover document anchor | Given the real injected probe source | When it runs in a page-like world | Then it reads location and performance.timeOrigin, not Node globals", async () => {
+  const match = backgroundSource.match(/function h2wHoverDocumentProbe\(\) \{[\s\S]*?\n\}/);
+  assert.ok(match, "h2wHoverDocumentProbe source must stay extractable");
+  const probe = new Function("location", "performance", "globalThis",
+    `${match[0]}\nreturn h2wHoverDocumentProbe();`)(
+    { href: "https://example.com/feed", origin: "https://example.com" },
+    { timeOrigin: 123456.5 },
+    { document: { timeOrigin: 999999 } },
+  );
+  assert.deepEqual(probe, {
+    href: "https://example.com/feed",
+    origin: "https://example.com",
+    timeOrigin: 123456.5,
+  });
 });
 
 test("user rejects invalid native form states | Given unavailable dropdown or unsupported checkable state | When fill checks the observed control | Then delivery is not_applied and retry-safe", async () => {

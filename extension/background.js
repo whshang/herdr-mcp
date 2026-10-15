@@ -8932,21 +8932,35 @@ async function browserPageTrustedHover(tabId, point, ctx) {
   try {
     await chrome.debugger.attach(target, "1.3");
     attached = true;
+    // Anchor the frame/loader identity first, then gather every async leg…
     const tree = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
-    const frame = tree?.frameTree?.frame;
+    const frameAnchor = tree?.frameTree?.frame;
+    const frameAnchorIdentity = frameAnchor?.id && frameAnchor?.loaderId
+      ? `${frameAnchor.id}:${frameAnchor.loaderId}` : null;
     // Same-document guarantee: the live MAIN-world document (origin, exact
     // canonical url, per-load timeOrigin) must still be the one the point was
     // validated against; a reload or committed navigation fails here.
     const liveDocument = await browserPageHoverDocumentProbe(tabId);
     const observed = ctx?.observedDocument;
+    // …and the last await re-reads the frame so a navigation during any
+    // earlier leg (including the tab query) swaps id/loaderId or trips the
+    // tab-update listener before the gate below runs.
+    const tabUnchanged = await exactTab();
+    const treeNow = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+    const frameNow = treeNow?.frameTree?.frame;
+    const frameUnchanged = frameNow?.id && frameNow?.loaderId
+      && `${frameNow.id}:${frameNow.loaderId}` === frameAnchorIdentity;
     const documentUnchanged = observed && liveDocument
       && liveDocument.origin.toLowerCase() === observed.origin.toLowerCase()
       && browserPageCanonicalUrl(liveDocument.href, page.origin) === page.canonical_url
       && liveDocument.timeOrigin === observed.timeOrigin;
+    // Synchronous fail-closed gate AFTER the last await: navigationSeen is
+    // re-read here, so a navigation during the final awaited query can never
+    // dispatch stale coordinates.
     if (navigationSeen
-        || !frame?.id || !frame?.loaderId
-        || browserPageCanonicalUrl(frame.url, page.origin) !== page.canonical_url
-        || !await exactTab()
+        || !frameAnchorIdentity || !frameUnchanged
+        || browserPageCanonicalUrl(frameAnchor.url, page.origin) !== page.canonical_url
+        || !tabUnchanged
         || !documentUnchanged) {
       result = { ok: false, error: "browser_page_hover_view_changed", retryable: true };
     } else {
@@ -8976,11 +8990,13 @@ async function browserPageTrustedHover(tabId, point, ctx) {
 }
 
 function h2wHoverDocumentProbe() {
-  const doc = global.document;
+  // Runs in the page's MAIN world via verified chrome.scripting: browser-page
+  // globals only (location, performance.timeOrigin — the per-load monotonic
+  // anchor), no Node-isms. This is one leg of the fence, never the sole proof.
   return {
-    href: String(global.location?.href || ""),
-    origin: String(global.location?.origin || ""),
-    timeOrigin: Number(doc?.timeOrigin),
+    href: String(location?.href || ""),
+    origin: String(location?.origin || ""),
+    timeOrigin: Number(performance?.timeOrigin),
   };
 }
 
