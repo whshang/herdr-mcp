@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.211";
+const H2W_SCRIPT_VERSION = "0.1.212";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -8468,15 +8468,55 @@ async function captureBrowserPageScreenshot(page, tab) {
     const onFocusChanged = (windowId) => {
       if (windowId !== tab.windowId) viewChanged = true;
     };
+    const onUpdated = (tabId, changeInfo) => {
+      if (tabId === tab.id
+          && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+        viewChanged = true;
+      }
+    };
+    const exactDocument = async () => {
+      try {
+        const result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: "ISOLATED",
+          func: () => ({
+            href: location.href, origin: location.origin, timeOrigin: performance.timeOrigin,
+          }),
+        });
+        const info = result?.[0]?.result;
+        if (info?.href !== page.canonical_url || info?.origin !== page.origin
+            || !Number.isFinite(info?.timeOrigin)) return null;
+        return info.timeOrigin;
+      } catch (_) {
+        return null;
+      }
+    };
+    if (!chrome.tabs.onUpdated?.addListener || !chrome.tabs.onUpdated?.removeListener) {
+      return withBrowserPageIdentity({
+        ok: false, error: "browser_page_screenshot_view_changed",
+        retryable: true, capture_scope: "visible_tab",
+      }, page);
+    }
     chrome.tabs.onActivated.addListener(onActivated);
     chrome.windows.onFocusChanged.addListener(onFocusChanged);
+    chrome.tabs.onUpdated.addListener(onUpdated);
 
     try {
+      const documentTimeOrigin = await exactDocument();
+      if (!documentTimeOrigin || viewChanged) {
+        return withBrowserPageIdentity({
+          ok: false, error: "browser_page_screenshot_view_changed",
+          retryable: true, capture_scope: "visible_tab",
+        }, page);
+      }
       dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
         format: "jpeg",
         quality: 80,
       });
-      if (viewChanged || !await exactTargetIsVisible()) {
+      const afterDocument = await exactDocument();
+      const liveTab = await chrome.tabs.get(tab.id);
+      if (viewChanged || afterDocument !== documentTimeOrigin
+          || liveTab.windowId !== tab.windowId || liveTab.url !== page.canonical_url
+          || !await exactTargetIsVisible()) {
         return withBrowserPageIdentity({
           ok: false,
           error: "browser_page_screenshot_view_changed",
@@ -8495,6 +8535,7 @@ async function captureBrowserPageScreenshot(page, tab) {
     } finally {
       chrome.tabs.onActivated.removeListener(onActivated);
       chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
     }
   }
 
