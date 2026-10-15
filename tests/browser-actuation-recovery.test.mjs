@@ -59,6 +59,7 @@ function browserPageLifecycleHarness({
   let nextTabId = Math.max(100, ...tabs.keys(), 0) + 1;
   const activatedListeners = new Set();
   const focusListeners = new Set();
+  const updatedListeners = new Set();
   const storageArea = {
     async get(key) { return { [key]: structuredClone(sessionStorage[key] || []) }; },
     async set(value) { Object.assign(sessionStorage, structuredClone(value)); },
@@ -127,6 +128,10 @@ function browserPageLifecycleHarness({
             }
           },
         });
+      },
+      onUpdated: {
+        addListener(listener) { updatedListeners.add(listener); },
+        removeListener(listener) { updatedListeners.delete(listener); },
       },
       onActivated: {
         addListener(listener) { activatedListeners.add(listener); },
@@ -213,7 +218,12 @@ function browserPageLifecycleHarness({
       return fetchResponder(...args);
     },
   });
-  return { ...api, sessionStorage, tabs };
+  return {
+    ...api, sessionStorage, tabs,
+    emitTabUpdated(id, changeInfo) {
+      for (const listener of updatedListeners) listener(id, changeInfo);
+    },
+  };
 }
 
 test("user opens a loading generic page | Given Chrome returns only pendingUrl from tabs.create | When BrowserPage waits for navigation completion | Then the owned page is bound to the live URL and retained", async () => {
@@ -1411,7 +1421,8 @@ test("user screenshots an owned background tab without stealing focus | Given an
   const tabs = new Map([[91, userTab]]);
   const calls = [];
   let uploaded = 0;
-  let changeUrl = false;
+  let navigationMode = "none";
+  let loaderId = "load-1";
   const h = browserPageLifecycleHarness({
     tabs,
     windowFocused: true,
@@ -1425,10 +1436,23 @@ test("user screenshots an owned background tab without stealing focus | Given an
         assert.notEqual(target.tabId, userTab.id);
       }
       if (phase === "command") {
+        if (arg.method === "Page.getFrameTree") {
+          return { frameTree: { frame: {
+            id: "frame-1", loaderId, url: "https://example.com/app",
+          } } };
+        }
         assert.equal(arg.method, "Page.captureScreenshot");
         assert.equal(arg.params.format, "jpeg");
         assert.equal(arg.params.captureBeyondViewport, false);
-        if (changeUrl) tabs.get(target.tabId).url = "https://example.com/other";
+        if (navigationMode === "document_aba") {
+          tabs.get(target.tabId).url = "https://other.example/secret";
+          tabs.get(target.tabId).url = "https://example.com/app";
+          loaderId = "load-2";
+        }
+        if (navigationMode === "history_aba") {
+          h.emitTabUpdated(target.tabId, { url: "https://example.com/other" });
+          h.emitTabUpdated(target.tabId, { url: "https://example.com/app" });
+        }
         return { data: "/9j/4AAQSkZJRg==" };
       }
     },
@@ -1463,20 +1487,22 @@ test("user screenshots an owned background tab without stealing focus | Given an
   assert.equal(captured.capture_scope, "owned_background");
   assert.equal(captured.artifact.mime, "image/jpeg");
   assert.equal(Object.hasOwn(captured, "bytes_b64"), false);
-  assert.deepEqual(calls, ["attach", "command", "detach"]);
+  assert.deepEqual(calls, ["attach", "command", "command", "command", "detach"]);
   assert.equal(tabs.get(91).active, true);
   assert.equal(ownedTab.active, false);
   assert.equal(uploaded, 1);
 
-  changeUrl = true;
-  const stale = await h.performBrowserPageActionRequest({
-    action: "screenshot", pageRef: opened.page_ref,
-  });
-  assert.equal(stale.ok, false);
-  assert.equal(stale.error, "browser_page_screenshot_view_changed");
-  assert.equal(stale.capture_scope, "owned_background");
-  assert.deepEqual(calls.slice(-3), ["attach", "command", "detach"]);
-  assert.equal(uploaded, 1, "a navigated image cannot enter artifact storage");
+  for (const mode of ["document_aba", "history_aba"]) {
+    navigationMode = mode;
+    const stale = await h.performBrowserPageActionRequest({
+      action: "screenshot", pageRef: opened.page_ref,
+    });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.error, "browser_page_screenshot_view_changed", mode);
+    assert.equal(stale.capture_scope, "owned_background");
+    assert.deepEqual(calls.slice(-5), ["attach", "command", "command", "command", "detach"]);
+    assert.equal(uploaded, 1, `${mode} must not upload a mismatched image`);
+  }
 });
 
 test("user reads a reviewed Bilibili transcript | Given one exact Bilibili BrowserPage | When the builtin read runs | Then bounded transcript data is returned and logged-out access fails closed", async () => {
