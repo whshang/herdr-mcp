@@ -1406,6 +1406,79 @@ test("user captures bounded visual evidence | Given one visible claimed BrowserP
   assert.equal(artifactCalls, 1);
 });
 
+test("user screenshots an owned background tab without stealing focus | Given an inactive owned page | When capture uses trusted Chrome debugger | Then only bounded artifact metadata is returned and debugger detaches", async () => {
+  const userTab = { id: 91, windowId: 1, url: "https://example.com/user", active: true, status: "complete" };
+  const tabs = new Map([[91, userTab]]);
+  const calls = [];
+  let uploaded = 0;
+  let changeUrl = false;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    windowFocused: true,
+    screenshotResponder() {
+      throw new Error("background screenshot must not capture the user's visible tab");
+    },
+    hoverResponder(phase, target, arg) {
+      calls.push(phase);
+      if (phase === "attach") {
+        assert.equal(arg, "1.3");
+        assert.notEqual(target.tabId, userTab.id);
+      }
+      if (phase === "command") {
+        assert.equal(arg.method, "Page.captureScreenshot");
+        assert.equal(arg.params.format, "jpeg");
+        assert.equal(arg.params.captureBeyondViewport, false);
+        if (changeUrl) tabs.get(target.tabId).url = "https://example.com/other";
+        return { data: "/9j/4AAQSkZJRg==" };
+      }
+    },
+    artifactResponder(image) {
+      uploaded++;
+      assert.match(image.source_id, /^bp_[a-f0-9]{64}$/);
+      assert.equal(image.mime, "image/jpeg");
+      assert.equal(image.bytes_b64, "/9j/4AAQSkZJRg==");
+      return {
+        ok: true,
+        artifact: {
+          artifact_id: "0123456789abcdef0123456789abcdef",
+          conversation_id: image.source_id,
+          file_id: image.artifact_key,
+          mime: "image/jpeg", bytes: 42, sha256: "b".repeat(64),
+          captured_at: 100, expires_at: 200,
+        },
+      };
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/app", idempotencyKey: "owned-background-capture-1",
+  });
+  assert.equal(opened.ok, true);
+  const ownedTab = [...tabs.values()].find(t => t.id !== 91);
+  assert.equal(ownedTab.active, false);
+  const captured = await h.performBrowserPageActionRequest({
+    action: "screenshot", pageRef: opened.page_ref,
+  });
+  assert.equal(captured.ok, true, JSON.stringify(captured));
+  assert.equal(captured.capture_scope, "owned_background");
+  assert.equal(captured.artifact.mime, "image/jpeg");
+  assert.equal(Object.hasOwn(captured, "bytes_b64"), false);
+  assert.deepEqual(calls, ["attach", "command", "detach"]);
+  assert.equal(tabs.get(91).active, true);
+  assert.equal(ownedTab.active, false);
+  assert.equal(uploaded, 1);
+
+  changeUrl = true;
+  const stale = await h.performBrowserPageActionRequest({
+    action: "screenshot", pageRef: opened.page_ref,
+  });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.error, "browser_page_screenshot_view_changed");
+  assert.equal(stale.capture_scope, "owned_background");
+  assert.deepEqual(calls.slice(-3), ["attach", "command", "detach"]);
+  assert.equal(uploaded, 1, "a navigated image cannot enter artifact storage");
+});
+
 test("user reads a reviewed Bilibili transcript | Given one exact Bilibili BrowserPage | When the builtin read runs | Then bounded transcript data is returned and logged-out access fails closed", async () => {
   const tabs = new Map([
     [71, {

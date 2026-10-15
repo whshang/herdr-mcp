@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.209";
+const H2W_SCRIPT_VERSION = "0.1.210";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -8322,6 +8322,59 @@ function browserImageArtifactMetadata(response) {
   };
 }
 
+async function captureOwnedBackgroundScreenshot(page, tab) {
+  const target = { tabId: tab.id };
+  const exactTab = async () => {
+    try {
+      const live = await chrome.tabs.get(tab.id);
+      return live?.windowId === tab.windowId
+        && live?.url === page.canonical_url
+        && live?.status === "complete"
+        && page.ownership === "owned";
+    } catch (_) {
+      return false;
+    }
+  };
+  if (!await exactTab()) {
+    return { ok: false, error: "browser_page_screenshot_view_changed", retryable: true };
+  }
+
+  let attached = false;
+  let detachVerified = true;
+  let imageData = "";
+  let error = null;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    const captured = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+      format: "jpeg", quality: 80, fromSurface: true, captureBeyondViewport: false,
+    });
+    imageData = captured?.data;
+    if (!await exactTab()) error = "browser_page_screenshot_view_changed";
+  } catch (_) {
+    error = "browser_page_screenshot_failed";
+  } finally {
+    if (attached) {
+      detachVerified = false;
+      for (let attempt = 0; attempt < 2 && !detachVerified; attempt += 1) {
+        try {
+          await chrome.debugger.detach(target);
+          detachVerified = true;
+        } catch (_) {}
+      }
+    }
+  }
+  if (!detachVerified) {
+    return { ok: false, error: "browser_page_screenshot_debugger_detach_unverified", retryable: false };
+  }
+  if (error) return { ok: false, error, retryable: true };
+  if (typeof imageData !== "string" || imageData.length > 12000000 || imageData.length < 16
+      || !/^[A-Za-z0-9+/]+={0,2}$/.test(imageData)) {
+    return { ok: false, error: "browser_page_screenshot_invalid", retryable: false };
+  }
+  return { ok: true, dataUrl: `data:image/jpeg;base64,${imageData}` };
+}
+
 async function captureBrowserPageScreenshot(page, tab) {
   if (!page || !tab?.id || !Number.isInteger(tab.windowId)
       || !chrome.tabs?.onActivated?.addListener
@@ -8362,50 +8415,62 @@ async function captureBrowserPageScreenshot(page, tab) {
     }
   };
 
-  if (!await exactTargetIsVisible()) {
-    return withBrowserPageIdentity({
-      ok: false,
-      error: "browser_page_screenshot_not_visible",
-      retryable: true,
-      capture_scope: "visible_tab",
-    }, page);
-  }
-
-  let viewChanged = false;
-  const onActivated = (activeInfo) => {
-    if (activeInfo?.windowId === tab.windowId) viewChanged = true;
-  };
-  const onFocusChanged = (windowId) => {
-    if (windowId !== tab.windowId) viewChanged = true;
-  };
-  chrome.tabs.onActivated.addListener(onActivated);
-  chrome.windows.onFocusChanged.addListener(onFocusChanged);
-
+  const visible = await exactTargetIsVisible();
   let dataUrl = "";
-  try {
-    dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: "jpeg",
-      quality: 80,
-    });
-    if (viewChanged || !await exactTargetIsVisible()) {
+  let captureScope = "visible_tab";
+  if (!visible) {
+    if (page.ownership !== "owned" || !chrome.debugger?.attach
+        || !chrome.debugger?.sendCommand || !chrome.debugger?.detach) {
       return withBrowserPageIdentity({
-        ok: false,
-        error: "browser_page_screenshot_view_changed",
-        retryable: true,
-        capture_scope: "visible_tab",
+        ok: false, error: "browser_page_screenshot_not_visible",
+        retryable: true, capture_scope: "visible_tab",
       }, page);
     }
-  } catch (error) {
-    return withBrowserPageIdentity({
-      ok: false,
-      error: "browser_page_screenshot_failed",
-      retryable: true,
-      detail: String(error?.message || error || ""),
-      capture_scope: "visible_tab",
-    }, page);
-  } finally {
-    chrome.tabs.onActivated.removeListener(onActivated);
-    chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+    const result = await captureOwnedBackgroundScreenshot(page, tab);
+    if (!result.ok) {
+      return withBrowserPageIdentity({
+        ok: false, error: result.error,
+        retryable: result.retryable, capture_scope: "owned_background",
+      }, page);
+    }
+    dataUrl = result.dataUrl;
+    captureScope = "owned_background";
+  } else {
+    let viewChanged = false;
+    const onActivated = (activeInfo) => {
+      if (activeInfo?.windowId === tab.windowId) viewChanged = true;
+    };
+    const onFocusChanged = (windowId) => {
+      if (windowId !== tab.windowId) viewChanged = true;
+    };
+    chrome.tabs.onActivated.addListener(onActivated);
+    chrome.windows.onFocusChanged.addListener(onFocusChanged);
+
+    try {
+      dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+        format: "jpeg",
+        quality: 80,
+      });
+      if (viewChanged || !await exactTargetIsVisible()) {
+        return withBrowserPageIdentity({
+          ok: false,
+          error: "browser_page_screenshot_view_changed",
+          retryable: true,
+          capture_scope: "visible_tab",
+        }, page);
+      }
+    } catch (error) {
+      return withBrowserPageIdentity({
+        ok: false,
+        error: "browser_page_screenshot_failed",
+        retryable: true,
+        detail: String(error?.message || error || ""),
+        capture_scope: "visible_tab",
+      }, page);
+    } finally {
+      chrome.tabs.onActivated.removeListener(onActivated);
+      chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+    }
   }
 
   const match = /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ""));
@@ -8414,7 +8479,7 @@ async function captureBrowserPageScreenshot(page, tab) {
       ok: false,
       error: "browser_page_screenshot_invalid",
       retryable: false,
-      capture_scope: "visible_tab",
+      capture_scope: captureScope,
     }, page);
   }
 
@@ -8433,12 +8498,12 @@ async function captureBrowserPageScreenshot(page, tab) {
       ok: false,
       error: String(response?.error || "browser_page_screenshot_artifact_failed"),
       retryable: true,
-      capture_scope: "visible_tab",
+      capture_scope: captureScope,
     }, page);
   }
   return withBrowserPageIdentity({
     ok: true,
-    capture_scope: "visible_tab",
+    capture_scope: captureScope,
     origin: page.origin,
     canonical_url: page.canonical_url,
     artifact,
