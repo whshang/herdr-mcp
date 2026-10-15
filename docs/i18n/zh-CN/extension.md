@@ -93,6 +93,31 @@ herdr-mcp Rust runtime
 
 浏览器负责页面交互和可视化；Native Host 是受信任本机桥；runtime 继续负责工具 schema、managed-root、权限和 mutation 边界。公网 OAuth/MCP 与本机 Native Messaging 是两个独立信任边界。
 
+## Linux 与 Google Chrome
+
+macOS 与 Linux 使用同一套 Native Messaging 契约。受管 runtime 在 mode-`0600` 的 `~/.config/herdr-mcp/extension.sock` 上提供扩展 IPC。浏览器 manifest 只允许一个 `chrome-extension://<id>/` origin，并指向稳定 wrapper `~/.config/herdr-mcp/native/herdr-extension-host`。该 wrapper 以 `herdr-mcp extension-host` 运行同目录的 runtime 副本。Host 不接受 loopback bearer；对 `127.0.0.1:8772` 的匿名 TCP 仍然拒绝。
+
+`herdr-mcp native-host install` 总会登记 Google Chrome。Chromium、Chrome for Testing、Chrome Beta、Chrome Dev（`google-chrome-unstable`）、Brave 和 Microsoft Edge 仅在对应浏览器配置目录已经存在时登记。默认路径：
+
+| 浏览器 | Manifest 目录 |
+| --- | --- |
+| Google Chrome | `~/.config/google-chrome/NativeMessagingHosts/dev.herdr.mcp.json` |
+| Chromium | `~/.config/chromium/NativeMessagingHosts/dev.herdr.mcp.json` |
+| Chrome for Testing | `~/.config/google-chrome-for-testing/NativeMessagingHosts/dev.herdr.mcp.json` |
+
+进程 home 上若 `XDG_CONFIG_HOME` 为绝对路径，这些目录改写到 `$XDG_CONFIG_HOME` 下。手写且不指向受管 wrapper 的 manifest 视为外来文件；`native-host install` 会拒绝接管，需先删除该文件。
+
+socket 由受管 runtime 创建，而不是由 `native-host install` 创建。`herdr-mcp service install`（更新和 `herdr-mcp dev sync` 也会执行它）会重写 user systemd unit 或脱离进程的环境，加入 `HERDR_EXTENSION_IPC_SOCKET` 并重启 runtime。对旧 unit 只做 `service restart` 不会补上这个变量。新 runtime 起来之后登记通道，并重启 Chrome 让它拉起 host：
+
+```bash
+herdr-mcp service install
+herdr-mcp native-host use standalone
+# 或：herdr-mcp native-host install
+herdr-mcp native-host status
+```
+
+然后重新加载扩展（或重启 Chrome），确认 `herdr-mcp webchat endpoints` 出现浏览器 endpoint。`extension.sock` 应为当前用户拥有的 mode-`0600` socket。
+
 ## 第一次使用
 
 1. 先确认 runtime + ChatGPT Connector 已经工作；

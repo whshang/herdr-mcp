@@ -235,8 +235,11 @@ herdr-mcp lang ja
 
 ```bash
 herdr-mcp native-host install
+herdr-mcp native-host use standalone
 herdr-mcp native-host status
 ```
+
+macOS 与 Linux 都会为所选 STORE / STANDALONE / DEV origin 登记 Chromium host `dev.herdr.mcp`。Linux 总会写入 `~/.config/google-chrome/NativeMessagingHosts/`；Chromium、Chrome for Testing、Chrome Beta/Dev、Brave 和 Microsoft Edge 仅在对应配置目录已存在时登记。受管 runtime 须经 `service install`、更新或 `dev sync` 重启，才会绑定 mode-`0600` 的 `~/.config/herdr-mcp/extension.sock`。详见 [浏览器扩展](extension.md)。
 
 安装后：
 

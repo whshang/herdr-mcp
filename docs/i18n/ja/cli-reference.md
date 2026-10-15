@@ -220,8 +220,11 @@ herdr-mcp lang ja
 
 ```bash
 herdr-mcp native-host install
+herdr-mcp native-host use standalone
 herdr-mcp native-host status
 ```
+
+macOS と Linux では、選択した STORE / STANDALONE / DEV origin 向けに Chromium host `dev.herdr.mcp` を登録します。Linux は常に `~/.config/google-chrome/NativeMessagingHosts/` へ書き、Chromium、Chrome for Testing、Chrome Beta/Dev、Brave、Microsoft Edge は設定ディレクトリが既にあるときだけ登録します。管理 runtime は `service install`、更新、または `dev sync` で再起動してから、mode-`0600` の `~/.config/herdr-mcp/extension.sock` を bind します。[ブラウザ拡張](extension.md) を参照してください。
 
 主要な経路:
 

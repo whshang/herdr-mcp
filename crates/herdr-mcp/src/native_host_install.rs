@@ -5,32 +5,32 @@
 //! code can atomically replace that binary without rewriting browser manifests.
 
 use crate::cli::NativeHostCommand;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use serde_json::{Value, json};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::collections::BTreeSet;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::env;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::fs::{self, OpenOptions};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::io::{Read, Write};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const HOST_NAME: &str = "dev.herdr.mcp";
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const WRAPPER_MARKER: &str = "# herdr-mcp rust native host v1";
 
 // Rollback evidence lives as immutable files under the managed native dir
@@ -45,18 +45,18 @@ const WRAPPER_MARKER: &str = "# herdr-mcp rust native host v1";
 //                          expected activated fingerprint). Persists across
 //                          later installs until explicitly consumed.
 //   * install-pending.json -> in-flight install transaction (recovery point).
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const ROLLBACK_FILE: &str = "rollback.json";
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const PENDING_FILE: &str = "install-pending.json";
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const ROLLBACK_PENDING_FILE: &str = "rollback-pending.json";
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const BACKUPS_DIR_NAME: &str = "backups";
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const NATIVE_HOST_MUTATION_LOCK: &str = "native-host-mutation.lock";
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 struct InstallPaths {
     source_binary: PathBuf,
@@ -80,7 +80,7 @@ struct InstallPaths {
     instance: crate::instance::InstanceId,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[derive(Debug)]
 struct NativeHostLayout {
     source_binary: PathBuf,
@@ -90,18 +90,19 @@ struct NativeHostLayout {
 }
 
 pub fn run(command: NativeHostCommand) -> Result<ExitCode, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(unix))]
     {
         let _ = command;
-        Err("native_host_install_currently_requires_macos".to_owned())
+        Err("native_host_install_requires_macos_or_linux".to_owned())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
         // Named instances must not mutate the global browser Native Messaging
-        // host. The browser manifests at ~/Library/Application Support/*/NativeMessagingHosts
-        // are global; the Native Host wrapper/runtime at ~/.config/herdr-mcp/native
-        // is the single default product contract. A named instance has its own
+        // host. Browser manifests (macOS ~/Library/Application Support/*/NativeMessagingHosts,
+        // Linux $XDG_CONFIG_HOME or ~/.config/*/NativeMessagingHosts) are global;
+        // the Native Host wrapper/runtime at ~/.config/herdr-mcp/native is the
+        // single default product contract. A named instance has its own
         // isolated config root (herdr-mcp-<name>) and port, and must never write
         // global manifests, wrapper, or runtime. Status remains read-only.
         if matches!(
@@ -144,16 +145,16 @@ pub fn run(command: NativeHostCommand) -> Result<ExitCode, String> {
 
 /// Read-only Native Messaging ownership snapshot for `doctor`.
 pub fn doctor_status() -> Result<serde_json::Value, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(unix))]
     {
         Ok(serde_json::json!({
             "ok": false,
             "implementation": "unsupported",
-            "detail": "Chromium Native Messaging host installation is currently implemented on macOS; Linux core MCP/Link operation does not depend on the native host",
+            "detail": "Chromium Native Messaging host installation is implemented on macOS and Linux",
         }))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
         let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
         Ok(status(&paths))
@@ -168,7 +169,8 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
 /// Returns `Ok(None)` when no managed footprint exists and `Ok(Some(value))`
 /// after an owned footprint was removed. Foreign/partial/orphaned state fails
 /// closed before the first mutation.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn product_uninstall_preflight() -> Result<bool, String> {
     // Named instances must not touch the default global Native Host.
     let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
@@ -183,7 +185,8 @@ pub(crate) fn product_uninstall_preflight() -> Result<bool, String> {
     product_uninstall_view_preflight(&view, footprint_present)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn product_uninstall_view_preflight(view: &Value, footprint_present: bool) -> Result<bool, String> {
     if !footprint_present {
         return Ok(false);
@@ -230,7 +233,8 @@ fn product_uninstall_view_preflight(view: &Value, footprint_present: bool) -> Re
 /// any manifest, wrapper, or runtime binary. The outer product-uninstall journal
 /// persists this snapshot so an interrupted uninstall can resume without
 /// treating a newly orphaned wrapper/runtime as fresh ownership evidence.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn product_uninstall_snapshot() -> Result<Option<serde_json::Value>, String> {
     let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
     if !paths.is_default_instance() {
@@ -263,7 +267,8 @@ pub(crate) fn product_uninstall_snapshot() -> Result<Option<serde_json::Value>, 
 /// Remove or resume removal of the exact Native Host cohort captured by
 /// `product_uninstall_snapshot`. Missing members are already-completed work;
 /// every member still present must match the persisted ownership proof.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn product_uninstall_owned_from_snapshot(
     snapshot: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -397,7 +402,8 @@ pub(crate) fn product_uninstall_owned_from_snapshot(
     }))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn validate_product_uninstall_snapshot(
     snapshot: &Value,
     paths: &InstallPaths,
@@ -441,7 +447,8 @@ fn validate_product_uninstall_snapshot(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn remove_snapshot_file_if_matching(
     path: &Path,
     expected_sha256: &str,
@@ -481,7 +488,7 @@ fn remove_snapshot_file_if_matching(
 /// This is invoked after managed service update/rollback so Chrome keeps talking
 /// to the same generation as the production runtime without rewriting manifests
 /// or consuming native-host rollback evidence.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
     let runtime = crate::paths::RuntimePaths::discover()?;
     if runtime.instance.is_named() {
@@ -498,7 +505,7 @@ pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
     sync_owned_runtime_with_active(&paths, &active)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn sync_preflight(view: &Value) -> Result<Option<Value>, String> {
     if view.get("recovery_required").and_then(Value::as_bool) == Some(true) {
         return Err(
@@ -527,7 +534,7 @@ fn sync_preflight(view: &Value) -> Result<Option<Value>, String> {
     Ok(None)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn managed_native_host_footprint_present(paths: &InstallPaths) -> bool {
     path_present(&paths.runtime_binary)
         || path_present(&paths.wrapper)
@@ -546,7 +553,7 @@ fn managed_native_host_footprint_present(paths: &InstallPaths) -> bool {
 /// Herdr-managed shape. Manifests and rollback evidence remain byte-for-byte
 /// untouched; the active admitted origin therefore cannot change as a side
 /// effect of runtime synchronization.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn refresh_legacy_managed_wrapper_identity(paths: &InstallPaths) -> Result<bool, String> {
     let current = status(paths);
     if current
@@ -655,7 +662,7 @@ fn refresh_legacy_managed_wrapper_identity(paths: &InstallPaths) -> Result<bool,
     Ok(true)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn sync_owned_runtime_with_active(paths: &InstallPaths, active: &Path) -> Result<Value, String> {
     if !paths.is_default_instance() {
         return Ok(json!({
@@ -749,7 +756,7 @@ fn sync_owned_runtime_with_active(paths: &InstallPaths, active: &Path) -> Result
     }))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl InstallPaths {
     fn discover(command: &NativeHostCommand) -> Result<Self, String> {
         let home = home_dir()?;
@@ -1040,7 +1047,7 @@ impl InstallPaths {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl InstallPaths {
     fn is_default_instance(&self) -> bool {
         self.instance.is_default()
@@ -1056,13 +1063,13 @@ impl InstallPaths {
 /// `another native-host mutation is in progress` instead of interleaving partial
 /// manifests / wrapper / runtime writes. The lock is non-blocking (LOCK_NB) to
 /// fail closed; callers retry idempotently after the holder completes.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[derive(Debug)]
 struct NativeHostMutationLock {
     _file: fs::File,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl NativeHostMutationLock {
     fn acquire(paths: &InstallPaths) -> Result<Self, String> {
         Self::acquire_for_path(&paths.mutation_lock, &paths.config_dir)
@@ -1155,7 +1162,7 @@ impl NativeHostMutationLock {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn require_default_instance() -> Result<(), String> {
     let runtime = crate::paths::RuntimePaths::discover()?;
     if runtime.instance.is_named() {
@@ -1167,7 +1174,7 @@ fn require_default_instance() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn check_origin_drift_after_lock(paths: &InstallPaths) -> Result<(), String> {
     // After acquiring the lock, re-read mutable origin evidence that was
     // previously read before the lock (find_registered_origin,
@@ -1207,7 +1214,7 @@ fn check_origin_drift_after_lock(paths: &InstallPaths) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn dev_extension_path(raw: Option<&str>) -> Result<PathBuf, String> {
     let input = raw
         .map(PathBuf::from)
@@ -1238,7 +1245,7 @@ fn dev_extension_path(raw: Option<&str>) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn wrapper_dev_extension_origin(wrapper: &Path) -> Result<Option<String>, String> {
     if !path_present(wrapper) || !wrapper_is_rust(wrapper) {
         return Ok(None);
@@ -1261,7 +1268,7 @@ fn wrapper_dev_extension_origin(wrapper: &Path) -> Result<Option<String>, String
     Ok(None)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn install(paths: &InstallPaths) -> Result<Value, String> {
     if !paths.is_default_instance() {
         return Err(
@@ -1342,7 +1349,7 @@ fn install(paths: &InstallPaths) -> Result<Value, String> {
 
 /// Apply the native-host file mutation (binary copy, wrapper write, manifest
 /// writes). Kept separate so the transactional wrapper can roll back on error.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn install_mutation(paths: &InstallPaths) -> Result<(), String> {
     let native_dir = paths
         .runtime_binary
@@ -1382,7 +1389,7 @@ fn install_mutation(paths: &InstallPaths) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn status(paths: &InstallPaths) -> Value {
     let active_runtime = home_dir()
         .ok()
@@ -1390,7 +1397,7 @@ fn status(paths: &InstallPaths) -> Value {
     status_with_active_runtime(paths, active_runtime.as_deref())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn status_with_active_runtime(paths: &InstallPaths, active_runtime: Option<&Path>) -> Value {
     let runtime_binary_ok = is_regular_executable(&paths.runtime_binary);
     let wrapper_ok = wrapper_is_rust(&paths.wrapper);
@@ -1505,7 +1512,7 @@ fn status_with_active_runtime(paths: &InstallPaths, active_runtime: Option<&Path
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn uninstall(paths: &InstallPaths) -> Result<Value, String> {
     if !paths.is_default_instance() {
         return Err(
@@ -1592,7 +1599,7 @@ fn uninstall(paths: &InstallPaths) -> Result<Value, String> {
 /// fingerprint check (the disk is already half-restored) and resumes from the
 /// same immutable evidence. READY and the backup are consumed only after every
 /// managed file has been restored successfully.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn rollback(paths: &InstallPaths) -> Result<Value, String> {
     if !paths.is_default_instance() {
         return Err(
@@ -1707,7 +1714,7 @@ fn rollback(paths: &InstallPaths) -> Result<Value, String> {
 /// case the pending marker is a stale leftover and MUST be cleared WITHOUT
 /// restoring the pre-install snapshot — restoring would undo a successful
 /// install.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn recover_pending(paths: &InstallPaths) -> Result<(), String> {
     let Some(pending) = read_json_file(&paths.pending_file)? else {
         return Ok(());
@@ -1748,7 +1755,7 @@ fn recover_pending(paths: &InstallPaths) -> Result<(), String> {
 /// marker. The previous ready rollback (if any) is left intact. If the READY
 /// record already matches the pending rollback_id, the install actually
 /// committed before the mutation failed; only the stale marker is cleared.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn abort_pending_install(paths: &InstallPaths) -> Result<(), String> {
     let Some(pending) = read_json_file(&paths.pending_file)? else {
         return Ok(());
@@ -1787,7 +1794,7 @@ fn abort_pending_install(paths: &InstallPaths) -> Result<(), String> {
 /// True when the durable READY `rollback.json` record carries the given
 /// rollback_id, i.e. the install for that transaction already committed and a
 /// same-id pending marker is a stale crash leftover.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn pending_matches_committed_ready(
     paths: &InstallPaths,
     rollback_id: &str,
@@ -1804,7 +1811,7 @@ fn pending_matches_committed_ready(
         == Some(rollback_id))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn read_json_file(path: &Path) -> Result<Option<Value>, String> {
     if !path_present(path) {
         return Ok(None);
@@ -1818,7 +1825,7 @@ fn read_json_file(path: &Path) -> Result<Option<Value>, String> {
         .map_err(|error| format!("cannot decode {}: {error}", path.display()))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn write_json_file(path: &Path, value: &Value, mode: u32) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("cannot encode {}: {error}", path.display()))?;
@@ -1831,7 +1838,7 @@ fn write_json_file(path: &Path, value: &Value, mode: u32) -> Result<(), String> 
 /// snapshots foreign/unowned state. Each entry records the exact relative
 /// backup file name so restore can validate confinement and never clobber a
 /// foreign file.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn snapshot_evidence(paths: &InstallPaths) -> Result<(String, PathBuf), String> {
     reject_non_regular_managed_targets(paths)?;
     validate_cohort_ownership(paths)?;
@@ -1875,7 +1882,7 @@ fn snapshot_evidence(paths: &InstallPaths) -> Result<(String, PathBuf), String> 
 /// Persist an immutable copy of a prior owned file (or record absence) into the
 /// backup dir and return an evidence entry keyed by the exact relative backup
 /// file name. The mode class (binary/wrapper 0700, manifest 0600) is recorded.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn persist_file_evidence(
     backup_dir: &Path,
     source: &Path,
@@ -1907,7 +1914,7 @@ fn persist_file_evidence(
 /// exact Rust-owned wrapper for the managed path/origin, and every present host
 /// manifest must be the exact owned manifest. All-absent is allowed (fresh
 /// install). Inconsistent/foreign partial state fails closed.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn validate_cohort_ownership(paths: &InstallPaths) -> Result<(), String> {
     if path_present(&paths.runtime_binary) && !is_regular_executable(&paths.runtime_binary) {
         return Err(format!(
@@ -1947,7 +1954,7 @@ fn validate_cohort_ownership(paths: &InstallPaths) -> Result<(), String> {
 }
 
 /// Verify the wrapper body targets the managed runtime binary and origin.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn wrapper_targets_managed_binary(wrapper: &Path, paths: &InstallPaths) -> bool {
     let Ok(content) = fs::read_to_string(wrapper) else {
         return false;
@@ -1961,7 +1968,7 @@ fn wrapper_targets_managed_binary(wrapper: &Path, paths: &InstallPaths) -> bool 
     ))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn wrapper_identity_matches(wrapper: &Path, paths: &InstallPaths) -> bool {
     let Ok(content) = fs::read_to_string(wrapper) else {
         return false;
@@ -1983,7 +1990,7 @@ fn wrapper_identity_matches(wrapper: &Path, paths: &InstallPaths) -> bool {
 
 /// Reject any managed on-disk target that is a symlink. Fail-closes before any
 /// mutation so we never follow a foreign link.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn reject_non_regular_managed_targets(paths: &InstallPaths) -> Result<(), String> {
     reject_symlink_target(&paths.runtime_binary)?;
     reject_symlink_target(&paths.wrapper)?;
@@ -2001,7 +2008,7 @@ fn reject_non_regular_managed_targets(paths: &InstallPaths) -> Result<(), String
 /// A marker whose READY is missing (crash after READY was consumed) or whose
 /// rollback_id no longer matches READY is a stale crash leftover: it is cleared
 /// here so install/uninstall are never bricked by dead state.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn reject_rollback_in_progress(paths: &InstallPaths) -> Result<(), String> {
     if rollback_marker_is_active(paths)? {
         return Err(
@@ -2017,7 +2024,7 @@ fn reject_rollback_in_progress(paths: &InstallPaths) -> Result<(), String> {
 /// marker's READY is missing (crash after READY was consumed) or points at a
 /// different snapshot, the marker is a stale crash leftover and is removed so
 /// later operations are never bricked by dead state.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn rollback_marker_is_active(paths: &InstallPaths) -> Result<bool, String> {
     let Some(marker) = read_json_file(&paths.rollback_pending_file)? else {
         return Ok(false);
@@ -2046,7 +2053,7 @@ fn rollback_marker_is_active(paths: &InstallPaths) -> Result<bool, String> {
 /// foreign one. The `activated_manifests` array is REQUIRED and must cover every
 /// managed manifest entry (path, presence, and sha256 when present); a missing,
 /// non-array, or incomplete list fails closed.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn validate_activated_state(paths: &InstallPaths, ready: &Value) -> Result<(), String> {
     if let Some(expected) = ready
         .get("activated_runtime_binary_sha256")
@@ -2132,7 +2139,7 @@ fn validate_activated_state(paths: &InstallPaths, ready: &Value) -> Result<(), S
 
 /// List the exact manifest paths the current install would touch (present or
 /// `always`) so the activated fingerprint covers the same set rollback restores.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn activated_manifests(paths: &InstallPaths) -> Result<Value, String> {
     let manifests = touched_manifest_paths(paths)
         .into_iter()
@@ -2156,7 +2163,7 @@ fn activated_manifests(paths: &InstallPaths) -> Result<Value, String> {
 
 /// Paths (as strings) of the manifests the install touched: always targets plus
 /// any present optional browser dirs.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn touched_manifest_paths(paths: &InstallPaths) -> Vec<String> {
     let mut out = Vec::new();
     for (target, always) in &paths.targets {
@@ -2180,7 +2187,7 @@ fn touched_manifest_paths(paths: &InstallPaths) -> Vec<String> {
 /// confined to a managed path with a simple backup token, and every present
 /// entry must carry a sha256 whose backup bytes match. A truncated, foreign, or
 /// tampered evidence set fails closed and nothing is written or removed.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn validate_evidence_set(
     paths: &InstallPaths,
     backup_dir: &Path,
@@ -2278,7 +2285,7 @@ fn validate_evidence_set(
 /// verifying each backup is a regular non-symlink file whose recorded SHA is
 /// intact before overwrite. The complete evidence set is validated up front so
 /// a truncated or tampered snapshot fails closed before any mutation.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn restore_evidence(
     paths: &InstallPaths,
     backup_dir: &Path,
@@ -2369,7 +2376,7 @@ fn restore_evidence(
 /// Production no-op for the install-mutation failpoint. The test build arms a
 /// real injection point (see below); production builds must still link the
 /// symbol that `install_mutation` calls, so this always succeeds.
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(all(unix, not(test)))]
 fn failpoint_after_install_mutation() -> Result<(), String> {
     Ok(())
 }
@@ -2377,7 +2384,7 @@ fn failpoint_after_install_mutation() -> Result<(), String> {
 /// Production no-op for the restore failpoint. The test build arms a real
 /// injection point (see below); production builds must still link the symbol
 /// that `restore_evidence` calls, so this always succeeds and has no effect.
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(all(unix, not(test)))]
 fn failpoint_after_restore_mutation() -> Result<(), String> {
     Ok(())
 }
@@ -2386,10 +2393,8 @@ fn failpoint_after_restore_mutation() -> Result<(), String> {
 // if a test has armed an injection for a specific mutation count, the restore
 // aborts. This models a mid-loop failure (e.g. Chrome manifest restored but an
 // Edge write failing) so a retry can be proven to resume from the same durable
-// snapshot. It is macOS-test-only and has no production effect. Keeping the
-// helpers out of non-macOS test builds also prevents Linux CI from compiling
-// unused failpoint symbols after the macOS mutation paths are cfg'd out.
-#[cfg(all(test, target_os = "macos"))]
+// snapshot. It is test-only and has no production effect.
+#[cfg(all(test, unix))]
 thread_local! {
     static MUTATION_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static FAIL_AT_MUTATION: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
@@ -2397,25 +2402,25 @@ thread_local! {
     static FAIL_AT_INSTALL_MUTATION: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, unix))]
 fn arm_failpoint_after_n_mutations(n: u32) {
     MUTATION_COUNT.with(|slot| slot.set(0));
     FAIL_AT_MUTATION.with(|slot| slot.set(Some(n)));
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, unix))]
 fn disarm_failpoint() {
     FAIL_AT_MUTATION.with(|slot| slot.set(None));
     FAIL_AT_INSTALL_MUTATION.with(|slot| slot.set(None));
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, unix))]
 fn arm_install_failpoint_after_n_mutations(n: u32) {
     INSTALL_MUTATION_COUNT.with(|slot| slot.set(0));
     FAIL_AT_INSTALL_MUTATION.with(|slot| slot.set(Some(n)));
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, unix))]
 fn failpoint_after_install_mutation() -> Result<(), String> {
     let count = INSTALL_MUTATION_COUNT.with(|slot| {
         let current = slot.get();
@@ -2434,7 +2439,7 @@ fn failpoint_after_install_mutation() -> Result<(), String> {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, unix))]
 fn failpoint_after_restore_mutation() -> Result<(), String> {
     let count = MUTATION_COUNT.with(|slot| {
         let current = slot.get();
@@ -2453,7 +2458,7 @@ fn failpoint_after_restore_mutation() -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn restore_mode(path: &Path) -> u32 {
     let file_name = path.file_name().and_then(|value| value.to_str());
     if file_name == Some("herdr-extension-host") || file_name == Some("herdr-mcp") {
@@ -2469,7 +2474,7 @@ fn restore_mode(path: &Path) -> u32 {
 /// two leaves an orphaned backup dir (garbage, never referenced) but never a
 /// READY record pointing at deleted evidence. The caller clears the
 /// rollback-in-progress marker after this returns.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn consume_ready_record(paths: &InstallPaths) -> Result<(), String> {
     let ready_id = read_json_file(&paths.rollback_file)?.and_then(|ready| {
         ready
@@ -2495,7 +2500,7 @@ fn consume_ready_record(paths: &InstallPaths) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2503,7 +2508,7 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn home_dir() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
@@ -2513,7 +2518,7 @@ fn home_dir() -> Result<PathBuf, String> {
 
 /// Remove a managed regular file back to absence while refusing to follow or
 /// remove a symlink (fail closed on foreign/tampered targets).
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn remove_regular_file(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
@@ -2556,7 +2561,63 @@ fn install_targets(home: &Path) -> Vec<(PathBuf, bool)> {
     .collect()
 }
 
-#[cfg(target_os = "macos")]
+/// Linux user-level Chromium Native Messaging directories.
+///
+/// Google Chrome is always registered. Chromium, Chrome for Testing, Chrome
+/// Beta/Dev, Brave, and Microsoft Edge are registered only when that browser's
+/// config directory already exists — the same optional-target rule macOS uses.
+/// Chrome looks under `$XDG_CONFIG_HOME` when this `home` is the process home;
+/// a fixture home never follows an ambient `XDG_CONFIG_HOME`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn install_targets(home: &Path) -> Vec<(PathBuf, bool)> {
+    let config_home = linux_browser_config_home(home);
+    [
+        (vec!["google-chrome"], true),
+        (vec!["google-chrome-for-testing"], false),
+        (vec!["google-chrome-beta"], false),
+        (vec!["google-chrome-unstable"], false),
+        (vec!["chromium"], false),
+        (vec!["BraveSoftware", "Brave-Browser"], false),
+        (vec!["microsoft-edge"], false),
+    ]
+    .into_iter()
+    .map(|(parts, always)| {
+        let mut target = config_home.clone();
+        for part in parts {
+            target.push(part);
+        }
+        target.push("NativeMessagingHosts");
+        (target, always)
+    })
+    .collect()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_browser_config_home(home: &Path) -> PathBuf {
+    linux_browser_config_home_from(home, env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_browser_config_home_from(
+    home: &Path,
+    xdg_config_home: Option<std::ffi::OsString>,
+    process_home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    let default = home.join(".config");
+    let Some(xdg) = xdg_config_home else {
+        return default;
+    };
+    let xdg = PathBuf::from(xdg);
+    if !xdg.is_absolute() {
+        return default;
+    }
+    match process_home {
+        Some(process_home) if Path::new(&process_home) == home => xdg,
+        _ => default,
+    }
+}
+
+#[cfg(unix)]
 fn find_registered_origin(
     targets: &[(PathBuf, bool)],
     wrapper: &Path,
@@ -2599,7 +2660,7 @@ fn find_registered_origin(
 /// switching Store <-> Dev rewrites the manifests, so an already-running host
 /// must not keep serving the previously active extension just because it still
 /// has the old wrapper environment in memory.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(crate) fn current_registered_extension_origin() -> Result<Option<String>, String> {
     let home = home_dir()?;
     let runtime_paths = crate::paths::RuntimePaths::discover()?;
@@ -2618,7 +2679,7 @@ pub(crate) fn current_registered_extension_origin() -> Result<Option<String>, St
 /// Missing metadata returns `Ok(None)` (caller may fall back to the live
 /// registered manifest). Corrupt/invalid durable metadata fails closed with an
 /// explicit error rather than silently falling back.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn durable_extension_origin(native_dir: &Path) -> Result<Option<String>, String> {
     let candidates = [
         native_dir.join(ROLLBACK_FILE),
@@ -2651,7 +2712,7 @@ fn durable_extension_origin(native_dir: &Path) -> Result<Option<String>, String>
     Ok(None)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn extension_id_from_origin(origin: &str) -> Option<String> {
     let id = origin
         .strip_prefix("chrome-extension://")?
@@ -2659,7 +2720,7 @@ fn extension_id_from_origin(origin: &str) -> Option<String> {
     (id.len() == 32 && id.bytes().all(|byte| (b'a'..=b'p').contains(&byte))).then(|| id.to_owned())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn explicit_extension_origin() -> Result<Option<String>, String> {
     let Some(raw) = env::var_os("HERDR_EXTENSION_ORIGIN") else {
         return Ok(None);
@@ -2676,7 +2737,7 @@ fn explicit_extension_origin() -> Result<Option<String>, String> {
     Ok(Some(origin))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn wrapper_body(paths: &InstallPaths) -> String {
     let dev_origin = paths
         .dev_extension_origin
@@ -2696,7 +2757,7 @@ fn wrapper_body(paths: &InstallPaths) -> String {
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn manifest_value(paths: &InstallPaths) -> Value {
     json!({
         "name": HOST_NAME,
@@ -2707,7 +2768,7 @@ fn manifest_value(paths: &InstallPaths) -> Value {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn manifest_status(path: &Path, paths: &InstallPaths) -> Value {
     let raw = match fs::read(path) {
         Ok(raw) if raw.len() <= 64 * 1024 => raw,
@@ -2752,7 +2813,7 @@ fn manifest_status(path: &Path, paths: &InstallPaths) -> Value {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn manifest_structurally_owned(path: &Path, paths: &InstallPaths) -> bool {
     let Ok(raw) = fs::read(path) else {
         return false;
@@ -2781,7 +2842,7 @@ fn manifest_structurally_owned(path: &Path, paths: &InstallPaths) -> bool {
         && one_valid_origin
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn ensure_secure_dir(path: &Path) -> Result<(), String> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -2806,7 +2867,7 @@ fn ensure_secure_dir(path: &Path) -> Result<(), String> {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn atomic_copy_executable(source: &Path, target: &Path) -> Result<(), String> {
     if source == target
         || (source.canonicalize().ok().is_some()
@@ -2855,7 +2916,7 @@ fn atomic_copy_executable(source: &Path, target: &Path) -> Result<(), String> {
     result
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     reject_symlink_target(path)?;
     let temp = temporary_sibling(path);
@@ -2880,7 +2941,7 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     result
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn reject_symlink_target(path: &Path) -> Result<(), String> {
     if let Ok(metadata) = fs::symlink_metadata(path)
         && metadata.file_type().is_symlink()
@@ -2893,7 +2954,7 @@ fn reject_symlink_target(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn temporary_sibling(path: &Path) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2906,12 +2967,12 @@ fn temporary_sibling(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp-{:x}-{nonce:x}", std::process::id()))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn is_regular_executable(path: &Path) -> bool {
     fs::symlink_metadata(path).ok().is_some_and(|metadata| {
         !metadata.file_type().is_symlink()
@@ -2920,7 +2981,7 @@ fn is_regular_executable(path: &Path) -> bool {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn wrapper_is_rust(path: &Path) -> bool {
     if fs::symlink_metadata(path)
         .ok()
@@ -2934,12 +2995,12 @@ fn wrapper_is_rust(path: &Path) -> bool {
         .is_some_and(|content| content.contains(WRAPPER_MARKER))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn path_present(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn read_binary_version(path: &Path) -> Option<String> {
     if !is_regular_executable(path) {
         return None;
@@ -2960,7 +3021,7 @@ fn read_binary_version(path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn file_sha256(path: &Path) -> Result<String, String> {
     let mut file =
         fs::File::open(path).map_err(|error| format!("cannot hash {}: {error}", path.display()))?;
@@ -2978,7 +3039,7 @@ fn file_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3032,11 +3093,17 @@ mod tests {
     #[test]
     fn install_targets_include_chrome_for_testing_as_optional() {
         let home = PathBuf::from("/tmp/herdr-cft-target-test-home");
+        #[cfg(target_os = "macos")]
         let target = home
             .join("Library")
             .join("Application Support")
             .join("Google")
             .join("ChromeForTesting")
+            .join("NativeMessagingHosts");
+        #[cfg(not(target_os = "macos"))]
+        let target = home
+            .join(".config")
+            .join("google-chrome-for-testing")
             .join("NativeMessagingHosts");
         let targets = install_targets(&home);
         let matches = targets
@@ -3048,6 +3115,53 @@ mod tests {
             !matches[0].1,
             "Chrome for Testing is a dev/UAT target, not an always-created user target"
         );
+        assert!(
+            targets[0].1,
+            "the stable Chrome target is always registered"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_install_targets_cover_chrome_chromium_and_ignore_foreign_xdg() {
+        let home = PathBuf::from("/tmp/herdr-linux-native-host-home");
+        let targets = install_targets(&home);
+        let chrome = home
+            .join(".config")
+            .join("google-chrome")
+            .join("NativeMessagingHosts");
+        let chromium = home
+            .join(".config")
+            .join("chromium")
+            .join("NativeMessagingHosts");
+        let testing = home
+            .join(".config")
+            .join("google-chrome-for-testing")
+            .join("NativeMessagingHosts");
+        assert_eq!(targets[0], (chrome, true));
+        assert!(
+            targets
+                .iter()
+                .any(|(path, always)| path == &chromium && !*always)
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|(path, always)| path == &testing && !*always)
+        );
+
+        let redirected = linux_browser_config_home_from(
+            &home,
+            Some("/var/chrome-config".into()),
+            Some("/home/operator".into()),
+        );
+        assert_eq!(redirected, home.join(".config"));
+        let honored = linux_browser_config_home_from(
+            Path::new("/home/operator"),
+            Some("/home/operator/.config".into()),
+            Some("/home/operator".into()),
+        );
+        assert_eq!(honored, PathBuf::from("/home/operator/.config"));
     }
 
     fn fixture() -> (PathBuf, InstallPaths) {
