@@ -4128,8 +4128,24 @@ fn browser_source_route(
 ) -> Result<BrowserSourceRoute, String> {
     let source = browser_conversation_url_ref(source_url)
         .ok_or_else(|| "browser_source_url_invalid".to_owned())?;
+    // ChatGPT renders project-scoped conversation URLs with a display-name
+    // suffix (`/g/g-p-<hex>-name/c/<uuid>`) while the registry stores the
+    // canonical form (`/g/g-p-<hex>/c/<uuid>`). Reconstruct the canonical URL
+    // from the parsed identity so the locator lookup matches the registered
+    // session regardless of which URL variant the caller supplied. The
+    // conversation/project identity itself is unchanged; ambiguity handling
+    // in the locator (newest-wins, exact-tie fails closed) is untouched.
+    let canonical_url = match &source.project_id {
+        Some(project_id) => {
+            format!(
+                "https://chatgpt.com/g/{}/c/{}",
+                project_id, source.conversation_id
+            )
+        }
+        None => format!("https://chatgpt.com/c/{}", source.conversation_id),
+    };
     let session_ref = store
-        .browser_session_ref_for_canonical_url(source_url)?
+        .browser_session_ref_for_canonical_url(&canonical_url)?
         .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
     let session = store
         .browser_resource(&session_ref)?
@@ -16903,6 +16919,109 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(duplicate_app["code"], "browser_required_apps_invalid");
+    }
+
+    /// user owner | Given a session registered under the canonical project URL
+    /// | When the equivalent vanity URL variant (display-name suffix) is used
+    /// | Then the same session route is resolved; unrelated and malformed URLs
+    /// still fail closed.
+    #[test]
+    fn user_source_route_given_vanity_url_variant_when_resolved_then_same_session_as_canonical() {
+        use crate::state_store::{
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        const CANONICAL: &str = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/6ace54d2-4fbc-83e9-8c9f-b99360c5b44f";
+        const VANITY: &str = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978-herdr-mcp/c/6ace54d2-4fbc-83e9-8c9f-b99360c5b44f";
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, account_ref, session_ref);
+        {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "vanity-route-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.212",
+                    observed_at: 10,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.create"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "vanity-route-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "vanity-route-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(&session.resource_ref, CANONICAL, 7, 12)
+                .unwrap();
+            endpoint_ref = endpoint.endpoint_ref;
+            account_ref = account.resource_ref;
+            session_ref = session.resource_ref;
+        }
+        let store = Arc::new(Mutex::new(store));
+
+        // Vanity URL resolves to the same registered session.
+        let vanity = browser_source_resolve(&store, &json!({"source_url": VANITY}), true);
+        assert_eq!(vanity["ok"], true, "{vanity}");
+        assert_eq!(vanity["route"]["session_ref"], session_ref);
+        assert_eq!(vanity["route"]["endpoint_ref"], endpoint_ref);
+        assert_eq!(vanity["route"]["account_ref"], account_ref);
+
+        // Canonical URL still resolves identically (no regression).
+        let canonical = browser_source_resolve(&store, &json!({"source_url": CANONICAL}), true);
+        assert_eq!(canonical["ok"], true);
+        assert_eq!(canonical["route"]["session_ref"], session_ref);
+
+        // Unrelated conversation URL does not route.
+        let unrelated = browser_source_resolve(
+            &store,
+            &json!({"source_url": "https://chatgpt.com/c/unrelated-conversation-id"}),
+            true,
+        );
+        assert_eq!(unrelated["code"], "browser_source_session_not_found");
+
+        // Malformed URL fails at parse, not at lookup.
+        let malformed = browser_source_resolve(&store, &json!({"source_url": "not-a-url"}), true);
+        assert_eq!(malformed["code"], "browser_source_url_invalid");
+
+        // Non-chatgpt origin does not route.
+        let foreign = browser_source_resolve(
+            &store,
+            &json!({"source_url": "https://claude.ai/c/some-conversation"}),
+            true,
+        );
+        assert_eq!(foreign["code"], "browser_source_url_invalid");
     }
 
     /// Register one ChatGPT browser profile (endpoint + provider + consent + account +
