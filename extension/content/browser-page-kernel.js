@@ -11,6 +11,7 @@
   const MAX_CHARS_CEILING = 100000;
   const MAX_FILL_CHARS = 10000;
   const MAX_ELEMENTS = 128;
+  const MAX_HOVER_TARGETS = 32;
   const DISALLOWED_INPUT_TYPES = new Set(["password", "file", "hidden"]);
   const FORBIDDEN_PARAM_KEYS = new Set([
     "selector", "css", "xpath", "js", "script", "eval", "code", "cookie", "storage", "cdp"
@@ -88,9 +89,22 @@
     return parts.join("").replace(/\s+/g, " ");
   }
 
+  const documentNonce = (() => {
+    if (global.crypto?.getRandomValues) {
+      const bytes = new Uint8Array(8);
+      global.crypto.getRandomValues(bytes);
+      return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+    return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  })();
+
+  const OBSERVABLE_CONTROL_SELECTOR =
+    'button, a[href], input, textarea, select, option, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="option"], [role="group"], [role="listitem"], [tabindex], label, span, div[class], article, section[class], li[class], [contenteditable="true"]';
+
   let generationSeq = 0;
   let currentGenerationToken = "";
   const elementMap = new Map();
+  const hoverOnlyRefs = new Set();
   const selectOptionMap = new Map();
   // Refs whose observed option list was a truncated prefix of the live list.
   const selectOptionTruncatedRefs = new Set();
@@ -98,6 +112,7 @@
   function invalidateGeneration() {
     currentGenerationToken = "";
     elementMap.clear();
+    hoverOnlyRefs.clear();
     selectOptionMap.clear();
     selectOptionTruncatedRefs.clear();
   }
@@ -204,33 +219,69 @@
     return false;
   }
 
+  function isObservableControlCandidate(el) {
+    const tag = (el.tagName || "").toLowerCase();
+    const role = el.getAttribute("role");
+    const native = ["button", "a", "input", "textarea", "select", "option", "table"].includes(tag);
+    const semantic = ["button", "link", "textbox", "checkbox", "radio", "option"].includes(role);
+    const focusable = el.hasAttribute("tabindex") && Number(el.getAttribute("tabindex")) >= 0
+      && String(el.innerText || "").length <= 256 && (el.children?.length || 0) <= 4;
+    const labelControl = tag === "label" && el.control && !isSensitiveField(el.control);
+    if (native || semantic || focusable || labelControl || el.isContentEditable) return true;
+    if (!["span", "div"].includes(tag)) return false;
+    // Framework choice tags often delegate clicks to a form/dialog ancestor.
+    const choice = /(?:^|[\s_-])(?:chip|choice|tag|option)(?:$|[\s_-])/i.test(el.getAttribute("class") || "")
+      && !!el.closest?.('form, dialog, [role="dialog"]');
+    if (!choice && global.getComputedStyle?.(el)?.cursor !== "pointer") return false;
+    const text = String(el.innerText || "").trim();
+    if (!text.length || text.length > 256 || (el.children?.length || 0) > 4) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.width <= 600 && rect.height > 0 && rect.height <= 120
+      && !el.querySelector?.("input, textarea, select, button, a[href], [contenteditable], [role]");
+  }
+
+  function isHoverOnlyCandidate(el) {
+    const tag = (el.tagName || "").toLowerCase();
+    if (!["div", "article", "section", "li"].includes(tag)) return false;
+    const role = String(el.getAttribute("role") || "");
+    const classes = String(el.getAttribute("class") || "");
+    if (!/(?:card|tile|row|item)/i.test(classes) && !["group", "listitem"].includes(role)) return false;
+    const rect = el.getBoundingClientRect?.();
+    if (!rect || rect.width < 16 || rect.height < 16 || rect.width > 1600 || rect.height > 800) return false;
+    return cleanText(collectVisibleText(el, 121), 120).length > 0;
+  }
+
   function scanDocument(options = {}) {
     if (isCrossOriginFrame()) {
       return { ok: false, error: "cross_origin_iframe_blocked" };
     }
 
     generationSeq += 1;
-    currentGenerationToken = `pa_gen_${generationSeq}_${Date.now().toString(36)}`;
+    currentGenerationToken = `pa_gen_${documentNonce}_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
+    hoverOnlyRefs.clear();
     selectOptionMap.clear();
     selectOptionTruncatedRefs.clear();
 
     const doc = global.document;
     if (!doc) return { ok: false, error: "document_unavailable" };
 
-    const candidates = doc.querySelectorAll(
-      'button, a[href], input, textarea, select, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
-    );
+    const candidates = doc.querySelectorAll(OBSERVABLE_CONTROL_SELECTOR);
 
     const elements = [];
     let elementIndex = 0;
+    let hoverTargets = 0;
 
     for (const el of candidates) {
       if (elements.length >= MAX_ELEMENTS) break;
       const tag = (el.tagName || "").toLowerCase();
 
+      const clickable = isObservableControlCandidate(el);
+      const hoverOnly = !clickable && hoverTargets < MAX_HOVER_TARGETS && isHoverOnlyCandidate(el);
+      if (!clickable && !hoverOnly) continue;
+
       // Exclude prohibited inputs and sensitive autocomplete fields
-      if (isSensitiveField(el)) continue;
+      if (isSensitiveField(el) || el.closest?.('[hidden], [aria-hidden="true"], [inert]')) continue;
 
       // Exclude hidden or disabled elements
       if (isElementHidden(el)) continue;
@@ -238,22 +289,26 @@
 
       const ref = `ref_${currentGenerationToken}_${elementIndex++}`;
       elementMap.set(ref, el);
+      if (hoverOnly) {
+        hoverOnlyRefs.add(ref);
+        hoverTargets += 1;
+      }
 
       const roleAttr = el.getAttribute("role");
-      const role = roleAttr || (tag === "a" ? "link" : tag);
-      const label = (
+      const observedRole = roleAttr || (tag === "a" ? "link" : tag);
+      const label = hoverOnly ? cleanText(collectVisibleText(el, 121), 121) : (
         el.getAttribute("aria-label") ||
         el.getAttribute("placeholder") ||
         el.innerText ||
         el.textContent ||
         el.value ||
         ""
-      ).trim().slice(0, 120);
+      ).trim();
       const classes = String(el.getAttribute("class") || "")
         .split(/\s+/)
         .map((value) => structuralToken(value, 48))
         .filter(Boolean)
-        .slice(0, 4);
+        .slice(0, 8);
       // Expose bounded visible labels only; never an option's raw value.
       const selectOptions = tag === "select"
         ? [...(el.options || [])].filter((option) => (
@@ -274,7 +329,8 @@
       elements.push({
         ref: ref.slice(0, 256),
         tag,
-        role: String(role || "").slice(0, 64),
+        role: String(observedRole || "").slice(0, 64),
+        hover_only: hoverOnly || undefined,
         id: structuralToken(el.getAttribute("id")),
         data_testid: structuralToken(el.getAttribute("data-testid")),
         classes: classes.length ? classes : undefined,
@@ -285,7 +341,8 @@
         checked: tag === "input" && ["checkbox", "radio"].includes(String(el.type || "").toLowerCase())
           ? el.checked === true
           : undefined,
-        text: label,
+        text: label.slice(0, 120),
+        text_truncated: label.length > 120 || undefined,
         options: selectOptions ? selectOptions.slice(0, 24).map((option) => (
           cleanText(option.label || option.textContent, 80)
         )) : undefined,
@@ -294,7 +351,7 @@
           ? cleanText((selectOptions || []).find((option) => option.value === el.value)?.label
             || (selectOptions || []).find((option) => option.value === el.value)?.textContent, 80) || undefined
           : undefined,
-        fast_path: fastPathActionClass(el, tag),
+        fast_path: hoverOnly ? undefined : fastPathActionClass(el, tag),
       });
     }
 
@@ -594,6 +651,7 @@
       if (!ref.startsWith(`ref_${generation}_`)) return { ok: false, error: "invalid_ref" };
       const el = elementMap.get(ref);
       if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+      if (hoverOnlyRefs.has(ref)) return { ok: false, error: "hover_only_target" };
       if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
         return { ok: false, error: "unsupported_element" };
       }
@@ -631,6 +689,45 @@
     }
   }
 
+  function executeHover(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const gen = String(params.generation || "").trim();
+    if (!gen || gen !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    const ref = String(params.ref || "").trim();
+    if (!ref.startsWith(`ref_${gen}_`)) return { ok: false, error: "invalid_ref" };
+    const el = elementMap.get(ref);
+    if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+    if (isSensitiveField(el) || el.closest?.('[hidden], [aria-hidden="true"], [inert]')) {
+      return { ok: false, error: "unsupported_element" };
+    }
+    if (isElementHidden(el) || isElementDisabled(el)) return { ok: false, error: "element_hidden" };
+    try { el.scrollIntoView?.({ block: "center", inline: "center", behavior: "instant" }); } catch (_) {}
+    const rect = el.getBoundingClientRect?.();
+    const width = Number(global.innerWidth || global.document?.documentElement?.clientWidth);
+    const height = Number(global.innerHeight || global.document?.documentElement?.clientHeight);
+    if (!rect || !Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1) {
+      return { ok: false, error: "hover_target_offscreen" };
+    }
+    const left = Math.max(0, rect.left), top = Math.max(0, rect.top);
+    const right = Math.min(width, rect.right), bottom = Math.min(height, rect.bottom);
+    if (!(right > left + 1 && bottom > top + 1)) {
+      return { ok: false, error: "hover_target_offscreen" };
+    }
+    const x = Math.round((left + right) / 2);
+    const y = Math.round((top + bottom) / 2);
+    const hit = global.document?.elementFromPoint?.(x, y);
+    if (hit && hit !== el && !el.contains?.(hit)) {
+      return { ok: false, error: "hover_target_obscured" };
+    }
+    invalidateGeneration();
+    return { ok: true, ref, generation: gen, hover_point: { x, y } };
+  }
+
   function executeClick(params = {}) {
     if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
     if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
@@ -655,6 +752,7 @@
     if (!el || !el.isConnected) {
       return { ok: false, error: "element_detached" };
     }
+    if (hoverOnlyRefs.has(ref)) return { ok: false, error: "hover_only_target" };
 
     if (isElementDisabled(el)) {
       return { ok: false, error: "element_disabled" };
@@ -900,6 +998,32 @@
 
     const condition = String(params.condition || "").toLowerCase();
     const value = typeof params.value === "string" ? params.value : "";
+    const scoped = ["input_value_equals", "input_value_contains", "element_checked", "element_selected", "element_class_contains", "element_visible", "element_enabled"];
+    if (scoped.includes(condition)) {
+      if (!params.generation || params.generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+      const el = elementMap.get(params.ref);
+      if (!el) return { ok: false, error: "invalid_ref" };
+      if (!el.isConnected) return { ok: false, error: "element_detached" };
+      if (isSensitiveField(el)) return { ok: false, error: "sensitive_field_blocked" };
+      if (condition === "element_visible") return { ok: !isElementHidden(el), condition };
+      if (isElementHidden(el)) return { ok: false, error: "element_hidden" };
+      if (condition === "element_enabled") return { ok: !isElementDisabled(el), condition };
+      if (condition.startsWith("input_value_")) {
+        if (!["input", "textarea"].includes((el.tagName || "").toLowerCase())) return { ok: false, error: "unsupported_element" };
+        if (typeof params.value !== "string" || params.value.length > 4096) return { ok: false, error: "expect_value_invalid" };
+        return { ok: condition === "input_value_equals" ? el.value === params.value : String(el.value).includes(params.value), condition };
+      }
+      if (condition === "element_class_contains") {
+        if (typeof params.value !== "string" || !/^[A-Za-z0-9_-]{1,48}$/.test(params.value)) {
+          return { ok: false, error: "expect_value_invalid" };
+        }
+        return { ok: String(el.getAttribute("class") || "").split(/\s+/).includes(params.value), condition };
+      }
+      const attribute = condition === "element_checked" ? "aria-checked" : "aria-selected";
+      const property = condition === "element_checked" ? "checked" : "selected";
+      if (typeof el[property] !== "boolean" && el.getAttribute(attribute) === null) return { ok: false, error: "unsupported_element" };
+      return { ok: el[property] === true || el.getAttribute(attribute) === "true", condition };
+    }
     if (!["document_ready", "url_equals", "text_present", "text_absent", "element_present", "element_absent"].includes(condition)) {
       return { ok: false, error: "unsupported_expect_condition" };
     }
@@ -922,15 +1046,18 @@
       if (value.length > 256 || value !== value.trim()) {
         return { ok: false, error: "expect_value_invalid", condition };
       }
-      const controls = global.document?.querySelectorAll?.(
-        'button, a[href], input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
-      ) || [];
-      const truncated = controls.length > MAX_ELEMENTS;
+      const controls = global.document?.querySelectorAll?.(OBSERVABLE_CONTROL_SELECTOR) || [];
+      let truncated = false;
       let found = false;
       let inspected = 0;
       for (const el of controls) {
-        if (++inspected > MAX_ELEMENTS) break;
-        if (!el.isConnected || isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) continue;
+        if (!el.isConnected || !isObservableControlCandidate(el)
+          || isSensitiveField(el) || el.closest?.('[hidden], [aria-hidden="true"], [inert]')
+          || isElementHidden(el) || isElementDisabled(el)) continue;
+        if (++inspected > MAX_ELEMENTS) {
+          truncated = true;
+          break;
+        }
         const exactLabels = [
           el.getAttribute?.("aria-label"),
           el.getAttribute?.("placeholder"),
@@ -984,6 +1111,7 @@
     const action = String(msg?.action || "").toLowerCase();
     if (action === "inspect" || action === "observe") return scanDocument(msg);
     if (action === "click") return executeClick(msg);
+    if (action === "hover") return executeHover(msg);
     if (action === "fill") return executeFill(msg);
     if (action === "extract") return executeExtract(msg);
     if (action === "extract_table") return executeExtractTable(msg);
