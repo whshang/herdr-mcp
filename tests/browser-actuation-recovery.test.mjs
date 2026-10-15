@@ -161,10 +161,14 @@ function browserPageLifecycleHarness({
       async executeScript(details) {
         if (scriptResponder) return scriptResponder(details);
         if (typeof details?.func !== "function") return undefined;
+        const tab = tabs.get(details.target?.tabId);
         return [{
           result: {
             hasFocus: documentFocused,
             visibilityState: documentVisibilityState,
+            href: tab?.url,
+            origin: tab?.url ? new URL(tab.url).origin : undefined,
+            timeOrigin: tab?.documentTimeOrigin || 123456,
           },
         }];
       },
@@ -1414,6 +1418,41 @@ test("user captures bounded visual evidence | Given one visible claimed BrowserP
   assert.equal(racedResult.error, "browser_page_screenshot_view_changed");
   assert.equal(racedResult.retryable, true);
   assert.equal(artifactCalls, 1);
+
+  const urlRaced = browserPageLifecycleHarness({
+    sessionStorage, tabs,
+    screenshotResponder() {
+      tabs.get(61).url = "https://other.example/private";
+      urlRaced.emitTabUpdated(61, { url: "https://other.example/private", status: "loading" });
+      tabs.get(61).url = "https://example.com/app";
+      urlRaced.emitTabUpdated(61, { url: "https://example.com/app", status: "complete" });
+      return "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    },
+    artifactResponder() {
+      throw new Error("a visible screenshot with A-B-A navigation must never be stored");
+    },
+  });
+  const urlRaceResult = await urlRaced.performBrowserPageActionRequest({
+    action: "screenshot", pageRef: claimed.page_ref,
+  });
+  assert.equal(urlRaceResult.ok, false);
+  assert.equal(urlRaceResult.error, "browser_page_screenshot_view_changed");
+
+  const reloadRace = browserPageLifecycleHarness({
+    sessionStorage, tabs,
+    screenshotResponder() {
+      tabs.get(61).documentTimeOrigin = 234567;
+      return "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    },
+    artifactResponder() {
+      throw new Error("a visible screenshot of a replaced document must never be stored");
+    },
+  });
+  const reloadResult = await reloadRace.performBrowserPageActionRequest({
+    action: "screenshot", pageRef: claimed.page_ref,
+  });
+  assert.equal(reloadResult.ok, false);
+  assert.equal(reloadResult.error, "browser_page_screenshot_view_changed");
 });
 
 test("user screenshots an owned background tab without stealing focus | Given an inactive owned page | When capture uses trusted Chrome debugger | Then only bounded artifact metadata is returned and debugger detaches", async () => {
