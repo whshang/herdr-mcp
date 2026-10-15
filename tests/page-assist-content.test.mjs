@@ -48,7 +48,9 @@ function createElement({
     hasAttribute(name) { return attributes.has(name); },
     setAttribute(name, value) { attributes.set(name, String(value)); },
     getBoundingClientRect() {
-      return visible ? { width: 120, height: 28 } : { width: 0, height: 0 };
+      return this.offsetParent
+        ? { left: 20, top: 30, right: 140, bottom: 58, width: 120, height: 28 }
+        : { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
     },
     scrollIntoView() {},
     focus() { this.focused += 1; },
@@ -97,6 +99,7 @@ function harness({
     ...extraGlobals,
     scrollY,
     innerHeight: 600,
+    innerWidth: 1000,
     scrollBy({ top }) {
       this.scrollY = Math.max(0, Math.min(scrollMax, this.scrollY + top));
     },
@@ -115,6 +118,7 @@ function harness({
         opacity: hidden ? "0" : "1",
         position: "static",
         overflowY: element.overflowY || "visible",
+        cursor: element.cursor || "auto",
       };
     },
   });
@@ -202,6 +206,54 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   });
   assert.equal(linkClick.ok, true);
   assert.equal(linkClick.navigation_url, "https://app.test/details");
+});
+
+test("user hovers a bounded visible card | Given a CSS-hidden edit button | When an observed hover-only ref is prepared | Then the revealed button receives its own ref only after a new observation", () => {
+  const card = createElement({
+    tag: "div", text: "Existing evaluation", attrs: { class: "evaluationCard__sample" },
+  });
+  const edit = createElement({
+    tag: "button", text: "Edit evaluation", visible: false,
+    attrs: { class: "ui-button ui-button-icon ui-button-default ui-button-sm edit-icon" },
+  });
+  const password = createElement({ tag: "input", type: "password", value: "private" });
+  const h = harness({ elements: [card, edit, password] });
+  const first = h.send({ type: "h2w_page_assist", action: "observe" });
+  assert.equal(first.ok, true);
+  assert.equal(first.elements.length, 1);
+  assert.equal(first.elements[0].hover_only, true);
+  assert.equal(first.elements[0].text, "Existing evaluation");
+  assert.equal(JSON.stringify(first).includes("Edit evaluation"), false);
+  assert.equal(JSON.stringify(first).includes("private"), false);
+  const rejected = h.send({
+    type: "h2w_page_assist", action: "click", generation: first.generation,
+    ref: first.elements[0].ref,
+  });
+  assert.equal(rejected.error, "hover_only_target");
+  assert.equal(card.clicked, 0);
+  const pressed = h.send({
+    type: "h2w_page_assist", action: "press", generation: first.generation,
+    ref: first.elements[0].ref, key: "Enter",
+  });
+  assert.equal(pressed.error, "hover_only_target");
+  const prepared = h.send({
+    type: "h2w_page_assist", action: "hover", generation: first.generation,
+    ref: first.elements[0].ref,
+  });
+  assert.equal(prepared.ok, true);
+  assert.equal(prepared.hover_point.x, 80);
+  assert.equal(prepared.hover_point.y, 44);
+  assert.equal(h.send({
+    type: "h2w_page_assist", action: "hover", generation: first.generation,
+    ref: first.elements[0].ref,
+  }).error, "stale_generation");
+  edit.offsetParent = {};
+  const after = h.send({ type: "h2w_page_assist", action: "observe" });
+  assert.equal(after.elements.length, 2);
+  const editable = after.elements.find((element) => element.text === "Edit evaluation");
+  assert.ok(editable?.ref);
+  assert.equal(editable.hover_only, undefined);
+  assert.ok(editable.classes.includes("edit-icon"));
 });
 
 test("user scrolls the viewport | Given a bounded observed page | When scrolling by direction and pixels | Then movement and a boundary are reported without reusing stale generation", () => {
@@ -774,7 +826,7 @@ test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMi
     attrs: {
       role: "textbox",
       "aria-label": "New chat",
-      class: "ProseMirror editor another other fifth",
+      class: "ProseMirror editor another other fifth sixth seventh eighth ninth",
       "data-testid": "chat-composer",
       id: "invalid:raw-id",
     },
@@ -787,7 +839,7 @@ test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMi
   assert.equal(observed.elements[0].contenteditable, true);
   assert.equal(observed.elements[0].id, undefined);
   assert.equal(observed.elements[0].data_testid, "chat-composer");
-  assert.deepEqual(Array.from(observed.elements[0].classes), ["ProseMirror", "editor", "another", "other"]);
+  assert.deepEqual(Array.from(observed.elements[0].classes), ["ProseMirror", "editor", "another", "other", "fifth", "sixth", "seventh", "eighth"]);
   assert.ok(!Object.hasOwn(observed.elements[0], "outerHTML"));
   assert.ok(!Object.hasOwn(observed.elements[0], "selector"));
 });
@@ -1068,7 +1120,7 @@ test("Page Assist fails closed inside a cross-origin iframe", () => {
 });
 
 test("user extracts only visible text | Given an observed container with hidden, aria-hidden and password descendants | When extract runs on the container ref | Then only visible descendant text is returned", () => {
-  const container = createElement({ tag: "div", text: "Visible SECRET_HIDDEN SECRET_ARIA" });
+  const container = createElement({ tag: "div", attrs: { role: "button" }, text: "Visible SECRET_HIDDEN SECRET_ARIA" });
   const h = harness({ elements: [container] });
   const doc = container.ownerDocument;
   const textNode = (value) => ({ nodeType: 3, nodeValue: value });
@@ -1289,4 +1341,112 @@ test("user fills a rich-text composer through the extension | Given the extensio
   assert.equal(handoff.value, "hello claude");
   assert.equal(editor.getAttribute("data-h2w-fill-token"), handoff.main_world_fill_token);
   assert.notEqual(editor.innerText, "hello claude");
+});
+
+test("user verifies observed controls | Given a textarea and semantic radio | When ref-scoped expect reads their actual state | Then values and checked state are verified without returning field contents", async () => {
+  const input = createElement({ tag: "textarea", value: "actual draft" });
+  const radio = createElement({ tag: "div", attrs: { role: "radio", "aria-checked": "true" } });
+  const option = createElement({ tag: "div", attrs: { role: "option", "aria-selected": "true" } });
+  const focusable = createElement({ tag: "div", attrs: { tabindex: "0", class: "custom-tag-selected" } });
+  const pointer = Object.assign(createElement({ tag: "span", text: "Safe action" }), { cursor: "pointer" });
+  const label = Object.assign(createElement({ tag: "label", text: "Choice" }), { control: radio });
+  const h = harness({ elements: [input, radio, option, focusable, pointer, label, createElement({ tag: "div", text: "Broad ancestor" }), createElement({ tag: "input", type: "password" })] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 6);
+  for (const [condition, ref, value] of [["input_value_equals", observed.elements[0].ref, "actual draft"], ["input_value_contains", observed.elements[0].ref, "draft"], ["element_checked", observed.elements[1].ref, undefined], ["element_selected", observed.elements[2].ref, undefined], ["element_class_contains", observed.elements[3].ref, "custom-tag-selected"], ["element_visible", observed.elements[0].ref, undefined], ["element_enabled", observed.elements[0].ref, undefined]]) {
+    const result = await h.sendAsync({ type: "h2w_page_assist", action: "expect", generation: observed.generation, ref, condition, value });
+    assert.equal(result.ok, true);
+    assert.equal(result.value, undefined);
+  }
+  const invalid = await h.sendAsync({ type: "h2w_page_assist", action: "expect", generation: observed.generation, ref: observed.elements[3].ref, condition: "element_class_contains", value: "span.tag" });
+  assert.equal(invalid.error, "expect_value_invalid");
+});
+test("user distinguishes clipped input preview from full input value | Given a long safe textarea value | When observe and scoped expect run | Then only the preview is exposed and the exact full value is verified", async () => {
+  const fullValue = `Draft ${"x".repeat(220)} final`;
+  const long = createElement({ tag: "textarea", value: fullValue });
+  const short = createElement({ tag: "textarea", value: "Short draft" });
+  const password = createElement({ tag: "input", type: "password", value: "private-value" });
+  const h = harness({ elements: [long, short, password] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+
+  assert.equal(observed.elements.length, 2);
+  assert.equal(observed.elements[0].text, fullValue.slice(0, 120));
+  assert.equal(observed.elements[0].text_truncated, true);
+  assert.equal(observed.elements[1].text, "Short draft");
+  assert.equal(observed.elements[1].text_truncated, undefined);
+  assert.equal(JSON.stringify(observed).includes("final"), false);
+  assert.equal(JSON.stringify(observed).includes("private-value"), false);
+
+  const matched = await h.sendAsync({
+    type: "h2w_page_assist", action: "expect", condition: "input_value_equals",
+    generation: observed.generation, ref: observed.elements[0].ref, value: fullValue,
+  });
+  assert.equal(matched.ok, true);
+  assert.equal(matched.value, undefined);
+});
+
+test("user rejects expired control assertions | Given an observed input whose generation has been replaced | When scoped expect uses its old ref | Then it fails closed", async () => {
+  const h = harness({ elements: [createElement({ tag: "input", value: "draft" })] });
+  const old = h.send({ type: "h2w_page_assist", action: "inspect" });
+  h.send({ type: "h2w_page_assist", action: "inspect" });
+  const result = await h.sendAsync({ type: "h2w_page_assist", action: "expect", generation: old.generation, ref: old.elements[0].ref, condition: "input_value_equals", value: "draft" });
+  assert.equal(result.error, "stale_generation");
+});
+
+test("user finds controls after inert markup | Given 128 inert spans before a visible Cancel button | When element presence and absence are checked | Then inert candidates do not consume the control budget", async () => {
+  const inert = Array.from({ length: 128 }, () => createElement({ tag: "span", text: "inert" }));
+  const h = harness({ elements: [...inert, createElement({ text: "Cancel" }), createElement({ tag: "input", type: "password", attrs: { "aria-label": "Secret" } })] });
+  for (const [condition, value] of [["element_present", "Cancel"], ["element_absent", "Missing"], ["element_absent", "Secret"]]) {
+    const result = await h.sendAsync({ type: "h2w_page_assist", action: "expect", condition, value });
+    assert.equal(result.ok, true);
+  }
+});
+
+test("user cannot reuse refs across documents | Given two page instances observed in the same millisecond | When a ref from the first is clicked in the second | Then generation fencing rejects it", () => {
+  class FixedDate extends Date { static now() { return 123456789; } }
+  const a = harness({ elements: [createElement({ text: "First" })], extraGlobals: { Date: FixedDate } });
+  const target = createElement({ text: "Second" });
+  const b = harness({ elements: [target], extraGlobals: { Date: FixedDate } });
+  const first = a.send({ type: "h2w_page_assist", action: "inspect" });
+  const second = b.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.notEqual(first.generation, second.generation);
+  const result = b.send({ type: "h2w_page_assist", action: "click", generation: first.generation, ref: first.elements[0].ref });
+  assert.equal(result.error, "stale_generation");
+  assert.equal(target.clicked, 0);
+});
+
+test("user clicks a nested custom choice | Given a bounded generic tag in a dialog | When its observed ref is clicked | Then the delegated choice handler receives the click", async () => {
+  const dialog = createElement({ tag: "div", attrs: { role: "dialog" } });
+  const choice = createElement({ tag: "span", text: "Experience mismatch", attrs: { class: "ui__tag outlined" } });
+  choice.children = [createElement({ tag: "span", text: "Experience mismatch" })];
+  choice.closest = (selector) => selector === 'form, dialog, [role="dialog"]' ? dialog : null;
+  choice.querySelector = () => null;
+  choice.click = function () { this.clicked += 1; dialog.clicked += 1; };
+  const h = harness({ elements: [choice] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 1);
+  assert.equal(observed.elements[0].text, "Experience mismatch");
+  const present = await h.sendAsync({ type: "h2w_page_assist", action: "expect", condition: "element_present", value: "Experience mismatch" });
+  assert.equal(present.ok, true);
+  const result = h.send({ type: "h2w_page_assist", action: "click", generation: observed.generation, ref: observed.elements[0].ref });
+  assert.equal(result.ok, true);
+  assert.equal(dialog.clicked, 1);
+  h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(h.send({ type: "h2w_page_assist", action: "click", generation: observed.generation, ref: observed.elements[0].ref }).error, "stale_generation");
+});
+
+test("user observes only bounded choice controls | Given inert tags and unsafe custom containers | When inspect scans them before Cancel | Then they receive no refs and do not consume the control budget", () => {
+  const inert = Array.from({ length: 128 }, () => createElement({ tag: "span", text: "Decorative", attrs: { class: "tag" } }));
+  const inertDiv = createElement({ tag: "div", text: "Inert", attrs: { class: "layout-container" } });
+  inertDiv.getBoundingClientRect = () => { throw new Error("inert div must not trigger geometry checks"); };
+  inertDiv.querySelector = () => { throw new Error("inert div must not trigger descendant checks"); };
+  const broad = createElement({ tag: "div", text: "Broad choice", attrs: { class: "choice" } });
+  broad.closest = () => ({});
+  broad.getBoundingClientRect = () => ({ width: 900, height: 300 });
+  const sensitive = createElement({ tag: "span", text: "Sensitive choice", attrs: { class: "chip" } });
+  sensitive.closest = () => ({});
+  sensitive.querySelector = () => createElement({ tag: "input", type: "password" });
+  const h = harness({ elements: [...inert, inertDiv, broad, sensitive, createElement({ text: "Cancel" })] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.deepEqual(Array.from(observed.elements, (el) => el.text), ["Cancel"]);
 });

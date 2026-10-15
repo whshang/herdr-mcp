@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.203";
+const H2W_SCRIPT_VERSION = "0.1.212";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -3574,6 +3574,7 @@ async function handleBrowserActuation(command) {
         amount: params.amount,
         key: params.key,
         maxRows: params.max_rows,
+        expectedUrl: params.expected_url,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -8274,6 +8275,9 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "scroll_unavailable",
   "press_params_invalid",
   "press_unavailable",
+  "hover_only_target",
+  "hover_target_offscreen",
+  "hover_target_obscured",
 ]);
 
 function browserPageMutationEnvelope(result, page, sendAttempted) {
@@ -8364,6 +8368,84 @@ function browserImageArtifactMetadata(response) {
   };
 }
 
+async function captureOwnedBackgroundScreenshot(page, tab) {
+  const target = { tabId: tab.id };
+  const exactTab = async () => {
+    try {
+      const live = await chrome.tabs.get(tab.id);
+      return live?.windowId === tab.windowId
+        && live?.url === page.canonical_url
+        && live?.status === "complete"
+        && page.ownership === "owned";
+    } catch (_) {
+      return false;
+    }
+  };
+  if (!chrome.tabs?.onUpdated?.addListener || !chrome.tabs?.onUpdated?.removeListener
+      || !await exactTab()) {
+    return { ok: false, error: "browser_page_screenshot_view_changed", retryable: true };
+  }
+  let navigationSeen = false;
+  const onTabUpdated = (updatedTabId, changeInfo) => {
+    if (updatedTabId === tab.id
+        && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+      navigationSeen = true;
+    }
+  };
+  chrome.tabs.onUpdated.addListener(onTabUpdated);
+
+  let attached = false;
+  let detachVerified = true;
+  let imageData = "";
+  let error = null;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    const frameIdentity = async () => {
+      const tree = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+      const frame = tree?.frameTree?.frame;
+      if (!frame?.id || !frame?.loaderId
+          || browserPageCanonicalUrl(frame.url, page.origin) !== page.canonical_url) return null;
+      return `${frame.id}:${frame.loaderId}`;
+    };
+    const before = await frameIdentity();
+    if (!before || navigationSeen) {
+      error = "browser_page_screenshot_view_changed";
+    } else {
+      const captured = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+        format: "jpeg", quality: 80, fromSurface: true, captureBeyondViewport: false,
+      });
+      imageData = captured?.data;
+      const after = await frameIdentity();
+      if (navigationSeen || !after || after !== before || !await exactTab()) {
+        error = "browser_page_screenshot_view_changed";
+      }
+    }
+  } catch (_) {
+    error = "browser_page_screenshot_failed";
+  } finally {
+    try { chrome.tabs.onUpdated.removeListener(onTabUpdated); } catch (_) {}
+    if (attached) {
+      detachVerified = false;
+      for (let attempt = 0; attempt < 2 && !detachVerified; attempt += 1) {
+        try {
+          await chrome.debugger.detach(target);
+          detachVerified = true;
+        } catch (_) {}
+      }
+    }
+  }
+  if (!detachVerified) {
+    return { ok: false, error: "browser_page_screenshot_debugger_detach_unverified", retryable: false };
+  }
+  if (error) return { ok: false, error, retryable: true };
+  if (typeof imageData !== "string" || imageData.length > 12000000 || imageData.length < 16
+      || !/^[A-Za-z0-9+/]+={0,2}$/.test(imageData)) {
+    return { ok: false, error: "browser_page_screenshot_invalid", retryable: false };
+  }
+  return { ok: true, dataUrl: `data:image/jpeg;base64,${imageData}` };
+}
+
 async function captureBrowserPageScreenshot(page, tab) {
   if (!page || !tab?.id || !Number.isInteger(tab.windowId)
       || !chrome.tabs?.onActivated?.addListener
@@ -8404,50 +8486,103 @@ async function captureBrowserPageScreenshot(page, tab) {
     }
   };
 
-  if (!await exactTargetIsVisible()) {
-    return withBrowserPageIdentity({
-      ok: false,
-      error: "browser_page_screenshot_not_visible",
-      retryable: true,
-      capture_scope: "visible_tab",
-    }, page);
-  }
-
-  let viewChanged = false;
-  const onActivated = (activeInfo) => {
-    if (activeInfo?.windowId === tab.windowId) viewChanged = true;
-  };
-  const onFocusChanged = (windowId) => {
-    if (windowId !== tab.windowId) viewChanged = true;
-  };
-  chrome.tabs.onActivated.addListener(onActivated);
-  chrome.windows.onFocusChanged.addListener(onFocusChanged);
-
+  const visible = await exactTargetIsVisible();
   let dataUrl = "";
-  try {
-    dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: "jpeg",
-      quality: 80,
-    });
-    if (viewChanged || !await exactTargetIsVisible()) {
+  let captureScope = "visible_tab";
+  if (!visible) {
+    if (page.ownership !== "owned" || !chrome.debugger?.attach
+        || !chrome.debugger?.sendCommand || !chrome.debugger?.detach) {
       return withBrowserPageIdentity({
-        ok: false,
-        error: "browser_page_screenshot_view_changed",
-        retryable: true,
-        capture_scope: "visible_tab",
+        ok: false, error: "browser_page_screenshot_not_visible",
+        retryable: true, capture_scope: "visible_tab",
       }, page);
     }
-  } catch (error) {
-    return withBrowserPageIdentity({
-      ok: false,
-      error: "browser_page_screenshot_failed",
-      retryable: true,
-      detail: String(error?.message || error || ""),
-      capture_scope: "visible_tab",
-    }, page);
-  } finally {
-    chrome.tabs.onActivated.removeListener(onActivated);
-    chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+    const result = await captureOwnedBackgroundScreenshot(page, tab);
+    if (!result.ok) {
+      return withBrowserPageIdentity({
+        ok: false, error: result.error,
+        retryable: result.retryable, capture_scope: "owned_background",
+      }, page);
+    }
+    dataUrl = result.dataUrl;
+    captureScope = "owned_background";
+  } else {
+    let viewChanged = false;
+    const onActivated = (activeInfo) => {
+      if (activeInfo?.windowId === tab.windowId) viewChanged = true;
+    };
+    const onFocusChanged = (windowId) => {
+      if (windowId !== tab.windowId) viewChanged = true;
+    };
+    const onUpdated = (tabId, changeInfo) => {
+      if (tabId === tab.id
+          && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+        viewChanged = true;
+      }
+    };
+    const exactDocument = async () => {
+      try {
+        const result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: "ISOLATED",
+          func: () => ({
+            href: location.href, origin: location.origin, timeOrigin: performance.timeOrigin,
+          }),
+        });
+        const info = result?.[0]?.result;
+        if (info?.href !== page.canonical_url || info?.origin !== page.origin
+            || !Number.isFinite(info?.timeOrigin)) return null;
+        return info.timeOrigin;
+      } catch (_) {
+        return null;
+      }
+    };
+    if (!chrome.tabs.onUpdated?.addListener || !chrome.tabs.onUpdated?.removeListener) {
+      return withBrowserPageIdentity({
+        ok: false, error: "browser_page_screenshot_view_changed",
+        retryable: true, capture_scope: "visible_tab",
+      }, page);
+    }
+    chrome.tabs.onActivated.addListener(onActivated);
+    chrome.windows.onFocusChanged.addListener(onFocusChanged);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+
+    try {
+      const documentTimeOrigin = await exactDocument();
+      if (!documentTimeOrigin || viewChanged) {
+        return withBrowserPageIdentity({
+          ok: false, error: "browser_page_screenshot_view_changed",
+          retryable: true, capture_scope: "visible_tab",
+        }, page);
+      }
+      dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+        format: "jpeg",
+        quality: 80,
+      });
+      const afterDocument = await exactDocument();
+      const liveTab = await chrome.tabs.get(tab.id);
+      if (viewChanged || afterDocument !== documentTimeOrigin
+          || liveTab.windowId !== tab.windowId || liveTab.url !== page.canonical_url
+          || !await exactTargetIsVisible()) {
+        return withBrowserPageIdentity({
+          ok: false,
+          error: "browser_page_screenshot_view_changed",
+          retryable: true,
+          capture_scope: "visible_tab",
+        }, page);
+      }
+    } catch (error) {
+      return withBrowserPageIdentity({
+        ok: false,
+        error: "browser_page_screenshot_failed",
+        retryable: true,
+        detail: String(error?.message || error || ""),
+        capture_scope: "visible_tab",
+      }, page);
+    } finally {
+      chrome.tabs.onActivated.removeListener(onActivated);
+      chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+    }
   }
 
   const match = /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ""));
@@ -8456,7 +8591,7 @@ async function captureBrowserPageScreenshot(page, tab) {
       ok: false,
       error: "browser_page_screenshot_invalid",
       retryable: false,
-      capture_scope: "visible_tab",
+      capture_scope: captureScope,
     }, page);
   }
 
@@ -8475,12 +8610,12 @@ async function captureBrowserPageScreenshot(page, tab) {
       ok: false,
       error: String(response?.error || "browser_page_screenshot_artifact_failed"),
       retryable: true,
-      capture_scope: "visible_tab",
+      capture_scope: captureScope,
     }, page);
   }
   return withBrowserPageIdentity({
     ok: true,
-    capture_scope: "visible_tab",
+    capture_scope: captureScope,
     origin: page.origin,
     canonical_url: page.canonical_url,
     artifact,
@@ -8490,7 +8625,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table"].includes(action)) {
+  if (!["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -8500,7 +8635,7 @@ async function performBrowserPageActionRequest(msg) {
 
   const pageRef = String(msg?.pageRef || "");
   if (!validBrowserPageRef(pageRef)) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
       : { ok: false, error: "browser_page_ref_invalid" };
   }
@@ -8508,12 +8643,12 @@ async function performBrowserPageActionRequest(msg) {
   await loadBrowserPages();
   const record = browserPagesByRef.get(pageRef);
   if (!record) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
       : { ok: false, error: "browser_page_not_found" };
   }
   if (record.endpoint_ref !== endpointRef) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
       : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
   }
@@ -8526,14 +8661,14 @@ async function performBrowserPageActionRequest(msg) {
       reason: "host_permission_missing",
       origin: record.origin,
     };
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope(denied, record, false)
       : withBrowserPageIdentity(denied, record);
   }
 
   const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
   if (!resolved.ok) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope(resolved, record, false)
       : withBrowserPageIdentity(resolved, record);
   }
@@ -8542,6 +8677,18 @@ async function performBrowserPageActionRequest(msg) {
     return captureBrowserPageScreenshot(page, resolved.tab);
   }
   const tabId = resolved.tab.id;
+  if (action === "hover" && (page.ownership !== "owned" || !chrome.debugger)) {
+    return browserPageMutationEnvelope({ ok: false, error: "browser_page_hover_unavailable" }, page, false);
+  }
+  const rawExpectedUrl = msg?.expectedUrl;
+  const expectedUrl = rawExpectedUrl == null
+    ? null
+    : browserPageCanonicalUrl(rawExpectedUrl, page.origin);
+  if (rawExpectedUrl != null && (action !== "click" || !expectedUrl || expectedUrl === page.canonical_url)) {
+    return browserPageMutationEnvelope(
+      { ok: false, error: "navigation_expectation_invalid" }, page, false,
+    );
+  }
   const payload = {
     type: "h2w_page_assist",
     action,
@@ -8559,7 +8706,7 @@ async function performBrowserPageActionRequest(msg) {
     ...(action === "fill" ? { mainWorldFill: true } : {}),
   };
 
-  const mutation = action === "click" || action === "fill" || action === "scroll" || action === "press";
+  const mutation = action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press";
   let sendAttempted = false;
   const send = async () => {
     sendAttempted = true;
@@ -8569,14 +8716,35 @@ async function performBrowserPageActionRequest(msg) {
   try {
     const response = await send();
     if (mutation) {
+      if (action === "hover") {
+        if (response?.ok !== true) return browserPageMutationEnvelope(response, page, false);
+        const hover = await browserPageTrustedHover(tabId, response.hover_point);
+        return browserPageMutationEnvelope(hover.result, page, hover.dispatched);
+      }
       let mutationResponse = response;
       if (action === "fill" && response?.ok === true && typeof response?.main_world_fill_token === "string") {
         mutationResponse = await browserPageMainWorldFill(tabId, response, { page, tab: resolved.tab });
       }
-      if (action === "click" && response?.ok === true && typeof response?.navigation_url === "string") {
-        await adoptAppliedBrowserPageNavigation(page, tabId, response.navigation_url);
-        mutationResponse = { ...response };
-        delete mutationResponse.navigation_url;
+      if (action === "click" && response?.ok === true) {
+        const observedNavigationUrl = typeof response.navigation_url === "string"
+          ? browserPageCanonicalUrl(response.navigation_url, page.origin)
+          : null;
+        if (expectedUrl && observedNavigationUrl && expectedUrl !== observedNavigationUrl) {
+          return browserPageMutationEnvelope(
+            { ok: false, error: "navigation_expectation_mismatch" }, page, true,
+          );
+        }
+        const navigationUrl = expectedUrl || observedNavigationUrl;
+        if (navigationUrl) {
+          const confirmed = await adoptAppliedBrowserPageNavigation(page, tabId, navigationUrl);
+          if (expectedUrl && !confirmed) {
+            return browserPageMutationEnvelope(
+              { ok: false, error: "navigation_postcondition_unverified" }, page, true,
+            );
+          }
+          mutationResponse = { ...response };
+          delete mutationResponse.navigation_url;
+        }
       }
       return browserPageMutationEnvelope(mutationResponse, page, true);
     }
@@ -8706,6 +8874,43 @@ function h2wFillTargetProbe(selector, mode) {
 
 function browserPageFillNormalize(value) {
   return String(value || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+async function browserPageTrustedHover(tabId, point) {
+  const x = Number(point?.x);
+  const y = Number(point?.y);
+  if (!Number.isInteger(x) || !Number.isInteger(y)
+      || x < 0 || y < 0 || x > 10000 || y > 10000) {
+    return { result: { ok: false, error: "hover_target_invalid" }, dispatched: false };
+  }
+  const target = { tabId };
+  let attached = false;
+  let dispatched = false;
+  let result = { ok: false, error: "browser_page_hover_unavailable" };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    dispatched = true;
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse",
+    });
+    result = { ok: true, hover_dispatched: true, hover_requires_observe: true };
+  } catch (_) {
+    result = { ok: false, error: dispatched ? "hover_delivery_unconfirmed" : "browser_page_hover_unavailable" };
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_) {
+        try {
+          await chrome.debugger.detach(target);
+        } catch (_) {
+          result = { ok: false, error: "hover_debugger_detach_unverified" };
+        }
+      }
+    }
+  }
+  return { result, dispatched };
 }
 
 function browserPageTrustedFillAllowed(page) {
