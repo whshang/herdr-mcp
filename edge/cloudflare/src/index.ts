@@ -418,8 +418,9 @@ export default {
       return noStoreJsonResponse(result, result.ok ? 200 : 403);
     }
     if (request.method === "POST" && url.pathname === "/connectors/webchat-control") {
-      const ownerDevice = await authenticateOwnerDevice(request, env);
-      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const ownerIdentity = await authenticateOwnerDeviceIdentity(request, env);
+      if (!ownerIdentity) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const ownerDevice = ownerIdentity.workstationId;
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)) {
         const code = parsed.ok ? "bad_request" : parsed.code;
@@ -443,11 +444,17 @@ export default {
         !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
         || !normalizedDeviceId || normalizedDeviceId !== deviceId
         || !endpointRef || endpointRef.length > 96
+        || (endpointRef === "*" && (provider !== "*" || accountRef !== "*"))
         || !accountRef || accountRef.length > 96
         || !provider || provider.length > 32 || !(provider === "*" || /^[a-z0-9][a-z0-9._-]*$/.test(provider))
         || typeof parsed.value.allowed !== "boolean"
       ) {
         return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
+      }
+      // Device-wide authority requires a credential enrolled for this exact
+      // target device. Legacy owner shared-secret alone cannot issue it.
+      if (endpointRef === "*" && ownerIdentity.deviceId !== normalizedDeviceId) {
+        return noStoreJsonResponse({ ok: false, code: "connector_owner_device_mismatch" }, 403);
       }
       const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
       const store = createOAuthPublicStore(stub);

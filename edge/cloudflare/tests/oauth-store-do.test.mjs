@@ -382,6 +382,50 @@ test("WebChat Control grants normalize legacy records and add/remove one exact t
   assert.deepEqual(disabled.record.webchat_control, []);
 });
 
+test("owner grants and revokes one device-wide WebChat scope without changing endpoint grants", async () => {
+  const h = harness();
+  const connectorId = "conn_device_scope_1";
+  h.storage.map.set("grant:device-scope-client", {
+    client_id: "device-scope-client", resource: "https://issuer/mcp",
+    scope: "mcp", status: "active", can_approve_connectors: true,
+    approved_at_ms: 100, approved_by: "device:owner",
+  });
+  h.storage.map.set(`connector:${connectorId}`, connectorRecord("device-scope-client", connectorId));
+  const base = {
+    connector_id: connectorId, device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    changed_by: "device:owner",
+  };
+  const exact = await body(await h.post("/internal/oauth/grant/webchat-control", {
+    ...base, endpoint_ref: "be_" + "a".repeat(64),
+    provider: "grok", account_ref: "*", allowed: true,
+  }));
+  assert.equal(exact.ok, true);
+  for (const partial of [
+    { endpoint_ref: "*", provider: "grok", account_ref: "*" },
+    { endpoint_ref: "*", provider: "*", account_ref: "br_legacy" },
+  ]) {
+    const rejected = await body(await h.post("/internal/oauth/grant/webchat-control", {
+      ...base, ...partial, allowed: true,
+    }));
+    assert.equal(rejected.ok, false);
+  }
+  const wide = { ...base, endpoint_ref: "*", provider: "*", account_ref: "*" };
+  const enabled = await body(await h.post("/internal/oauth/grant/webchat-control", { ...wide, allowed: true }));
+  assert.equal(enabled.ok, true);
+  assert.equal(enabled.record.webchat_control.length, 2);
+  const inherited = enabled.record.webchat_control.find(g => g.endpoint_ref === "*");
+  assert.deepEqual({
+    connector_id: inherited.connector_id, grant_generation: inherited.grant_generation,
+    device_id: inherited.device_id, endpoint_ref: inherited.endpoint_ref,
+    provider: inherited.provider, account_ref: inherited.account_ref,
+  }, { connector_id: connectorId, grant_generation: 1,
+    device_id: base.device_id, endpoint_ref: "*", provider: "*", account_ref: "*" });
+  const denied = await body(await h.post("/internal/oauth/grant/webchat-control", { ...wide, allowed: false }));
+  assert.equal(denied.ok, true);
+  assert.equal(denied.record.webchat_control.length, 1);
+  assert.equal(denied.record.webchat_control[0].provider, "grok");
+});
+
 test("user owner | Given a legacy per-account WebChat Control grant | When allow is issued without account_ref and then deny | Then one provider-scoped grant replaces it and deny removes every grant for that endpoint+provider", async () => {
   const h = harness();
   const connectorId = "conn_webchat_scope_1";

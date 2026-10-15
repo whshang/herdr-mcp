@@ -1995,10 +1995,12 @@ test("user stops a WebChat generation on one of two granted devices | Given WebC
   for (const [device, expectedGrants, forbiddenRefs] of [
     [DEVICE_A, [
       { endpoint_ref: WEBCHAT_A, provider: "chatgpt", account_ref: ACCOUNT_A },
+      { endpoint_ref: "*", provider: "*", account_ref: "*" },
       { endpoint_ref: PAGE_A, provider: "*", account_ref: "*" },
     ], [WEBCHAT_B, PAGE_B]],
     [DEVICE_B, [
       { endpoint_ref: WEBCHAT_B, provider: "grok", account_ref: ACCOUNT_B },
+      { endpoint_ref: "*", provider: "*", account_ref: "*" },
       { endpoint_ref: PAGE_B, provider: "*", account_ref: "*" },
     ], [WEBCHAT_A, PAGE_A]],
   ]) {
@@ -2008,7 +2010,9 @@ test("user stops a WebChat generation on one of two granted devices | Given WebC
         grantGeneration: 3,
         webchatControlGrants: [
           { device_id: DEVICE_A, endpoint_ref: WEBCHAT_A, provider: "chatgpt", account_ref: ACCOUNT_A },
+          { device_id: DEVICE_A, endpoint_ref: "*", provider: "*", account_ref: "*" },
           { device_id: DEVICE_B, endpoint_ref: WEBCHAT_B, provider: "grok", account_ref: ACCOUNT_B },
+          { device_id: DEVICE_B, endpoint_ref: "*", provider: "*", account_ref: "*" },
         ],
         pageAssistGrants: [
           { device_id: DEVICE_A, endpoint_ref: PAGE_A },

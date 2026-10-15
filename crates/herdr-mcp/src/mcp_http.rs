@@ -2874,6 +2874,9 @@ fn trusted_edge_webchat_control_grants(
             || !(valid_browser_grant_provider(provider)
                 || provider == crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER)
             || !valid_browser_grant_ref(account_ref, 96)
+            || (endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
+                && (provider != crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
+                    || account_ref != crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT))
         {
             return Err(());
         }
