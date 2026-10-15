@@ -887,6 +887,11 @@ test("user reveals controls with a trusted hover | Given one owned generic page 
       events.push(phase);
       if (phase === "attach" && failAttach) throw new Error("debugger in use");
       if (phase === "command") {
+        if (data.method === "Page.getFrameTree") {
+          return { frameTree: { frame: {
+            id: "frame-hover-1", loaderId: "loader-hover-1", url: "https://example.com/card",
+          } } };
+        }
         if (failCommand) throw new Error("mouse dispatch uncertain");
         assert.equal(data.method, "Input.dispatchMouseEvent");
         assert.equal(data.params.type, "mouseMoved");
@@ -912,7 +917,7 @@ test("user reveals controls with a trusted hover | Given one owned generic page 
   assert.equal(applied.postcondition_observed, false);
   assert.equal(applied.hover_requires_observe, true);
   assert.equal(Object.hasOwn(applied, "hover_point"), false);
-  assert.deepEqual(events, ["attach", "command", "detach"]);
+  assert.deepEqual(events, ["attach", "command", "command", "detach"]);
   const after = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
   assert.equal(after.elements[0].text, "Edit");
 
@@ -936,7 +941,69 @@ test("user reveals controls with a trusted hover | Given one owned generic page 
   assert.equal(uncertain.delivery_state, "delivery_unknown");
   assert.equal(uncertain.retry_safe, false);
   assert.equal(uncertain.mutation_submitted, true);
-  assert.deepEqual(events.slice(-3), ["attach", "command", "detach"]);
+  assert.deepEqual(events.slice(-4), ["attach", "command", "command", "detach"]);
+});
+
+test("user hovers with a fenced dispatch | Given the document navigates between hover-point preparation and the debugger dispatch | When the post-attach fence sees a different live document | Then no mouse event is dispatched and the hover fails closed retryably", async () => {
+  let mouseDispatches = 0;
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_hovrace_1", origin: "https://example.com",
+        url: "https://example.com/feed",
+        elements: [{ ref: "ref_pa_gen_hovrace_1_0", text: "Card", hover_only: true }],
+      };
+      if (payload.action === "hover") return {
+        ok: true, generation: payload.generation, ref: payload.ref,
+        hover_point: { x: 51, y: 49 },
+      };
+      throw new Error("unexpected action");
+    },
+    scriptResponder() {
+      // Document probe: report document A until the second in-hover probe,
+      // then report the navigated document (same URL, new timeOrigin) — the
+      // navigation commits between point preparation and the dispatch fence.
+      probeCalls += 1;
+      const navigated = probeCalls - hoverProbeBaseline >= 2;
+      return [{ result: {
+        href: "https://example.com/feed",
+        origin: "https://example.com",
+        timeOrigin: navigated ? 987654 : 123456,
+      } }];
+    },
+    hoverResponder(phase, _target, data) {
+      if (phase === "command" && data.method === "Input.dispatchMouseEvent") mouseDispatches += 1;
+      if (phase === "command" && data.method === "Page.getFrameTree") {
+        return { frameTree: { frame: {
+          id: "frame-race-1", loaderId: "loader-race-1", url: "https://example.com/feed",
+        } } };
+      }
+    },
+  });
+  let probeCalls = 0;
+  let hoverProbeBaseline = 0;
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/feed", idempotencyKey: "hover-race-1",
+  });
+  assert.equal(opened.ok, true);
+  const observed = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  // From here the next two probes belong to the hover request: the first is
+  // the pre-send anchor (document A), the second is the post-attach fence —
+  // which must already observe the navigated document B.
+  hoverProbeBaseline = probeCalls;
+  const fenced = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: observed.generation,
+    ref: observed.elements[0].ref,
+  });
+  assert.equal(fenced.ok, false);
+  assert.equal(fenced.error, "browser_page_hover_view_changed");
+  assert.equal(fenced.retryable, true);
+  assert.equal(fenced.delivery_state, "not_applied");
+  assert.equal(fenced.mutation_submitted, false);
+  assert.equal(mouseDispatches, 0, "no mouse event may be dispatched after a navigation");
 });
 
 test("user rejects invalid native form states | Given unavailable dropdown or unsupported checkable state | When fill checks the observed control | Then delivery is not_applied and retry-safe", async () => {

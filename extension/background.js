@@ -8714,11 +8714,20 @@ async function performBrowserPageActionRequest(msg) {
   };
 
   try {
+    // Anchor the document the hover coordinates will be validated against:
+    // href/origin/timeOrigin read from the live page right before the
+    // content-script round that computes the point. The post-attach fence in
+    // browserPageTrustedHover compares against this observation.
+    const observedDocument = action === "hover"
+      ? await browserPageHoverDocumentProbe(tabId)
+      : null;
     const response = await send();
     if (mutation) {
       if (action === "hover") {
         if (response?.ok !== true) return browserPageMutationEnvelope(response, page, false);
-        const hover = await browserPageTrustedHover(tabId, response.hover_point);
+        const hover = await browserPageTrustedHover(tabId, response.hover_point, {
+          page, tab: resolved.tab, observedDocument,
+        });
         return browserPageMutationEnvelope(hover.result, page, hover.dispatched);
       }
       let mutationResponse = response;
@@ -8876,13 +8885,46 @@ function browserPageFillNormalize(value) {
   return String(value || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim();
 }
 
-async function browserPageTrustedHover(tabId, point) {
+async function browserPageTrustedHover(tabId, point, ctx) {
   const x = Number(point?.x);
   const y = Number(point?.y);
   if (!Number.isInteger(x) || !Number.isInteger(y)
       || x < 0 || y < 0 || x > 10000 || y > 10000) {
     return { result: { ok: false, error: "hover_target_invalid" }, dispatched: false };
   }
+  const page = ctx?.page;
+  const tab = ctx?.tab;
+  // P1 hover navigation race (review on 08ee0348): the hover point was
+  // validated by the content script against the document it observed, before
+  // the async debugger attach. Fence the dispatch with the same document and
+  // navigation evidence the owned-tab screenshot uses: after attach, the frame
+  // identity (id + loaderId + canonical url), the live tab (window, exact url,
+  // settled loader) and the tab-update stream must all still match that
+  // observation. Any drift fails closed BEFORE a mouse event is dispatched.
+  if (!page?.canonical_url || !tab || !Number.isInteger(tab.windowId)
+      || page.ownership !== "owned"
+      || !chrome.tabs?.onUpdated?.addListener || !chrome.tabs?.onUpdated?.removeListener) {
+    return { result: { ok: false, error: "browser_page_hover_unavailable" }, dispatched: false };
+  }
+  const exactTab = async () => {
+    try {
+      const live = await chrome.tabs.get(tabId);
+      return live?.windowId === tab.windowId
+        && live?.url === page.canonical_url
+        && live?.status === "complete";
+    } catch (_) {
+      return false;
+    }
+  };
+  let navigationSeen = false;
+  const onTabUpdated = (updatedTabId, changeInfo) => {
+    if (updatedTabId === tabId
+        && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+      navigationSeen = true;
+    }
+  };
+  chrome.tabs.onUpdated.addListener(onTabUpdated);
+
   const target = { tabId };
   let attached = false;
   let dispatched = false;
@@ -8890,14 +8932,34 @@ async function browserPageTrustedHover(tabId, point) {
   try {
     await chrome.debugger.attach(target, "1.3");
     attached = true;
-    dispatched = true;
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse",
-    });
-    result = { ok: true, hover_dispatched: true, hover_requires_observe: true };
+    const tree = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+    const frame = tree?.frameTree?.frame;
+    // Same-document guarantee: the live MAIN-world document (origin, exact
+    // canonical url, per-load timeOrigin) must still be the one the point was
+    // validated against; a reload or committed navigation fails here.
+    const liveDocument = await browserPageHoverDocumentProbe(tabId);
+    const observed = ctx?.observedDocument;
+    const documentUnchanged = observed && liveDocument
+      && liveDocument.origin.toLowerCase() === observed.origin.toLowerCase()
+      && browserPageCanonicalUrl(liveDocument.href, page.origin) === page.canonical_url
+      && liveDocument.timeOrigin === observed.timeOrigin;
+    if (navigationSeen
+        || !frame?.id || !frame?.loaderId
+        || browserPageCanonicalUrl(frame.url, page.origin) !== page.canonical_url
+        || !await exactTab()
+        || !documentUnchanged) {
+      result = { ok: false, error: "browser_page_hover_view_changed", retryable: true };
+    } else {
+      dispatched = true;
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse",
+      });
+      result = { ok: true, hover_dispatched: true, hover_requires_observe: true };
+    }
   } catch (_) {
     result = { ok: false, error: dispatched ? "hover_delivery_unconfirmed" : "browser_page_hover_unavailable" };
   } finally {
+    try { chrome.tabs.onUpdated.removeListener(onTabUpdated); } catch (_) {}
     if (attached) {
       try {
         await chrome.debugger.detach(target);
@@ -8911,6 +8973,24 @@ async function browserPageTrustedHover(tabId, point) {
     }
   }
   return { result, dispatched };
+}
+
+function h2wHoverDocumentProbe() {
+  const doc = global.document;
+  return {
+    href: String(global.location?.href || ""),
+    origin: String(global.location?.origin || ""),
+    timeOrigin: Number(doc?.timeOrigin),
+  };
+}
+
+async function browserPageHoverDocumentProbe(tabId) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId }, world: "MAIN", func: h2wHoverDocumentProbe,
+  });
+  const value = res?.[0]?.result;
+  return value && typeof value.href === "string" && typeof value.origin === "string"
+    && Number.isFinite(value.timeOrigin) ? value : null;
 }
 
 function browserPageTrustedFillAllowed(page) {
