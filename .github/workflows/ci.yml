@@ -14,8 +14,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # GitHub-hosted Linux. Rust, Node, Deno, and the compiler cache are
+  # installed in-job; the Node gate downloads the pinned Herdr binary.
+  # Windows Candidate stays on its own GitHub-hosted workflow.
   rust:
-    runs-on: [self-hosted, Linux, X64, herdr-box, ci]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       CARGO_INCREMENTAL: "0"
@@ -33,7 +36,7 @@ jobs:
         run: scripts/release-gate.sh rust
 
   test:
-    runs-on: [self-hosted, Linux, X64, herdr-box, ci]
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
