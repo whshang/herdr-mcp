@@ -378,6 +378,21 @@ pub fn run(command: WorkerCommand, language: Locale) -> Result<ExitCode, String>
             &account_ref,
             allowed,
         ),
+        WorkerCommand::ConnectorPageAssistOrphans {
+            from,
+            to,
+            device_id,
+        } => connector_page_assist_orphans(
+            &paths,
+            from.as_deref(),
+            to.as_deref(),
+            device_id.as_deref(),
+        ),
+        WorkerCommand::ConnectorPageAssistMigrate {
+            from,
+            to,
+            idempotency_key,
+        } => connector_page_assist_migrate(&paths, &from, &to, idempotency_key.as_deref()),
         WorkerCommand::ConnectorPageAssist {
             connector_id,
             device_id,
@@ -1473,6 +1488,167 @@ fn connector_planner_control(
             .map_err(|error| format!("cannot encode planner control result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn connector_page_assist_orphans(
+    _paths: &RuntimePaths,
+    _from: Option<&str>,
+    _to: Option<&str>,
+    _device_id: Option<&str>,
+) -> Result<ExitCode, String> {
+    Err(
+        "connector Page Assist orphans requires a supported enrolled-owner credential backend"
+            .to_owned(),
+    )
+}
+
+/// #626: read-only. Lists orphan grant rows, or with `from`/`to` prints a migrate
+/// dry-run plan. Uses the same owner-device authentication as `page-assist allow`.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn connector_page_assist_orphans(
+    paths: &RuntimePaths,
+    from: Option<&str>,
+    to: Option<&str>,
+    device_id: Option<&str>,
+) -> Result<ExitCode, String> {
+    let body = match (from, to, device_id) {
+        (None, None, device_id) => crate::grant_migration::orphans_list_body(device_id)?,
+        (_, _, None) => crate::grant_migration::orphans_request_body(from, to)?,
+        _ => return Err("--device-id applies only to `connector page-assist orphans`".to_owned()),
+    };
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(
+            &identity.edge_origin,
+            "/connectors/page-assist/orphans",
+        )?)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .map_err(|error| format!("cannot read Connector Page Assist orphans: {error}"))?;
+    let payload = parse_json_response(response, "connector Page Assist orphans")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).map_err(|error| format!(
+            "cannot encode Connector Page Assist orphans result: {error}"
+        ))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn connector_page_assist_migrate(
+    _paths: &RuntimePaths,
+    _from: &str,
+    _to: &str,
+    _idempotency_key: Option<&str>,
+) -> Result<ExitCode, String> {
+    Err(
+        "connector page-assist migrate requires a supported enrolled-owner credential backend"
+            .to_owned(),
+    )
+}
+
+/// #630 `--confirm`: fetch the device-scoped dry-run plan, print it with the
+/// generated (or caller-supplied) idempotency key, then confirm it by digest.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn connector_page_assist_migrate(
+    paths: &RuntimePaths,
+    from: &str,
+    to: &str,
+    idempotency_key: Option<&str>,
+) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let client = client_for_origin(&identity.edge_origin)?;
+
+    // 1. Device-scoped dry run: the plan and its digest cover only this device.
+    let plan_body = crate::grant_migration::orphans_request_body(Some(from), Some(to))?;
+    let plan_response = client
+        .post(endpoint(
+            &identity.edge_origin,
+            "/connectors/page-assist/orphans",
+        )?)
+        .headers(headers.clone())
+        .json(&plan_body)
+        .send()
+        .map_err(|error| format!("cannot read migrate dry-run plan: {error}"))?;
+    let plan = parse_json_response(plan_response, "migrate dry-run plan")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&plan)
+            .map_err(|error| format!("cannot encode migrate dry-run plan: {error}"))?
+    );
+    if plan.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        return Ok(ExitCode::FAILURE);
+    }
+    let plan_digest = plan
+        .get("plan_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("migrate dry-run plan returned no plan_digest")?
+        .to_owned();
+
+    // 2. Confirm: same key replays to the stored result; the key is printed so
+    // a retry after an interrupted run can reuse it deliberately.
+    let key = idempotency_key
+        .map(str::to_owned)
+        .unwrap_or_else(generate_idempotency_key);
+    println!("idempotency_key: {key}");
+    let confirm_body = serde_json::json!({
+        "from": from,
+        "to": to,
+        "plan_digest": plan_digest,
+        "idempotency_key": key,
+    });
+    let response = client
+        .post(endpoint(
+            &identity.edge_origin,
+            "/connectors/page-assist/migrate",
+        )?)
+        .headers(headers)
+        .json(&confirm_body)
+        .send()
+        .map_err(|error| format!("cannot apply connector Page Assist migrate: {error}"))?;
+    let payload = parse_json_response(response, "connector Page Assist migrate")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("cannot encode migrate result: {error}"))?
+    );
+    Ok(
+        if payload.get("ok") == Some(&serde_json::Value::Bool(true)) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        },
+    )
+}
+
+/// Random idempotency key from time + pid (hex subset of the allowed charset,
+/// at least 16 chars). No new dependency; uniqueness within a CLI invocation
+/// stream is sufficient for the 24h server TTL.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn generate_idempotency_key() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let pid = std::process::id();
+    format!("m{nanos:x}{pid:x}")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

@@ -29,6 +29,7 @@ mod fs_security;
 mod fs_tools;
 mod git_tools;
 mod github_status;
+mod grant_migration;
 mod herdr;
 mod herdr_dependency;
 mod herdr_native;
@@ -52,6 +53,11 @@ mod mcp_http;
 mod mutation;
 mod native_host;
 mod native_host_install;
+// The origin-check diagnostics serve the macOS native-host status wiring and
+// the cross-platform unit tests; a plain Linux bin build has no caller, and
+// compiling it there would be dead code under the -D warnings clippy gate.
+#[cfg(any(target_os = "macos", test))]
+mod native_host_origin_check;
 mod native_tools;
 mod patch;
 mod paths;

@@ -136,7 +136,7 @@ continuity_id
 
 - Not supported today (runtime returns `code: "unsupported"`): `browser_space.create`, `browser_space.open`, `browser_message.append`, `browser_composer.set_reasoning`, `browser_composer.set_apps`, and `dispatch.submit` with `reasoning_effort` or `required_apps`.
 - Supported private methods with **no CLI wrapper**: `browser_dispatch.stop`, `browser_endpoint.inspect`, `browser_space.inspect`, and the trusted-local read-only source resolver used internally by the CLI. `browser_session.open` is available through `herdr-mcp webchat open`; `browser_handoff.prepare` is reached through `herdr-mcp webchat handoff`. `webchat create --source-url URL` is available for exact source-window affinity and requires only the canonical source URL plus the normal message/idempotency inputs; the trusted local CLI resolves the exact endpoint/account route and attaches that grant internally, while Runtime resolves and validates the same canonical route again before mutation. An exact canonical URL observed by more than one browser session is ambiguous and fails closed as `browser_canonical_url_ambiguous`, so source-anchored create and handoff never retarget another profile/account's session.
-- `code: "caller_grant_missing"` means you are not on the trusted local path (for example a raw TCP MCP client); grants cannot be asserted over TCP. Use the CLI.
+- `code: "caller_grant_missing"` has one of two causes. You may be off the trusted local path (for example a raw TCP MCP client; grants cannot be asserted over TCP — use the CLI), or the caller is a remote connector whose Page Assist grant is missing or stale (see the grant-binding note below).
 - `ego-browser` is development/UAT infrastructure, never a user dependency.
 
 Always re-check the installed runtime before relying on a capability.
@@ -163,3 +163,18 @@ forward time from every Page Assist endpoint grant for the routed device, so
 `connector page-assist allow` also authorizes WebChat send/status/stop for all providers on
 that endpoint, existing Page Assist grants work without migration, and `page-assist deny`
 removes the derived grant. Explicit per-provider grants remain until denied.
+
+**Page Assist grant binding.** A Page Assist grant is not a label; it binds
+`{connector_id, grant_generation, device_id, endpoint_ref}`. Re-authorizing ChatGPT issues a
+new `connector_id`, and a changed extension identity registers a new `endpoint_ref`; in either
+case the previous grant silently stops matching and connector callers get
+`caller_grant_missing` (fail-closed, `retryable=false`). Do not widen permissions in response.
+Re-allow the exact current combination as the workstation owner, in order:
+
+```sh
+herdr-mcp connector list                                        # current connector_id
+herdr-mcp webchat endpoints                                     # browser_endpoint.list: pick an
+                                                                # online endpoint (status "live")
+                                                                # with the newest version
+herdr-mcp connector page-assist allow CONNECTOR_ID DEVICE_ID ENDPOINT_REF --confirm
+```
