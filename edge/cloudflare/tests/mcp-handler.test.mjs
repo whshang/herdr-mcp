@@ -1732,6 +1732,31 @@ test("read tools receive stable short-window dedupe keys while mutations do not"
   assert.equal(d.calls[3].readDedupeKey, undefined);
 });
 
+test("user diagnoses which connector called a tool | Given an OAuth connector and an unbound caller | When each tools/call is forwarded | Then the forward log names that connectorId and no token", async () => {
+  const bound = deps({
+    client: {
+      connectorId: "conn_logconnector123",
+      grantGeneration: 4,
+      authSource: "oauth_edge",
+    },
+  });
+  await handleMcp(req(42, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", bound.value);
+  const forward = bound.logs.find((entry) => entry.event === "mcp.tools_call.forward");
+  assert.ok(forward);
+  assert.equal(forward.fields.connectorId, "conn_logconnector123");
+  assert.equal(forward.fields.connectorBound, true);
+  assert.equal(forward.fields.grantGeneration, 4);
+  assert.equal(JSON.stringify(forward).includes("token"), false);
+  assert.equal(JSON.stringify(forward).includes("secret"), false);
+
+  const unbound = deps();
+  await handleMcp(req(43, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", unbound.value);
+  const unboundForward = unbound.logs.find((entry) => entry.event === "mcp.tools_call.forward");
+  assert.ok(unboundForward);
+  assert.equal(unboundForward.fields.connectorId, null);
+  assert.equal(unboundForward.fields.connectorBound, false);
+});
+
 test("forwarded requests carry a bounded principal ownership key derived from authenticated identity", async () => {
   const a = deps({ client: { connectorId: "conn_principal_a", authSource: "oauth_edge" } });
   const b = deps({ client: { connectorId: "conn_principal_b", authSource: "oauth_edge" } });

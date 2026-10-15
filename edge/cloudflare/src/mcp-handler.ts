@@ -1477,6 +1477,7 @@ export async function handleMcp(
       opClass,
       clientKind: isOpenAiDiscoverClient(deps.client) ? "openai-mcp" : "other",
       connectorBound: Boolean(deps.client?.connectorId),
+      connectorId: deps.client?.connectorId ?? null,
       grantGeneration: deps.client?.grantGeneration ?? null,
       authSource: deps.client?.authSource ?? null,
       contractEpoch: publicContract.contract_epoch,
