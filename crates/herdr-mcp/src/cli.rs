@@ -4131,6 +4131,51 @@ mod tests {
                 device_wide: false,
             })
         );
+        for (command, allowed) in [("allow-device", true), ("deny-device", false)] {
+            assert_eq!(
+                parse(args(&[
+                    "connector",
+                    "webchat-control",
+                    command,
+                    "conn_webchat_test_1",
+                    "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    "--confirm",
+                ]))
+                .unwrap()
+                .command,
+                Command::Worker(WorkerCommand::ConnectorWebChatControl {
+                    connector_id: "conn_webchat_test_1".to_owned(),
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    endpoint_ref: "*".to_owned(),
+                    provider: "*".to_owned(),
+                    account_ref: "*".to_owned(),
+                    allowed,
+                })
+            );
+        }
+        assert!(
+            parse(args(&[
+                "connector",
+                "webchat-control",
+                "allow-device",
+                "conn_webchat_test_1",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "connector",
+                "webchat-control",
+                "allow",
+                "conn_webchat_test_1",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "*",
+                "*",
+                "--confirm",
+            ]))
+            .is_err()
+        );
         assert_eq!(
             parse(args(&[
                 "connector",

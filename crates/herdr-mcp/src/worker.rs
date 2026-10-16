@@ -3430,6 +3430,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_wide_webchat_grant_requires_complete_scope_at_owner_transport() {
+        assert!(valid_webchat_control_scope("*", "*", "*"));
+        assert!(valid_webchat_control_scope("bep_a", "*", "*"));
+        assert!(valid_webchat_control_scope("bep_a", "grok", "*"));
+        assert!(!valid_webchat_control_scope("*", "grok", "*"));
+        assert!(!valid_webchat_control_scope("*", "*", "br_specific"));
+    }
+
+    #[test]
     fn production_link_identity_reads_legacy_single_device_link_environment() {
         let env = std::collections::BTreeMap::from([
             (

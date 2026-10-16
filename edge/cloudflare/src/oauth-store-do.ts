@@ -821,6 +821,7 @@ export class OAuthStoreDO {
       typeof connectorId !== "string" || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
       || !boundedString(deviceId, 64)
       || !boundedString(endpointRef, 96)
+      || (endpointRef === "*" && (provider !== "*" || accountRef !== "*"))
       || !boundedString(accountRef, 96)
       || !boundedString(provider, 32)
       || !(provider === "*" || /^[a-z0-9][a-z0-9._-]*$/.test(provider))

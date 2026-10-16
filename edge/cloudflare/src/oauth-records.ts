@@ -421,6 +421,7 @@ export function normalizeWebChatControlGrants(value: unknown): OAuthWebChatContr
     if (!boundedString(item.device_id, 64)) return null;
     if (!boundedString(item.endpoint_ref, 96) || !boundedString(item.account_ref, 96)) return null;
     if (!boundedString(item.provider, 32) || !(item.provider === "*" || /^[a-z0-9][a-z0-9._-]*$/.test(item.provider))) return null;
+    if (item.endpoint_ref === "*" && (item.provider !== "*" || item.account_ref !== "*")) return null;
     grants.push({
       connector_id: item.connector_id,
       grant_generation: item.grant_generation as number,

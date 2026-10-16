@@ -418,8 +418,8 @@ export default {
       return noStoreJsonResponse(result, result.ok ? 200 : 403);
     }
     if (request.method === "POST" && url.pathname === "/connectors/webchat-control") {
-      const owner = await authenticateOwnerDeviceIdentity(request, env);
-      if (!owner) {
+      const ownerIdentity = await authenticateOwnerDeviceIdentity(request, env);
+      if (!ownerIdentity) {
         logger.warn("connector.webchat_control_denied", {
           code: "connector_owner_device_required",
           requesterDeviceId: null,
@@ -429,6 +429,7 @@ export default {
         });
         return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
       }
+      const ownerDevice = ownerIdentity.workstationId;
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)) {
         const code = parsed.ok ? "bad_request" : parsed.code;
@@ -466,11 +467,26 @@ export default {
         !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
         || !normalizedDeviceId || normalizedDeviceId !== deviceId
         || !endpointRef || endpointRef.length > 96
+        || (endpointRef === "*" && (provider !== "*" || accountRef !== "*"))
         || !accountRef || accountRef.length > 96
         || !provider || provider.length > 32 || !(provider === "*" || /^[a-z0-9][a-z0-9._-]*$/.test(provider))
         || typeof parsed.value.allowed !== "boolean"
       ) {
         return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
+      }
+      // Same-fleet authority: owner device A can target another ACTIVE enrolled
+      // device B in the same Worker fleet. The requester MUST be authenticated
+      // via an actual enrolled device credential — a legacy shared-secret owner
+      // lookup is not proof of device identity for a device-wide grant.
+      if (!ownerIdentity.deviceId) {
+        logger.warn("connector.webchat_control_denied", {
+          code: "connector_owner_device_mismatch",
+          requesterDeviceId: null,
+          requesterWorkstationId: ownerIdentity.workstationId,
+          targetDeviceId: deviceId,
+          connectorId,
+        });
+        return noStoreJsonResponse({ ok: false, code: "connector_owner_device_mismatch" }, 403);
       }
       const target = await fleetDeviceMembership(env, deviceId);
       if (target === "unavailable") {
@@ -479,16 +495,16 @@ export default {
       if (target !== "member") {
         logger.warn("connector.webchat_control_denied", {
           code: "connector_owner_device_mismatch",
-          requesterDeviceId: owner.deviceId,
-          requesterWorkstationId: owner.workstationId,
+          requesterDeviceId: ownerIdentity.deviceId,
+          requesterWorkstationId: ownerIdentity.workstationId,
           targetDeviceId: deviceId,
           connectorId,
         });
         return noStoreJsonResponse({ ok: false, code: "connector_owner_device_mismatch" }, 403);
       }
       logger.info("connector.webchat_control_grant", {
-        requesterDeviceId: owner.deviceId,
-        requesterWorkstationId: owner.workstationId,
+        requesterDeviceId: ownerIdentity.deviceId,
+        requesterWorkstationId: ownerIdentity.workstationId,
         targetDeviceId: deviceId,
         connectorId,
         allowed: parsed.value.allowed,
@@ -503,7 +519,7 @@ export default {
         provider,
         account_ref: accountRef,
         allowed: parsed.value.allowed,
-        changed_by: `device:${owner.deviceId ?? owner.workstationId}`,
+        changed_by: `device:${ownerIdentity.deviceId ?? ownerIdentity.workstationId}`,
       });
       return record
         ? noStoreJsonResponse({
@@ -516,7 +532,7 @@ export default {
           account_ref: accountRef,
           allowed: parsed.value.allowed,
           scope: deviceWide ? "device" : "endpoint",
-          requester_device_id: owner.deviceId,
+          requester_device_id: ownerIdentity.deviceId,
           grants: record.webchat_control,
         })
         : noStoreJsonResponse({ ok: false, code: "webchat_control_grant_update_failed" }, 409);

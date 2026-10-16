@@ -802,6 +802,44 @@ test("new Connector requires Worker fleet-admin approval and operator credential
     account_ref: grantInput.account_ref,
   }]);
 
+  const deviceScopeInput = {
+    connector_id: connectorId, device_id: target.device_id,
+    endpoint_ref: "*", provider: "*", account_ref: "*", allowed: true,
+  };
+  const operatorScope = await worker.fetch(post(
+    "/connectors/webchat-control", deviceScopeInput, "owner-secret",
+  ), h.env);
+  assert.equal(operatorScope.status, 401, "ordinary owner bearer cannot issue device-wide authority");
+  const legacyScope = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", deviceScopeInput, "prod-real-runtime", "legacy-secret",
+  ), h.env);
+  assert.equal(legacyScope.status, 403, "legacy owner without enrolled target identity cannot widen it");
+  const exactOwnerEnv = { ...h.env, DEFAULT_WORKSTATION_ID: target.device_id };
+  const malformedScope = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", { ...deviceScopeInput, provider: "grok" },
+    target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(malformedScope.status, 400);
+  const otherTarget = await pair(h.env, "another-webchat-grant-device");
+  const wrongScope = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", { ...deviceScopeInput, device_id: otherTarget.device_id },
+    target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(wrongScope.status, 403, "one enrolled device cannot grant control of another");
+  const wide = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", deviceScopeInput, target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(wide.status, 200, "the exact enrolled owner can issue a device-wide grant");
+  const wideGrants = (await wide.json()).grants;
+  assert.equal(wideGrants.filter(g => g.endpoint_ref === "*").length, 1);
+  assert.equal(wideGrants.length, 2, "existing narrow grant is preserved");
+  const deniedWide = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", { ...deviceScopeInput, allowed: false },
+    target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(deniedWide.status, 200);
+  assert.deepEqual((await deniedWide.json()).grants, ownerGrantBody.grants);
+
   const storedGrant = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/get", {
     method: "POST",
     headers: { "content-type": "application/json" },
