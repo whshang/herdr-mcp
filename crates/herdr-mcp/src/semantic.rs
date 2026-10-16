@@ -1,10 +1,13 @@
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, atomic::AtomicUsize};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+};
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -21,6 +24,15 @@ const DECISION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 const DECISION_POOL_BUDGET: Duration = Duration::from_secs(10);
 const CHAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CHAT_POOL_BUDGET: Duration = Duration::from_secs(12);
+/// Background callers (summaries, digests, memory compaction) are not latency
+/// sensitive, so they get a far larger allowance than interactive calls.
+const BACKGROUND_CHAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+const BACKGROUND_CHAT_POOL_BUDGET: Duration = Duration::from_secs(120);
+/// Rolling one-hour cap on background chat calls so an automation loop cannot
+/// drain provider quota that interactive callers depend on.
+const BACKGROUND_CHAT_HOURLY_CAP: usize = 120;
+const BACKGROUND_CHAT_WINDOW: Duration = Duration::from_secs(3600);
+const MAX_CHAT_MAX_TOKENS: u32 = 32_768;
 const SEMANTIC_ATTEMPT_LIMIT: usize = 3;
 const MAX_STATE_BYTES: usize = 64 * 1024;
 const MAX_QUESTIONS: usize = 32;
@@ -33,6 +45,8 @@ static EDGE_PROXY_AVAILABILITY: Mutex<Option<(Instant, crate::worker::SemanticPr
 static ROUTE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static CHAT_ROUTE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static ROUTE_COOLDOWNS: OnceLock<Mutex<BTreeMap<String, Instant>>> = OnceLock::new();
+static BACKGROUND_CHAT_CALLS: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
+static CHAT_USAGE: [ChatUsageCounters; 2] = [ChatUsageCounters::new(), ChatUsageCounters::new()];
 static SEMANTIC_TRACES: OnceLock<Mutex<BTreeMap<&'static str, SemanticTrace>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -524,13 +538,180 @@ pub struct SemanticChatResponse {
     pub usage: Option<Value>,
 }
 
+/// Latency tier of a semantic call. Foreground callers sit on an interactive
+/// path and keep the short budget; background callers trade latency for
+/// completion and are rate limited separately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SemanticTier {
+    #[default]
+    Foreground,
+    Background,
+}
+
+impl SemanticTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Foreground => 0,
+            Self::Background => 1,
+        }
+    }
+
+    /// Cooldown keys are namespaced per tier: a route that timed out under a
+    /// tight foreground budget must stay usable for a patient background
+    /// caller, and background failures must not sideline interactive routes.
+    fn cooldown_scope(self) -> &'static str {
+        match self {
+            Self::Foreground => "",
+            Self::Background => "background:",
+        }
+    }
+
+    fn chat_budget(self, timeout: Duration) -> RouteBudget {
+        let (attempt, total) = match self {
+            Self::Foreground => (CHAT_ATTEMPT_TIMEOUT, CHAT_POOL_BUDGET),
+            Self::Background => (BACKGROUND_CHAT_ATTEMPT_TIMEOUT, BACKGROUND_CHAT_POOL_BUDGET),
+        };
+        RouteBudget::split(timeout.min(attempt), timeout.min(total)).scoped(self.cooldown_scope())
+    }
+}
+
+/// Per-call chat options. `max_tokens` and `json_response` are forwarded to
+/// OpenAI-compatible routes as `max_tokens` and
+/// `response_format: {"type": "json_object"}`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SemanticChatOptions {
+    pub tier: SemanticTier,
+    pub max_tokens: Option<u32>,
+    pub json_response: bool,
+}
+
+impl SemanticChatOptions {
+    fn valid(&self) -> bool {
+        self.max_tokens
+            .is_none_or(|tokens| (1..=MAX_CHAT_MAX_TOKENS).contains(&tokens))
+    }
+}
+
+struct ChatUsageCounters {
+    calls: AtomicU64,
+    prompt_tokens: AtomicU64,
+    completion_tokens: AtomicU64,
+    total_tokens: AtomicU64,
+}
+
+impl ChatUsageCounters {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            prompt_tokens: AtomicU64::new(0),
+            completion_tokens: AtomicU64::new(0),
+            total_tokens: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, usage: Option<&Value>) {
+        self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+        let Some(usage) = usage else {
+            return;
+        };
+        let field = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0);
+        let prompt = field("prompt_tokens");
+        let completion = field("completion_tokens");
+        let total = usage
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(prompt.saturating_add(completion));
+        self.prompt_tokens
+            .fetch_add(prompt, AtomicOrdering::Relaxed);
+        self.completion_tokens
+            .fetch_add(completion, AtomicOrdering::Relaxed);
+        self.total_tokens.fetch_add(total, AtomicOrdering::Relaxed);
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "calls": self.calls.load(AtomicOrdering::Relaxed),
+            "prompt_tokens": self.prompt_tokens.load(AtomicOrdering::Relaxed),
+            "completion_tokens": self.completion_tokens.load(AtomicOrdering::Relaxed),
+            "total_tokens": self.total_tokens.load(AtomicOrdering::Relaxed),
+        })
+    }
+
+    #[cfg(test)]
+    fn reset(&self) {
+        for counter in [
+            &self.calls,
+            &self.prompt_tokens,
+            &self.completion_tokens,
+            &self.total_tokens,
+        ] {
+            counter.store(0, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+fn record_chat_usage(tier: SemanticTier, usage: Option<&Value>) {
+    CHAT_USAGE[tier.index()].record(usage);
+}
+
+/// Process-lifetime token usage per tier, exposed in capability JSON.
+pub fn chat_usage_json() -> Value {
+    json!({
+        "foreground": CHAT_USAGE[SemanticTier::Foreground.index()].to_json(),
+        "background": CHAT_USAGE[SemanticTier::Background.index()].to_json(),
+    })
+}
+
+/// Reserve one slot in the rolling hourly background window. Returns false
+/// (and reserves nothing) when the cap is already reached.
+fn reserve_hourly_slot(calls: &mut VecDeque<Instant>, now: Instant, cap: usize) -> bool {
+    while calls
+        .front()
+        .is_some_and(|at| now.duration_since(*at) >= BACKGROUND_CHAT_WINDOW)
+    {
+        calls.pop_front();
+    }
+    if calls.len() >= cap {
+        return false;
+    }
+    calls.push_back(now);
+    true
+}
+
+fn reserve_background_chat_slot() -> bool {
+    match BACKGROUND_CHAT_CALLS.lock() {
+        Ok(mut calls) => {
+            reserve_hourly_slot(&mut calls, Instant::now(), BACKGROUND_CHAT_HOURLY_CAP)
+        }
+        Err(_) => false,
+    }
+}
+
+fn background_chat_calls_last_hour() -> usize {
+    BACKGROUND_CHAT_CALLS.lock().map_or(0, |calls| {
+        let now = Instant::now();
+        calls
+            .iter()
+            .filter(|at| now.duration_since(**at) < BACKGROUND_CHAT_WINDOW)
+            .count()
+    })
+}
+
 trait SemanticChatProvider: Send + Sync {
     fn id(&self) -> &str;
     fn protocol(&self) -> &'static str;
-    fn chat(
+    fn chat_with_options(
         &self,
         messages: &[SemanticChatMessage],
         timeout: Duration,
+        options: &SemanticChatOptions,
     ) -> Result<SemanticChatResponse, SemanticError>;
 }
 
@@ -585,11 +766,22 @@ fn clear_route_cooldown(id: &str) {
 struct RouteBudget {
     attempt: Duration,
     total: Duration,
+    /// Prefix applied to cooldown keys so tiers keep independent cooldown state.
+    cooldown_scope: &'static str,
 }
 
 impl RouteBudget {
     fn split(attempt: Duration, total: Duration) -> Self {
-        Self { attempt, total }
+        Self {
+            attempt,
+            total,
+            cooldown_scope: "",
+        }
+    }
+
+    fn scoped(mut self, cooldown_scope: &'static str) -> Self {
+        self.cooldown_scope = cooldown_scope;
+        self
     }
 }
 
@@ -634,7 +826,8 @@ fn execute_route_pool_with_observer<T>(
         }
         let index = (start + offset) % route_count;
         let id = route_id(index);
-        if route_is_cooling_down(&id) {
+        let cooldown_key = format!("{}{id}", budget.cooldown_scope);
+        if route_is_cooling_down(&cooldown_key) {
             continue;
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -650,12 +843,12 @@ fn execute_route_pool_with_observer<T>(
         observe(&id, route_protocol(index), started_at.elapsed(), &result);
         match result {
             Ok(response) => {
-                clear_route_cooldown(&id);
+                clear_route_cooldown(&cooldown_key);
                 return Ok(response);
             }
             Err(error) => {
                 if let Some(duration) = error.cooldown() {
-                    mark_route_cooldown(&id, duration);
+                    mark_route_cooldown(&cooldown_key, duration);
                 }
                 if !error.allows_route_failover() {
                     return Err(error);
@@ -839,14 +1032,36 @@ impl SemanticService {
         )
     }
 
-    pub fn chat(
+    /// Background-tier chat: 60s per route attempt, 120s total, separate
+    /// cooldown state, and subject to the hourly background call cap.
+    // Entry point for background callers (summaries, digests, compaction);
+    // the extension surface reaches the same path via `"tier": "background"`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn chat_background(
+        &self,
+        messages: &[SemanticChatMessage],
+        options: SemanticChatOptions,
+    ) -> Result<SemanticChatResponse, SemanticError> {
+        self.chat_with_options(
+            messages,
+            BACKGROUND_CHAT_POOL_BUDGET,
+            &SemanticChatOptions {
+                tier: SemanticTier::Background,
+                ..options
+            },
+        )
+    }
+
+    pub fn chat_with_options(
         &self,
         messages: &[SemanticChatMessage],
         timeout: Duration,
+        options: &SemanticChatOptions,
     ) -> Result<SemanticChatResponse, SemanticError> {
         if messages.is_empty()
             || messages.len() > MAX_CHAT_MESSAGES
             || messages.iter().any(|message| !message.valid())
+            || !options.valid()
         {
             return Err(SemanticError::new("invalid_request"));
         }
@@ -864,16 +1079,18 @@ impl SemanticService {
             );
             return Err(SemanticError::new("not_configured"));
         }
-        execute_route_pool_with_observer(
+        if options.tier == SemanticTier::Background && !reserve_background_chat_slot() {
+            return Err(SemanticError::new("background_rate_limited"));
+        }
+        let result = execute_route_pool_with_observer(
             self.chat_providers.len(),
             &CHAT_ROUTE_CURSOR,
-            RouteBudget::split(
-                timeout.min(CHAT_ATTEMPT_TIMEOUT),
-                timeout.min(CHAT_POOL_BUDGET),
-            ),
+            options.tier.chat_budget(timeout),
             |index| self.chat_providers[index].id().to_owned(),
             |index| self.chat_providers[index].protocol(),
-            |index, remaining| self.chat_providers[index].chat(messages, remaining),
+            |index, remaining| {
+                self.chat_providers[index].chat_with_options(messages, remaining, options)
+            },
             |route, protocol, latency, result| {
                 let (result_class, fallback_reason) = match result {
                     Ok(_) => ("used", None),
@@ -898,7 +1115,11 @@ impl SemanticService {
                     },
                 );
             },
-        )
+        );
+        if let Ok(response) = &result {
+            record_chat_usage(options.tier, response.usage.as_ref());
+        }
+        result
     }
 
     pub fn capability_json(&self) -> Value {
@@ -956,6 +1177,13 @@ impl SemanticService {
             },
             "policy": "advisory_only",
             "fallback": "existing_behavior",
+            "chat_usage": chat_usage_json(),
+            "background_chat": {
+                "attempt_timeout_ms": BACKGROUND_CHAT_ATTEMPT_TIMEOUT.as_millis() as u64,
+                "total_budget_ms": BACKGROUND_CHAT_POOL_BUDGET.as_millis() as u64,
+                "hourly_cap": BACKGROUND_CHAT_HOURLY_CAP,
+                "calls_last_hour": background_chat_calls_last_hour(),
+            },
         })
     }
 }
@@ -1014,10 +1242,12 @@ pub fn extension_chat_json(payload: &Value) -> Value {
     let Some(object) = payload.as_object() else {
         return json!({"ok": false, "code": "invalid_request"});
     };
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "messages" | "timeout_ms"))
-    {
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "messages" | "timeout_ms" | "tier" | "max_tokens" | "response_format"
+        )
+    }) {
         return json!({"ok": false, "code": "invalid_request"});
     }
     let Some(messages) = object.get("messages").and_then(Value::as_array) else {
@@ -1042,23 +1272,71 @@ pub fn extension_chat_json(payload: &Value) -> Value {
     let Some(messages) = messages else {
         return json!({"ok": false, "code": "invalid_request"});
     };
+    let Some(options) = chat_options_from_json(object) else {
+        return json!({"ok": false, "code": "invalid_request"});
+    };
+    let (default_timeout_ms, max_timeout_ms) = match options.tier {
+        SemanticTier::Foreground => (15_000, 60_000),
+        SemanticTier::Background => (
+            BACKGROUND_CHAT_POOL_BUDGET.as_millis() as u64,
+            BACKGROUND_CHAT_POOL_BUDGET.as_millis() as u64,
+        ),
+    };
     let timeout_ms = object
         .get("timeout_ms")
         .and_then(Value::as_u64)
-        .unwrap_or(15_000)
-        .clamp(1_000, 60_000);
-    match SemanticService::from_config().chat(&messages, Duration::from_millis(timeout_ms)) {
+        .unwrap_or(default_timeout_ms)
+        .clamp(1_000, max_timeout_ms);
+    match SemanticService::from_config().chat_with_options(
+        &messages,
+        Duration::from_millis(timeout_ms),
+        &options,
+    ) {
         Ok(response) => json!({
             "ok": true,
             "provider": response.provider,
             "model": response.model,
             "content": response.content,
             "usage": response.usage,
+            "tier": options.tier.as_str(),
         }),
         Err(error) => {
             json!({"ok": false, "code": error.public_code(), "semantic": error.fallback_json()})
         }
     }
+}
+
+/// Parse the optional `tier` ("foreground" | "background"), `max_tokens`
+/// (1..=32768) and `response_format` ("text" | "json" | {"type": "json_object"})
+/// fields of an extension chat request.
+fn chat_options_from_json(object: &Map<String, Value>) -> Option<SemanticChatOptions> {
+    let tier = match object.get("tier") {
+        None | Some(Value::Null) => SemanticTier::Foreground,
+        Some(Value::String(tier)) if tier == "foreground" => SemanticTier::Foreground,
+        Some(Value::String(tier)) if tier == "background" => SemanticTier::Background,
+        Some(_) => return None,
+    };
+    let max_tokens = match object.get("max_tokens") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(u32::try_from(value.as_u64()?).ok()?),
+    };
+    let json_response = match object.get("response_format") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(format)) if format == "text" => false,
+        Some(Value::String(format)) if format == "json" || format == "json_object" => true,
+        Some(Value::Object(format)) => match format.get("type").and_then(Value::as_str) {
+            Some("json_object") => true,
+            Some("text") => false,
+            _ => return None,
+        },
+        Some(_) => return None,
+    };
+    let options = SemanticChatOptions {
+        tier,
+        max_tokens,
+        json_response,
+    };
+    options.valid().then_some(options)
 }
 
 fn semantic_request_from_json(payload: &Value) -> Result<SemanticRequest, SemanticError> {
@@ -1243,10 +1521,13 @@ impl SemanticChatProvider for EdgeSemanticChatProvider {
         "openai-chat"
     }
 
-    fn chat(
+    /// The Edge `/semantic/chat` contract accepts only `messages`; per-call
+    /// `max_tokens` / JSON mode are not forwarded until the Worker supports them.
+    fn chat_with_options(
         &self,
         messages: &[SemanticChatMessage],
         timeout: Duration,
+        _options: &SemanticChatOptions,
     ) -> Result<SemanticChatResponse, SemanticError> {
         let payload = crate::worker::semantic_proxy_chat_request(
             &json!({
@@ -1457,22 +1738,18 @@ impl SemanticChatProvider for OpenAiChatProvider {
         "openai-chat"
     }
 
-    fn chat(
+    fn chat_with_options(
         &self,
         messages: &[SemanticChatMessage],
         timeout: Duration,
+        options: &SemanticChatOptions,
     ) -> Result<SemanticChatResponse, SemanticError> {
         let response = self
             .client
             .post(self.endpoint.clone())
             .bearer_auth(&self.api_key)
             .timeout(timeout)
-            .json(&json!({
-                "model": self.model,
-                "messages": messages.iter().map(SemanticChatMessage::to_json).collect::<Vec<_>>(),
-                "temperature": 0,
-                "stream": false,
-            }))
+            .json(&openai_chat_body(&self.model, messages, options))
             .send()
             .map_err(|error| {
                 if error.is_timeout() {
@@ -1494,6 +1771,26 @@ impl SemanticChatProvider for OpenAiChatProvider {
                 .map_err(|_| SemanticError::new("invalid_response"))?,
         )
     }
+}
+
+fn openai_chat_body(
+    model: &str,
+    messages: &[SemanticChatMessage],
+    options: &SemanticChatOptions,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": messages.iter().map(SemanticChatMessage::to_json).collect::<Vec<_>>(),
+        "temperature": 0,
+        "stream": false,
+    });
+    if let Some(max_tokens) = options.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if options.json_response {
+        body["response_format"] = json!({"type": "json_object"});
+    }
+    body
 }
 
 fn local_semantic_providers() -> Vec<Box<dyn SemanticProvider>> {
@@ -2205,12 +2502,13 @@ mod tests {
             ],
         };
         let chat = chat_service
-            .chat(
+            .chat_with_options(
                 &[SemanticChatMessage {
                     role: "user".to_owned(),
                     content: "continue?".to_owned(),
                 }],
                 Duration::from_secs(2),
+                &SemanticChatOptions::default(),
             )
             .unwrap();
         assert_eq!(chat.provider, "chat-good");
@@ -2499,6 +2797,190 @@ mod tests {
         if let Ok(mut cooldowns) = route_cooldowns().lock() {
             cooldowns.clear();
         }
+    }
+
+    #[test]
+    fn background_tier_gets_long_budget_and_its_own_cooldown_scope() {
+        let foreground = SemanticTier::Foreground.chat_budget(Duration::from_secs(600));
+        assert_eq!(foreground.attempt, CHAT_ATTEMPT_TIMEOUT);
+        assert_eq!(foreground.total, CHAT_POOL_BUDGET);
+        assert_eq!(foreground.cooldown_scope, "");
+
+        let background = SemanticTier::Background.chat_budget(Duration::from_secs(600));
+        assert_eq!(background.attempt, Duration::from_secs(60));
+        assert_eq!(background.total, Duration::from_secs(120));
+        assert_eq!(background.cooldown_scope, "background:");
+
+        let capped = SemanticTier::Background.chat_budget(Duration::from_secs(30));
+        assert_eq!(capped.attempt, Duration::from_secs(30));
+        assert_eq!(capped.total, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn foreground_and_background_cooldowns_are_independent() {
+        let _guard = crate::test_env::lock();
+        if let Ok(mut cooldowns) = route_cooldowns().lock() {
+            cooldowns.clear();
+        }
+        let cursor = AtomicUsize::new(0);
+        let foreground = RouteBudget::split(Duration::from_millis(50), Duration::from_millis(200));
+        let background = foreground.scoped(SemanticTier::Background.cooldown_scope());
+
+        // A foreground timeout cools the route down for foreground callers only.
+        let _ = execute_route_pool(
+            1,
+            &cursor,
+            foreground,
+            |_| "tier-route".to_owned(),
+            |_, _| Err::<usize, _>(SemanticError::new("timeout")),
+        );
+        assert!(route_is_cooling_down("tier-route"));
+        assert!(!route_is_cooling_down("background:tier-route"));
+        assert_eq!(
+            execute_route_pool(
+                1,
+                &cursor,
+                foreground,
+                |_| "tier-route".to_owned(),
+                |_, _| Ok(1)
+            )
+            .unwrap_err()
+            .code(),
+            "routes_cooling_down"
+        );
+        assert_eq!(
+            execute_route_pool(
+                1,
+                &cursor,
+                background,
+                |_| "tier-route".to_owned(),
+                |_, _| Ok(7)
+            )
+            .unwrap(),
+            7
+        );
+
+        // And a background failure leaves the foreground state untouched.
+        if let Ok(mut cooldowns) = route_cooldowns().lock() {
+            cooldowns.clear();
+        }
+        let _ = execute_route_pool(
+            1,
+            &cursor,
+            background,
+            |_| "tier-route".to_owned(),
+            |_, _| Err::<usize, _>(SemanticError::new("timeout")),
+        );
+        assert!(route_is_cooling_down("background:tier-route"));
+        assert!(!route_is_cooling_down("tier-route"));
+
+        if let Ok(mut cooldowns) = route_cooldowns().lock() {
+            cooldowns.clear();
+        }
+    }
+
+    #[test]
+    fn background_hourly_cap_rejects_once_full_and_recovers_after_window() {
+        let mut calls = VecDeque::new();
+        let start = Instant::now();
+        for _ in 0..3 {
+            assert!(reserve_hourly_slot(&mut calls, start, 3));
+        }
+        assert!(!reserve_hourly_slot(&mut calls, start, 3));
+        assert_eq!(calls.len(), 3);
+        let later = start + BACKGROUND_CHAT_WINDOW;
+        assert!(reserve_hourly_slot(&mut calls, later, 3));
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn openai_chat_body_carries_max_tokens_and_json_mode_only_when_requested() {
+        let messages = [SemanticChatMessage {
+            role: "user".to_owned(),
+            content: "hi".to_owned(),
+        }];
+        let plain = openai_chat_body("m", &messages, &SemanticChatOptions::default());
+        assert!(plain.get("max_tokens").is_none());
+        assert!(plain.get("response_format").is_none());
+        assert_eq!(plain["stream"], json!(false));
+
+        let tuned = openai_chat_body(
+            "m",
+            &messages,
+            &SemanticChatOptions {
+                tier: SemanticTier::Background,
+                max_tokens: Some(256),
+                json_response: true,
+            },
+        );
+        assert_eq!(tuned["max_tokens"], json!(256));
+        assert_eq!(tuned["response_format"], json!({"type": "json_object"}));
+    }
+
+    #[test]
+    fn extension_chat_options_parse_tier_max_tokens_and_response_format() {
+        let parse = |value: Value| chat_options_from_json(value.as_object().unwrap());
+        assert_eq!(parse(json!({})), Some(SemanticChatOptions::default()));
+        assert_eq!(
+            parse(json!({"tier": "background", "max_tokens": 512, "response_format": "json"})),
+            Some(SemanticChatOptions {
+                tier: SemanticTier::Background,
+                max_tokens: Some(512),
+                json_response: true,
+            })
+        );
+        assert_eq!(
+            parse(json!({"response_format": {"type": "json_object"}}))
+                .map(|options| options.json_response),
+            Some(true)
+        );
+        assert_eq!(parse(json!({"tier": "urgent"})), None);
+        assert_eq!(parse(json!({"max_tokens": 0})), None);
+        assert_eq!(parse(json!({"max_tokens": 1_000_000})), None);
+        assert_eq!(parse(json!({"response_format": "yaml"})), None);
+        assert_eq!(
+            extension_chat_json(&json!({
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": -1,
+            }))["code"],
+            json!("invalid_request")
+        );
+    }
+
+    #[test]
+    fn background_chat_on_unconfigured_service_keeps_existing_behavior() {
+        let error = SemanticService::test_empty()
+            .chat_background(
+                &[SemanticChatMessage {
+                    role: "user".to_owned(),
+                    content: "summarize".to_owned(),
+                }],
+                SemanticChatOptions {
+                    max_tokens: Some(64),
+                    json_response: true,
+                    ..SemanticChatOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "not_configured");
+    }
+
+    #[test]
+    fn chat_usage_is_accumulated_per_tier() {
+        let counters = ChatUsageCounters::new();
+        counters.record(Some(
+            &json!({"prompt_tokens": 40, "completion_tokens": 25, "total_tokens": 65}),
+        ));
+        counters.record(Some(&json!({"prompt_tokens": 10, "completion_tokens": 5})));
+        counters.record(None);
+        let usage = counters.to_json();
+        assert_eq!(usage["calls"], json!(3));
+        assert_eq!(usage["prompt_tokens"], json!(50));
+        assert_eq!(usage["completion_tokens"], json!(30));
+        assert_eq!(usage["total_tokens"], json!(80));
+        counters.reset();
+        assert_eq!(counters.to_json()["calls"], json!(0));
+        assert!(chat_usage_json().get("background").is_some());
     }
 
     #[test]
