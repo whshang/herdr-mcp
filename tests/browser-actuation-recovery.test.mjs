@@ -2900,6 +2900,337 @@ test("user Given unavailable browser actuation When the content script rejects i
   }
 });
 
+test("user never sends a drifted second-account create | Given a create reservation for account B while the page freshly reports account A right before the send | When the create actuation runs | Then it refuses before performWake with typed scope diagnostics and zero sends", async () => {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
+  assert.ok(commandStart >= 0 && commandEnd > commandStart);
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const ctx = {
+    sends: 0,
+    registrations: 0,
+    clock: 0,
+    currentConvKey: "https://chatgpt.com/g/g-p-second/project",
+    registrationAccountRef: "br_" + "a".repeat(64),
+    registrationSpaceRef: null,
+    registrationGeneration: 17,
+  };
+  const act = new Function("ctx", `
+    const adapterName = "chatgpt";
+    const capabilities = { browserActuation: true, stopGeneration: true, sessionCreate: true, sessionOpen: true, chatModeGuard: true };
+    const ADAPTER = {
+      name: adapterName,
+      capabilities,
+      prepareBrowserActuation: async () => ({ ok: true, switched: false }),
+      getConversationKey: () => ctx.currentConvKey,
+      getCanonicalConversationUrl: () => "https://chatgpt.com/c/created",
+      getInputEl: () => ({}),
+      inputHasContent: () => false,
+    };
+    const chatGptConversationId = () => "created";
+    const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    let registeredConvKey = null;
+    let registeredBrowserSessionRef = null;
+    let registeredBrowserGeneration = null;
+    let registeredBrowserAccountRef = null;
+    let registeredBrowserSpaceRef = null;
+    let lastRegistrationErrorClass = null;
+    const registerCurrentConversation = async () => {
+      ctx.registrations += 1;
+      registeredBrowserAccountRef = ctx.registrationAccountRef;
+      registeredBrowserSpaceRef = ctx.registrationSpaceRef;
+      registeredBrowserGeneration = ctx.registrationGeneration;
+      registeredConvKey = ctx.currentConvKey;
+      registeredBrowserSessionRef = "br_" + "e".repeat(64);
+      return true;
+    };
+    const isTurnInProgress = () => false;
+    const runtimeAlive = () => true;
+    const wait = async () => {};
+    const Date = { now: () => (ctx.clock += 250) };
+    const providerCanonicalConversationObserved = () => true;
+    const currentHerdrRequiredApps = () => [];
+    const document = { hidden: false };
+    const performWake = async () => {
+      ctx.sends += 1;
+      return { ok: true };
+    };
+    ${evidenceSource}
+    ${commandSource}
+    return performBrowserActuationCommand;
+  `)(ctx);
+  const result = await act({
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      reservation_ref: "bsr_" + "c".repeat(64),
+      account_ref: "br_" + "b".repeat(64),
+      space_ref: "",
+      message: "second account create",
+    },
+  });
+  assert.equal(result.rejected, true, "the drifted create must be rejected");
+  assert.equal(result.result?.error, "browser_create_scope_mismatch");
+  assert.equal(result.result?.create_diagnostics?.scope_identity_error, "account_mismatch");
+  assert.equal(result.result?.create_diagnostics?.scope_identity_verified, false);
+  assert.equal(ctx.sends, 0, "the send pipeline is never entered");
+  assert.ok(ctx.registrations >= 1, "the fresh identity observation ran");
+});
+
+test("user never dispatches a create whose account switched after the early fence | Given matching scope at the early pre-send check but an account switch during the submit waits | When the final pre-dispatch fence runs | Then dispatchEnterSubmit is never called and the refusal names the typed mismatch", async () => {
+  const submitStart = wakeSource.indexOf("  async function submitBrowserActuationOnce(");
+  const submitEnd = wakeSource.indexOf("\n  // ---- Submission ----", submitStart);
+  assert.ok(submitStart >= 0 && submitEnd > submitStart, "single-shot submit must remain extractable");
+  const submitSource = wakeSource.slice(submitStart, submitEnd);
+  // Each case runs the REAL submitBrowserActuationOnce: the early actuation
+  // refresh already matched account B, but the final fence must await a NEW
+  // attempt-bound registration and prove THIS attempt before dispatching.
+  for (const item of [
+    {
+      name: "account switched after the early fence",
+      // The fresh h2w_register answer reports account A while the cached
+      // refs still held account B: only the final fresh check catches it.
+      freshAccountRef: "br_" + "a".repeat(64),
+      cachedAccountRef: "br_" + "b".repeat(64),
+      expectDispatch: 0,
+      expectCategory: "account_mismatch",
+    },
+    {
+      name: "final refresh returns null while the old cache matches",
+      // The refresh is superseded/unavailable; the stale cache cannot prove
+      // identity, so the send fails closed even though it would have matched.
+      freshAccountRef: null,
+      cachedAccountRef: "br_" + "b".repeat(64),
+      freshNull: true,
+      expectDispatch: 0,
+      expectCategory: "identity_unavailable",
+    },
+    {
+      name: "route drifted between the fences",
+      freshAccountRef: "br_" + "b".repeat(64),
+      cachedAccountRef: "br_" + "b".repeat(64),
+      routeAfterFresh: "https://chatgpt.com/c/other-route",
+      expectDispatch: 0,
+      expectCategory: "route_mismatch",
+    },
+    {
+      name: "generation went stale after the early fence",
+      freshAccountRef: "br_" + "b".repeat(64),
+      cachedAccountRef: "br_" + "b".repeat(64),
+      freshGeneration: 18,
+      expectDispatch: 0,
+      expectCategory: "generation_mismatch",
+    },
+    {
+      name: "empty Project launcher with a matching fresh identity still sends once",
+      // A brand-new Project tab has NO session yet (browser_session_ref
+      // null, bound false): that is exactly the legitimate create case.
+      freshAccountRef: "br_" + "b".repeat(64),
+      cachedAccountRef: "br_" + "b".repeat(64),
+      freshSessionRef: null,
+      expectDispatch: 1,
+      expectCategory: null,
+    },
+  ]) {
+    const ctx = { dispatches: 0, freshRegistrations: 0 };
+    const submit = new Function("ctx", `
+      const route = { current: "https://chatgpt.com/g/g-p-second/project" };
+      const ADAPTER = {
+        name: "chatgpt",
+        getInputEl: () => ({}),
+        getConversationKey: () => route.current,
+      };
+      // Cached refs from the early actuation-time refresh.
+      let registeredConvKey = "https://chatgpt.com/g/g-p-second/project";
+      let registeredBrowserSessionRef = "br_" + "e".repeat(64);
+      let registeredBrowserAccountRef = ${JSON.stringify(item.cachedAccountRef)};
+      let registeredBrowserSpaceRef = null;
+      let registeredBrowserGeneration = 17;
+      let lastRegistrationErrorClass = null;
+      const registerCurrentConversation = async () => {
+        ctx.freshRegistrations += 1;
+        if (${item.freshNull === true ? "true" : "false"}) return null;
+        const accountRef = ${item.freshAccountRef === null ? "null" : JSON.stringify(item.freshAccountRef)};
+        const generation = ${item.freshGeneration ? String(item.freshGeneration) : "17"};
+        // The real h2w_register answer shape: opaque account/space refs,
+        // generation, session ref (null on an empty Project launcher), and
+        // no bound conversation for a fresh create tab.
+        const response = {
+          bound: false,
+          browser_session_ref: ${item.freshSessionRef === null ? "null" : `"br_${"e".repeat(64)}"`},
+          browser_account_ref: accountRef,
+          browser_space_ref: null,
+          browser_generation: generation,
+          herdr_app_keyword: null,
+          browser_pending_dispatch: null,
+        };
+        if (${JSON.stringify(item.routeAfterFresh || null)} !== null) route.current = ${JSON.stringify(item.routeAfterFresh || "")};
+        registeredBrowserAccountRef = accountRef;
+        registeredBrowserGeneration = generation;
+        return response;
+      };
+      const isComposerGenerating = () => false;
+      const wait = async () => {};
+      const findSendButton = () => ({ disabled: false });
+      const isSendButton = () => true;
+      const captureSubmitAckBaseline = () => ({});
+      const dispatchEnterSubmit = () => { ctx.dispatches += 1; };
+      const waitForSubmitAck = async () => true;
+      ${submitSource}
+      return submitBrowserActuationOnce;
+    `)(ctx);
+    const outcome = await submit({
+      creatingSession: true,
+      reservedAccountRef: "br_" + "b".repeat(64),
+      reservedSpaceRef: "",
+      reservedGeneration: 17,
+    });
+    assert.equal(ctx.freshRegistrations, 1, `${item.name}: the fence awaits exactly one fresh observation`);
+    assert.equal(ctx.dispatches, item.expectDispatch, item.name);
+    if (item.expectCategory === null) {
+      assert.equal(outcome.ok, true, item.name);
+    } else {
+      assert.equal(outcome.ok, false, item.name);
+      assert.equal(outcome.attempted, false, item.name);
+      assert.equal(outcome.error, "browser_create_scope_mismatch", item.name);
+      assert.equal(outcome.scope_identity_error, item.expectCategory, item.name);
+    }
+  }
+});
+
+test("user keeps an uncertain created tab and never resends | Given the create content leg answered with accepted evidence carrying typed registration diagnostics or the evidence upload failed | When the background completes the actuation | Then the owned tab stays open with typed evidence and no second send happens", async () => {
+  const createBranch = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
+  assert.ok(createBranch >= 0, "create branch must exist in handleBrowserActuation");
+  const legStart = backgroundSource.indexOf(".then(async (response) => {", createBranch);
+  // The outer actuation catch is the last one before the dispatch-setup
+  // failure post; inner close-tab catches sit deeper inside the leg.
+  const setupCatch = backgroundSource.indexOf("browser_create_dispatch_setup_failed", legStart);
+  const legEnd = setupCatch >= 0
+    ? backgroundSource.lastIndexOf("    } catch (_) {", setupCatch)
+    : -1;
+  assert.ok(legStart >= 0 && legEnd > legStart, "create content leg must remain extractable");
+  const legSource = backgroundSource.slice(legStart, legEnd);
+  const reasonStart = backgroundSource.indexOf("function missingReceiverError(");
+  const reasonEnd = backgroundSource.indexOf("\nasync function sendTabMessageWithTimeout(", reasonStart);
+  const reasonSource = backgroundSource.slice(reasonStart, reasonEnd);
+  const evidenceHelperStart = backgroundSource.indexOf("function contentActuationEvidenceWithReason(");
+  const evidenceHelperEnd = backgroundSource.indexOf("\nfunction unavailableBrowserActuationEvidence(", evidenceHelperStart);
+  const unavailableStart = backgroundSource.indexOf("function unavailableBrowserActuationEvidence(");
+  const unavailableEnd = backgroundSource.indexOf("\nfunction shouldCloseArchivedChatGptTab(", unavailableStart);
+  assert.ok(reasonStart >= 0 && reasonEnd > reasonStart);
+  assert.ok(evidenceHelperStart >= 0 && evidenceHelperEnd > evidenceHelperStart);
+  assert.ok(unavailableStart >= 0 && unavailableEnd > unavailableStart);
+
+  const makeLeg = (ctx) => new Function("ctx", `
+    const chrome = {
+      tabs: {
+        remove: async () => { ctx.removes += 1; },
+        get: async () => ({}),
+      },
+    };
+    const createdTab = { id: 91 };
+    const actuationId = "ba_legtest000000000";
+    const expectedGeneration = 17;
+    ${reasonSource}
+    ${backgroundSource.slice(evidenceHelperStart, evidenceHelperEnd)}
+    ${backgroundSource.slice(unavailableStart, unavailableEnd)}
+    const postBrowserActuationEvidence = ${ctx.postFails ? "async () => { ctx.posts += 1; throw new Error(\"upload unavailable\"); }" : "async () => { ctx.posts += 1; }"};
+    const setTimeout = (fn, ms) => { fn(); return 1; };
+    return (sendPromise) => Promise.resolve(sendPromise)${legSource};
+  `)(ctx);
+
+  // (b) Accepted create whose Browser Registry registration failed: the typed
+  // error rides the posted evidence and the created owned tab is retained.
+  {
+    const ctx = { removes: 0, posts: 0 };
+    const leg = makeLeg(ctx);
+    await leg(Promise.resolve({
+      evidence: {
+        observed_generation: 17,
+        command_accepted: true,
+        browser_online: true,
+        resource_available: true,
+        rejected: false,
+        stable_resource_ref_observed: false,
+        lifecycle_observed: true,
+        canonical_url_observed: true,
+        accepted_message_observed: true,
+        message_baseline_advanced: true,
+        reasoning_effort_readback: null,
+        required_apps_readback: [],
+        generation_owner: 17,
+        generation_status_observed: false,
+        generation_stopped: false,
+        result: {
+          accepted_user_message_ref: "user-2",
+          accepted_user_text_sha256: "a".repeat(64),
+          create_diagnostics: {
+            registration_attempted: true,
+            registration_error: "browser_session_reservation_not_pending",
+            scope_identity_verified: true,
+            scope_identity_error: null,
+          },
+        },
+      },
+    }));
+    assert.equal(ctx.removes, 0, "an accepted-but-registration-failed create keeps its tab");
+    assert.equal(ctx.posts, 1, "exactly one evidence post");
+  }
+
+  // (f) The evidence upload itself fails after the content leg: the tab is
+  // preserved, the upload retries exactly once, and nothing resends.
+  {
+    const ctx = { removes: 0, posts: 0, postFails: true };
+    const leg = makeLeg(ctx);
+    await leg(Promise.resolve({
+      evidence: {
+        observed_generation: 17,
+        command_accepted: true,
+        browser_online: true,
+        resource_available: true,
+        rejected: false,
+        stable_resource_ref_observed: true,
+        lifecycle_observed: true,
+        canonical_url_observed: true,
+        accepted_message_observed: true,
+        message_baseline_advanced: true,
+        reasoning_effort_readback: null,
+        required_apps_readback: [],
+        generation_owner: 17,
+        generation_status_observed: false,
+        generation_stopped: false,
+        result: { accepted_user_message_ref: "user-3" },
+      },
+    }));
+    assert.equal(ctx.removes, 0, "an upload failure never closes the unverified created tab");
+    assert.equal(ctx.posts, 2, "one bounded upload retry, then the runtime times the actuation out");
+  }
+
+  // A delivered-but-unanswered content leg keeps the tab and reports the
+  // typed uncertain with an explicit unverified-cleanup flag.
+  {
+    const ctx = { removes: 0, posts: 0 };
+    const leg = makeLeg(ctx);
+    await leg(Promise.reject(new Error("browser-actuation-content-timeout")));
+    assert.equal(ctx.removes, 0, "a timeout cannot prove not-sent; the tab stays");
+    assert.equal(ctx.posts, 1);
+  }
+
+  // A missing receiver proves the command never reached a listener: the
+  // empty launcher tab is closed with the typed not-delivered evidence.
+  {
+    const ctx = { removes: 0, posts: 0 };
+    const leg = makeLeg(ctx);
+    await leg(Promise.reject(new Error("Could not establish connection. Receiving end does not exist.")));
+    assert.equal(ctx.removes, 1, "proven not-delivered closes the launcher tab");
+    assert.equal(ctx.posts, 1);
+  }
+});
+
 test("user can stop a live answer | Given an explicit visible stop control while the generic turn probe lags | When stop is requested | Then Herdr clicks once and verifies the stopped postcondition", async () => {
   const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
   const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
@@ -2930,6 +3261,14 @@ test("user can stop a live answer | Given an explicit visible stop control while
     let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
     let registeredBrowserGeneration = 17;
     let registeredConvKey = "conv-current";
+    let registeredBrowserAccountRef = null;
+    let registeredBrowserSpaceRef = null;
+    let lastRegistrationErrorClass = null;
+    const registerCurrentConversation = async () => {
+      registeredBrowserAccountRef = "br_" + "f".repeat(64);
+      registeredBrowserSpaceRef = null;
+      return { ok: true };
+    };
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
     const isTurnInProgress = () => false;
@@ -3057,6 +3396,14 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
     let registeredBrowserGeneration = 17;
     let registeredConvKey = "https://chatgpt.com/c/current";
+    let registeredBrowserAccountRef = null;
+    let registeredBrowserSpaceRef = null;
+    let lastRegistrationErrorClass = null;
+    const registerCurrentConversation = async () => {
+      registeredBrowserAccountRef = "br_" + "f".repeat(64);
+      registeredBrowserSpaceRef = null;
+      return { ok: true };
+    };
     const currentHerdrRequiredApps = () => ["herdr"];
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
@@ -3097,6 +3444,8 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     expected_generation: 17,
     params: {
       reservation_ref: reservationRef,
+      account_ref: "br_" + "f".repeat(64),
+      space_ref: "",
       message: "first worker turn",
       required_apps: [],
     },
@@ -3152,6 +3501,14 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
     let registeredBrowserSessionRef = null;
     let registeredBrowserGeneration = 17;
     let registeredConvKey = "https://chatgpt.com/g/g-p-test/project";
+    let registeredBrowserAccountRef = null;
+    let registeredBrowserSpaceRef = null;
+    let lastRegistrationErrorClass = null;
+    const registerCurrentConversation = async () => {
+      registeredBrowserAccountRef = "br_" + "f".repeat(64);
+      registeredBrowserSpaceRef = null;
+      return { ok: true };
+    };
     const currentHerdrRequiredApps = () => [];
     const providerCanonicalConversationObserved = () => false;
     const document = { hidden: false };
@@ -3226,6 +3583,14 @@ test("user receives exact content rejection reasons | Given browser controls rej
       let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
       let registeredBrowserGeneration = 17;
       let registeredConvKey = "conv-current";
+      let registeredBrowserAccountRef = null;
+      let registeredBrowserSpaceRef = null;
+      let lastRegistrationErrorClass = null;
+      const registerCurrentConversation = async () => {
+      registeredBrowserAccountRef = "br_" + "f".repeat(64);
+      registeredBrowserSpaceRef = null;
+      return { ok: true };
+    };
       const currentHerdrRequiredApps = () => ["herdr"];
       const providerCanonicalConversationObserved = () => true;
       const document = { hidden: false };
@@ -4576,6 +4941,7 @@ function createActuationBranchHarness({
   const sendBrowserActuationTabMessage = async (tabId, message) => {
     actuationMessages.push({ tabId, message });
     if (contentMode === "throw") throw new Error("content dispatch failed");
+    if (contentMode === "missing-receiver") throw new Error("Could not establish connection. Receiving end does not exist.");
     if (contentMode === "missing") return {};
     if (contentMode === "unavailable-missing-reason") {
       return {
@@ -4621,10 +4987,11 @@ function createActuationBranchHarness({
     };
   };
 
+  const missingReceiverError = (error) => /receiving end does not exist|could not establish connection/i.test(String(error?.message || error || ""));
   const actuate = new Function(
     "chrome", "browserTabScopes", "browserSessionTargets", "activeH2WTabUrlsForProvider",
     "browserConversationInfo", "browserConversationInfoFromSupportedUrl",
-    "sendTabMessageWithTimeout",
+    "sendTabMessageWithTimeout", "missingReceiverError",
     "postBrowserActuationEvidence", "protectBoundTab", "sendBrowserActuationTabMessage",
     "unavailableBrowserActuationEvidence", "BROWSER_CREATE_CONTENT_TIMEOUT_MS",
     "BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS", "Date", "setTimeout",
@@ -4637,7 +5004,7 @@ function createActuationBranchHarness({
     `${contentActuationEvidenceWithReasonSource}\n${recoverBrowserSessionTargetSource}\n${createAnchorSource2}\n${createBranchSource}\n}\nreturn __actuate;`,
   )(chrome, browserTabScopes, browserSessionTargets, activeH2WTabUrlsForProvider,
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
-    sendTabMessageWithTimeout,
+    sendTabMessageWithTimeout, missingReceiverError,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
     unavailable, BROWSER_CREATE_CONTENT_TIMEOUT_MS, BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS, dateShim, setTimeoutShim);
 
@@ -4953,14 +5320,16 @@ test("user Given a fresh ChatGPT create When content dispatch throws Then the ex
   });
   for (let i = 0; i < 12; i += 1) await Promise.resolve();
 
+  // A generic content-leg throw is NOT proof of not-sent: the created owned
+  // tab is preserved and the typed uncertain names the unverified cleanup.
   const evidence = harness.postCalls.at(-1)?.evidence;
   assert.equal(evidence?.command_accepted, true);
   assert.equal(evidence?.resource_available, true);
-  assert.equal(evidence?.result?.error, "browser_create_content_dispatch_failed");
+  assert.equal(evidence?.result?.error, "browser_create_content_timeout_uncertain");
   assert.equal(evidence?.result?.tab_opened, true);
-  assert.equal(evidence?.result?.tab_closed, true);
-  assert.equal(evidence?.result?.tab_cleanup_verified, true);
-  assert.deepEqual(harness.removedTabs, [100]);
+  assert.equal(evidence?.result?.tab_closed, false);
+  assert.equal(evidence?.result?.cleanup_unverified, true);
+  assert.deepEqual(harness.removedTabs, []);
   assert.equal(harness.tabs.has(71), true, "content failure cleanup must preserve the user's anchor tab");
 });
 
@@ -5114,8 +5483,13 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
   const helperSource = wakeSource.slice(helperStart, helperEnd);
   const commandSource = wakeSource.slice(commandStart, commandEnd);
+  // `shared` is the caller's own ctx: inner observations (registers,
+  // wakeArgs) mirror onto it so assertions observe the real flow, while the
+  // sandbox inputs keep their per-test copy.
+  const shared = ctx;
   return new Function("ctx", `
     const crypto = ctx.crypto;
+    const outerCtx = ctx.shared || null;
     const ADAPTER = {
       name: "chatgpt",
       capabilities: { browserActuation: true, sessionCreate: true, chatModeGuard: true },
@@ -5137,7 +5511,18 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
     let registeredBrowserSessionRef = ctx.registeredSessionRef || null;
     let registeredBrowserGeneration = 17;
     let registeredConvKey = ctx.registeredConvKey || null;
-    const registerCurrentConversation = async () => { ctx.registers = (ctx.registers || 0) + 1; };
+    let registeredBrowserAccountRef = null;
+    let registeredBrowserSpaceRef = null;
+    let lastRegistrationErrorClass = null;
+    const registerCurrentConversation = async () => {
+      ctx.registers = (ctx.registers || 0) + 1;
+      if (ctx.createAccountRef) {
+        registeredBrowserAccountRef = ctx.createAccountRef;
+        registeredBrowserSpaceRef = ctx.createSpaceRef || null;
+      }
+      if (outerCtx) outerCtx.registers = ctx.registers;
+      return { ok: true };
+    };
     const currentHerdrRequiredApps = () => ctx.herdrApps || [];
     const providerCanonicalConversationObserved = () => ctx.canonicalObserved !== false;
     const document = { hidden: false };
@@ -5165,6 +5550,7 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
     const performWake = async (args) => {
       ctx.wakeArgs = ctx.wakeArgs || [];
       ctx.wakeArgs.push(args);
+      if (outerCtx) outerCtx.wakeArgs = ctx.wakeArgs;
       if (typeof ctx.afterWake === "function") ctx.afterWake();
       return ctx.wakeResult || { ok: true };
     };
@@ -5179,7 +5565,7 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
     ${helperSource}
     ${commandSource}
     return performBrowserActuationCommand;
-  `)({ crypto: webcrypto, ...ctx });
+  `)({ crypto: webcrypto, ...ctx, shared });
 }
 
 test("user dispatch stays uncertain | Given the before snapshot fails and the latest user id is unchanged | When dispatch.submit acknowledges | Then the previous user message is not recorded", async () => {
@@ -5261,6 +5647,8 @@ test("user create does not adopt a foreign conversation | Given a Project-home t
   const ctx = {
     currentConvKey: "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     canonicalObserved: true,
+    createAccountRef: "br_" + "f".repeat(64),
+    createSpaceRef: null,
     snapshots: [
       { ok: false },
       { ok: true, userMessageId: "user-foreign", userText: "someone else's turn" },
@@ -5276,6 +5664,8 @@ test("user create does not adopt a foreign conversation | Given a Project-home t
     expected_generation: 17,
     params: {
       reservation_ref: "bsr_" + "e".repeat(64),
+      account_ref: "br_" + "f".repeat(64),
+      space_ref: "",
       message: "ship the patch",
       required_apps: [],
     },
@@ -5286,7 +5676,7 @@ test("user create does not adopt a foreign conversation | Given a Project-home t
   assert.equal(result.message_baseline_advanced, false);
   assert.equal(result.stable_resource_ref_observed, false);
   assert.equal(result.result, undefined, "a foreign conversation's latest turn is not this create's acceptance");
-  assert.equal(ctx.registers || 0, 0, "the landed conversation must not be materialized as the new session");
+  assert.equal(ctx.registers || 0, 1, "only the pre-send fence refresh ran; the landed conversation is never materialized as the new session");
 });
 
 test("user accepted message must carry the required app | Given the composer selected herdr but the accepted provider message carries no app identity | When acceptance is evaluated | Then the required-app readback is empty and no app is credited", async () => {

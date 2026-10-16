@@ -2645,6 +2645,32 @@ fn browser_session_create_uncertain_classification_reason(
     Ok(None)
 }
 
+/// Bounded create-stage diagnostics the extension reports inside the actuation
+/// evidence result object. The HTTP layer already strips and enum-normalizes
+/// this nested object, so extraction here only reads typed tokens:
+/// `(registration_error, scope_identity_error)`. The diagnostics never
+/// confer authority or an Applied promotion; they only classify uncertain
+/// outcomes.
+fn browser_evidence_create_diagnostics(
+    evidence: &BrowserPostconditionEvidence,
+) -> (Option<&str>, Option<&str>) {
+    let Some(result) = evidence.result.as_ref() else {
+        return (None, None);
+    };
+    let Some(diagnostics) = result.get("create_diagnostics") else {
+        return (None, None);
+    };
+    let registration_error = diagnostics
+        .get("registration_error")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty());
+    let scope_identity_error = diagnostics
+        .get("scope_identity_error")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty());
+    (registration_error, scope_identity_error)
+}
+
 /// The title projection object the browser actuation evidence reported for a
 /// created session, if any. Only object-shaped projections count; anything
 /// else is treated as unobserved.
@@ -3765,6 +3791,8 @@ fn browser_session_create_reconcile_uncertain(
     caller_authorization: Option<&BrowserCallerAuthorization>,
     first_title_projection: Option<Value>,
     classification_reason: Option<&'static str>,
+    registration_error: Option<&str>,
+    scope_identity_error: Option<&str>,
 ) -> Value {
     // Surface why late acceptance did not promote (fixed token, no content).
     let mut late_reason = None;
@@ -3778,6 +3806,8 @@ fn browser_session_create_reconcile_uncertain(
         caller_authorization,
         first_title_projection,
         classification_reason,
+        registration_error,
+        scope_identity_error,
         &mut late_reason,
     );
     if value.get("delivery_state").and_then(Value::as_str) == Some("uncertain")
@@ -3799,6 +3829,8 @@ fn browser_session_create_reconcile_uncertain_inner(
     caller_authorization: Option<&BrowserCallerAuthorization>,
     first_title_projection: Option<Value>,
     mut classification_reason: Option<&'static str>,
+    registration_error: Option<&str>,
+    scope_identity_error: Option<&str>,
     late_reason_out: &mut Option<&'static str>,
 ) -> Value {
     let current = {
@@ -3860,6 +3892,19 @@ fn browser_session_create_reconcile_uncertain_inner(
         }
     }
 
+    // Attach the create's bounded stage diagnostics (typed tokens only) to
+    // every non-success uncertain result this reconciliation can return.
+    let apply_registration_diagnostics = |value: &mut Value| {
+        if value.get("ok") == Some(&Value::Bool(true)) {
+            return;
+        }
+        if let (Some(error), Some(object)) = (registration_error, value.as_object_mut()) {
+            object.insert("registration_error".to_owned(), json!(error));
+        }
+        if let (Some(error), Some(object)) = (scope_identity_error, value.as_object_mut()) {
+            object.insert("scope_identity_error".to_owned(), json!(error));
+        }
+    };
     let Some(actuator) = actuator else {
         let Ok(guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
@@ -3867,6 +3912,7 @@ fn browser_session_create_reconcile_uncertain_inner(
         match browser_session_materialized_uncertain(&guard, &current, replayed) {
             Ok(Some(mut result)) => {
                 browser_session_apply_classification_reason(&mut result, classification_reason);
+                apply_registration_diagnostics(&mut result);
                 return result;
             }
             Ok(None) => {}
@@ -3882,6 +3928,7 @@ fn browser_session_create_reconcile_uncertain_inner(
             "reconciled": false,
         });
         browser_session_apply_classification_reason(&mut value, classification_reason);
+        apply_registration_diagnostics(&mut value);
         return value;
     };
     let evidence = match browser_session_create_reconcile_evidence(
@@ -3975,6 +4022,7 @@ fn browser_session_create_reconcile_uncertain_inner(
                 "reconciled": false,
             });
             browser_session_apply_classification_reason(&mut value, classification_reason);
+            apply_registration_diagnostics(&mut value);
             return value;
         }
         Err(error) => return browser_store_error(error),
@@ -4060,6 +4108,7 @@ fn browser_session_create_reconcile_uncertain_inner(
         match browser_session_materialized_uncertain(&guard, &settled, replayed) {
             Ok(Some(mut result)) => {
                 browser_session_apply_classification_reason(&mut result, classification_reason);
+                apply_registration_diagnostics(&mut result);
                 return result;
             }
             Ok(None) => {}
@@ -4139,6 +4188,7 @@ fn browser_session_create_reconcile_uncertain_inner(
         "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
     });
     browser_session_apply_classification_reason(&mut value, classification_reason);
+    apply_registration_diagnostics(&mut value);
     value
 }
 
@@ -4919,6 +4969,8 @@ fn browser_session_create(
             // still contribute a projection and a fresh classification.
             None,
             None,
+            None,
+            None,
         );
     }
     if current_delivery != BrowserDeliveryState::NotApplied {
@@ -5059,6 +5111,8 @@ fn browser_session_create(
             caller_authorization,
             title_projection,
             classification_reason,
+            browser_evidence_create_diagnostics(&evidence).0,
+            browser_evidence_create_diagnostics(&evidence).1,
         );
     }
     json!({
@@ -15784,6 +15838,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(result["delivery_state"], "applied");
@@ -15952,7 +16008,10 @@ mod tests {
                 None,
                 first_title_projection,
                 Some("text_digest_mismatch"),
+                None,
+                None,
             );
+
             assert_eq!(result["ok"], true, "{case}: {result}");
             assert_eq!(result["delivery_state"], "applied", "{case}");
             assert_eq!(result["reconciled"], true, "{case}");
@@ -15967,6 +16026,272 @@ mod tests {
                 "{case}: no actuation repeats beyond the single retry"
             );
         }
+    }
+    /// user sees why a create stayed uncertain | Given an accepted create whose
+    /// Browser Registry registration failed with a typed category | When the
+    /// create is classified uncertain | Then the uncertain response carries the
+    /// typed registration error and the reservation stays pending
+    #[test]
+    fn browser_session_create_uncertain_surfaces_typed_registration_error() {
+        struct RegistrationFailedActuator;
+        impl BrowserActuator for RegistrationFailedActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let _ = dispatch_id;
+                if operation == BROWSER_SESSION_ARCHIVE_STATUS_METHOD {
+                    // The late-acceptance readback stays unavailable: nothing
+                    // else can promote the pending reservation.
+                    return Err("browser_actuation_unavailable".to_owned());
+                }
+                assert_eq!(operation, BrowserOperation::SessionCreate.method());
+                let message = params["message"].as_str().unwrap().to_owned();
+                let mut result = accepted_result(&message, "provider-created-session-user");
+                // The extension reports the bounded nested diagnostics the
+                // HTTP layer sanitized: accepted send, registration attempted,
+                // registration failed with the runtime's typed category.
+                result.as_object_mut().unwrap().insert(
+                    "create_diagnostics".to_owned(),
+                    json!({
+                        "registration_attempted": true,
+                        "registration_error": "browser_session_reservation_not_pending",
+                        "scope_identity_verified": true,
+                        "scope_identity_error": null,
+                    }),
+                );
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    // The registration POST failed, so the stable registry
+                    // ref never became observable.
+                    stable_resource_ref_observed: false,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: true,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                    result: Some(result),
+                })
+            }
+        }
+
+        let (store, endpoint_ref, account_ref) = session_create_projection_store();
+        let params = session_create_projection_params(
+            &endpoint_ref,
+            &account_ref,
+            "Registration failure",
+            "session-create-registration-error-1",
+        );
+        let actuator = RegistrationFailedActuator;
+        let created = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(created["ok"], false, "{created}");
+        assert_eq!(created["delivery_state"], "uncertain");
+        assert_eq!(
+            created["classification_reason"], "stable_resource_ref_missing",
+            "{created}"
+        );
+        assert_eq!(
+            created["registration_error"], "browser_session_reservation_not_pending",
+            "the typed registration failure category survives on the uncertain result"
+        );
+        assert_eq!(
+            created["reservation_state"], "pending",
+            "a failed registration never materializes the reservation"
+        );
+    }
+
+    /// user isolates a second account create | Given a first-account session
+    /// holding the shared canonical conversation URL and a second account with
+    /// its own precise parent | When the second account's reservation
+    /// materializes through that parent | Then the new session binds only to
+    /// the second account and the first-account locator row stays untouched
+    #[test]
+    fn browser_session_create_second_account_materializes_without_touching_first_account() {
+        use crate::state_store::{
+            BrowserResourceObservationInput, BrowserSessionReservation,
+            BrowserSessionReservationInput,
+        };
+        let (store, endpoint_ref, first_account_ref) = session_create_projection_store();
+        let (first_session_ref, second_account_ref, second_space_ref, reservation_ref) = {
+            let mut guard = store.lock().unwrap();
+            let first_session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&first_account_ref),
+                    native_identity: "first-account-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            // A stale first-account locator still points at the same shared
+            // canonical conversation URL.
+            guard
+                .upsert_browser_resource_locator(
+                    &first_session.resource_ref,
+                    "https://chatgpt.com/c/shared-conversation",
+                    7,
+                    13,
+                )
+                .unwrap();
+            let second_account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "session-create-projection-account-b",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 14,
+                })
+                .unwrap();
+            let second_space = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "space",
+                    parent_ref: Some(&second_account.resource_ref),
+                    native_identity: "g-p-second-account-space",
+                    display_label: Some("Second account space"),
+                    observation_generation: 7,
+                    observed_at: 15,
+                })
+                .unwrap();
+            let reservation = match guard
+                .reserve_browser_session(BrowserSessionReservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    account_ref: &second_account.resource_ref,
+                    space_ref: Some(&second_space.resource_ref),
+                    display_label: "Second account create",
+                    expected_generation: 7,
+                    idempotency_key_digest: &browser_sha256("second-account-key"),
+                    request_digest: &browser_sha256("second-account-request"),
+                    created_at: 16,
+                    expires_at: 4000,
+                })
+                .unwrap()
+            {
+                BrowserSessionReservation::Reserved(record) => record,
+                BrowserSessionReservation::Existing(_) => panic!("must be new"),
+            };
+            (
+                first_session.resource_ref,
+                second_account.resource_ref,
+                second_space.resource_ref,
+                reservation.reservation_ref,
+            )
+        };
+
+        // The second account's session observes under its OWN precise parent
+        // and materializes the reservation exactly once.
+        let second_session_ref = {
+            let mut guard = store.lock().unwrap();
+            // A foreign first-account-parent session first proves the
+            // materialization fence stays closed for this reservation.
+            let foreign_session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&first_account_ref),
+                    native_identity: "first-account-foreign-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 16,
+                })
+                .unwrap();
+            assert_eq!(
+                guard
+                    .materialize_browser_session_reservation(
+                        &reservation_ref,
+                        &foreign_session.resource_ref,
+                        17,
+                    )
+                    .unwrap_err(),
+                "browser_session_materialization_scope_mismatch",
+                "a foreign-account or stale-parent session must fail closed"
+            );
+            let second_session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&second_space_ref),
+                    native_identity: "second-account-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 17,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &second_session.resource_ref,
+                    "https://chatgpt.com/c/shared-conversation",
+                    7,
+                    17,
+                )
+                .unwrap();
+            let materialized = guard
+                .materialize_browser_session_reservation(
+                    &reservation_ref,
+                    &second_session.resource_ref,
+                    18,
+                )
+                .unwrap();
+            assert_eq!(
+                materialized.account_ref, second_account_ref,
+                "the materialized create binds to the second account only"
+            );
+            assert_eq!(
+                materialized.session_ref.as_deref(),
+                Some(second_session.resource_ref.as_str())
+            );
+            second_session.resource_ref
+        };
+
+        // The first account's stale locator row is untouched: both sessions
+        // keep their own resource rows under the shared canonical URL.
+        let guard = store.lock().unwrap();
+        let first_locator = guard
+            .browser_resource_locator(&first_session_ref)
+            .unwrap()
+            .expect("first-account locator must survive");
+        assert_eq!(
+            first_locator.canonical_url,
+            "https://chatgpt.com/c/shared-conversation"
+        );
+        let second_locator = guard
+            .browser_resource_locator(&second_session_ref)
+            .unwrap()
+            .expect("second-account locator must exist");
+        assert_eq!(second_locator.canonical_url, first_locator.canonical_url);
+        let first_session = guard.browser_resource(&first_session_ref).unwrap().unwrap();
+        assert_eq!(
+            first_session.parent_ref.as_deref(),
+            Some(first_account_ref.as_str()),
+            "the first-account session never rebinds to the second account"
+        );
     }
 
     #[test]
