@@ -3939,13 +3939,19 @@ fn browser_session_create_reconcile_uncertain_inner(
                 let Ok(mut guard) = store.lock() else {
                     return json!({"ok": false, "code": "browser_operation_store_unavailable"});
                 };
-                return browser_session_create_success(
+                // Route through the reconcile-success wrapper (PR #628):
+                // the same title/classification evidence contract as the
+                // first late-readback acceptance path. A direct
+                // browser_session_create_success here would silently drop
+                // title_projection and classification_reason.
+                return browser_session_create_reconcile_success(
                     &mut guard,
                     &promoted.reservation_ref,
                     params,
                     replayed,
-                    true,
                     caller_authorization,
+                    first_title_projection.as_ref(),
+                    classification_reason,
                 );
             }
             let Ok(guard) = store.lock() else {
@@ -15782,6 +15788,185 @@ mod tests {
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(result["delivery_state"], "applied");
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// user late acceptance keeps title evidence on the second readback |
+    /// Given a create classified uncertain with first-actuation title evidence
+    /// and a transient first readback | When the second post-poll readback
+    /// accepts the message | Then the promoted success carries the original
+    /// title projection (or unobserved when no evidence existed), the
+    /// classification reason survives, and no actuation repeats beyond the
+    /// single retry.
+    #[test]
+    fn browser_session_create_second_late_readback_retains_title_projection() {
+        use crate::state_store::{
+            BrowserResourceObservationInput, BrowserSessionReservation,
+            BrowserSessionReservationInput,
+        };
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        struct FlakyReadbackActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for FlakyReadbackActuator {
+            fn actuate(
+                &self,
+                _: &str,
+                _: &Value,
+                _: i64,
+                _: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Err("unavailable".to_owned())
+            }
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                _: &Value,
+                expected_generation: i64,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_SESSION_ARCHIVE_STATUS_METHOD);
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    return Err("transient readback failure".to_owned());
+                }
+                let mut result = accepted_text_evidence("late accepted turn");
+                let object = result.as_object_mut().unwrap();
+                object.insert(
+                    "accepted_user_message_ref".to_owned(),
+                    json!("provider-late-user"),
+                );
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.resource_available = true;
+                evidence.stable_resource_ref_observed = true;
+                evidence.lifecycle_observed = true;
+                evidence.result = Some(result);
+                Ok(evidence)
+            }
+        }
+
+        for (case, first_title_projection, expected_projection) in [
+            (
+                "retained",
+                Some(json!({
+                    "status": "verified",
+                    "projection_source": "actuation"
+                })),
+                json!({
+                    "status": "verified",
+                    "projection_source": "actuation"
+                }),
+            ),
+            ("unobserved", None, json!({"status": "unobserved"})),
+        ] {
+            let (store, endpoint_ref, observed_session_ref) = browser_dispatch_reconcile_fixture();
+            let (reservation, params) = {
+                let mut guard = store.lock().unwrap();
+                let account_ref = guard
+                    .browser_resource(&observed_session_ref)
+                    .unwrap()
+                    .unwrap()
+                    .parent_ref
+                    .unwrap();
+                let reservation = match guard
+                    .reserve_browser_session(BrowserSessionReservationInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        account_ref: &account_ref,
+                        space_ref: None,
+                        display_label: "Second late readback projection",
+                        expected_generation: 7,
+                        idempotency_key_digest: &browser_sha256(&format!(
+                            "second-late-readback-key-{case}"
+                        )),
+                        request_digest: &browser_sha256(&format!(
+                            "second-late-readback-request-{case}"
+                        )),
+                        created_at: 40,
+                        expires_at: 4000,
+                    })
+                    .unwrap()
+                {
+                    BrowserSessionReservation::Reserved(record) => record,
+                    BrowserSessionReservation::Existing(_) => panic!("must be new"),
+                };
+                let created = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        kind: "session",
+                        parent_ref: Some(&account_ref),
+                        native_identity: &format!("second-late-readback-{case}"),
+                        display_label: None,
+                        observation_generation: 7,
+                        observed_at: 41,
+                    })
+                    .unwrap();
+                guard
+                    .upsert_browser_resource_locator(
+                        &created.resource_ref,
+                        "https://chatgpt.com/c/second-late-readback",
+                        7,
+                        41,
+                    )
+                    .unwrap();
+                guard
+                    .materialize_browser_session_reservation(
+                        &reservation.reservation_ref,
+                        &created.resource_ref,
+                        42,
+                    )
+                    .unwrap();
+                guard
+                    .update_browser_session_reservation_delivery(
+                        &reservation.reservation_ref,
+                        7,
+                        BrowserDeliveryState::Uncertain,
+                        None,
+                        43,
+                    )
+                    .unwrap();
+                (
+                    guard
+                        .browser_session_reservation(&reservation.reservation_ref)
+                        .unwrap()
+                        .unwrap(),
+                    json!({"message": "late accepted turn"}),
+                )
+            };
+
+            let actuator = FlakyReadbackActuator {
+                calls: AtomicUsize::new(0),
+            };
+            let result = browser_session_create_reconcile_uncertain(
+                &store,
+                &reservation,
+                &params,
+                Some(&actuator),
+                7,
+                false,
+                None,
+                first_title_projection,
+                Some("text_digest_mismatch"),
+            );
+            assert_eq!(result["ok"], true, "{case}: {result}");
+            assert_eq!(result["delivery_state"], "applied", "{case}");
+            assert_eq!(result["reconciled"], true, "{case}");
+            assert_eq!(result["title_projection"], expected_projection, "{case}");
+            assert_eq!(
+                result["classification_reason"], "text_digest_mismatch",
+                "{case}"
+            );
+            assert_eq!(
+                actuator.calls.load(Ordering::SeqCst),
+                2,
+                "{case}: no actuation repeats beyond the single retry"
+            );
+        }
     }
 
     #[test]
