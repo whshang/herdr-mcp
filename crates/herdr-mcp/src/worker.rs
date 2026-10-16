@@ -1668,6 +1668,26 @@ fn set_connector_webchat_control(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn valid_webchat_control_scope(endpoint_ref: &str, provider: &str, account_ref: &str) -> bool {
+    if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
+        && (provider != crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
+            || account_ref != crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT)
+    {
+        return false;
+    }
+    provider == crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
+        || (!provider.is_empty()
+            && provider.len() <= 32
+            && provider.chars().enumerate().all(|(index, ch)| {
+                if index == 0 {
+                    ch.is_ascii_lowercase() || ch.is_ascii_digit()
+                } else {
+                    ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+                }
+            }))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn set_connector_webchat_control(
     paths: &RuntimePaths,
     connector_id: &str,
@@ -1702,17 +1722,8 @@ fn set_connector_webchat_control(
     {
         return Err("browser account ref is invalid".to_owned());
     }
-    if provider.is_empty()
-        || provider.len() > 32
-        || !provider.chars().enumerate().all(|(index, ch)| {
-            if index == 0 {
-                ch.is_ascii_lowercase() || ch.is_ascii_digit()
-            } else {
-                ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
-            }
-        })
-    {
-        return Err("browser provider is invalid".to_owned());
+    if !valid_webchat_control_scope(endpoint_ref, provider, account_ref) {
+        return Err("browser provider or device scope is invalid".to_owned());
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_owner_link_identity(paths, &config)?;
@@ -3300,6 +3311,15 @@ fn print_json(value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_wide_webchat_grant_requires_complete_scope_at_owner_transport() {
+        assert!(valid_webchat_control_scope("*", "*", "*"));
+        assert!(valid_webchat_control_scope("bep_a", "*", "*"));
+        assert!(valid_webchat_control_scope("bep_a", "grok", "*"));
+        assert!(!valid_webchat_control_scope("*", "grok", "*"));
+        assert!(!valid_webchat_control_scope("*", "*", "br_specific"));
+    }
 
     #[test]
     fn production_link_identity_reads_legacy_single_device_link_environment() {

@@ -1415,8 +1415,14 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             // provider). A supplied account-ref is still accepted for
             // backward compatibility and stored, but does not narrow the match.
             let provider_scope = crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT.to_owned();
+            let device_scope = crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT.to_owned();
             let (action, connector_id, device_id, endpoint_ref, provider, account_ref, confirm) =
                 match &args[1..] {
+                    [action, connector_id, device_id, confirm]
+                        if matches!(action.as_str(), "allow-device" | "deny-device") =>
+                    {
+                        (action, connector_id, device_id, &device_scope, &device_scope, &device_scope, confirm)
+                    }
                     [action, connector_id, device_id, endpoint_ref, provider, account_ref, confirm] => {
                         (action, connector_id, device_id, endpoint_ref, provider, account_ref, confirm)
                     }
@@ -1424,14 +1430,14 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                         (action, connector_id, device_id, endpoint_ref, provider, &provider_scope, confirm)
                     }
                     _ => {
-                        return Err("connector webchat-control requires: <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm".to_owned());
+                        return Err("connector webchat-control requires: <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm OR <allow-device|deny-device> <connector-id> <device-id> --confirm".to_owned());
                     }
                 };
             let allowed = match action.as_str() {
-                "allow" => true,
-                "deny" => false,
+                "allow" | "allow-device" => true,
+                "deny" | "deny-device" => false,
                 _ => {
-                    return Err("connector webchat-control action must be allow or deny".to_owned());
+                    return Err("connector webchat-control action must be allow, deny, allow-device or deny-device".to_owned());
                 }
             };
             if !connector_id.starts_with("conn_")
@@ -1450,6 +1456,8 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             if endpoint_ref.starts_with('-')
                 || endpoint_ref.trim().is_empty()
                 || endpoint_ref.len() > 96
+                || (endpoint_ref == &device_scope
+                    && !matches!(action.as_str(), "allow-device" | "deny-device"))
             {
                 return Err("connector webchat-control requires a valid endpoint ref".to_owned());
             }
@@ -2414,7 +2422,8 @@ User path:\n\
   herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
   herdr-mcp connector revoke-client <client-id> --confirm  (legacy client/grant kill switch)\n\
   herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm  (enrolled owner device)\n\
-  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm  (macOS/Linux enrolled owner device)\n\
+  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm  (specific endpoint and provider)\n\
+  herdr-mcp connector webchat-control <allow-device|deny-device> <connector-id> <device-id> --confirm  (all WebChat accounts/endpoints on exactly one enrolled owner device; no Page Assist)\n\
   herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp connector page-assist orphans [list] [--device-id <device-id>]  (read-only: grant rows left under a previous connector; always scoped server-side to the authenticated owner device; --device-id is only an assertion and must match it, else 403 orphans_device_mismatch)\n\
   herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id> [--idempotency-key <key>] [--confirm]  (dry run without --confirm; with --confirm fetches the device-scoped plan, prints it plus the idempotency key, and applies it by plan_digest)\n\
@@ -4045,6 +4054,51 @@ mod tests {
                     .to_owned(),
                 allowed: true,
             })
+        );
+        for (command, allowed) in [("allow-device", true), ("deny-device", false)] {
+            assert_eq!(
+                parse(args(&[
+                    "connector",
+                    "webchat-control",
+                    command,
+                    "conn_webchat_test_1",
+                    "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    "--confirm",
+                ]))
+                .unwrap()
+                .command,
+                Command::Worker(WorkerCommand::ConnectorWebChatControl {
+                    connector_id: "conn_webchat_test_1".to_owned(),
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    endpoint_ref: "*".to_owned(),
+                    provider: "*".to_owned(),
+                    account_ref: "*".to_owned(),
+                    allowed,
+                })
+            );
+        }
+        assert!(
+            parse(args(&[
+                "connector",
+                "webchat-control",
+                "allow-device",
+                "conn_webchat_test_1",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "connector",
+                "webchat-control",
+                "allow",
+                "conn_webchat_test_1",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "*",
+                "*",
+                "--confirm",
+            ]))
+            .is_err()
         );
         assert_eq!(
             parse(args(&[

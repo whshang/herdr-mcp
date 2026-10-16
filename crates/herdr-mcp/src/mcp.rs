@@ -6139,14 +6139,22 @@ fn webchat_control_grant_covers(
     endpoint_ref: &str,
     provider: &str,
 ) -> bool {
-    grant.endpoint_ref == endpoint_ref
+    (grant.endpoint_ref == endpoint_ref
+        || (grant.endpoint_ref == WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
+            && grant.provider == WEBCHAT_CONTROL_ANY_PROVIDER
+            && grant.account_ref == WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT))
         && (grant.provider == provider || grant.provider == WEBCHAT_CONTROL_ANY_PROVIDER)
 }
 
 /// Provider wildcard: a grant with provider `*` covers every WebChat provider
-/// on its exact endpoint (issued explicitly, or derived by Edge from a Page
-/// Assist endpoint grant).
+/// on its exact endpoint (issued explicitly, or derived by Edge from Page
+/// Assist). The separately issued complete `*/*/*` tuple covers a device's
+/// endpoints after the trusted Edge device-route filter.
 pub(crate) const WEBCHAT_CONTROL_ANY_PROVIDER: &str = "*";
+/// Device-wide WebChat control is issued only by the enrolled owner's
+/// allow-device command. Edge binds it to a verified connector and routes
+/// it only to the same device; Page Assist is never inherited.
+pub(crate) const WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT: &str = "*";
 
 fn browser_resource_actuation_decision(
     store: &StateStore,
@@ -21077,6 +21085,33 @@ mod webchat_control_provider_scope_tests {
                 .iter()
                 .any(|g| webchat_control_grant_covers(g, "bep_a", "grok"))
         );
+    }
+
+    /// Device-wide scope inherits across endpoints/providers, but only with
+    /// the exact owner-issued triple; partial wildcard records fail closed.
+    #[test]
+    fn user_owner_device_scope_covers_all_webchat_endpoints_only_when_complete() {
+        let wide = grant("*", "*", "*");
+        for endpoint in ["bep_a", "bep_b"] {
+            for provider in ["chatgpt", "grok", "claude"] {
+                assert!(webchat_control_grant_covers(&wide, endpoint, provider));
+            }
+        }
+        assert!(!webchat_control_grant_covers(
+            &grant("*", "grok", "*"),
+            "bep_b",
+            "grok"
+        ));
+        assert!(!webchat_control_grant_covers(
+            &grant("*", "*", "br_legacy"),
+            "bep_a",
+            "chatgpt"
+        ));
+        assert!(!webchat_control_grant_covers(
+            &grant("bep_a", "*", "*"),
+            "bep_b",
+            "chatgpt"
+        ));
     }
 
     /// user owner | Given a legacy grant carrying an explicit account_ref | When that provider on that endpoint is controlled | Then it still works (account_ref is ignored)
