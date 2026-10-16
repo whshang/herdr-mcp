@@ -8,7 +8,7 @@ use crate::state_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -175,6 +175,7 @@ struct PromptRecord {
 #[derive(Default)]
 struct PromptRegistryInner {
     records: Mutex<HashMap<String, PromptRecord>>,
+    handoff_injected_panes: Mutex<HashSet<String>>,
     store: Option<Arc<Mutex<StateStore>>>,
     cache: Option<Arc<EventCache>>,
     client: Option<HerdrClient>,
@@ -202,6 +203,7 @@ impl PromptRegistry {
         Self {
             inner: Arc::new(PromptRegistryInner {
                 records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
                 client: None,
@@ -217,6 +219,7 @@ impl PromptRegistry {
         let registry = Self {
             inner: Arc::new(PromptRegistryInner {
                 records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: Some(cache),
                 client: Some(client),
@@ -306,6 +309,59 @@ impl PromptRegistry {
             );
         }
         Ok(())
+    }
+
+    fn inject_handoff_once(&self, pane_id: &str, worktree: &str, text: &str) -> String {
+        let Ok(mut injected) = self.inner.handoff_injected_panes.lock() else {
+            return text.to_owned();
+        };
+        if !injected.insert(pane_id.to_owned()) {
+            return text.to_owned();
+        }
+        let Some(store) = &self.inner.store else {
+            return text.to_owned();
+        };
+        let Ok(store) = store.lock() else {
+            return text.to_owned();
+        };
+        let Ok(states) = store.work_states() else {
+            return text.to_owned();
+        };
+        let Some(state) = states
+            .into_iter()
+            .filter(|state| state.worktree == worktree && !state.handoff_md.trim().is_empty())
+            .max_by_key(|state| state.updated_at)
+        else {
+            return text.to_owned();
+        };
+        let handoff = crate::state_store::work_journal::clip_chars(&state.handoff_md, 16_000);
+        format!("## Handoff context\n\n{handoff}\n\n---\n\n{text}")
+    }
+
+    fn pane_worktree(&self, pane_id: &str) -> Option<String> {
+        let workspace_id = self.workspace_for_pane(pane_id)?;
+        let snapshot = self.inner.cache.as_ref()?.snapshot();
+        snapshot
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .and_then(|workspaces| {
+                workspaces.iter().find(|workspace| {
+                    workspace
+                        .get("workspace_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| workspace.get("id").and_then(Value::as_str))
+                        == Some(&workspace_id)
+                })
+            })
+            .and_then(|workspace| workspace.get("worktree"))
+            .and_then(Value::as_object)
+            .and_then(|worktree| {
+                worktree
+                    .get("checkout_path")
+                    .and_then(Value::as_str)
+                    .or_else(|| worktree.get("path").and_then(Value::as_str))
+            })
+            .map(str::to_owned)
     }
 
     fn current_task_cursor(&self) -> u64 {
@@ -1505,12 +1561,23 @@ pub fn run_with_parent_session(
 
     let start_cursor = registry.current_task_cursor();
     let before = agent_state_of(client, target);
+    let pane_id = before
+        .as_ref()
+        .and_then(|state| state.pane_id.as_deref())
+        .or_else(|| registry.pane_worktree(target).map(|_| target));
+    let dispatch_text = pane_id
+        .and_then(|pane_id| {
+            registry
+                .pane_worktree(pane_id)
+                .map(|worktree| registry.inject_handoff_once(pane_id, &worktree, text))
+        })
+        .unwrap_or_else(|| text.to_owned());
     // Native Herdr 0.9.x wait is lifecycle/status based and cannot identify the
     // prompt turn. Submit exactly once without native wait, then wait on the
     // Runtime-owned task ledger below.
     let params = json!({
         "target": target,
-        "text": text,
+        "text": dispatch_text,
     });
 
     let mut result = match client.call_with_timeout(
@@ -2399,6 +2466,40 @@ mod tests {
         assert_eq!(
             parse_wait(Some(&json!({"timeout_ms": 0}))).unwrap_err()["code"],
             "invalid_params"
+        );
+    }
+
+    #[test]
+    fn first_pane_dispatch_injects_bounded_handoff_once() {
+        use crate::state_store::work_journal::WorkState;
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "project-a".to_owned(),
+                worktree: "/repo".to_owned(),
+                handoff_md: "important context".to_owned(),
+                through_event_id: 4,
+                log_cursors_json: "{}".to_owned(),
+                updated_at: 5,
+            })
+            .unwrap();
+        let registry = PromptRegistry::with_store(store);
+        let first = registry.inject_handoff_once("w1:p1", "/repo", "do next");
+        assert!(first.starts_with("## Handoff context\n\nimportant context"));
+        assert!(first.ends_with("do next"));
+        assert_eq!(
+            registry.inject_handoff_once("w1:p1", "/repo", "do another"),
+            "do another"
+        );
+        assert!(
+            registry
+                .inject_handoff_once("w1:p2", "/repo", "other pane")
+                .chars()
+                .count()
+                < 16_100
         );
     }
 

@@ -19,7 +19,7 @@ use super::{
     LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD, TEXT_READ_METHOD, TEXT_WRITE_METHOD,
     VALIDATION_ADVISE_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
     WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
+    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
@@ -265,6 +265,24 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "backup": {"type": "boolean"},
                 },
                 "required": ["path", "content", "sha256"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": WORK_PICKUP_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "worktree": {"type": "string", "maxLength": 4096},
+                    "project_root": {"type": "string", "maxLength": 4096},
+                    "project_ref": {"type": "string", "maxLength": 512},
+                },
+                "required": [],
+                "oneOf": [
+                    {"required": ["worktree"]},
+                    {"required": ["project_root"]}
+                ],
                 "empty": false,
             },
         }),

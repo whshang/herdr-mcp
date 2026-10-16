@@ -79,6 +79,12 @@ fn request(op: &str, snapshot: &Value, args: Value) -> Value {
 }
 
 fn binary_under_test() -> PathBuf {
+    if let Some(binary) = option_env!("CARGO_BIN_EXE_herdr-mcp") {
+        let binary = PathBuf::from(binary);
+        if binary.is_file() {
+            return binary;
+        }
+    }
     let mut root = std::env::current_dir().expect("test working directory");
     loop {
         let manifest = root.join("Cargo.toml");
