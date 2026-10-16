@@ -220,8 +220,13 @@ The browser extension also supports English, Simplified Chinese and Japanese.
 
 ```bash
 herdr-mcp native-host install
+herdr-mcp native-host use standalone
 herdr-mcp native-host status
+herdr-mcp native-host use standalone --user-data-dir /home/box/chrome-profile/Fork-2
+herdr-mcp native-host install --user-data-dir /home/box/chrome-profile/Fork-2 --user-data-dir /home/box/chrome-profile/Fork-3
 ```
+
+On macOS and Linux this registers the Chromium host `dev.herdr.mcp` for the selected STORE / STANDALONE / DEV origin. Linux writes user-level manifests under `~/.config/google-chrome/NativeMessagingHosts/` (always) and, when those browsers have already created a config directory, under `chromium`, `google-chrome-for-testing`, Chrome Beta/Dev, Brave, and Microsoft Edge. Chrome started with `--user-data-dir` reads hosts from `<user-data-dir>/NativeMessagingHosts/` instead. Repeat `--user-data-dir` on `native-host install` or `native-host use`; the directories are remembered, listed by `native-host status`, and restored by `native-host rollback`. The managed runtime must be restarted by `service install`, an update, or `dev sync` so it binds mode-`0600` `~/.config/herdr-mcp/extension.sock`. See [Browser extension](extension.md).
 
 Primary path:
 
@@ -233,7 +238,7 @@ native host
 herdr-mcp runtime
 ```
 
-The browser does not need to store the Herdr bearer. See [Browser extension](extension.md).
+The browser does not need to store the Herdr bearer.
 
 ## Cloudflare Edge credentials
 

@@ -404,15 +404,35 @@ pub enum TccBrokerCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum NativeHostCommand {
-    Install,
+    Install { user_data_dirs: Vec<String> },
     Status,
     Uninstall,
     Rollback,
     DevEnable { path: Option<String> },
     DevDisable,
-    UseStore,
-    UseStandalone,
-    UseDev,
+    UseStore { user_data_dirs: Vec<String> },
+    UseStandalone { user_data_dirs: Vec<String> },
+    UseDev { user_data_dirs: Vec<String> },
+}
+
+impl NativeHostCommand {
+    /// Extra Chromium `--user-data-dir` profile roots for this invocation.
+    ///
+    /// Only `install` and `use` accept the flag. Status, rollback, and uninstall
+    /// honor the persisted set and do not take new paths.
+    pub(crate) fn user_data_dirs(&self) -> &[String] {
+        match self {
+            Self::Install { user_data_dirs }
+            | Self::UseStore { user_data_dirs }
+            | Self::UseStandalone { user_data_dirs }
+            | Self::UseDev { user_data_dirs } => user_data_dirs,
+            Self::Status
+            | Self::Uninstall
+            | Self::Rollback
+            | Self::DevEnable { .. }
+            | Self::DevDisable => &[],
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2292,46 +2312,116 @@ fn parse_update(args: &[String]) -> Result<Command, String> {
 }
 
 fn parse_native_host(args: &[String]) -> Result<Command, String> {
-    match args {
-        [subcommand] if subcommand == "install" => {
-            Ok(Command::NativeHost(NativeHostCommand::Install))
-        }
-        [subcommand] if subcommand == "status" => {
-            Ok(Command::NativeHost(NativeHostCommand::Status))
-        }
-        [subcommand] if subcommand == "uninstall" => {
-            Ok(Command::NativeHost(NativeHostCommand::Uninstall))
-        }
-        [subcommand] if subcommand == "rollback" => {
-            Ok(Command::NativeHost(NativeHostCommand::Rollback))
-        }
-        [group, action] if group == "dev" && action == "enable" => Ok(Command::NativeHost(
-            NativeHostCommand::DevEnable { path: None },
-        )),
-        [group, action, path] if group == "dev" && action == "enable" => Ok(
-            Command::NativeHost(NativeHostCommand::DevEnable {
-                path: Some(path.clone()),
-            }),
-        ),
-        [group, action] if group == "dev" && action == "disable" => {
-            Ok(Command::NativeHost(NativeHostCommand::DevDisable))
-        }
-        [subcommand, channel] if subcommand == "use" && channel == "store" => {
-            Ok(Command::NativeHost(NativeHostCommand::UseStore))
-        }
-        [subcommand, channel] if subcommand == "use" && channel == "standalone" => {
-            Ok(Command::NativeHost(NativeHostCommand::UseStandalone))
-        }
-        [subcommand, channel] if subcommand == "use" && channel == "dev" => {
-            Ok(Command::NativeHost(NativeHostCommand::UseDev))
-        }
-        [] => Err(
+    if args.is_empty() {
+        return Err(
             "native-host requires install, status, uninstall, rollback, dev enable|disable, or use store|standalone|dev"
                 .to_owned(),
-        ),
-        [subcommand] => Err(format!("unknown native-host command '{subcommand}'")),
+        );
+    }
+    match args[0].as_str() {
+        "install" => Ok(Command::NativeHost(NativeHostCommand::Install {
+            user_data_dirs: parse_user_data_dir_flags(&args[1..])?,
+        })),
+        "status" => {
+            reject_native_host_user_data_dir(&args[1..])?;
+            Ok(Command::NativeHost(NativeHostCommand::Status))
+        }
+        "uninstall" => {
+            reject_native_host_user_data_dir(&args[1..])?;
+            Ok(Command::NativeHost(NativeHostCommand::Uninstall))
+        }
+        "rollback" => {
+            reject_native_host_user_data_dir(&args[1..])?;
+            Ok(Command::NativeHost(NativeHostCommand::Rollback))
+        }
+        "dev" => parse_native_host_dev(&args[1..]),
+        "use" => parse_native_host_use(&args[1..]),
+        subcommand if args.len() == 1 => Err(format!("unknown native-host command '{subcommand}'")),
         _ => Err("invalid native-host command or arguments".to_owned()),
     }
+}
+
+fn parse_native_host_dev(args: &[String]) -> Result<Command, String> {
+    if args
+        .iter()
+        .any(|arg| arg == "--user-data-dir" || arg.starts_with("--user-data-dir="))
+    {
+        return Err(
+            "--user-data-dir is only valid for native-host install and native-host use".to_owned(),
+        );
+    }
+    match args {
+        [action] if action == "enable" => Ok(Command::NativeHost(NativeHostCommand::DevEnable {
+            path: None,
+        })),
+        [action, path] if action == "enable" => {
+            Ok(Command::NativeHost(NativeHostCommand::DevEnable {
+                path: Some(path.clone()),
+            }))
+        }
+        [action] if action == "disable" => Ok(Command::NativeHost(NativeHostCommand::DevDisable)),
+        _ => Err("invalid native-host command or arguments".to_owned()),
+    }
+}
+
+fn parse_native_host_use(args: &[String]) -> Result<Command, String> {
+    let Some(channel) = args.first() else {
+        return Err("invalid native-host command or arguments".to_owned());
+    };
+    let user_data_dirs = parse_user_data_dir_flags(&args[1..])?;
+    let command = match channel.as_str() {
+        "store" => NativeHostCommand::UseStore { user_data_dirs },
+        "standalone" => NativeHostCommand::UseStandalone { user_data_dirs },
+        "dev" => NativeHostCommand::UseDev { user_data_dirs },
+        _ => return Err("invalid native-host command or arguments".to_owned()),
+    };
+    Ok(Command::NativeHost(command))
+}
+
+fn reject_native_host_user_data_dir(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|arg| arg == "--user-data-dir" || arg.starts_with("--user-data-dir="))
+    {
+        return Err(
+            "--user-data-dir is only valid for native-host install and native-host use".to_owned(),
+        );
+    }
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err("invalid native-host command or arguments".to_owned())
+    }
+}
+
+/// Repeatable `--user-data-dir PATH` or `--user-data-dir=PATH`.
+fn parse_user_data_dir_flags(args: &[String]) -> Result<Vec<String>, String> {
+    let mut dirs = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(value) = arg.strip_prefix("--user-data-dir=") {
+            if value.is_empty() {
+                return Err("--user-data-dir requires a path".to_owned());
+            }
+            dirs.push(value.to_owned());
+            index += 1;
+            continue;
+        }
+        if arg == "--user-data-dir" {
+            let Some(value) = args.get(index + 1) else {
+                return Err("--user-data-dir requires a path".to_owned());
+            };
+            if value.starts_with('-') {
+                return Err("--user-data-dir requires a path".to_owned());
+            }
+            dirs.push(value.clone());
+            index += 2;
+            continue;
+        }
+        return Err(format!("unknown native-host option '{arg}'"));
+    }
+    Ok(dirs)
 }
 
 fn parse_extension(args: &[String]) -> Result<Command, String> {
@@ -2455,9 +2545,10 @@ Advanced / internal:\n\
   herdr-mcp link migrate-runtime-control [--dry-run|--write-staging|--apply]\n\
   herdr-mcp browser-page <lifecycle|action|fast-path> --params-json JSON  (advanced trusted-local Generic Web control; Runtime validates typed params)\n\
   herdr-mcp tcc-broker <install [--force]|status|uninstall>\n\
-  herdr-mcp native-host <install|status|uninstall|rollback>\n\
+  herdr-mcp native-host install [--user-data-dir PATH]...\n\
+  herdr-mcp native-host <status|uninstall|rollback>\n\
   herdr-mcp native-host dev <enable [PATH]|disable>\n\
-  herdr-mcp native-host use <store|standalone|dev>\n\
+  herdr-mcp native-host use <store|standalone|dev> [--user-data-dir PATH]...\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
   herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME | --signed-url] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
   (--signed-url imports a safe signed HTTPS URL directly; R2 relay objects use
@@ -3706,6 +3797,40 @@ mod tests {
             })
         );
         assert_eq!(
+            parse(args(&["native-host", "install"])).unwrap().command,
+            Command::NativeHost(NativeHostCommand::Install {
+                user_data_dirs: Vec::new()
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "native-host",
+                "install",
+                "--user-data-dir",
+                "/home/box/chrome-profile/Fork-2",
+                "--user-data-dir=/home/box/chrome-profile/Fork-3"
+            ]))
+            .unwrap()
+            .command,
+            Command::NativeHost(NativeHostCommand::Install {
+                user_data_dirs: vec![
+                    "/home/box/chrome-profile/Fork-2".to_owned(),
+                    "/home/box/chrome-profile/Fork-3".to_owned()
+                ]
+            })
+        );
+        assert!(parse(args(&["native-host", "install", "--user-data-dir"])).is_err());
+        assert!(
+            parse(args(&[
+                "native-host",
+                "status",
+                "--user-data-dir",
+                "/home/box/chrome-profile/Fork-2"
+            ]))
+            .unwrap_err()
+            .contains("only valid for native-host install and native-host use")
+        );
+        assert_eq!(
             parse(args(&["native-host", "status"])).unwrap().command,
             Command::NativeHost(NativeHostCommand::Status)
         );
@@ -3741,17 +3866,47 @@ mod tests {
             parse(args(&["native-host", "use", "store"]))
                 .unwrap()
                 .command,
-            Command::NativeHost(NativeHostCommand::UseStore)
+            Command::NativeHost(NativeHostCommand::UseStore {
+                user_data_dirs: Vec::new()
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "native-host",
+                "use",
+                "standalone",
+                "--user-data-dir",
+                "/home/box/chrome-profile/Fork-2"
+            ]))
+            .unwrap()
+            .command,
+            Command::NativeHost(NativeHostCommand::UseStandalone {
+                user_data_dirs: vec!["/home/box/chrome-profile/Fork-2".to_owned()]
+            })
         );
         assert_eq!(
             parse(args(&["native-host", "use", "standalone"]))
                 .unwrap()
                 .command,
-            Command::NativeHost(NativeHostCommand::UseStandalone)
+            Command::NativeHost(NativeHostCommand::UseStandalone {
+                user_data_dirs: Vec::new()
+            })
         );
         assert_eq!(
             parse(args(&["native-host", "use", "dev"])).unwrap().command,
-            Command::NativeHost(NativeHostCommand::UseDev)
+            Command::NativeHost(NativeHostCommand::UseDev {
+                user_data_dirs: Vec::new()
+            })
+        );
+        assert!(
+            parse(args(&[
+                "native-host",
+                "dev",
+                "enable",
+                "--user-data-dir",
+                "/tmp/profile"
+            ]))
+            .is_err()
         );
         assert_eq!(
             parse(args(&["extension", "standalone", "install"]))

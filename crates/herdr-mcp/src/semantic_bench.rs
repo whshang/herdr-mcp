@@ -361,7 +361,11 @@ fn record_chat_samples(
     for run in 1..=runs {
         for case in cases {
             let started = Instant::now();
-            let result = provider.chat(&case.messages, attempt);
+            let result = provider.chat_with_options(
+                &case.messages,
+                attempt,
+                &SemanticChatOptions::default(),
+            );
             let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             match result {
                 Ok(response) => {

@@ -403,6 +403,70 @@ test("user uses one semantic route schema for chat | Given a Worker-wide openai-
   }
 });
 
+test("user tunes semantic chat output | Given a Worker-wide openai-chat route | When chat carries max_tokens JSON mode and tier | Then they are validated and forwarded upstream", async () => {
+  const h = makeEnv({
+    HERDR_SEMANTIC_ROUTES: JSON.stringify([{
+      name: "chat_primary",
+      protocol: "openai-chat",
+      url: "https://chat.example/v1/chat/completions",
+      model: "chat-model",
+      api_key: "chat-secret",
+    }]),
+  });
+  const paired = await pair(h.env, "semantic-chat-options");
+  const originalFetch = globalThis.fetch;
+  const upstreamBodies = [];
+  globalThis.fetch = async (_input, init = {}) => {
+    upstreamBodies.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: "{\"ok\":true}" } }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const send = (extra) => worker.fetch(
+    postAsWorkstation(
+      "/semantic/chat",
+      { messages: [{ role: "user", content: "json please" }], ...extra },
+      paired.workstation_id,
+      paired.device_secret,
+    ),
+    h.env,
+  );
+  try {
+    const tuned = await send({ max_tokens: 64, response_format: { type: "json_object" }, tier: "background" });
+    assert.equal(tuned.status, 200);
+    assert.equal(upstreamBodies[0].max_tokens, 64);
+    assert.deepEqual(upstreamBodies[0].response_format, { type: "json_object" });
+    assert.equal("tier" in upstreamBodies[0], false);
+
+    const shorthand = await send({ response_format: "json" });
+    assert.equal(shorthand.status, 200);
+    assert.deepEqual(upstreamBodies[1].response_format, { type: "json_object" });
+    assert.equal("max_tokens" in upstreamBodies[1], false);
+
+    const plain = await send({});
+    assert.equal(plain.status, 200);
+    assert.equal("max_tokens" in upstreamBodies[2], false);
+    assert.equal("response_format" in upstreamBodies[2], false);
+
+    for (const invalid of [
+      { max_tokens: 0 },
+      { max_tokens: 32769 },
+      { max_tokens: 1.5 },
+      { max_tokens: "64" },
+      { response_format: "yaml" },
+      { response_format: { type: "json_schema" } },
+      { tier: "urgent" },
+      { temperature: 1 },
+    ]) {
+      const rejected = await send(invalid);
+      assert.equal(rejected.status, 400, JSON.stringify(invalid));
+    }
+    assert.equal(upstreamBodies.length, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("user receives normalized Vercel evaluation | Given a decision-vercel Jev route | When a Noul question is evaluated | Then boolean wire output is normalized to Noul", async () => {
   const h = makeEnv({
     HERDR_SEMANTIC_ROUTES: JSON.stringify([{
