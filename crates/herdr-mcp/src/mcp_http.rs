@@ -603,6 +603,75 @@ async fn post_extension_browser_registry(State(state): State<AppState>, body: By
     }
 }
 
+/// Fixed allowlist for the extension's create-stage diagnostics nested inside
+/// the actuation result. Only the `create_diagnostics` key is inspected:
+/// booleans pass through unchanged, error fields survive only when they match
+/// their strictly enumerated category, and every unknown token degrades to
+/// `other`. Any other key inside the nested object is stripped. Raw error
+/// text, native account ids, message bodies, and tokens never pass through,
+/// and the diagnostics never confer authority or an Applied promotion.
+fn sanitize_browser_actuation_result(result: &Value) -> Value {
+    let Some(object) = result.as_object() else {
+        return result.clone();
+    };
+    let Some(diagnostics) = object.get("create_diagnostics") else {
+        return result.clone();
+    };
+    const REGISTRATION_ERRORS: &[&str] = &[
+        "registration_unavailable",
+        "registration_failed",
+        "browser_observation_failed",
+        "browser_session_reservation_not_found",
+        "browser_session_reservation_not_pending",
+        "browser_session_reservation_expired",
+        "stale_capability_generation",
+        "browser_session_materialization_scope_mismatch",
+        "browser_registry_store_unavailable",
+    ];
+    const SCOPE_ERRORS: &[&str] = &[
+        "account_mismatch",
+        "space_mismatch",
+        "generation_mismatch",
+        "identity_unavailable",
+        "route_mismatch",
+    ];
+    let mut clean = serde_json::Map::new();
+    if let Value::Object(fields) = diagnostics {
+        for (key, value) in fields {
+            match (key.as_str(), value) {
+                ("registration_attempted", Value::Bool(flag))
+                | ("scope_identity_verified", Value::Bool(flag)) => {
+                    clean.insert(key.clone(), Value::Bool(*flag));
+                }
+                ("registration_error", Value::String(token)) => {
+                    clean.insert(
+                        key.clone(),
+                        Value::String(if REGISTRATION_ERRORS.contains(&token.as_str()) {
+                            token.clone()
+                        } else {
+                            "other".to_owned()
+                        }),
+                    );
+                }
+                ("scope_identity_error", Value::String(token)) => {
+                    clean.insert(
+                        key.clone(),
+                        Value::String(if SCOPE_ERRORS.contains(&token.as_str()) {
+                            token.clone()
+                        } else {
+                            "other".to_owned()
+                        }),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = object.clone();
+    out.insert("create_diagnostics".to_owned(), Value::Object(clean));
+    Value::Object(out)
+}
+
 async fn post_extension_browser_actuation(State(state): State<AppState>, body: Bytes) -> Response {
     if !state.trusted_extension_ipc {
         return browser_registry_http_error(
@@ -695,7 +764,7 @@ async fn post_extension_browser_actuation(State(state): State<AppState>, body: B
         };
         let actuation_result = match payload.get("result") {
             None | Some(Value::Null) => None,
-            Some(Value::Object(_)) => payload.get("result").cloned(),
+            Some(value @ Value::Object(_)) => Some(sanitize_browser_actuation_result(value)),
             Some(_) => return Err("browser_actuation_result_invalid".to_owned()),
         };
         state.browser_actuation.complete(

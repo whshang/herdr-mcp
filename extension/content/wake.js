@@ -1113,10 +1113,104 @@ function normalizeHerdrMentionAlias(value) {
     if (!isSendButton(btn)) {
       return { ok: false, attempted: false, error: "submit-unavailable" };
     }
-    const baseline = captureSubmitAckBaseline(btn, options);
-    const input = ADAPTER.getInputEl();
+    let baseline = null;
+    let input = ADAPTER.getInputEl();
     if (!input) {
       return { ok: false, attempted: false, error: "submit-input-unavailable" };
+    }
+    if (options.creatingSession === true) {
+      // FINAL create scope fence (second-account safety). Cached registry refs
+      // from the earlier actuation-time refresh are NOT proof: every await
+      // since then (App selection, snapshots, composer insert, readiness
+      // waits) could have observed an account switch while the cache still
+      // matches. So the fence FIRST awaits a new attempt-bound registration
+      // refresh through the existing identity+registry path, proves THIS
+      // attempt succeeded, and only then compares the fresh opaque
+      // account/space/generation to the reserved scope. No raw native account
+      // id and no new network primitive. A null, superseded, failed, or
+      // timed-out refresh fails closed with ZERO submits even when the old
+      // cache still matches.
+      const reservedAccountRef = typeof options.reservedAccountRef === "string"
+        ? options.reservedAccountRef
+        : "";
+      const reservedSpaceRef = typeof options.reservedSpaceRef === "string"
+        ? options.reservedSpaceRef
+        : "";
+      const reservedGeneration = Number.isSafeInteger(options.reservedGeneration)
+        && options.reservedGeneration > 0
+        ? options.reservedGeneration
+        : 0;
+      let freshOutcome = null;
+      try {
+        freshOutcome = await registerCurrentConversation("browser-session-create", {
+          refreshObservation: true,
+        });
+      } catch (_) {
+        freshOutcome = null;
+      }
+      const freshRoute = ADAPTER.getConversationKey();
+      // Compare THIS refresh response's own opaque fields, never the global
+      // cache: a superseded or non-bound refresh that left old globals behind
+      // cannot pass. The background registry answer carries exactly these
+      // field names for the Project launcher route; missing or malformed
+      // values fail closed with no retry.
+      const actualAccountRef = typeof freshOutcome?.browser_account_ref === "string"
+        && freshOutcome.browser_account_ref
+        ? freshOutcome.browser_account_ref
+        : null;
+      const actualSpaceRef = typeof freshOutcome?.browser_space_ref === "string"
+        && freshOutcome.browser_space_ref
+        ? freshOutcome.browser_space_ref
+        : null;
+      const actualGeneration = Number.isSafeInteger(freshOutcome?.browser_generation)
+        && freshOutcome.browser_generation > 0
+        ? freshOutcome.browser_generation
+        : null;
+      let scopeCategory = null;
+      if (!freshOutcome || !reservedAccountRef || !actualAccountRef) {
+        scopeCategory = "identity_unavailable";
+      } else if (registeredConvKey !== freshRoute || !freshRoute) {
+        scopeCategory = "route_mismatch";
+      } else if (actualAccountRef !== reservedAccountRef) {
+        scopeCategory = "account_mismatch";
+      } else if (reservedSpaceRef ? actualSpaceRef !== reservedSpaceRef : Boolean(actualSpaceRef)) {
+        scopeCategory = "space_mismatch";
+      } else if (!reservedGeneration || actualGeneration !== reservedGeneration) {
+        scopeCategory = "generation_mismatch";
+      }
+      if (scopeCategory !== null) {
+        return {
+          ok: false,
+          attempted: false,
+          error: "browser_create_scope_mismatch",
+          scope_identity_error: scopeCategory,
+        };
+      }
+      // The fresh identity is proven for exactly this registration attempt's
+      // route. runConversationRegistration reads the page identity before its
+      // other awaits, so a provider-side account flip during those awaits can
+      // still produce a stale-but-consistent observation; that residual race
+      // is accepted fail-closed server-side (the reservation never
+      // materializes under a foreign account) and is NOT proof for dispatch.
+      // Synchronously revalidate the submit surface — no further await — and
+      // capture the ack baseline only now, immediately before dispatch.
+      const finalInput = ADAPTER.getInputEl();
+      if (!finalInput) {
+        return { ok: false, attempted: false, error: "submit-input-unavailable" };
+      }
+      if (isComposerGenerating()) {
+        return { ok: false, attempted: false, error: "composer-busy" };
+      }
+      const finalButton = findSendButton();
+      if (!isSendButton(finalButton)) {
+        return { ok: false, attempted: false, error: "submit-unavailable" };
+      }
+      input = finalInput;
+      btn = finalButton;
+      baseline = captureSubmitAckBaseline(btn, options);
+    }
+    if (baseline === null) {
+      baseline = captureSubmitAckBaseline(btn, options);
     }
     try {
       dispatchEnterSubmit(input);
@@ -1394,6 +1488,9 @@ function normalizeHerdrMentionAlias(value) {
             creatingSession: data.browserSessionCreate === true,
             expectedConvKey: data.expectedConvKey ?? null,
             requiredApps,
+            reservedAccountRef: data.reservedAccountRef ?? "",
+            reservedSpaceRef: data.reservedSpaceRef ?? "",
+            reservedGeneration: data.reservedGeneration ?? 0,
           });
           noteWakeResult(n, outcome.ok);
           if (outcome.ok) {
@@ -2604,6 +2701,57 @@ function normalizeHerdrMentionAlias(value) {
       return busy;
     }
 
+
+    let createReservedAccountRef = "";
+    let createReservedSpaceRef = "";
+    if (creatingSession) {
+      // Early identity fence before the submit pipeline. The scope can go
+      // stale while the composer hydration window waited, so re-observe the
+      // CURRENT page identity through the existing registration path and
+      // compare the actual account, space, and generation to the reserved
+      // scope. This is NOT the final fence: App selection, snapshots, the
+      // composer insert, and the single-shot submit all still await after it,
+      // so submitBrowserActuationOnce re-checks immediately before the Enter
+      // dispatch. Any mismatch refuses with zero submits, and the
+      // reservation scope is never switched to whatever the page now shows.
+      createReservedAccountRef = typeof command?.params?.account_ref === "string"
+        ? command.params.account_ref
+        : "";
+      createReservedSpaceRef = typeof command?.params?.space_ref === "string"
+        ? command.params.space_ref
+        : "";
+      const reservedAccountRef = createReservedAccountRef;
+      const reservedSpaceRef = createReservedSpaceRef;
+      try {
+        await registerCurrentConversation("browser-session-create", { refreshObservation: true });
+      } catch (_) {}
+      const actualAccountRef = registeredBrowserAccountRef || null;
+      const actualSpaceRef = registeredBrowserSpaceRef || null;
+      const actualGeneration = registeredBrowserGeneration;
+      let scopeCategory = null;
+      if (!actualAccountRef) {
+        scopeCategory = "identity_unavailable";
+      } else if (reservedAccountRef && actualAccountRef !== reservedAccountRef) {
+        scopeCategory = "account_mismatch";
+      } else if (reservedSpaceRef ? actualSpaceRef !== reservedSpaceRef : Boolean(actualSpaceRef)) {
+        scopeCategory = "space_mismatch";
+      } else if (actualGeneration !== expectedGeneration) {
+        scopeCategory = "generation_mismatch";
+      }
+      if (scopeCategory !== null) {
+        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+        const refused = browserRejectedEvidence(evidence, "browser_create_scope_mismatch");
+        // Bounded nested diagnostics (fixed keys, typed tokens only): the
+        // runtime reads them through the strict HTTP allowlist.
+        refused.result.create_diagnostics = {
+          registration_attempted: true,
+          registration_error: lastRegistrationErrorClass,
+          scope_identity_verified: false,
+          scope_identity_error: scopeCategory,
+        };
+        return refused;
+      }
+    }
     if (requiredApps.length > 0) {
       const appSelection = await ensureRequiredComposerApps(requiredApps);
       if (!appSelection.ok) {
@@ -2642,6 +2790,12 @@ function normalizeHerdrMentionAlias(value) {
       browserSessionCreate: creatingSession,
       expectedConvKey: command?.expectedConvKey ?? null,
       requiredApps,
+      // The reserved scope rides the existing options chain so the final
+      // pre-dispatch fence inside submitBrowserActuationOnce can compare the
+      // CURRENT registered identity without a new primitive.
+      reservedAccountRef: createReservedAccountRef,
+      reservedSpaceRef: createReservedSpaceRef,
+      reservedGeneration: expectedGeneration,
     });
     if (!result?.ok) {
       if (boundedChatGptSubmit && result?.uncertain === true) {
@@ -2649,6 +2803,20 @@ function normalizeHerdrMentionAlias(value) {
         evidence.resource_available = true;
         evidence.canonical_url_observed = providerCanonicalConversationObserved();
         return evidence;
+      }
+      if (creatingSession && typeof result?.scope_identity_error === "string") {
+        // The final pre-dispatch fence refused the send: zero submits left
+        // the page. Typed diagnostics only; the reservation is never
+        // switched to whatever the page now shows.
+        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+        const refused = browserRejectedEvidence(evidence, "browser_create_scope_mismatch");
+        refused.result.create_diagnostics = {
+          registration_attempted: true,
+          registration_error: lastRegistrationErrorClass,
+          scope_identity_verified: false,
+          scope_identity_error: result.scope_identity_error,
+        };
+        return refused;
       }
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
@@ -2758,7 +2926,24 @@ function normalizeHerdrMentionAlias(value) {
       // conversation would materialize it as the new session.
       if (creatingSession && evidence.canonical_url_observed && evidence.accepted_message_observed) {
         if (currentConvKey && (registeredConvKey !== currentConvKey || !registeredBrowserSessionRef)) {
-          await registerCurrentConversation("browser-session-create").catch(() => null);
+          // Typed registration outcome for the create evidence: the runtime
+          // distinguishes an accepted-but-registration-failed uncertain from a
+          // not-yet-accepted one. Never retry the send itself. Bounded nested
+          // diagnostics ride on the existing result object (fixed keys,
+          // typed tokens only; the runtime HTTP layer enforces the allowlist).
+          let registrationOutcomeError = null;
+          try {
+            await registerCurrentConversation("browser-session-create");
+          } catch (_) {}
+          if (!registeredBrowserSessionRef || registeredConvKey !== currentConvKey) {
+            registrationOutcomeError = lastRegistrationErrorClass || "registration_failed";
+          }
+          evidence.result.create_diagnostics = {
+            registration_attempted: true,
+            registration_error: registrationOutcomeError,
+            scope_identity_verified: true,
+            scope_identity_error: null,
+          };
         }
         evidence.stable_resource_ref_observed = Boolean(
           registeredBrowserSessionRef
@@ -3064,8 +3249,12 @@ function normalizeHerdrMentionAlias(value) {
   let registeredConvKey = null;
   let registeredBrowserSessionRef = null;
   let registeredBrowserGeneration = null;
+  let registeredBrowserAccountRef = null;
+  let registeredBrowserSpaceRef = null;
+  // Typed error-category token from the most recent h2w_register outcome for
+  // the current conversation; reset to null on a successful registration.
+  let lastRegistrationErrorClass = null;
   let registeredHerdrAppKeyword = null;
-  let registeredConversationBound = false;
   let browserRegistrationAttempt = 0;
   let chatGptProjectCatalogCache = { accountNativeIdentity: null, fetchedAt: 0, projects: [] };
   const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
@@ -3634,6 +3823,9 @@ function normalizeHerdrMentionAlias(value) {
         if (ADAPTER.getConversationKey() !== convKey) {
           registeredBrowserSessionRef = null;
           registeredBrowserGeneration = null;
+          registeredBrowserAccountRef = null;
+          registeredBrowserSpaceRef = null;
+          lastRegistrationErrorClass = null;
           registeredHerdrAppKeyword = null;
           registeredConversationBound = false;
         }
@@ -3657,6 +3849,7 @@ function normalizeHerdrMentionAlias(value) {
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
       ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
       : [];
+    lastRegistrationErrorClass = null;
     const response = await sendBg({
       type: "h2w_register",
       convKey,
@@ -3669,12 +3862,19 @@ function normalizeHerdrMentionAlias(value) {
       browserCurrentProjectName: browserCurrentProject?.name || null,
       browserSessionReservationRef,
     });
+    if (response === null) {
+      // The background never answered: typed class only, no content.
+      lastRegistrationErrorClass = "registration_unavailable";
+    }
     if (response !== null) {
       if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
         if (registeredConvKey === convKey) {
           if (ADAPTER.getConversationKey() !== convKey) {
             registeredBrowserSessionRef = null;
             registeredBrowserGeneration = null;
+            registeredBrowserAccountRef = null;
+            registeredBrowserSpaceRef = null;
+            lastRegistrationErrorClass = null;
             registeredHerdrAppKeyword = null;
             registeredConversationBound = false;
           }
@@ -3691,6 +3891,22 @@ function normalizeHerdrMentionAlias(value) {
         && response.browser_generation > 0
         ? response.browser_generation
         : null;
+      registeredBrowserAccountRef = typeof response?.browser_account_ref === "string"
+        && response.browser_account_ref
+        ? response.browser_account_ref
+        : null;
+      registeredBrowserSpaceRef = typeof response?.browser_space_ref === "string"
+        && response.browser_space_ref
+        ? response.browser_space_ref
+        : null;
+      // Typed observation-failure class from the background registry POST;
+      // a create that registered keeps no error.
+      lastRegistrationErrorClass = registeredBrowserSessionRef
+        ? null
+        : (typeof response?.browser_observation_error === "string"
+          && /^[a-z][a-z0-9_]{0,95}$/.test(response.browser_observation_error)
+          ? response.browser_observation_error
+          : "registration_failed");
       registeredHerdrAppKeyword = typeof response?.herdr_app_keyword === "string"
         && response.herdr_app_keyword.trim()
         ? response.herdr_app_keyword.trim().toLowerCase()
@@ -3750,6 +3966,9 @@ function normalizeHerdrMentionAlias(value) {
       // Browser Registry target while the new route is still registering.
       registeredBrowserSessionRef = null;
       registeredBrowserGeneration = null;
+      registeredBrowserAccountRef = null;
+      registeredBrowserSpaceRef = null;
+      lastRegistrationErrorClass = null;
       registeredHerdrAppKeyword = null;
       registeredConversationBound = false;
     }

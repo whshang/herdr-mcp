@@ -3959,15 +3959,39 @@ async function handleBrowserActuation(command) {
               response.evidence,
               "browser_create_content_reason_missing",
             )
-          : {
-              ...unavailableBrowserActuationEvidence(
-                expectedGeneration,
-                "browser_create_content_response_missing",
-              ),
-              command_accepted: true,
-              resource_available: true,
-            };
-        if (!hasEvidence || evidence?.resource_available === false || evidence?.rejected === true) {
+          : null;
+        // Auto-close only on EXPLICIT pre-send refusal reasons. A generic
+        // rejected/unavailable shape is not proof of not-sent on its own: some
+        // post-send failures reuse those flags. Anything not named here keeps
+        // the created owned tab for owner-side cleanup.
+        const PRE_SEND_CREATE_REASONS = new Set([
+          "browser_create_params_invalid",
+          "browser_create_anchor_unavailable",
+          "browser_create_tab_open_failed",
+          "browser_create_reservation_invalid",
+          "browser_create_reservation_storage_unavailable",
+          "browser_create_composer_unavailable",
+          "browser_create_composer_busy",
+          "browser_create_runtime_unavailable",
+          "browser_create_scope_mismatch",
+          "browser_create_params_invalid",
+          "browser_adapter_not_ready",
+          "browser_session_identity_mismatch",
+          "browser_actuation_context_unavailable",
+          "browser_dispatch_composer_busy",
+          "required-apps-unsupported",
+          "required-apps-menu-unavailable",
+          "required-app-not-found",
+          "required-app-ambiguous",
+          "required-app-selection-not-observed",
+        ]);
+        const preSendReason = typeof evidence?.result?.error === "string"
+          && PRE_SEND_CREATE_REASONS.has(evidence.result.error)
+          ? evidence.result.error
+          : null;
+        if (hasEvidence && preSendReason !== null && evidence?.rejected === true) {
+          // The content script PROVED this exact create never sent (a named
+          // pre-send refusal), so the empty launcher tab is closed.
           let tabClosed = false;
           let tabCleanupVerified = false;
           try {
@@ -3990,32 +4014,87 @@ async function handleBrowserActuation(command) {
               tab_cleanup_verified: tabCleanupVerified,
             },
           };
+        } else if (!hasEvidence) {
+          // The tab answered without evidence: the send state is UNKNOWN, so
+          // the created owned tab is preserved and reported as an unverified
+          // cleanup candidate instead of being closed blindly.
+          evidence = {
+            ...unavailableBrowserActuationEvidence(
+              expectedGeneration,
+              "browser_create_content_response_missing",
+            ),
+            command_accepted: true,
+            resource_available: true,
+            result: {
+              error: "browser_create_content_response_missing",
+              tab_opened: true,
+              tab_closed: false,
+              cleanup_unverified: true,
+            },
+          };
         }
-        await postBrowserActuationEvidence(actuationId, evidence);
-      }).catch(async () => {
-        let tabClosed = false;
-        let tabCleanupVerified = false;
-        try {
-          await chrome.tabs.remove(createdTab.id);
-          tabClosed = true;
-        } catch (_) {}
-        try {
-          await chrome.tabs.get(createdTab.id);
-        } catch (_) {
-          tabCleanupVerified = true;
+        // An evidence-upload failure after the content leg is a delivery-
+        // uncertain outcome, not proof of not-sent: never close the created
+        // tab here. One bounded retry keeps the runtime's actuation wait fed;
+        // if it still fails, the runtime times out the actuation out and the
+        // reservation reconciles by same-key replay without a second send.
+        let evidencePosted = false;
+        for (let attempt = 0; attempt < 2 && !evidencePosted; attempt += 1) {
+          try {
+            await postBrowserActuationEvidence(actuationId, evidence);
+            evidencePosted = true;
+          } catch (_) {
+            await new Promise((resolve) => setTimeout(resolve, 250));
+          }
         }
+      }).catch(async (error) => {
+        if (missingReceiverError(error)) {
+          // The command never reached a content listener: proven not-sent.
+          let tabClosed = false;
+          let tabCleanupVerified = false;
+          try {
+            await chrome.tabs.remove(createdTab.id);
+            tabClosed = true;
+          } catch (_) {}
+          try {
+            await chrome.tabs.get(createdTab.id);
+          } catch (_) {
+            tabCleanupVerified = true;
+          }
+          await postBrowserActuationEvidence(actuationId, {
+            ...unavailableBrowserActuationEvidence(
+              expectedGeneration,
+              "browser_create_content_dispatch_failed",
+            ),
+            command_accepted: true,
+            resource_available: true,
+            result: {
+              error: "browser_create_content_dispatch_failed",
+              tab_opened: true,
+              tab_closed: tabClosed,
+              tab_cleanup_verified: tabCleanupVerified,
+            },
+          }).catch(() => {});
+          return;
+        }
+        // Delivered but no response (timeout) or a non-receiver failure: the
+        // submit may already be in flight. Keep the created owned tab and
+        // report delivery-uncertain with an explicit unverified cleanup flag.
         await postBrowserActuationEvidence(actuationId, {
           ...unavailableBrowserActuationEvidence(
             expectedGeneration,
-            "browser_create_content_dispatch_failed",
+            "browser_create_content_timeout_uncertain",
           ),
           command_accepted: true,
           resource_available: true,
           result: {
-            error: "browser_create_content_dispatch_failed",
+            error: "browser_create_content_timeout_uncertain",
             tab_opened: true,
-            tab_closed: tabClosed,
-            tab_cleanup_verified: tabCleanupVerified,
+            tab_closed: false,
+            cleanup_unverified: true,
+            dispatch_delivery_reason: String(error?.message || "").includes("browser-actuation-content-timeout")
+              ? "content_response_timeout"
+              : "content_response_failed",
           },
         }).catch(() => {});
       });
@@ -10581,6 +10660,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
       }
       let browserObservation = null;
+      // Typed observation-failure class so a create can distinguish an
+      // accepted-but-registration-failed turn from a not-yet-accepted one.
+      // Fixed snake_case token only; never the raw error text.
+      let browserObservationError = null;
       if (browserPageInfo && sender.tab?.id && accountNativeIdentity) {
         const observationInput = {
           provider: browserPageInfo.site,
@@ -10608,12 +10691,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 reservationRef: null,
               });
             } catch (retryError) {
+              browserObservationError = /^[a-z][a-z0-9_]{1,95}$/.test(String(retryError?.message || ""))
+                ? String(retryError.message)
+                : "browser_observation_failed";
               callLog("browser observation failed:", retryError?.message || String(retryError));
             }
           } else {
+            browserObservationError = /^[a-z][a-z0-9_]{1,95}$/.test(String(code))
+              ? String(code)
+              : "browser_observation_failed";
             callLog("browser observation failed:", code);
           }
         }
+      } else if (browserPageInfo && sender.tab?.id) {
+        browserObservationError = "browser_observation_failed";
       }
       let matched = bindingsForPageInfo(bindings, pageInfo, msg.convKey);
       if (!matched.length && sender.tab?.id) {
@@ -10681,6 +10772,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           status: firstBinding.status || null,
           bindings: matched.map((b) => bindingView(bindings[b.storeKey] || b)),
           browser_session_ref: browserObservation?.sessionRef || null,
+          browser_observation_error: browserObservationError,
           herdr_app_keyword: normalizeAppKeyword(firstBinding.herdr_app_keyword),
           browser_pending_dispatch: browserObservation?.pendingDispatch || null,
           browser_generation: browserObservation?.observationGeneration || null,
@@ -10691,6 +10783,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({
           bound: false,
           browser_session_ref: browserObservation?.sessionRef || null,
+          browser_observation_error: browserObservationError,
           herdr_app_keyword: null,
           browser_pending_dispatch: browserObservation?.pendingDispatch || null,
           browser_generation: browserObservation?.observationGeneration || null,
