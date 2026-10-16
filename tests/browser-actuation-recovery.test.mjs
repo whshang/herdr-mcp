@@ -3176,7 +3176,11 @@ test("user keeps a second-account create fail-closed through the real registrati
     const ctx = { sends: 0, dispatches: 0, healthCalls: 0, identityReads: 0 };
     const sandbox = new Function("ctx", `
       const SCENARIO = ${JSON.stringify(scenario)};
-      const routes = { current: ${JSON.stringify(ROUTE)} };
+      const routes = {
+        current: SCENARIO.concreteChat === true
+          ? "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+          : ${JSON.stringify(ROUTE)},
+      };
       const location = {
         get origin() { return "https://chatgpt.com"; },
         get href() { return routes.current; },
@@ -3206,7 +3210,7 @@ test("user keeps a second-account create fail-closed through the real registrati
       const runtimeAlive = () => true;
       const chatGptProjectCatalog = async () => [];
       const currentChatGptProjectFromCatalog = () => null;
-      const chatGptConversationId = () => null;
+      const chatGptConversationId = () => (SCENARIO.concreteChat === true ? "conversation-id-proof" : null);
       const latestTurnForRole = () => null;
       const wait = async () => {};
       const findSendButton = () => ({ disabled: false });
@@ -3229,7 +3233,7 @@ test("user keeps a second-account create fail-closed through the real registrati
       const observeBrowserResultSettlement = async () => {};
       const acceptedDispatchAssignments = new Map();
       let browserResultProbeState = null;
-      const CONTEXT_PRESSURE = false;
+      const CONTEXT_PRESSURE = SCENARIO.concreteChat === true;
       const loadContextPressure = async () => null;
       const updateContextPressure = async () => null;
       const paintPageHud = () => {};
@@ -3316,11 +3320,120 @@ test("user keeps a second-account create fail-closed through the real registrati
   assert.equal(healthDrift.state.convKey, null, "a rejected strict registration must clear the identity cache");
   assert.equal(healthDrift.state.sessionRef, null, "a rejected strict registration must clear the cached session ref");
 
+  // A concrete /c/ route reaches its own post-response awaits
+  // (ensureConversationHealth and loadContextPressure) before the strict
+  // registration returns, so a replacement there must be caught the same way.
+  const concreteDrift = await create({ concreteChat: true, accountDriftAfterResponse: true });
+  assert.ok(concreteDrift.ctx.healthCalls >= 1, "the concrete-chat route must await its post-response health check");
+  assert.equal(concreteDrift.ctx.dispatches, 0, "an account replaced during the concrete-chat awaits must leave zero Enter submits");
+  assert.equal(concreteDrift.outcome.scope_identity_error, "identity_unavailable", "a failed strict registration must return null instead of a stale proof");
+  assert.equal(concreteDrift.state.convKey, null, "the aborted concrete-chat registration must not leave a usable identity cache");
+
   const accepted = await create();
   assert.equal(accepted.ctx.sends, 1, "the strict fence performs exactly one strict registration send");
   assert.equal(accepted.ctx.dispatches, 1, "a matching empty Project launcher must dispatch exactly once");
   assert.equal(accepted.outcome.ok, true, "the accepted create reports success");
   assert.equal(accepted.state.accountRef, ACCOUNT_REF, "the successful strict registration publishes the response's own account ref");
+});
+
+function strictRefreshHarness(initialConvKey = "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") {
+  return new Function(`
+    let currentConvKey = ${JSON.stringify(initialConvKey)};
+    let currentUrl = currentConvKey;
+    let registeredConvKey = null;
+    let registeredBrowserSessionRef = null;
+    let registeredBrowserGeneration = null;
+    let registeredBrowserAccountRef = null;
+    let registeredBrowserSpaceRef = null;
+    let registeredHerdrAppKeyword = null;
+    let registeredConversationBound = false;
+    let lastRegistrationErrorClass = null;
+    let browserRegistrationAttempt = 0;
+    const pending = [];
+    const ADAPTER = {
+      name: "chatgpt",
+      getConversationKey: () => currentConvKey,
+      resolveProjectIdentity: () => null,
+      getLatestUserAppKeywords: () => [],
+    };
+    const location = {
+      get href() { return currentUrl; },
+      get origin() { return "https://chatgpt.com"; },
+    };
+    const sessionStorage = { getItem: () => null, removeItem: () => {} };
+    const runtimeAlive = () => true;
+    const browserAccountNativeIdentity = async () => "opaque-native-account";
+    const chatGptProjectCatalog = async () => [];
+    const currentChatGptProjectFromCatalog = () => null;
+    const chatGptConversationId = () => null;
+    const latestTurnForRole = () => null;
+    const sendBg = async (payload) => new Promise((resolve) => pending.push({ payload, resolve }));
+    const ensureConversationHealth = async () => {};
+    const refreshQueuedInsertStatus = () => {};
+    const backfillCurrentChatGptContinuity = () => {};
+    const restoreBrowserResultAssignment = () => {};
+    const armBrowserPendingDispatchRefresh = () => {};
+    const clearBrowserPendingDispatchRefresh = () => {};
+    const observeBrowserResultSettlement = async () => {};
+    const acceptedDispatchAssignments = new Map();
+    let browserResultProbeState = null;
+    const CONTEXT_PRESSURE = false;
+    const loadContextPressure = async () => null;
+    const updateContextPressure = async () => null;
+    const paintPageHud = () => {};
+    const usesOperationalHud = () => false;
+    const refreshPageHud = () => {};
+    const removeQueuedInsertButton = () => {};
+    let conversationHealth = null;
+    let contextPressureRecord = null;
+    let queuedInsertCount = 0;
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    ${registrationSource}
+    return {
+      pending,
+      register: (reason) => registerCurrentConversation(reason),
+      registerStrict: (reason) => registerCurrentConversation(reason, {
+        refreshObservation: true,
+        requireFreshIdentityProof: true,
+      }),
+      receiptFor: (response) => (response ? registrationReceipts.get(response) || null : null),
+      reply: (sessionRef) => ({
+        bound: false,
+        browser_session_ref: sessionRef,
+        browser_account_ref: "br_" + "b".repeat(64),
+        browser_space_ref: "br_" + "d".repeat(64),
+        browser_generation: 17,
+        herdr_app_keyword: null,
+        browser_pending_dispatch: null,
+      }),
+      attempts: () => browserRegistrationAttempt,
+    };
+  `)();
+}
+
+test("user never reuses an in-flight registration as create identity proof | Given an ordinary same-route registration is still in flight | When a strict refreshObservation create refresh is requested | Then it queues its own strict attempt and only that new response carries the proof", async () => {
+  const harness = strictRefreshHarness();
+  const ordinary = harness.register("ordinary");
+  await flushRegistrationToSend(harness);
+  assert.equal(harness.pending.length, 1, "the ordinary registration owns the first send");
+
+  const strict = harness.registerStrict("browser-session-create");
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  assert.equal(harness.pending.length, 1, "the strict refresh must not cancel or duplicate the in-flight send, and must not wait on itself");
+
+  harness.pending[0].resolve(harness.reply("br_ordinary"));
+  const ordinaryResult = await ordinary;
+  for (let i = 0; i < 50 && harness.pending.length < 2; i += 1) await Promise.resolve();
+  assert.equal(harness.pending.length, 2, "the strict refresh starts its own attempt after the in-flight one settles");
+
+  harness.pending[1].resolve(harness.reply("br_strict"));
+  const strictResult = await strict;
+  assert.notStrictEqual(strictResult, ordinaryResult, "the older in-flight response must not satisfy the strict proof");
+  assert.equal(harness.receiptFor(ordinaryResult), null, "an ordinary registration must never carry a strict receipt");
+  const receipt = harness.receiptFor(strictResult);
+  assert.equal(receipt?.strict, true, "the strict refresh must carry its own receipt");
+  assert.equal(receipt.attempt, harness.attempts(), "the receipt must belong to the newest registration attempt");
+  assert.equal(harness.pending[0].payload.accountNativeIdentity, harness.pending[1].payload.accountNativeIdentity, "both attempts compare the same live native identity locally");
 });
 
 test("user keeps an uncertain created tab and never resends | Given the create content leg answered with accepted evidence carrying typed registration diagnostics or the evidence upload failed | When the background completes the actuation | Then the owned tab stays open with typed evidence and no second send happens", async () => {
