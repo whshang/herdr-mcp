@@ -254,7 +254,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
     let exec = ExecRegistry::new_with_client(exec_state_dir, Some(client.clone()))?;
     let prompt = PromptRegistry::with_runtime(state_store.clone(), cache.clone(), client.clone());
     if let Ok(store) = state_store.lock() {
-        crate::work_compactor::start_background(&store);
+        crate::work_compactor::start_background(&store, cache.clone());
     }
     let skill = SkillService::new();
     crate::schema::prewarm_async();
