@@ -319,6 +319,11 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             true,
         ));
     }
+    let _work_capture = ToolCallCapture {
+        name,
+        arguments: &arguments,
+        context,
+    };
 
     let output = match name {
         "herdr_methods" => {
@@ -590,6 +595,26 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         model_visible_tool_output(name, &arguments, output),
         false,
     ))
+}
+
+struct ToolCallCapture<'a, 'context> {
+    name: &'a str,
+    arguments: &'a Value,
+    context: &'a RuntimeContext<'context>,
+}
+
+impl Drop for ToolCallCapture<'_, '_> {
+    fn drop(&mut self) {
+        let snapshot = self.context.cache.snapshot();
+        let Some(event) =
+            crate::work_capture::event_for_tool_call(self.name, self.arguments, &snapshot)
+        else {
+            return;
+        };
+        if let Ok(store) = self.context.state_store.try_lock() {
+            let _ = store.append_work_event(&event);
+        }
+    }
 }
 
 /// ChatGPT's composer rewrites a pasted chatgpt.com conversation URL into a

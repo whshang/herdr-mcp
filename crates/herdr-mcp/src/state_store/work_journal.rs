@@ -4,7 +4,8 @@
 //! browser archive/dispatch tables: it only adds tables, so a pinned
 //! schema-15 binary (PROD rollback target) can still open the same DB.
 
-// Consumers (capture, tailers, compactor) land in follow-up lanes.
+// The tool-call capture consumer lives in `crate::work_capture`; tailers and
+// the compactor land in follow-up lanes, so unused items stay allow-listed.
 #![allow(dead_code)]
 
 use super::StateStore;

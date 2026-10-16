@@ -9468,7 +9468,9 @@ mod tests {
                 "browser_resource_locators",
                 "browser_session_archive_intents",
                 "browser_session_reservations",
-                "browser_source_turns"
+                "browser_source_turns",
+                "work_events",
+                "work_state"
             ]
         );
         assert!(!tables_after.contains(&"browser_delivery_events".to_owned()));
