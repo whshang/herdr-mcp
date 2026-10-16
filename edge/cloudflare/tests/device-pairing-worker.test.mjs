@@ -2294,3 +2294,203 @@ test("user Given a migrate request where from equals to When it passes the publi
   );
   assert.equal(h.oauthStorage.map.get("grant:c1").page_assist.find((r) => r.endpoint_ref === "epA").connector_id, MIG_OLD, "grant rows untouched");
 });
+
+async function approveConnector(env, clientName) {
+  const registration = await worker.fetch(new Request("https://edge.example/oauth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      redirect_uris: ["https://client.example/callback"],
+      token_endpoint_auth_method: "none",
+      client_name: clientName,
+    }),
+  }), env);
+  assert.equal(registration.status, 201);
+  const client = await registration.json();
+  const authorize = new URL("https://edge.example/oauth/authorize");
+  authorize.searchParams.set("client_id", client.client_id);
+  authorize.searchParams.set("redirect_uri", "https://client.example/callback");
+  authorize.searchParams.set("response_type", "code");
+  authorize.searchParams.set("code_challenge", "A".repeat(43));
+  authorize.searchParams.set("code_challenge_method", "S256");
+  authorize.searchParams.set("state", `state-${clientName}`);
+  const pendingResponse = await worker.fetch(new Request(authorize), env);
+  assert.equal(pendingResponse.status, 200);
+  const html = await pendingResponse.text();
+  const requestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  const approvalCode = /<div class="approval-code">(\d{6})<\/div>/.exec(html)?.[1];
+  assert.ok(requestId && approvalCode);
+  const approved = await worker.fetch(post("/connectors/approve", {
+    request_id: requestId,
+    code: approvalCode,
+  }, "owner-secret"), env);
+  assert.equal(approved.status, 200);
+  const inventory = await worker.fetch(new Request("https://edge.example/connectors", {
+    headers: { authorization: "Bearer owner-secret" },
+  }), env);
+  assert.equal(inventory.status, 200);
+  const body = await inventory.json();
+  const connector = body.connectors.find((row) => row.client_id === client.client_id);
+  assert.ok(connector);
+  return connector;
+}
+
+function ownerWebChatGrant(env, body) {
+  return worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control",
+    body,
+    "prod-real-runtime",
+    "legacy-secret",
+  ), env);
+}
+
+test("user owner labels a connector | Given an approved connector whose client_name is not an account | When the owner sets and clears platform_account | Then the label is display metadata and grant_generation stays unchanged", async () => {
+  const h = makeEnv();
+  const oauth = new OAuthStoreDO({ storage: new FakeStorage() }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+
+  const cursorNamed = await approveConnector(h.env, "Cursor");
+  assert.equal(cursorNamed.platform_account, null);
+  assert.equal(cursorNamed.client_name, "Cursor");
+  const before = cursorNamed.grant_generation;
+
+  const derived = await approveConnector(h.env, "grokbot-whshang@gmail.com");
+  assert.equal(derived.platform_account, "grokbot-whshang@gmail.com");
+  assert.equal(derived.client_name, "grokbot-whshang@gmail.com");
+
+  const labeled = await worker.fetch(post("/connectors/label", {
+    connector_id: cursorNamed.connector_id,
+    platform_account: "chatgpt-whshang1@gmail.com",
+  }, "owner-secret"), h.env);
+  assert.equal(labeled.status, 200);
+  const labeledBody = await labeled.json();
+  assert.equal(labeledBody.platform_account, "chatgpt-whshang1@gmail.com");
+  assert.equal(labeledBody.grant_generation, before);
+
+  const rejected = await worker.fetch(post("/connectors/label", {
+    connector_id: cursorNamed.connector_id,
+    platform_account: "Cursor",
+  }, "owner-secret"), h.env);
+  assert.equal(rejected.status, 400);
+  assert.equal((await rejected.json()).code, "invalid_platform_account");
+
+  const cleared = await worker.fetch(post("/connectors/label", {
+    connector_id: cursorNamed.connector_id,
+    platform_account: null,
+  }, "owner-secret"), h.env);
+  assert.equal(cleared.status, 200);
+  const clearedBody = await cleared.json();
+  assert.equal(clearedBody.platform_account, null);
+  assert.equal(clearedBody.grant_generation, before);
+});
+
+test("user owner grants WebChat control across the fleet | Given an owner device, another device in the same fleet, a non-owner device, and an unenrolled device | When device-wide allow and deny are requested | Then same-fleet and self grants succeed and cross-owner or non-owner requests are denied", async () => {
+  const h = makeEnv();
+  const oauth = new OAuthStoreDO({ storage: new FakeStorage() }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+  const connector = await approveConnector(h.env, "Cursor");
+  const ensured = await h.registry.fetch(new Request("https://registry.internal/internal/devices/legacy/ensure", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workstation_id: "prod-real-runtime", name: "owner" }),
+  }));
+  assert.equal(ensured.status, 200);
+  const ownerDeviceId = (await ensured.json()).device.device_id;
+  const other = await pair(h.env, "same-fleet-other");
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (line) => logs.push(line);
+  try {
+    const sameFleet = await ownerWebChatGrant(h.env, {
+      connector_id: connector.connector_id,
+      device_id: other.device_id,
+      scope: "device",
+      allowed: true,
+    });
+    assert.equal(sameFleet.status, 200);
+    const sameFleetBody = await sameFleet.json();
+    assert.equal(sameFleetBody.scope, "device");
+    assert.equal(sameFleetBody.requester_device_id, ownerDeviceId);
+    assert.equal(sameFleetBody.device_id, other.device_id);
+    assert.deepEqual(sameFleetBody.grants, [{
+      connector_id: connector.connector_id,
+      grant_generation: connector.grant_generation,
+      device_id: other.device_id,
+      endpoint_ref: "*",
+      provider: "*",
+      account_ref: "*",
+    }]);
+
+    const selfGrant = await ownerWebChatGrant(h.env, {
+      connector_id: connector.connector_id,
+      device_id: ownerDeviceId,
+      scope: "device",
+      allowed: true,
+    });
+    assert.equal(selfGrant.status, 200);
+    const selfBody = await selfGrant.json();
+    assert.equal(selfBody.device_id, ownerDeviceId);
+    assert.ok(selfBody.grants.some((grant) => grant.device_id === ownerDeviceId && grant.endpoint_ref === "*"));
+
+    const otherOwner = await ownerWebChatGrant(h.env, {
+      connector_id: connector.connector_id,
+      device_id: "dev_01M1TEST000000000000000000",
+      scope: "device",
+      allowed: true,
+    });
+    assert.equal(otherOwner.status, 403);
+    assert.equal((await otherOwner.json()).code, "connector_owner_device_mismatch");
+
+    const nonOwner = await worker.fetch(postAsWorkstation(
+      "/connectors/webchat-control",
+      {
+        connector_id: connector.connector_id,
+        device_id: other.device_id,
+        scope: "device",
+        allowed: true,
+      },
+      other.workstation_id,
+      other.device_secret,
+    ), h.env);
+    assert.equal(nonOwner.status, 401);
+    assert.equal((await nonOwner.json()).code, "connector_owner_device_required");
+
+    const mixed = await ownerWebChatGrant(h.env, {
+      connector_id: connector.connector_id,
+      device_id: other.device_id,
+      scope: "device",
+      endpoint_ref: "*",
+      allowed: true,
+    });
+    assert.equal(mixed.status, 400);
+    assert.equal((await mixed.json()).code, "invalid_webchat_control_grant");
+
+    const denied = await ownerWebChatGrant(h.env, {
+      connector_id: connector.connector_id,
+      device_id: other.device_id,
+      scope: "device",
+      allowed: false,
+    });
+    assert.equal(denied.status, 200);
+    const deniedBody = await denied.json();
+    assert.equal(deniedBody.allowed, false);
+    assert.equal(deniedBody.grants.some((grant) => grant.device_id === other.device_id && grant.endpoint_ref === "*"), false);
+  } finally {
+    console.log = originalLog;
+  }
+  const events = logs.flatMap((line) => {
+    try { return [JSON.parse(line)]; } catch { return []; }
+  });
+  const granted = events.find((entry) => entry.event === "connector.webchat_control_grant"
+    && entry.fields?.targetDeviceId === other.device_id
+    && entry.fields?.allowed === true);
+  assert.equal(granted.fields.requesterDeviceId, ownerDeviceId);
+  assert.equal(granted.fields.connectorId, connector.connector_id);
+  const mismatch = events.find((entry) => entry.event === "connector.webchat_control_denied"
+    && entry.fields?.code === "connector_owner_device_mismatch");
+  assert.equal(mismatch.fields.requesterDeviceId, ownerDeviceId);
+  assert.equal(mismatch.fields.targetDeviceId, "dev_01M1TEST000000000000000000");
+  assert.equal(mismatch.fields.connectorId, connector.connector_id);
+});

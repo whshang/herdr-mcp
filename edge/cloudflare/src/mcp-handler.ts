@@ -186,6 +186,8 @@ export interface McpClientContext {
   userAgent?: string | null;
   oauthClientId?: string | null;
   connectorId?: string | null;
+  /** Display identity only. Never used as a grant principal. */
+  platformAccount?: string | null;
   grantGeneration?: number | null;
   authSource?: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge" | null;
   webchatControlGrants?: readonly WebChatControlGrant[];
@@ -577,12 +579,47 @@ function recordOpenAiClientLifecycle(
     method,
     client_kind: "openai-mcp",
     connector_bound: Boolean(deps.client?.connectorId),
+    connectorId: deps.client?.connectorId ?? null,
+    platformAccount: deps.client?.platformAccount ?? null,
     grant_generation: deps.client?.grantGeneration ?? null,
     auth_source: deps.client?.authSource ?? null,
     contract_epoch: publicContract.contract_epoch,
     contract_hash: publicContract.contract_hash,
     tool_count: publicContract.tool_count,
   });
+}
+
+function stampConnectorDenial(record: Record<string, unknown>, client?: McpClientContext): Record<string, unknown> {
+  if (record.code !== "caller_grant_missing" || !client?.platformAccount) return record;
+  return {
+    ...record,
+    connector_id: client.connectorId ?? null,
+    platform_account: client.platformAccount,
+  };
+}
+
+/** Attach the readable platform account beside connector id on grant denials. */
+function annotateConnectorDenial(result: Record<string, unknown>, client?: McpClientContext): Record<string, unknown> {
+  if (!client?.platformAccount) return result;
+  const next: Record<string, unknown> = { ...result };
+  if (isRecord(next.structuredContent)) {
+    next.structuredContent = stampConnectorDenial(next.structuredContent, client);
+  }
+  if (Array.isArray(next.content)) {
+    next.content = next.content.map((item) => {
+      if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") return item;
+      try {
+        const parsed = JSON.parse(item.text) as unknown;
+        if (!isRecord(parsed)) return item;
+        const stampedText = stampConnectorDenial(parsed, client);
+        if (stampedText === parsed) return item;
+        return { ...item, text: JSON.stringify(stampedText) };
+      } catch {
+        return item;
+      }
+    });
+  }
+  return next;
 }
 
 function discoverSupportedVersions(client?: McpClientContext): string[] {
@@ -1393,6 +1430,7 @@ export async function handleMcp(
           principal_ref: `connector:${deps.client.connectorId}`,
           connector_id: deps.client.connectorId,
           grant_generation: Number(deps.client.grantGeneration),
+          ...(deps.client.platformAccount ? { platform_account: deps.client.platformAccount } : {}),
         }
       : null;
     const browserCallerSession = (isBrowserPrivateMethod || isAgentTaskCaller) && openaiSession
@@ -1477,6 +1515,8 @@ export async function handleMcp(
       opClass,
       clientKind: isOpenAiDiscoverClient(deps.client) ? "openai-mcp" : "other",
       connectorBound: Boolean(deps.client?.connectorId),
+      connectorId: deps.client?.connectorId ?? null,
+      platformAccount: deps.client?.platformAccount ?? null,
       grantGeneration: deps.client?.grantGeneration ?? null,
       authSource: deps.client?.authSource ?? null,
       contractEpoch: publicContract.contract_epoch,
@@ -1635,13 +1675,13 @@ export async function handleMcp(
         route.device_id,
         route.device_name ?? forwarded.route_device_name,
       );
-      return rpcResult(id, normalizeSuccessfulToolResult(wrapped, name, args));
+      return rpcResult(id, annotateConnectorDenial(normalizeSuccessfulToolResult(wrapped, name, args), deps.client));
     }
     if (forwarded.status === "ok" && forwarded.completion?.status === "error") {
-      return rpcResult(id, relayErrorToolResult(forwarded.completion.error, activeRequestId, route.workstation_id));
+      return rpcResult(id, annotateConnectorDenial(relayErrorToolResult(forwarded.completion.error, activeRequestId, route.workstation_id), deps.client));
     }
     if (forwarded.status === "error" && forwarded.error) {
-      return rpcResult(id, relayErrorToolResult(forwarded.error, activeRequestId, route.workstation_id));
+      return rpcResult(id, annotateConnectorDenial(relayErrorToolResult(forwarded.error, activeRequestId, route.workstation_id), deps.client));
     }
     return rpcResult(
       id,

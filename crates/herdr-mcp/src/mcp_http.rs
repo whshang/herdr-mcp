@@ -2941,7 +2941,19 @@ fn trusted_edge_webchat_authorization(
     }
     let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
     let object = value.as_object().ok_or(())?;
-    if object.len() != 3
+    let platform_account = match object.get("platform_account") {
+        Some(label) => {
+            let label = label.as_str().ok_or(())?;
+            let normalized = crate::mcp::normalize_platform_account(label).ok_or(())?;
+            if normalized != label {
+                return Err(());
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
+    let expected_len = if platform_account.is_some() { 4 } else { 3 };
+    if object.len() != expected_len
         || !object.contains_key("principal_ref")
         || !object.contains_key("connector_id")
         || !object.contains_key("grant_generation")
@@ -2976,6 +2988,7 @@ fn trusted_edge_webchat_authorization(
         principal_ref: principal_ref.to_owned(),
         connector_id: connector_id.to_owned(),
         grant_generation,
+        platform_account,
     }))
 }
 

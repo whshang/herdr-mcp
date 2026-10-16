@@ -209,3 +209,27 @@ A real ChatGPT integration should satisfy:
 - a safe command can execute;
 - permissions behave as expected;
 - browser continuity works for long-running tasks when installed.
+
+## Platform accounts
+
+`connector_id` remains the grant principal, together with `grant_generation`. `platform_account` is display metadata in `<platform>-<email>` form, for example `grokbot-whshang@gmail.com`. An OAuth `client_name` such as `Cursor` is not an account. The owner sets or clears the label by `connector_id`:
+
+```bash
+herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> --clear
+```
+
+`connector list` shows `platform_account` beside `client_name`. WebChat control and Page Assist grant commands accept one unambiguous active `platform_account` in place of `connector_id`. Zero matches and more than one match fail closed.
+
+A shared label is not a shared grant. One label matching several active connectors is an error. A future group would need its own principal and generation and an explicit owner binding. It must not be inferred from `client_name`.
+
+## Device-wide WebChat control
+
+An authenticated owner device may `allow-device` or `deny-device` for any non-revoked device in the same fleet. The requester must still be an owner device. A non-owner requester is rejected with `connector_owner_device_required`. A target that is missing or revoked in this fleet is `connector_owner_device_mismatch`. If the device registry cannot be read, the result is `connector_target_device_unresolved` and the grant is not written. `--confirm` is required. The audit event records `requesterDeviceId`, `targetDeviceId`, and `connectorId`.
+
+```bash
+herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
+herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm
+```
+
+Device-wide scope stores endpoint `*`, provider `*`, and account `*`. It covers WebChat endpoints on that device only. Per-endpoint allow and deny are unchanged. Page Assist grants are unchanged. A grant stays bound to `{connector_id, grant_generation, device_id, endpoint_ref}`.

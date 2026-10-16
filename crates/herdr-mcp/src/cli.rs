@@ -201,6 +201,11 @@ pub enum WorkerCommand {
     ConnectorClientRevoke {
         client_id: String,
     },
+    ConnectorLabel {
+        connector_id: String,
+        /// None clears the label.
+        platform_account: Option<String>,
+    },
     ConnectorWebChatControl {
         connector_id: String,
         device_id: String,
@@ -208,6 +213,7 @@ pub enum WorkerCommand {
         provider: String,
         account_ref: String,
         allowed: bool,
+        device_wide: bool,
     },
     ConnectorPlannerControl {
         action: String,
@@ -1395,6 +1401,7 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 client_id: client_id.to_owned(),
             }))
         }
+        Some("label") => parse_connector_label(&args[1..]),
         Some("planner-control") => {
             let usage = "connector planner-control requires list or <approve|revoke> <request-id> --confirm";
             let (action, request_id) = match &args[1..] {
@@ -1410,70 +1417,7 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             };
             Ok(Command::Worker(WorkerCommand::ConnectorPlannerControl { action, request_id }))
         }
-        Some("webchat-control") => {
-            // account-ref is optional: grants are provider-scoped (endpoint +
-            // provider). A supplied account-ref is still accepted for
-            // backward compatibility and stored, but does not narrow the match.
-            let provider_scope = crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT.to_owned();
-            let (action, connector_id, device_id, endpoint_ref, provider, account_ref, confirm) =
-                match &args[1..] {
-                    [action, connector_id, device_id, endpoint_ref, provider, account_ref, confirm] => {
-                        (action, connector_id, device_id, endpoint_ref, provider, account_ref, confirm)
-                    }
-                    [action, connector_id, device_id, endpoint_ref, provider, confirm] => {
-                        (action, connector_id, device_id, endpoint_ref, provider, &provider_scope, confirm)
-                    }
-                    _ => {
-                        return Err("connector webchat-control requires: <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm".to_owned());
-                    }
-                };
-            let allowed = match action.as_str() {
-                "allow" => true,
-                "deny" => false,
-                _ => {
-                    return Err("connector webchat-control action must be allow or deny".to_owned());
-                }
-            };
-            if !connector_id.starts_with("conn_")
-                || connector_id.len() < 13
-                || connector_id.len() > 133
-                || !connector_id
-                    .chars()
-                    .skip(5)
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-            {
-                return Err("connector webchat-control requires a valid connector id".to_owned());
-            }
-            if device_id.starts_with('-') || device_id.trim().is_empty() || device_id.len() > 64 {
-                return Err("connector webchat-control requires a valid device id".to_owned());
-            }
-            if endpoint_ref.starts_with('-')
-                || endpoint_ref.trim().is_empty()
-                || endpoint_ref.len() > 96
-            {
-                return Err("connector webchat-control requires a valid endpoint ref".to_owned());
-            }
-            if provider.starts_with('-') || provider.trim().is_empty() || provider.len() > 32 {
-                return Err("connector webchat-control requires a valid provider".to_owned());
-            }
-            if account_ref.starts_with('-')
-                || account_ref.trim().is_empty()
-                || account_ref.len() > 96
-            {
-                return Err("connector webchat-control requires a valid account ref".to_owned());
-            }
-            if confirm != "--confirm" {
-                return Err("connector webchat-control requires --confirm".to_owned());
-            }
-            Ok(Command::Worker(WorkerCommand::ConnectorWebChatControl {
-                connector_id: connector_id.clone(),
-                device_id: device_id.clone(),
-                endpoint_ref: endpoint_ref.clone(),
-                provider: provider.clone(),
-                account_ref: account_ref.clone(),
-                allowed,
-            }))
-        }
+        Some("webchat-control") => parse_connector_webchat_control(&args[1..]),
         Some("page-assist") => {
             if let Some(parsed) = crate::grant_migration::parse_cli(&args[1..]) {
                 // #626/#630: orphans list and migrate dry run are read-only Edge
@@ -1513,16 +1457,10 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 "deny" => false,
                 _ => return Err("connector page-assist action must be allow or deny".to_owned()),
             };
-            if !connector_id.starts_with("conn_")
-                || connector_id.len() < 13
-                || connector_id.len() > 133
-                || !connector_id
-                    .chars()
-                    .skip(5)
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-            {
-                return Err("connector page-assist requires a valid connector id".to_owned());
-            }
+            let connector_id = normalize_connector_selector(connector_id).map_err(|_| {
+                "connector page-assist requires a connector id or an unambiguous platform-account label"
+                    .to_owned()
+            })?;
             if device_id.starts_with('-') || device_id.trim().is_empty() || device_id.len() > 64 {
                 return Err("connector page-assist requires a valid device id".to_owned());
             }
@@ -1533,17 +1471,17 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 return Err("connector page-assist requires --confirm".to_owned());
             }
             Ok(Command::Worker(WorkerCommand::ConnectorPageAssist {
-                connector_id: connector_id.clone(),
+                connector_id,
                 device_id: device_id.clone(),
                 endpoint_ref: endpoint_ref.clone(),
                 allowed,
             }))
         }
         Some(value) => Err(format!(
-            "unknown connector command '{value}' (expected list, approve, cancel, revoke, revoke-client, webchat-control, planner-control, or page-assist)"
+            "unknown connector command '{value}' (expected list, approve, cancel, revoke, revoke-client, label, webchat-control, planner-control, or page-assist)"
         )),
         None => {
-            Err("connector requires list, approve, cancel, revoke, revoke-client, webchat-control, planner-control, or page-assist".to_owned())
+            Err("connector requires list, approve, cancel, revoke, revoke-client, label, webchat-control, planner-control, or page-assist".to_owned())
         }
     }
 }
@@ -1641,6 +1579,147 @@ fn parse_automation_create(args: &[String]) -> Result<Command, String> {
         name,
         device,
     }))
+}
+
+fn parse_connector_label(args: &[String]) -> Result<Command, String> {
+    let usage =
+        "connector label requires: <connector-id> <platform-account> | <connector-id> --clear";
+    match args {
+        [connector_id, flag] if flag == "--clear" => {
+            validate_connector_id(connector_id)?;
+            Ok(Command::Worker(WorkerCommand::ConnectorLabel {
+                connector_id: connector_id.clone(),
+                platform_account: None,
+            }))
+        }
+        [connector_id, platform_account] => {
+            validate_connector_id(connector_id)?;
+            let Some(platform_account) = crate::mcp::normalize_platform_account(platform_account)
+            else {
+                return Err(
+                    "connector label requires <platform>-<account-email>, for example grokbot-owner@example.com"
+                        .to_owned(),
+                );
+            };
+            Ok(Command::Worker(WorkerCommand::ConnectorLabel {
+                connector_id: connector_id.clone(),
+                platform_account: Some(platform_account),
+            }))
+        }
+        _ => Err(usage.to_owned()),
+    }
+}
+
+fn parse_connector_webchat_control(args: &[String]) -> Result<Command, String> {
+    let usage = "connector webchat-control requires: <allow|deny> <connector-id-or-platform-account> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm, or <allow-device|deny-device> <connector-id-or-platform-account> <device-id> --confirm";
+    if let [action, selector, device_id, confirm] = args
+        && matches!(action.as_str(), "allow-device" | "deny-device")
+    {
+        let connector_id = normalize_connector_selector(selector)?;
+        validate_webchat_device_id(device_id)?;
+        if confirm != "--confirm" {
+            return Err("connector webchat-control requires --confirm".to_owned());
+        }
+        return Ok(Command::Worker(WorkerCommand::ConnectorWebChatControl {
+            connector_id,
+            device_id: device_id.clone(),
+            endpoint_ref: "*".to_owned(),
+            provider: "*".to_owned(),
+            account_ref: "*".to_owned(),
+            allowed: action == "allow-device",
+            device_wide: true,
+        }));
+    }
+    // account-ref is optional: grants are provider-scoped (endpoint +
+    // provider). A supplied account-ref is still accepted for backward
+    // compatibility and stored, but does not narrow the match.
+    let provider_scope = crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT.to_owned();
+    let (action, selector, device_id, endpoint_ref, provider, account_ref, confirm) = match args {
+        [
+            action,
+            selector,
+            device_id,
+            endpoint_ref,
+            provider,
+            account_ref,
+            confirm,
+        ] => (
+            action,
+            selector,
+            device_id,
+            endpoint_ref.as_str(),
+            provider.as_str(),
+            account_ref.as_str(),
+            confirm,
+        ),
+        [action, selector, device_id, endpoint_ref, provider, confirm] => (
+            action,
+            selector,
+            device_id,
+            endpoint_ref.as_str(),
+            provider.as_str(),
+            provider_scope.as_str(),
+            confirm,
+        ),
+        _ => return Err(usage.to_owned()),
+    };
+    let allowed = match action.as_str() {
+        "allow" => true,
+        "deny" => false,
+        _ => {
+            return Err("connector webchat-control action must be allow or deny".to_owned());
+        }
+    };
+    let connector_id = normalize_connector_selector(selector)?;
+    validate_webchat_device_id(device_id)?;
+    if endpoint_ref.starts_with('-') || endpoint_ref.trim().is_empty() || endpoint_ref.len() > 96 {
+        return Err("connector webchat-control requires a valid endpoint ref".to_owned());
+    }
+    if provider.starts_with('-') || provider.trim().is_empty() || provider.len() > 32 {
+        return Err("connector webchat-control requires a valid provider".to_owned());
+    }
+    if account_ref.starts_with('-') || account_ref.trim().is_empty() || account_ref.len() > 96 {
+        return Err("connector webchat-control requires a valid account ref".to_owned());
+    }
+    if confirm != "--confirm" {
+        return Err("connector webchat-control requires --confirm".to_owned());
+    }
+    Ok(Command::Worker(WorkerCommand::ConnectorWebChatControl {
+        connector_id,
+        device_id: device_id.clone(),
+        endpoint_ref: endpoint_ref.to_owned(),
+        provider: provider.to_owned(),
+        account_ref: account_ref.to_owned(),
+        allowed,
+        device_wide: false,
+    }))
+}
+
+fn explicit_connector_selector(connector_id: &str) -> bool {
+    connector_id.starts_with("conn_")
+        && (13..=133).contains(&connector_id.len())
+        && connector_id
+            .chars()
+            .skip(5)
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+fn normalize_connector_selector(value: &str) -> Result<String, String> {
+    if explicit_connector_selector(value) {
+        return Ok(value.to_owned());
+    }
+    if let Some(label) = crate::mcp::normalize_platform_account(value) {
+        return Ok(label);
+    }
+    Err("connector selector must be a conn_ id or a platform-account label".to_owned())
+}
+
+fn validate_webchat_device_id(device_id: &str) -> Result<(), String> {
+    if device_id.starts_with('-') || device_id.trim().is_empty() || device_id.len() > 64 {
+        Err("connector webchat-control requires a valid device id".to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 fn valid_connector_approval_request_id(request_id: &str) -> bool {
@@ -2414,7 +2493,9 @@ User path:\n\
   herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
   herdr-mcp connector revoke-client <client-id> --confirm  (legacy client/grant kill switch)\n\
   herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm  (enrolled owner device)\n\
+  herdr-mcp connector label <connector-id> <platform-account> | <connector-id> --clear\n\
   herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm  (macOS/Linux enrolled owner device)\n\
+  herdr-mcp connector webchat-control <allow-device|deny-device> <connector-id-or-platform-account> <device-id> --confirm  (owner device; any non-revoked device in the same fleet)\n\
   herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp connector page-assist orphans [list] [--device-id <device-id>]  (read-only: grant rows left under a previous connector; always scoped server-side to the authenticated owner device; --device-id is only an assertion and must match it, else 403 orphans_device_mismatch)\n\
   herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id> [--idempotency-key <key>] [--confirm]  (dry run without --confirm; with --confirm fetches the device-scoped plan, prints it plus the idempotency key, and applies it by plan_digest)\n\
@@ -2546,7 +2627,10 @@ commands require an enrolled-device credential.\n\n\
 pub fn connector_help() -> &'static str {
     "Herdr MCP connector management (OAuth connectors registered against the fleet)\n\n\
 All of these require the credential of a device already enrolled in the fleet;\nthere is no WebChat delegated admin path. Secrets are never echoed or written\nto argv.\n\n\
-  herdr-mcp connector list [--all]\n      Lists current/actionable Connector state by default. --all also includes\n      revoked Connector instances and legacy client/grant tombstones retained\n      for audit and credential fencing.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector cancel <approval-request-id>\n      Cancels a pending or approved-but-never-used request so the OAuth flow can be restarted.\n      Refuses cancellation after credentials have been issued.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes only that Connector instance and its attributed credentials.\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Client-level kill switch: revokes every Connector/grant for that OAuth client\n      and invalidates its issued access/refresh credentials.\n"
+  herdr-mcp connector list [--all]\n      Lists current/actionable Connector state by default. --all also includes\n      revoked Connector instances and legacy client/grant tombstones retained\n      for audit and credential fencing.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector cancel <approval-request-id>\n      Cancels a pending or approved-but-never-used request so the OAuth flow can be restarted.\n      Refuses cancellation after credentials have been issued.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes only that Connector instance and its attributed credentials.\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Client-level kill switch: revokes every Connector/grant for that OAuth client\n      and invalidates its issued access/refresh credentials.\n\n\
+  herdr-mcp connector label <connector-id> <platform-account>\n      Sets the display label `<platform>-<email>`. It does not change grants.\n      `--clear` removes the label. `connector_id` stays the grant principal.\n\n\
+  herdr-mcp connector webchat-control <allow|deny> ... --confirm\n      Provider-scoped grant for one endpoint. A platform-account label may\n      replace the connector id when it matches exactly one active connector.\n\n\
+  herdr-mcp connector webchat-control <allow-device|deny-device> <selector> <device-id> --confirm\n      Device-wide grant. The requester must be an owner device. The target\n      must be a non-revoked device in the same fleet.\n"
 }
 
 pub fn automation_help() -> &'static str {
@@ -4044,7 +4128,76 @@ mod tests {
                 account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                     .to_owned(),
                 allowed: true,
+                device_wide: false,
             })
+        );
+        assert_eq!(
+            parse(args(&[
+                "connector",
+                "webchat-control",
+                "allow-device",
+                "grokbot-whshang@gmail.com",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "--confirm"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::ConnectorWebChatControl {
+                connector_id: "grokbot-whshang@gmail.com".to_owned(),
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                endpoint_ref: "*".to_owned(),
+                provider: "*".to_owned(),
+                account_ref: "*".to_owned(),
+                allowed: true,
+                device_wide: true,
+            })
+        );
+        assert!(
+            parse(args(&[
+                "connector",
+                "webchat-control",
+                "deny-device",
+                "conn_webchat_test_1",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ]))
+            .is_err()
+        );
+        assert_eq!(
+            parse(args(&[
+                "connector",
+                "label",
+                "conn_webchat_test_1",
+                "ChatGPT-Whshang1@gmail.com"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::ConnectorLabel {
+                connector_id: "conn_webchat_test_1".to_owned(),
+                platform_account: Some("chatgpt-whshang1@gmail.com".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "connector",
+                "label",
+                "conn_webchat_test_1",
+                "--clear"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::ConnectorLabel {
+                connector_id: "conn_webchat_test_1".to_owned(),
+                platform_account: None,
+            })
+        );
+        assert!(
+            parse(args(&[
+                "connector",
+                "label",
+                "conn_webchat_test_1",
+                "Cursor"
+            ]))
+            .is_err()
         );
         assert_eq!(
             parse(args(&[

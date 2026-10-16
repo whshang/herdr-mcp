@@ -418,26 +418,49 @@ export default {
       return noStoreJsonResponse(result, result.ok ? 200 : 403);
     }
     if (request.method === "POST" && url.pathname === "/connectors/webchat-control") {
-      const ownerDevice = await authenticateOwnerDevice(request, env);
-      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const owner = await authenticateOwnerDeviceIdentity(request, env);
+      if (!owner) {
+        logger.warn("connector.webchat_control_denied", {
+          code: "connector_owner_device_required",
+          requesterDeviceId: null,
+          requesterWorkstationId: null,
+          targetDeviceId: null,
+          connectorId: null,
+        });
+        return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      }
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)) {
         const code = parsed.ok ? "bad_request" : parsed.code;
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
-      const allowedKeys = new Set(["connector_id", "device_id", "endpoint_ref", "provider", "account_ref", "allowed"]);
+      const allowedKeys = new Set(["connector_id", "device_id", "endpoint_ref", "provider", "account_ref", "allowed", "scope"]);
       if (Object.keys(parsed.value).some((key) => !allowedKeys.has(key))) {
         return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
       }
       const connectorId = typeof parsed.value.connector_id === "string" ? parsed.value.connector_id.trim() : "";
       const deviceId = typeof parsed.value.device_id === "string" ? parsed.value.device_id.trim() : "";
-      const endpointRef = typeof parsed.value.endpoint_ref === "string" ? parsed.value.endpoint_ref.trim() : "";
-      const provider = typeof parsed.value.provider === "string" ? parsed.value.provider.trim() : "";
+      const deviceWide = parsed.value.scope === "device";
+      if (parsed.value.scope !== undefined && parsed.value.scope !== "device") {
+        return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
+      }
+      if (deviceWide && (parsed.value.endpoint_ref !== undefined || parsed.value.provider !== undefined || parsed.value.account_ref !== undefined)) {
+        return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
+      }
+      const endpointRef = deviceWide
+        ? "*"
+        : (typeof parsed.value.endpoint_ref === "string" ? parsed.value.endpoint_ref.trim() : "");
+      const provider = deviceWide
+        ? "*"
+        : (typeof parsed.value.provider === "string" ? parsed.value.provider.trim() : "");
       // Provider-scoped grants: account_ref is optional ("*" = every account of
       // the provider on this endpoint); a legacy explicit value is accepted.
-      const accountRef = typeof parsed.value.account_ref === "string" && parsed.value.account_ref.trim()
-        ? parsed.value.account_ref.trim()
-        : WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT;
+      // Device-wide grants use "*" for endpoint, provider, and account.
+      const accountRef = deviceWide
+        ? "*"
+        : (typeof parsed.value.account_ref === "string" && parsed.value.account_ref.trim()
+          ? parsed.value.account_ref.trim()
+          : WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT);
       const normalizedDeviceId = normalizeDeviceId(deviceId);
       if (
         !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
@@ -449,6 +472,28 @@ export default {
       ) {
         return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
       }
+      const target = await fleetDeviceMembership(env, deviceId);
+      if (target === "unavailable") {
+        return noStoreJsonResponse({ ok: false, code: "connector_target_device_unresolved" }, 503);
+      }
+      if (target !== "member") {
+        logger.warn("connector.webchat_control_denied", {
+          code: "connector_owner_device_mismatch",
+          requesterDeviceId: owner.deviceId,
+          requesterWorkstationId: owner.workstationId,
+          targetDeviceId: deviceId,
+          connectorId,
+        });
+        return noStoreJsonResponse({ ok: false, code: "connector_owner_device_mismatch" }, 403);
+      }
+      logger.info("connector.webchat_control_grant", {
+        requesterDeviceId: owner.deviceId,
+        requesterWorkstationId: owner.workstationId,
+        targetDeviceId: deviceId,
+        connectorId,
+        allowed: parsed.value.allowed,
+        scope: deviceWide ? "device" : "endpoint",
+      });
       const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
       const store = createOAuthPublicStore(stub);
       const record = await store.setWebChatControlGrant({
@@ -458,7 +503,7 @@ export default {
         provider,
         account_ref: accountRef,
         allowed: parsed.value.allowed,
-        changed_by: `device:${ownerDevice}`,
+        changed_by: `device:${owner.deviceId ?? owner.workstationId}`,
       });
       return record
         ? noStoreJsonResponse({
@@ -470,9 +515,39 @@ export default {
           provider,
           account_ref: accountRef,
           allowed: parsed.value.allowed,
+          scope: deviceWide ? "device" : "endpoint",
+          requester_device_id: owner.deviceId,
           grants: record.webchat_control,
         })
         : noStoreJsonResponse({ ok: false, code: "webchat_control_grant_update_failed" }, 409);
+    }
+
+    if (request.method === "POST" && url.pathname === "/connectors/label") {
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)) {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const allowedKeys = new Set(["connector_id", "platform_account"]);
+      if (Object.keys(parsed.value).some((key) => !allowedKeys.has(key))) {
+        return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
+      const connectorId = typeof parsed.value.connector_id === "string" ? parsed.value.connector_id.trim() : "";
+      if (!/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)) {
+        return noStoreJsonResponse({ ok: false, code: "invalid_connector_id" }, 400);
+      }
+      if (parsed.value.platform_account !== null && typeof parsed.value.platform_account !== "string") {
+        return noStoreJsonResponse({ ok: false, code: "invalid_platform_account" }, 400);
+      }
+      const response = await oauthInternal(env, "/internal/oauth/connector/label", {
+        connector_id: connectorId,
+        platform_account: parsed.value.platform_account,
+        labeled_by: fleetAdmin,
+      });
+      const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+      return noStoreJsonResponse(payload ?? { ok: false, code: "connector_label_failed" }, response.status);
     }
 
     if (request.method === "POST" && url.pathname === "/connectors/page-assist/orphans") {
@@ -1003,6 +1078,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         userAgent: request.headers.get("user-agent"),
         oauthClientId: devAuth.clientId ?? null,
         connectorId: devAuth.connectorId ?? null,
+        platformAccount: devAuth.platformAccount ?? null,
         grantGeneration: devAuth.grantGeneration ?? null,
         authSource: devAuth.source,
         webchatControlGrants,
@@ -1265,6 +1341,7 @@ async function verifyEdgeAccessToken(env: Env, token: string): Promise<{
   deviceId?: string;
   webchatControlGrants?: readonly AuthWebChatControlGrant[];
   pageAssistGrants?: readonly AuthPageAssistGrant[];
+  platformAccount?: string | null;
 }> {
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
   const response = await stub.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
@@ -1283,6 +1360,7 @@ async function verifyEdgeAccessToken(env: Env, token: string): Promise<{
     : undefined;
   const principalType = typeof payload.principal_type === "string" ? payload.principal_type : undefined;
   const deviceId = typeof payload.device_id === "string" ? payload.device_id : undefined;
+  const platformAccount = typeof payload.platform_account === "string" ? payload.platform_account : null;
   if (!clientId || ((connectorId === undefined) !== (grantGeneration === undefined))) return { ok: false };
 
   const webchatControlGrants = Array.isArray(payload.webchat_control)
@@ -1317,6 +1395,7 @@ async function verifyEdgeAccessToken(env: Env, token: string): Promise<{
     ...(deviceId ? { deviceId } : {}),
     ...(webchatControlGrants.length > 0 ? { webchatControlGrants } : {}),
     ...(pageAssistGrants.length > 0 ? { pageAssistGrants } : {}),
+    platformAccount,
   };
 }
 
@@ -1392,10 +1471,28 @@ async function authenticateFleetDevice(request: Request, env: Env): Promise<stri
   }
 }
 
+/**
+ * Same-fleet membership for a grant target. One Worker registry is one owner
+ * account. A missing or revoked device is not that owner's device.
+ */
+async function fleetDeviceMembership(env: Env, deviceId: string): Promise<"member" | "mismatch" | "unavailable"> {
+  try {
+    const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+    const resp = await registry.fetch(new Request("https://registry.internal/internal/devices"));
+    if (!resp.ok) return "unavailable";
+    const body = await resp.json() as { devices?: Array<{ device_id?: unknown; authorization?: unknown }> };
+    const hit = (body.devices ?? []).find((device) => device.device_id === deviceId);
+    if (!hit || hit.authorization === "revoked") return "mismatch";
+    return "member";
+  } catch {
+    return "unavailable";
+  }
+}
+
 // WebChat Control is a separate 1.0 security boundary: unlike ordinary
 // v0.4.6 fleet administration, widening a WebChat grant remains restricted to
-// the configured owner device. Keep this check distinct from
-// authenticateFleetDevice/authenticateFleetAdmin.
+// an authenticated owner device. That owner may target any non-revoked device
+// in the same fleet. Keep this check distinct from authenticateFleetAdmin.
 async function authenticateOwnerDevice(request: Request, env: Env): Promise<string | null> {
   return (await authenticateOwnerDeviceIdentity(request, env))?.workstationId ?? null;
 }

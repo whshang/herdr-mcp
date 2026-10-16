@@ -74,6 +74,12 @@ export interface OAuthConnectorRecord {
   auth_source: "dcr" | "cimd" | "chatgpt_cimd" | "legacy";
   grant_generation: number;
   alias?: string;
+  /**
+   * Owner-facing `<platform>-<email>` display identity, for example
+   * `grokbot-whshang@gmail.com`. Display and unambiguous CLI resolution only.
+   * Grants stay bound to `connector_id` and `grant_generation`.
+   */
+  platform_account?: string;
   approved_at_ms: number;
   approved_by: string;
   last_used_at_ms?: number;
@@ -127,6 +133,23 @@ export interface OAuthPageAssistGrant {
   grant_generation: number;
   device_id: string;
   endpoint_ref: string;
+}
+
+/**
+ * Normalize a human platform-account label. The platform token has no hyphen;
+ * the account is an email. This is display metadata, not an auth principal.
+ */
+export function normalizePlatformAccount(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized.length < 6 || normalized.length > 128) return null;
+  const split = normalized.indexOf("-");
+  if (split <= 0) return null;
+  const platform = normalized.slice(0, split);
+  const account = normalized.slice(split + 1);
+  if (!/^[a-z][a-z0-9]{0,31}$/.test(platform)) return null;
+  if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(account)) return null;
+  return normalized;
 }
 
 export function record(value: unknown): value is Record<string, unknown> {
@@ -268,6 +291,7 @@ export function normalizeConnector(value: unknown): OAuthConnectorRecord | null 
   if (!Number.isSafeInteger(value.grant_generation) || (value.grant_generation as number) <= 0) return null;
   if (!finiteEpoch(value.approved_at_ms) || !boundedString(value.approved_by, 4096)) return null;
   const alias = typeof value.alias === "string" && value.alias.length > 0 && value.alias.length <= 256 ? value.alias : undefined;
+  const platformAccount = normalizePlatformAccount(value.platform_account) ?? undefined;
   const lastTokenIssuedAt = finiteEpoch(value.last_token_issued_at_ms) ? value.last_token_issued_at_ms as number : undefined;
   const lastUsedAt = finiteEpoch(value.last_used_at_ms) ? value.last_used_at_ms as number : undefined;
   const tokenIssueCount = Number.isSafeInteger(value.token_issue_count) && (value.token_issue_count as number) >= 0
@@ -290,6 +314,7 @@ export function normalizeConnector(value: unknown): OAuthConnectorRecord | null 
     approved_at_ms: value.approved_at_ms,
     approved_by: value.approved_by,
     ...(alias ? { alias } : {}),
+    ...(platformAccount ? { platform_account: platformAccount } : {}),
     ...(lastUsedAt !== undefined ? { last_used_at_ms: lastUsedAt } : {}),
     ...(lastTokenIssuedAt !== undefined ? { last_token_issued_at_ms: lastTokenIssuedAt } : {}),
     ...(tokenIssueCount !== undefined ? { token_issue_count: tokenIssueCount } : {}),
