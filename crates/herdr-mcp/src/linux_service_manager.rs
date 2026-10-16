@@ -108,6 +108,10 @@ struct LinuxPaths {
 }
 
 impl LinuxPaths {
+    fn rollback_file(&self) -> PathBuf {
+        self.runtime_root.join("linux-rollback-generation")
+    }
+
     fn discover() -> Result<Self, String> {
         let runtime = RuntimePaths::discover()?;
         let home = env::var_os("HOME")
@@ -157,6 +161,10 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
                 LinuxBackend::SystemdUser => systemctl(&["start", SERVICE_UNIT])?,
                 LinuxBackend::DetachedProcess => start_service_process(&paths)?,
             }
+            // Init-less hosts (containers, sandboxes) lose detached processes on
+            // host restart. `service start` is the single idempotent recovery
+            // command: it also brings an enrolled device's Link back.
+            ensure_enrolled_link_running(&paths)?;
             print_json(&status_value()?)?;
         }
         ServiceCommand::Stop => {
@@ -185,7 +193,8 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
         }
         ServiceCommand::Uninstall => uninstall()?,
         ServiceCommand::Rollback => {
-            return Err("Linux service rollback is not yet exposed as a public operation; failed installs restore the prior generation transactionally".to_owned());
+            ensure_supported_linux_workstation("service rollback")?;
+            rollback()?;
         }
         ServiceCommand::Guardian { .. } => {
             return Err("service guardian is a macOS launchd recovery primitive".to_owned());
@@ -499,6 +508,21 @@ pub fn runtime_token_for_link() -> Result<String, String> {
 }
 
 fn install() -> Result<(), String> {
+    let source = env::current_exe()
+        .map_err(|error| format!("cannot resolve current herdr-mcp binary: {error}"))?;
+    install_from(&source)
+}
+
+/// Install-from-payload seam used by `dev rollback`: the running binary
+/// orchestrates the transaction while the installed generation bytes come from
+/// an explicit (pinned) payload path that is never executed as orchestrator.
+pub(crate) fn install_from_payload(payload: &Path) -> Result<ExitCode, String> {
+    ensure_supported_linux_workstation("service install")?;
+    install_from(payload)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn install_from(source: &Path) -> Result<(), String> {
     ensure_supported_linux_workstation("service install")?;
     let paths = LinuxPaths::discover()?;
     let backend = backend_for_install(&paths)?;
@@ -511,9 +535,7 @@ fn install() -> Result<(), String> {
         ensure_secure_dir(&paths.systemd_dir, 0o700)?;
     }
 
-    let source = env::current_exe()
-        .map_err(|error| format!("cannot resolve current herdr-mcp binary: {error}"))?;
-    let sha = file_sha256(&source)?;
+    let sha = file_sha256(source)?;
     let generation_id = format!("rust-{}", &sha[..16]);
     let generation_dir = paths.generations_dir.join(&generation_id);
     let generation_binary = generation_dir.join("herdr-mcp");
@@ -527,7 +549,7 @@ fn install() -> Result<(), String> {
     } else {
         ensure_secure_dir(&generation_dir, 0o700)?;
         let temp = generation_dir.join(format!(".herdr-mcp-{}", std::process::id()));
-        fs::copy(&source, &temp)
+        fs::copy(source, &temp)
             .map_err(|error| format!("cannot stage Linux runtime generation: {error}"))?;
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("cannot secure Linux runtime generation: {error}"))?;
@@ -669,6 +691,19 @@ fn install() -> Result<(), String> {
         ));
     }
 
+    // Remember the generation we replaced so `service rollback` (and DEV-sync
+    // compensation) can reactivate it. Best effort: the install itself is
+    // already committed and healthy.
+    if let Some(previous) =
+        rollback_generation_after_install(previous_current.as_deref(), &generation_id)
+    {
+        let _ = atomic_write(
+            &paths.rollback_file(),
+            format!("{previous}\n").as_bytes(),
+            0o600,
+        );
+    }
+
     let service_unit = if backend == LinuxBackend::SystemdUser {
         Some(paths.service_unit.clone())
     } else {
@@ -686,6 +721,129 @@ fn install() -> Result<(), String> {
         "link_reconciled": reconcile_enrolled_link,
         "runtime_token_printed": false,
     }))
+}
+
+/// Generation id recorded as the rollback target after an install moved
+/// `runtime/current` from `previous_current` to `installed`. Reinstalling the
+/// same generation keeps the existing rollback target.
+fn rollback_generation_after_install(
+    previous_current: Option<&Path>,
+    installed: &str,
+) -> Option<String> {
+    let previous = previous_current?.file_name()?.to_str()?;
+    (valid_generation_id(previous) && previous != installed).then(|| previous.to_owned())
+}
+
+fn valid_generation_id(value: &str) -> bool {
+    value.len() <= 64
+        && value.starts_with("rust-")
+        && value[5..].chars().all(|ch| ch.is_ascii_alphanumeric())
+        && value.len() > 5
+}
+
+fn read_rollback_generation(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|_| {
+        "Linux service rollback has no recorded previous generation; install a generation first"
+            .to_owned()
+    })?;
+    let value = String::from_utf8_lossy(&bytes).trim().to_owned();
+    if !valid_generation_id(&value) {
+        return Err(format!(
+            "Linux rollback record holds an invalid generation id: {value:?}"
+        ));
+    }
+    Ok(value)
+}
+
+/// Reactivate the previously installed generation (recorded by the last
+/// install) and restart the service and, when enrolled, the Link on it. On
+/// failure the generation that was current before the rollback is restored.
+fn rollback() -> Result<(), String> {
+    let paths = LinuxPaths::discover()?;
+    let backend = backend_for_control(&paths)?;
+    let target = read_rollback_generation(&paths.rollback_file())?;
+    let target_dir = paths.generations_dir.join(&target);
+    if !target_dir.join("herdr-mcp").is_file() {
+        return Err(format!(
+            "Linux rollback target generation {target} is not installed under runtime/generations"
+        ));
+    }
+    let previous_current = fs::read_link(&paths.current_link).ok();
+    let previous_generation = current_generation(&paths);
+    if previous_generation.as_deref() == Some(target.as_str()) {
+        return Err(format!(
+            "Linux rollback target {target} is already runtime/current"
+        ));
+    }
+    let previous_unit = read_optional(&paths.service_unit)?;
+
+    let activate = |paths: &LinuxPaths, generation: &str| -> Result<(), String> {
+        match backend {
+            LinuxBackend::SystemdUser => {
+                atomic_write(
+                    &paths.service_unit,
+                    service_unit_contents(paths, generation)?.as_bytes(),
+                    0o600,
+                )?;
+                systemctl(&["daemon-reload"])?;
+                systemctl(&["restart", SERVICE_UNIT])?;
+            }
+            LinuxBackend::DetachedProcess => {
+                stop_managed_process(&paths.service_process, "service")?;
+                start_service_process(paths)?;
+            }
+        }
+        wait_for_health(paths)?;
+        reconcile_link()
+    };
+
+    switch_current(&paths.current_link, &target_dir)?;
+    if let Err(error) = activate(&paths, &target) {
+        restore_current(&paths.current_link, previous_current.as_deref());
+        restore_optional_file(&paths.service_unit, previous_unit.as_deref(), 0o600);
+        let restore_error = previous_generation
+            .as_deref()
+            .map(|generation| activate(&paths, generation).err())
+            .unwrap_or(None);
+        return Err(format!(
+            "Linux service rollback to {target} failed and runtime/current was restored: {error}; restore_error={}",
+            restore_error.as_deref().unwrap_or("none")
+        ));
+    }
+    if let Some(previous) = previous_generation
+        .as_deref()
+        .filter(|value| valid_generation_id(value))
+    {
+        let _ = atomic_write(
+            &paths.rollback_file(),
+            format!("{previous}\n").as_bytes(),
+            0o600,
+        );
+    }
+    print_json(&json!({
+        "ok": true,
+        "action": "service_rollback",
+        "implementation": backend.implementation(),
+        "generation": target,
+        "previous_generation": previous_generation,
+    }))
+}
+
+fn ensure_enrolled_link_running(paths: &LinuxPaths) -> Result<(), String> {
+    let runtime_paths = RuntimePaths::discover()?;
+    let config = Config::load(&runtime_paths.config_file)?;
+    if config.edge_device_id.is_none() {
+        return Ok(());
+    }
+    let loaded = match backend_for_control(paths)? {
+        LinuxBackend::SystemdUser => unit_active(LINK_UNIT),
+        LinuxBackend::DetachedProcess => managed_process_active(&paths.link_process, "link"),
+    };
+    if loaded {
+        Ok(())
+    } else {
+        ensure_link_installed()
+    }
 }
 
 fn should_reconcile_link_after_install(enrolled: bool) -> bool {
@@ -1561,6 +1719,55 @@ mod tests {
         let error = ensure_supported_linux_workstation_for("service install", true).unwrap_err();
         assert!(error.contains("unsupported_platform_wsl"));
         assert!(ensure_supported_linux_workstation_for("service install", false).is_ok());
+    }
+
+    #[test]
+    fn rollback_target_is_the_generation_an_install_replaced() {
+        assert_eq!(
+            rollback_generation_after_install(
+                Some(Path::new("generations/rust-8713b17527d5e775")),
+                "rust-c41db1ee44021861"
+            ),
+            Some("rust-8713b17527d5e775".to_owned())
+        );
+        assert_eq!(
+            rollback_generation_after_install(
+                Some(Path::new("generations/rust-c41db1ee44021861")),
+                "rust-c41db1ee44021861"
+            ),
+            None
+        );
+        assert_eq!(
+            rollback_generation_after_install(None, "rust-c41db1ee44021861"),
+            None
+        );
+        assert_eq!(
+            rollback_generation_after_install(Some(Path::new("generations/../etc")), "rust-a"),
+            None
+        );
+    }
+
+    #[test]
+    fn rollback_record_is_validated_before_use() {
+        let dir = std::env::temp_dir().join(format!("herdr-linux-rollback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let record = dir.join("linux-rollback-generation");
+        assert!(
+            read_rollback_generation(&record)
+                .unwrap_err()
+                .contains("no recorded previous")
+        );
+        fs::write(&record, "rust-8713b17527d5e775\n").unwrap();
+        assert_eq!(
+            read_rollback_generation(&record).unwrap(),
+            "rust-8713b17527d5e775"
+        );
+        for invalid in ["../../bin", "rust-", "rust-abc/def", "node-123"] {
+            fs::write(&record, invalid).unwrap();
+            assert!(read_rollback_generation(&record).is_err(), "{invalid}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
