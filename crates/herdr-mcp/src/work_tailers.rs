@@ -925,15 +925,10 @@ fn file_inode(metadata: &Metadata) -> u64 {
     metadata.ino()
 }
 
-#[cfg(windows)]
-fn file_inode(metadata: &Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    metadata.file_index().unwrap_or(0)
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn file_inode(_metadata: &Metadata) -> u64 {
-    // No stable file identity from std here: the len and first-line-hash
+    // No stable file identity from stable std here (Windows file_index is
+    // unstable): the len and first-line-hash
     // resets still catch truncation and rewrites.
     0
 }
