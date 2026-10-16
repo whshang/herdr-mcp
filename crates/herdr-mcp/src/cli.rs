@@ -1675,6 +1675,15 @@ fn parse_connector_webchat_control(args: &[String]) -> Result<Command, String> {
     if endpoint_ref.starts_with('-') || endpoint_ref.trim().is_empty() || endpoint_ref.len() > 96 {
         return Err("connector webchat-control requires a valid endpoint ref".to_owned());
     }
+    // Device scope must use allow-device/deny-device (which routes through the
+    // credential-authenticated owner gate): the per-endpoint allow/deny path
+    // never accepts a wildcard endpoint.
+    if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT {
+        return Err(
+            "connector webchat-control device scope requires allow-device or deny-device"
+                .to_owned(),
+        );
+    }
     if provider.starts_with('-') || provider.trim().is_empty() || provider.len() > 32 {
         return Err("connector webchat-control requires a valid provider".to_owned());
     }

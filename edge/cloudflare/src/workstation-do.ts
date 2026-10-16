@@ -247,7 +247,8 @@ function authorizedPageAssistEndpoints(trace: Record<string, unknown> | undefine
   for (const grant of grants) {
     if (grant === null || typeof grant !== "object") continue;
     const ref = (grant as Record<string, unknown>).endpoint_ref;
-    if (typeof ref === "string" && ref.length > 0) out.push(ref);
+    // Wildcard endpoint rows are not per-endpoint authority; drop them.
+    if (typeof ref === "string" && ref.length > 0 && ref !== "*") out.push(ref);
   }
   return out;
 }

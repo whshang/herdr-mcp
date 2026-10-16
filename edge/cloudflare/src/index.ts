@@ -441,11 +441,16 @@ export default {
       }
       const connectorId = typeof parsed.value.connector_id === "string" ? parsed.value.connector_id.trim() : "";
       const deviceId = typeof parsed.value.device_id === "string" ? parsed.value.device_id.trim() : "";
-      const deviceWide = parsed.value.scope === "device";
-      if (parsed.value.scope !== undefined && parsed.value.scope !== "device") {
+      const explicitDeviceScope = parsed.value.scope === "device";
+      // Device scope is either the explicit `scope: "device"` form or the
+      // legacy full-wildcard shape (*//*//*): both mean every endpoint,
+      // provider, and account on one device and get the strict gate below.
+      const deviceWide = explicitDeviceScope
+        || (parsed.value.endpoint_ref === "*" && parsed.value.provider === "*" && parsed.value.account_ref === "*");
+      if (parsed.value.scope !== undefined && !explicitDeviceScope) {
         return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
       }
-      if (deviceWide && (parsed.value.endpoint_ref !== undefined || parsed.value.provider !== undefined || parsed.value.account_ref !== undefined)) {
+      if (explicitDeviceScope && (parsed.value.endpoint_ref !== undefined || parsed.value.provider !== undefined || parsed.value.account_ref !== undefined)) {
         return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
       }
       const endpointRef = deviceWide
@@ -475,13 +480,14 @@ export default {
         return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
       }
       // Same-fleet authority: owner device A can target another ACTIVE enrolled
-      // device B in the same Worker fleet. The requester MUST be authenticated
-      // via an actual enrolled device credential — a legacy shared-secret owner
-      // lookup is not proof of device identity for a device-wide grant.
-      if (!ownerIdentity.deviceId) {
+      // device B in the same Worker fleet. Device-wide grants additionally
+      // require a TRUE enrolled device credential: a legacy shared-secret
+      // owner lookup is a registry correlation, not proof of device identity,
+      // and can never issue */*//* device scope.
+      if (deviceWide && (ownerIdentity.authSource !== "device_credential" || !ownerIdentity.deviceId)) {
         logger.warn("connector.webchat_control_denied", {
           code: "connector_owner_device_mismatch",
-          requesterDeviceId: null,
+          requesterDeviceId: ownerIdentity.deviceId,
           requesterWorkstationId: ownerIdentity.workstationId,
           targetDeviceId: deviceId,
           connectorId,
@@ -491,6 +497,16 @@ export default {
       const target = await fleetDeviceMembership(env, deviceId);
       if (target === "unavailable") {
         return noStoreJsonResponse({ ok: false, code: "connector_target_device_unresolved" }, 503);
+      }
+      if (target === "suspended") {
+        logger.warn("connector.webchat_control_denied", {
+          code: "connector_target_device_suspended",
+          requesterDeviceId: ownerIdentity.deviceId,
+          requesterWorkstationId: ownerIdentity.workstationId,
+          targetDeviceId: deviceId,
+          connectorId,
+        });
+        return noStoreJsonResponse({ ok: false, code: "connector_target_device_suspended" }, 403);
       }
       if (target !== "member") {
         logger.warn("connector.webchat_control_denied", {
@@ -690,6 +706,10 @@ export default {
         !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
         || !normalizedDeviceId || normalizedDeviceId !== deviceId
         || !endpointRef || endpointRef.length > 96 || /[\u0000-\u001f\u007f]/.test(endpointRef)
+        // Page Assist grants are per-endpoint only. A wildcard endpoint here
+        // would derive a full *//*//* WebChat device-scope grant at forward
+        // time, so it is rejected at the public surface (#644 security gate).
+        || endpointRef === "*"
         || typeof parsed.value.allowed !== "boolean"
       ) {
         return noStoreJsonResponse({ ok: false, code: "invalid_page_assist_grant" }, 400);
@@ -1398,9 +1418,11 @@ async function verifyEdgeAccessToken(env: Env, token: string): Promise<{
   const pageAssistGrants = Array.isArray(payload.page_assist)
     ? payload.page_assist.flatMap((value): AuthPageAssistGrant[] => {
         if (!isRecord(value)) return [];
-        return typeof value.device_id === "string" && typeof value.endpoint_ref === "string"
-          ? [{ device_id: value.device_id, endpoint_ref: value.endpoint_ref }]
-          : [];
+        if (typeof value.device_id !== "string" || typeof value.endpoint_ref !== "string") return [];
+        // Wildcard Page Assist rows (legacy or injected) never confer
+        // authority: they are dropped before they can reach the forward path.
+        if (value.endpoint_ref === "*") return [];
+        return [{ device_id: value.device_id, endpoint_ref: value.endpoint_ref }];
       })
     : [];
   return {
@@ -1491,14 +1513,22 @@ async function authenticateFleetDevice(request: Request, env: Env): Promise<stri
  * Same-fleet membership for a grant target. One Worker registry is one owner
  * account. A missing or revoked device is not that owner's device.
  */
-async function fleetDeviceMembership(env: Env, deviceId: string): Promise<"member" | "mismatch" | "unavailable"> {
+async function fleetDeviceMembership(
+  env: Env,
+  deviceId: string,
+): Promise<"member" | "mismatch" | "suspended" | "unavailable"> {
   try {
     const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
     const resp = await registry.fetch(new Request("https://registry.internal/internal/devices"));
     if (!resp.ok) return "unavailable";
     const body = await resp.json() as { devices?: Array<{ device_id?: unknown; authorization?: unknown }> };
     const hit = (body.devices ?? []).find((device) => device.device_id === deviceId);
-    if (!hit || hit.authorization === "revoked") return "mismatch";
+    // Grant targets must be ACTIVE. Revoked, suspended, or any unrecognized
+    // authorization state is rejected; only an explicit "active" device may
+    // receive a same-fleet grant.
+    if (!hit) return "mismatch";
+    if (hit.authorization === "suspended") return "suspended";
+    if (hit.authorization !== "active") return "mismatch";
     return "member";
   } catch {
     return "unavailable";
@@ -1521,7 +1551,7 @@ async function authenticateOwnerDevice(request: Request, env: Env): Promise<stri
 async function authenticateOwnerDeviceIdentity(
   request: Request,
   env: Env,
-): Promise<{ workstationId: string; deviceId: string | null } | null> {
+): Promise<{ workstationId: string; deviceId: string | null; authSource: "device_credential" | "legacy_secret" } | null> {
   const workstationId = request.headers.get("x-herdr-workstation")?.trim() ?? "";
   const ownerWorkstationId = env.DEFAULT_WORKSTATION_ID?.trim() ?? "";
   if (!ownerWorkstationId || !workstationId) return null;
@@ -1531,19 +1561,25 @@ async function authenticateOwnerDeviceIdentity(
   const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
   const deviceAuth = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
   if (deviceAuth.ok) {
-    if (workstationId === ownerWorkstationId) return { workstationId, deviceId: deviceAuth.device_id };
+    if (workstationId === ownerWorkstationId) {
+      return { workstationId, deviceId: deviceAuth.device_id, authSource: "device_credential" };
+    }
     const ownerAliasAuth = await authenticateDeviceCredential(registry, ownerWorkstationId, extracted.credential);
     return ownerAliasAuth.ok && ownerAliasAuth.device_id === deviceAuth.device_id
-      ? { workstationId, deviceId: deviceAuth.device_id }
+      ? { workstationId, deviceId: deviceAuth.device_id, authSource: "device_credential" }
       : null;
   }
   if (workstationId !== ownerWorkstationId) return null;
   if (deviceAuth.code !== "device_not_found" && deviceAuth.code !== "device_credential_missing") {
     return null;
   }
+  // Legacy shared-secret fallback. The looked-up device_id is a registry
+  // correlation, NOT proof of possessing an enrolled device credential:
+  // authSource stays "legacy_secret" so device-wide grant issuance can
+  // require a true credential-authenticated owner.
   const legacy = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
   if (!legacy.authenticate(request, workstationId, Date.now()).ok) return null;
-  return { workstationId, deviceId: await lookupLegacyDeviceId(registry, workstationId) };
+  return { workstationId, deviceId: await lookupLegacyDeviceId(registry, workstationId), authSource: "legacy_secret" };
 }
 
 /** Read-only: the registry device_id already recorded for a legacy workstation, else null. */

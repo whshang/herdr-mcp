@@ -80,8 +80,8 @@ pub struct BrowserCallerAuthorization {
     pub principal_ref: String,
     pub connector_id: String,
     pub grant_generation: i64,
-    /// Display label only. Absent on authorizations issued before platform accounts.
-    pub platform_account: Option<String>,
+    // Display-only platform_account labels live Edge-side; they never ride
+    // the authorization wire and are not part of the runtime struct.
 }
 
 /// `<platform>-<email>` display label. The first `-` separates the platform
@@ -11220,7 +11220,6 @@ mod tests {
             principal_ref: "connector:conn_current_chat_test".to_owned(),
             connector_id: "conn_current_chat_test".to_owned(),
             grant_generation: 1,
-            platform_account: None,
         };
         let caller_session = BrowserCallerSessionIdentity {
             provider: "chatgpt".to_owned(),

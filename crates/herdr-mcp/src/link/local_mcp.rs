@@ -420,19 +420,10 @@ impl LocalMcpTransport {
             return Ok(None);
         };
         let object = value.as_object().ok_or(())?;
-        let platform_account = match object.get("platform_account") {
-            Some(label) => {
-                let label = label.as_str().ok_or(())?;
-                let normalized = crate::mcp::normalize_platform_account(label).ok_or(())?;
-                if normalized != label {
-                    return Err(());
-                }
-                Some(normalized)
-            }
-            None => None,
-        };
-        let expected_len = if platform_account.is_some() { 4 } else { 3 };
-        if object.len() != expected_len
+        // The authorization wire is exactly three fields. A fourth
+        // (platform_account) must never ride the header: old runtimes
+        // reject the extra field and new runtimes do not consume it.
+        if object.len() != 3
             || !object.contains_key("principal_ref")
             || !object.contains_key("connector_id")
             || !object.contains_key("grant_generation")
@@ -462,18 +453,13 @@ impl LocalMcpTransport {
         {
             return Err(());
         }
-        let mut forwarded = json!({
+        serde_json::to_string(&json!({
             "principal_ref": principal_ref,
             "connector_id": connector_id,
             "grant_generation": grant_generation,
-        });
-        if let Some(label) = platform_account {
-            forwarded
-                .as_object_mut()
-                .ok_or(())?
-                .insert("platform_account".to_owned(), json!(label));
-        }
-        serde_json::to_string(&forwarded).map(Some).map_err(|_| ())
+        }))
+        .map(Some)
+        .map_err(|_| ())
     }
 
     fn browser_caller_session_header(

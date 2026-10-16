@@ -525,6 +525,37 @@ test("Page Assist grants normalize legacy records and add/remove one exact endpo
   assert.deepEqual(disabled.record.page_assist, []);
 });
 
+test("user cannot store or inherit wildcard Page Assist grants | Given a stored legacy wildcard row and an active connector | When Page Assist is read or a wildcard row is written | Then the stored wildcard is dropped and the write is rejected", async () => {
+  const h = harness();
+  const connectorId = "conn_pageassist_wild_1";
+  h.storage.map.set("grant:wild-page-client", {
+    client_id: "wild-page-client",
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    status: "active",
+    can_approve_connectors: true,
+    approved_at_ms: 100,
+    approved_by: "device:owner",
+    page_assist: [
+      { connector_id: connectorId, grant_generation: 1, device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: "*" },
+    ],
+  });
+  h.storage.map.set(`connector:${connectorId}`, connectorRecord("wild-page-client", connectorId));
+
+  const read = await body(await h.post("/internal/oauth/grant/get", { client_id: "wild-page-client" }));
+  assert.equal(read.ok, true);
+  assert.deepEqual(read.record.page_assist, [], "an injected stored wildcard Page Assist row fails closed at normalize");
+
+  const wildWrite = await h.post("/internal/oauth/grant/page-assist", {
+    connector_id: connectorId,
+    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    endpoint_ref: "*",
+    allowed: true,
+    changed_by: "device:owner",
+  });
+  assert.equal(wildWrite.status, 400, "the store rejects creating a wildcard Page Assist grant");
+});
+
 test("connector approval resume token is independent, idempotent until expiry, and cannot be substituted", async () => {
   const h = harness();
   await h.post("/internal/oauth/approval/put", {

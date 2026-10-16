@@ -451,6 +451,10 @@ export function normalizePageAssistGrants(value: unknown): OAuthPageAssistGrant[
     const hasGrantGeneration = item.grant_generation !== undefined;
     if (!hasConnectorId && !hasGrantGeneration) continue;
     if (hasConnectorId !== hasGrantGeneration) return null;
+    // Legacy/injected wildcard rows are dropped, not honored: a Page Assist
+    // endpoint "*" must never normalize into grant material that could derive
+    // a WebChat device-scope grant at forward time.
+    if (item.endpoint_ref === "*") continue;
     if (Object.keys(item).some((key) => !["connector_id", "grant_generation", "device_id", "endpoint_ref"].includes(key))) return null;
     if (typeof item.connector_id !== "string" || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(item.connector_id)) return null;
     if (!Number.isSafeInteger(item.grant_generation) || (item.grant_generation as number) <= 0) return null;

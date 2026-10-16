@@ -580,7 +580,7 @@ function recordOpenAiClientLifecycle(
     client_kind: "openai-mcp",
     connector_bound: Boolean(deps.client?.connectorId),
     connectorId: deps.client?.connectorId ?? null,
-    platformAccount: deps.client?.platformAccount ?? null,
+    platformAccountLabeled: Boolean(deps.client?.platformAccount),
     grant_generation: deps.client?.grantGeneration ?? null,
     auth_source: deps.client?.authSource ?? null,
     contract_epoch: publicContract.contract_epoch,
@@ -1414,6 +1414,9 @@ export async function handleMcp(
       }
       for (const grant of deps.client?.pageAssistGrants ?? []) {
         if (grant.device_id !== initialRouteDeviceId) continue;
+        // A wildcard Page Assist endpoint must never derive the full
+        // *//*//* WebChat device-scope triplet; skip it entirely.
+        if (grant.endpoint_ref === "*") continue;
         push({ endpoint_ref: grant.endpoint_ref, provider: "*", account_ref: "*" });
       }
     }
@@ -1427,10 +1430,12 @@ export async function handleMcp(
       && Number.isSafeInteger(deps.client.grantGeneration)
       && Number(deps.client.grantGeneration) > 0
       ? {
+          // Wire stays three-field (principal_ref, connector_id,
+          // grant_generation): the display-only platform_account never rides
+          // the authorization header, so old runtimes keep accepting it.
           principal_ref: `connector:${deps.client.connectorId}`,
           connector_id: deps.client.connectorId,
           grant_generation: Number(deps.client.grantGeneration),
-          ...(deps.client.platformAccount ? { platform_account: deps.client.platformAccount } : {}),
         }
       : null;
     const browserCallerSession = (isBrowserPrivateMethod || isAgentTaskCaller) && openaiSession
@@ -1516,7 +1521,7 @@ export async function handleMcp(
       clientKind: isOpenAiDiscoverClient(deps.client) ? "openai-mcp" : "other",
       connectorBound: Boolean(deps.client?.connectorId),
       connectorId: deps.client?.connectorId ?? null,
-      platformAccount: deps.client?.platformAccount ?? null,
+      platformAccountLabeled: Boolean(deps.client?.platformAccount),
       grantGeneration: deps.client?.grantGeneration ?? null,
       authSource: deps.client?.authSource ?? null,
       contractEpoch: publicContract.contract_epoch,

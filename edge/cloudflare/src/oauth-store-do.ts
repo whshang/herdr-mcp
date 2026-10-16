@@ -499,7 +499,9 @@ export class OAuthStoreDO {
       const client = normalizeOAuthClient(
         await txn.get<OAuthClientRecord>(CLIENT_PREFIX + current.client_id),
       );
-      const derivedPlatformAccount = normalizePlatformAccount(client?.client_name) ?? undefined;
+      // No platform_account is derived at approval time: the OAuth
+      // client_name is client-controlled (DCR) and must never become a
+      // trusted label. Labels come only from the fleet-admin label endpoint.
       const approved: OAuthApprovalRecord = {
         ...current,
         connector_id: connectorId,
@@ -518,7 +520,6 @@ export class OAuthStoreDO {
         redirect_uri: current.redirect_uri,
         auth_source: current.auth_source ?? "legacy",
         grant_generation: 1,
-        ...(derivedPlatformAccount ? { platform_account: derivedPlatformAccount } : {}),
         approved_at_ms: nowMs,
         approved_by: approver,
         token_issue_count: 0,
@@ -1228,6 +1229,9 @@ export class OAuthStoreDO {
       || !boundedString(deviceId, 64)
       || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)
       || !boundedString(endpointRef, 96)
+      // Page Assist grants are per-endpoint; the wildcard endpoint is
+      // rejected so it can never be stored as grant material.
+      || endpointRef === "*"
       || typeof allowed !== "boolean"
       || !boundedString(changedBy, 4096)
     ) {
