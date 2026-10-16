@@ -442,31 +442,25 @@ export default {
       const connectorId = typeof parsed.value.connector_id === "string" ? parsed.value.connector_id.trim() : "";
       const deviceId = typeof parsed.value.device_id === "string" ? parsed.value.device_id.trim() : "";
       const explicitDeviceScope = parsed.value.scope === "device";
-      // Device scope is either the explicit `scope: "device"` form or the
-      // legacy full-wildcard shape (*//*//*): both mean every endpoint,
-      // provider, and account on one device and get the strict gate below.
-      const deviceWide = explicitDeviceScope
-        || (parsed.value.endpoint_ref === "*" && parsed.value.provider === "*" && parsed.value.account_ref === "*");
       if (parsed.value.scope !== undefined && !explicitDeviceScope) {
         return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
       }
       if (explicitDeviceScope && (parsed.value.endpoint_ref !== undefined || parsed.value.provider !== undefined || parsed.value.account_ref !== undefined)) {
         return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
       }
-      const endpointRef = deviceWide
-        ? "*"
-        : (typeof parsed.value.endpoint_ref === "string" ? parsed.value.endpoint_ref.trim() : "");
-      const provider = deviceWide
-        ? "*"
-        : (typeof parsed.value.provider === "string" ? parsed.value.provider.trim() : "");
-      // Provider-scoped grants: account_ref is optional ("*" = every account of
-      // the provider on this endpoint); a legacy explicit value is accepted.
-      // Device-wide grants use "*" for endpoint, provider, and account.
-      const accountRef = deviceWide
-        ? "*"
-        : (typeof parsed.value.account_ref === "string" && parsed.value.account_ref.trim()
-          ? parsed.value.account_ref.trim()
-          : WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT);
+      const requestedEndpointRef = typeof parsed.value.endpoint_ref === "string" ? parsed.value.endpoint_ref.trim() : "";
+      const requestedProvider = typeof parsed.value.provider === "string" ? parsed.value.provider.trim() : "";
+      // Provider-scoped grants default to every account on the selected endpoint.
+      const requestedAccountRef = typeof parsed.value.account_ref === "string" && parsed.value.account_ref.trim()
+        ? parsed.value.account_ref.trim()
+        : WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT;
+      // Classify the normalized scope before choosing its credential gate.
+      // Omitted fields and whitespace must never downgrade */*/* into endpoint scope.
+      const deviceWide = explicitDeviceScope
+        || (requestedEndpointRef === "*" && requestedProvider === "*" && requestedAccountRef === "*");
+      const endpointRef = deviceWide ? "*" : requestedEndpointRef;
+      const provider = deviceWide ? "*" : requestedProvider;
+      const accountRef = deviceWide ? "*" : requestedAccountRef;
       const normalizedDeviceId = normalizeDeviceId(deviceId);
       if (
         !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
@@ -518,14 +512,6 @@ export default {
         });
         return noStoreJsonResponse({ ok: false, code: "connector_owner_device_mismatch" }, 403);
       }
-      logger.info("connector.webchat_control_grant", {
-        requesterDeviceId: ownerIdentity.deviceId,
-        requesterWorkstationId: ownerIdentity.workstationId,
-        targetDeviceId: deviceId,
-        connectorId,
-        allowed: parsed.value.allowed,
-        scope: deviceWide ? "device" : "endpoint",
-      });
       const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
       const store = createOAuthPublicStore(stub);
       const record = await store.setWebChatControlGrant({
@@ -537,6 +523,16 @@ export default {
         allowed: parsed.value.allowed,
         changed_by: `device:${ownerIdentity.deviceId ?? ownerIdentity.workstationId}`,
       });
+      if (record) {
+        logger.info("connector.webchat_control_grant", {
+          requesterDeviceId: ownerIdentity.deviceId,
+          requesterWorkstationId: ownerIdentity.workstationId,
+          targetDeviceId: deviceId,
+          connectorId,
+          allowed: parsed.value.allowed,
+          scope: deviceWide ? "device" : "endpoint",
+        });
+      }
       return record
         ? noStoreJsonResponse({
           ok: true,

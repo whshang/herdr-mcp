@@ -814,6 +814,18 @@ test("new Connector requires Worker fleet-admin approval and operator credential
     "/connectors/webchat-control", deviceScopeInput, "prod-real-runtime", "legacy-secret",
   ), h.env);
   assert.equal(legacyScope.status, 403, "legacy owner without enrolled target identity cannot widen it");
+  for (const scopeInput of [
+    { ...deviceScopeInput, account_ref: undefined },
+    { ...deviceScopeInput, endpoint_ref: " * " },
+    { ...deviceScopeInput, provider: " * " },
+    { ...deviceScopeInput, account_ref: " * " },
+  ]) {
+    const normalizedLegacyScope = await worker.fetch(postAsWorkstation(
+      "/connectors/webchat-control", scopeInput, "prod-real-runtime", "legacy-secret",
+    ), h.env);
+    assert.equal(normalizedLegacyScope.status, 403,
+      "normalized device scope still requires an enrolled device credential");
+  }
   const exactOwnerEnv = { ...h.env, DEFAULT_WORKSTATION_ID: target.device_id };
   const malformedScope = await worker.fetch(postAsWorkstation(
     "/connectors/webchat-control", { ...deviceScopeInput, provider: "grok" },
@@ -840,6 +852,13 @@ test("new Connector requires Worker fleet-admin approval and operator credential
     "/connectors/webchat-control", deviceScopeInput, target.device_id, target.device_secret,
   ), exactOwnerEnv);
   assert.equal(wide.status, 200, "the exact enrolled owner can issue a device-wide grant");
+  const normalizedOwnerScope = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control",
+    { ...deviceScopeInput, endpoint_ref: " * ", account_ref: undefined },
+    target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(normalizedOwnerScope.status, 200, "enrolled owner may grant normalized device scope");
+  assert.equal((await normalizedOwnerScope.json()).scope, "device");
   const wideGrants = (await wide.json()).grants;
   assert.equal(wideGrants.filter(g => g.endpoint_ref === "*").length, 1);
   assert.equal(wideGrants.length, 2, "existing narrow grant is preserved");
@@ -2449,6 +2468,30 @@ test("user owner grants WebChat control across the fleet | Given an owner device
   const originalLog = console.log;
   console.log = (line) => logs.push(line);
   try {
+    const realStoreNamespace = h.env.OAUTH_STORE_DO;
+    h.env.OAUTH_STORE_DO = namespace({
+      fetch(request) {
+        if (new URL(request.url).pathname === "/internal/oauth/grant/webchat-control") {
+          return new Response(JSON.stringify({ ok: false, code: "storage_unavailable" }), { status: 503 });
+        }
+        return oauth.fetch(request);
+      },
+    });
+    try {
+      const failed = await ownerWebChatGrant(h.env, {
+        connector_id: connector.connector_id,
+        device_id: other.device_id,
+        scope: "device",
+        allowed: true,
+      }, owner.workstation_id, owner.device_secret);
+      assert.equal(failed.status, 409);
+      assert.equal(logs.some((line) => {
+        try { return JSON.parse(line).event === "connector.webchat_control_grant"; } catch { return false; }
+      }), false, "failed storage writes cannot emit a successful grant audit");
+    } finally {
+      h.env.OAUTH_STORE_DO = realStoreNamespace;
+    }
+
     const sameFleet = await ownerWebChatGrant(h.env, {
       connector_id: connector.connector_id,
       device_id: other.device_id,
