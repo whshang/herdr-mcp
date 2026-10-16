@@ -4198,7 +4198,7 @@ fn browser_session_create_params_from_source(
         Some(value) => Some(
             value
                 .as_str()
-                .filter(|value| !value.is_empty())
+                .filter(|value| !value.is_empty() && value.len() <= 96)
                 .ok_or_else(|| json!({"ok": false, "code": "browser_operation_params_invalid"}))?,
         ),
         None => None,
@@ -4305,6 +4305,16 @@ fn browser_source_route(
     source_url: &str,
     selected_session_ref: Option<&str>,
 ) -> Result<BrowserSourceRoute, String> {
+    // Reject URLs carrying credentials or a non-default port: neither form
+    // appears in a legitimately observed ChatGPT conversation URL, and
+    // accepting them could route a source through a lookalike origin.
+    if source_url.contains("://")
+        && let Ok(parsed) = url::Url::parse(source_url.trim())
+        && (parsed.username().len() + parsed.password().map_or(0, |p| p.len()) > 0
+            || parsed.port().is_some())
+    {
+        return Err("browser_source_url_invalid".to_owned());
+    }
     let source = browser_conversation_url_ref(source_url)
         .ok_or_else(|| "browser_source_url_invalid".to_owned())?;
     // ChatGPT renders project-scoped conversation URLs with a display-name
@@ -17472,6 +17482,116 @@ mod tests {
             true,
         );
         assert_eq!(foreign["code"], "browser_source_url_invalid");
+    }
+
+    /// user owner | Given a source URL with credentials or a custom port
+    /// | When browser_source_route runs | Then the URL is rejected as invalid
+    /// before any locator lookup; a harmless query/fragment still routes.
+    #[test]
+    fn user_source_route_rejects_userinfo_and_custom_port() {
+        use crate::state_store::{
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput,
+        };
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, _account_ref, session_ref);
+        {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "port-reject-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.212",
+                    observed_at: 10,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.create"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "port-reject-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "port-reject-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            const CANONICAL: &str = "https://chatgpt.com/c/port-reject-conv";
+            store
+                .upsert_browser_resource_locator(&session.resource_ref, CANONICAL, 7, 12)
+                .unwrap();
+            endpoint_ref = endpoint.endpoint_ref;
+            _account_ref = account.resource_ref;
+            session_ref = session.resource_ref;
+        }
+        // Userinfo URLs are rejected before lookup.
+        let userinfo = browser_source_route(
+            &store,
+            "https://user:pass@chatgpt.com/c/port-reject-conv",
+            None,
+        );
+        assert_eq!(
+            userinfo.err(),
+            Some("browser_source_url_invalid".to_owned())
+        );
+
+        // Custom port URLs are rejected.
+        let port =
+            browser_source_route(&store, "https://chatgpt.com:8443/c/port-reject-conv", None);
+        assert_eq!(port.err(), Some("browser_source_url_invalid".to_owned()));
+
+        // Harmless query/fragment still routes to the same session.
+        let query = browser_source_route(
+            &store,
+            "https://chatgpt.com/c/port-reject-conv?ref=share",
+            None,
+        )
+        .unwrap();
+        assert_eq!(query.session_ref, session_ref);
+        assert_eq!(query.endpoint_ref, endpoint_ref);
+    }
+
+    /// user owner | Given a source_session_ref exceeding 96 chars
+    /// | When browser_session_create_params_from_source validates it
+    /// | Then the param is rejected as invalid before any store lookup.
+    #[test]
+    fn user_source_route_rejects_oversized_source_session_ref() {
+        let store = StateStore::open(":memory:").unwrap();
+        let long_ref = "br_".to_owned() + &"a".repeat(100);
+        let result = browser_session_create_params_from_source(
+            &store,
+            &json!({
+                "source_url": "https://chatgpt.com/c/some-conv",
+                "source_session_ref": long_ref,
+                "message": "must reject",
+                "idempotency_key": "oversized-ref-1",
+            }),
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err["code"], "browser_operation_params_invalid");
     }
 
     /// Register one ChatGPT browser profile (endpoint + provider + consent + account +
