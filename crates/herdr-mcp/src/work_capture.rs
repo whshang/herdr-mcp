@@ -8,6 +8,11 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const REDACTED: &str = "[REDACTED]";
+
+/// Summaries are clipped to WORK_SUMMARY_MAX_CHARS, so nothing past this
+/// bound can survive into the stored event. Clip before running the regexes
+/// to bound the redaction work applied to any single tool-call value.
+const REDACT_INPUT_MAX_CHARS: usize = 8 * 1024;
 const SALIENT_KEYS: [&str; 14] = [
     "method",
     "command",
@@ -36,6 +41,11 @@ pub(crate) fn event_for_tool_call(
         return None;
     }
 
+    // Structural redaction first: sensitive-named JSON fields are replaced
+    // outright and the remaining strings are text-redacted, so the summary
+    // (and scope fields) are built from already-sanitized values.
+    let sanitized = sanitize_json(arguments);
+    let arguments = &sanitized;
     let scope = resolve_scope(arguments, snapshot)?;
     let kind = classify(tool_name, arguments);
     let summary = summarize(tool_name, arguments);
@@ -76,9 +86,33 @@ pub(crate) fn classify(tool_name: &str, arguments: &Value) -> String {
     }
 }
 
+/// Walk JSON argument values, replacing the value of any sensitive-named
+/// key (password/passwd/secret/token/api key/authorization/cookie/
+/// credential/private key, case-insensitive) with a redaction marker. String
+/// leaves under non-sensitive keys are still text-redacted.
+fn sanitize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sanitized = serde_json::Map::with_capacity(map.len());
+            for (key, item) in map {
+                if sensitive_key_regex().is_match(key) {
+                    sanitized.insert(key.clone(), Value::String(REDACTED.to_owned()));
+                } else {
+                    sanitized.insert(key.clone(), sanitize_json(item));
+                }
+            }
+            Value::Object(sanitized)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_json).collect()),
+        Value::String(text) => Value::String(redact(text)),
+        scalar => scalar.clone(),
+    }
+}
+
 pub(crate) fn redact(input: &str) -> String {
+    let input = clip_chars(input, REDACT_INPUT_MAX_CHARS);
     let mut value = private_key_regex()
-        .replace_all(input, REDACTED)
+        .replace_all(&input, REDACTED)
         .into_owned();
     value = bearer_regex().replace_all(&value, REDACTED).into_owned();
     value = known_token_regex()
@@ -262,10 +296,25 @@ fn known_token_regex() -> &'static Regex {
     })
 }
 
+/// Sensitive JSON key names: substring match so names like
+/// `github_api_key` are covered as well as exact forms.
+fn sensitive_key_regex() -> &'static Regex {
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    VALUE.get_or_init(|| {
+        Regex::new(
+            r"(?i)password|passwd|secret|token|api[_-]?key|authorization|cookie|credential|private[_-]?key",
+        )
+        .expect("sensitive key regex")
+    })
+}
+
 fn assigned_secret_regex() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
     VALUE.get_or_init(|| {
-        Regex::new(r#"(?i)\b(api[_-]?key|password|passwd|token|secret)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)"#)
+        // The key itself may be bare (`password=`), double-quoted
+        // (`"password":"x"`) or single-quoted (`'token': 'y'`), with optional
+        // whitespace around the separator.
+        Regex::new(r#"(?i)(["']?(?:password|passwd|secret|token|api[_-]?key|authorization|cookie|credential|private[_-]?key)["']?)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)"#)
             .expect("assigned secret regex")
     })
 }
@@ -276,7 +325,9 @@ fn high_entropy_regex() -> &'static Regex {
 }
 
 fn looks_high_entropy(value: &str) -> bool {
-    let mut counts = [0_u16; 128];
+    // usize counters: a single repeated byte in an unbounded token must not
+    // wrap (debug builds panic on integer overflow).
+    let mut counts = [0_usize; 128];
     let mut length = 0_f64;
     for byte in value.bytes() {
         if !byte.is_ascii() {
@@ -289,7 +340,7 @@ fn looks_high_entropy(value: &str) -> bool {
         .into_iter()
         .filter(|count| *count > 0)
         .map(|count| {
-            let probability = f64::from(count) / length;
+            let probability = count as f64 / length;
             -probability * probability.log2()
         })
         .sum::<f64>();
@@ -342,6 +393,21 @@ mod tests {
         assert!(output.contains(REDACTED));
     }
 
+    fn test_snapshot() -> Value {
+        json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {
+                    "checkout_path": "/repo",
+                    "repo_root": "/repo",
+                    "repo_key": "github.com/example/repo"
+                }
+            }],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/repo/src"}],
+            "agents": []
+        })
+    }
+
     #[test]
     fn user_tool_call_is_scoped_to_a_managed_worktree_and_pickup_is_excluded() {
         let snapshot = json!({
@@ -379,6 +445,50 @@ mod tests {
     }
 
     #[test]
+    fn user_json_embedded_secrets_never_reach_the_stored_summary() {
+        // Quoted-key JSON forms embedded in salient string arguments.
+        let embedded = event_for_tool_call(
+            "herdr_prompt",
+            &json!({
+                "prompt": "apply config {\"password\":\"hunter2\", \"api_key\": \"sq-topsecret-\", 'token': 'zz-hidden-token'} done",
+                "path": "/repo/src/main.rs"
+            }),
+            &test_snapshot(),
+        )
+        .expect("managed path should resolve");
+        for secret in ["hunter2", "sq-topsecret-", "zz-hidden-token"] {
+            assert!(
+                !embedded.summary.contains(secret),
+                "secret leaked into summary: {secret}"
+            );
+        }
+        assert!(embedded.summary.contains(REDACTED));
+
+        // Sensitive-named keys in nested argument objects are redacted
+        // structurally, whatever the value format.
+        let structured = event_for_tool_call(
+            "tool",
+            &json!({
+                "path": "/repo/src/main.rs",
+                "query": {
+                    "password": "hunter2-nested",
+                    "api_key": "sq-nested-secret",
+                    "nested": [1, {"private_key": "key-material-zzz"}]
+                }
+            }),
+            &test_snapshot(),
+        )
+        .expect("managed path should resolve");
+        for secret in ["hunter2-nested", "sq-nested-secret", "key-material-zzz"] {
+            assert!(
+                !structured.summary.contains(secret),
+                "secret leaked into summary: {secret}"
+            );
+        }
+        assert!(structured.summary.contains(REDACTED));
+    }
+
+    #[test]
     fn user_summary_is_bounded_and_redacted() {
         let summary = summarize(
             "herdr_exec",
@@ -386,5 +496,21 @@ mod tests {
         );
         assert!(summary.chars().count() <= WORK_SUMMARY_MAX_CHARS);
         assert!(!summary.contains("hidden"));
+    }
+
+    #[test]
+    fn user_oversized_arguments_stay_bounded_without_panicking() {
+        // >70k chars of one repeated byte: previously overflowed the u16
+        // entropy counter and panicked in debug builds.
+        let big = "a".repeat(140_000);
+        let event = event_for_tool_call(
+            "herdr_exec",
+            &json!({"path": "/repo", "command": big}),
+            &test_snapshot(),
+        )
+        .expect("managed path should resolve");
+        assert!(event.summary.chars().count() <= WORK_SUMMARY_MAX_CHARS);
+        let redacted = redact(&"b".repeat(140_000));
+        assert!(redacted.chars().count() <= REDACT_INPUT_MAX_CHARS + 1);
     }
 }
