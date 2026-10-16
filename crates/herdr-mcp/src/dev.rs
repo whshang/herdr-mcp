@@ -238,6 +238,29 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         }
     }
 
+    // A DEV sync whose activation committed but whose post-activation gate or
+    // compensation failed (e.g. Linux before a real gate/rollback existed)
+    // leaves channel=prod while the failed transaction's DEV generation is
+    // still runtime/current. The pinned PROD snapshot remains the PROD source:
+    // treat the state as DEV so this sync re-pins nothing from DEV bytes.
+    if let Some(state) = existing.as_mut()
+        && failed_transaction_left_dev_active(
+            state,
+            &active_before,
+            is_dev_runtime_version(&binary_version(
+                &runtime.config_dir.join("runtime/current/herdr-mcp"),
+            )?),
+        )
+    {
+        if !verify_snapshot(state)? {
+            return Err(
+                "refusing to resume after a failed DEV sync because the pinned PROD snapshot failed SHA-256 validation"
+                    .to_owned(),
+            );
+        }
+        state.channel = "dev".to_owned();
+    }
+
     let prod_generation = match existing.as_ref() {
         Some(state) if state.channel == "dev" => state.prod_generation.clone(),
         _ => active_before.clone(),
@@ -1660,6 +1683,20 @@ fn ensure_prod_snapshot(
     atomic_copy_executable(&current_binary, &paths.prod_binary)
 }
 
+fn failed_transaction_left_dev_active(
+    state: &DevRuntimeState,
+    active_generation: &str,
+    active_is_dev: bool,
+) -> bool {
+    active_is_dev
+        && state.channel == "prod"
+        && state.prod_generation != active_generation
+        && state.last_transaction.as_ref().is_some_and(|transaction| {
+            transaction.phase == DevSyncPhase::Failed
+                && transaction.generation.as_deref() == Some(active_generation)
+        })
+}
+
 fn verify_snapshot(state: &DevRuntimeState) -> Result<bool, String> {
     let path = Path::new(&state.prod_snapshot_binary);
     match fs::symlink_metadata(path) {
@@ -2855,5 +2892,64 @@ mod tests {
             validate_linux_activation_evidence("rust-new", &healthy, &wrong_current, false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn failed_linux_dev_sync_with_dev_still_active_resumes_from_pinned_prod() {
+        let transaction = DevSyncTransaction {
+            transaction_id: "dstx-1".to_owned(),
+            phase: DevSyncPhase::Failed,
+            target_version: "1.0.0-dev".to_owned(),
+            source_repo: "/src".to_owned(),
+            source_branch: Some("main".to_owned()),
+            source_commit: "abc".to_owned(),
+            source_dirty: false,
+            active_generation_before: "rust-prod".to_owned(),
+            expected_generation: Some("rust-dev".to_owned()),
+            generation: Some("rust-dev".to_owned()),
+            started_at_ms: 1,
+            updated_at_ms: 2,
+            completed_at_ms: Some(2),
+            error: Some("gate failed".to_owned()),
+            activation_evidence: None,
+        };
+        let state = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "prod".to_owned(),
+            target_version: "1.0.0-dev".to_owned(),
+            source_repo: None,
+            source_branch: None,
+            source_commit: None,
+            source_dirty: false,
+            dev_generation: None,
+            prod_generation: "rust-prod".to_owned(),
+            prod_version: "1.0.0".to_owned(),
+            prod_snapshot_binary: "/prod".to_owned(),
+            prod_snapshot_sha256: "00".to_owned(),
+            updated_at_ms: 2,
+            last_transaction: Some(transaction.clone()),
+        };
+        assert!(failed_transaction_left_dev_active(&state, "rust-dev", true));
+        assert!(!failed_transaction_left_dev_active(
+            &state, "rust-dev", false
+        ));
+        assert!(!failed_transaction_left_dev_active(
+            &state,
+            "rust-other",
+            true
+        ));
+        assert!(!failed_transaction_left_dev_active(
+            &state,
+            "rust-prod",
+            true
+        ));
+        let mut succeeded = state.clone();
+        succeeded.last_transaction = Some(DevSyncTransaction {
+            phase: DevSyncPhase::Succeeded,
+            ..transaction
+        });
+        assert!(!failed_transaction_left_dev_active(
+            &succeeded, "rust-dev", true
+        ));
     }
 }
