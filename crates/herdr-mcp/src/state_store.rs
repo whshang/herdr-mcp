@@ -24,6 +24,8 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 mod schema;
+pub(crate) mod work_journal;
+use work_journal::ensure_work_journal_auxiliary_schema;
 
 use schema::{
     META_SCHEMA_VERSION, db_file_name, ensure_browser_archive_auxiliary_schema,
@@ -682,6 +684,7 @@ impl StateStore {
             migrate(&mut conn)?;
             ensure_browser_archive_auxiliary_schema(&conn)?;
             ensure_browser_dispatch_auxiliary_schema(&conn)?;
+            ensure_work_journal_auxiliary_schema(&conn)?;
             return Ok(Self { path: None, conn });
         }
 
@@ -693,6 +696,7 @@ impl StateStore {
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
+        ensure_work_journal_auxiliary_schema(&conn)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
             conn,
@@ -718,6 +722,7 @@ impl StateStore {
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
+        ensure_work_journal_auxiliary_schema(&conn)?;
         Ok(Self {
             path: Some(path),
             conn,
