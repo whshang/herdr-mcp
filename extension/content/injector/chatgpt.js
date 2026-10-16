@@ -59,7 +59,14 @@ class ChatGPTAdapter extends BaseAdapter {
     return { ok: false, error: "chat_mode_switch_timeout" };
   }
 
-  async getAccountNativeIdentity(timeoutMs = 1500) {
+  displayEmailFromPayload(payload) {
+    const raw = payload?.email || payload?.user?.email || payload?.account?.email || payload?.email_address || null;
+    const email = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+    return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null;
+  }
+
+  async getAccountObservation(timeoutMs = 1500) {
+    let nativeIdentity = null;
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -74,13 +81,22 @@ class ChatGPTAdapter extends BaseAdapter {
         if (!response.ok) continue;
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-        if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+        const observedIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+        if (!observedIdentity) continue;
+        if (!nativeIdentity) nativeIdentity = observedIdentity;
+        if (observedIdentity !== nativeIdentity) continue;
+        const email = this.displayEmailFromPayload(payload);
+        if (email) return { nativeIdentity, email };
       } catch (_) {
       } finally {
         clearTimeout(timer);
       }
     }
-    return null;
+    return { nativeIdentity, email: null };
+  }
+
+  async getAccountNativeIdentity(timeoutMs = 1500) {
+    return (await this.getAccountObservation(timeoutMs)).nativeIdentity;
   }
 
   getConversationKey() {
