@@ -114,6 +114,11 @@ pub(crate) fn redact(input: &str) -> String {
     let mut value = private_key_regex()
         .replace_all(&input, REDACTED)
         .into_owned();
+    value = url_userinfo_regex()
+        .replace_all(&value, |captures: &regex::Captures<'_>| {
+            format!("{}{REDACTED}@", &captures[1])
+        })
+        .into_owned();
     value = bearer_regex().replace_all(&value, REDACTED).into_owned();
     value = known_token_regex()
         .replace_all(&value, REDACTED)
@@ -283,6 +288,15 @@ fn private_key_regex() -> &'static Regex {
     })
 }
 
+/// user:password@ credentials embedded in an otherwise-public URL: the
+/// whole userinfo pair is dropped, keeping only the scheme and the host.
+fn url_userinfo_regex() -> &'static Regex {
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    VALUE.get_or_init(|| {
+        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@").expect("url userinfo regex")
+    })
+}
+
 fn bearer_regex() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
     VALUE.get_or_init(|| Regex::new(r"(?i)\bbearer\s+[^\s,;]+").expect("bearer regex"))
@@ -372,7 +386,7 @@ mod tests {
         let random = "xP9mQ2vL7sN4kR8tY1wC6dF3hJ5uB0zA";
         let random_hex = "c81e728d9d4c2f636f067f89cc14862c9a1b2c3d4e5f6071";
         let input = format!(
-            "Authorization: Bearer abc.def password=hunter2 token='hidden' sk-abcdefghijklmnopqrstuvwxyz ghp_abcdefghijklmnopqrstuvwxyz github_pat_abcdefghijklmnopqrstuvwxyz123 xoxb-1234567890-secret AKIAIOSFODNN7EXAMPLE {private_key} opaque={random} hex={random_hex}"
+            "Authorization: Bearer abc.def password=hunter2 token='hidden' sk-abcdefghijklmnopqrstuvwxyz ghp_abcdefghijklmnopqrstuvwxyz github_pat_abcdefghijklmnopqrstuvwxyz123 xoxb-1234567890-secret AKIAIOSFODNN7EXAMPLE {private_key} opaque={random} hex={random_hex} fetch=https://ci-user:pw-hunter@example.invalid/repo"
         );
         let output = redact(&input);
         for secret in [
@@ -387,10 +401,16 @@ mod tests {
             "abc123",
             random,
             random_hex,
+            "pw-hunter",
+            "ci-user:pw-hunter",
         ] {
             assert!(!output.contains(secret), "secret remained: {secret}");
         }
         assert!(output.contains(REDACTED));
+        assert!(
+            output.contains("https://[REDACTED]@example.invalid/repo"),
+            "{output}"
+        );
     }
 
     fn test_snapshot() -> Value {

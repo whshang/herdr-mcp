@@ -2,7 +2,6 @@
 
 use crate::state_store::StateStore;
 use crate::state_store::work_journal::{NewWorkEvent, WorkState, clip_chars};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -10,7 +9,7 @@ use std::env;
 use std::fs::{self, File, Metadata};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::time::SystemTime;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -21,20 +20,6 @@ const MAX_CONTEXT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CONTEXT_LINES: usize = 200;
 const EVENT_TEXT_CHARS: usize = 200;
 
-static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|authorization|cookie)[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+"#,
-    )
-    .expect("valid secret assignment regex")
-});
-static BEARER_SECRET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+").expect("valid bearer regex")
-});
-static PROVIDER_SECRET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,})\b")
-        .expect("valid provider key regex")
-});
-
 #[derive(Debug, Clone)]
 struct LogDirs {
     codex_sessions: Option<PathBuf>,
@@ -44,7 +29,6 @@ struct LogDirs {
 }
 
 impl LogDirs {
-    #[allow(dead_code)]
     fn discover() -> Self {
         let home = env::var_os("HOME")
             .or_else(|| env::var_os("USERPROFILE"))
@@ -84,12 +68,18 @@ impl Provider {
 struct LogFile {
     provider: Provider,
     path: PathBuf,
+    mtime: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Cursor {
     inode: u64,
     offset: u64,
+    /// Hash of the file's first line: catches same-inode, non-shrinking
+    /// rewrites that an offset-only cursor would never re-read. Absent from
+    /// pre-existing cursor JSON, so old cursors decode to 0 and rescan once.
+    #[serde(default)]
+    first_line_hash: u64,
 }
 
 type ScopeKey = (String, String);
@@ -116,10 +106,20 @@ struct ParsedEvent {
     ts: Option<i64>,
 }
 
+#[derive(Debug)]
+enum FileOutcome {
+    /// The file was scanned and its cursor advanced.
+    Ingested(IngestedFile),
+    /// The session cwd is outside every managed root: drop any stale cursor.
+    Unmanaged,
+    /// open/stat/seek/read failed (already logged): keep the previous cursor
+    /// so the next scan retries the file.
+    Unreadable,
+}
+
 /// Incrementally ingest supported native session logs below the current user's
 /// agent homes. This function only reads those logs and writes journal rows and
 /// cursors to `store`; scheduling belongs to the compaction lane.
-#[allow(dead_code)]
 pub(crate) fn ingest_native_logs(
     store: &StateStore,
     managed_roots: &[PathBuf],
@@ -163,7 +163,7 @@ fn ingest_from_dirs(
         let path_key = log.path.to_string_lossy().into_owned();
         let previous = cursor_index.get(&path_key).cloned();
         match ingest_file(store, &log, &path_key, previous.as_ref(), &scopes, now_ms) {
-            Ok(Some(result)) => {
+            Ok(FileOutcome::Ingested(result)) => {
                 appended += result.appended;
                 if let Some((old_scope, _)) = previous.as_ref()
                     && old_scope != &result.scope
@@ -179,16 +179,19 @@ fn ingest_from_dirs(
                     now_ms,
                 );
             }
-            Ok(None) => {
+            Ok(FileOutcome::Unmanaged) => {
                 // A replaced file may now belong to an unmanaged cwd. Forget
                 // its old managed cursor so a later rewrite is inspected anew.
                 if let Some((old_scope, _)) = previous.as_ref() {
                     remove_cursor(&mut states, &mut dirty, old_scope, &path_key, now_ms);
                 }
             }
+            Ok(FileOutcome::Unreadable) => {
+                // Keep the stored cursor so the next scan retries this file.
+            }
             Err(error) => {
                 return Err(format!(
-                    "cannot tail {} log {}: {error}",
+                    "cannot store events from {} log {}: {error}",
                     log.provider.name(),
                     log.path.display()
                 ));
@@ -261,8 +264,23 @@ fn discover_logs(dirs: &LogDirs) -> Vec<LogFile> {
             &mut logs,
         );
     }
-    logs.sort_by(|left, right| left.path.cmp(&right.path));
+    // Cap across ALL providers, keeping the newest by mtime, so one chatty
+    // provider discovered earlier cannot starve the others.
+    let discovered = logs.len();
+    logs.sort_by(|left, right| {
+        right
+            .mtime
+            .cmp(&left.mtime)
+            .then_with(|| left.path.cmp(&right.path))
+    });
     logs.truncate(MAX_FILES);
+    if discovered > logs.len() {
+        eprintln!(
+            "work log discovery capped at {MAX_FILES} files; skipped {} older logs",
+            discovered - logs.len()
+        );
+    }
+    logs.sort_by(|left, right| left.path.cmp(&right.path));
     logs
 }
 
@@ -275,9 +293,6 @@ fn collect_jsonl(
 ) {
     let mut queue = vec![(root.to_path_buf(), 0usize)];
     while let Some((directory, depth)) = queue.pop() {
-        if output.len() >= MAX_FILES {
-            return;
-        }
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -289,7 +304,17 @@ fn collect_jsonl(
                 continue;
             }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!(
+                        "work log discovery skipped an entry under {}: {error}",
+                        directory.display()
+                    );
+                    continue;
+                }
+            };
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
@@ -302,12 +327,24 @@ fn collect_jsonl(
                     .is_some_and(|extension| extension == "jsonl")
                 && path.strip_prefix(root).is_ok_and(&accept)
             {
-                output.push(LogFile { provider, path });
+                let mtime = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok());
+                output.push(LogFile {
+                    provider,
+                    path,
+                    mtime,
+                });
             }
         }
     }
 }
 
+/// Scan one log file from its stored cursor forward. `Err` is reserved for
+/// journal-store failures; per-file I/O problems are logged and reported as
+/// [`FileOutcome::Unreadable`], so one bad file never aborts the scan or
+/// discards the cursors of files that already succeeded.
 fn ingest_file(
     store: &StateStore,
     log: &LogFile,
@@ -315,24 +352,48 @@ fn ingest_file(
     previous: Option<&(ScopeKey, Cursor)>,
     scopes: &[Scope],
     now_ms: i64,
-) -> Result<Option<IngestedFile>, String> {
-    let mut file = File::open(&log.path).map_err(|error| format!("cannot open log: {error}"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect log: {error}"))?;
+) -> Result<FileOutcome, String> {
+    let unreadable = |error: String| {
+        eprintln!(
+            "work log skipped {} {}: {error}",
+            log.provider.name(),
+            log.path.display()
+        );
+        FileOutcome::Unreadable
+    };
+    let mut file = match File::open(&log.path) {
+        Ok(file) => file,
+        Err(error) => return Ok(unreadable(format!("cannot open log: {error}"))),
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return Ok(unreadable(format!("cannot inspect log: {error}"))),
+    };
     let inode = file_inode(&metadata);
+    let first_line_hash = match first_line_hash(&mut file) {
+        Ok(hash) => hash,
+        Err(error) => return Ok(unreadable(error)),
+    };
     let previous_cursor = previous.map(|(_, cursor)| *cursor).unwrap_or_default();
+    // Resume only when the file identity still matches the cursor: a changed
+    // inode, a shrink, or a rewritten first line all mean earlier bytes may
+    // have changed underneath the stored offset, so restart from the top.
     let reset = previous.is_none()
         || previous_cursor.inode != inode
-        || metadata.len() < previous_cursor.offset;
+        || metadata.len() < previous_cursor.offset
+        || previous_cursor.first_line_hash != first_line_hash;
     let start = if reset { 0 } else { previous_cursor.offset };
     let session_account = if start == 0 {
         None
     } else {
-        scan_session_account(&mut file, start)?
+        match scan_session_account(&mut file, start) {
+            Ok(account) => account,
+            Err(error) => return Ok(unreadable(error)),
+        }
     };
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| format!("cannot seek log: {error}"))?;
+    if let Err(error) = file.seek(SeekFrom::Start(start)) {
+        return Ok(unreadable(format!("cannot seek log: {error}")));
+    }
 
     let mut scope_key = if reset {
         None
@@ -346,7 +407,10 @@ fn ingest_file(
 
     loop {
         let line_offset = offset;
-        let Some((line, consumed)) = read_complete_line(&mut reader)? else {
+        let Some((line, consumed)) = (match read_complete_line(&mut reader) {
+            Ok(line) => line,
+            Err(error) => return Ok(unreadable(error)),
+        }) else {
             break;
         };
         offset += consumed;
@@ -369,7 +433,7 @@ fn ingest_file(
             scope_key = matching_scope(&cwd, scopes)
                 .map(|scope| (scope.project_ref.clone(), scope.worktree.clone()));
             if scope_key.is_none() {
-                return Ok(None);
+                return Ok(FileOutcome::Unmanaged);
             }
         }
         let Some((project_ref, worktree)) = scope_key.as_ref() else {
@@ -379,6 +443,7 @@ fn ingest_file(
             session_account = Some(account);
         }
 
+        let line_hash = hash_bytes(&line);
         for (index, mut event) in parse_events(log.provider, &value).into_iter().enumerate() {
             if event.account.is_none() {
                 event.account.clone_from(&session_account);
@@ -387,7 +452,13 @@ fn ingest_file(
             if summary.is_empty() {
                 continue;
             }
-            let dedupe = format!("{}:{}:{line_offset}:{index}", log.provider.name(), path_key);
+            // The raw-line hash (and inode) keep the key honest when a line
+            // is rewritten at a byte offset the journal has already seen.
+            let dedupe = format!(
+                "{}:{}:{inode}:{line_offset}:{index}:{line_hash:016x}",
+                log.provider.name(),
+                path_key
+            );
             let event = NewWorkEvent {
                 ts: event.ts.unwrap_or(now_ms),
                 project_ref: project_ref.clone(),
@@ -405,11 +476,40 @@ fn ingest_file(
         }
     }
 
-    Ok(scope_key.map(|scope| IngestedFile {
-        scope,
-        cursor: Cursor { inode, offset },
-        appended,
-    }))
+    Ok(match scope_key {
+        Some(scope) => FileOutcome::Ingested(IngestedFile {
+            scope,
+            cursor: Cursor {
+                inode,
+                offset,
+                first_line_hash,
+            },
+            appended,
+        }),
+        None => FileOutcome::Unmanaged,
+    })
+}
+
+/// Hash of the first line of the file (bounded prefix when the first line is
+/// oversized), the cheapest stable fingerprint of a file's identity.
+fn first_line_hash(file: &mut File) -> Result<u64, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("cannot seek log start: {error}"))?;
+    let mut line = Vec::new();
+    std::io::BufReader::new((&mut *file).take(MAX_LINE_BYTES + 1))
+        .read_until(b'\n', &mut line)
+        .map_err(|error| format!("cannot read first log line: {error}"))?;
+    Ok(hash_bytes(&line))
+}
+
+/// FNV-1a 64-bit: stable across runs and platforms, no extra dependency.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn scan_session_account(file: &mut File, before: u64) -> Result<Option<String>, String> {
@@ -639,7 +739,6 @@ fn explicit_error(value: &Value, message: &Value) -> Option<String> {
         value.get("errorMessage"),
         value.get("error"),
         value.pointer("/payload/error"),
-        value.pointer("/payload/message"),
     ]
     .into_iter()
     .flatten()
@@ -650,6 +749,19 @@ fn explicit_error(value: &Value, message: &Value) -> Option<String> {
         if candidate.is_object() {
             return Some(candidate.to_string());
         }
+    }
+    // Only an explicit error marker qualifies: payloads such as Codex
+    // event_msg agent_message rows carry a `message` field that is plain
+    // user-visible text, never an error by itself.
+    if value.pointer("/payload/type").and_then(Value::as_str) == Some("error") {
+        return Some(
+            value
+                .pointer("/payload/message")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or("agent reported an error")
+                .to_owned(),
+        );
     }
     let failed = message.get("stopReason").and_then(Value::as_str) == Some("error")
         || value.get("is_error").and_then(Value::as_bool) == Some(true)
@@ -726,12 +838,11 @@ fn collapse(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// One redaction implementation for every stored journal field: lane A's
+/// `work_capture` redactor covers quoted assignments, bearer/provider
+/// tokens, high-entropy strings, and URL userinfo.
 fn redact(text: &str) -> String {
-    let text = SECRET_ASSIGNMENT.replace_all(text, "$1[REDACTED]");
-    let text = BEARER_SECRET.replace_all(&text, "$1[REDACTED]");
-    PROVIDER_SECRET
-        .replace_all(&text, "[REDACTED]")
-        .into_owned()
+    crate::work_capture::redact(text)
 }
 
 fn decode_cursors(json: &str) -> BTreeMap<String, Cursor> {
@@ -763,8 +874,10 @@ fn put_cursor(
     if cursors.insert(path.to_owned(), cursor) == Some(cursor) {
         return;
     }
-    state.log_cursors_json =
-        serde_json::to_string(&cursors).expect("cursor serialization cannot fail");
+    let Some(json) = encode_cursors(key, &cursors) else {
+        return;
+    };
+    state.log_cursors_json = json;
     state.updated_at = now_ms;
     dirty.insert(key.clone());
 }
@@ -780,11 +893,29 @@ fn remove_cursor(
         return;
     };
     let mut cursors = decode_cursors(&state.log_cursors_json);
-    if cursors.remove(path).is_some() {
-        state.log_cursors_json =
-            serde_json::to_string(&cursors).expect("cursor serialization cannot fail");
-        state.updated_at = now_ms;
-        dirty.insert(key.clone());
+    if cursors.remove(path).is_none() {
+        return;
+    }
+    let Some(json) = encode_cursors(key, &cursors) else {
+        return;
+    };
+    state.log_cursors_json = json;
+    state.updated_at = now_ms;
+    dirty.insert(key.clone());
+}
+
+/// Serialize cursors without panicking in the ingest loop: on failure log
+/// and keep the prior cursor row so the next scan simply retries.
+fn encode_cursors(key: &ScopeKey, cursors: &BTreeMap<String, Cursor>) -> Option<String> {
+    match serde_json::to_string(cursors) {
+        Ok(json) => Some(json),
+        Err(error) => {
+            eprintln!(
+                "work log cursors not persisted for {}:{}: {error}",
+                key.0, key.1
+            );
+            None
+        }
     }
 }
 
@@ -794,10 +925,16 @@ fn file_inode(metadata: &Metadata) -> u64 {
     metadata.ino()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn file_inode(metadata: &Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_index().unwrap_or(0)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn file_inode(_metadata: &Metadata) -> u64 {
-    // Unix supplies the inode required by the cursor contract. Other targets
-    // retain shrink detection without treating every append as replacement.
+    // No stable file identity from std here: the len and first-line-hash
+    // resets still catch truncation and rewrites.
     0
 }
 
@@ -923,7 +1060,7 @@ mod tests {
         assert!(!rows.iter().any(|row| row.summary.contains("top-secret")));
         assert_eq!(
             redact("use sk-proj-abcdefghijklmnop and bearer abc.def"),
-            "use [REDACTED] and bearer [REDACTED]"
+            "use [REDACTED] and [REDACTED]"
         );
         assert!(
             rows.iter()
@@ -941,7 +1078,8 @@ mod tests {
             0
         );
         let mut file = fs::OpenOptions::new().append(true).open(codex).unwrap();
-        write!(file, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"new answer\"}}]}}}}\n{{\"partial\":true").unwrap();
+        write!(file, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"new answer\"}}]}}}}\n{{\"type\":\"message_start\",\"message\":{{\"role\":\"user\",\"content\":\"deferred part").unwrap();
+        // The complete line lands; the partial line stays behind the cursor.
         assert_eq!(
             ingest_from_dirs(
                 &store,
@@ -958,7 +1096,8 @@ mod tests {
                 .as_deref(),
             Some("codex@example.test")
         );
-        file.write_all(b"}\n").unwrap();
+        // Completing the partial line turns it into a real ingested event.
+        file.write_all(b"ial line\"}}\n").unwrap();
         assert_eq!(
             ingest_from_dirs(
                 &store,
@@ -967,7 +1106,11 @@ mod tests {
                 &fixture.dirs
             )
             .unwrap(),
-            0
+            1
+        );
+        assert_eq!(
+            store.latest_work_events(&cwd, &cwd, 1).unwrap()[0].summary,
+            "deferred partial line"
         );
     }
 
@@ -990,11 +1133,13 @@ mod tests {
         fs::create_dir_all(garbage.parent().unwrap()).unwrap();
         fs::write(
             &garbage,
-            format!("not json\n{{\"type\":\"session\",\"cwd\":{cwd:?}}}\n"),
+            format!("not json\n{{\"type\":\"session\",\"cwd\":{cwd:?}}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"after bad line\"}}}}\n"),
         )
         .unwrap();
 
         let store = StateStore::open(":memory:").unwrap();
+        // The unparseable line is skipped and the valid event after it in the
+        // same file is still ingested; the foreign-cwd file is ignored.
         assert_eq!(
             ingest_from_dirs(
                 &store,
@@ -1003,7 +1148,7 @@ mod tests {
                 &fixture.dirs
             )
             .unwrap(),
-            1
+            2
         );
 
         // Shrink below the cursor: the new header is rescanned and its event is
@@ -1053,6 +1198,125 @@ mod tests {
         assert!(rows.iter().any(|row| row.summary == "after truncate"));
         #[cfg(unix)]
         assert!(rows.iter().any(|row| row.summary == "after replace"));
+        assert!(rows.iter().any(|row| row.summary == "after bad line"));
         assert!(!rows.iter().any(|row| row.summary == "foreign"));
+    }
+
+    /// user rewritten line at a seen offset | Given a file whose cursor
+    /// already advanced | When one line is replaced with same-length content
+    /// (same inode, no shrink) | Then the new summary is stored.
+    #[test]
+    fn rewritten_line_at_a_seen_offset_is_reingested_instead_of_deduped_forever() {
+        let fixture = Fixture::new();
+        let cwd = fixture.project.to_string_lossy();
+        let line = |text: String| serde_json::json!({"type":"user","cwd":cwd,"message":{"role":"user","content":text}});
+        let path = fixture.write(
+            "claude/projects/p/rewritten.jsonl",
+            &[
+                line(format!("alpha {}", "x".repeat(50))),
+                line("stable second line".to_owned()),
+            ],
+        );
+        let store = StateStore::open(":memory:").unwrap();
+        let roots = std::slice::from_ref(&fixture.project);
+        assert_eq!(
+            ingest_from_dirs(&store, roots, 1, &fixture.dirs).unwrap(),
+            2
+        );
+
+        // Replace line 1 in place: identical length and inode. An offset-only
+        // cursor would never re-read it; the first-line hash reset must.
+        let replacement = format!(
+            "{}\n{}\n",
+            line(format!("beta  {}", "y".repeat(50))),
+            line("stable second line".to_owned())
+        );
+        assert_eq!(replacement.len() as u64, fs::metadata(&path).unwrap().len());
+        fs::write(&path, replacement).unwrap();
+        assert_eq!(
+            ingest_from_dirs(&store, roots, 2, &fixture.dirs).unwrap(),
+            1
+        );
+        let rows = store.latest_work_events(&cwd, &cwd, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row.summary.starts_with("beta")));
+    }
+
+    /// user chat rows are not errors | Given a Codex event_msg agent_message
+    /// line | When the file is ingested | Then no error event is stored.
+    #[test]
+    fn codex_agent_and_user_event_messages_are_not_errors() {
+        let fixture = Fixture::new();
+        let cwd = fixture.project.to_string_lossy();
+        fixture.write(
+            "codex/sessions/2026/reply.jsonl",
+            &[
+                serde_json::json!({"type":"session_meta","payload":{"cwd":cwd}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"agent_message","message":"ok"}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"hi"}}),
+            ],
+        );
+        let store = StateStore::open(":memory:").unwrap();
+        ingest_from_dirs(
+            &store,
+            std::slice::from_ref(&fixture.project),
+            1,
+            &fixture.dirs,
+        )
+        .unwrap();
+        let rows = store.latest_work_events(&cwd, &cwd, 10).unwrap();
+        assert!(!rows.iter().any(|row| row.kind == "error"), "{rows:?}");
+    }
+
+    /// user secrets in native logs | Given a log line carrying quoted,
+    /// hyphenated-key and URL-userinfo secrets | When the event is stored |
+    /// Then none of the four inputs survive in summary or account.
+    #[test]
+    fn user_native_log_secrets_never_reach_the_stored_summary_or_account() {
+        let fixture = Fixture::new();
+        let cwd = fixture.project.to_string_lossy();
+        fixture.write(
+            "pi/sessions/p/secrets.jsonl",
+            &[
+                serde_json::json!({"type":"session","cwd":cwd,"account":"worker sk-ant-api03-AbCdEfGhIjKlMnOpQr"}),
+                serde_json::json!({"type":"message_start","message":{"role":"user","content":"set password: \"hello world\" then sk-proj-AbCdEfGhIjKlMnOpQrSt via https://ci-user:pw-hunter@example.invalid/repo"}}),
+            ],
+        );
+        let store = StateStore::open(":memory:").unwrap();
+        assert_eq!(
+            ingest_from_dirs(
+                &store,
+                std::slice::from_ref(&fixture.project),
+                1,
+                &fixture.dirs
+            )
+            .unwrap(),
+            1
+        );
+        let rows = store.latest_work_events(&cwd, &cwd, 10).unwrap();
+        for secret in [
+            "hello world",
+            "sk-proj-AbCdEfGhIjKlMnOpQrSt",
+            "sk-ant-api03-AbCdEfGhIjKlMnOpQr",
+            "pw-hunter",
+        ] {
+            assert!(
+                rows.iter().all(|row| !row.summary.contains(secret)),
+                "secret leaked into summary: {secret}"
+            );
+            assert!(
+                rows.iter().all(|row| {
+                    row.account
+                        .as_deref()
+                        .is_none_or(|account| !account.contains(secret))
+                }),
+                "secret leaked into account: {secret}"
+            );
+        }
+        assert_eq!(
+            rows[0].account.as_deref(),
+            Some("worker [REDACTED]"),
+            "{rows:?}"
+        );
     }
 }

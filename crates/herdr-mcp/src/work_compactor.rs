@@ -1,9 +1,11 @@
 use crate::semantic::{SemanticChatMessage, SemanticChatOptions, SemanticService};
+use crate::state_cache::EventCache;
 use crate::state_store::StateStore;
 use crate::state_store::work_journal::{WorkEvent, WorkState, clip_chars};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -350,7 +352,7 @@ fn resolve_git_common_dir(worktree: &Path) -> Result<Option<PathBuf>, String> {
     }
 }
 
-pub(crate) fn start_background(store: &StateStore) {
+pub(crate) fn start_background(store: &StateStore, cache: Arc<EventCache>) {
     let Some(path) = store.path().map(Path::to_path_buf) else {
         return;
     };
@@ -358,16 +360,22 @@ pub(crate) fn start_background(store: &StateStore) {
         .name("herdr-mcp-work-compactor".to_owned())
         .spawn(move || {
             loop {
-                let _ = std::panic::catch_unwind(|| {
-                    let store = StateStore::open(&path)?;
+                let path = &path;
+                let cache = Arc::clone(&cache);
+                // AssertUnwindSafe: a panicking tick can only poison this
+                // loop's own freshly-opened store handle, never shared state.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let store = StateStore::open(path)?;
+                    let roots = crate::fs_security::managed_roots(&cache.snapshot());
+                    let now = now_ms();
                     compact_tick(
                         &store,
                         &SemanticService::from_config(),
-                        &|_| Ok(0),
-                        now_ms(),
+                        &move |store| crate::work_tailers::ingest_native_logs(store, &roots, now),
+                        now,
                     )
                     .map(|_| ())
-                });
+                }));
                 thread::sleep(COMPACTION_INTERVAL);
             }
         });
