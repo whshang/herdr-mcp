@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CONTINUITY_JOURNAL_STORAGE_KEY,
+  continuityJournalEntry,
   continuityMessageId,
   stableHash,
   turnFingerprint,
@@ -37,4 +38,34 @@ test("fingerprint is stable for identical text and distinct for changes", () => 
 test("stableHash is deterministic", () => {
   assert.equal(stableHash("a"), stableHash("a"));
   assert.notEqual(stableHash("a"), stableHash("b"));
+});
+
+test("user retains journal identity | Given known and legacy browser bindings | When entries are cached | Then identity is recorded or explicitly unknown", () => {
+  assert.deepEqual(continuityJournalEntry({
+    message_id: "m1",
+    role: "user",
+    createdAt: 10,
+    provider: " chatgpt ",
+    account: "br_account",
+    project: "g-p-project",
+  }), {
+    message_id: "m1",
+    role: "user",
+    createdAt: 10,
+    provider: "chatgpt",
+    account: "br_account",
+    project: "g-p-project",
+  });
+  assert.deepEqual(continuityJournalEntry({
+    message_id: "legacy",
+    role: "assistant",
+    createdAt: 11,
+  }), {
+    message_id: "legacy",
+    role: "assistant",
+    createdAt: 11,
+    provider: null,
+    account: null,
+    project: null,
+  });
 });

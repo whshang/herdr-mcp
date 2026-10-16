@@ -319,6 +319,11 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             true,
         ));
     }
+    let _work_capture = ToolCallCapture {
+        name,
+        arguments: &arguments,
+        context,
+    };
 
     let output = match name {
         "herdr_methods" => {
@@ -590,6 +595,34 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         model_visible_tool_output(name, &arguments, output),
         false,
     ))
+}
+
+struct ToolCallCapture<'a, 'context> {
+    name: &'a str,
+    arguments: &'a Value,
+    context: &'a RuntimeContext<'context>,
+}
+
+impl Drop for ToolCallCapture<'_, '_> {
+    fn drop(&mut self) {
+        // Capture is best-effort and must never panic out of Drop (a panic
+        // during unwind would abort the process).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let snapshot = self.context.cache.snapshot();
+            let Some(event) =
+                crate::work_capture::event_for_tool_call(self.name, self.arguments, &snapshot)
+            else {
+                return;
+            };
+            // This drop runs after the tool output is computed, so this
+            // thread does not hold the store lock; a normal lock avoids
+            // try_lock silently dropping events. Poisoned locks (a caller
+            // panicked while holding the store) stay ignored as before.
+            if let Ok(store) = self.context.state_store.lock() {
+                let _ = store.append_work_event(&event);
+            }
+        }));
+    }
 }
 
 /// ChatGPT's composer rewrites a pasted chatgpt.com conversation URL into a
