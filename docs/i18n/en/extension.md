@@ -93,6 +93,33 @@ herdr-mcp Rust runtime
 
 The browser owns interaction and visualization; Native Host is the trusted local bridge; the runtime still owns tool schemas, managed-root checks, permissions, and mutation boundaries. Public OAuth/MCP and local Native Messaging are separate trust boundaries.
 
+## Linux and Google Chrome
+
+macOS and Linux use the same Native Messaging contract. The managed runtime listens on the mode-`0600` socket `~/.config/herdr-mcp/extension.sock`. The browser manifest allows exactly one `chrome-extension://<id>/` origin and points at the stable wrapper `~/.config/herdr-mcp/native/herdr-extension-host`. That wrapper runs the colocated runtime copy as `herdr-mcp extension-host`. The host does not accept the loopback bearer; anonymous TCP to `127.0.0.1:8772` stays denied.
+
+`herdr-mcp native-host install` always registers Google Chrome. Chromium, Chrome for Testing, Chrome Beta, Chrome Dev (`google-chrome-unstable`), Brave, and Microsoft Edge are registered only when that browser's config directory already exists. Linux manifest directories:
+
+| Browser | Manifest directory |
+| --- | --- |
+| Google Chrome | `~/.config/google-chrome/NativeMessagingHosts/dev.herdr.mcp.json` |
+| Chromium | `~/.config/chromium/NativeMessagingHosts/dev.herdr.mcp.json` |
+| Chrome for Testing | `~/.config/google-chrome-for-testing/NativeMessagingHosts/dev.herdr.mcp.json` |
+
+When `XDG_CONFIG_HOME` is an absolute path and this is the process home, those directories are created under `$XDG_CONFIG_HOME` instead of `~/.config`. A hand-written manifest that does not point at the managed wrapper is foreign; remove it before `native-host install`, which refuses to take over an unowned host file.
+
+Chrome launched with `--user-data-dir` reads native hosts from `<user-data-dir>/NativeMessagingHosts/`, not the default config directory. Repeat `--user-data-dir` on `native-host install` or `native-host use`. `native-host status` lists those directories and `native-host rollback` restores the previous set. The profile directory must already exist and must not be a symlink.
+
+The socket is created by the managed runtime, not by `native-host install`. `herdr-mcp service install` (also what an update and `herdr-mcp dev sync` run) rewrites the user systemd unit or the detached-process environment with `HERDR_EXTENSION_IPC_SOCKET` and restarts the runtime. A `service restart` of a unit written by an older runtime does not add that variable. After the new runtime is up, register the channel and restart Chrome so it launches the host:
+
+```bash
+herdr-mcp service install
+herdr-mcp native-host use standalone
+# or: herdr-mcp native-host install
+herdr-mcp native-host status
+```
+
+Then reload the extension (or restart Chrome) and confirm `herdr-mcp webchat endpoints` shows the browser endpoint. `extension.sock` should be a mode-`0600` socket owned by your user.
+
 ## First use
 
 1. Make sure Runtime + ChatGPT Connector already work.
