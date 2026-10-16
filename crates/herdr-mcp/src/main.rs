@@ -99,6 +99,7 @@ mod user_cli;
 mod utility_exec;
 mod web_artifact_cache;
 mod work_capture;
+mod work_compactor;
 mod worker;
 mod worker_bootstrap;
 mod workstation;

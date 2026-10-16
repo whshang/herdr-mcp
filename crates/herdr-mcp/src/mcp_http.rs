@@ -253,6 +253,9 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
     runtime_started_at_ms();
     let exec = ExecRegistry::new_with_client(exec_state_dir, Some(client.clone()))?;
     let prompt = PromptRegistry::with_runtime(state_store.clone(), cache.clone(), client.clone());
+    if let Ok(store) = state_store.lock() {
+        crate::work_compactor::start_background(&store);
+    }
     let skill = SkillService::new();
     crate::schema::prewarm_async();
     // Herdr is a recoverable local dependency. EventCache owns reconnect/backoff,

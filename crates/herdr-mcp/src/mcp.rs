@@ -21,7 +21,7 @@ use crate::progressive_skills::{
     BROWSER_SPACE_OPEN_METHOD, DOUBAO_IMAGE_GENERATE_METHOD, DOUBAO_IMAGE_STATUS_METHOD,
     EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
     WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
+    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
 use crate::semantic::{
@@ -371,6 +371,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 continuity_call(context.state_store, method, &params)
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
+            } else if method == WORK_PICKUP_METHOD {
+                work_pickup_call(context.state_store, &params)
             } else if method == BROWSER_SOURCE_RESOLVE_METHOD {
                 browser_source_resolve(context.state_store, &params, context.trusted_local_ipc)
             } else if method == BROWSER_HANDOFF_PREPARE_METHOD {
@@ -731,6 +733,57 @@ fn browser_conversation_url_ref(raw: &str) -> Option<BrowserConversationUrlRef> 
         }
         _ => None,
     }
+}
+
+fn work_pickup_call(store: &std::sync::Arc<std::sync::Mutex<StateStore>>, params: &Value) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "work_pickup_params_invalid"});
+    };
+    const ALLOWED: &[&str] = &["worktree", "project_root", "project_ref"];
+    if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+        return json!({"ok": false, "code": "work_pickup_params_invalid"});
+    }
+    let worktree = object.get("worktree").and_then(Value::as_str);
+    let project_root = object.get("project_root").and_then(Value::as_str);
+    if usize::from(worktree.is_some()) + usize::from(project_root.is_some()) != 1 {
+        return json!({"ok": false, "code": "work_pickup_params_invalid"});
+    }
+    let worktree = worktree.or(project_root).unwrap_or_default();
+    if worktree.trim().is_empty() || worktree.len() > 4096 {
+        return json!({"ok": false, "code": "work_pickup_params_invalid"});
+    }
+    let project_ref = object.get("project_ref").and_then(Value::as_str);
+    if project_ref.is_some_and(|value| value.trim().is_empty() || value.len() > 512) {
+        return json!({"ok": false, "code": "work_pickup_params_invalid"});
+    }
+    let Ok(store) = store.lock() else {
+        return json!({"ok": false, "code": "work_store_unavailable"});
+    };
+    let state = if let Some(project_ref) = project_ref {
+        match store.work_state(project_ref, worktree) {
+            Ok(state) => state,
+            Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+        }
+    } else {
+        let Ok(states) = store.work_states() else {
+            return json!({"ok": false, "code": "work_store_unavailable"});
+        };
+        states
+            .into_iter()
+            .filter(|state| state.worktree == worktree)
+            .max_by_key(|state| state.updated_at)
+    };
+    state.map_or_else(
+        || json!({"ok": true, "handoff_md": "", "through_event_id": 0, "updated_at": 0}),
+        |state| {
+            json!({
+                "ok": true,
+                "handoff_md": state.handoff_md,
+                "through_event_id": state.through_event_id,
+                "updated_at": state.updated_at,
+            })
+        },
+    )
 }
 
 fn continuity_call(
@@ -10900,6 +10953,45 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn work_pickup_returns_latest_matching_state_or_empty_success() {
+        use crate::state_store::work_journal::WorkState;
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "project-a".to_owned(),
+                worktree: "/repo".to_owned(),
+                handoff_md: "# Ready".to_owned(),
+                through_event_id: 9,
+                log_cursors_json: "{}".to_owned(),
+                updated_at: 12,
+            })
+            .unwrap();
+        let found = work_pickup_call(
+            &store,
+            &json!({"project_root": "/repo", "project_ref": "project-a"}),
+        );
+        assert_eq!(found["ok"], true);
+        assert_eq!(found["handoff_md"], "# Ready");
+        assert_eq!(found["through_event_id"], 9);
+        assert_eq!(found["updated_at"], 12);
+
+        let empty = work_pickup_call(&store, &json!({"worktree": "/other"}));
+        assert_eq!(
+            empty,
+            json!({
+                "ok": true,
+                "handoff_md": "",
+                "through_event_id": 0,
+                "updated_at": 0,
+            })
+        );
+    }
 
     /// Accepted-text evidence a real content script now reports alongside the
     /// provider user-message identity. Applied fixtures must carry it because
