@@ -2992,85 +2992,138 @@ test("user never dispatches a create whose account switched after the early fenc
   for (const item of [
     {
       name: "account switched after the early fence",
-      // The fresh h2w_register answer reports account A while the cached
-      // refs still held account B: only the final fresh check catches it.
-      freshAccountRef: "br_" + "a".repeat(64),
-      cachedAccountRef: "br_" + "b".repeat(64),
+      // The strict registration's own receipt reports account A while the
+      // cached refs still held account B: only the receipt catches it.
+      receiptAccountRef: "br_" + "a".repeat(64),
       expectDispatch: 0,
       expectCategory: "account_mismatch",
+      expectCacheCleared: true,
     },
     {
       name: "final refresh returns null while the old cache matches",
-      // The refresh is superseded/unavailable; the stale cache cannot prove
-      // identity, so the send fails closed even though it would have matched.
-      freshAccountRef: null,
-      cachedAccountRef: "br_" + "b".repeat(64),
-      freshNull: true,
+      // The refresh is superseded/unavailable and produces no receipt at all;
+      // the stale cache cannot prove identity, so the send fails closed even
+      // though it would have matched.
+      receiptNull: true,
       expectDispatch: 0,
       expectCategory: "identity_unavailable",
+      expectCacheCleared: false,
     },
     {
       name: "route drifted between the fences",
-      freshAccountRef: "br_" + "b".repeat(64),
-      cachedAccountRef: "br_" + "b".repeat(64),
       routeAfterFresh: "https://chatgpt.com/c/other-route",
       expectDispatch: 0,
       expectCategory: "route_mismatch",
+      expectCacheCleared: true,
+    },
+    {
+      name: "registration was superseded by a newer attempt during the wait",
+      supersededAttempt: true,
+      expectDispatch: 0,
+      expectCategory: "registration_superseded",
+      expectCacheCleared: false,
+    },
+    {
+      name: "the page document was replaced during the wait",
+      documentAfterFresh: true,
+      expectDispatch: 0,
+      expectCategory: "document_superseded",
+      expectCacheCleared: true,
+    },
+    {
+      name: "the live account changed after the strict registration finished",
+      nativeIdentityAfterFresh: "second-account-native",
+      expectDispatch: 0,
+      expectCategory: "account_mismatch",
+      expectCacheCleared: true,
     },
     {
       name: "generation went stale after the early fence",
-      freshAccountRef: "br_" + "b".repeat(64),
-      cachedAccountRef: "br_" + "b".repeat(64),
-      freshGeneration: 18,
+      receiptGeneration: 18,
       expectDispatch: 0,
       expectCategory: "generation_mismatch",
+      expectCacheCleared: true,
+    },
+    {
+      name: "the reserved space no longer matches the receipt",
+      receiptSpaceRef: "br_" + "c".repeat(64),
+      reservedSpaceRef: "br_" + "d".repeat(64),
+      expectDispatch: 0,
+      expectCategory: "space_mismatch",
+      expectCacheCleared: true,
     },
     {
       name: "empty Project launcher with a matching fresh identity still sends once",
-      // A brand-new Project tab has NO session yet (browser_session_ref
-      // null, bound false): that is exactly the legitimate create case.
-      freshAccountRef: "br_" + "b".repeat(64),
-      cachedAccountRef: "br_" + "b".repeat(64),
-      freshSessionRef: null,
+      // A brand-new Project tab has NO session yet (browser_session_ref null,
+      // bound false) while its reserved Project space is nonempty: that is
+      // exactly the legitimate create case and it must dispatch exactly once.
+      receiptSpaceRef: "br_" + "d".repeat(64),
+      reservedSpaceRef: "br_" + "d".repeat(64),
+      receiptSessionRef: null,
       expectDispatch: 1,
       expectCategory: null,
+      expectCacheCleared: false,
     },
   ]) {
-    const ctx = { dispatches: 0, freshRegistrations: 0 };
+    const ctx = { dispatches: 0, freshRegistrations: 0, cacheCleared: 0 };
     const submit = new Function("ctx", `
       const route = { current: "https://chatgpt.com/g/g-p-second/project" };
+      const location = { get href() { return route.current; } };
+      let registrationDocumentIdentity = {};
+      const documentTimeOrigin = () => 1234;
+      const registrationReceipts = new Map();
+      let browserRegistrationAttempt = 7;
+      let nativeIdentity = "opaque-native-account";
       const ADAPTER = {
         name: "chatgpt",
         getInputEl: () => ({}),
         getConversationKey: () => route.current,
       };
-      // Cached refs from the early actuation-time refresh.
-      let registeredConvKey = "https://chatgpt.com/g/g-p-second/project";
+      const browserAccountNativeIdentity = async () => nativeIdentity;
+      const clearRegistrationIdentityCache = () => { ctx.cacheCleared += 1; };
+      // Cached refs from the early actuation-time refresh. They are stale on
+      // purpose: the fence must never consult them as authority.
+      let registeredConvKey = route.current;
       let registeredBrowserSessionRef = "br_" + "e".repeat(64);
-      let registeredBrowserAccountRef = ${JSON.stringify(item.cachedAccountRef)};
+      let registeredBrowserAccountRef = ${JSON.stringify(item.receiptAccountRef || ("br_" + "b".repeat(64)))};
       let registeredBrowserSpaceRef = null;
       let registeredBrowserGeneration = 17;
       let lastRegistrationErrorClass = null;
       const registerCurrentConversation = async () => {
         ctx.freshRegistrations += 1;
-        if (${item.freshNull === true ? "true" : "false"}) return null;
-        const accountRef = ${item.freshAccountRef === null ? "null" : JSON.stringify(item.freshAccountRef)};
-        const generation = ${item.freshGeneration ? String(item.freshGeneration) : "17"};
+        if (${item.receiptNull === true ? "true" : "false"}) return null;
         // The real h2w_register answer shape: opaque account/space refs,
-        // generation, session ref (null on an empty Project launcher), and
-        // no bound conversation for a fresh create tab.
+        // generation, session ref (null on an empty Project launcher), and no
+        // bound conversation for a fresh create tab.
         const response = {
           bound: false,
-          browser_session_ref: ${item.freshSessionRef === null ? "null" : `"br_${"e".repeat(64)}"`},
-          browser_account_ref: accountRef,
-          browser_space_ref: null,
-          browser_generation: generation,
+          browser_session_ref: ${item.receiptSessionRef === null ? "null" : `"br_${"e".repeat(64)}"`},
+          browser_account_ref: ${JSON.stringify(item.receiptAccountRef || ("br_" + "b".repeat(64)))},
+          browser_space_ref: ${item.receiptSpaceRef === undefined ? "null" : JSON.stringify(item.receiptSpaceRef)},
+          browser_generation: ${item.receiptGeneration ? String(item.receiptGeneration) : "17"},
           herdr_app_keyword: null,
           browser_pending_dispatch: null,
         };
-        if (${JSON.stringify(item.routeAfterFresh || null)} !== null) route.current = ${JSON.stringify(item.routeAfterFresh || "")};
-        registeredBrowserAccountRef = accountRef;
-        registeredBrowserGeneration = generation;
+        // The strict registration binds its private receipt to THIS response
+        // object; the fence can only obtain it from here.
+        registrationReceipts.set(response, Object.freeze({
+          strict: true,
+          route: route.current,
+          attempt: browserRegistrationAttempt,
+          documentIdentity: registrationDocumentIdentity,
+          timeOrigin: documentTimeOrigin(),
+          href: location.href,
+          nativeAccountIdentity: nativeIdentity,
+          accountRef: response.browser_account_ref,
+          spaceRef: response.browser_space_ref,
+          generation: response.browser_generation,
+          sessionRef: response.browser_session_ref,
+        }));
+        // The page moves on while the create still waits.
+        ${item.supersededAttempt === true ? "browserRegistrationAttempt += 1;" : ""}
+        ${item.documentAfterFresh === true ? "registrationDocumentIdentity = {};" : ""}
+        ${item.nativeIdentityAfterFresh !== undefined ? `nativeIdentity = ${JSON.stringify(item.nativeIdentityAfterFresh)};` : ""}
+        ${item.routeAfterFresh ? `route.current = ${JSON.stringify(item.routeAfterFresh)};` : ""}
         return response;
       };
       const isComposerGenerating = () => false;
@@ -3085,12 +3138,13 @@ test("user never dispatches a create whose account switched after the early fenc
     `)(ctx);
     const outcome = await submit({
       creatingSession: true,
-      reservedAccountRef: "br_" + "b".repeat(64),
-      reservedSpaceRef: "",
+      reservedAccountRef: item.reservedAccountRef || ("br_" + "b".repeat(64)),
+      reservedSpaceRef: item.reservedSpaceRef === undefined ? "" : item.reservedSpaceRef,
       reservedGeneration: 17,
     });
-    assert.equal(ctx.freshRegistrations, 1, `${item.name}: the fence awaits exactly one fresh observation`);
+    assert.equal(ctx.freshRegistrations, 1, `${item.name}: the fence awaits exactly one fresh strict observation`);
     assert.equal(ctx.dispatches, item.expectDispatch, item.name);
+    assert.equal(ctx.cacheCleared, item.expectCacheCleared === true ? 1 : 0, `${item.name}: a refused attempt clears the stale identity cache`);
     if (item.expectCategory === null) {
       assert.equal(outcome.ok, true, item.name);
     } else {
@@ -3100,6 +3154,173 @@ test("user never dispatches a create whose account switched after the early fenc
       assert.equal(outcome.scope_identity_error, item.expectCategory, item.name);
     }
   }
+});
+
+test("user keeps a second-account create fail-closed through the real registration chain | Given a strict create registration whose page, attempt, or account identity drifts during its awaits | When the pre-dispatch fence revalidates the private receipt | Then every drift sends zero Enter submits while a matching empty Project launcher sends exactly one", async () => {
+  const projectIdentityStart = wakeSource.indexOf("async function currentAdapterProjectIdentity(convKey)");
+  const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch()", projectIdentityStart);
+  const submitStart = wakeSource.indexOf("  async function submitBrowserActuationOnce(");
+  const submitEnd = wakeSource.indexOf("\n  // ---- Submission ----", submitStart);
+  assert.ok(projectIdentityStart >= 0 && registrationEnd > projectIdentityStart, "registration chain must remain extractable");
+  assert.ok(submitStart >= 0 && submitEnd > submitStart, "single-shot submit must remain extractable");
+  // The REAL runConversationRegistration, registerCurrentConversation, and
+  // submitBrowserActuationOnce run in one scope; only the adapter, the provider
+  // identity API, the background IPC, and the DOM surface are faked.
+  const chainSource = `${wakeSource.slice(projectIdentityStart, registrationEnd)}\n${wakeSource.slice(submitStart, submitEnd)}`;
+
+  const ROUTE = "https://chatgpt.com/g/g-p-second/project";
+  const ACCOUNT_REF = "br_" + "b".repeat(64);
+  const SPACE_REF = "br_" + "d".repeat(64);
+
+  function harness(scenario = {}) {
+    const ctx = { sends: 0, dispatches: 0, healthCalls: 0, identityReads: 0 };
+    const sandbox = new Function("ctx", `
+      const SCENARIO = ${JSON.stringify(scenario)};
+      const routes = { current: ${JSON.stringify(ROUTE)} };
+      const location = {
+        get origin() { return "https://chatgpt.com"; },
+        get href() { return routes.current; },
+      };
+      const performance = { timeOrigin: 9001 };
+      let accountIdentity = "opaque-native-account";
+      let identityReads = 0;
+      const browserAccountNativeIdentity = async () => {
+        identityReads += 1;
+        ctx.identityReads = identityReads;
+        if (SCENARIO.nullIdentity === true) return null;
+        // Same-route replacement of the provider session after the entry read.
+        if (SCENARIO.accountDriftAfterEntry === true && identityReads > 1) return "second-account-native";
+        return accountIdentity;
+      };
+      const ADAPTER = {
+        name: "chatgpt",
+        getConversationKey: () => routes.current,
+        getInputEl: () => ({}),
+        inputHasContent: () => true,
+        resolveProjectIdentity: () => null,
+        getLatestUserAppKeywords: () => [],
+        needsMainWorldInsert: false,
+      };
+      const sessionStorage = { getItem: () => null, removeItem: () => {} };
+      const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+      const runtimeAlive = () => true;
+      const chatGptProjectCatalog = async () => [];
+      const currentChatGptProjectFromCatalog = () => null;
+      const chatGptConversationId = () => null;
+      const latestTurnForRole = () => null;
+      const wait = async () => {};
+      const findSendButton = () => ({ disabled: false });
+      const isSendButton = () => true;
+      const isComposerGenerating = () => false;
+      const captureSubmitAckBaseline = () => ({});
+      const dispatchEnterSubmit = () => { ctx.dispatches += 1; };
+      const waitForSubmitAck = async () => true;
+      const submitMainWorld = async () => ({ ok: true, submitted: true });
+      const refreshQueuedInsertStatus = () => {};
+      const backfillCurrentChatGptContinuity = () => {};
+      const restoreBrowserResultAssignment = () => {
+        // The provider session is replaced under the SAME route during the
+        // post-response phase of the registration, so the response is stale by
+        // the time runConversationRegistration would return it.
+        if (SCENARIO.accountDriftAfterResponse === true) accountIdentity = "second-account-native";
+      };
+      const armBrowserPendingDispatchRefresh = () => {};
+      const clearBrowserPendingDispatchRefresh = () => {};
+      const observeBrowserResultSettlement = async () => {};
+      const acceptedDispatchAssignments = new Map();
+      let browserResultProbeState = null;
+      const CONTEXT_PRESSURE = false;
+      const loadContextPressure = async () => null;
+      const updateContextPressure = async () => null;
+      const paintPageHud = () => {};
+      const usesOperationalHud = () => false;
+      const refreshPageHud = () => {};
+      const removeQueuedInsertButton = () => {};
+      let conversationHealth = null;
+      let contextPressureRecord = null;
+      let queuedInsertCount = 0;
+      let registeredConvKey = null;
+      let registeredBrowserSessionRef = null;
+      let registeredBrowserGeneration = null;
+      let registeredBrowserAccountRef = null;
+      let registeredBrowserSpaceRef = null;
+      let registeredHerdrAppKeyword = null;
+      let registeredConversationBound = false;
+      let lastRegistrationErrorClass = null;
+      let browserRegistrationAttempt = 0;
+      const ensureConversationHealth = async () => {
+        ctx.healthCalls += 1;
+        // A concrete /c/ route reaches here after the response as well; the same
+        // drift must be caught on that path too.
+        if (SCENARIO.accountDriftAfterResponse === true) accountIdentity = "second-account-native";
+      };
+      const sendBg = async () => {
+        ctx.sends += 1;
+        if (SCENARIO.routeSupersededDuringSend === true) routes.current = "https://chatgpt.com/c/other-route";
+        if (SCENARIO.attemptSupersededDuringSend === true) browserRegistrationAttempt += 1;
+        // The real h2w_register answer shape for an empty Project launcher:
+        // nonempty Project space, no session yet, no bound conversation.
+        return {
+          bound: false,
+          browser_session_ref: null,
+          browser_account_ref: ${JSON.stringify(ACCOUNT_REF)},
+          browser_space_ref: ${JSON.stringify(SPACE_REF)},
+          browser_generation: 17,
+          herdr_app_keyword: null,
+          browser_pending_dispatch: null,
+        };
+      };
+      ${chainSource}
+      return {
+        submit: submitBrowserActuationOnce,
+        state: () => ({
+          convKey: registeredConvKey,
+          sessionRef: registeredBrowserSessionRef,
+          accountRef: registeredBrowserAccountRef,
+          attempt: browserRegistrationAttempt,
+        }),
+      };
+    `)(ctx);
+    return { ctx, sandbox };
+  }
+
+  async function create(scenario = {}) {
+    const { ctx, sandbox } = harness(scenario);
+    const outcome = await sandbox.submit({
+      creatingSession: true,
+      reservedAccountRef: ACCOUNT_REF,
+      reservedSpaceRef: SPACE_REF,
+      reservedGeneration: 17,
+    });
+    return { outcome, ctx, state: sandbox.state() };
+  }
+
+  const drifted = await create({ accountDriftAfterEntry: true });
+  assert.equal(drifted.ctx.sends, 0, "a same-route account change before the registry answer must never reach h2w_register");
+  assert.equal(drifted.ctx.dispatches, 0, "a same-route account change must leave zero Enter submits");
+  assert.equal(drifted.outcome.attempted, false, "the refusal must not claim an attempt");
+
+  const missingIdentity = await create({ nullIdentity: true });
+  assert.equal(missingIdentity.ctx.sends, 0, "a null native identity must fail closed before registration");
+  assert.equal(missingIdentity.ctx.dispatches, 0, "a null native identity must leave zero Enter submits");
+
+  const routeSuperseded = await create({ routeSupersededDuringSend: true });
+  assert.equal(routeSuperseded.ctx.sends, 1, "the superseded route case still completed its one registry send");
+  assert.equal(routeSuperseded.ctx.dispatches, 0, "a route superseded during the await must leave zero Enter submits");
+
+  const attemptSuperseded = await create({ attemptSupersededDuringSend: true });
+  assert.equal(attemptSuperseded.ctx.dispatches, 0, "a superseded registration attempt must leave zero Enter submits");
+
+  const healthDrift = await create({ accountDriftAfterResponse: true });
+  assert.equal(healthDrift.ctx.dispatches, 0, "an account replaced during the post-response phase must leave zero Enter submits");
+  assert.equal(healthDrift.state.convKey, null, "a rejected strict registration must clear the identity cache");
+  assert.equal(healthDrift.state.sessionRef, null, "a rejected strict registration must clear the cached session ref");
+
+  const accepted = await create();
+  assert.equal(accepted.ctx.sends, 1, "the strict fence performs exactly one strict registration send");
+  assert.equal(accepted.ctx.dispatches, 1, "a matching empty Project launcher must dispatch exactly once");
+  assert.equal(accepted.outcome.ok, true, "the accepted create reports success");
+  assert.equal(accepted.state.accountRef, ACCOUNT_REF, "the successful strict registration publishes the response's own account ref");
 });
 
 test("user keeps an uncertain created tab and never resends | Given the create content leg answered with accepted evidence carrying typed registration diagnostics or the evidence upload failed | When the background completes the actuation | Then the owned tab stays open with typed evidence and no second send happens", async () => {

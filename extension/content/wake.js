@@ -1120,16 +1120,14 @@ function normalizeHerdrMentionAlias(value) {
     }
     if (options.creatingSession === true) {
       // FINAL create scope fence (second-account safety). Cached registry refs
-      // from the earlier actuation-time refresh are NOT proof: every await
-      // since then (App selection, snapshots, composer insert, readiness
-      // waits) could have observed an account switch while the cache still
-      // matches. So the fence FIRST awaits a new attempt-bound registration
-      // refresh through the existing identity+registry path, proves THIS
-      // attempt succeeded, and only then compares the fresh opaque
-      // account/space/generation to the reserved scope. No raw native account
-      // id and no new network primitive. A null, superseded, failed, or
-      // timed-out refresh fails closed with ZERO submits even when the old
-      // cache still matches.
+      // from the earlier actuation-time refresh are NOT proof: every await since
+      // then (App selection, snapshots, composer insert, readiness waits) could
+      // have observed an account switch while the cache still matches. So the
+      // fence awaits a NEW attempt-bound STRICT registration and then accepts
+      // only the private receipt that registration attached to its own response
+      // object. Mutable registry globals are never consulted as authority, and a
+      // null, non-strict, superseded, or mismatched result fails closed with
+      // ZERO submits even when the old cache would have matched.
       const reservedAccountRef = typeof options.reservedAccountRef === "string"
         ? options.reservedAccountRef
         : "";
@@ -1140,37 +1138,53 @@ function normalizeHerdrMentionAlias(value) {
         && options.reservedGeneration > 0
         ? options.reservedGeneration
         : 0;
+      // Capture the page identity this fence intends to prove BEFORE awaiting,
+      // so a navigation during the refresh cannot retroactively define it.
+      const fenceRoute = ADAPTER.getConversationKey();
+      const fenceDocumentIdentity = registrationDocumentIdentity;
       let freshOutcome = null;
       try {
         freshOutcome = await registerCurrentConversation("browser-session-create", {
           refreshObservation: true,
+          requireFreshIdentityProof: true,
         });
       } catch (_) {
         freshOutcome = null;
       }
-      const freshRoute = ADAPTER.getConversationKey();
-      // Compare THIS refresh response's own opaque fields, never the global
-      // cache: a superseded or non-bound refresh that left old globals behind
-      // cannot pass. The background registry answer carries exactly these
-      // field names for the Project launcher route; missing or malformed
+      // The ONLY authority for this send is the receipt bound to this exact
+      // response object. The background registry answer carries exactly these
+      // opaque field names for the Project launcher route; missing or malformed
       // values fail closed with no retry.
-      const actualAccountRef = typeof freshOutcome?.browser_account_ref === "string"
-        && freshOutcome.browser_account_ref
-        ? freshOutcome.browser_account_ref
+      const receipt = freshOutcome ? (registrationReceipts.get(freshOutcome) || null) : null;
+      // Last live identity read: after this await every remaining step is
+      // synchronous through the single Enter dispatch.
+      const dispatchAccountNativeIdentity = receipt
+        ? await browserAccountNativeIdentity().catch(() => null)
         : null;
-      const actualSpaceRef = typeof freshOutcome?.browser_space_ref === "string"
-        && freshOutcome.browser_space_ref
-        ? freshOutcome.browser_space_ref
-        : null;
-      const actualGeneration = Number.isSafeInteger(freshOutcome?.browser_generation)
-        && freshOutcome.browser_generation > 0
-        ? freshOutcome.browser_generation
-        : null;
+      const actualAccountRef = receipt?.accountRef || null;
+      const actualSpaceRef = receipt?.spaceRef || null;
+      const actualGeneration = Number.isSafeInteger(receipt?.generation) ? receipt.generation : null;
+      const routeNow = ADAPTER.getConversationKey();
       let scopeCategory = null;
-      if (!freshOutcome || !reservedAccountRef || !actualAccountRef) {
+      if (!freshOutcome || !receipt || receipt.strict !== true || !reservedAccountRef || !actualAccountRef) {
         scopeCategory = "identity_unavailable";
-      } else if (registeredConvKey !== freshRoute || !freshRoute) {
+      } else if (receipt.attempt !== browserRegistrationAttempt) {
+        // Another registration started after this one: this observation is no
+        // longer the newest statement about the page.
+        scopeCategory = "registration_superseded";
+      } else if (!fenceRoute || !routeNow || routeNow !== fenceRoute || receipt.route !== fenceRoute) {
         scopeCategory = "route_mismatch";
+      } else if (registrationDocumentIdentity !== fenceDocumentIdentity
+        || receipt.documentIdentity !== fenceDocumentIdentity
+        || documentTimeOrigin() !== receipt.timeOrigin
+        || location.href !== receipt.href) {
+        scopeCategory = "document_superseded";
+      } else if (!dispatchAccountNativeIdentity) {
+        scopeCategory = "identity_unavailable";
+      } else if (dispatchAccountNativeIdentity !== receipt.nativeAccountIdentity) {
+        // The account changed between the end of the strict registration and
+        // this read: the response's opaque account_ref describes the old one.
+        scopeCategory = "account_mismatch";
       } else if (actualAccountRef !== reservedAccountRef) {
         scopeCategory = "account_mismatch";
       } else if (reservedSpaceRef ? actualSpaceRef !== reservedSpaceRef : Boolean(actualSpaceRef)) {
@@ -1179,6 +1193,9 @@ function normalizeHerdrMentionAlias(value) {
         scopeCategory = "generation_mismatch";
       }
       if (scopeCategory !== null) {
+        // Fail closed AND drop any cache written by the refused attempt: a stale
+        // identity cache must never become authority for a later send.
+        if (receipt && receipt.attempt === browserRegistrationAttempt) clearRegistrationIdentityCache();
         return {
           ok: false,
           attempted: false,
@@ -1186,13 +1203,7 @@ function normalizeHerdrMentionAlias(value) {
           scope_identity_error: scopeCategory,
         };
       }
-      // The fresh identity is proven for exactly this registration attempt's
-      // route. runConversationRegistration reads the page identity before its
-      // other awaits, so a provider-side account flip during those awaits can
-      // still produce a stale-but-consistent observation; that residual race
-      // is accepted fail-closed server-side (the reservation never
-      // materializes under a foreign account) and is NOT proof for dispatch.
-      // Synchronously revalidate the submit surface — no further await — and
+      // Synchronously revalidate the submit surface - no further await - and
       // capture the ack baseline only now, immediately before dispatch.
       const finalInput = ADAPTER.getInputEl();
       if (!finalInput) {
@@ -3801,8 +3812,71 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   const registrationInFlight = new Map();
+  // One immutable identity object per content-script instance. The script is
+  // re-injected for every new document, so a different object - or a different
+  // performance.timeOrigin - proves that a different document is live and an
+  // older registration response no longer describes this page.
+  const registrationDocumentIdentity = Object.freeze({});
+  // Private per-response receipt for a strict registration, keyed by the exact
+  // response object. A caller therefore cannot obtain identity proof from a
+  // mutable global cache. The raw native account identity lives ONLY in this
+  // receipt and in local variables: it is never an enumerable response field,
+  // never a diagnostic token, never logged, and never sent over IPC.
+  const registrationReceipts = new WeakMap();
+  const documentTimeOrigin = () => (typeof performance !== "undefined" && performance
+    ? performance.timeOrigin
+    : null);
 
-  async function runConversationRegistration(reason, convKey, registrationAttempt) {
+  // Bounded INTERNAL proof of the page, document, and attempt a registration
+  // belongs to. Captured BEFORE the first await so that no later await can
+  // retroactively define what the proof is about.
+  function registrationProof(convKey, registrationAttempt) {
+    return {
+      attempt: registrationAttempt,
+      route: convKey,
+      documentIdentity: registrationDocumentIdentity,
+      timeOrigin: documentTimeOrigin(),
+      href: location.href,
+    };
+  }
+
+  // Re-derive the live page facts and report whether the proof still holds. The
+  // route is compared through the adapter's own normalization, not string
+  // equality on href alone, so the check means "this is still the conversation
+  // this registration was started for".
+  function registrationProofHolds(proof, convKey) {
+    if (!proof) return false;
+    if (proof.attempt !== browserRegistrationAttempt) return false;
+    if (registrationDocumentIdentity !== proof.documentIdentity) return false;
+    if (documentTimeOrigin() !== proof.timeOrigin) return false;
+    if (location.href !== proof.href) return false;
+    return Boolean(convKey) && proof.route === convKey && ADAPTER.getConversationKey() === proof.route;
+  }
+
+  // Fail closed: a strict registration that can no longer prove its own route,
+  // attempt, document, or account must not leave an identity/session cache
+  // behind for other code paths to mistake for evidence. The route poll
+  // re-registers the current conversation on its next tick.
+  function clearRegistrationIdentityCache() {
+    registeredConvKey = null;
+    registeredBrowserSessionRef = null;
+    registeredBrowserGeneration = null;
+    registeredBrowserAccountRef = null;
+    registeredBrowserSpaceRef = null;
+    registeredHerdrAppKeyword = null;
+    registeredConversationBound = false;
+    lastRegistrationErrorClass = null;
+  }
+
+  async function runConversationRegistration(reason, convKey, registrationAttempt, options = null) {
+    // STRICT IDENTITY PROOF (session.create). A create is a mutation under an
+    // account-bound reservation, so a registration that cannot prove its own
+    // route, attempt, document, and CURRENTLY LIVE native account must return
+    // null instead of advertising an identity that may belong to a previous
+    // account. The proof is taken before the first await and revalidated after
+    // the pre-send awaits and again after every post-send await.
+    const requireFreshIdentityProof = options?.requireFreshIdentityProof === true;
+    const proof = requireFreshIdentityProof ? registrationProof(convKey, registrationAttempt) : null;
     const accountNativeIdentity = await browserAccountNativeIdentity();
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
@@ -3850,6 +3924,23 @@ function normalizeHerdrMentionAlias(value) {
       ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
       : [];
     lastRegistrationErrorClass = null;
+    if (requireFreshIdentityProof) {
+      // The catalog/project awaits above can take seconds (catalog cache miss,
+      // provider project lookups) and the provider session can be replaced by a
+      // different account during them. Re-read the SAME fixed provider identity
+      // API and refuse to advertise a stale identity: a failed read, a changed
+      // account, a superseded attempt, a moved route, or a replaced document
+      // fails closed with no h2w_register at all.
+      const revalidatedAccountNativeIdentity = await browserAccountNativeIdentity();
+      if (!revalidatedAccountNativeIdentity || revalidatedAccountNativeIdentity !== accountNativeIdentity) {
+        lastRegistrationErrorClass = "registration_unavailable";
+        return null;
+      }
+      if (!registrationProofHolds(proof, convKey)) {
+        lastRegistrationErrorClass = "registration_superseded";
+        return null;
+      }
+    }
     const response = await sendBg({
       type: "h2w_register",
       convKey,
@@ -3954,6 +4045,51 @@ function normalizeHerdrMentionAlias(value) {
         if (usesOperationalHud()) void refreshPageHud();
       }
     }
+    if (requireFreshIdentityProof && response !== null) {
+      // FINAL registration check: this runs after every await in this function
+      // (health, context pressure, App-identity backfill), so a receipt can only
+      // exist when the account, route, attempt, and document are still the exact
+      // ones this response was produced under. Without it an account replaced
+      // during those awaits would leave a response whose opaque account_ref came
+      // from an identity read taken before them. This removes the deliberate
+      // async window; it cannot promise atomicity against the provider changing
+      // authentication after this read, which is why the dispatch fence performs
+      // one more live read immediately before the single Enter submit.
+      const finalAccountNativeIdentity = await browserAccountNativeIdentity();
+      if (!finalAccountNativeIdentity || finalAccountNativeIdentity !== accountNativeIdentity) {
+        clearRegistrationIdentityCache();
+        lastRegistrationErrorClass = "registration_unavailable";
+        return null;
+      }
+      if (!registrationProofHolds(proof, convKey)) {
+        clearRegistrationIdentityCache();
+        lastRegistrationErrorClass = "registration_superseded";
+        return null;
+      }
+      // Response-owned opaque facts only: the receipt never copies a value back
+      // out of the mutable cache, so a later registration cannot rewrite it.
+      registrationReceipts.set(response, Object.freeze({
+        strict: true,
+        route: convKey,
+        attempt: registrationAttempt,
+        documentIdentity: proof.documentIdentity,
+        timeOrigin: proof.timeOrigin,
+        href: proof.href,
+        nativeAccountIdentity: finalAccountNativeIdentity,
+        accountRef: typeof response?.browser_account_ref === "string" && response.browser_account_ref
+          ? response.browser_account_ref
+          : null,
+        spaceRef: typeof response?.browser_space_ref === "string" && response.browser_space_ref
+          ? response.browser_space_ref
+          : null,
+        generation: Number.isSafeInteger(response?.browser_generation) && response.browser_generation > 0
+          ? response.browser_generation
+          : null,
+        sessionRef: typeof response?.browser_session_ref === "string" && response.browser_session_ref
+          ? response.browser_session_ref
+          : null,
+      }));
+    }
     return response;
   }
 
@@ -3978,6 +4114,21 @@ function normalizeHerdrMentionAlias(value) {
     // the h2w_register send (registry_handshake_delay).
     const inFlight = registrationInFlight.get(convKey);
     if (inFlight && inFlight.attempt === browserRegistrationAttempt) {
+      if (options?.requireFreshIdentityProof === true) {
+        // A strict (create) caller must never accept the ordinary in-flight
+        // result: chain one additional strict run AFTER it, so the proof belongs
+        // to a registration this caller awaited itself. The chained call never
+        // re-requests a refresh, so the chain cannot recurse, and it starts a
+        // new attempt because the in-flight entry is deleted as it settles.
+        if (!inFlight.strictRefreshChain) {
+          const base = inFlight.refreshChain || inFlight.promise;
+          const chainedStrictRefresh = () => (ADAPTER.getConversationKey() === convKey
+            ? registerCurrentConversation(reason, { requireFreshIdentityProof: true })
+            : null);
+          inFlight.strictRefreshChain = base.then(chainedStrictRefresh, chainedStrictRefresh);
+        }
+        return inFlight.strictRefreshChain;
+      }
       if (options?.refreshObservation === true) {
         if (!inFlight.refreshQueued) {
           // A refreshObservation request chains one fresh run after the
@@ -3999,8 +4150,14 @@ function normalizeHerdrMentionAlias(value) {
     // in-flight ones: newest attempt wins across route changes, and the
     // route-drift fences in runConversationRegistration stay authoritative.
     const registrationAttempt = ++browserRegistrationAttempt;
-    const entry = { attempt: registrationAttempt, promise: null, refreshQueued: false, refreshChain: null };
-    entry.promise = runConversationRegistration(reason, convKey, registrationAttempt);
+    const entry = {
+      attempt: registrationAttempt,
+      promise: null,
+      refreshQueued: false,
+      refreshChain: null,
+      strictRefreshChain: null,
+    };
+    entry.promise = runConversationRegistration(reason, convKey, registrationAttempt, options);
     registrationInFlight.set(convKey, entry);
     entry.promise.then(
       () => { if (registrationInFlight.get(convKey) === entry) registrationInFlight.delete(convKey); },

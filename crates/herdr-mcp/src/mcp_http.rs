@@ -620,6 +620,7 @@ fn sanitize_browser_actuation_result(result: &Value) -> Value {
     const REGISTRATION_ERRORS: &[&str] = &[
         "registration_unavailable",
         "registration_failed",
+        "registration_superseded",
         "browser_observation_failed",
         "browser_session_reservation_not_found",
         "browser_session_reservation_not_pending",
@@ -634,6 +635,8 @@ fn sanitize_browser_actuation_result(result: &Value) -> Value {
         "generation_mismatch",
         "identity_unavailable",
         "route_mismatch",
+        "registration_superseded",
+        "document_superseded",
     ];
     let mut clean = serde_json::Map::new();
     if let Value::Object(fields) = diagnostics {
@@ -3277,6 +3280,65 @@ mod tests {
             "herdr-mcp-http-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn browser_actuation_diagnostics_keep_only_typed_bounded_tokens() {
+        let result = json!({
+            "error": "browser_create_scope_mismatch",
+            "create_diagnostics": {
+                "registration_attempted": true,
+                "registration_error": "registration_superseded",
+                "scope_identity_verified": false,
+                "scope_identity_error": "document_superseded",
+                "raw_account_native_id": "user-1234567890",
+                "provider_message": "account 1234567890 is not the reserved one",
+            },
+        });
+        let clean = sanitize_browser_actuation_result(&result);
+        let diagnostics = clean
+            .get("create_diagnostics")
+            .and_then(Value::as_object)
+            .expect("sanitized diagnostics must stay an object");
+        assert_eq!(
+            diagnostics.get("registration_attempted"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            diagnostics.get("scope_identity_verified"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            diagnostics
+                .get("registration_error")
+                .and_then(Value::as_str),
+            Some("registration_superseded")
+        );
+        assert_eq!(
+            diagnostics
+                .get("scope_identity_error")
+                .and_then(Value::as_str),
+            Some("document_superseded")
+        );
+        assert_eq!(diagnostics.len(), 4, "only the four typed keys survive");
+        assert!(
+            !clean.to_string().contains("1234567890"),
+            "raw account ids and provider text never pass the allowlist"
+        );
+
+        // An unlisted token degrades to the bounded `other` category instead of
+        // forwarding unvalidated provider-controlled text.
+        let degraded = sanitize_browser_actuation_result(&json!({
+            "create_diagnostics": { "scope_identity_error": "account-1234567890-mismatch" },
+        }));
+        assert_eq!(
+            degraded
+                .get("create_diagnostics")
+                .and_then(Value::as_object)
+                .and_then(|diagnostics| diagnostics.get("scope_identity_error"))
+                .and_then(Value::as_str),
+            Some("other")
+        );
     }
 
     #[test]
