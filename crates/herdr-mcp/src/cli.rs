@@ -4150,6 +4150,7 @@ mod tests {
                     provider: "*".to_owned(),
                     account_ref: "*".to_owned(),
                     allowed,
+                    device_wide: true,
                 })
             );
         }

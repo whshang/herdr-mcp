@@ -1743,6 +1743,29 @@ fn resolve_connector_selector(
     select_active_connector_id(selector, &inventory)
 }
 
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    test
+))]
+fn valid_webchat_control_scope(endpoint_ref: &str, provider: &str, account_ref: &str) -> bool {
+    if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
+        && (provider != crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
+            || account_ref != crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT)
+    {
+        return false;
+    }
+    provider == crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
+        || (!provider.is_empty()
+            && provider.len() <= 32
+            && provider.chars().enumerate().all(|(index, ch)| {
+                if index == 0 {
+                    ch.is_ascii_lowercase() || ch.is_ascii_digit()
+                } else {
+                    ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+                }
+            }))
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn set_connector_webchat_control(
     paths: &RuntimePaths,

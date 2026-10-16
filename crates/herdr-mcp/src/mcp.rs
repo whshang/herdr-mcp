@@ -6213,6 +6213,9 @@ pub(crate) const WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT: &str = "*";
 
 /// Device-wide wildcard. Edge forwards only grants whose `device_id` matches
 /// the routed device, so `*` covers every endpoint on that device and no other.
+/// Kept for test references; the strict grant_covers path uses the
+/// DEVICE_SCOPE_ENDPOINT triplet check instead.
+#[cfg(test)]
 pub(crate) const WEBCHAT_CONTROL_ANY_ENDPOINT: &str = "*";
 
 fn browser_resource_actuation_decision(
