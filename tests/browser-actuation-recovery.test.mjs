@@ -2152,6 +2152,7 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     const location = { get href() { return currentUrl; } };
     const runtimeAlive = () => true;
     const browserAccountNativeIdentity = async () => "opaque-account";
+    const browserAccountObservation = async () => ({ nativeIdentity: await browserAccountNativeIdentity(), email: null });
     const chatGptProjectCatalog = async () => [];
     const currentChatGptProjectFromCatalog = () => null;
     const sendBg = async (payload) => new Promise((resolve) => pending.push({ payload, resolve }));

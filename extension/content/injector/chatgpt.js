@@ -66,6 +66,7 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   async getAccountObservation(timeoutMs = 1500) {
+    let nativeIdentity = null;
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -80,14 +81,18 @@ class ChatGPTAdapter extends BaseAdapter {
         if (!response.ok) continue;
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-        const nativeIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
-        if (nativeIdentity) return { nativeIdentity, email: this.displayEmailFromPayload(payload) };
+        const observedIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+        if (!observedIdentity) continue;
+        if (!nativeIdentity) nativeIdentity = observedIdentity;
+        if (observedIdentity !== nativeIdentity) continue;
+        const email = this.displayEmailFromPayload(payload);
+        if (email) return { nativeIdentity, email };
       } catch (_) {
       } finally {
         clearTimeout(timer);
       }
     }
-    return { nativeIdentity: null, email: null };
+    return { nativeIdentity, email: null };
   }
 
   async getAccountNativeIdentity(timeoutMs = 1500) {

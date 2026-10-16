@@ -114,6 +114,10 @@ ok(wakeSource.includes('tasks: hud?.task_summary || null')
     && hudRendererSource.includes('tasks.uncertain'),
   "HUD renders durable task running/completed/blocked/uncertain counters from the Runtime inbox");
 ok(wakeSource.includes(`const H2W_CONTENT_VERSION = "${manifestVersion}"`), "content version matches manifest");
+ok(wakeSource.includes("async function browserAccountObservation()")
+    && wakeSource.includes("const accountObservation = await browserAccountObservation()")
+    && wakeSource.includes("accountDisplayEmail: accountObservation.email"),
+  "conversation registration implements and forwards display-only account observation");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
 // Conversation attachment contract: extension-generated ChatGPT turns preserve
 // a provider-owned App identity only from explicit input, the learned binding,
@@ -784,6 +788,28 @@ ok(
   ok(accountDisplayObservation.nativeIdentity === "chatgpt-user-123"
       && accountDisplayObservation.email === "claude@qingxian.com",
     "ChatGPT account email is display-only metadata from the same signed-in identity response");
+  accountCtx.fetch = async (url) => ({
+    ok: true,
+    json: async () => url === "/backend-api/me"
+      ? { id: "chatgpt-user-123" }
+      : { user: { id: "chatgpt-user-123", email: " SECOND@QINGXIAN.COM " } },
+  });
+  const secondaryEmail = await vm.runInContext(
+    "window.__H2W_ADAPTER__.getAccountObservation()", accountCtx);
+  ok(secondaryEmail.nativeIdentity === "chatgpt-user-123"
+      && secondaryEmail.email === "second@qingxian.com",
+    "ChatGPT secondary session email is accepted only for the same signed-in identity");
+  accountCtx.fetch = async (url) => ({
+    ok: true,
+    json: async () => url === "/backend-api/me"
+      ? { id: "chatgpt-user-123" }
+      : { user: { id: "different-user", email: "wrong@qingxian.com" } },
+  });
+  const mismatchedEmail = await vm.runInContext(
+    "window.__H2W_ADAPTER__.getAccountObservation()", accountCtx);
+  ok(mismatchedEmail.nativeIdentity === "chatgpt-user-123"
+      && mismatchedEmail.email === null,
+    "ChatGPT refuses display email from a mismatched signed-in identity");
 
   const accountFallbackCtx = vm.createContext({
     window: {},
