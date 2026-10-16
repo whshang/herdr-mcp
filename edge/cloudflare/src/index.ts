@@ -492,7 +492,24 @@ export default {
       if (target === "unavailable") {
         return noStoreJsonResponse({ ok: false, code: "connector_target_device_unresolved" }, 503);
       }
-      if (target === "suspended") {
+      if (!parsed.value.allowed && (target === "suspended" || target === "revoked")) {
+        // A deny for an existing same-fleet device that has since been
+        // suspended or revoked is a cleanup revoke, not an escalation: it
+        // must stay possible so a stale grant cannot resurface when the
+        // device is reactivated. It still requires a credential-verified
+        // owner; a legacy shared-secret owner never writes grants, and no
+        // write of any kind proceeds for unknown devices.
+        if (ownerIdentity.authSource !== "device_credential" || !ownerIdentity.deviceId) {
+          logger.warn("connector.webchat_control_denied", {
+            code: "connector_owner_device_mismatch",
+            requesterDeviceId: ownerIdentity.deviceId,
+            requesterWorkstationId: ownerIdentity.workstationId,
+            targetDeviceId: deviceId,
+            connectorId,
+          });
+          return noStoreJsonResponse({ ok: false, code: "connector_owner_device_mismatch" }, 403);
+        }
+      } else if (target === "suspended") {
         logger.warn("connector.webchat_control_denied", {
           code: "connector_target_device_suspended",
           requesterDeviceId: ownerIdentity.deviceId,
@@ -501,8 +518,16 @@ export default {
           connectorId,
         });
         return noStoreJsonResponse({ ok: false, code: "connector_target_device_suspended" }, 403);
-      }
-      if (target !== "member") {
+      } else if (target === "revoked") {
+        logger.warn("connector.webchat_control_denied", {
+          code: "connector_target_device_revoked",
+          requesterDeviceId: ownerIdentity.deviceId,
+          requesterWorkstationId: ownerIdentity.workstationId,
+          targetDeviceId: deviceId,
+          connectorId,
+        });
+        return noStoreJsonResponse({ ok: false, code: "connector_target_device_revoked" }, 403);
+      } else if (target !== "member") {
         logger.warn("connector.webchat_control_denied", {
           code: "connector_owner_device_mismatch",
           requesterDeviceId: ownerIdentity.deviceId,
@@ -551,8 +576,10 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/connectors/label") {
-      const fleetAdmin = await authenticateFleetAdmin(request, env);
-      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
+      const labelAuthority = await authenticateLabelAuthority(request, env);
+      if (!labelAuthority.ok) {
+        return noStoreJsonResponse({ ok: false, code: labelAuthority.code }, labelAuthority.status);
+      }
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)) {
         const code = parsed.ok ? "bad_request" : parsed.code;
@@ -572,7 +599,7 @@ export default {
       const response = await oauthInternal(env, "/internal/oauth/connector/label", {
         connector_id: connectorId,
         platform_account: parsed.value.platform_account,
-        labeled_by: fleetAdmin,
+        labeled_by: labelAuthority.principal,
       });
       const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
       return noStoreJsonResponse(payload ?? { ok: false, code: "connector_label_failed" }, response.status);
@@ -1479,6 +1506,38 @@ async function authenticateFleetAdmin(request: Request, env: Env): Promise<strin
   return authenticateFleetDevice(request, env);
 }
 
+
+/**
+ * Narrow write authority for /connectors/label. Unlike fleet administration,
+ * a platform-account label steers owner connector selection (the CLI matches
+ * connectors by this mutable label), so writing one is owner-only: either a
+ * valid Worker operator credential (unchanged operator contract) or the
+ * actual OWNER device credential. Any other enrolled fleet member and any
+ * legacy shared-secret lookup are rejected; authenticateFleetAdmin keeps its
+ * broader semantics for unrelated fleet tools.
+ */
+async function authenticateLabelAuthority(
+  request: Request,
+  env: Env,
+): Promise<{ ok: true; principal: string } | { ok: false; code: string; status: number }> {
+  const mcp = await authenticateEdgeMcpRequest(request, env);
+  if (mcp.ok && (mcp.source === "dev_bearer" || mcp.source === "static_bearer")) {
+    return { ok: true, principal: `operator:${mcp.source}` };
+  }
+  const ownerIdentity = await authenticateOwnerDeviceIdentity(request, env);
+  if (ownerIdentity && ownerIdentity.authSource === "device_credential" && ownerIdentity.deviceId) {
+    return { ok: true, principal: `device:${ownerIdentity.deviceId}` };
+  }
+  // Distinguish an authenticated fleet principal that is not label-authorized
+  // (non-owner enrolled device, legacy shared-secret owner) from no
+  // credential at all.
+  const fleetDevice = await authenticateFleetDevice(request, env);
+  if (fleetDevice) {
+    return { ok: false, code: "connector_owner_device_mismatch", status: 403 };
+  }
+  return { ok: false, code: "connector_owner_device_required", status: 401 };
+}
+
 async function authenticateFleetDevice(request: Request, env: Env): Promise<string | null> {
   const workstationId = request.headers.get("x-herdr-workstation")?.trim() ?? "";
   if (!workstationId || !/^[A-Za-z0-9_.-]{1,64}$/.test(workstationId)) return null;
@@ -1507,12 +1566,14 @@ async function authenticateFleetDevice(request: Request, env: Env): Promise<stri
 
 /**
  * Same-fleet membership for a grant target. One Worker registry is one owner
- * account. A missing or revoked device is not that owner's device.
+ * account. A missing or unrecognized device is not that owner's device.
+ * Suspended and revoked records stay distinguishable so a credential-verified
+ * owner may still revoke a stale grant (deny-only, no new grants).
  */
 async function fleetDeviceMembership(
   env: Env,
   deviceId: string,
-): Promise<"member" | "mismatch" | "suspended" | "unavailable"> {
+): Promise<"member" | "suspended" | "revoked" | "mismatch" | "unavailable"> {
   try {
     const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
     const resp = await registry.fetch(new Request("https://registry.internal/internal/devices"));
@@ -1524,6 +1585,7 @@ async function fleetDeviceMembership(
     // receive a same-fleet grant.
     if (!hit) return "mismatch";
     if (hit.authorization === "suspended") return "suspended";
+    if (hit.authorization === "revoked") return "revoked";
     if (hit.authorization !== "active") return "mismatch";
     return "member";
   } catch {

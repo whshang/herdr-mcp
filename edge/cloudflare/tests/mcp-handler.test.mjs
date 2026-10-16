@@ -1884,6 +1884,26 @@ test("user cannot derive device scope from a wildcard Page Assist endpoint | Giv
   assert.deepEqual(grants, [{ endpoint_ref: DERIVED_E, provider: "*", account_ref: "*" }]);
 });
 
+test("user platform account stays redacted in logs | Given a connector client carrying a labeled platform account | When a tool call is forwarded | Then logs carry only a labeled flag and never the raw email", async () => {
+  const d = deps({
+    client: {
+      connectorId: "conn_labeledlogs1234",
+      grantGeneration: 2,
+      authSource: "oauth_edge",
+      platformAccount: "grokbot-owner@example.com",
+    },
+  });
+  await handleMcp(req(77, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", d.value);
+  const forward = d.logs.find((entry) => entry.event === "mcp.tools_call.forward");
+  assert.ok(forward, "the forward log entry exists");
+  assert.equal(forward.fields.platformAccountLabeled, true, "the label appears only as a presence flag");
+  assert.equal(
+    JSON.stringify(d.logs).includes("grokbot-owner@example.com"),
+    false,
+    "the raw platform-account email never appears in any log entry",
+  );
+});
+
 test("user lists browser endpoints | Given a connector with Page Assist grants | When a non-page method is forwarded | Then no Page Assist grant is attached", async () => {
   const d = pageScopedGrantDeps();
   const res = await handleMcp(

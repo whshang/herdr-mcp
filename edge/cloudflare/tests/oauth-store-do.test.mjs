@@ -1457,3 +1457,65 @@ test("issuing fresh tokens for a connector fences older refresh tokens of that c
   // sibling conn2 refresh must still exist untouched
   assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t2RefreshHash, now_sec: 106 })).status, 200);
 });
+
+test("user token from a superseded generation cannot regain scope | Given a connector at grant_generation 2 whose stored grant rows still carry generation 1 | When the access token is verified | Then stale-generation rows are excluded from the control snapshot", async () => {
+  const h = harness();
+  const connectorId = "conn_stalegen1234";
+  const clientId = "c-stalegen";
+  const nowSec = 6_000_000;
+  await h.storage.put(`connector:${connectorId}`, {
+    connector_id: connectorId,
+    client_id: clientId,
+    status: "active",
+    principal_type: "connector",
+    capabilities: ["mcp_access"],
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect",
+    auth_source: "chatgpt_cimd",
+    grant_generation: 2,
+    approved_at_ms: nowSec * 1000 - 1_000,
+    approved_by: "device:owner",
+  });
+  await h.storage.put(`grant:${clientId}`, {
+    client_id: clientId,
+    status: "active",
+    principal_type: "connector",
+    connector_id: connectorId,
+    grant_generation: 2,
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    approved_at_ms: nowSec * 1000 - 1_000,
+    approved_by: "device:owner",
+    webchat_control: [{
+      connector_id: connectorId,
+      grant_generation: 1,
+      device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      endpoint_ref: "*",
+      provider: "*",
+      account_ref: "*",
+    }],
+    page_assist: [{
+      connector_id: connectorId,
+      grant_generation: 1,
+      device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      endpoint_ref: "browser-endpoint-stale",
+    }],
+  });
+  const accessToken = "opaque-stalegen-access";
+  const accessHash = await hashOpaqueToken(accessToken);
+  await h.storage.put(`access:${accessHash}`, {
+    client_id: clientId,
+    connector_id: connectorId,
+    grant_generation: 2,
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    expires_at: nowSec + 3600,
+  });
+
+  const verified = await h.post("/internal/oauth/access/verify", { token: accessToken, now_sec: nowSec });
+  assert.equal(verified.status, 200);
+  const verifiedBody = await body(verified);
+  assert.deepEqual(verifiedBody.webchat_control, [], "a stale-generation device-wide grant never re-enters the snapshot");
+  assert.deepEqual(verifiedBody.page_assist, [], "a stale-generation Page Assist grant never re-enters the snapshot");
+});
