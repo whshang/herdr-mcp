@@ -3675,13 +3675,25 @@ function normalizeHerdrMentionAlias(value) {
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
       ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
       : [];
+    // Async project discovery can outlive an account or project switch.
+    // Fence the registration against the current page before publishing it.
+    const currentAccount = await browserAccountObservation();
+    const currentProject = typeof ADAPTER.getProjectIdentity === "function"
+      ? ADAPTER.getProjectIdentity()
+      : adapterProject;
+    if (registrationAttempt !== browserRegistrationAttempt
+        || ADAPTER.getConversationKey() !== convKey
+        || currentAccount.nativeIdentity !== accountNativeIdentity
+        || (currentProject?.id || null) !== (adapterProject?.id || null)) {
+      return null;
+    }
     const response = await sendBg({
       type: "h2w_register",
       convKey,
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
-      accountDisplayEmail: accountObservation.email,
+      accountDisplayEmail: currentAccount.email,
       browserProjects,
       browserAppKeywords,
       browserCurrentProjectId: browserCurrentProject?.id || null,

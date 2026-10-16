@@ -1764,9 +1764,9 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
   `)();
 }
 
-async function flushRegistrationToSend(harness) {
-  for (let i = 0; i < 4; i += 1) await Promise.resolve();
-  assert.ok(harness.pending.length > 0, "registration must reach background send");
+async function flushRegistrationToSend(harness, expected = 1) {
+  for (let i = 0; i < 24 && harness.pending.length < expected; i += 1) await Promise.resolve();
+  assert.ok(harness.pending.length >= expected, "registration must reach background send");
 }
 
 test("canonical ChatGPT session recovery reuses one slugged Project alias instead of opening a duplicate tab", async () => {
@@ -2338,10 +2338,10 @@ test("A to B to A registration cannot resurrect an older A response", async () =
   await flushRegistrationToSend(harness);
   harness.setRoute(b);
   const pendingB = harness.register("b");
-  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  await flushRegistrationToSend(harness, 2);
   harness.setRoute(a);
   const newA = harness.register("new-a");
-  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  await flushRegistrationToSend(harness, 3);
   assert.equal(harness.pending.length, 3);
 
   harness.pending[2].resolve({ browser_session_ref: "br_a_new", browser_generation: 12, bound: false });
