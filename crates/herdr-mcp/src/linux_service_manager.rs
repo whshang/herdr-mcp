@@ -600,6 +600,14 @@ fn install() -> Result<(), String> {
             link_reconcile_attempted = true;
             reconcile_link()?;
         }
+        // Keep an already-owned Native Host binary on the generation that just
+        // became current. A machine with no managed host returns skipped and
+        // does not create browser manifests. The sync helper resolves the
+        // default ~/.config/herdr-mcp runtime; a custom config root keeps
+        // service install independent of that path.
+        if paths.config_dir == paths.home.join(".config").join("herdr-mcp") {
+            crate::native_host_install::sync_owned_runtime_from_active()?;
+        }
         Ok(())
     })();
     if let Err(error) = activation {
@@ -748,11 +756,16 @@ fn status_value() -> Result<Value, String> {
     }))
 }
 
+fn extension_ipc_socket(config_dir: &Path) -> PathBuf {
+    config_dir.join("extension.sock")
+}
+
 fn service_unit_contents(paths: &LinuxPaths, generation_id: &str) -> Result<String, String> {
     let current = quote(&paths.current_binary)?;
     let env_file = systemd_env_value(&paths.runtime_env)?;
+    let extension_socket = systemd_env_value(&extension_ipc_socket(&paths.config_dir))?;
     Ok(format!(
-        "[Unit]\nDescription=Herdr MCP Runtime\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={current} candidate --port {}\nEnvironmentFile={env_file}\nEnvironment=\"HOME={}\"\nEnvironment=\"HERDR_MCP_HOST=127.0.0.1\"\nEnvironment=\"HERDR_MCP_PORT={}\"\nEnvironment=\"HERDR_MCP_STATE_DIR={}\"\nEnvironment=\"HERDR_MCP_CONFIG_DIR={}\"\nEnvironment=\"HERDR_MCP_CONTRACT_PROFILE=epoch2\"\nEnvironment=\"HERDR_SKILL_NETWORK=1\"\nEnvironment=\"HERDR_SOCKET_PATH={}\"\nEnvironment=\"HERDR_MCP_RUNTIME_GENERATION={}\"\nEnvironment=\"HERDR_MCP_SERVICE_IMPL=rust-systemd-user\"\nEnvironment=\"PATH={}/.local/bin:/usr/local/bin:/usr/bin:/bin\"\nRestart=always\nRestartSec=3\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Herdr MCP Runtime\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={current} candidate --port {}\nEnvironmentFile={env_file}\nEnvironment=\"HOME={}\"\nEnvironment=\"HERDR_MCP_HOST=127.0.0.1\"\nEnvironment=\"HERDR_MCP_PORT={}\"\nEnvironment=\"HERDR_MCP_STATE_DIR={}\"\nEnvironment=\"HERDR_MCP_CONFIG_DIR={}\"\nEnvironment=\"HERDR_MCP_CONTRACT_PROFILE=epoch2\"\nEnvironment=\"HERDR_SKILL_NETWORK=1\"\nEnvironment=\"HERDR_SOCKET_PATH={}\"\nEnvironment=\"HERDR_EXTENSION_IPC_SOCKET={extension_socket}\"\nEnvironment=\"HERDR_MCP_RUNTIME_GENERATION={}\"\nEnvironment=\"HERDR_MCP_SERVICE_IMPL=rust-systemd-user\"\nEnvironment=\"PATH={}/.local/bin:/usr/local/bin:/usr/bin:/bin\"\nRestart=always\nRestartSec=3\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
         paths.port,
         systemd_env_value(&paths.home)?,
         paths.port,
@@ -885,6 +898,10 @@ fn start_service_process(paths: &LinuxPaths) -> Result<(), String> {
         .env("HERDR_MCP_CONTRACT_PROFILE", "epoch2")
         .env("HERDR_SKILL_NETWORK", "1")
         .env("HERDR_SOCKET_PATH", &paths.herdr_socket)
+        .env(
+            "HERDR_EXTENSION_IPC_SOCKET",
+            extension_ipc_socket(&paths.config_dir),
+        )
         .env("HERDR_MCP_RUNTIME_GENERATION", &generation)
         .env("HERDR_MCP_SERVICE_IMPL", PROCESS_BACKEND)
         .env("HERDR_MCP_TOKEN", token)
@@ -1569,6 +1586,9 @@ mod tests {
         let server = service_unit_contents(&paths, "rust-deadbeef").unwrap();
         let link = link_unit_contents(&paths, "rust-deadbeef").unwrap();
         assert!(server.contains("EnvironmentFile=/home/tester/.config/herdr-mcp/runtime.env"));
+        assert!(server.contains(
+            "Environment=\"HERDR_EXTENSION_IPC_SOCKET=/home/tester/.config/herdr-mcp/extension.sock\""
+        ));
         assert!(!server.contains("WorkingDirectory="));
         assert!(!link.contains("WorkingDirectory="));
         assert!(!server.contains("HERDR_MCP_TOKEN="));
