@@ -1521,21 +1521,15 @@ impl SemanticChatProvider for EdgeSemanticChatProvider {
         "openai-chat"
     }
 
-    /// The Edge `/semantic/chat` contract accepts only `messages`; per-call
-    /// `max_tokens` / JSON mode are not forwarded until the Worker supports them.
     fn chat_with_options(
         &self,
         messages: &[SemanticChatMessage],
         timeout: Duration,
-        _options: &SemanticChatOptions,
+        options: &SemanticChatOptions,
     ) -> Result<SemanticChatResponse, SemanticError> {
-        let payload = crate::worker::semantic_proxy_chat_request(
-            &json!({
-                "messages": messages.iter().map(SemanticChatMessage::to_json).collect::<Vec<_>>(),
-            }),
-            timeout,
-        )
-        .map_err(|_| SemanticError::new("edge_proxy_unavailable"))?;
+        let payload =
+            crate::worker::semantic_proxy_chat_request(&edge_chat_body(messages, options), timeout)
+                .map_err(|_| SemanticError::new("edge_proxy_unavailable"))?;
         parse_chat_response("edge-semantic-chat", payload)
     }
 }
@@ -1771,6 +1765,25 @@ impl SemanticChatProvider for OpenAiChatProvider {
                 .map_err(|_| SemanticError::new("invalid_response"))?,
         )
     }
+}
+
+/// Body for the Edge `/semantic/chat` proxy. Optional fields are only sent
+/// when set, so default requests stay compatible with older Workers that
+/// accept `messages` alone.
+fn edge_chat_body(messages: &[SemanticChatMessage], options: &SemanticChatOptions) -> Value {
+    let mut body = json!({
+        "messages": messages.iter().map(SemanticChatMessage::to_json).collect::<Vec<_>>(),
+    });
+    if let Some(max_tokens) = options.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if options.json_response {
+        body["response_format"] = json!({"type": "json_object"});
+    }
+    if options.tier == SemanticTier::Background {
+        body["tier"] = json!("background");
+    }
+    body
 }
 
 fn openai_chat_body(
@@ -2915,6 +2928,30 @@ mod tests {
         );
         assert_eq!(tuned["max_tokens"], json!(256));
         assert_eq!(tuned["response_format"], json!({"type": "json_object"}));
+    }
+
+    #[test]
+    fn edge_chat_body_sends_options_only_when_set() {
+        let messages = [SemanticChatMessage {
+            role: "user".to_owned(),
+            content: "hi".to_owned(),
+        }];
+        let plain = edge_chat_body(&messages, &SemanticChatOptions::default());
+        assert_eq!(
+            plain.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["messages"]
+        );
+        let tuned = edge_chat_body(
+            &messages,
+            &SemanticChatOptions {
+                tier: SemanticTier::Background,
+                max_tokens: Some(128),
+                json_response: true,
+            },
+        );
+        assert_eq!(tuned["max_tokens"], json!(128));
+        assert_eq!(tuned["response_format"], json!({"type": "json_object"}));
+        assert_eq!(tuned["tier"], json!("background"));
     }
 
     #[test]
