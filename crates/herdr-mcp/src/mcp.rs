@@ -4021,6 +4021,7 @@ fn browser_session_create_params_from_source(
     };
     const ALLOWED: &[&str] = &[
         "source_url",
+        "source_session_ref",
         "message",
         "idempotency_key",
         "work_chain_id",
@@ -4056,7 +4057,17 @@ fn browser_session_create_params_from_source(
     let required_apps = browser_required_apps(params, true)?;
     let work_chain_id = browser_optional_string(params, "work_chain_id", 128)?;
     let lane_id = browser_optional_string(params, "lane_id", 160)?;
-    let route = browser_source_route(store, source_url).map_err(browser_store_error)?;
+    let source_session_ref = match object.get("source_session_ref") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| json!({"ok": false, "code": "browser_operation_params_invalid"}))?,
+        ),
+        None => None,
+    };
+    let route =
+        browser_source_route(store, source_url, source_session_ref).map_err(browser_store_error)?;
     if route.provider != "chatgpt" {
         return Err(json!({
             "ok": false,
@@ -4155,6 +4166,7 @@ struct BrowserSourceRoute {
 fn browser_source_route(
     store: &StateStore,
     source_url: &str,
+    selected_session_ref: Option<&str>,
 ) -> Result<BrowserSourceRoute, String> {
     let source = browser_conversation_url_ref(source_url)
         .ok_or_else(|| "browser_source_url_invalid".to_owned())?;
@@ -4163,8 +4175,8 @@ fn browser_source_route(
     // canonical form (`/g/g-p-<hex>/c/<uuid>`). Reconstruct the canonical URL
     // from the parsed identity so the locator lookup matches the registered
     // session regardless of which URL variant the caller supplied. The
-    // conversation/project identity itself is unchanged; ambiguity handling
-    // in the locator (newest-wins, exact-tie fails closed) is untouched.
+    // conversation/project identity itself is unchanged; the locator still
+    // rejects all duplicate canonical URLs without an explicit session ref.
     let canonical_url = match &source.project_id {
         Some(project_id) => {
             format!(
@@ -4174,9 +4186,28 @@ fn browser_source_route(
         }
         None => format!("https://chatgpt.com/c/{}", source.conversation_id),
     };
-    let session_ref = store
-        .browser_session_ref_for_canonical_url(&canonical_url)?
-        .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+    let session_ref = if let Some(selected) = selected_session_ref {
+        // An explicit observed ref selects the intended account when the URL
+        // exists in multiple browser profiles. The locator must be the same
+        // canonical page at the same generation; never infer by recency.
+        let resource = store
+            .browser_resource(selected)?
+            .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+        let locator = store
+            .browser_resource_locator(selected)?
+            .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+        if resource.kind != "session"
+            || locator.canonical_url != canonical_url
+            || locator.observation_generation != resource.observation_generation
+        {
+            return Err("browser_source_scope_mismatch".to_owned());
+        }
+        selected.to_owned()
+    } else {
+        store
+            .browser_session_ref_for_canonical_url(&canonical_url)?
+            .ok_or_else(|| "browser_source_session_not_found".to_owned())?
+    };
     let session = store
         .browser_resource(&session_ref)?
         .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
@@ -4248,7 +4279,7 @@ fn browser_source_resolve(
     let Ok(store) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
-    match browser_source_route(&store, source_url) {
+    match browser_source_route(&store, source_url, None) {
         Ok(route) => json!({
             "ok": true,
             "route": {
@@ -4335,26 +4366,26 @@ fn browser_handoff_prepare(
         // ambiguous source (two distinct sessions on one canonical URL) resolves to no
         // route and is therefore refused for automatic delivery while the manual packet
         // still returns.
-        let (route, route_error, route_session_ref) = match browser_source_route(&store, source_url)
-        {
-            Ok(route) => {
-                let route_session_ref = route.session_ref.clone();
-                (
-                    json!({
-                        "session_ref": route.session_ref,
-                        "provider": route.provider,
-                        "endpoint_ref": route.endpoint_ref,
-                        "account_ref": route.account_ref,
-                        "space_ref": route.space_ref,
-                        "display_label": route.display_label,
-                        "expected_generation": route.expected_generation,
-                    }),
-                    Value::Null,
-                    Some(route_session_ref),
-                )
-            }
-            Err(error) => (Value::Null, json!(error), None),
-        };
+        let (route, route_error, route_session_ref) =
+            match browser_source_route(&store, source_url, None) {
+                Ok(route) => {
+                    let route_session_ref = route.session_ref.clone();
+                    (
+                        json!({
+                            "session_ref": route.session_ref,
+                            "provider": route.provider,
+                            "endpoint_ref": route.endpoint_ref,
+                            "account_ref": route.account_ref,
+                            "space_ref": route.space_ref,
+                            "display_label": route.display_label,
+                            "expected_generation": route.expected_generation,
+                        }),
+                        Value::Null,
+                        Some(route_session_ref),
+                    )
+                }
+                Err(error) => (Value::Null, json!(error), None),
+            };
         (record, work_chain_id, route, route_error, route_session_ref)
     };
     let latest_source_ref = record
@@ -17428,6 +17459,43 @@ mod tests {
         assert_eq!(result["ok"], false);
         assert_eq!(result["code"], "browser_canonical_url_ambiguous");
         assert!(result.get("reservation_ref").is_none());
+
+        // Explicit observed source session selects exactly one of the two
+        // accounts. The same ref cannot authorize an unrelated URL.
+        {
+            let guard = store.lock().unwrap();
+            let sessions = guard
+                .browser_resources(None, Some("chatgpt"), Some("session"), None, 10)
+                .unwrap();
+            assert_eq!(sessions.len(), 2);
+            for session in sessions {
+                let params = json!({
+                    "source_url": URL,
+                    "source_session_ref": session.resource_ref,
+                    "message": "explicit account continuation",
+                    "idempotency_key": "ambiguous-source-explicit-1",
+                });
+                let (normalized, chosen) =
+                    browser_session_create_params_from_source(&guard, &params)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(chosen, session.resource_ref);
+                assert_eq!(normalized["endpoint_ref"], session.endpoint_ref);
+                assert_eq!(
+                    normalized["account_ref"],
+                    browser_resource_account_ref(&guard, &session).unwrap()
+                );
+
+                let wrong = json!({
+                    "source_url": "https://chatgpt.com/c/unrelated-conversation",
+                    "source_session_ref": session.resource_ref,
+                    "message": "must refuse",
+                    "idempotency_key": "ambiguous-source-wrong-url-1",
+                });
+                let err = browser_session_create_params_from_source(&guard, &wrong).unwrap_err();
+                assert_eq!(err["code"], "browser_source_scope_mismatch");
+            }
+        }
         // Durable state proves the refusal happened before any reservation: the strict
         // source lookup fails closed during normalization, so no create can be replayed
         // against the wrong identity later.
