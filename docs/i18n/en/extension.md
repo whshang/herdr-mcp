@@ -107,6 +107,8 @@ macOS and Linux use the same Native Messaging contract. The managed runtime list
 
 When `XDG_CONFIG_HOME` is an absolute path and this is the process home, those directories are created under `$XDG_CONFIG_HOME` instead of `~/.config`. A hand-written manifest that does not point at the managed wrapper is foreign; remove it before `native-host install`, which refuses to take over an unowned host file.
 
+Chrome launched with `--user-data-dir` reads native hosts from `<user-data-dir>/NativeMessagingHosts/`, not the default config directory. Repeat `--user-data-dir` on `native-host install` or `native-host use`. `native-host status` lists those directories and `native-host rollback` restores the previous set. The profile directory must already exist and must not be a symlink.
+
 The socket is created by the managed runtime, not by `native-host install`. `herdr-mcp service install` (also what an update and `herdr-mcp dev sync` run) rewrites the user systemd unit or the detached-process environment with `HERDR_EXTENSION_IPC_SOCKET` and restarts the runtime. A `service restart` of a unit written by an older runtime does not add that variable. After the new runtime is up, register the channel and restart Chrome so it launches the host:
 
 ```bash

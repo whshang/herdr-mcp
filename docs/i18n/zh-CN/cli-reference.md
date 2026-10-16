@@ -237,9 +237,11 @@ herdr-mcp lang ja
 herdr-mcp native-host install
 herdr-mcp native-host use standalone
 herdr-mcp native-host status
+herdr-mcp native-host use standalone --user-data-dir /home/box/chrome-profile/Fork-2
+herdr-mcp native-host install --user-data-dir /home/box/chrome-profile/Fork-2 --user-data-dir /home/box/chrome-profile/Fork-3
 ```
 
-macOS 与 Linux 都会为所选 STORE / STANDALONE / DEV origin 登记 Chromium host `dev.herdr.mcp`。Linux 总会写入 `~/.config/google-chrome/NativeMessagingHosts/`；Chromium、Chrome for Testing、Chrome Beta/Dev、Brave 和 Microsoft Edge 仅在对应配置目录已存在时登记。受管 runtime 须经 `service install`、更新或 `dev sync` 重启，才会绑定 mode-`0600` 的 `~/.config/herdr-mcp/extension.sock`。详见 [浏览器扩展](extension.md)。
+macOS 与 Linux 都会为所选 STORE / STANDALONE / DEV origin 登记 Chromium host `dev.herdr.mcp`。Linux 总会写入 `~/.config/google-chrome/NativeMessagingHosts/`；`chromium`、`google-chrome-for-testing`、Chrome Beta/Dev、Brave 和 Microsoft Edge 仅在对应配置目录已存在时登记。带 `--user-data-dir` 启动的 Chrome 从 `<user-data-dir>/NativeMessagingHosts/` 读取 host。可在 `native-host install` 或 `native-host use` 上重复传入 `--user-data-dir`。这些目录会被记住，出现在 `native-host status` 中，并由 `native-host rollback` 恢复。受管 runtime 须经 `service install`、更新或 `dev sync` 重启，才会绑定 mode-`0600` 的 `~/.config/herdr-mcp/extension.sock`。详见 [浏览器扩展](extension.md)。
 
 安装后：
 

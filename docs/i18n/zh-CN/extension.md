@@ -107,6 +107,8 @@ macOS 与 Linux 使用同一套 Native Messaging 契约。受管 runtime 在 mod
 
 进程 home 上若 `XDG_CONFIG_HOME` 为绝对路径，这些目录改写到 `$XDG_CONFIG_HOME` 下。手写且不指向受管 wrapper 的 manifest 视为外来文件；`native-host install` 会拒绝接管，需先删除该文件。
 
+带 `--user-data-dir` 启动的 Chrome 从 `<user-data-dir>/NativeMessagingHosts/` 读取 native host，而不是默认配置目录。可在 `native-host install` 或 `native-host use` 上重复传入 `--user-data-dir`。`native-host status` 会列出这些目录，`native-host rollback` 会恢复上一组。配置目录必须已经存在，且不能是 symlink。
+
 socket 由受管 runtime 创建，而不是由 `native-host install` 创建。`herdr-mcp service install`（更新和 `herdr-mcp dev sync` 也会执行它）会重写 user systemd unit 或脱离进程的环境，加入 `HERDR_EXTENSION_IPC_SOCKET` 并重启 runtime。对旧 unit 只做 `service restart` 不会补上这个变量。新 runtime 起来之后登记通道，并重启 Chrome 让它拉起 host：
 
 ```bash
