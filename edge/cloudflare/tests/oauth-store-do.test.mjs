@@ -525,6 +525,37 @@ test("Page Assist grants normalize legacy records and add/remove one exact endpo
   assert.deepEqual(disabled.record.page_assist, []);
 });
 
+test("user cannot store or inherit wildcard Page Assist grants | Given a stored legacy wildcard row and an active connector | When Page Assist is read or a wildcard row is written | Then the stored wildcard is dropped and the write is rejected", async () => {
+  const h = harness();
+  const connectorId = "conn_pageassist_wild_1";
+  h.storage.map.set("grant:wild-page-client", {
+    client_id: "wild-page-client",
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    status: "active",
+    can_approve_connectors: true,
+    approved_at_ms: 100,
+    approved_by: "device:owner",
+    page_assist: [
+      { connector_id: connectorId, grant_generation: 1, device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: "*" },
+    ],
+  });
+  h.storage.map.set(`connector:${connectorId}`, connectorRecord("wild-page-client", connectorId));
+
+  const read = await body(await h.post("/internal/oauth/grant/get", { client_id: "wild-page-client" }));
+  assert.equal(read.ok, true);
+  assert.deepEqual(read.record.page_assist, [], "an injected stored wildcard Page Assist row fails closed at normalize");
+
+  const wildWrite = await h.post("/internal/oauth/grant/page-assist", {
+    connector_id: connectorId,
+    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    endpoint_ref: "*",
+    allowed: true,
+    changed_by: "device:owner",
+  });
+  assert.equal(wildWrite.status, 400, "the store rejects creating a wildcard Page Assist grant");
+});
+
 test("connector approval resume token is independent, idempotent until expiry, and cannot be substituted", async () => {
   const h = harness();
   await h.post("/internal/oauth/approval/put", {
@@ -1425,4 +1456,66 @@ test("issuing fresh tokens for a connector fences older refresh tokens of that c
   assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t1FreshRefreshHash, now_sec: 106 })).status, 200);
   // sibling conn2 refresh must still exist untouched
   assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t2RefreshHash, now_sec: 106 })).status, 200);
+});
+
+test("user token from a superseded generation cannot regain scope | Given a connector at grant_generation 2 whose stored grant rows still carry generation 1 | When the access token is verified | Then stale-generation rows are excluded from the control snapshot", async () => {
+  const h = harness();
+  const connectorId = "conn_stalegen1234";
+  const clientId = "c-stalegen";
+  const nowSec = 6_000_000;
+  await h.storage.put(`connector:${connectorId}`, {
+    connector_id: connectorId,
+    client_id: clientId,
+    status: "active",
+    principal_type: "connector",
+    capabilities: ["mcp_access"],
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect",
+    auth_source: "chatgpt_cimd",
+    grant_generation: 2,
+    approved_at_ms: nowSec * 1000 - 1_000,
+    approved_by: "device:owner",
+  });
+  await h.storage.put(`grant:${clientId}`, {
+    client_id: clientId,
+    status: "active",
+    principal_type: "connector",
+    connector_id: connectorId,
+    grant_generation: 2,
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    approved_at_ms: nowSec * 1000 - 1_000,
+    approved_by: "device:owner",
+    webchat_control: [{
+      connector_id: connectorId,
+      grant_generation: 1,
+      device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      endpoint_ref: "*",
+      provider: "*",
+      account_ref: "*",
+    }],
+    page_assist: [{
+      connector_id: connectorId,
+      grant_generation: 1,
+      device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      endpoint_ref: "browser-endpoint-stale",
+    }],
+  });
+  const accessToken = "opaque-stalegen-access";
+  const accessHash = await hashOpaqueToken(accessToken);
+  await h.storage.put(`access:${accessHash}`, {
+    client_id: clientId,
+    connector_id: connectorId,
+    grant_generation: 2,
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    expires_at: nowSec + 3600,
+  });
+
+  const verified = await h.post("/internal/oauth/access/verify", { token: accessToken, now_sec: nowSec });
+  assert.equal(verified.status, 200);
+  const verifiedBody = await body(verified);
+  assert.deepEqual(verifiedBody.webchat_control, [], "a stale-generation device-wide grant never re-enters the snapshot");
+  assert.deepEqual(verifiedBody.page_assist, [], "a stale-generation Page Assist grant never re-enters the snapshot");
 });

@@ -3016,6 +3016,8 @@ fn trusted_edge_webchat_authorization(
     }
     let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
     let object = value.as_object().ok_or(())?;
+    // The authorization wire is exactly three fields. The display-only
+    // platform_account never rides this header; a fourth field is rejected.
     if object.len() != 3
         || !object.contains_key("principal_ref")
         || !object.contains_key("connector_id")
@@ -4520,6 +4522,23 @@ mod tests {
         );
         assert_eq!(authorization.connector_id, "conn_auditconnector123");
         assert_eq!(authorization.grant_generation, 7);
+        headers.insert(
+            EDGE_WEBCHAT_AUTHORIZATION_HEADER,
+            HeaderValue::from_static(
+                r#"{"principal_ref":"connector:conn_auditconnector123","connector_id":"conn_auditconnector123","grant_generation":7,"platform_account":"grokbot-owner@example.com"}"#,
+            ),
+        );
+        assert_eq!(
+            trusted_edge_webchat_authorization(&trusted_state, &headers),
+            Err(()),
+            "the authorization wire stays three-field: a fourth field is rejected"
+        );
+        headers.insert(
+            EDGE_WEBCHAT_AUTHORIZATION_HEADER,
+            HeaderValue::from_static(
+                r#"{"principal_ref":"connector:conn_auditconnector123","connector_id":"conn_auditconnector123","grant_generation":7}"#,
+            ),
+        );
         assert_eq!(
             trusted_edge_browser_caller_session(&trusted_state, &headers),
             Ok(Some(BrowserCallerSessionIdentity {

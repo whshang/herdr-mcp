@@ -318,7 +318,7 @@ class ClaudeAdapter extends BaseAdapter {
       .some((element) => this.elementVisible(element));
   }
 
-  async getAccountNativeIdentity() {
+  async getAccountObservation() {
     const sha256Identity = async (value) => {
       if (!value || !globalThis.crypto?.subtle) return null;
       const digest = await globalThis.crypto.subtle.digest(
@@ -343,7 +343,8 @@ class ClaudeAdapter extends BaseAdapter {
         const rawEmail = payload?.account?.email_address || payload?.email_address || null;
         const email = typeof rawEmail === "string" ? rawEmail.trim().toLowerCase() : "";
         if (email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-          return await sha256Identity(email);
+          const display = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null;
+          return { nativeIdentity: await sha256Identity(email), email: display };
         }
       }
     } catch (_) {}
@@ -356,11 +357,17 @@ class ClaudeAdapter extends BaseAdapter {
       const hint = String(localStorage.getItem("__qk_hint_account_uuid") || "").trim().toLowerCase();
       const confirmed = String(localStorage.getItem("rq-cache-confirmed-account") || "").trim().toLowerCase();
       const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-      if (!uuid.test(hint) || !uuid.test(confirmed) || hint !== confirmed) return null;
-      return await sha256Identity(confirmed);
+      if (!uuid.test(hint) || !uuid.test(confirmed) || hint !== confirmed) {
+        return { nativeIdentity: null, email: null };
+      }
+      return { nativeIdentity: await sha256Identity(confirmed), email: null };
     } catch (_) {
-      return null;
+      return { nativeIdentity: null, email: null };
     }
+  }
+
+  async getAccountNativeIdentity() {
+    return (await this.getAccountObservation()).nativeIdentity;
   }
 }
 

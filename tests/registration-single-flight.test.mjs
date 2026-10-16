@@ -116,11 +116,18 @@ function registrationHarness(initialConvKey = KEY_A) {
     state: () => api.state(),
     sends,
     // Resolve the stalled pre-registration work and make later runs flow.
-    releasePreWork() {
-      resolveAccount("opaque-account");
+    releaseAccount(identity = "opaque-account") {
+      resolveAccount(identity);
+      accountBox.promise = Promise.resolve(identity);
+    },
+    changeAccount(identity) { accountBox.promise = Promise.resolve(identity); },
+    releaseCatalog() {
       resolveCatalog([]);
-      accountBox.promise = Promise.resolve("opaque-account");
       catalogBox.promise = Promise.resolve([]);
+    },
+    releasePreWork() {
+      this.releaseAccount();
+      this.releaseCatalog();
     },
   };
 }
@@ -250,6 +257,18 @@ test("user gets exactly one registration per conversation | Given slow pre-regis
     bound: true,
     attempt: 1,
   });
+});
+
+test("user cannot register a stale account | Given an account switch during project discovery | When registration is about to publish | Then no old-account identity is sent", async () => {
+  const harness = registrationHarness(KEY_A);
+  const registration = harness.register("startup");
+  harness.releaseAccount("account-one");
+  await flush();
+  harness.changeAccount("account-two");
+  harness.releaseCatalog();
+  const result = await registration;
+  assert.equal(result, null);
+  assert.equal(harness.sends.length, 0, "the old account must never reach h2w_register");
 });
 
 test("user refreshes registration observation without cancelling the in-flight run | Given one slow in-flight registration | When an identity-recovery handshake requests refreshObservation | Then the in-flight run still lands and a fresh registration follows it", async () => {

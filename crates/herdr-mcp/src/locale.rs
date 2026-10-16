@@ -300,7 +300,7 @@ fn worker_help(l: Locale) -> String {
 
 fn connector_help(l: Locale) -> String {
     format!(
-        "Herdr MCP — {}\n\n{}\n\n  herdr-mcp connector list [--all]\n  herdr-mcp connector approve <approval-request-id>\n  herdr-mcp connector cancel <approval-request-id>\n  herdr-mcp connector revoke <connector-id> --confirm\n  herdr-mcp connector revoke-client <client-id> --confirm\n  herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm\n  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm\n  herdr-mcp connector webchat-control <allow-device|deny-device> <connector-id> <device-id> --confirm\n  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm\n",
+        "Herdr MCP — {}\n\n{}\n\n  herdr-mcp connector list [--all]\n  herdr-mcp connector approve <approval-request-id>\n  herdr-mcp connector cancel <approval-request-id>\n  herdr-mcp connector revoke <connector-id> --confirm\n  herdr-mcp connector revoke-client <client-id> --confirm\n  herdr-mcp connector label <connector-id> <platform-account> | <connector-id> --clear\n  herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm\n  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm\n  herdr-mcp connector webchat-control <allow-device|deny-device> <connector-id-or-platform-account> <device-id> --confirm\n  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm\n",
         l.text("", "Connector 管理", "コネクター管理"),
         l.text(
             "",

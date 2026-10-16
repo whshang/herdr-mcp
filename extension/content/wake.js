@@ -3827,6 +3827,23 @@ function normalizeHerdrMentionAlias(value) {
     ? performance.timeOrigin
     : null);
 
+  async function browserAccountObservation() {
+    try {
+      if (typeof ADAPTER.getAccountObservation === "function") {
+        const observed = await ADAPTER.getAccountObservation();
+        const nativeIdentity = typeof observed?.nativeIdentity === "string" && observed.nativeIdentity.trim()
+          ? observed.nativeIdentity.trim()
+          : null;
+        const email = typeof observed?.email === "string" ? observed.email.trim().toLowerCase() : "";
+        return {
+          nativeIdentity,
+          email: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null,
+        };
+      }
+    } catch (_) {}
+    return { nativeIdentity: await browserAccountNativeIdentity(), email: null };
+  }
+
   // Bounded INTERNAL proof of the page, document, and attempt a registration
   // belongs to. Captured BEFORE the first await so that no later await can
   // retroactively define what the proof is about.
@@ -3877,7 +3894,8 @@ function normalizeHerdrMentionAlias(value) {
     // the pre-send awaits and again after every post-send await.
     const requireFreshIdentityProof = options?.requireFreshIdentityProof === true;
     const proof = requireFreshIdentityProof ? registrationProof(convKey, registrationAttempt) : null;
-    const accountNativeIdentity = await browserAccountNativeIdentity();
+    const accountObservation = await browserAccountObservation();
+    const accountNativeIdentity = accountObservation.nativeIdentity;
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
       try {
@@ -3924,15 +3942,19 @@ function normalizeHerdrMentionAlias(value) {
       ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
       : [];
     lastRegistrationErrorClass = null;
+    // Async project discovery can outlive an account, project, or document switch.
+    // Keep the strict create proof while rechecking ordinary registrations too.
+    const currentAccount = await browserAccountObservation();
+    const currentProject = typeof ADAPTER.getProjectIdentity === "function"
+      ? ADAPTER.getProjectIdentity()
+      : adapterProject;
+    if (currentAccount.nativeIdentity !== accountNativeIdentity
+        || (currentProject?.id || null) !== (adapterProject?.id || null)) {
+      if (requireFreshIdentityProof) lastRegistrationErrorClass = "registration_unavailable";
+      return null;
+    }
     if (requireFreshIdentityProof) {
-      // The catalog/project awaits above can take seconds (catalog cache miss,
-      // provider project lookups) and the provider session can be replaced by a
-      // different account during them. Re-read the SAME fixed provider identity
-      // API and refuse to advertise a stale identity: a failed read, a changed
-      // account, a superseded attempt, a moved route, or a replaced document
-      // fails closed with no h2w_register at all.
-      const revalidatedAccountNativeIdentity = await browserAccountNativeIdentity();
-      if (!revalidatedAccountNativeIdentity || revalidatedAccountNativeIdentity !== accountNativeIdentity) {
+      if (!currentAccount.nativeIdentity) {
         lastRegistrationErrorClass = "registration_unavailable";
         return null;
       }
@@ -3940,6 +3962,9 @@ function normalizeHerdrMentionAlias(value) {
         lastRegistrationErrorClass = "registration_superseded";
         return null;
       }
+    } else if (registrationAttempt !== browserRegistrationAttempt
+        || ADAPTER.getConversationKey() !== convKey) {
+      return null;
     }
     const response = await sendBg({
       type: "h2w_register",
@@ -3947,6 +3972,7 @@ function normalizeHerdrMentionAlias(value) {
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
+      accountDisplayEmail: currentAccount.email,
       browserProjects,
       browserAppKeywords,
       browserCurrentProjectId: browserCurrentProject?.id || null,

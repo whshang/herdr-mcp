@@ -780,6 +780,28 @@ ok(
       === "chatgpt-user-123",
     "ChatGPT account identity is observed through the provider adapter hook");
 
+  const labeledAccountCtx = vm.createContext({
+    window: {},
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    location: { origin: u.origin, pathname: "/c/test" },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    fetch: async (url, options) => ({
+      ok: url === "/backend-api/me"
+        && options?.method === "GET"
+        && options?.credentials === "include"
+        && options?.cache === "no-store",
+      json: async () => ({ id: "chatgpt-user-123", email: "Whshang1@gmail.com" }),
+    }),
+    console,
+  });
+  vm.runInContext(baseCode, labeledAccountCtx);
+  vm.runInContext(chatgptCode, labeledAccountCtx);
+  ok(JSON.stringify(await vm.runInContext("window.__H2W_ADAPTER__.getAccountObservation()", labeledAccountCtx))
+      === JSON.stringify({ nativeIdentity: "chatgpt-user-123", email: "whshang1@gmail.com" }),
+    "ChatGPT display email is metadata beside the unchanged native identity");
+
   const accountFallbackCtx = vm.createContext({
     window: {},
     AbortController,
@@ -1396,7 +1418,7 @@ ok((backgroundSource.match(/await moveQueuedInsertForHandoff\(/g) || []).length 
   "handoff commit migrates queued user messages to every supported target cutover path");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
-const fixed = ["background.js", "background/json-bridge.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js", "content/chatgpt-perf-main.js",
+const fixed = ["background.js", "account-display.js", "background/json-bridge.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js", "content/chatgpt-perf-main.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/gemini.js", "content/injector/claude.js",
   "content/injector/grok.js", "content/injector/chatgpt.js", "content/browser-page-kernel.js", "content/page-assist.js",
   "content/webmcp/speaks-json.js", "content/wake.js"];

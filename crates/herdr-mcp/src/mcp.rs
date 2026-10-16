@@ -80,6 +80,59 @@ pub struct BrowserCallerAuthorization {
     pub principal_ref: String,
     pub connector_id: String,
     pub grant_generation: i64,
+    // Display-only platform_account labels live Edge-side; they never ride
+    // the authorization wire and are not part of the runtime struct.
+}
+
+/// `<platform>-<email>` display label. The first `-` separates the platform
+/// from the account, so the email may itself contain `-`.
+pub(crate) fn normalize_platform_account(value: &str) -> Option<String> {
+    let text = value.trim().to_ascii_lowercase();
+    if text.len() < 6 || text.len() > 128 {
+        return None;
+    }
+    let (platform, account) = text.split_once('-')?;
+    if !is_platform_account_token(platform) || !is_platform_account_email(account) {
+        return None;
+    }
+    Some(text)
+}
+
+fn is_platform_account_token(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_lowercase()
+        && value.len() <= 32
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+}
+
+fn is_platform_account_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || !local.chars().all(|ch| {
+            ch.is_ascii_lowercase()
+                || ch.is_ascii_digit()
+                || matches!(ch, '.' | '_' | '%' | '+' | '-')
+        })
+    {
+        return false;
+    }
+    let Some((host, tld)) = domain.rsplit_once('.') else {
+        return false;
+    };
+    !host.is_empty()
+        && !host.starts_with(['.', '-'])
+        && !host.ends_with(['.', '-'])
+        && !host.contains("..")
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-'))
+        && (2..=24).contains(&tld.len())
+        && tld.chars().all(|ch| ch.is_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6430,7 +6483,8 @@ fn browser_operation_resource(
     Ok(resource)
 }
 
-/// WebChat control grants are provider-scoped: exact endpoint + provider.
+/// WebChat control grants are provider-scoped: exact endpoint + provider,
+/// unless the grant is device-wide (`endpoint_ref` `*`).
 /// `account_ref` (legacy per-account grants, or the `*` provider-scope marker)
 /// is accepted for backward compatibility and does not narrow the match.
 pub(crate) const WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT: &str = "*";
@@ -6450,12 +6504,20 @@ fn webchat_control_grant_covers(
 /// Provider wildcard: a grant with provider `*` covers every WebChat provider
 /// on its exact endpoint (issued explicitly, or derived by Edge from Page
 /// Assist). The separately issued complete `*/*/*` tuple covers a device's
-/// endpoints after the trusted Edge device-route filter.
+/// endpoints after the trusted Edge device-route filter. Partial wildcards
+/// (endpoint `*` with a specific provider or account) are always rejected.
 pub(crate) const WEBCHAT_CONTROL_ANY_PROVIDER: &str = "*";
 /// Device-wide WebChat control is issued only by the enrolled owner's
 /// allow-device command. Edge binds it to a verified connector and routes
 /// it only to the same device; Page Assist is never inherited.
 pub(crate) const WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT: &str = "*";
+
+/// Device-wide wildcard. Edge forwards only grants whose `device_id` matches
+/// the routed device, so `*` covers every endpoint on that device and no other.
+/// Kept for test references; the strict grant_covers path uses the
+/// DEVICE_SCOPE_ENDPOINT triplet check instead.
+#[cfg(test)]
+pub(crate) const WEBCHAT_CONTROL_ANY_ENDPOINT: &str = "*";
 
 fn browser_resource_actuation_decision(
     store: &StateStore,
@@ -23147,6 +23209,40 @@ mod webchat_control_provider_scope_tests {
     fn user_owner_given_legacy_account_grant_when_same_endpoint_provider_then_authorized() {
         let g = grant("bep_a", "chatgpt", "br_legacy_account");
         assert!(webchat_control_grant_covers(&g, "bep_a", "chatgpt"));
+    }
+
+    /// user owner | Given a device-wide grant (`*` endpoint and provider) | When any provider on another endpoint of that device is controlled | Then it is authorized
+    #[test]
+    fn user_owner_given_device_wide_grant_when_any_endpoint_then_authorized() {
+        let g = grant(
+            WEBCHAT_CONTROL_ANY_ENDPOINT,
+            WEBCHAT_CONTROL_ANY_PROVIDER,
+            WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+        );
+        for (endpoint, provider) in [("bep_a", "grok"), ("bep_b", "claude"), ("bep_c", "chatgpt")] {
+            assert!(
+                webchat_control_grant_covers(&g, endpoint, provider),
+                "{endpoint}/{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_account_label_accepts_platform_email_and_rejects_client_name() {
+        assert_eq!(
+            normalize_platform_account("  Grokbot-Whshang@gmail.com "),
+            Some("grokbot-whshang@gmail.com".to_owned())
+        );
+        assert_eq!(
+            normalize_platform_account("chatgpt-user.name+tag@example.com"),
+            Some("chatgpt-user.name+tag@example.com".to_owned())
+        );
+        assert_eq!(normalize_platform_account("Cursor"), None);
+        assert_eq!(normalize_platform_account("grokbot-not-an-email"), None);
+        assert_eq!(
+            normalize_platform_account("grok_bot-owner@example.com"),
+            None
+        );
     }
 }
 

@@ -256,6 +256,10 @@ test("Claude adapter hashes current-account email before returning native identi
     await h.adapter.getAccountNativeIdentity(),
     `claude-account-sha256:${expected}`,
   );
+  assert.equal(JSON.stringify(await h.adapter.getAccountObservation()), JSON.stringify({
+    nativeIdentity: `claude-account-sha256:${expected}`,
+    email: "user.name+claude@example.com",
+  }));
 
   h.setAccountPayload({ account: {} });
   assert.equal(await h.adapter.getAccountNativeIdentity(), null);
