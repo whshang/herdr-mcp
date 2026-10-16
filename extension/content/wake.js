@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.212";
+const H2W_CONTENT_VERSION = "0.1.213";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -1140,6 +1140,14 @@ function normalizeHerdrMentionAlias(value) {
         && options.reservedGeneration > 0
         ? options.reservedGeneration
         : 0;
+      // Capture the route BEFORE the refresh await: the fence compares the
+      // exact fresh registration attempt's route to this captured value, not
+      // to a mutable global that a concurrent route change could have
+      // rewritten. Route must be identical before, after, and as registered
+      // by THIS attempt.
+      const preRefreshRoute = typeof ADAPTER.getConversationKey() === "string"
+        ? ADAPTER.getConversationKey()
+        : "";
       let freshOutcome = null;
       try {
         freshOutcome = await registerCurrentConversation("browser-session-create", {
@@ -1169,7 +1177,7 @@ function normalizeHerdrMentionAlias(value) {
       let scopeCategory = null;
       if (!freshOutcome || !reservedAccountRef || !actualAccountRef) {
         scopeCategory = "identity_unavailable";
-      } else if (registeredConvKey !== freshRoute || !freshRoute) {
+      } else if (!freshRoute || freshRoute !== preRefreshRoute || registeredConvKey !== freshRoute) {
         scopeCategory = "route_mismatch";
       } else if (actualAccountRef !== reservedAccountRef) {
         scopeCategory = "account_mismatch";
@@ -3803,7 +3811,8 @@ function normalizeHerdrMentionAlias(value) {
   const registrationInFlight = new Map();
 
   async function runConversationRegistration(reason, convKey, registrationAttempt) {
-    const accountNativeIdentity = await browserAccountNativeIdentity();
+    const accountObservation = await browserAccountObservation();
+    const accountNativeIdentity = accountObservation.nativeIdentity;
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
       try {
@@ -3856,6 +3865,7 @@ function normalizeHerdrMentionAlias(value) {
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
+      accountDisplayEmail: accountObservation.email,
       browserProjects,
       browserAppKeywords,
       browserCurrentProjectId: browserCurrentProject?.id || null,

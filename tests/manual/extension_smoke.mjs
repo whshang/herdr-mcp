@@ -770,7 +770,7 @@ ok(
         && options?.method === "GET"
         && options?.credentials === "include"
         && options?.cache === "no-store",
-      json: async () => ({ id: "  chatgpt-user-123  " }),
+      json: async () => ({ id: "  chatgpt-user-123  ", email: " CLAUDE@QINGXIAN.COM " }),
     }),
     console,
   });
@@ -779,6 +779,11 @@ ok(
   ok(await vm.runInContext("window.__H2W_ADAPTER__.getAccountNativeIdentity()", accountCtx)
       === "chatgpt-user-123",
     "ChatGPT account identity is observed through the provider adapter hook");
+  const accountDisplayObservation = await vm.runInContext(
+    "window.__H2W_ADAPTER__.getAccountObservation()", accountCtx);
+  ok(accountDisplayObservation.nativeIdentity === "chatgpt-user-123"
+      && accountDisplayObservation.email === "claude@qingxian.com",
+    "ChatGPT account email is display-only metadata from the same signed-in identity response");
 
   const accountFallbackCtx = vm.createContext({
     window: {},
