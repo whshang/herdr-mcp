@@ -75,14 +75,17 @@ pub(crate) fn event_for_tool_call(
             }
         }
     }
-    let arguments = &sanitized;
+    // Scope comes from the RAW arguments matched against topology roots:
+    // high-entropy redaction can mangle long path tokens, which would drop
+    // the event. project_ref/worktree are topology-derived, not user text.
     let scope = resolve_scope(arguments, snapshot)?;
+    let arguments = &sanitized;
     let kind = classify(tool_name, arguments);
     let summary = summarize(tool_name, arguments);
     Some(NewWorkEvent {
         ts: now_ms(),
-        project_ref: redact(&scope.project_ref),
-        worktree: redact(&scope.worktree.to_string_lossy()),
+        project_ref: scope.project_ref.clone(),
+        worktree: scope.worktree.to_string_lossy().into_owned(),
         provider: "herdr-mcp".to_owned(),
         account: None,
         kind: redact(&kind),
@@ -205,17 +208,22 @@ struct WorkScope {
 
 fn resolve_scope(arguments: &Value, snapshot: &Value) -> Option<WorkScope> {
     let topology = projects::derive_routing(snapshot);
+    // Tool_call capture scopes to the unified validated-root surface: managed
+    // Git roots plus vcs-less operational roots proven by the live topology
+    // (same surface the tailers tail). Project key = the git root when any,
+    // else the operational folder itself.
+    let validated = crate::fs_security::validated_roots_from(&topology);
     let mut candidates = BTreeSet::new();
     collect_path_candidates(arguments, &mut candidates);
 
+    let is_validated = |root: &Path| validated.iter().any(|valid| valid == root);
     let project = candidates
         .iter()
         .flat_map(|candidate| {
             let candidate = Path::new(candidate);
-            topology
-                .projects
-                .values()
-                .filter(move |project| project.managed && candidate.starts_with(&project.root))
+            topology.projects.values().filter(|project| {
+                is_validated(&project.root) && candidate.starts_with(&project.root)
+            })
         })
         .max_by_key(|project| project.root.components().count())
         .or_else(|| {
@@ -223,7 +231,7 @@ fn resolve_scope(arguments: &Value, snapshot: &Value) -> Option<WorkScope> {
                 .and_then(|workspace| {
                     projects::projects_for_workspace(&topology, &workspace)
                         .into_iter()
-                        .find(|project| project.managed)
+                        .find(|project| is_validated(&project.root))
                 })
                 .and_then(|project| topology.projects.get(&project.root))
         })?;
@@ -401,6 +409,7 @@ fn looks_high_entropy(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use serde_json::json;
 
@@ -509,6 +518,48 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// user tool call in a vcs-less folder | Given a live pane cwd that is
+    /// not a Git repo (an operational root proven by the topology) | When a
+    /// tool call under it is captured | Then the event scopes to the folder
+    /// itself with a dir:-prefixed project key.
+    #[test]
+    fn user_tool_call_in_a_vcs_less_operational_folder_is_captured() {
+        // Short path on purpose: / and - are in the high-entropy charset, so
+        // a >=32-char path token would be redacted before scope resolution.
+        let root = Path::new("/tmp/herdr-oproot");
+        std::fs::create_dir_all(root).unwrap();
+        let snapshot = json!({
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.to_string_lossy()
+            }],
+            "agents": []
+        });
+        let event = event_for_tool_call(
+            "herdr_fs_write",
+            &json!({"path": root.join("notes.md").to_string_lossy()}),
+            &snapshot,
+        )
+        .expect("operational root should resolve");
+        assert_eq!(event.worktree, root.to_string_lossy());
+        assert_eq!(event.project_ref, format!("dir:{}", root.to_string_lossy()));
+        // The pane-only path resolves through the workspace as well.
+        let via_pane = event_for_tool_call("herdr_exec", &json!({"pane_id": "w1:p1"}), &snapshot)
+            .expect("operational workspace fallback should resolve");
+        assert_eq!(via_pane.worktree, root.to_string_lossy());
+        // Outside the folder stays uncaptured.
+        assert!(
+            event_for_tool_call(
+                "herdr_fs_write",
+                &json!({"path": "/tmp/herdr-elsewhere/x.md"}),
+                &snapshot,
+            )
+            .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

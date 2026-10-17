@@ -277,13 +277,11 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "worktree": {"type": "string", "maxLength": 4096},
                     "project_root": {"type": "string", "maxLength": 4096},
                     "project_ref": {"type": "string", "maxLength": 512},
+                    "cwd": {"type": "string", "maxLength": 4096},
+                    "pane": {"type": "string", "maxLength": 256},
                 },
                 "required": [],
-                "oneOf": [
-                    {"required": ["worktree"]},
-                    {"required": ["project_root"]}
-                ],
-                "empty": false,
+                "description": "Pass worktree or project_root (or cwd/pane to resolve the caller's project); with no selector, lists projects that have handoffs.",
             },
         }),
         json!({

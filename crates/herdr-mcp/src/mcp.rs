@@ -372,7 +372,11 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
             } else if method == WORK_PICKUP_METHOD {
-                work_pickup_call(context.state_store, &params)
+                work_pickup_call(
+                    context.state_store,
+                    &params,
+                    Some(&context.cache.snapshot()),
+                )
             } else if method == BROWSER_SOURCE_RESOLVE_METHOD {
                 browser_source_resolve(context.state_store, &params, context.trusted_local_ipc)
             } else if method == BROWSER_HANDOFF_PREPARE_METHOD {
@@ -735,55 +739,212 @@ fn browser_conversation_url_ref(raw: &str) -> Option<BrowserConversationUrlRef> 
     }
 }
 
-fn work_pickup_call(store: &std::sync::Arc<std::sync::Mutex<StateStore>>, params: &Value) -> Value {
+fn work_pickup_call(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    snapshot: Option<&Value>,
+) -> Value {
     let Some(object) = params.as_object() else {
         return json!({"ok": false, "code": "work_pickup_params_invalid"});
     };
-    const ALLOWED: &[&str] = &["worktree", "project_root", "project_ref"];
+    const ALLOWED: &[&str] = &["worktree", "project_root", "project_ref", "cwd", "pane"];
     if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
         return json!({"ok": false, "code": "work_pickup_params_invalid"});
     }
-    let worktree = object.get("worktree").and_then(Value::as_str);
-    let project_root = object.get("project_root").and_then(Value::as_str);
-    if usize::from(worktree.is_some()) + usize::from(project_root.is_some()) != 1 {
-        return json!({"ok": false, "code": "work_pickup_params_invalid"});
-    }
-    let worktree = worktree.or(project_root).unwrap_or_default();
-    if worktree.trim().is_empty() || worktree.len() > 4096 {
-        return json!({"ok": false, "code": "work_pickup_params_invalid"});
-    }
-    let project_ref = object.get("project_ref").and_then(Value::as_str);
-    if project_ref.is_some_and(|value| value.trim().is_empty() || value.len() > 512) {
+    let bounded_str = |key: &str, max: usize| -> Result<Option<String>, Value> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(value) => match value.as_str() {
+                Some(text) if !text.trim().is_empty() && text.len() <= max => {
+                    Ok(Some(text.to_owned()))
+                }
+                _ => Err(json!({"ok": false, "code": "work_pickup_params_invalid"})),
+            },
+        }
+    };
+    let worktree = match bounded_str("worktree", 4096) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let project_root = match bounded_str("project_root", 4096) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let project_ref = match bounded_str("project_ref", 512) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let cwd = match bounded_str("cwd", 4096) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let pane = match bounded_str("pane", 256) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if usize::from(worktree.is_some()) + usize::from(project_root.is_some()) > 1 {
         return json!({"ok": false, "code": "work_pickup_params_invalid"});
     }
     let Ok(store) = store.lock() else {
         return json!({"ok": false, "code": "work_store_unavailable"});
     };
-    let state = if let Some(project_ref) = project_ref {
-        match store.work_state(project_ref, worktree) {
+
+    if let Some(worktree) = worktree.or(project_root) {
+        let state = match pickup_state(&store, &worktree, project_ref.as_deref()) {
             Ok(state) => state,
             Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
-        }
-    } else {
-        let Ok(states) = store.work_states() else {
-            return json!({"ok": false, "code": "work_store_unavailable"});
         };
-        states
-            .into_iter()
-            .filter(|state| state.worktree == worktree)
-            .max_by_key(|state| state.updated_at)
+        // Only inspect AGENTS.md/CLAUDE.md for a root the relay actually
+        // recorded (capture validated it against the topology); never for an
+        // arbitrary caller-supplied path.
+        let root = state.as_ref().map(|state| state.worktree.clone());
+        return pickup_response(state, root.as_deref());
+    }
+
+    // Caller-context resolution: a cwd (or the pane's cwd) that resolves to a
+    // project hands back that project's handoff directly.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(cwd) = cwd {
+        candidates.push(cwd);
+    }
+    if let Some(pane_cwd) = pane
+        .as_deref()
+        .and_then(|pane| snapshot.and_then(|snapshot| pickup_pane_cwd(snapshot, pane)))
+    {
+        candidates.push(pane_cwd);
+    }
+    if !candidates.is_empty() {
+        let resolved = pickup_resolve_root(snapshot, &candidates);
+        let states = match store.work_states() {
+            Ok(states) => states,
+            Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+        };
+        // Prefer the topology-resolved root; fall back to the deepest recorded
+        // handoff whose worktree contains the caller path (covers folders
+        // that compacted before this snapshot or were dropped from it).
+        let state = resolved
+            .as_ref()
+            .and_then(|root| {
+                let root = root.to_string_lossy();
+                states
+                    .iter()
+                    .filter(|state| state.worktree == root.as_ref())
+                    .max_by_key(|state| state.updated_at)
+                    .cloned()
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .flat_map(|candidate| {
+                        let candidate = std::path::Path::new(candidate);
+                        states.iter().filter(move |state| {
+                            candidate.starts_with(std::path::Path::new(&state.worktree))
+                        })
+                    })
+                    .max_by_key(|state| std::path::Path::new(&state.worktree).components().count())
+                    .cloned()
+            });
+        let root = resolved
+            .map(|root| root.to_string_lossy().into_owned())
+            .or_else(|| state.as_ref().map(|state| state.worktree.clone()));
+        return pickup_response(state, root.as_deref());
+    }
+
+    // No selector at all: list projects that have a handoff so the caller can
+    // present them or follow up with worktree/project_root.
+    let states = match store.work_states() {
+        Ok(states) => states,
+        Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
     };
-    state.map_or_else(
-        || json!({"ok": true, "handoff_md": "", "through_event_id": 0, "updated_at": 0}),
-        |state| {
+    let mut projects = states
+        .into_iter()
+        .filter(|state| !state.handoff_md.trim().is_empty())
+        .map(|state| {
             json!({
-                "ok": true,
-                "handoff_md": state.handoff_md,
-                "through_event_id": state.through_event_id,
+                "worktree": state.worktree,
+                "project_ref": state.project_ref,
                 "updated_at": state.updated_at,
             })
-        },
-    )
+        })
+        .collect::<Vec<_>>();
+    projects.sort_by_key(|project| std::cmp::Reverse(project["updated_at"].as_i64().unwrap_or(0)));
+    let total = projects.len();
+    projects.truncate(50);
+    json!({"ok": true, "projects": projects, "total": total})
+}
+
+fn pickup_state(
+    store: &StateStore,
+    worktree: &str,
+    project_ref: Option<&str>,
+) -> Result<Option<crate::state_store::work_journal::WorkState>, String> {
+    if let Some(project_ref) = project_ref {
+        return store.work_state(project_ref, worktree);
+    }
+    Ok(store
+        .work_states()?
+        .into_iter()
+        .filter(|state| state.worktree == worktree)
+        .max_by_key(|state| state.updated_at))
+}
+
+/// The resolved handoff payload: rendered markdown, the structured sections
+/// (when the document carries a decodable relay-memory block), and the
+/// agent-instruction reference report for the project root.
+fn pickup_response(
+    state: Option<crate::state_store::work_journal::WorkState>,
+    root: Option<&str>,
+) -> Value {
+    let _ = root;
+    let handoff_md = state
+        .as_ref()
+        .map(|state| state.handoff_md.clone())
+        .unwrap_or_default();
+    let sections = crate::work_compactor::parsed_memory(&handoff_md)
+        .and_then(|memory| serde_json::to_value(memory).ok())
+        .unwrap_or(Value::Null);
+    let response = json!({
+        "ok": true,
+        "handoff_md": handoff_md,
+        "through_event_id": state.as_ref().map_or(0, |state| state.through_event_id),
+        "updated_at": state.as_ref().map_or(0, |state| state.updated_at),
+        "sections": sections,
+    });
+    response
+}
+
+fn pickup_pane_cwd(snapshot: &Value, pane: &str) -> Option<String> {
+    ["panes", "agents"].into_iter().find_map(|key| {
+        snapshot
+            .get(key)
+            .and_then(Value::as_array)?
+            .iter()
+            .filter(|item| item.get("pane_id").and_then(Value::as_str) == Some(pane))
+            .find_map(|item| {
+                item.get("cwd")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("foreground_cwd").and_then(Value::as_str))
+                    .map(str::to_owned)
+            })
+    })
+}
+
+/// Resolve a caller path to the deepest validated project root containing it
+/// (managed Git root or proven vcs-less operational root).
+fn pickup_resolve_root(
+    snapshot: Option<&Value>,
+    candidates: &[String],
+) -> Option<std::path::PathBuf> {
+    let topology = crate::projects::derive_routing(snapshot?);
+    let roots = crate::fs_security::validated_roots_from(&topology);
+    candidates.iter().find_map(|candidate| {
+        let candidate = std::path::Path::new(candidate);
+        roots
+            .iter()
+            .filter(|root| candidate.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned()
+    })
 }
 
 fn continuity_call(
@@ -10975,22 +11136,153 @@ mod tests {
         let found = work_pickup_call(
             &store,
             &json!({"project_root": "/repo", "project_ref": "project-a"}),
+            None,
         );
         assert_eq!(found["ok"], true);
         assert_eq!(found["handoff_md"], "# Ready");
         assert_eq!(found["through_event_id"], 9);
         assert_eq!(found["updated_at"], 12);
+        // A legacy free-form handoff has no structured sections block.
+        assert_eq!(found["sections"], Value::Null);
 
-        let empty = work_pickup_call(&store, &json!({"worktree": "/other"}));
+        let empty = work_pickup_call(&store, &json!({"worktree": "/other"}), None);
+        assert_eq!(empty["ok"], true);
+        assert_eq!(empty["handoff_md"], "");
+        assert_eq!(empty["through_event_id"], 0);
+        assert_eq!(empty["updated_at"], 0);
+
+        for bad in [
+            json!({"worktree": "/repo", "project_root": "/repo"}),
+            json!({"nope": 1}),
+            json!({"cwd": ""}),
+            json!({"pane": 7}),
+        ] {
+            assert_eq!(
+                work_pickup_call(&store, &bad, None)["code"],
+                "work_pickup_params_invalid",
+                "{bad}"
+            );
+        }
+    }
+
+    /// user pickup without selectors | Given recorded handoffs | When
+    /// work.pickup is called with no worktree/project_root/cwd/pane | Then it
+    /// lists the projects with handoffs instead of failing.
+    #[test]
+    fn work_pickup_without_params_lists_projects_with_handoffs() {
+        use crate::state_store::work_journal::WorkState;
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        for (worktree, project_ref, handoff, updated_at) in [
+            ("/a", "dir:/a", "# A", 3),
+            ("/b", "git:example/b", "# B", 9),
+            ("/empty", "dir:/empty", "   ", 7),
+        ] {
+            store
+                .lock()
+                .unwrap()
+                .put_work_state(&WorkState {
+                    project_ref: project_ref.to_owned(),
+                    worktree: worktree.to_owned(),
+                    handoff_md: handoff.to_owned(),
+                    updated_at,
+                    ..WorkState::default()
+                })
+                .unwrap();
+        }
+        let listed = work_pickup_call(&store, &json!({}), None);
+        assert_eq!(listed["ok"], true);
+        let projects = listed["projects"].as_array().unwrap();
+        // Empty-handoff scopes stay out; newest first.
+        assert_eq!(projects.len(), 2);
         assert_eq!(
-            empty,
-            json!({
-                "ok": true,
-                "handoff_md": "",
-                "through_event_id": 0,
-                "updated_at": 0,
-            })
+            projects[0],
+            json!({"worktree": "/b", "project_ref": "git:example/b", "updated_at": 9})
         );
+        assert_eq!(
+            projects[1],
+            json!({"worktree": "/a", "project_ref": "dir:/a", "updated_at": 3})
+        );
+    }
+
+    /// user pickup via caller cwd | Given a handoff under a managed Git root
+    /// and a caller cwd inside it | When work.pickup passes only cwd | Then
+    /// the project handoff resolves, with structured sections and the
+    /// handoff-reference report.
+    #[test]
+    fn work_pickup_resolves_cwd_to_project_handoff() {
+        use crate::state_store::work_journal::WorkState;
+        use crate::work_compactor::{RelayItem, RelayMemory, render_handoff};
+        use std::sync::{Arc, Mutex};
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-work-pickup-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "see HANDOFF.md\n").unwrap();
+
+        let memory = RelayMemory {
+            goals: vec![RelayItem {
+                id: "g1".to_owned(),
+                text: "ship relay".to_owned(),
+            }],
+            current_state: "green".to_owned(),
+            ..RelayMemory::default()
+        };
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "git:example/repo".to_owned(),
+                worktree: root.to_string_lossy().into_owned(),
+                handoff_md: render_handoff(&memory),
+                through_event_id: 4,
+                updated_at: 5,
+                ..WorkState::default()
+            })
+            .unwrap();
+        let snapshot = json!({
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.join("src").to_string_lossy()
+            }],
+            "agents": []
+        });
+
+        // cwd resolution through the topology project root.
+        let by_cwd = work_pickup_call(
+            &store,
+            &json!({"cwd": root.join("src").to_string_lossy()}),
+            Some(&snapshot),
+        );
+        assert_eq!(by_cwd["ok"], true);
+        assert_eq!(by_cwd["through_event_id"], 4);
+        assert!(by_cwd["handoff_md"].as_str().unwrap().contains("## 规则"));
+        assert_eq!(by_cwd["sections"]["goals"][0]["text"], "ship relay");
+
+        // pane resolution goes through the pane's live cwd the same way.
+        let by_pane = work_pickup_call(&store, &json!({"pane": "w1:p1"}), Some(&snapshot));
+        assert_eq!(by_pane["handoff_md"], by_cwd["handoff_md"]);
+
+        // A cwd that resolves to no project and no recorded worktree is an
+        // empty success, never an error.
+        let unknown = work_pickup_call(
+            &store,
+            &json!({"cwd": "/definitely/nowhere"}),
+            Some(&snapshot),
+        );
+        assert_eq!(unknown["ok"], true);
+        assert_eq!(unknown["handoff_md"], "");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Accepted-text evidence a real content script now reports alongside the
