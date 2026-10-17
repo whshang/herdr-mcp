@@ -26,6 +26,9 @@ struct LogDirs {
     claude_projects: Option<PathBuf>,
     pi_sessions: Option<PathBuf>,
     omp_home: Option<PathBuf>,
+    droid_sessions: Option<PathBuf>,
+    grok_sessions: Option<PathBuf>,
+    cursor_projects: Option<PathBuf>,
 }
 
 impl LogDirs {
@@ -40,7 +43,10 @@ impl LogDirs {
             codex_sessions: codex_home.map(|path| path.join("sessions")),
             claude_projects: home.as_ref().map(|path| path.join(".claude/projects")),
             pi_sessions: home.as_ref().map(|path| path.join(".pi/agent/sessions")),
-            omp_home: home.map(|path| path.join(".omp")),
+            omp_home: home.as_ref().map(|path| path.join(".omp")),
+            droid_sessions: home.as_ref().map(|path| path.join(".factory/sessions")),
+            grok_sessions: home.as_ref().map(|path| path.join(".grok/sessions")),
+            cursor_projects: home.map(|path| path.join(".cursor/projects")),
         }
     }
 }
@@ -51,6 +57,9 @@ enum Provider {
     Claude,
     Pi,
     Omp,
+    Droid,
+    Grok,
+    CursorAgent,
 }
 
 impl Provider {
@@ -60,6 +69,9 @@ impl Provider {
             Self::Claude => "claude-code",
             Self::Pi => "pi",
             Self::Omp => "omp",
+            Self::Droid => "droid",
+            Self::Grok => "grok",
+            Self::CursorAgent => "cursor-agent",
         }
     }
 }
@@ -69,6 +81,61 @@ struct LogFile {
     provider: Provider,
     path: PathBuf,
     mtime: Option<SystemTime>,
+    /// Session cwd recoverable from the file's location rather than its
+    /// content (grok percent-encodes it in a directory name; cursor-agent
+    /// lossily encodes it into the project directory name).
+    cwd_hint: Option<CwdHint>,
+}
+
+#[derive(Debug, Clone)]
+enum CwdHint {
+    /// A decoded absolute cwd: matched with the usual prefix rule.
+    Path(PathBuf),
+    /// cursor-agent's lossy `Users-x-Documents-proj` encoding: matched by
+    /// encoding each managed root the same way and comparing for equality.
+    EncodedName(String),
+}
+
+impl CwdHint {
+    fn matching<'a>(&self, scopes: &'a [Scope]) -> Option<&'a Scope> {
+        match self {
+            Self::Path(cwd) => matching_scope(cwd, scopes),
+            // `scopes` is sorted deepest-first, so the deepest managed root
+            // wins. A session in a subdirectory encodes as `<root>-<sub>`.
+            Self::EncodedName(name) => scopes.iter().find(|scope| {
+                let root = cursor_project_name(&scope.match_root);
+                *name == root || name.starts_with(&format!("{root}-"))
+            }),
+        }
+    }
+}
+
+/// cursor-agent's project directory encoding: absolute path without the
+/// leading slash, every remaining `/` replaced by `-`.
+fn cursor_project_name(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim_start_matches('/')
+        .replace('/', "-")
+}
+
+/// Minimal percent-decoder for grok's URL-encoded cwd directory names.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let pair = bytes.get(index + 1..index + 3)?;
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            decoded.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +351,74 @@ fn discover_logs(dirs: &LogDirs) -> Vec<LogFile> {
             &mut logs,
         );
     }
+    if let Some(root) = &dirs.droid_sessions {
+        // Sessions live exactly one directory deep: sessions/<cwd>/<uuid>.jsonl.
+        collect_jsonl(
+            root,
+            1,
+            Provider::Droid,
+            |relative| relative.components().count() == 2,
+            &mut logs,
+        );
+    }
+    if let Some(root) = &dirs.grok_sessions {
+        collect_jsonl(
+            root,
+            2,
+            Provider::Grok,
+            |relative| {
+                relative
+                    .file_name()
+                    .is_some_and(|name| name == "chat_history.jsonl")
+            },
+            &mut logs,
+        );
+        for log in logs
+            .iter_mut()
+            .filter(|log| matches!(log.provider, Provider::Grok))
+        {
+            if let Some(encoded) = log
+                .path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .and_then(|part| percent_decode(&part.as_os_str().to_string_lossy()))
+            {
+                log.cwd_hint = Some(CwdHint::Path(PathBuf::from(encoded)));
+            }
+        }
+    }
+    if let Some(root) = &dirs.cursor_projects {
+        // Only transcripts: projects/<p>/agent-transcripts/[<uuid>/]<uuid>.jsonl.
+        collect_jsonl(
+            root,
+            3,
+            Provider::CursorAgent,
+            |relative| {
+                let mut parts = relative.components();
+                parts.next().is_some()
+                    && parts
+                        .next()
+                        .is_some_and(|part| part.as_os_str() == "agent-transcripts")
+            },
+            &mut logs,
+        );
+        for log in logs
+            .iter_mut()
+            .filter(|log| matches!(log.provider, Provider::CursorAgent))
+        {
+            if let Some(name) = log
+                .path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|relative| relative.components().next())
+            {
+                log.cwd_hint = Some(CwdHint::EncodedName(
+                    name.as_os_str().to_string_lossy().into_owned(),
+                ));
+            }
+        }
+    }
     // Cap across ALL providers, keeping the newest by mtime, so one chatty
     // provider discovered earlier cannot starve the others.
     let discovered = logs.len();
@@ -355,6 +490,7 @@ fn collect_jsonl(
                     provider,
                     path,
                     mtime,
+                    cwd_hint: None,
                 });
             }
         }
@@ -448,6 +584,7 @@ fn ingest_file(
 
         if reset
             && scope_key.is_none()
+            && log.cwd_hint.is_none()
             && let Some(cwd) = record_cwd(&value)
         {
             scope_key = matching_scope(&cwd, scopes)
@@ -455,6 +592,17 @@ fn ingest_file(
             if scope_key.is_none() {
                 return Ok(FileOutcome::Unmanaged);
             }
+        }
+        if reset
+            && scope_key.is_none()
+            && let Some(hint) = &log.cwd_hint
+        {
+            // Providers whose logs carry no in-band cwd: resolve the path-
+            // derived hint instead. A hint that matches no managed root
+            // leaves the file unmanaged once the scan completes.
+            scope_key = hint
+                .matching(scopes)
+                .map(|scope| (scope.project_ref.clone(), scope.worktree.clone()));
         }
         let Some((project_ref, worktree)) = scope_key.as_ref() else {
             continue;
@@ -609,6 +757,17 @@ fn record_cwd(value: &Value) -> Option<PathBuf> {
 }
 
 fn parse_events(provider: Provider, value: &Value) -> Vec<ParsedEvent> {
+    match provider {
+        Provider::Droid => parse_droid_events(value),
+        Provider::Grok => parse_grok_events(value),
+        Provider::CursorAgent => parse_cursor_events(value),
+        Provider::Codex | Provider::Claude | Provider::Pi | Provider::Omp => {
+            parse_generic_events(value)
+        }
+    }
+}
+
+fn parse_generic_events(value: &Value) -> Vec<ParsedEvent> {
     let account = find_account(value);
     let ts = find_timestamp(value);
     let message = value.get("message").unwrap_or(value);
@@ -691,10 +850,139 @@ fn parse_events(provider: Provider, value: &Value) -> Vec<ParsedEvent> {
         events.push(parsed("error", error, &account, ts));
     }
 
-    // OMP currently follows pi's session shape; keeping provider-specific
-    // parsing selected here makes a future format divergence local.
-    let _ = provider;
     events
+}
+
+/// Factory droid: `{"type":"message","message":{"role":..,"content":[..]}}`
+/// plus a `session_start` first line whose `cwd` `record_cwd` already finds.
+fn parse_droid_events(value: &Value) -> Vec<ParsedEvent> {
+    let mut events = Vec::new();
+    if value.get("type").and_then(Value::as_str) != Some("message") {
+        return events;
+    }
+    let Some(message) = value.get("message") else {
+        return events;
+    };
+    let Some(content) = message.get("content") else {
+        return events;
+    };
+    let account = find_account(value);
+    let ts = find_timestamp(value);
+    match message.get("role").and_then(Value::as_str) {
+        Some("user") => {
+            // System reminders are injected user messages marked llm_only.
+            let llm_only = [value, message]
+                .into_iter()
+                .any(|owner| owner.get("visibility").and_then(Value::as_str) == Some("llm_only"));
+            // Empty content or tool_result-only content yields no text to log.
+            if !llm_only
+                && let Some(text) = content_text(content)
+                    .and_then(|text| crate::work_capture::strip_handoff_context(&text))
+            {
+                events.push(parsed("user_prompt", text, &account, ts));
+            }
+        }
+        Some("assistant") => {
+            if let Some(text) = content_text(content) {
+                events.push(parsed("assistant_summary", text, &account, ts));
+            }
+            collect_tool_events(content, &account, ts, &mut events);
+        }
+        _ => {}
+    }
+    events
+}
+
+/// grok CLI: flat `{"type":"user"|"assistant",...}` lines from
+/// `<encoded-cwd>/<session-id>/chat_history.jsonl`.
+fn parse_grok_events(value: &Value) -> Vec<ParsedEvent> {
+    let mut events = Vec::new();
+    let account = find_account(value);
+    let ts = find_timestamp(value);
+    match value.get("type").and_then(Value::as_str) {
+        Some("user") => {
+            // Only real typed turns carry prompt_index; synthetic reminders
+            // and <user_info> bookkeeping lines never do.
+            if value.get("prompt_index").is_none() || value.get("synthetic_reason").is_some() {
+                return events;
+            }
+            let Some(text) = value.get("content").and_then(content_text) else {
+                return events;
+            };
+            let text = extract_user_query(&text).unwrap_or(&text);
+            if let Some(text) = crate::work_capture::strip_handoff_context(text) {
+                events.push(parsed("user_prompt", text, &account, ts));
+            }
+        }
+        Some("assistant") => {
+            if let Some(text) = value.get("content").and_then(content_text) {
+                events.push(parsed("assistant_summary", text, &account, ts));
+            }
+            if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    let Some(name) = call.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    // `arguments` is a JSON string, not an object; an
+                    // unparseable argument string still yields a named event.
+                    let arguments = call
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+                    let short = arguments
+                        .as_ref()
+                        .map(short_argument)
+                        .filter(|text| !text.is_empty());
+                    let summary =
+                        short.map_or_else(|| name.to_owned(), |arg| format!("{name}: {arg}"));
+                    events.push(parsed("tool_call", summary, &account, ts));
+                }
+            }
+        }
+        _ => {}
+    }
+    events
+}
+
+/// cursor-agent: `{"role":..,"message":{"content":[..]}}` lines; the cwd
+/// comes from the project directory name, never from file content.
+fn parse_cursor_events(value: &Value) -> Vec<ParsedEvent> {
+    let mut events = Vec::new();
+    let account = find_account(value);
+    let ts = find_timestamp(value);
+    let Some(message) = value.get("message") else {
+        return events;
+    };
+    let Some(content) = message.get("content") else {
+        return events;
+    };
+    match value.get("role").and_then(Value::as_str) {
+        Some("user") => {
+            let Some(text) = content_text(content) else {
+                return events;
+            };
+            let text = extract_user_query(&text).unwrap_or(&text);
+            if let Some(text) = crate::work_capture::strip_handoff_context(text) {
+                events.push(parsed("user_prompt", text, &account, ts));
+            }
+        }
+        Some("assistant") => {
+            if let Some(text) = content_text(content) {
+                events.push(parsed("assistant_summary", text, &account, ts));
+            }
+            collect_tool_events(content, &account, ts, &mut events);
+        }
+        _ => {}
+    }
+    events
+}
+
+/// Inner text of a `<user_query>...</user_query>` block when one exists.
+fn extract_user_query(text: &str) -> Option<&str> {
+    let after = text.find("<user_query>")? + "<user_query>".len();
+    let before = text[after..].find("</user_query>")?;
+    let inner = text[after..after + before].trim();
+    (!inner.is_empty()).then_some(inner)
 }
 
 fn parsed(
@@ -994,6 +1282,9 @@ mod tests {
                     claude_projects: Some(base.join("claude/projects")),
                     pi_sessions: Some(base.join("pi/sessions")),
                     omp_home: Some(base.join("omp")),
+                    droid_sessions: Some(base.join("droid/sessions")),
+                    grok_sessions: Some(base.join("grok/sessions")),
+                    cursor_projects: Some(base.join("cursor/projects")),
                 },
                 base,
             }
@@ -1017,6 +1308,300 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.base);
         }
+    }
+
+    /// helper for grok directory names: percent-encode every byte.
+    fn percent_encode(text: &str) -> String {
+        text.bytes().map(|byte| format!("%{byte:02X}")).collect()
+    }
+
+    /// user droid transcript tail | Given a factory session log | When the
+    /// store ingests it twice | Then scoped events appear once, reminders and
+    /// non-transcript files are skipped, and handoff context is stripped.
+    #[test]
+    fn droid_logs_are_tailed_incrementally_with_scope_and_cleanup_rules() {
+        let fixture = Fixture::new();
+        let cwd = fixture.project.to_string_lossy();
+        fixture.write(
+            "droid/sessions/encoded-cwd/11111111-1111-1111-1111-111111111111.jsonl",
+            &[
+                serde_json::json!({"type":"session_start","id":"s1","title":"t","cwd":cwd}),
+                serde_json::json!({"type":"message","id":"m1","timestamp":"2026-09-14T01:13:35.738Z","message":{"role":"user","content":[{"type":"text","text":"## Handoff context\n\nh\n\n---\n\ndroid real ask"}]}}),
+                serde_json::json!({"type":"message","message":{"role":"user","visibility":"llm_only","content":[{"type":"text","text":"system reminder text"}]}}),
+                serde_json::json!({"type":"message","visibility":"llm_only","message":{"role":"user","content":[{"type":"text","text":"top level reminder"}]}}),
+                serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"tool_result","content":"tool output"}]}}),
+                serde_json::json!({"type":"todo_state","items":["noise"]}),
+                serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"droid hidden"},{"type":"text","text":"droid answer"},{"type":"tool_use","id":"t1","name":"Execute","input":{"command":"git diff"}}]}}),
+            ],
+        );
+        // Not a transcript: files outside <cwd>/<uuid>.jsonl or without the
+        // .jsonl extension are never discovered.
+        fixture.write(
+            "droid/sessions/stray.jsonl",
+            &[serde_json::json!({"type":"session_start","cwd":cwd})],
+        );
+        fixture.write(
+            "droid/sessions/encoded-cwd/session.settings.jsonl-notes.txt",
+            &[],
+        );
+        fixture.write(
+            "droid/sessions/other-cwd/22222222-2222-2222-2222-222222222222.jsonl",
+            &[
+                serde_json::json!({"type":"session_start","id":"s2","cwd":fixture.base.join("other")}),
+                serde_json::json!({"type":"message","message":{"role":"user","content":"droid foreign"}}),
+            ],
+        );
+        // A garbage line is skipped without losing later lines in the file.
+        let garbage = fixture
+            .base
+            .join("droid/sessions/encoded-cwd/33333333-3333-3333-3333-333333333333.jsonl");
+        fs::write(
+            &garbage,
+            format!("not json\n{{\"type\":\"session_start\",\"cwd\":{cwd:?}}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"droid after garbage\"}}}}\n"),
+        )
+        .unwrap();
+
+        let store = StateStore::open(":memory:").unwrap();
+        let roots = std::slice::from_ref(&fixture.project);
+        assert_eq!(
+            ingest_from_dirs(&store, roots, 1, &fixture.dirs).unwrap(),
+            4
+        );
+        let rows = store.latest_work_events(&cwd, &cwd, 20).unwrap();
+        assert!(rows.iter().all(|row| row.provider == "droid"));
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "user_prompt" && row.summary == "droid real ask")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "assistant_summary" && row.summary == "droid answer")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "tool_call" && row.summary == "Execute: git diff")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "user_prompt" && row.summary == "droid after garbage")
+        );
+        for skipped in [
+            "system reminder text",
+            "top level reminder",
+            "tool output",
+            "droid hidden",
+            "droid foreign",
+        ] {
+            assert!(
+                rows.iter().all(|row| !row.summary.contains(skipped)),
+                "unexpected event: {skipped}"
+            );
+        }
+        // Incremental tail: no new bytes means no new rows.
+        assert_eq!(
+            ingest_from_dirs(&store, roots, 2, &fixture.dirs).unwrap(),
+            0
+        );
+    }
+
+    /// user grok transcript tail | Given a grok chat_history.jsonl | When the
+    /// store ingests it twice | Then typed turns appear once, synthetic and
+    /// non-chat files are skipped, and the cwd decodes from the directory.
+    #[test]
+    fn grok_logs_are_tailed_incrementally_with_scope_and_cleanup_rules() {
+        let fixture = Fixture::new();
+        let cwd = fixture.project.to_string_lossy();
+        fixture.write(
+            &format!(
+                "grok/sessions/{}/sess-1/chat_history.jsonl",
+                percent_encode(&cwd)
+            ),
+            &[
+                serde_json::json!({"type":"system","content":"system banner"}),
+                serde_json::json!({"type":"user","content":[{"type":"text","text":"<user_query>\n## Handoff context\n\nh\n\n---\n\ngrok real ask\n</user_query>"}],"prompt_index":0}),
+                serde_json::json!({"type":"user","content":[{"type":"text","text":"<user_query>\nplain grok ask\n</user_query>"}],"prompt_index":1}),
+                serde_json::json!({"type":"user","content":[{"type":"text","text":"<user_info>bookkeeping</user_info>"}]}),
+                serde_json::json!({"type":"user","content":"synthetic reminder","prompt_index":2,"synthetic_reason":"system_reminder"}),
+                serde_json::json!({"type":"reasoning","content":"grok hidden"}),
+                serde_json::json!({"type":"assistant","content":"grok answer","tool_calls":[{"id":"c1","name":"run_terminal_command","arguments":"{\"command\":\"git status\"}"},{"id":"c2","name":"broken_args","arguments":"{not json"}]}),
+                serde_json::json!({"type":"tool_result","content":"tool output"}),
+            ],
+        );
+        // Sibling files in the session directory are not transcripts.
+        fixture.write(
+            &format!(
+                "grok/sessions/{}/sess-1/updates.jsonl",
+                percent_encode(&cwd)
+            ),
+            &[serde_json::json!({"type":"user","content":"updates noise","prompt_index":0})],
+        );
+        fixture.write(
+            &format!(
+                "grok/sessions/{}/sess-2/chat_history.jsonl",
+                percent_encode(&fixture.base.join("other").to_string_lossy())
+            ),
+            &[serde_json::json!({"type":"user","content":"grok foreign","prompt_index":0})],
+        );
+        let garbage = fixture.base.join(format!(
+            "grok/sessions/{}/sess-3/chat_history.jsonl",
+            percent_encode(&cwd)
+        ));
+        fs::create_dir_all(garbage.parent().unwrap()).unwrap();
+        fs::write(
+            &garbage,
+            "not json\n{\"type\":\"user\",\"content\":\"grok after garbage\",\"prompt_index\":0}\n",
+        )
+        .unwrap();
+
+        let store = StateStore::open(":memory:").unwrap();
+        let roots = std::slice::from_ref(&fixture.project);
+        assert_eq!(
+            ingest_from_dirs(&store, roots, 1, &fixture.dirs).unwrap(),
+            6
+        );
+        let rows = store.latest_work_events(&cwd, &cwd, 20).unwrap();
+        assert!(rows.iter().all(|row| row.provider == "grok"));
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "user_prompt" && row.summary == "grok real ask")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "user_prompt" && row.summary == "plain grok ask")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "assistant_summary" && row.summary == "grok answer")
+        );
+        assert!(rows.iter().any(
+            |row| row.kind == "tool_call" && row.summary == "run_terminal_command: git status"
+        ));
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "tool_call" && row.summary == "broken_args")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "user_prompt" && row.summary == "grok after garbage")
+        );
+        for skipped in [
+            "system banner",
+            "bookkeeping",
+            "synthetic reminder",
+            "grok hidden",
+            "tool output",
+            "updates noise",
+            "grok foreign",
+        ] {
+            assert!(
+                rows.iter().all(|row| !row.summary.contains(skipped)),
+                "unexpected event: {skipped}"
+            );
+        }
+        assert_eq!(
+            ingest_from_dirs(&store, roots, 2, &fixture.dirs).unwrap(),
+            0
+        );
+    }
+
+    /// user cursor-agent transcript tail | Given agent-transcripts logs | When
+    /// the store ingests them twice | Then events resolve scope by the encoded
+    /// project name, prefer the deepest root, and non-transcript dirs and
+    /// unmanaged projects are skipped.
+    #[test]
+    fn cursor_agent_logs_are_tailed_incrementally_with_scope_and_cleanup_rules() {
+        let fixture = Fixture::new();
+        let cwd = fixture.project.to_string_lossy();
+        let nested = fixture.project.join("sub");
+        fs::create_dir_all(&nested).unwrap();
+        let nested_cwd = nested.to_string_lossy().into_owned();
+        let encoded_project = cursor_project_name(&fs::canonicalize(&fixture.project).unwrap());
+        let encoded_nested = cursor_project_name(&fs::canonicalize(&nested).unwrap());
+        fixture.write(
+            &format!("cursor/projects/{encoded_project}/agent-transcripts/uuid-1/uuid-1.jsonl"),
+            &[
+                serde_json::json!({"role":"user","message":{"content":[{"type":"text","text":"<timestamp>2026-09-14</timestamp>\n<user_query>\n## Handoff context\n\nh\n\n---\n\ncursor real ask\n</user_query>"}]}}),
+                serde_json::json!({"role":"assistant","message":{"content":[{"type":"text","text":"cursor answer"},{"type":"tool_use","name":"Shell","input":{"command":"gh pr view 52","description":"show pr"}}]}}),
+                serde_json::json!({"role":"user","message":{"content":[{"type":"text","text":"plain cursor ask"}]}}),
+            ],
+        );
+        // A transcript directly under agent-transcripts is also accepted, and
+        // the deepest matching managed root wins the encoded-name comparison.
+        fixture.write(
+            &format!("cursor/projects/{encoded_nested}/agent-transcripts/direct.jsonl"),
+            &[serde_json::json!({"role":"user","message":{"content":"nested cursor ask"}})],
+        );
+        fixture.write(
+            &format!("cursor/projects/{encoded_project}/other-dir/ignored.jsonl"),
+            &[serde_json::json!({"role":"user","message":{"content":"non transcript noise"}})],
+        );
+        fixture.write(
+            "cursor/projects/unmanaged-project/agent-transcripts/x.jsonl",
+            &[serde_json::json!({"role":"user","message":{"content":"cursor foreign"}})],
+        );
+        let garbage = fixture.base.join(format!(
+            "cursor/projects/{encoded_project}/agent-transcripts/uuid-2/uuid-2.jsonl"
+        ));
+        fs::create_dir_all(garbage.parent().unwrap()).unwrap();
+        fs::write(
+            &garbage,
+            "not json\n{\"role\":\"user\",\"message\":{\"content\":\"cursor after garbage\"}}\n",
+        )
+        .unwrap();
+
+        let store = StateStore::open(":memory:").unwrap();
+        let roots = [fixture.project.clone(), nested];
+        assert_eq!(
+            ingest_from_dirs(&store, &roots, 1, &fixture.dirs).unwrap(),
+            6
+        );
+        let rows = store.latest_work_events(&cwd, &cwd, 20).unwrap();
+        assert!(rows.iter().all(|row| row.provider == "cursor-agent"));
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "user_prompt" && row.summary == "cursor real ask")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "user_prompt" && row.summary == "plain cursor ask")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "assistant_summary" && row.summary == "cursor answer")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "tool_call" && row.summary == "Shell: gh pr view 52")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "user_prompt" && row.summary == "cursor after garbage")
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !row.summary.contains("non transcript noise")
+                    && !row.summary.contains("cursor foreign"))
+        );
+        let nested_rows = store
+            .latest_work_events(&nested_cwd, &nested_cwd, 10)
+            .unwrap();
+        assert!(nested_rows.iter().any(|row| row.provider == "cursor-agent"
+            && row.kind == "user_prompt"
+            && row.summary == "nested cursor ask"));
+        assert_eq!(
+            store
+                .latest_work_events(&cwd, &cwd, 30)
+                .unwrap()
+                .iter()
+                .chain(&nested_rows)
+                .filter(|row| row.provider == "cursor-agent")
+                .count(),
+            6
+        );
+        assert_eq!(
+            ingest_from_dirs(&store, &roots, 2, &fixture.dirs).unwrap(),
+            0
+        );
     }
 
     #[test]
