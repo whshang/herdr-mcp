@@ -311,7 +311,11 @@ fn ingest_from_dirs_with_refs(
 
 fn scopes(roots: &[PathBuf], project_refs: &BTreeMap<PathBuf, String>) -> Vec<Scope> {
     let mut result = Vec::new();
-    for root in roots {
+    // Scope guard: never tail into $HOME itself or global agent-config dirs.
+    for root in roots
+        .iter()
+        .filter(|root| crate::work_compactor::is_allowed_project_root(root))
+    {
         let display = root.to_string_lossy().into_owned();
         if result.iter().any(|scope: &Scope| scope.worktree == display) {
             continue;
