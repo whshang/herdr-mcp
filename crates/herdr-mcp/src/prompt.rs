@@ -386,29 +386,8 @@ impl PromptRegistry {
     }
 
     fn pane_worktree(&self, pane_id: &str) -> Option<String> {
-        let workspace_id = self.workspace_for_pane(pane_id)?;
         let snapshot = self.inner.cache.as_ref()?.snapshot();
-        snapshot
-            .get("workspaces")
-            .and_then(Value::as_array)
-            .and_then(|workspaces| {
-                workspaces.iter().find(|workspace| {
-                    workspace
-                        .get("workspace_id")
-                        .and_then(Value::as_str)
-                        .or_else(|| workspace.get("id").and_then(Value::as_str))
-                        == Some(&workspace_id)
-                })
-            })
-            .and_then(|workspace| workspace.get("worktree"))
-            .and_then(Value::as_object)
-            .and_then(|worktree| {
-                worktree
-                    .get("checkout_path")
-                    .and_then(Value::as_str)
-                    .or_else(|| worktree.get("path").and_then(Value::as_str))
-            })
-            .map(str::to_owned)
+        pane_worktree_from_snapshot(&snapshot, pane_id, self.workspace_for_pane(pane_id))
     }
 
     fn current_task_cursor(&self) -> u64 {
@@ -2384,6 +2363,48 @@ fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, Value
 
 fn invalid(message: &str) -> Value {
     json!({"ok": false, "code": "invalid_params", "message": message})
+}
+
+/// Worktree for a pane: the herdr-managed worktree checkout of its workspace
+/// when present, otherwise the deepest managed Git project root containing the
+/// pane (plain workspaces opened on a repo carry no `worktree` metadata). This
+/// matches the worktree the tool_call capture and tailers key work_state by.
+fn pane_worktree_from_snapshot(
+    snapshot: &Value,
+    pane_id: &str,
+    workspace_id: Option<String>,
+) -> Option<String> {
+    let from_metadata = workspace_id.and_then(|workspace_id| {
+        snapshot
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .and_then(|workspaces| {
+                workspaces.iter().find(|workspace| {
+                    workspace
+                        .get("workspace_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| workspace.get("id").and_then(Value::as_str))
+                        == Some(&workspace_id)
+                })
+            })
+            .and_then(|workspace| workspace.get("worktree"))
+            .and_then(Value::as_object)
+            .and_then(|worktree| {
+                worktree
+                    .get("checkout_path")
+                    .and_then(Value::as_str)
+                    .or_else(|| worktree.get("path").and_then(Value::as_str))
+            })
+            .map(str::to_owned)
+    });
+    from_metadata.or_else(|| {
+        crate::projects::derive_routing(snapshot)
+            .projects
+            .values()
+            .filter(|project| project.managed && project.pane_ids.iter().any(|p| p == pane_id))
+            .max_by_key(|project| project.root.components().count())
+            .map(|project| project.root.to_string_lossy().into_owned())
+    })
 }
 
 #[cfg(all(test, unix))]
