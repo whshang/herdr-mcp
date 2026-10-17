@@ -123,18 +123,38 @@ enum FileOutcome {
 pub(crate) fn ingest_native_logs(
     store: &StateStore,
     managed_roots: &[PathBuf],
+    project_refs: &BTreeMap<PathBuf, String>,
     now_ms: i64,
 ) -> Result<usize, String> {
-    ingest_from_dirs(store, managed_roots, now_ms, &LogDirs::discover())
+    ingest_from_dirs_with_refs(
+        store,
+        managed_roots,
+        project_refs,
+        now_ms,
+        &LogDirs::discover(),
+    )
 }
 
+#[cfg(test)]
 fn ingest_from_dirs(
     store: &StateStore,
     managed_roots: &[PathBuf],
     now_ms: i64,
     dirs: &LogDirs,
 ) -> Result<usize, String> {
-    let scopes = scopes(managed_roots);
+    ingest_from_dirs_with_refs(store, managed_roots, &BTreeMap::new(), now_ms, dirs)
+}
+
+/// `project_refs` maps a managed root to the same project_ref the tool_call
+/// capture uses, so native-log events and MCP events share one work_state row.
+fn ingest_from_dirs_with_refs(
+    store: &StateStore,
+    managed_roots: &[PathBuf],
+    project_refs: &BTreeMap<PathBuf, String>,
+    now_ms: i64,
+    dirs: &LogDirs,
+) -> Result<usize, String> {
+    let scopes = scopes(managed_roots, project_refs);
     if scopes.is_empty() {
         return Ok(0);
     }
@@ -220,18 +240,18 @@ fn ingest_from_dirs(
     Ok(appended)
 }
 
-fn scopes(roots: &[PathBuf]) -> Vec<Scope> {
+fn scopes(roots: &[PathBuf], project_refs: &BTreeMap<PathBuf, String>) -> Vec<Scope> {
     let mut result = Vec::new();
     for root in roots {
         let display = root.to_string_lossy().into_owned();
-        if result
-            .iter()
-            .any(|scope: &Scope| scope.project_ref == display)
-        {
+        if result.iter().any(|scope: &Scope| scope.worktree == display) {
             continue;
         }
         result.push(Scope {
-            project_ref: display.clone(),
+            project_ref: project_refs
+                .get(root)
+                .cloned()
+                .unwrap_or_else(|| display.clone()),
             worktree: display,
             match_root: fs::canonicalize(root).unwrap_or_else(|_| root.clone()),
         });

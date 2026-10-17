@@ -366,12 +366,24 @@ pub(crate) fn start_background(store: &StateStore, cache: Arc<EventCache>) {
                 // loop's own freshly-opened store handle, never shared state.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     let store = StateStore::open(path)?;
-                    let roots = crate::fs_security::managed_roots(&cache.snapshot());
+                    let snapshot = cache.snapshot();
+                    let roots = crate::fs_security::managed_roots(&snapshot);
+                    let refs = roots
+                        .iter()
+                        .map(|root| {
+                            (
+                                root.clone(),
+                                crate::work_capture::project_ref_for(&snapshot, root),
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>();
                     let now = now_ms();
                     compact_tick(
                         &store,
                         &SemanticService::from_config(),
-                        &move |store| crate::work_tailers::ingest_native_logs(store, &roots, now),
+                        &move |store| {
+                            crate::work_tailers::ingest_native_logs(store, &roots, &refs, now)
+                        },
                         now,
                     )
                     .map(|_| ())

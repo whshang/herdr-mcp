@@ -198,8 +198,7 @@ fn resolve_scope(arguments: &Value, snapshot: &Value) -> Option<WorkScope> {
                 .and_then(|project| topology.projects.get(&project.root))
         })?;
 
-    let project_ref = project_ref_for_root(snapshot, &project.root)
-        .unwrap_or_else(|| format!("dir:{}", project.root.to_string_lossy()));
+    let project_ref = project_ref_for(snapshot, &project.root);
     Some(WorkScope {
         project_ref,
         worktree: project.root.clone(),
@@ -251,6 +250,13 @@ fn workspace_argument(arguments: &Value, topology: &projects::ProjectTopology) -
                 .and_then(|params| serde_json::from_str::<Value>(params).ok())
                 .and_then(|params| workspace_argument(&params, topology))
         })
+}
+
+/// The single project_ref derivation shared by tool_call capture and the
+/// native-log tailers.
+pub(crate) fn project_ref_for(snapshot: &Value, root: &Path) -> String {
+    project_ref_for_root(snapshot, root)
+        .unwrap_or_else(|| format!("dir:{}", root.to_string_lossy()))
 }
 
 fn project_ref_for_root(snapshot: &Value, root: &Path) -> Option<String> {
@@ -328,7 +334,7 @@ fn assigned_secret_regex() -> &'static Regex {
         // The key itself may be bare (`password=`), double-quoted
         // (`"password":"x"`) or single-quoted (`'token': 'y'`), with optional
         // whitespace around the separator.
-        Regex::new(r#"(?i)(["']?(?:password|passwd|secret|token|api[_-]?key|authorization|cookie|credential|private[_-]?key)["']?)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)"#)
+        Regex::new(r#"(?i)(["']?(?:password|passwd|secret|token|api[_-]?key|authorization|cookie|credential|private[_-]?key)["']?)\s*[:=]\s*(?:\[REDACTED\]|"[^"]*"|'[^']*'|[^\s,;}\]]+)"#)
             .expect("assigned secret regex")
     })
 }
@@ -532,5 +538,14 @@ mod tests {
         assert!(event.summary.chars().count() <= WORK_SUMMARY_MAX_CHARS);
         let redacted = redact(&"b".repeat(140_000));
         assert!(redacted.chars().count() <= REDACT_INPUT_MAX_CHARS + 1);
+    }
+}
+
+#[cfg(test)]
+mod redact_idempotence_tests {
+    #[test]
+    fn known_token_after_assignment_is_not_double_bracketed() {
+        let out = super::redact("echo token=ghp_FAKEe2eTOKEN1234567890abcdefABCDEF12 && ls");
+        assert_eq!(out, "echo token=[REDACTED] && ls");
     }
 }
