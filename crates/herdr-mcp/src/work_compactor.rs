@@ -83,6 +83,137 @@ pub(crate) struct RelayMemory {
     /// ## 历史会话路径: "provider time path" of source session logs, newest last.
     #[serde(default)]
     pub sources: Vec<String>,
+    /// Git context of the worktree at the last compaction (no LLM), rendered
+    /// under each open task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<GitContext>,
+}
+
+/// Cheap, bounded git facts about a worktree: branch, changed files (vs the
+/// merge-base with the default branch, plus uncommitted/untracked) and a
+/// derived next step.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GitContext {
+    pub branch: String,
+    pub worktree: String,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    /// Total changed files (the list is capped at CHANGED_FILES_MAX).
+    #[serde(default)]
+    pub changed_total: usize,
+    #[serde(default)]
+    pub next_step: String,
+}
+
+const CHANGED_FILES_MAX: usize = 8;
+
+fn git_output(worktree: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_owned()
+    })
+}
+
+/// Derive the git context of `worktree`; `None` when it is not a git work
+/// tree (or git is unavailable).
+pub(crate) fn git_context(worktree: &Path) -> Option<GitContext> {
+    if git_output(worktree, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
+        return None;
+    }
+    let branch = git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or_else(|| "(no commits)".to_owned());
+    let status = git_output(
+        worktree,
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
+    )
+    .unwrap_or_default();
+    let mut files: Vec<String> = Vec::new();
+    let push = |files: &mut Vec<String>, path: &str| {
+        let path = path.trim().trim_matches('"');
+        if !path.is_empty() && !files.iter().any(|f| f == path) {
+            files.push(path.to_owned());
+        }
+    };
+    let dirty = status.lines().filter(|line| line.len() > 3).count();
+    for line in status.lines().filter(|line| line.len() > 3) {
+        let path = &line[3..];
+        push(&mut files, path.rsplit(" -> ").next().unwrap_or(path));
+    }
+    // Committed changes on this branch vs the default branch.
+    let base = git_output(
+        worktree,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .or_else(|| {
+        ["main", "master"].into_iter().find_map(|name| {
+            git_output(worktree, &["rev-parse", "--verify", "--quiet", name])
+                .map(|_| name.to_owned())
+        })
+    });
+    let merge_base = base
+        .as_deref()
+        .and_then(|base| git_output(worktree, &["merge-base", "HEAD", base]));
+    let mut ahead = 0;
+    if let Some(merge_base) = merge_base.as_deref() {
+        for path in git_output(worktree, &["diff", "--name-only", merge_base, "HEAD"])
+            .unwrap_or_default()
+            .lines()
+        {
+            push(&mut files, path);
+        }
+        ahead = git_output(
+            worktree,
+            &["rev-list", "--count", &format!("{merge_base}..HEAD")],
+        )
+        .and_then(|count| count.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    }
+    let next_step = if dirty > 0 {
+        format!("verify and commit {dirty} uncommitted change(s) on {branch}")
+    } else if ahead > 0 {
+        format!("push {branch} and open/merge its PR ({ahead} commit(s) ahead)")
+    } else {
+        String::new()
+    };
+    let changed_total = files.len();
+    files.truncate(CHANGED_FILES_MAX);
+    Some(GitContext {
+        branch,
+        worktree: worktree.to_string_lossy().into_owned(),
+        changed_files: files,
+        changed_total,
+        next_step,
+    })
+}
+
+/// One-line rendering of a git context (shown under each open task).
+pub(crate) fn render_git_context(context: &GitContext) -> String {
+    let mut line = format!("branch `{}` @ `{}`", context.branch, context.worktree);
+    if context.changed_total > 0 {
+        line.push_str(&format!(
+            " · files({}): {}",
+            context.changed_total,
+            context.changed_files.join(", ")
+        ));
+        if context.changed_total > context.changed_files.len() {
+            line.push_str(", …");
+        }
+    }
+    if !context.next_step.is_empty() {
+        line.push_str(&format!(" · next: {}", context.next_step));
+    }
+    single_line(&line)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,7 +238,7 @@ const TASK_STATUSES: [&str; 4] = ["todo", "doing", "done", "blocked"];
 
 /// Incremental ops the summarizer returns. Only these apply; the previous
 /// memory is the merge base, so an LLM rewrite cannot wipe sections.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 struct HandoffOps {
     goals: Vec<ItemOp>,
@@ -135,14 +266,14 @@ impl HandoffOps {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ItemOp {
     op: String,
     id: Option<String>,
     text: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TaskOp {
     op: String,
     id: Option<String>,
@@ -365,7 +496,8 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
     // Only rules, the task list and source session paths; newest first.
     // Agents may edit items in place (`- [id] text`, tasks
     // `- [id] (status) text`); edits are folded back on the next tick.
-    let mut out = format!("# HANDOFF\n\n## 规则\n\n> {RULES_SCOPE_NOTE}\n");
+    let mut out =
+        format!("# HANDOFF\n\n## 规则\n\n> {RULES_SCOPE_NOTE}\n>\n> {RULES_EXECUTABLE_NOTE}\n");
     render_items(&mut out, RULES_HEADING, &memory.preferences);
     render_items(&mut out, MISTAKES_HEADING, &memory.mistakes);
     out.push_str(&format!("\n\n## {TASKS_HEADING}\n"));
@@ -376,6 +508,12 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
             task.status,
             single_line(&task.text)
         ));
+        // Indented, non-list line: ignored when agent edits are folded back.
+        if task.status != "done"
+            && let Some(context) = &memory.workspace
+        {
+            out.push_str(&format!("\n  ↳ {}", render_git_context(context)));
+        }
     }
     out.push_str("\n\n## 历史会话路径\n");
     for line in memory.sources.iter().rev() {
@@ -396,6 +534,8 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
 /// Rules recorded here are project-scoped; agents must keep them out of
 /// global instruction files.
 pub(crate) const RULES_SCOPE_NOTE: &str = "以下规则仅适用于本项目（this project only）。不要修改全局 agent 指令文件（~/.agents/AGENTS.md、~/.claude/CLAUDE.md、~/.codex/AGENTS.md 等）；偏好请写在本文件。";
+/// Prefer executable rules: enforceable mistakes become tests/lints/scripts.
+pub(crate) const RULES_EXECUTABLE_NOTE: &str = "错题集中能用测试、lint 或脚本强制执行的条目，应改写成对应的测试/lint/脚本，本文件只保留原因（mistakes that a test, lint or script can enforce should become one; keep only the reason here).";
 const RULES_HEADING: &str = "公共原则/偏好规范";
 const MISTAKES_HEADING: &str = "错题集";
 const TASKS_HEADING: &str = "任务清单";
@@ -608,6 +748,10 @@ fn enforce_budget(memory: &mut RelayMemory) {
             memory.tasks.remove(index);
             continue;
         }
+        // Derived git context is re-derivable; drop it before clipping text.
+        if memory.workspace.take().is_some() {
+            continue;
+        }
         if !clip_longest_text(memory) {
             return;
         }
@@ -718,33 +862,52 @@ fn compact_scope(
 
         // Merge base: structured memory from the relay-memory block, with a
         // legacy free-form document carried as context for migration.
-        let (mut memory, legacy) = split_memory(&previous.handoff_md);
-        if let Ok(file_md) = fs::read_to_string(Path::new(worktree).join("HANDOFF.md"))
-            && file_md != previous.handoff_md
-        {
-            fold_file_edits(&mut memory, &file_md);
-        }
-        record_sources(&mut memory, &events);
-        let prompt = compaction_prompt(&memory, &legacy, &events);
-        let semantic_ops = summarizer
-            .summarize(&prompt)
-            .ok()
-            .and_then(|content| serde_json::from_str::<HandoffOps>(&content).ok())
-            .filter(|ops| !ops.is_empty());
-        match semantic_ops {
-            Some(ops) => {
-                apply_memory_ops(&mut memory, ops);
+        let (base, legacy) = split_memory(&previous.handoff_md);
+        let workspace = git_context(Path::new(worktree));
+        // Rebuild from the merge base + whatever HANDOFF.md currently holds,
+        // so a retry after a concurrent agent edit folds that edit in too.
+        let build = |file_md: Option<&str>, ops: Option<&HandoffOps>| {
+            let mut memory = base.clone();
+            if let Some(file_md) = file_md
+                && file_md != previous.handoff_md
+            {
+                fold_file_edits(&mut memory, file_md);
+            }
+            record_sources(&mut memory, &events);
+            memory.workspace = workspace.clone();
+            if let Some(ops) = ops {
+                apply_memory_ops(&mut memory, ops.clone());
                 // Never lose a pre-upgrade free-form handoff: keep it in
                 // 当前状态 unless the model already restated state.
                 if !legacy.trim().is_empty() && memory.current_state.trim().is_empty() {
                     memory.current_state = clip_chars(legacy.trim(), CURRENT_STATE_MAX_CHARS);
                 }
             }
-            None => apply_fallback(&mut memory, &legacy, &events),
-        }
-        enforce_budget(&mut memory);
-        let handoff_md = render_handoff(&memory);
-
+            memory
+        };
+        let target = Path::new(worktree).join("HANDOFF.md");
+        let prompt_memory = build(read_handoff_file(&target).as_deref(), None);
+        let prompt = compaction_prompt(&prompt_memory, &legacy, &events);
+        let semantic_ops = summarizer
+            .summarize(&prompt)
+            .ok()
+            .and_then(|content| serde_json::from_str::<HandoffOps>(&content).ok())
+            .filter(|ops| !ops.is_empty());
+        let handoff_md = write_handoff_guarded(Path::new(worktree), |file_md| {
+            let mut memory = build(file_md, semantic_ops.as_ref());
+            if semantic_ops.is_none() {
+                apply_fallback(&mut memory, &legacy, &events);
+            }
+            enforce_budget(&mut memory);
+            render_handoff(&memory)
+        });
+        let (handoff_md, write_error) = match handoff_md {
+            GuardedWrite::Written(handoff_md) => (handoff_md, None),
+            GuardedWrite::Failed(handoff_md, error) => (handoff_md, Some(error)),
+            // The file kept changing under us: keep the cursor so the next
+            // tick retries instead of overwriting an agent edit.
+            GuardedWrite::Conflict => return Err(HANDOFF_CONFLICT_ERROR.to_owned()),
+        };
         store.put_work_state(&WorkState {
             project_ref: project_ref.to_owned(),
             worktree: worktree.to_owned(),
@@ -753,7 +916,9 @@ fn compact_scope(
             log_cursors_json: previous.log_cursors_json.clone(),
             updated_at: now_ms,
         })?;
-        write_handoff(Path::new(worktree), &handoff_md)?;
+        if let Some(error) = write_error {
+            return Err(error);
+        }
 
         previous = WorkState {
             handoff_md,
@@ -772,7 +937,7 @@ fn compaction_prompt(memory: &RelayMemory, legacy: &str, events: &[WorkEvent]) -
     let mut prompt = String::from(
         "You maintain one project relay memory shared across coding agents. Given the CURRENT structured memory (JSON), optional LEGACY context from an older free-form handoff, and NEW work events, return ONLY JSON of this exact shape:
 {\"goals\":[{\"op\":\"add|update|remove\",\"id\":\"g1\",\"text\":\"...\"}],\"preferences\":[{\"op\":\"add|update|remove\",\"id\":\"p1\",\"text\":\"...\"}],\"mistakes\":[{\"op\":\"add|update|remove\",\"id\":\"m1\",\"text\":\"what went wrong + correct approach\"}],\"tasks\":[{\"op\":\"add|update|remove\",\"id\":\"t1\",\"text\":\"...\",\"status\":\"todo|doing|done|blocked\"}],\"current_state\":\"short current state\",\"recent\":[\"provider: one-line summary\"]}
-Sections that matter: 公共原则/偏好规范=preferences (durable principles, conventions, user preferences), 错题集=mistakes (what went wrong + the correct approach), 任务清单=tasks (latest remaining tasks with status). Continuously distill rules from the events. goals/current_state/recent are optional. Rules: apply ONLY incremental ops; prefer update over remove and never remove a goal/preference/mistake unless the events clearly supersede it; reuse existing ids, new ids use the section prefix with an unused number; do not invent facts; omit sections with no change; \"recent\" lists ONLY new lines to append, each prefixed with its provider. In this input, line breaks are written as the two characters \\n; use plain single-line text inside list item fields.
+Sections that matter: 公共原则/偏好规范=preferences (durable principles, conventions, user preferences), 错题集=mistakes (what went wrong + the correct approach), 任务清单=tasks (latest remaining tasks with status). Continuously distill rules from the events. A mistake that a test, lint or script can enforce should be turned into one (note that in the task list); keep only the reason in the mistake text. goals/current_state/recent are optional. Rules: apply ONLY incremental ops; prefer update over remove and never remove a goal/preference/mistake unless the events clearly supersede it; reuse existing ids, new ids use the section prefix with an unused number; do not invent facts; omit sections with no change; \"recent\" lists ONLY new lines to append, each prefixed with its provider. In this input, line breaks are written as the two characters \\n; use plain single-line text inside list item fields.
 
 Current memory JSON:
 ",
@@ -867,29 +1032,85 @@ fn reconcile_handoff_files(store: &StateStore) -> Result<(), String> {
         }
         // An agent edited HANDOFF.md: fold its rules/tasks back into the
         // stored memory instead of overwriting the edit.
-        let mut handoff = state.handoff_md.clone();
-        if let Ok(file_md) = fs::read_to_string(&target)
-            && let Some(mut memory) = parsed_memory(&state.handoff_md)
-            && fold_file_edits(&mut memory, &file_md)
-        {
-            handoff = render_handoff(&memory);
+        let result = write_handoff_guarded(worktree, |file_md| {
+            if let Some(file_md) = file_md
+                && let Some(mut memory) = parsed_memory(&state.handoff_md)
+                && fold_file_edits(&mut memory, file_md)
+            {
+                render_handoff(&memory)
+            } else {
+                state.handoff_md.clone()
+            }
+        });
+        let (handoff, error) = match result {
+            GuardedWrite::Written(handoff) => (handoff, None),
+            GuardedWrite::Failed(handoff, error) => (handoff, Some(error)),
+            GuardedWrite::Conflict => (
+                state.handoff_md.clone(),
+                Some(HANDOFF_CONFLICT_ERROR.to_owned()),
+            ),
+        };
+        if handoff != state.handoff_md {
             let mut updated = state.clone();
-            updated.handoff_md = handoff.clone();
+            updated.handoff_md = handoff;
             if let Err(error) = store.put_work_state(&updated) {
                 first_error.get_or_insert(error);
-                continue;
             }
         }
-        if let Err(error) = write_handoff(worktree, &handoff) {
+        if let Some(error) = error {
             first_error.get_or_insert(error);
         }
     }
     first_error.map_or(Ok(()), Err)
 }
 
-fn write_handoff(worktree: &Path, handoff: &str) -> Result<(), String> {
+/// Test helper: write against whatever HANDOFF.md currently holds.
+#[cfg(test)]
+fn write_handoff_current(worktree: &Path, handoff: &str) -> Result<(), String> {
+    let expected = read_handoff_file(&worktree.join("HANDOFF.md"));
+    write_handoff(worktree, handoff, expected.as_deref()).map(|_| ())
+}
+
+const HANDOFF_WRITE_ATTEMPTS: usize = 3;
+const HANDOFF_CONFLICT_ERROR: &str =
+    "HANDOFF.md kept changing during compaction; write skipped to preserve agent edits";
+
+fn read_handoff_file(target: &Path) -> Option<String> {
+    fs::read_to_string(target).ok()
+}
+
+enum GuardedWrite {
+    Written(String),
+    /// The rendered handoff plus the write error (e.g. a symlinked target).
+    Failed(String, String),
+    /// HANDOFF.md changed between read and write on every attempt.
+    Conflict,
+}
+
+/// Lost-update guard: render from the HANDOFF.md content just read, then
+/// re-read right before the (atomic temp+rename) write; when an agent edited
+/// the file in between, render again from the new content (folding the edit
+/// in) instead of overwriting it. Bounded attempts.
+fn write_handoff_guarded(worktree: &Path, render: impl Fn(Option<&str>) -> String) -> GuardedWrite {
+    let target = worktree.join("HANDOFF.md");
+    for _ in 0..HANDOFF_WRITE_ATTEMPTS {
+        let seen = read_handoff_file(&target);
+        let handoff = render(seen.as_deref());
+        return match write_handoff(worktree, &handoff, seen.as_deref()) {
+            Ok(true) => GuardedWrite::Written(handoff),
+            Ok(false) => continue,
+            Err(error) => GuardedWrite::Failed(handoff, error),
+        };
+    }
+    GuardedWrite::Conflict
+}
+
+/// Write HANDOFF.md (plus agent-doc blocks and git excludes). `expected` is
+/// the HANDOFF.md content the handoff was rendered from; returns Ok(false)
+/// without writing when the file no longer matches it.
+fn write_handoff(worktree: &Path, handoff: &str, expected: Option<&str>) -> Result<bool, String> {
     if !worktree.is_dir() {
-        return Ok(());
+        return Ok(true);
     }
     // Never drop a file into hidden/config folders (e.g. ~/.ssh) that became
     // an operational root; git checkouts are exempt.
@@ -899,12 +1120,18 @@ fn write_handoff(worktree: &Path, handoff: &str) -> Result<(), String> {
             .is_some_and(|name| name.starts_with('.') && name.len() > 1)
     });
     if hidden && resolve_git_common_dir(worktree)?.is_none() {
-        return Ok(());
+        return Ok(true);
     }
     if !is_allowed_project_root(worktree) {
-        return Ok(());
+        return Ok(true);
     }
-    write_regular_file(&worktree.join("HANDOFF.md"), handoff, "HANDOFF.md")?;
+    let target = worktree.join("HANDOFF.md");
+    if read_handoff_file(&target).as_deref() != expected {
+        return Ok(false);
+    }
+    if expected != Some(handoff) {
+        write_regular_file(&target, handoff, "HANDOFF.md")?;
+    }
     let mut created = vec!["HANDOFF.md"];
     // Claude Code does not read AGENTS.md: only touch CLAUDE.md when it
     // already exists or Claude Code worked in this folder.
@@ -918,7 +1145,7 @@ fn write_handoff(worktree: &Path, handoff: &str) -> Result<(), String> {
         }
     }
     let Some(git_common_dir) = resolve_git_common_dir(worktree)? else {
-        return Ok(());
+        return Ok(true);
     };
     // Only files we created (plus HANDOFF.md) are excluded; a pre-existing,
     // possibly tracked AGENTS.md/CLAUDE.md just carries a local block change.
@@ -932,7 +1159,8 @@ fn write_handoff(worktree: &Path, handoff: &str) -> Result<(), String> {
             .is_ok_and(|output| output.status.success())
     };
     created.retain(|name| *name == "HANDOFF.md" || !tracked_or_listed(name));
-    add_git_excludes(&git_common_dir, &created)
+    add_git_excludes(&git_common_dir, &created)?;
+    Ok(true)
 }
 
 /// Scope guard: the relay only ever writes project-local files
@@ -1245,8 +1473,8 @@ mod audit_fix_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("CLAUDE.md"), "# Mine\nkeep me\n").unwrap();
-        write_handoff(&dir, "h1").unwrap();
-        write_handoff(&dir, "h2").unwrap();
+        write_handoff_current(&dir, "h1").unwrap();
+        write_handoff_current(&dir, "h2").unwrap();
         let agents = fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         let claude = fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         assert!(agents.contains("HANDOFF.md") && agents.contains(HANDOFF_BLOCK_START));
@@ -1259,7 +1487,7 @@ mod audit_fix_tests {
             claude.replace("auto-maintained by herdr-mcp", "stale") + "tail\n",
         )
         .unwrap();
-        write_handoff(&dir, "h3").unwrap();
+        write_handoff_current(&dir, "h3").unwrap();
         let claude = fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         assert!(claude.contains("auto-maintained by herdr-mcp") && claude.ends_with("tail\n"));
         assert_eq!(fs::read_to_string(dir.join("HANDOFF.md")).unwrap(), "h3");
@@ -1381,7 +1609,7 @@ mod audit_fix_tests {
         let base = std::env::temp_dir().join(format!("hrm-{}", std::process::id()));
         let hidden = base.join(".secretdir");
         fs::create_dir_all(&hidden).unwrap();
-        write_handoff(&hidden, "x").unwrap();
+        write_handoff_current(&hidden, "x").unwrap();
         assert!(!hidden.join("HANDOFF.md").exists());
         let _ = fs::remove_dir_all(&base);
     }
@@ -1609,8 +1837,8 @@ mod tests {
             format!("gitdir: {}\n", git_dir.display()),
         )
         .unwrap();
-        write_handoff(&root, "handoff one").unwrap();
-        write_handoff(&root, "handoff two").unwrap();
+        write_handoff_current(&root, "handoff one").unwrap();
+        write_handoff_current(&root, "handoff two").unwrap();
         assert_eq!(
             fs::read_to_string(root.join("HANDOFF.md")).unwrap(),
             "handoff two"
@@ -1635,7 +1863,7 @@ mod tests {
         fs::write(&target, "do not touch").unwrap();
         let link = root.join("HANDOFF.md");
         symlink(&target, &link).unwrap();
-        let error = write_handoff(&root, "attacker content").unwrap_err();
+        let error = write_handoff_current(&root, "attacker content").unwrap_err();
         assert!(error.contains("symlink"), "unexpected error: {error}");
         assert_eq!(fs::read_to_string(&target).unwrap(), "do not touch");
         assert!(
@@ -1666,7 +1894,7 @@ mod tests {
         let target = temp_dir("exclude-target").join("exclude");
         fs::write(&target, "original\n").unwrap();
         symlink(&target, info.join("exclude")).unwrap();
-        let error = write_handoff(&root, "handoff").unwrap_err();
+        let error = write_handoff_current(&root, "handoff").unwrap_err();
         assert!(error.contains("symlink"), "unexpected error: {error}");
         assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
         fs::remove_dir_all(&root).unwrap();
@@ -1831,7 +2059,7 @@ mod tests {
             ],
         );
 
-        write_handoff(&linked, "# linked handoff").unwrap();
+        write_handoff_current(&linked, "# linked handoff").unwrap();
 
         assert_eq!(
             fs::read_to_string(linked.join("HANDOFF.md")).unwrap(),
@@ -1924,6 +2152,7 @@ mod tests {
             current_state: "mid-implementation".to_owned(),
             recent: vec!["pi: started relay memory lane".to_owned()],
             sources: Vec::new(),
+            workspace: None,
         }
     }
 
@@ -2141,6 +2370,183 @@ mod tests {
             .handoff_md;
         let migrated = parsed_memory(&handoff).unwrap();
         assert_eq!(migrated.current_state, "compacted");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn concurrent_agent_edit_between_read_and_write_is_folded_not_lost() {
+        let root = temp_dir("guard");
+        fs::create_dir(root.join(".git")).unwrap();
+        let target = root.join("HANDOFF.md");
+        let initial = render_handoff(&RelayMemory::default());
+        fs::write(&target, &initial).unwrap();
+        let edited = initial.replace("### 错题集\n", "### 错题集\n\n- never force-push main\n");
+        let renders = AtomicUsize::new(0);
+        // Simulate an agent editing HANDOFF.md right after the first read.
+        let result = write_handoff_guarded(&root, |file_md| {
+            if renders.fetch_add(1, Ordering::SeqCst) == 0 {
+                fs::write(&target, &edited).unwrap();
+            }
+            let mut memory = RelayMemory::default();
+            if let Some(file_md) = file_md {
+                fold_file_edits(&mut memory, file_md);
+            }
+            memory.tasks.push(RelayTask {
+                id: "t9".to_owned(),
+                text: "compactor task".to_owned(),
+                status: "todo".to_owned(),
+            });
+            render_handoff(&memory)
+        });
+        assert!(matches!(result, GuardedWrite::Written(_)));
+        assert_eq!(renders.load(Ordering::SeqCst), 2);
+        let on_disk = fs::read_to_string(&target).unwrap();
+        assert!(on_disk.contains("never force-push main"), "{on_disk}");
+        assert!(on_disk.contains("compactor task"));
+
+        // An agent that never stops editing: bounded retries, file untouched.
+        let result = write_handoff_guarded(&root, |_| {
+            fs::write(
+                &target,
+                format!("agent {}", renders.fetch_add(1, Ordering::SeqCst)),
+            )
+            .unwrap();
+            "compactor".to_owned()
+        });
+        assert!(matches!(result, GuardedWrite::Conflict));
+        assert!(fs::read_to_string(&target).unwrap().starts_with("agent "));
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    struct EditingSummarizer(PathBuf);
+
+    impl WorkSummarizer for EditingSummarizer {
+        fn summarize(&self, _prompt: &str) -> Result<String, String> {
+            // An agent edits HANDOFF.md while the (slow) summarizer runs.
+            let target = self.0.join("HANDOFF.md");
+            let md = fs::read_to_string(&target).unwrap();
+            fs::write(
+                &target,
+                md.replace("### 错题集\n", "### 错题集\n\n- agent added mistake\n"),
+            )
+            .unwrap();
+            Ok(r#"{"tasks":[{"op":"add","text":"llm task"}]}"#.to_owned())
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_agent_edit_made_during_summarize() {
+        let root = temp_dir("guard-scope");
+        fs::create_dir(root.join(".git")).unwrap();
+        let store = StateStore::open(":memory:").unwrap();
+        append(&store, &root, "first", 1);
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), 2).unwrap();
+        append(&store, &root, "second", 3);
+        compact_tick(&store, &EditingSummarizer(root.clone()), &|_| Ok(0), 4).unwrap();
+        let on_disk = fs::read_to_string(root.join("HANDOFF.md")).unwrap();
+        assert!(on_disk.contains("agent added mistake"), "{on_disk}");
+        assert!(on_disk.contains("llm task"));
+        let state = store
+            .work_state("proj", root.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.handoff_md, on_disk);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{args:?}: {status:?}");
+    }
+
+    #[test]
+    fn git_context_lists_branch_files_and_next_step_and_skips_non_git() {
+        let plain = temp_dir("nogit");
+        assert_eq!(git_context(&plain), None);
+        fs::remove_dir_all(plain).unwrap();
+
+        let root = temp_dir("gitctx");
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("base.txt"), "b").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "base"]);
+        git(&root, &["checkout", "-qb", "feat/x"]);
+        for i in 0..10 {
+            fs::write(root.join(format!("c{i}.rs")), "c").unwrap();
+        }
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "feat"]);
+        let clean = git_context(&root).unwrap();
+        assert_eq!(clean.branch, "feat/x");
+        assert_eq!(clean.changed_total, 10);
+        assert_eq!(clean.changed_files.len(), CHANGED_FILES_MAX);
+        assert!(
+            clean.next_step.starts_with("push feat/x"),
+            "{}",
+            clean.next_step
+        );
+        fs::write(root.join("base.txt"), "changed").unwrap();
+        fs::write(root.join("new.md"), "n").unwrap();
+        let dirty = git_context(&root).unwrap();
+        assert_eq!(dirty.changed_total, 12);
+        assert!(
+            dirty
+                .changed_files
+                .starts_with(&["base.txt".to_owned(), "new.md".to_owned()])
+        );
+        assert!(
+            dirty.next_step.contains("2 uncommitted"),
+            "{}",
+            dirty.next_step
+        );
+
+        let memory = RelayMemory {
+            tasks: vec![
+                RelayTask {
+                    id: "t1".into(),
+                    text: "open".into(),
+                    status: "doing".into(),
+                },
+                RelayTask {
+                    id: "t2".into(),
+                    text: "old".into(),
+                    status: "done".into(),
+                },
+            ],
+            workspace: Some(dirty),
+            ..RelayMemory::default()
+        };
+        let rendered = render_handoff(&memory);
+        assert_eq!(
+            rendered.matches("↳ branch `feat/x`").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(rendered.contains("files(12): base.txt, new.md"));
+        assert!(rendered.contains(RULES_EXECUTABLE_NOTE));
+        // The context line is not folded back as a task.
+        let mut folded = memory.clone();
+        assert!(fold_file_edits(&mut folded, &rendered));
+        assert_eq!(folded.tasks, memory.tasks);
         fs::remove_dir_all(root).unwrap();
     }
 }
