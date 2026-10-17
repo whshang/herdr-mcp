@@ -95,6 +95,13 @@
     return text.slice(0, limit);
   }
 
+  function structuralToken(value, maxLength = 80) {
+    const token = String(value || "").trim();
+    return token.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(token)
+      ? token
+      : undefined;
+  }
+
   function fastPathActionClass(el, tag) {
     if (tag === "a") {
       if (el.hasAttribute?.("download")) return undefined;
@@ -188,10 +195,20 @@
         el.value ||
         ""
       ).trim().slice(0, 120);
+      const classes = String(el.getAttribute("class") || "")
+        .split(/\s+/)
+        .map((value) => structuralToken(value, 48))
+        .filter(Boolean)
+        .slice(0, 4);
 
       elements.push({
         ref: ref.slice(0, 256),
+        tag,
         role: String(role || "").slice(0, 64),
+        id: structuralToken(el.getAttribute("id")),
+        data_testid: structuralToken(el.getAttribute("data-testid")),
+        classes: classes.length ? classes : undefined,
+        contenteditable: el.getAttribute("contenteditable") === "true" || undefined,
         type: (tag === "input" || tag === "button")
           ? String(el.type || (tag === "input" ? "text" : "")).slice(0, 64)
           : undefined,

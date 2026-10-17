@@ -138,7 +138,10 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
     text: "More",
     attrs: { "aria-expanded": "false" },
   });
-  const safeInput = createElement({ tag: "input", type: "text", attrs: { placeholder: "Name" } });
+  const safeInput = createElement({
+    tag: "input", type: "text",
+    attrs: { placeholder: "Name", id: "display-name", "data-testid": "profile-name", class: "form-field primary" },
+  });
   const password = createElement({ tag: "input", type: "password", attrs: { placeholder: "Password" } });
   const otp = createElement({ tag: "input", type: "text", attrs: { autocomplete: "one-time-code" } });
   const card = createElement({ tag: "input", type: "text", attrs: { autocomplete: "cc-number" } });
@@ -161,6 +164,11 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   assert.equal(result.elements.length, 6);
   assert.equal(result.elements.map((item) => item.text).join("|"), "Continue|Details|More details|Account|More|Name");
   assert.equal(result.elements[0].type, "submit");
+  assert.equal(result.elements[5].tag, "input");
+  assert.equal(result.elements[5].id, "display-name");
+  assert.equal(result.elements[5].data_testid, "profile-name");
+  assert.deepEqual(Array.from(result.elements[5].classes), ["form-field", "primary"]);
+  assert.equal(result.elements[5].contenteditable, undefined);
   assert.equal(result.elements[0].fast_path, undefined);
   assert.equal(result.elements[1].fast_path, "same_origin_navigation");
   assert.equal(result.elements[2].fast_path, undefined);
@@ -178,6 +186,32 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   });
   assert.equal(linkClick.ok, true);
   assert.equal(linkClick.navigation_url, "https://app.test/details");
+});
+
+test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMirror textbox | When observing DOM structure | Then only bounded structural attributes are returned", () => {
+  const textbox = createElement({
+    tag: "div",
+    text: "",
+    contentEditable: true,
+    attrs: {
+      role: "textbox",
+      "aria-label": "New chat",
+      class: "ProseMirror editor another other fifth",
+      "data-testid": "chat-composer",
+      id: "invalid:raw-id",
+    },
+  });
+  const h = harness({ elements: [textbox] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect", expectedOrigin: "https://app.test" });
+  assert.equal(observed.elements.length, 1);
+  assert.equal(observed.elements[0].tag, "div");
+  assert.equal(observed.elements[0].role, "textbox");
+  assert.equal(observed.elements[0].contenteditable, true);
+  assert.equal(observed.elements[0].id, undefined);
+  assert.equal(observed.elements[0].data_testid, "chat-composer");
+  assert.deepEqual(Array.from(observed.elements[0].classes), ["ProseMirror", "editor", "another", "other"]);
+  assert.ok(!Object.hasOwn(observed.elements[0], "outerHTML"));
+  assert.ok(!Object.hasOwn(observed.elements[0], "selector"));
 });
 
 test("Page Assist click requires the current generation and invalidates refs after one action", () => {

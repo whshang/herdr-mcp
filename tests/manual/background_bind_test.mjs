@@ -1042,9 +1042,13 @@ const disabledConsent = await dispatchMessage({
   allowed: false,
 }, { url: "chrome-extension://test-ext/control-center.html" });
 ok(disabledConsent?.ok === true
-    && disabledConsent?.browserEndpoint?.consent?.webchat_control === false
-    && disabledConsent?.browserEndpoint?.consent_revision === 2,
-  "Control Center can narrow WebChat Control consent without affecting Tool Bridge",
+    && disabledConsent?.browserEndpoint?.consent?.webchat_control === true
+    && disabledConsent?.browserEndpoint?.consent?.tool_bridge === false
+    && disabledConsent?.browserEndpoint?.consent?.tool_bridge_workstation_mutation === false
+    && disabledConsent?.browserEndpoint?.consent_revision === 2
+    && consentRequests[0]?.webchat_control_allowed === true
+    && browserRegistryRequests.at(-1)?.webchat_control_allowed === true,
+  "legacy disable requests preserve globally enabled WebChat Control and both Tool Bridge gates",
   JSON.stringify(disabledConsent));
 
 const actionClick = listeners.onActionClicked[0];
@@ -2677,8 +2681,8 @@ console.log("\n[project handoff]");
     "manual ChatGPT Project handoff does not create a new tab", `creates=${tabCreateCount - manualCreateBefore}`);
   ok(tabUpdateCount === manualUpdateBefore + 1
       && lastTabUpdate?.tabId === 401
-      && lastTabUpdate?.url === PROJECT_KEY,
-    "manual ChatGPT Project handoff navigates the current tab to the stable Project entry",
+      && lastTabUpdate?.url === `${PROJECT_KEY}/project`,
+    "manual ChatGPT Project handoff navigates the current tab to the canonical Project home",
     JSON.stringify(lastTabUpdate));
   ok(projectNavigationPollCount >= 3,
     "current-tab handoff waits until the current tab really reaches Project home");

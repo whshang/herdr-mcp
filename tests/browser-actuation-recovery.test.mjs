@@ -275,6 +275,80 @@ test("user finalizes one owned generic page | Given open is retried across a ser
   assert.ok(capacityStorage.herdrBrowserPagesV1.every((record) => record.ownership === "owned"));
 });
 
+test("user can clean up an owned search page | Given a form navigates to a new URL | When the old ref becomes stale | Then mutations remain fenced and finalize closes exactly that task-owned tab", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/search",
+    idempotencyKey: "form-search-owned-1",
+  });
+  assert.equal(opened.ok, true);
+  const tab = [...tabs.values()][0];
+  tab.url = "https://example.com/results?q=sample";
+
+  const stale = await h.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.error, "browser_page_stale");
+  assert.equal(sessionStorage.herdrBrowserPagesV1[0]?.stale, true);
+  assert.equal(sessionStorage.herdrBrowserPagesV1[0]?.ownership, "owned");
+
+  tab.url = "https://example.com/search";
+  const restarted = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const revived = await restarted.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(revived.error, "browser_page_stale");
+  const replayed = await restarted.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/search",
+    idempotencyKey: "form-search-owned-1",
+  });
+  assert.equal(replayed.error, "browser_page_operation_stale");
+  assert.equal(tabs.size, 1);
+
+  tab.url = "https://example.com/results?q=sample";
+  const resultsPage = await restarted.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/results?q=sample",
+    idempotencyKey: "form-search-results-claim-1",
+  });
+  assert.equal(resultsPage.ok, true);
+  assert.equal(resultsPage.ownership, "claimed");
+  assert.notEqual(resultsPage.page_ref, opened.page_ref);
+  const releasedResults = await restarted.performBrowserPageLifecycleRequest({
+    action: "release",
+    pageRef: resultsPage.page_ref,
+  });
+  assert.equal(releasedResults.ok, true);
+  assert.equal(releasedResults.tab_closed, false);
+  assert.equal(tabs.size, 1);
+
+  tab.url = "https://other.example/redirect";
+  const outsideOrigin = await restarted.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(outsideOrigin.error, "browser_page_origin_mismatch");
+  const finalized = await restarted.performBrowserPageLifecycleRequest({
+    action: "finalize",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(finalized.ok, true);
+  assert.equal(finalized.tab_cleanup_verified, true);
+  assert.equal(finalized.tab_closed, true);
+  assert.equal(tabs.size, 0);
+  assert.deepEqual(sessionStorage.herdrBrowserPagesV1, []);
+});
+
 test("user releases a claimed generic page | Given one exact user tab and another unrelated tab | When claim and release run | Then the user tab survives and ambiguous duplicate claims fail closed", async () => {
   const tabs = new Map([
     [41, { id: 41, url: "https://example.com/app", active: true }],
