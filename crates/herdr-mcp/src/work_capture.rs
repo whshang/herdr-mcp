@@ -13,7 +13,7 @@ const REDACTED: &str = "[REDACTED]";
 /// bound can survive into the stored event. Clip before running the regexes
 /// to bound the redaction work applied to any single tool-call value.
 const REDACT_INPUT_MAX_CHARS: usize = 8 * 1024;
-const SALIENT_KEYS: [&str; 14] = [
+const SALIENT_KEYS: [&str; 16] = [
     "method",
     "command",
     "project_root",
@@ -28,6 +28,8 @@ const SALIENT_KEYS: [&str; 14] = [
     "pane",
     "pane_id",
     "prompt",
+    "target",
+    "text",
 ];
 
 const HANDOFF_CONTEXT_HEADING: &str = "## Handoff context";
@@ -269,6 +271,8 @@ fn workspace_argument(arguments: &Value, topology: &projects::ProjectTopology) -
                 .get("pane")
                 .and_then(Value::as_str)
                 .or_else(|| arguments.get("pane_id").and_then(Value::as_str))
+                // herdr_prompt addresses its pane as `target`.
+                .or_else(|| arguments.get("target").and_then(Value::as_str))
                 .and_then(|pane| topology.pane_to_workspace.get(pane).cloned())
         })
         .or_else(|| {
@@ -488,6 +492,15 @@ mod tests {
         assert_eq!(event.source_ref, "mcp:herdr_fs_write");
         assert!(!event.summary.contains("hidden"));
         assert!(event_for_tool_call("herdr_inspect", &json!({}), &snapshot).is_none());
+        let prompt = event_for_tool_call(
+            "herdr_prompt",
+            &json!({"target": "w1:p1", "text": "## Handoff context\n\nold\n\n---\n\nreal task"}),
+            &snapshot,
+        )
+        .expect("herdr_prompt target pane should resolve its worktree");
+        assert_eq!(prompt.worktree, "/repo");
+        assert!(prompt.summary.contains("real task"));
+        assert!(!prompt.summary.contains("Handoff context"));
         assert!(
             event_for_tool_call(
                 "herdr_call",
