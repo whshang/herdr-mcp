@@ -278,11 +278,14 @@ pub(crate) fn fold_file_edits(memory: &mut RelayMemory, file_md: &str) -> bool {
 /// Record the native session log files behind these events (newest last,
 /// deduplicated by path, bounded).
 fn record_sources(memory: &mut RelayMemory, events: &[WorkEvent]) {
+    for line in &mut memory.sources {
+        *line = normalize_legacy_times(line);
+    }
     for event in events {
         let Some(path) = event.source_ref.strip_prefix("native-log:") else {
             continue;
         };
-        let when = chrono_like(event.ts);
+        let when = relay_time(event.ts);
         memory
             .sources
             .retain(|line| !line.ends_with(&format!(" {path}")));
@@ -294,12 +297,26 @@ fn record_sources(memory: &mut RelayMemory, events: &[WorkEvent]) {
     memory.sources.drain(..excess);
 }
 
-/// `YYYY-MM-DD HH:MM UTC` from epoch milliseconds (no date crate needed).
-fn chrono_like(ts_ms: i64) -> String {
-    let secs = ts_ms.div_euclid(1000);
+/// Fixed relay display offset: Asia/Shanghai (UTC+8, no DST).
+const RELAY_TZ_OFFSET_SECS: i64 = 8 * 3600;
+const RELAY_TZ_LABEL: &str = "+08:00";
+
+/// The single relay time format: `YYYY-MM-DD HH:MM +08:00` (Asia/Shanghai)
+/// from epoch milliseconds. Every relay-rendered timestamp goes through here.
+pub(crate) fn relay_time(ts_ms: i64) -> String {
+    let secs = ts_ms.div_euclid(1000) + RELAY_TZ_OFFSET_SECS;
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
-    // Civil-from-days (Howard Hinnant).
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} {RELAY_TZ_LABEL}",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
+}
+
+/// Civil-from-days (Howard Hinnant).
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -308,12 +325,33 @@ fn chrono_like(ts_ms: i64) -> String {
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
-        rem / 3600,
-        (rem % 3600) / 60
-    )
+    (yoe + era * 400 + i64::from(month <= 2), month, day)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Rewrite legacy `YYYY-MM-DD HH:MM UTC` stamps (stored before the relay
+/// switched to +08:00) into the relay format, so output stays consistent.
+fn normalize_legacy_times(text: &str) -> String {
+    static LEGACY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let legacy = LEGACY.get_or_init(|| {
+        regex::Regex::new(r"\b(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}) UTC\b").expect("regex")
+    });
+    legacy
+        .replace_all(text, |caps: &regex::Captures<'_>| {
+            let n = |i: usize| caps[i].parse::<i64>().unwrap_or(0);
+            let days = days_from_civil(n(1), n(2), n(3));
+            relay_time((days * 86_400 + n(4) * 3600 + n(5) * 60) * 1000)
+        })
+        .into_owned()
 }
 
 /// Whitespace-collapse a value onto one line for list rendering.
@@ -327,7 +365,7 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
     // Only rules, the task list and source session paths; newest first.
     // Agents may edit items in place (`- [id] text`, tasks
     // `- [id] (status) text`); edits are folded back on the next tick.
-    let mut out = String::from("# HANDOFF\n\n## 规则\n");
+    let mut out = format!("# HANDOFF\n\n## 规则\n\n> {RULES_SCOPE_NOTE}\n");
     render_items(&mut out, RULES_HEADING, &memory.preferences);
     render_items(&mut out, MISTAKES_HEADING, &memory.mistakes);
     out.push_str(&format!("\n\n## {TASKS_HEADING}\n"));
@@ -341,7 +379,10 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
     }
     out.push_str("\n\n## 历史会话路径\n");
     for line in memory.sources.iter().rev() {
-        out.push_str(&format!("\n- {}", single_line(line)));
+        out.push_str(&format!(
+            "\n- {}",
+            normalize_legacy_times(&single_line(line))
+        ));
     }
     // `<!--` inside item text must never terminate the block early or shadow
     // the outer open marker; \u0021 decodes back to `!` in valid JSON.
@@ -352,6 +393,9 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
     out
 }
 
+/// Rules recorded here are project-scoped; agents must keep them out of
+/// global instruction files.
+pub(crate) const RULES_SCOPE_NOTE: &str = "以下规则仅适用于本项目（this project only）。不要修改全局 agent 指令文件（~/.agents/AGENTS.md、~/.claude/CLAUDE.md、~/.codex/AGENTS.md 等）；偏好请写在本文件。";
 const RULES_HEADING: &str = "公共原则/偏好规范";
 const MISTAKES_HEADING: &str = "错题集";
 const TASKS_HEADING: &str = "任务清单";
@@ -857,7 +901,7 @@ fn write_handoff(worktree: &Path, handoff: &str) -> Result<(), String> {
     if hidden && resolve_git_common_dir(worktree)?.is_none() {
         return Ok(());
     }
-    if is_home_dir(worktree) {
+    if !is_allowed_project_root(worktree) {
         return Ok(());
     }
     write_regular_file(&worktree.join("HANDOFF.md"), handoff, "HANDOFF.md")?;
@@ -891,12 +935,38 @@ fn write_handoff(worktree: &Path, handoff: &str) -> Result<(), String> {
     add_git_excludes(&git_common_dir, &created)
 }
 
-fn is_home_dir(path: &Path) -> bool {
-    std::env::var_os("HOME").is_some_and(|home| {
-        let home = PathBuf::from(home);
-        fs::canonicalize(&home).unwrap_or(home)
-            == fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    })
+/// Scope guard: the relay only ever writes project-local files
+/// (HANDOFF.md / AGENTS.md / CLAUDE.md directly inside a project root). A
+/// root is refused when it is the filesystem root, `$HOME` itself or one of
+/// its ancestors, or anything under a hidden top-level `$HOME` folder (the
+/// global agent config homes `~/.agents`, `~/.claude`, `~/.codex`,
+/// `~/.config`, ... — even when they are Git checkouts).
+pub(crate) fn is_allowed_project_root(path: &Path) -> bool {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    is_allowed_project_root_with_home(path, home.as_deref())
+}
+
+fn is_allowed_project_root_with_home(path: &Path, home: Option<&Path>) -> bool {
+    let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let root = canonical(path);
+    if root.parent().is_none() {
+        return false;
+    }
+    let Some(home) = home.map(canonical) else {
+        return true;
+    };
+    if home.starts_with(&root) {
+        // $HOME itself or an ancestor of it (/home, /Users, ...).
+        return false;
+    }
+    match root.strip_prefix(&home) {
+        Ok(relative) => !relative
+            .components()
+            .next()
+            .and_then(|first| first.as_os_str().to_str())
+            .is_some_and(|name| name.starts_with('.')),
+        Err(_) => true,
+    }
 }
 
 pub(crate) const HANDOFF_BLOCK_START: &str = "<!-- herdr:handoff:start -->";
@@ -905,7 +975,7 @@ const AGENT_DOC_MAX_BYTES: u64 = 256 * 1024;
 
 fn handoff_block() -> String {
     format!(
-        "{HANDOFF_BLOCK_START}\nRead `HANDOFF.md` (rules, task list, past session log paths; auto-maintained by herdr-mcp) before starting, and update it by editing its items in place (`- [id] text`, tasks `- [id] (status) text`) — your edits are merged automatically.\n{HANDOFF_BLOCK_END}\n"
+        "{HANDOFF_BLOCK_START}\nRead `HANDOFF.md` (rules, task list, past session log paths; auto-maintained by herdr-mcp) before starting, and update it by editing its items in place (`- [id] text`, tasks `- [id] (status) text`) — your edits are merged automatically. Its rules apply to this project only; record preferences there and never edit global agent instruction files (~/.agents/AGENTS.md, ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md).\n{HANDOFF_BLOCK_END}\n"
     )
 }
 
@@ -1314,6 +1384,62 @@ mod audit_fix_tests {
         write_handoff(&hidden, "x").unwrap();
         assert!(!hidden.join("HANDOFF.md").exists());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn relay_times_are_shanghai_with_explicit_offset() {
+        // 2026-10-17T08:18:00Z == 16:18 in Asia/Shanghai.
+        assert_eq!(relay_time(1_792_225_080_000), "2026-10-17 16:18 +08:00");
+        // Day rollover.
+        assert_eq!(relay_time(1_792_252_800_000), "2026-10-18 00:00 +08:00");
+        assert_eq!(
+            normalize_legacy_times("pi 2026-10-17 08:18 UTC /a.jsonl"),
+            "pi 2026-10-17 16:18 +08:00 /a.jsonl"
+        );
+        let mut memory = RelayMemory {
+            sources: vec!["pi 2026-10-16 23:30 UTC /old.jsonl".into()],
+            ..Default::default()
+        };
+        let rendered = render_handoff(&memory);
+        assert!(rendered.contains("pi 2026-10-17 07:30 +08:00 /old.jsonl"));
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with("- ") && line.contains(" UTC "))
+        );
+        record_sources(&mut memory, &[]);
+        assert_eq!(
+            memory.sources,
+            vec!["pi 2026-10-17 07:30 +08:00 /old.jsonl".to_owned()]
+        );
+    }
+
+    #[test]
+    fn scope_guard_refuses_home_ancestors_and_global_agent_dirs() {
+        let home = Path::new("/home/someone");
+        let allowed = |p: &str| is_allowed_project_root_with_home(Path::new(p), Some(home));
+        assert!(!allowed("/"));
+        assert!(!allowed("/home"));
+        assert!(!allowed("/home/someone"));
+        assert!(!allowed("/home/someone/.agents"));
+        assert!(!allowed("/home/someone/.claude"));
+        assert!(!allowed("/home/someone/.codex"));
+        assert!(!allowed("/home/someone/.config/foo"));
+        assert!(allowed("/home/someone/code/proj"));
+        assert!(allowed("/workspace/proj"));
+        assert!(allowed("/home/someone/code/.hidden-proj"));
+    }
+
+    #[test]
+    fn handoff_texts_state_project_only_scope() {
+        assert!(handoff_block().contains("this project only"));
+        assert!(handoff_block().contains("~/.agents/AGENTS.md"));
+        let rendered = render_handoff(&RelayMemory::default());
+        assert!(rendered.contains(RULES_SCOPE_NOTE));
+        // The note is not an item: folding the file back adds no rule.
+        let mut memory = RelayMemory::default();
+        fold_file_edits(&mut memory, &rendered);
+        assert!(memory.preferences.is_empty());
     }
 }
 

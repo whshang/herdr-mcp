@@ -216,7 +216,12 @@ fn resolve_scope(arguments: &Value, snapshot: &Value) -> Option<WorkScope> {
     let mut candidates = BTreeSet::new();
     collect_path_candidates(arguments, &mut candidates);
 
-    let is_validated = |root: &Path| validated.iter().any(|valid| valid == root);
+    // Scope guard: $HOME (or an ancestor) and global agent-config folders are
+    // never a relay project, so nothing is journaled or exported for them.
+    let is_validated = |root: &Path| {
+        validated.iter().any(|valid| valid == root)
+            && crate::work_compactor::is_allowed_project_root(root)
+    };
     let project = candidates
         .iter()
         .flat_map(|candidate| {
@@ -227,7 +232,7 @@ fn resolve_scope(arguments: &Value, snapshot: &Value) -> Option<WorkScope> {
         })
         .max_by_key(|project| project.root.components().count())
         .or_else(|| {
-            workspace_argument(arguments, &topology)
+            workspace_argument(arguments, snapshot, &topology)
                 .and_then(|workspace| {
                     projects::projects_for_workspace(&topology, &workspace)
                         .into_iter()
@@ -268,12 +273,18 @@ fn collect_path_candidates(arguments: &Value, candidates: &mut BTreeSet<String>)
     }
 }
 
-fn workspace_argument(arguments: &Value, topology: &projects::ProjectTopology) -> Option<String> {
+fn workspace_argument(
+    arguments: &Value,
+    snapshot: &Value,
+    topology: &projects::ProjectTopology,
+) -> Option<String> {
     arguments
         .get("workspace")
         .and_then(Value::as_str)
         .or_else(|| arguments.get("workspace_id").and_then(Value::as_str))
-        .map(str::to_owned)
+        // herdr tools accept a workspace by id OR label; topology is keyed
+        // by id, so map a label to its id first.
+        .map(|workspace| canonical_workspace_id(snapshot, workspace))
         .or_else(|| {
             arguments
                 .get("pane")
@@ -288,8 +299,35 @@ fn workspace_argument(arguments: &Value, topology: &projects::ProjectTopology) -
                 .get("params")
                 .and_then(Value::as_str)
                 .and_then(|params| serde_json::from_str::<Value>(params).ok())
-                .and_then(|params| workspace_argument(&params, topology))
+                .and_then(|params| workspace_argument(&params, snapshot, topology))
         })
+}
+
+/// Resolve a workspace target given by id or label to its workspace id (the
+/// same id-or-label lookup herdr_exec uses). Unknown targets pass through.
+fn canonical_workspace_id(snapshot: &Value, target: &str) -> String {
+    let workspaces = snapshot
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let id_of = |workspace: &Value| {
+        workspace
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .or_else(|| workspace.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+    };
+    workspaces
+        .iter()
+        .find(|workspace| id_of(workspace).as_deref() == Some(target))
+        .or_else(|| {
+            workspaces
+                .iter()
+                .find(|workspace| workspace.get("label").and_then(Value::as_str) == Some(target))
+        })
+        .and_then(id_of)
+        .unwrap_or_else(|| target.to_owned())
 }
 
 /// The single project_ref derivation shared by tool_call capture and the
@@ -560,6 +598,42 @@ mod tests {
             .is_none()
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// herdr_exec targeting a workspace by LABEL | Given a workspace whose
+    /// label differs from its id | When herdr_exec names it by label | Then
+    /// the call is journaled under that workspace's project.
+    #[test]
+    fn user_exec_targeting_workspace_by_label_is_captured() {
+        let root = Path::new("/tmp/herdr-labelroot");
+        std::fs::create_dir_all(root).unwrap();
+        let snapshot = json!({
+            "workspaces": [{"workspace_id": "w7", "label": "relay-e2e"}],
+            "panes": [{"pane_id": "w7:p1", "workspace_id": "w7", "cwd": root.to_string_lossy()}],
+            "agents": []
+        });
+        let by_label = event_for_tool_call(
+            "herdr_exec",
+            &json!({"workspace": "relay-e2e", "command": "echo hi"}),
+            &snapshot,
+        )
+        .expect("label target should resolve to its workspace project");
+        assert_eq!(by_label.worktree, root.to_string_lossy());
+        let by_id = event_for_tool_call(
+            "herdr_exec",
+            &json!({"workspace": "w7", "command": "x"}),
+            &snapshot,
+        )
+        .expect("id target still resolves");
+        assert_eq!(by_id.worktree, by_label.worktree);
+        assert!(
+            event_for_tool_call(
+                "herdr_exec",
+                &json!({"workspace": "nope", "command": "x"}),
+                &snapshot
+            )
+            .is_none()
+        );
     }
 
     #[test]
