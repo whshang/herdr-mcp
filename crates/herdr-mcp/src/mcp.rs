@@ -3902,6 +3902,36 @@ fn browser_session_create_reconcile_uncertain_inner(
                 Ok(None) => {}
                 Err(error) => return browser_store_error(error),
             }
+            // The initial late acceptance ran before the polling window, when
+            // async reservation materialization (state "pending" ->
+            // "materialized" via the extension's resource registration) may
+            // not have completed. Re-attempt it with the freshly loaded record:
+            // if materialization caught up during the poll and the readback
+            // finds the accepted message, the create promotes instead of
+            // returning a false uncertain.
+            drop(guard);
+            if let Ok(promoted) = browser_session_create_late_acceptance_readback(
+                store,
+                &latest,
+                params,
+                actuator,
+                expected_generation,
+            ) {
+                let Ok(mut guard) = store.lock() else {
+                    return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+                };
+                return browser_session_create_success(
+                    &mut guard,
+                    &promoted.reservation_ref,
+                    params,
+                    replayed,
+                    true,
+                    caller_authorization,
+                );
+            }
+            let Ok(guard) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
             match browser_session_materialized_uncertain(&guard, &latest, replayed) {
                 Ok(Some(result)) => return result,
                 Ok(None) => {}
@@ -15431,6 +15461,154 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// user owner | Given a materialized uncertain create whose initial
+    /// late-acceptance readback fails | When the post-polling retry runs with
+    /// the same actuator | Then the retry promotes the create to applied
+    /// from the accepted-message identity, not from an optimistic guess.
+    #[test]
+    fn browser_session_create_retries_late_acceptance_after_reconcile_polling() {
+        use crate::state_store::{
+            BrowserResourceObservationInput, BrowserSessionReservation,
+            BrowserSessionReservationInput,
+        };
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        let (store, endpoint_ref, observed_session_ref) = browser_dispatch_reconcile_fixture();
+        let (reservation, params) = {
+            let mut guard = store.lock().unwrap();
+            let account_ref = guard
+                .browser_resource(&observed_session_ref)
+                .unwrap()
+                .unwrap()
+                .parent_ref
+                .unwrap();
+            let reservation = match guard
+                .reserve_browser_session(BrowserSessionReservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    account_ref: &account_ref,
+                    space_ref: None,
+                    display_label: "Late acceptance retry",
+                    expected_generation: 7,
+                    idempotency_key_digest: &browser_sha256("late-retry-key"),
+                    request_digest: &browser_sha256("late-retry-request"),
+                    created_at: 40,
+                    expires_at: 4000,
+                })
+                .unwrap()
+            {
+                BrowserSessionReservation::Reserved(record) => record,
+                BrowserSessionReservation::Existing(_) => panic!("must be new"),
+            };
+            let created = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account_ref),
+                    native_identity: "late-retry-created",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 41,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &created.resource_ref,
+                    "https://chatgpt.com/c/late-retry",
+                    7,
+                    41,
+                )
+                .unwrap();
+            guard
+                .materialize_browser_session_reservation(
+                    &reservation.reservation_ref,
+                    &created.resource_ref,
+                    42,
+                )
+                .unwrap();
+            guard
+                .update_browser_session_reservation_delivery(
+                    &reservation.reservation_ref,
+                    7,
+                    BrowserDeliveryState::Uncertain,
+                    None,
+                    43,
+                )
+                .unwrap();
+            (
+                guard
+                    .browser_session_reservation(&reservation.reservation_ref)
+                    .unwrap()
+                    .unwrap(),
+                json!({"message": "late accepted turn"}),
+            )
+        };
+
+        struct FlakyReadbackActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for FlakyReadbackActuator {
+            fn actuate(
+                &self,
+                _: &str,
+                _: &Value,
+                _: i64,
+                _: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Err("unavailable".to_owned())
+            }
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                _: &Value,
+                expected_generation: i64,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_SESSION_ARCHIVE_STATUS_METHOD);
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First call (initial late acceptance): fail to simulate
+                    // a transient readback error (or a pending-state guard).
+                    return Err("transient readback failure".to_owned());
+                }
+                // Second call (post-polling retry): return the accepted message.
+                let mut result = accepted_text_evidence("late accepted turn");
+                let object = result.as_object_mut().unwrap();
+                object.insert(
+                    "accepted_user_message_ref".to_owned(),
+                    json!("provider-late-user"),
+                );
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.resource_available = true;
+                evidence.stable_resource_ref_observed = true;
+                evidence.lifecycle_observed = true;
+                evidence.result = Some(result);
+                Ok(evidence)
+            }
+        }
+
+        let actuator = FlakyReadbackActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let result = browser_session_create_reconcile_uncertain(
+            &store,
+            &reservation,
+            &params,
+            Some(&actuator),
+            7,
+            false,
+            None,
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["delivery_state"], "applied");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
