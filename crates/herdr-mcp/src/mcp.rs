@@ -908,6 +908,9 @@ fn pickup_response(
         "handoff_md": handoff_md,
         "through_event_id": state.as_ref().map_or(0, |state| state.through_event_id),
         "updated_at": state.as_ref().map_or(0, |state| state.updated_at),
+        "updated_at_local": state
+            .as_ref()
+            .map(|state| crate::work_compactor::relay_time(state.updated_at)),
         "sections": sections,
     });
     response
