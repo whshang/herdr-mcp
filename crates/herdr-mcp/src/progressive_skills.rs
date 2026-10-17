@@ -4253,7 +4253,8 @@ mod tests {
         assert_eq!(pickup.len(), 1);
         assert_eq!(pickup[0]["method"], WORK_PICKUP_METHOD);
         assert_eq!(pickup[0]["access"], "read_only");
-        assert_eq!(pickup[0]["params"]["oneOf"].as_array().unwrap().len(), 2);
+        assert!(pickup[0]["params"]["properties"]["cwd"].is_object());
+        assert!(pickup[0]["params"]["properties"]["pane"].is_object());
 
         let methods = local_method_schemas("work_memory.");
         assert_eq!(methods.len(), 6);

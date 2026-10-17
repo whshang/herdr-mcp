@@ -3,7 +3,7 @@ use crate::state_cache::EventCache;
 use crate::state_store::StateStore;
 use crate::state_store::work_journal::{WorkEvent, WorkState, clip_chars};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -115,6 +115,23 @@ struct HandoffOps {
     recent: Vec<String>,
 }
 
+impl HandoffOps {
+    /// Valid-but-unrecognized JSON (`{}`, renamed keys) deserializes to an
+    /// empty op set; treat it as a failure so the rule fallback records the
+    /// events instead of silently advancing the cursor past them.
+    fn is_empty(&self) -> bool {
+        self.goals.is_empty()
+            && self.preferences.is_empty()
+            && self.mistakes.is_empty()
+            && self.tasks.is_empty()
+            && self.recent.is_empty()
+            && self
+                .current_state
+                .as_deref()
+                .is_none_or(|state| state.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ItemOp {
     op: String,
@@ -157,12 +174,13 @@ fn single_line(text: &str) -> String {
 /// Render the fixed-section handoff document plus the trailing structured
 /// block. Section order is contractual (entry-agnostic readers rely on it).
 pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
+    // Order: durable principles first, then lessons, newest tasks, state,
+    // goals, and the older rolling history last; lists newest-first.
     let mut out = String::from("# HANDOFF\n");
-    render_items(&mut out, "目标与计划", &memory.goals);
-    render_items(&mut out, "偏好与规范", &memory.preferences);
+    render_items(&mut out, "公共原则/偏好与规范", &memory.preferences);
     render_items(&mut out, "错题集", &memory.mistakes);
-    out.push_str("\n## 剩余任务\n");
-    for task in &memory.tasks {
+    out.push_str("\n## 最新任务（剩余任务）\n");
+    for task in memory.tasks.iter().rev() {
         out.push_str(&format!(
             "\n- [{}] ({}) {}",
             task.id,
@@ -172,8 +190,10 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
     }
     out.push_str("\n\n## 当前状态\n\n");
     out.push_str(memory.current_state.trim());
+    out.push('\n');
+    render_items(&mut out, "目标与计划", &memory.goals);
     out.push_str("\n\n## 最近对话摘要\n");
-    for line in &memory.recent {
+    for line in memory.recent.iter().rev() {
         out.push_str(&format!("\n- {}", single_line(line)));
     }
     // `<!--` inside item text must never terminate the block early or shadow
@@ -187,7 +207,7 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
 
 fn render_items(out: &mut String, heading: &str, items: &[RelayItem]) {
     out.push_str(&format!("\n## {heading}\n"));
-    for item in items {
+    for item in items.iter().rev() {
         out.push_str(&format!("\n- [{}] {}", item.id, single_line(&item.text)));
     }
 }
@@ -202,14 +222,14 @@ fn next_id(items: &[RelayItem], prefix: &str) -> String {
         })
         .max()
         .unwrap_or(0);
-    format!("{prefix}{}", max + 1)
+    format!("{prefix}{}", max.saturating_add(1))
 }
 
 fn apply_item_ops(items: &mut Vec<RelayItem>, ops: Vec<ItemOp>, prefix: &str) {
     for op in ops {
         match op.op.as_str() {
             "remove" => {
-                if let Some(id) = op.id.as_deref() {
+                if let Some(id) = op.id.as_deref().map(str::trim) {
                     items.retain(|item| item.id != id);
                 }
             }
@@ -431,34 +451,6 @@ fn clip_longest_text(memory: &mut RelayMemory) -> bool {
     true
 }
 
-/// Which agent-instruction files in `root` mention HANDOFF.md. `true` =
-/// exists and mentions it, `false` = exists without a mention (listed in
-/// `missing` so callers can tell the user), `null` = absent/unreadable. We
-/// never edit these files.
-pub(crate) fn handoff_reference(root: &Path) -> Value {
-    let mentions = |name: &str| -> Value {
-        let path = root.join(name);
-        let regular = fs::symlink_metadata(&path)
-            .ok()
-            .is_some_and(|metadata| metadata.file_type().is_file());
-        if !regular {
-            return Value::Null;
-        }
-        match fs::read_to_string(&path) {
-            Ok(content) => Value::Bool(content.contains("HANDOFF.md")),
-            Err(_) => Value::Null,
-        }
-    };
-    let agents_md = mentions("AGENTS.md");
-    let claude_md = mentions("CLAUDE.md");
-    let missing = [("AGENTS.md", &agents_md), ("CLAUDE.md", &claude_md)]
-        .into_iter()
-        .filter(|(_, value)| **value == Value::Bool(false))
-        .map(|(name, _)| name)
-        .collect::<Vec<_>>();
-    json!({"agents_md": agents_md, "claude_md": claude_md, "missing": missing})
-}
-
 pub(crate) fn compact_tick(
     store: &StateStore,
     summarizer: &dyn WorkSummarizer,
@@ -528,9 +520,17 @@ fn compact_scope(
         let semantic_ops = summarizer
             .summarize(&prompt)
             .ok()
-            .and_then(|content| serde_json::from_str::<HandoffOps>(&content).ok());
+            .and_then(|content| serde_json::from_str::<HandoffOps>(&content).ok())
+            .filter(|ops| !ops.is_empty());
         match semantic_ops {
-            Some(ops) => apply_memory_ops(&mut memory, ops),
+            Some(ops) => {
+                apply_memory_ops(&mut memory, ops);
+                // Never lose a pre-upgrade free-form handoff: keep it in
+                // 当前状态 unless the model already restated state.
+                if !legacy.trim().is_empty() && memory.current_state.trim().is_empty() {
+                    memory.current_state = clip_chars(legacy.trim(), CURRENT_STATE_MAX_CHARS);
+                }
+            }
             None => apply_fallback(&mut memory, &legacy, &events),
         }
         enforce_budget(&mut memory);
@@ -664,10 +664,116 @@ fn write_handoff(worktree: &Path, handoff: &str) -> Result<(), String> {
     if !worktree.is_dir() {
         return Ok(());
     }
+    // Never drop a file into hidden/config folders (e.g. ~/.ssh) that became
+    // an operational root; git checkouts are exempt.
+    let hidden = worktree.components().any(|part| {
+        part.as_os_str()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.') && name.len() > 1)
+    });
+    if hidden && resolve_git_common_dir(worktree)?.is_none() {
+        return Ok(());
+    }
+    if is_home_dir(worktree) {
+        return Ok(());
+    }
     write_regular_file(&worktree.join("HANDOFF.md"), handoff, "HANDOFF.md")?;
+    let mut created = vec!["HANDOFF.md"];
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        if ensure_handoff_block(&worktree.join(name))? {
+            created.push(name);
+        }
+    }
     let Some(git_common_dir) = resolve_git_common_dir(worktree)? else {
         return Ok(());
     };
+    // Only files we created (plus HANDOFF.md) are excluded; a pre-existing,
+    // possibly tracked AGENTS.md/CLAUDE.md just carries a local block change.
+    // Never commit anything.
+    let tracked_or_listed = |name: &str| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["ls-files", "--error-unmatch", name])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    created.retain(|name| *name == "HANDOFF.md" || !tracked_or_listed(name));
+    add_git_excludes(&git_common_dir, &created)
+}
+
+fn is_home_dir(path: &Path) -> bool {
+    std::env::var_os("HOME").is_some_and(|home| {
+        let home = PathBuf::from(home);
+        fs::canonicalize(&home).unwrap_or(home)
+            == fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    })
+}
+
+pub(crate) const HANDOFF_BLOCK_START: &str = "<!-- herdr:handoff:start -->";
+pub(crate) const HANDOFF_BLOCK_END: &str = "<!-- herdr:handoff:end -->";
+const AGENT_DOC_MAX_BYTES: u64 = 256 * 1024;
+
+fn handoff_block() -> String {
+    format!(
+        "{HANDOFF_BLOCK_START}\n## Handoff (auto-maintained by herdr-mcp)\n\nBefore starting work in this folder, read `HANDOFF.md` first: it is the shared relay memory (preferences, mistakes to avoid, latest tasks, current state, goals, recent history) across all agents. It is regenerated automatically from session logs; do not edit it by hand. Only this marked block is managed by herdr-mcp.\n{HANDOFF_BLOCK_END}\n"
+    )
+}
+
+/// Idempotently ensure `path` contains the managed handoff block, touching
+/// only the text between the markers. Returns true when the file was newly
+/// created. Oversized or non-regular files are left alone.
+fn ensure_handoff_block(path: &Path) -> Result<bool, String> {
+    let block = handoff_block();
+    let existing = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.len() > AGENT_DOC_MAX_BYTES {
+                return Ok(false);
+            }
+            Some(
+                fs::read_to_string(path)
+                    .map_err(|error| format!("cannot read agent doc: {error}"))?,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("cannot stat agent doc: {error}")),
+    };
+    let Some(existing) = existing else {
+        write_regular_file(path, &block, "agent doc")?;
+        return Ok(true);
+    };
+    let updated = match (
+        existing.find(HANDOFF_BLOCK_START),
+        existing.find(HANDOFF_BLOCK_END),
+    ) {
+        (Some(start), Some(end)) if end > start => {
+            let end = end + HANDOFF_BLOCK_END.len();
+            let end = if existing[end..].starts_with('\n') {
+                end + 1
+            } else {
+                end
+            };
+            format!("{}{block}{}", &existing[..start], &existing[end..])
+        }
+        _ => {
+            let mut text = existing.clone();
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&block);
+            text
+        }
+    };
+    if updated != existing {
+        write_regular_file(path, &updated, "agent doc")?;
+    }
+    Ok(false)
+}
+
+fn add_git_excludes(git_common_dir: &Path, names: &[&str]) -> Result<(), String> {
     let info = git_common_dir.join("info");
     if let Ok(metadata) = fs::symlink_metadata(&info)
         && !metadata.file_type().is_dir()
@@ -693,14 +799,20 @@ fn write_handoff(worktree: &Path, handoff: &str) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("cannot stat Git exclude file: {error}")),
     };
-    if existing.lines().any(|line| line.trim() == "HANDOFF.md") {
-        return Ok(());
-    }
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
+    let mut updated = existing.clone();
+    for name in names {
+        if updated.lines().any(|line| line.trim() == *name) {
+            continue;
+        }
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(name);
         updated.push('\n');
     }
-    updated.push_str("HANDOFF.md\n");
+    if updated == existing {
+        return Ok(());
+    }
     write_regular_file(&exclude, &updated, "Git exclude file")
 }
 
@@ -834,6 +946,106 @@ fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
+mod audit_fix_tests {
+    use super::*;
+
+    #[test]
+    fn empty_llm_ops_are_rejected_so_fallback_runs() {
+        assert!(serde_json::from_str::<HandoffOps>("{}").unwrap().is_empty());
+        assert!(
+            serde_json::from_str::<HandoffOps>(r#"{"ok":true}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !serde_json::from_str::<HandoffOps>(r#"{"recent":["pi: x"]}"#)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn next_id_saturates_and_remove_trims() {
+        let items = vec![RelayItem {
+            id: format!("g{}", u64::MAX),
+            text: "x".to_owned(),
+        }];
+        assert_eq!(next_id(&items, "g"), format!("g{}", u64::MAX));
+        let mut items = vec![RelayItem {
+            id: "g1".to_owned(),
+            text: "keep?".to_owned(),
+        }];
+        let ops: Vec<ItemOp> = serde_json::from_str(r#"[{"op":"remove","id":" g1 "}]"#).unwrap();
+        apply_item_ops(&mut items, ops, "g");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn agent_docs_get_idempotent_managed_block() {
+        let dir = std::env::temp_dir().join(format!("hrm-docs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("CLAUDE.md"), "# Mine\nkeep me\n").unwrap();
+        write_handoff(&dir, "h1").unwrap();
+        write_handoff(&dir, "h2").unwrap();
+        let agents = fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        let claude = fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+        assert!(agents.contains("HANDOFF.md") && agents.contains(HANDOFF_BLOCK_START));
+        assert!(claude.starts_with("# Mine\nkeep me\n"));
+        assert_eq!(claude.matches(HANDOFF_BLOCK_START).count(), 1);
+        assert_eq!(agents.matches(HANDOFF_BLOCK_END).count(), 1);
+        // Only the managed block is rewritten.
+        fs::write(
+            dir.join("CLAUDE.md"),
+            claude.replace("auto-maintained by herdr-mcp", "stale") + "tail\n",
+        )
+        .unwrap();
+        write_handoff(&dir, "h3").unwrap();
+        let claude = fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+        assert!(claude.contains("auto-maintained by herdr-mcp") && claude.ends_with("tail\n"));
+        assert_eq!(fs::read_to_string(dir.join("HANDOFF.md")).unwrap(), "h3");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_orders_principles_first_and_history_last_newest_first() {
+        let mut memory = RelayMemory::default();
+        memory.preferences.push(RelayItem {
+            id: "p1".into(),
+            text: "old pref".into(),
+        });
+        memory.preferences.push(RelayItem {
+            id: "p2".into(),
+            text: "new pref".into(),
+        });
+        memory.goals.push(RelayItem {
+            id: "g1".into(),
+            text: "goal".into(),
+        });
+        memory.recent = vec!["pi: first".into(), "omp: second".into()];
+        let md = render_handoff(&memory);
+        let pos = |needle: &str| md.find(needle).unwrap();
+        assert!(pos("公共原则/偏好与规范") < pos("错题集"));
+        assert!(pos("错题集") < pos("最新任务"));
+        assert!(pos("最新任务") < pos("当前状态"));
+        assert!(pos("当前状态") < pos("目标与计划"));
+        assert!(pos("目标与计划") < pos("最近对话摘要"));
+        assert!(pos("new pref") < pos("old pref"));
+        assert!(pos("omp: second") < pos("pi: first"));
+    }
+
+    #[test]
+    fn hidden_non_git_root_gets_no_handoff_file() {
+        let base = std::env::temp_dir().join(format!("hrm-{}", std::process::id()));
+        let hidden = base.join(".secretdir");
+        fs::create_dir_all(&hidden).unwrap();
+        write_handoff(&hidden, "x").unwrap();
+        assert!(!hidden.join("HANDOFF.md").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::state_store::work_journal::NewWorkEvent;
@@ -922,7 +1134,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(root.join(".git/info/exclude")).unwrap(),
-            "HANDOFF.md\n"
+            "HANDOFF.md\nAGENTS.md\nCLAUDE.md\n"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1007,7 +1219,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(git_dir.join("info/exclude")).unwrap(),
-            "HANDOFF.md\n"
+            "HANDOFF.md\nAGENTS.md\nCLAUDE.md\n"
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(git_dir).unwrap();
@@ -1365,11 +1577,11 @@ mod tests {
         // The rendered document keeps the fixed section order and round-trips.
         let rendered = render_handoff(&memory);
         let order = [
-            "## 目标与计划",
-            "## 偏好与规范",
+            "## 公共原则/偏好与规范",
             "## 错题集",
-            "## 剩余任务",
+            "## 最新任务",
             "## 当前状态",
+            "## 目标与计划",
             "## 最近对话摘要",
         ]
         .iter()
@@ -1531,23 +1743,6 @@ mod tests {
             .handoff_md;
         let migrated = parsed_memory(&handoff).unwrap();
         assert_eq!(migrated.current_state, "compacted");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn handoff_reference_reports_agents_and_claude_mentions() {
-        let root = temp_dir("handoff-reference");
-        let report = handoff_reference(&root);
-        assert_eq!(
-            report,
-            json!({"agents_md": null, "claude_md": null, "missing": []})
-        );
-        fs::write(root.join("AGENTS.md"), "read HANDOFF.md first\n").unwrap();
-        fs::write(root.join("CLAUDE.md"), "no mention here\n").unwrap();
-        let report = handoff_reference(&root);
-        assert_eq!(report["agents_md"], true);
-        assert_eq!(report["claude_md"], false);
-        assert_eq!(report["missing"], json!(["CLAUDE.md"]));
         fs::remove_dir_all(root).unwrap();
     }
 }

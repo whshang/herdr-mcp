@@ -794,7 +794,11 @@ fn work_pickup_call(
             Ok(state) => state,
             Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
         };
-        return pickup_response(state, Some(&worktree));
+        // Only inspect AGENTS.md/CLAUDE.md for a root the relay actually
+        // recorded (capture validated it against the topology); never for an
+        // arbitrary caller-supplied path.
+        let root = state.as_ref().map(|state| state.worktree.clone());
+        return pickup_response(state, root.as_deref());
     }
 
     // Caller-context resolution: a cwd (or the pane's cwd) that resolves to a
@@ -864,7 +868,9 @@ fn work_pickup_call(
         })
         .collect::<Vec<_>>();
     projects.sort_by_key(|project| std::cmp::Reverse(project["updated_at"].as_i64().unwrap_or(0)));
-    json!({"ok": true, "projects": projects})
+    let total = projects.len();
+    projects.truncate(50);
+    json!({"ok": true, "projects": projects, "total": total})
 }
 
 fn pickup_state(
@@ -889,8 +895,7 @@ fn pickup_response(
     state: Option<crate::state_store::work_journal::WorkState>,
     root: Option<&str>,
 ) -> Value {
-    let reference =
-        root.map(|root| crate::work_compactor::handoff_reference(std::path::Path::new(root)));
+    let _ = root;
     let handoff_md = state
         .as_ref()
         .map(|state| state.handoff_md.clone())
@@ -898,16 +903,13 @@ fn pickup_response(
     let sections = crate::work_compactor::parsed_memory(&handoff_md)
         .and_then(|memory| serde_json::to_value(memory).ok())
         .unwrap_or(Value::Null);
-    let mut response = json!({
+    let response = json!({
         "ok": true,
         "handoff_md": handoff_md,
         "through_event_id": state.as_ref().map_or(0, |state| state.through_event_id),
         "updated_at": state.as_ref().map_or(0, |state| state.updated_at),
         "sections": sections,
     });
-    if let Some(reference) = reference {
-        response["handoff_reference"] = reference;
-    }
     response
 }
 
@@ -11142,7 +11144,6 @@ mod tests {
         assert_eq!(found["updated_at"], 12);
         // A legacy free-form handoff has no structured sections block.
         assert_eq!(found["sections"], Value::Null);
-        assert!(found["handoff_reference"]["agents_md"].is_null());
 
         let empty = work_pickup_call(&store, &json!({"worktree": "/other"}), None);
         assert_eq!(empty["ok"], true);
@@ -11272,9 +11273,6 @@ mod tests {
                 .contains("## 目标与计划")
         );
         assert_eq!(by_cwd["sections"]["goals"][0]["text"], "ship relay");
-        assert_eq!(by_cwd["handoff_reference"]["agents_md"], true);
-        assert_eq!(by_cwd["handoff_reference"]["claude_md"], Value::Null);
-        assert_eq!(by_cwd["handoff_reference"]["missing"], json!([]));
 
         // pane resolution goes through the pane's live cwd the same way.
         let by_pane = work_pickup_call(&store, &json!({"pane": "w1:p1"}), Some(&snapshot));
