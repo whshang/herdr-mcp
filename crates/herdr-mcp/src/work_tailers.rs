@@ -621,7 +621,10 @@ fn parse_events(provider: Provider, value: &Value) -> Vec<ParsedEvent> {
 
     match role {
         Some("user") | Some("human") => {
-            if let Some(text) = content.and_then(content_text) {
+            if let Some(text) = content
+                .and_then(content_text)
+                .and_then(|text| crate::work_capture::strip_handoff_context(&text))
+            {
                 events.push(parsed("user_prompt", text, &account, ts));
             }
         }
@@ -642,7 +645,17 @@ fn parse_events(provider: Provider, value: &Value) -> Vec<ParsedEvent> {
         match payload.get("type").and_then(Value::as_str) {
             Some("message") if events.is_empty() => {
                 let role = payload.get("role").and_then(Value::as_str);
-                if let Some(text) = payload.get("content").and_then(content_text) {
+                let text = payload
+                    .get("content")
+                    .and_then(content_text)
+                    .and_then(|text| {
+                        if role == Some("user") {
+                            crate::work_capture::strip_handoff_context(&text)
+                        } else {
+                            Some(text)
+                        }
+                    });
+                if let Some(text) = text {
                     let kind = if role == Some("user") {
                         "user_prompt"
                     } else if role == Some("assistant") {
@@ -1333,5 +1346,20 @@ mod tests {
             Some("worker [REDACTED]"),
             "{rows:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod strip_handoff_tailer_tests {
+    use super::*;
+
+    #[test]
+    fn native_user_prompt_with_injected_handoff_is_stripped_or_skipped() {
+        let with_task = serde_json::json!({"message": {"role": "user", "content": "## Handoff context\n\nh\n\n---\n\nreal ask"}});
+        let events = parse_events(Provider::Pi, &with_task);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].summary, "real ask");
+        let only = serde_json::json!({"message": {"role": "user", "content": "## Handoff context\n\nh\n\n---\n\n"}});
+        assert!(parse_events(Provider::Pi, &only).is_empty());
     }
 }
