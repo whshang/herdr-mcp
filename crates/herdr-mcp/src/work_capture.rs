@@ -30,6 +30,24 @@ const SALIENT_KEYS: [&str; 14] = [
     "prompt",
 ];
 
+const HANDOFF_CONTEXT_HEADING: &str = "## Handoff context";
+
+/// Remove a herdr-injected `## Handoff context ... ---` prefix so injected
+/// handoffs are never re-journaled (feedback loop). Returns the user's own
+/// text, or `None` when nothing remains after the injected block.
+pub(crate) fn strip_handoff_context(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix(HANDOFF_CONTEXT_HEADING) else {
+        return (!text.trim().is_empty()).then(|| text.to_owned());
+    };
+    let rest = rest.replace("\r\n", "\n");
+    let user = rest
+        .find("\n---\n")
+        .map(|index| rest[index + 5..].trim().to_owned())
+        .unwrap_or_default();
+    (!user.is_empty()).then_some(user)
+}
+
 pub(crate) fn event_for_tool_call(
     tool_name: &str,
     arguments: &Value,
@@ -44,7 +62,17 @@ pub(crate) fn event_for_tool_call(
     // Structural redaction first: sensitive-named JSON fields are replaced
     // outright and the remaining strings are text-redacted, so the summary
     // (and scope fields) are built from already-sanitized values.
-    let sanitized = sanitize_json(arguments);
+    let mut sanitized = sanitize_json(arguments);
+    if let Some(object) = sanitized.as_object_mut() {
+        for key in ["prompt", "text"] {
+            if let Some(Value::String(text)) = object.get(key)
+                && let stripped = strip_handoff_context(text).unwrap_or_default()
+                && stripped != *text
+            {
+                object.insert(key.to_owned(), Value::String(stripped));
+            }
+        }
+    }
     let arguments = &sanitized;
     let scope = resolve_scope(arguments, snapshot)?;
     let kind = classify(tool_name, arguments);
@@ -547,5 +575,44 @@ mod redact_idempotence_tests {
     fn known_token_after_assignment_is_not_double_bracketed() {
         let out = super::redact("echo token=ghp_FAKEe2eTOKEN1234567890abcdefABCDEF12 && ls");
         assert_eq!(out, "echo token=[REDACTED] && ls");
+    }
+}
+
+#[cfg(test)]
+mod strip_handoff_tests {
+    use super::strip_handoff_context;
+
+    #[test]
+    fn injected_handoff_block_is_stripped() {
+        let injected = "## Handoff context\n\n## Recent\n- [read] x\n\n---\n\ndo the next thing";
+        assert_eq!(
+            strip_handoff_context(injected).as_deref(),
+            Some("do the next thing")
+        );
+        assert_eq!(
+            strip_handoff_context("## Handoff context\n\nonly handoff\n\n---\n\n  "),
+            None
+        );
+        assert_eq!(
+            strip_handoff_context("## Handoff context\n\nno separator"),
+            None
+        );
+        assert_eq!(
+            strip_handoff_context("plain prompt").as_deref(),
+            Some("plain prompt")
+        );
+        assert_eq!(strip_handoff_context("   "), None);
+    }
+
+    #[test]
+    fn herdr_prompt_audit_drops_injected_block() {
+        let event = super::event_for_tool_call(
+            "herdr_prompt",
+            &serde_json::json!({"prompt": "## Handoff context\n\nold\n\n---\n\nreal task", "cwd": "/repo"}),
+            &serde_json::json!({}),
+        );
+        if let Some(event) = event {
+            assert!(!event.summary.contains("Handoff context"));
+        }
     }
 }
