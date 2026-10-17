@@ -912,6 +912,10 @@ fn pickup_response(
             .as_ref()
             .map(|state| crate::work_compactor::relay_time(state.updated_at)),
         "sections": sections,
+        // Live git context (branch, changed files, next step) of the worktree.
+        "workspace": state
+            .as_ref()
+            .and_then(|state| crate::work_compactor::git_context(std::path::Path::new(&state.worktree))),
     });
     response
 }
