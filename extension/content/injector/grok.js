@@ -301,7 +301,7 @@ class GrokAdapter extends BaseAdapter {
       .some((element) => this.elementVisible(element));
   }
 
-  async getAccountNativeIdentity() {
+  async getAccountObservation() {
     try {
       const response = await fetch("/api/auth/session", {
         method: "GET",
@@ -309,12 +309,12 @@ class GrokAdapter extends BaseAdapter {
         cache: "no-store",
         headers: { accept: "application/json" },
       });
-      if (!response.ok) return null;
+      if (!response.ok) return { nativeIdentity: null, email: null };
       const payload = await response.json();
       const rawUserId = payload?.session?.userId || payload?.userId || null;
       const userId = typeof rawUserId === "string" ? rawUserId.trim().toLowerCase() : "";
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(userId)
-          || !globalThis.crypto?.subtle) return null;
+          || !globalThis.crypto?.subtle) return { nativeIdentity: null, email: null };
       const digest = await globalThis.crypto.subtle.digest(
         "SHA-256",
         new TextEncoder().encode(userId),
@@ -322,10 +322,19 @@ class GrokAdapter extends BaseAdapter {
       const hex = [...new Uint8Array(digest)]
         .map((value) => value.toString(16).padStart(2, "0"))
         .join("");
-      return `grok-account-sha256:${hex}`;
+      const rawEmail = payload?.user?.email || payload?.session?.user?.email || payload?.email || payload?.session?.email || null;
+      const email = typeof rawEmail === "string" ? rawEmail.trim().toLowerCase() : "";
+      return {
+        nativeIdentity: `grok-account-sha256:${hex}`,
+        email: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null,
+      };
     } catch (_) {
-      return null;
+      return { nativeIdentity: null, email: null };
     }
+  }
+
+  async getAccountNativeIdentity() {
+    return (await this.getAccountObservation()).nativeIdentity;
   }
 }
 

@@ -165,6 +165,10 @@ herdr_call(
 herdr-mcp connector approve <approval-request-id>
 herdr-mcp connector list
 herdr-mcp connector revoke <connector-id> --confirm
+herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> --clear
+herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
+herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm
 ```
 
 批准命令会交互式读取 6 位授权码，不要把授权码放进 argv 或 shell history。所有已登记 Device 都是平等的 Worker 管理通道，不存在 owner/member 设备层级。

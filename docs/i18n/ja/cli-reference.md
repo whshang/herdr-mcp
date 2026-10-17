@@ -164,6 +164,10 @@ herdr_call(
 herdr-mcp connector approve <approval-request-id>
 herdr-mcp connector list
 herdr-mcp connector revoke <connector-id> --confirm
+herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> --clear
+herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
+herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm
 ```
 
 承認コマンドは 6 桁のコードを対話的に読み取ります。そのコードを argv や shell history に置かないでください。enrollment 済みのデバイスは等価な Worker 管理チャネルであり、owner/member のデバイス階層はありません。

@@ -157,6 +157,24 @@ A trailing `ACCOUNT_REF` before `--confirm` is still accepted (legacy form) but 
 narrows the match; `deny` removes every grant for that endpoint + provider. Caller grant,
 exact device/endpoint, tab ownership, origin and sensitive-field checks are unchanged.
 
+`connector list` may show `platform_account` (`<platform>-<email>`, for example
+`grokbot-whshang@gmail.com`) beside `connector_id`. Grant commands accept that label only
+when it matches one active connector. `client_name` such as `Cursor` is not the account,
+and a label is not a shared grant. Set it with `herdr-mcp connector label <connector-id> <platform-account>`.
+
+An owner device may also grant or revoke WebChat control for any other non-revoked device
+in the same fleet. `--confirm` stays required. A non-owner requester is
+`connector_owner_device_required`. A target outside this fleet is
+`connector_owner_device_mismatch`.
+
+```sh
+herdr-mcp connector webchat-control allow-device CONNECTOR_OR_PLATFORM_ACCOUNT DEVICE_ID --confirm
+herdr-mcp connector webchat-control deny-device CONNECTOR_OR_PLATFORM_ACCOUNT DEVICE_ID --confirm
+```
+
+Device-wide scope is endpoint `*`, provider `*`, and account `*` on that device only.
+Page Assist grants are unchanged.
+
 **Provider wildcard and Page Assist implication (2026-10-11 23:03).** A grant may use
 provider `*` (exact endpoint, any provider). Edge derives a `*` WebChat control grant at
 forward time from every Page Assist endpoint grant for the routed device, so

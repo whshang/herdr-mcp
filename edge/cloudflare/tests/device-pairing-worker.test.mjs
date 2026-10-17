@@ -866,6 +866,73 @@ test("new Connector requires Worker fleet-admin approval and operator credential
     account_ref: grantInput.account_ref,
   }]);
 
+  const deviceScopeInput = {
+    connector_id: connectorId, device_id: target.device_id,
+    endpoint_ref: "*", provider: "*", account_ref: "*", allowed: true,
+  };
+  const operatorScope = await worker.fetch(post(
+    "/connectors/webchat-control", deviceScopeInput, "owner-secret",
+  ), h.env);
+  assert.equal(operatorScope.status, 401, "ordinary owner bearer cannot issue device-wide authority");
+  const legacyScope = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", deviceScopeInput, "prod-real-runtime", "legacy-secret",
+  ), h.env);
+  assert.equal(legacyScope.status, 403, "legacy owner without enrolled target identity cannot widen it");
+  for (const scopeInput of [
+    { ...deviceScopeInput, account_ref: undefined },
+    { ...deviceScopeInput, endpoint_ref: " * " },
+    { ...deviceScopeInput, provider: " * " },
+    { ...deviceScopeInput, account_ref: " * " },
+  ]) {
+    const normalizedLegacyScope = await worker.fetch(postAsWorkstation(
+      "/connectors/webchat-control", scopeInput, "prod-real-runtime", "legacy-secret",
+    ), h.env);
+    assert.equal(normalizedLegacyScope.status, 403,
+      "normalized device scope still requires an enrolled device credential");
+  }
+  const exactOwnerEnv = { ...h.env, DEFAULT_WORKSTATION_ID: target.device_id };
+  const malformedScope = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", { ...deviceScopeInput, provider: "grok" },
+    target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(malformedScope.status, 400);
+  const otherTarget = await pair(h.env, "another-webchat-grant-device");
+  const crossFleetScope = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", { ...deviceScopeInput, device_id: otherTarget.device_id },
+    target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(crossFleetScope.status, 200, "credential holder may device-wide grant another ACTIVE same-fleet device");
+  const revokedScope = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", { ...deviceScopeInput, device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV" },
+    target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(revokedScope.status, 403, "unknown or non-active fleet target is rejected");
+  const revokeOther = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", { ...deviceScopeInput, device_id: otherTarget.device_id, allowed: false },
+    target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(revokeOther.status, 200, "same-fleet cleanup revokes the cross-device grant again");
+  const wide = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", deviceScopeInput, target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(wide.status, 200, "the exact enrolled owner can issue a device-wide grant");
+  const normalizedOwnerScope = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control",
+    { ...deviceScopeInput, endpoint_ref: " * ", account_ref: undefined },
+    target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(normalizedOwnerScope.status, 200, "enrolled owner may grant normalized device scope");
+  assert.equal((await normalizedOwnerScope.json()).scope, "device");
+  const wideGrants = (await wide.json()).grants;
+  assert.equal(wideGrants.filter(g => g.endpoint_ref === "*").length, 1);
+  assert.equal(wideGrants.length, 2, "existing narrow grant is preserved");
+  const deniedWide = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control", { ...deviceScopeInput, allowed: false },
+    target.device_id, target.device_secret,
+  ), exactOwnerEnv);
+  assert.equal(deniedWide.status, 200);
+  assert.deepEqual((await deniedWide.json()).grants, ownerGrantBody.grants);
+
   const storedGrant = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/get", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -2357,4 +2424,460 @@ test("user Given a migrate request where from equals to When it passes the publi
     [["migrate_source_is_current", "validate"], ["migrate_invalid_connector_id", "validate"]],
   );
   assert.equal(h.oauthStorage.map.get("grant:c1").page_assist.find((r) => r.endpoint_ref === "epA").connector_id, MIG_OLD, "grant rows untouched");
+});
+
+async function approveConnector(env, clientName) {
+  const registration = await worker.fetch(new Request("https://edge.example/oauth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      redirect_uris: ["https://client.example/callback"],
+      token_endpoint_auth_method: "none",
+      client_name: clientName,
+    }),
+  }), env);
+  assert.equal(registration.status, 201);
+  const client = await registration.json();
+  const authorize = new URL("https://edge.example/oauth/authorize");
+  authorize.searchParams.set("client_id", client.client_id);
+  authorize.searchParams.set("redirect_uri", "https://client.example/callback");
+  authorize.searchParams.set("response_type", "code");
+  authorize.searchParams.set("code_challenge", "A".repeat(43));
+  authorize.searchParams.set("code_challenge_method", "S256");
+  authorize.searchParams.set("state", `state-${clientName}`);
+  const pendingResponse = await worker.fetch(new Request(authorize), env);
+  assert.equal(pendingResponse.status, 200);
+  const html = await pendingResponse.text();
+  const requestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  const approvalCode = /<div class="approval-code">(\d{6})<\/div>/.exec(html)?.[1];
+  assert.ok(requestId && approvalCode);
+  const approved = await worker.fetch(post("/connectors/approve", {
+    request_id: requestId,
+    code: approvalCode,
+  }, "owner-secret"), env);
+  assert.equal(approved.status, 200);
+  const inventory = await worker.fetch(new Request("https://edge.example/connectors", {
+    headers: { authorization: "Bearer owner-secret" },
+  }), env);
+  assert.equal(inventory.status, 200);
+  const body = await inventory.json();
+  const connector = body.connectors.find((row) => row.client_id === client.client_id);
+  assert.ok(connector);
+  return connector;
+}
+
+function ownerWebChatGrant(env, body, workstationId = "prod-real-runtime", secret = "legacy-secret") {
+  return worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control",
+    body,
+    workstationId,
+    secret,
+  ), env);
+}
+
+test("user owner labels a connector | Given an approved connector whose client_name is not an account | When the owner sets and clears platform_account | Then the label is display metadata and grant_generation stays unchanged", async () => {
+  const h = makeEnv();
+  const oauth = new OAuthStoreDO({ storage: new FakeStorage() }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+
+  const cursorNamed = await approveConnector(h.env, "Cursor");
+  assert.equal(cursorNamed.platform_account, null);
+  assert.equal(cursorNamed.client_name, "Cursor");
+  const before = cursorNamed.grant_generation;
+
+  const spoofed = await approveConnector(h.env, "grokbot-whshang@gmail.com");
+  assert.equal(spoofed.platform_account, null, "client-controlled client_name is never auto-labeled as a platform account");
+
+  const labeled = await worker.fetch(post("/connectors/label", {
+    connector_id: cursorNamed.connector_id,
+    platform_account: "chatgpt-whshang1@gmail.com",
+  }, "owner-secret"), h.env);
+  assert.equal(labeled.status, 200);
+  const labeledBody = await labeled.json();
+  assert.equal(labeledBody.platform_account, "chatgpt-whshang1@gmail.com");
+  assert.equal(labeledBody.grant_generation, before);
+
+  const rejected = await worker.fetch(post("/connectors/label", {
+    connector_id: cursorNamed.connector_id,
+    platform_account: "Cursor",
+  }, "owner-secret"), h.env);
+  assert.equal(rejected.status, 400);
+  assert.equal((await rejected.json()).code, "invalid_platform_account");
+
+  const cleared = await worker.fetch(post("/connectors/label", {
+    connector_id: cursorNamed.connector_id,
+    platform_account: null,
+  }, "owner-secret"), h.env);
+  assert.equal(cleared.status, 200);
+  const clearedBody = await cleared.json();
+  assert.equal(clearedBody.platform_account, null);
+  assert.equal(clearedBody.grant_generation, before);
+});
+
+test("user owner grants WebChat control across the fleet | Given an owner device, another device in the same fleet, a non-owner device, and an unenrolled device | When device-wide allow and deny are requested | Then same-fleet and self grants succeed and cross-owner or non-owner requests are denied", async () => {
+  const h = makeEnv();
+  const oauth = new OAuthStoreDO({ storage: new FakeStorage() }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+  const connector = await approveConnector(h.env, "Cursor");
+  // The owner is a genuinely enrolled device with its own credential:
+  // device-wide grants require credential authentication (never the legacy
+  // shared secret), so the default workstation becomes the paired owner.
+  const owner = await pair(h.env, "fleet-owner");
+  h.env.DEFAULT_WORKSTATION_ID = owner.workstation_id;
+  const ownerDeviceId = owner.device_id;
+  const other = await pair(h.env, "same-fleet-other");
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (line) => logs.push(line);
+  try {
+    const realStoreNamespace = h.env.OAUTH_STORE_DO;
+    h.env.OAUTH_STORE_DO = namespace({
+      fetch(request) {
+        if (new URL(request.url).pathname === "/internal/oauth/grant/webchat-control") {
+          return new Response(JSON.stringify({ ok: false, code: "storage_unavailable" }), { status: 503 });
+        }
+        return oauth.fetch(request);
+      },
+    });
+    try {
+      const failed = await ownerWebChatGrant(h.env, {
+        connector_id: connector.connector_id,
+        device_id: other.device_id,
+        scope: "device",
+        allowed: true,
+      }, owner.workstation_id, owner.device_secret);
+      assert.equal(failed.status, 409);
+      assert.equal(logs.some((line) => {
+        try { return JSON.parse(line).event === "connector.webchat_control_grant"; } catch { return false; }
+      }), false, "failed storage writes cannot emit a successful grant audit");
+    } finally {
+      h.env.OAUTH_STORE_DO = realStoreNamespace;
+    }
+
+    const sameFleet = await ownerWebChatGrant(h.env, {
+      connector_id: connector.connector_id,
+      device_id: other.device_id,
+      scope: "device",
+      allowed: true,
+    }, owner.workstation_id, owner.device_secret);
+    assert.equal(sameFleet.status, 200);
+    const sameFleetBody = await sameFleet.json();
+    assert.equal(sameFleetBody.scope, "device");
+    assert.equal(sameFleetBody.requester_device_id, ownerDeviceId);
+    assert.equal(sameFleetBody.device_id, other.device_id);
+    assert.deepEqual(sameFleetBody.grants, [{
+      connector_id: connector.connector_id,
+      grant_generation: connector.grant_generation,
+      device_id: other.device_id,
+      endpoint_ref: "*",
+      provider: "*",
+      account_ref: "*",
+    }]);
+
+    const selfGrant = await ownerWebChatGrant(h.env, {
+      connector_id: connector.connector_id,
+      device_id: ownerDeviceId,
+      scope: "device",
+      allowed: true,
+    }, owner.workstation_id, owner.device_secret);
+    assert.equal(selfGrant.status, 200);
+    const selfBody = await selfGrant.json();
+    assert.equal(selfBody.device_id, ownerDeviceId);
+    assert.ok(selfBody.grants.some((grant) => grant.device_id === ownerDeviceId && grant.endpoint_ref === "*"));
+
+    const otherOwner = await ownerWebChatGrant(h.env, {
+      connector_id: connector.connector_id,
+      device_id: "dev_01M1TEST000000000000000000",
+      scope: "device",
+      allowed: true,
+    }, owner.workstation_id, owner.device_secret);
+    assert.equal(otherOwner.status, 403);
+    assert.equal((await otherOwner.json()).code, "connector_owner_device_mismatch");
+
+    const nonOwner = await worker.fetch(postAsWorkstation(
+      "/connectors/webchat-control",
+      {
+        connector_id: connector.connector_id,
+        device_id: other.device_id,
+        scope: "device",
+        allowed: true,
+      },
+      other.workstation_id,
+      other.device_secret,
+    ), h.env);
+    assert.equal(nonOwner.status, 401);
+    assert.equal((await nonOwner.json()).code, "connector_owner_device_required");
+
+    const mixed = await ownerWebChatGrant(h.env, {
+      connector_id: connector.connector_id,
+      device_id: other.device_id,
+      scope: "device",
+      endpoint_ref: "*",
+      allowed: true,
+    }, owner.workstation_id, owner.device_secret);
+    assert.equal(mixed.status, 400);
+    assert.equal((await mixed.json()).code, "invalid_webchat_control_grant");
+
+    const denied = await ownerWebChatGrant(h.env, {
+      connector_id: connector.connector_id,
+      device_id: other.device_id,
+      scope: "device",
+      allowed: false,
+    }, owner.workstation_id, owner.device_secret);
+    assert.equal(denied.status, 200);
+    const deniedBody = await denied.json();
+    assert.equal(deniedBody.allowed, false);
+    assert.equal(deniedBody.grants.some((grant) => grant.device_id === other.device_id && grant.endpoint_ref === "*"), false);
+  } finally {
+    console.log = originalLog;
+  }
+  const events = logs.flatMap((line) => {
+    try { return [JSON.parse(line)]; } catch { return []; }
+  });
+  const granted = events.find((entry) => entry.event === "connector.webchat_control_grant"
+    && entry.fields?.targetDeviceId === other.device_id
+    && entry.fields?.allowed === true);
+  assert.equal(granted.fields.requesterDeviceId, ownerDeviceId);
+  assert.equal(granted.fields.connectorId, connector.connector_id);
+  const mismatch = events.find((entry) => entry.event === "connector.webchat_control_denied"
+    && entry.fields?.code === "connector_owner_device_mismatch");
+  assert.equal(mismatch.fields.requesterDeviceId, ownerDeviceId);
+  assert.equal(mismatch.fields.targetDeviceId, "dev_01M1TEST000000000000000000");
+  assert.equal(mismatch.fields.connectorId, connector.connector_id);
+});
+
+test("user cannot widen Page Assist or grant to non-active targets | Given an owner device with a credential, an active connector, and a suspended fleet device | When wildcard Page Assist or device-wide grants to suspended/unknown targets are requested | Then each request is rejected fail-closed", async () => {
+  const h = makeEnv();
+  const oauth = new OAuthStoreDO({ storage: new FakeStorage() }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+  const connector = await approveConnector(h.env, "Cursor");
+  const owner = await pair(h.env, "strict-owner");
+  h.env.DEFAULT_WORKSTATION_ID = owner.workstation_id;
+  const suspended = await pair(h.env, "suspended-target");
+  const suspendedRecord = h.storage.map.get(`device:${suspended.device_id}`);
+  h.storage.map.set(`device:${suspended.device_id}`, { ...suspendedRecord, authorization: "suspended" });
+
+  const wildcardPageAssist = await worker.fetch(postAsWorkstation(
+    "/connectors/page-assist",
+    {
+      connector_id: connector.connector_id,
+      device_id: owner.device_id,
+      endpoint_ref: "*",
+      allowed: true,
+    },
+    owner.workstation_id,
+    owner.device_secret,
+  ), h.env);
+  assert.equal(wildcardPageAssist.status, 400);
+  assert.equal((await wildcardPageAssist.json()).code, "invalid_page_assist_grant");
+
+  const legacyWildcardShape = await ownerWebChatGrant(h.env, {
+    connector_id: connector.connector_id,
+    device_id: owner.device_id,
+    endpoint_ref: "*",
+    provider: "*",
+    account_ref: "*",
+    allowed: true,
+  }, owner.workstation_id, owner.device_secret);
+  assert.equal(legacyWildcardShape.status, 200, "credential owner may still issue device scope via the legacy wire shape");
+
+  const suspendedTarget = await ownerWebChatGrant(h.env, {
+    connector_id: connector.connector_id,
+    device_id: suspended.device_id,
+    scope: "device",
+    allowed: true,
+  }, owner.workstation_id, owner.device_secret);
+  assert.equal(suspendedTarget.status, 403);
+  assert.equal((await suspendedTarget.json()).code, "connector_target_device_suspended");
+
+  const unknownTarget = await ownerWebChatGrant(h.env, {
+    connector_id: connector.connector_id,
+    device_id: "dev_01M1TEST000000000000000000",
+    scope: "device",
+    allowed: true,
+  }, owner.workstation_id, owner.device_secret);
+  assert.equal(unknownTarget.status, 403);
+  assert.equal((await unknownTarget.json()).code, "connector_owner_device_mismatch");
+});
+
+test("user cannot hijack connector labels | Given a legacy default owner, a credential owner device, a non-owner enrolled device, and an operator bearer | When labels are written | Then only owner credential and operator succeed and failed writes leave the record unchanged", async () => {
+  const h = makeEnv();
+  const oauth = new OAuthStoreDO({ storage: new FakeStorage() }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+  const connector = await approveConnector(h.env, "Cursor");
+  const owner = await pair(h.env, "label-owner");
+  const other = await pair(h.env, "label-nonowner");
+
+  // Legacy shared-secret default owner is rejected even though it is the
+  // configured default workstation (registry correlation is not a credential).
+  const legacy = await worker.fetch(postAsWorkstation(
+    "/connectors/label",
+    { connector_id: connector.connector_id, platform_account: "legacy-owner@example.com" },
+    "prod-real-runtime", "legacy-secret",
+  ), h.env);
+  assert.equal(legacy.status, 403);
+  assert.equal((await legacy.json()).code, "connector_owner_device_mismatch");
+
+  // A wrong bearer has no credential at all.
+  const wrongBearer = await worker.fetch(post(
+    "/connectors/label", { connector_id: connector.connector_id, platform_account: "x-owner@example.com" }, "wrong-secret",
+  ), h.env);
+  assert.equal(wrongBearer.status, 401);
+  assert.equal((await wrongBearer.json()).code, "connector_owner_device_required");
+
+  // The enrolled owner device credential writes the label.
+  h.env.DEFAULT_WORKSTATION_ID = owner.workstation_id;
+  const ownerLabel = await worker.fetch(postAsWorkstation(
+    "/connectors/label",
+    { connector_id: connector.connector_id, platform_account: "grokbot-owner@example.com" },
+    owner.workstation_id, owner.device_secret,
+  ), h.env);
+  assert.equal(ownerLabel.status, 200);
+  const ownerLabelBody = await ownerLabel.json();
+  assert.equal(ownerLabelBody.platform_account, "grokbot-owner@example.com");
+  assert.equal(ownerLabelBody.grant_generation, connector.grant_generation, "labels never alter grant generation");
+
+  // A non-owner active enrolled device cannot relabel or redirect selection.
+  const nonOwner = await worker.fetch(postAsWorkstation(
+    "/connectors/label",
+    { connector_id: connector.connector_id, platform_account: "attacker-owner@example.com" },
+    other.workstation_id, other.device_secret,
+  ), h.env);
+  assert.equal(nonOwner.status, 403);
+  assert.equal((await nonOwner.json()).code, "connector_owner_device_mismatch");
+
+  // The operator bearer keeps its contract.
+  const operator = await worker.fetch(post(
+    "/connectors/label", { connector_id: connector.connector_id, platform_account: "chatgpt-owner@example.com" }, "owner-secret",
+  ), h.env);
+  assert.equal(operator.status, 200);
+
+  // No failed relabel redirected the record: the label is the operator's
+  // last successful write, on the same connector and generation.
+  const inventory = await worker.fetch(new Request("https://edge.example/connectors", {
+    headers: { authorization: "Bearer owner-secret" },
+  }), h.env);
+  const rows = (await inventory.json()).connectors.filter((row) => row.connector_id === connector.connector_id);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].platform_account, "chatgpt-owner@example.com");
+  assert.equal(rows[0].grant_generation, connector.grant_generation);
+});
+
+test("user owner may revoke grants on suspended or revoked same-fleet targets | Given a credential owner and a device-wide grant on an active target | When the target is suspended or revoked and the grant is denied | Then the stored grant is deleted and never resurfaces after reactivation", async () => {
+  const h = makeEnv();
+  const oauth = new OAuthStoreDO({ storage: new FakeStorage() }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+  const connector = await approveConnector(h.env, "Cursor");
+  const owner = await pair(h.env, "revoke-owner");
+  h.env.DEFAULT_WORKSTATION_ID = owner.workstation_id;
+  const target = await pair(h.env, "revoke-target");
+
+  const grant = { connector_id: connector.connector_id, device_id: target.device_id, scope: "device" };
+  const allowActive = await ownerWebChatGrant(h.env, { ...grant, allowed: true }, owner.workstation_id, owner.device_secret);
+  assert.equal(allowActive.status, 200, "allow on an ACTIVE target succeeds");
+
+  const record = h.storage.map.get(`device:${target.device_id}`);
+  h.storage.map.set(`device:${target.device_id}`, { ...record, authorization: "suspended" });
+  const allowSuspended = await ownerWebChatGrant(h.env, { ...grant, allowed: true }, owner.workstation_id, owner.device_secret);
+  assert.equal(allowSuspended.status, 403, "allow on a suspended target always fails");
+  assert.equal((await allowSuspended.json()).code, "connector_target_device_suspended");
+
+  const denySuspended = await ownerWebChatGrant(h.env, { ...grant, allowed: false }, owner.workstation_id, owner.device_secret);
+  assert.equal(denySuspended.status, 200, "a credential owner may deny a suspended same-fleet target");
+  assert.equal((await denySuspended.json()).grants.some((g) => g.device_id === target.device_id), false,
+    "the stored device-wide grant is deleted");
+
+  // Reactivation must not resurrect the stale grant.
+  h.storage.map.set(`device:${target.device_id}`, { ...record, authorization: "active" });
+  const stored = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: connector.client_id }),
+  }));
+  assert.equal(stored.status, 200);
+  const storedBody = await stored.json();
+  assert.equal(storedBody.record.webchat_control.some((g) => g.device_id === target.device_id), false,
+    "reenabling the device does not restore the revoked grant");
+
+  // A revoked target may also be denied, but never granted.
+  h.storage.map.set(`device:${target.device_id}`, {
+    ...record,
+    authorization: "revoked",
+    revoked_at_ms: (record.updated_at_ms ?? 0) + 1,
+  });
+  const allowRevoked = await ownerWebChatGrant(h.env, { ...grant, allowed: true }, owner.workstation_id, owner.device_secret);
+  assert.equal(allowRevoked.status, 403, "allow on a revoked target always fails");
+  assert.equal((await allowRevoked.json()).code, "connector_target_device_revoked");
+  const denyRevoked = await ownerWebChatGrant(h.env, { ...grant, allowed: false }, owner.workstation_id, owner.device_secret);
+  assert.equal(denyRevoked.status, 200, "a credential owner may deny a revoked same-fleet target");
+
+  // Reactivate so the remaining checks run against an ACTIVE target again.
+  h.storage.map.set(`device:${target.device_id}`, { ...record, authorization: "active" });
+  // An absent target is never blindly denied: no write happens for unknown devices.
+  const endpointGrant = await ownerWebChatGrant(h.env, {
+    connector_id: connector.connector_id,
+    device_id: target.device_id,
+    endpoint_ref: `be_${"h".repeat(64)}`,
+    provider: "chatgpt",
+    allowed: true,
+  }, owner.workstation_id, owner.device_secret);
+  assert.equal(endpointGrant.status, 200);
+  const denyUnknown = await ownerWebChatGrant(h.env, {
+    connector_id: connector.connector_id,
+    device_id: "dev_01M1TEST000000000000000000",
+    scope: "device",
+    allowed: false,
+  }, owner.workstation_id, owner.device_secret);
+  assert.equal(denyUnknown.status, 403, "deny for an unknown target is rejected");
+  assert.equal((await denyUnknown.json()).code, "connector_owner_device_mismatch");
+  const afterUnknown = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: connector.client_id }),
+  }));
+  const afterUnknownBody = (await afterUnknown.json());
+  assert.equal(afterUnknownBody.record.webchat_control.some((g) => g.device_id === target.device_id), true,
+    "the rejected deny wrote nothing");
+});
+
+test("user legacy owner with a registry device id still cannot widen device scope | Given the default workstation on the legacy shared secret with one registered device | When device-wide allow or suspended-target deny is requested | Then every device-scope write is rejected fail-closed", async () => {
+  const h = makeEnv();
+  const oauth = new OAuthStoreDO({ storage: new FakeStorage() }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+  const connector = await approveConnector(h.env, "Cursor");
+  const ensured = await h.registry.fetch(new Request("https://registry.internal/internal/devices/legacy/ensure", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workstation_id: "prod-real-runtime", name: "legacy-owner" }),
+  }));
+  assert.equal(ensured.status, 200);
+  const legacyDeviceId = (await ensured.json()).device.device_id;
+  assert.ok(legacyDeviceId, "the legacy workstation has a registry device correlation");
+  const target = await pair(h.env, "legacy-gap-target");
+
+  const wide = { connector_id: connector.connector_id, device_id: target.device_id, scope: "device", allowed: true };
+  const allow = await ownerWebChatGrant(h.env, wide, "prod-real-runtime", "legacy-secret");
+  assert.equal(allow.status, 403,
+    "a legacy shared-secret owner with a resolvable registry device id still cannot issue device scope");
+
+  const endpoint = await ownerWebChatGrant(h.env, {
+    connector_id: connector.connector_id,
+    device_id: target.device_id,
+    endpoint_ref: `be_${"k".repeat(64)}`,
+    provider: "chatgpt",
+    allowed: true,
+  }, "prod-real-runtime", "legacy-secret");
+  assert.equal(endpoint.status, 200, "endpoint-scope grants keep their current legacy contract");
+
+  const record = h.storage.map.get(`device:${target.device_id}`);
+  h.storage.map.set(`device:${target.device_id}`, { ...record, authorization: "suspended" });
+  const deny = await ownerWebChatGrant(h.env, { ...wide, allowed: false }, "prod-real-runtime", "legacy-secret");
+  assert.equal(deny.status, 403,
+    "suspended-target deny is a device-scope write and stays credential-only");
 });
