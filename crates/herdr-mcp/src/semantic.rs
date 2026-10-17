@@ -57,6 +57,7 @@ struct SemanticTrace {
     result_class: String,
     confidence: Option<f64>,
     fallback_reason: Option<String>,
+    detail: Option<String>,
 }
 
 impl SemanticTrace {
@@ -68,6 +69,7 @@ impl SemanticTrace {
             "result_class": self.result_class,
             "confidence": self.confidence,
             "fallback_reason": self.fallback_reason,
+            "detail": self.detail,
         })
     }
 }
@@ -77,6 +79,12 @@ fn semantic_traces() -> &'static Mutex<BTreeMap<&'static str, SemanticTrace>> {
 }
 
 fn record_semantic_trace(boundary: &'static str, trace: SemanticTrace) {
+    if let Some(detail) = &trace.detail {
+        eprintln!(
+            "herdr-mcp semantic {boundary} route={} failed: {detail}",
+            trace.route
+        );
+    }
     if let Ok(mut traces) = semantic_traces().lock() {
         traces.insert(boundary, trace);
     }
@@ -418,11 +426,23 @@ impl SemanticResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SemanticError(String);
+pub struct SemanticError(String, Option<String>);
 
 impl SemanticError {
     fn new(code: impl Into<String>) -> Self {
-        Self(code.into())
+        Self(code.into(), None)
+    }
+
+    /// Keep the stable machine `code` but retain the underlying transport
+    /// detail (HTTP status, Edge error code) for traces and logs, so an Edge
+    /// failure is diagnosable instead of collapsing to a bare code.
+    fn with_detail(code: impl Into<String>, detail: impl Into<String>) -> Self {
+        let detail: String = detail.into();
+        Self(code.into(), Some(detail.chars().take(300).collect()))
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        self.1.as_deref()
     }
 
     fn fallback_json(&self) -> Value {
@@ -993,6 +1013,7 @@ impl SemanticService {
                     result_class: "not_configured".to_owned(),
                     confidence: None,
                     fallback_reason: Some("not_configured".to_owned()),
+                    detail: None,
                 },
             );
             return Err(SemanticError::new("not_configured"));
@@ -1026,6 +1047,10 @@ impl SemanticService {
                         result_class: result_class.to_owned(),
                         confidence,
                         fallback_reason,
+                        detail: result
+                            .as_ref()
+                            .err()
+                            .and_then(|error| error.detail().map(str::to_owned)),
                     },
                 );
             },
@@ -1075,6 +1100,7 @@ impl SemanticService {
                     result_class: "not_configured".to_owned(),
                     confidence: None,
                     fallback_reason: Some("not_configured".to_owned()),
+                    detail: None,
                 },
             );
             return Err(SemanticError::new("not_configured"));
@@ -1112,6 +1138,10 @@ impl SemanticService {
                         result_class: result_class.to_owned(),
                         confidence: None,
                         fallback_reason,
+                        detail: result
+                            .as_ref()
+                            .err()
+                            .and_then(|error| error.detail().map(str::to_owned)),
                     },
                 );
             },
@@ -1505,7 +1535,7 @@ impl SemanticProvider for EdgeSemanticProvider {
             }),
             timeout,
         )
-        .map_err(|_| SemanticError::new("edge_proxy_unavailable"))?;
+        .map_err(|error| SemanticError::with_detail("edge_proxy_unavailable", error))?;
         parse_response(EDGE_SEMANTIC_PROVIDER_ID, request, payload)
     }
 }
@@ -1529,7 +1559,7 @@ impl SemanticChatProvider for EdgeSemanticChatProvider {
     ) -> Result<SemanticChatResponse, SemanticError> {
         let payload =
             crate::worker::semantic_proxy_chat_request(&edge_chat_body(messages, options), timeout)
-                .map_err(|_| SemanticError::new("edge_proxy_unavailable"))?;
+                .map_err(|error| SemanticError::with_detail("edge_proxy_unavailable", error))?;
         parse_chat_response("edge-semantic-chat", payload)
     }
 }
@@ -3046,5 +3076,38 @@ mod tests {
                 .and_then(SemanticAnswer::noul_probability)
                 .is_some_and(|probability| probability >= DEFAULT_DECISION_THRESHOLD)
         );
+    }
+}
+
+#[cfg(test)]
+mod semantic_error_detail_tests {
+    use super::*;
+
+    #[test]
+    fn edge_error_keeps_stable_code_and_bounded_detail() {
+        let error = SemanticError::with_detail(
+            "edge_proxy_unavailable",
+            "semantic proxy failed with HTTP 400 Bad Request code=semantic_request_invalid",
+        );
+        assert_eq!(error.code(), "edge_proxy_unavailable");
+        assert!(error.detail().unwrap().contains("HTTP 400"));
+        assert!(error.detail().unwrap().contains("semantic_request_invalid"));
+        let long = SemanticError::with_detail("edge_proxy_unavailable", "x".repeat(1000));
+        assert_eq!(long.detail().unwrap().chars().count(), 300);
+        assert_eq!(SemanticError::new("timeout").detail(), None);
+    }
+
+    #[test]
+    fn trace_json_exposes_detail() {
+        let trace = SemanticTrace {
+            route: "edge-semantic-chat".to_owned(),
+            protocol: "openai-chat".to_owned(),
+            latency_ms: 1,
+            result_class: "provider_error".to_owned(),
+            confidence: None,
+            fallback_reason: Some("edge_proxy_unavailable".to_owned()),
+            detail: Some("HTTP 400".to_owned()),
+        };
+        assert_eq!(trace.to_json()["detail"], "HTTP 400");
     }
 }

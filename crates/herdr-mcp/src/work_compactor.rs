@@ -146,16 +146,33 @@ fn compact_scope(
 
 fn compaction_prompt(previous: &str, events: &[WorkEvent]) -> String {
     let mut prompt = String::from(
-        "Rewrite a concise engineering handoff from the previous handoff and new work events. Preserve decisions, current state, blockers, and next actions. Do not invent facts. Return only JSON shaped {\"handoff_md\":\"...\"}. Keep handoff_md under 16000 characters.\n\nPrevious handoff:\n",
+        "Rewrite a concise engineering handoff from the previous handoff and new work events. Preserve decisions, current state, blockers, and next actions. Do not invent facts. Return only JSON shaped {\"handoff_md\":\"...\"}. Keep handoff_md under 16000 characters. In this input, line breaks are written as the two characters \\n; use real newlines in handoff_md.\n\nPrevious handoff:\n",
     );
     prompt.push_str(&clip_chars(previous, HANDOFF_MAX_CHARS));
     prompt.push_str("\n\nNew events:\n");
     for event in events {
         prompt.push_str(&format_event(event));
     }
+    // The Edge /semantic/chat contract rejects message content containing any
+    // control character (U+0000-U+001F, U+007F) with semantic_request_invalid,
+    // so encode line breaks/tabs as visible escapes before the byte clip.
     // The semantic message cap is measured in bytes, not chars; truncate on a
     // UTF-8 char boundary against the byte budget.
-    clip_utf8_bytes(&prompt, SEMANTIC_PROMPT_MAX_BYTES)
+    clip_utf8_bytes(&escape_control_chars(&prompt), SEMANTIC_PROMPT_MAX_BYTES)
+}
+
+fn escape_control_chars(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 16);
+    for ch in text.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => {}
+            ch if ch.is_control() && (ch as u32) < 0x80 => out.push(' '),
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Truncate to at most `max_bytes` UTF-8 bytes, ending on a char boundary and
@@ -624,8 +641,9 @@ mod tests {
     }
 
     fn prompt_event_lines(prompt: &str) -> usize {
+        // Prompts carry escaped line breaks (Edge rejects control chars).
         prompt
-            .lines()
+            .split("\\n")
             .filter(|line| line.starts_with("- [edit]"))
             .count()
     }
@@ -821,6 +839,15 @@ mod tests {
         let prompt = compaction_prompt(&cjk_previous, &events);
         assert!(prompt.len() <= SEMANTIC_PROMPT_MAX_BYTES);
         assert!(prompt.ends_with('…'));
+
+        assert!(
+            !prompt
+                .chars()
+                .any(|ch| (ch as u32) < 0x20 || ch == '\u{7f}')
+        );
+        let edged = compaction_prompt("a\nb\tc\u{1}", &[]);
+        assert!(edged.contains("a\\nb\\tc "));
+        assert!(!edged.chars().any(|ch| (ch as u32) < 0x20 || ch == '\u{7f}'));
 
         let short = "small prompt";
         assert_eq!(clip_utf8_bytes(short, SEMANTIC_PROMPT_MAX_BYTES), short);
