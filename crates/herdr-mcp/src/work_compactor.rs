@@ -358,6 +358,9 @@ const TASKS_HEADING: &str = "任务清单";
 const SOURCES_MAX: usize = 30;
 
 fn render_items(out: &mut String, heading: &str, items: &[RelayItem]) {
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
     out.push_str(&format!("\n### {heading}\n"));
     for item in items.iter().rev() {
         out.push_str(&format!("\n- [{}] {}", item.id, single_line(&item.text)));
