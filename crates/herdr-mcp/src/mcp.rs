@@ -11266,12 +11266,7 @@ mod tests {
         );
         assert_eq!(by_cwd["ok"], true);
         assert_eq!(by_cwd["through_event_id"], 4);
-        assert!(
-            by_cwd["handoff_md"]
-                .as_str()
-                .unwrap()
-                .contains("## 目标与计划")
-        );
+        assert!(by_cwd["handoff_md"].as_str().unwrap().contains("## 规则"));
         assert_eq!(by_cwd["sections"]["goals"][0]["text"], "ship relay");
 
         // pane resolution goes through the pane's live cwd the same way.

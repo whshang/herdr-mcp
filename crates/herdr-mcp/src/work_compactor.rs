@@ -77,9 +77,12 @@ pub(crate) struct RelayMemory {
     /// ## 当前状态
     #[serde(default)]
     pub current_state: String,
-    /// ## 最近对话摘要 (each line prefixed with the provider, newest last)
+    /// Internal rolling log (not rendered).
     #[serde(default)]
     pub recent: Vec<String>,
+    /// ## 历史会话路径: "provider time path" of source session logs, newest last.
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +169,153 @@ fn split_memory(handoff_md: &str) -> (RelayMemory, String) {
     }
 }
 
+/// Fold agent edits of HANDOFF.md back into the memory: the rules and task
+/// list in the file are authoritative (rendered newest-first, so reversed
+/// back). Lines without an `[id]` become new items. Returns true if folded.
+pub(crate) fn fold_file_edits(memory: &mut RelayMemory, file_md: &str) -> bool {
+    #[derive(PartialEq)]
+    enum Section {
+        None,
+        Rules,
+        Mistakes,
+        Tasks,
+        Other,
+    }
+    let mut section = Section::None;
+    let (mut rules, mut mistakes, mut tasks) = (Vec::new(), Vec::new(), Vec::new());
+    let mut saw_any = false;
+    for line in file_md.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<!--") {
+            break;
+        }
+        if let Some(heading) = trimmed.strip_prefix('#') {
+            let heading = heading.trim_start_matches('#').trim();
+            section = if heading == RULES_HEADING {
+                saw_any = true;
+                Section::Rules
+            } else if heading == MISTAKES_HEADING {
+                saw_any = true;
+                Section::Mistakes
+            } else if heading == TASKS_HEADING {
+                saw_any = true;
+                Section::Tasks
+            } else if heading == "规则" {
+                Section::None
+            } else {
+                Section::Other
+            };
+            continue;
+        }
+        let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        else {
+            continue;
+        };
+        let (id, rest) = match item.strip_prefix('[').and_then(|r| r.split_once(']')) {
+            Some((id, rest)) => (Some(id.trim().to_owned()), rest.trim()),
+            None => (None, item.trim()),
+        };
+        match section {
+            Section::Rules | Section::Mistakes if !rest.is_empty() => {
+                let target = if section == Section::Rules {
+                    &mut rules
+                } else {
+                    &mut mistakes
+                };
+                target.push((id, rest.to_owned()));
+            }
+            Section::Tasks if !rest.is_empty() => {
+                let (status, text) = match rest.strip_prefix('(').and_then(|r| r.split_once(')')) {
+                    Some((status, text)) if TASK_STATUSES.contains(&status.trim()) => {
+                        (status.trim().to_owned(), text.trim().to_owned())
+                    }
+                    _ => ("todo".to_owned(), rest.to_owned()),
+                };
+                if !text.is_empty() {
+                    tasks.push((id, text, status));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !saw_any {
+        return false;
+    }
+    let to_items = |parsed: Vec<(Option<String>, String)>, prefix: &str| {
+        let mut items: Vec<RelayItem> = Vec::new();
+        for (id, text) in parsed.into_iter().rev() {
+            let id = id
+                .filter(|id| !id.is_empty() && !items.iter().any(|item| &item.id == id))
+                .unwrap_or_else(|| next_id(&items, prefix));
+            items.push(RelayItem { id, text });
+        }
+        items
+    };
+    memory.preferences = to_items(rules, "p");
+    memory.mistakes = to_items(mistakes, "m");
+    let mut folded: Vec<RelayTask> = Vec::new();
+    for (id, text, status) in tasks.into_iter().rev() {
+        let id = id
+            .filter(|id| !id.is_empty() && !folded.iter().any(|task| &task.id == id))
+            .unwrap_or_else(|| {
+                let ids: Vec<RelayItem> = folded
+                    .iter()
+                    .map(|task| RelayItem {
+                        id: task.id.clone(),
+                        text: String::new(),
+                    })
+                    .collect();
+                next_id(&ids, "t")
+            });
+        folded.push(RelayTask { id, text, status });
+    }
+    memory.tasks = folded;
+    true
+}
+
+/// Record the native session log files behind these events (newest last,
+/// deduplicated by path, bounded).
+fn record_sources(memory: &mut RelayMemory, events: &[WorkEvent]) {
+    for event in events {
+        let Some(path) = event.source_ref.strip_prefix("native-log:") else {
+            continue;
+        };
+        let when = chrono_like(event.ts);
+        memory
+            .sources
+            .retain(|line| !line.ends_with(&format!(" {path}")));
+        memory
+            .sources
+            .push(format!("{} {when} {path}", single_line(&event.provider)));
+    }
+    let excess = memory.sources.len().saturating_sub(SOURCES_MAX);
+    memory.sources.drain(..excess);
+}
+
+/// `YYYY-MM-DD HH:MM UTC` from epoch milliseconds (no date crate needed).
+fn chrono_like(ts_ms: i64) -> String {
+    let secs = ts_ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Civil-from-days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
+}
+
 /// Whitespace-collapse a value onto one line for list rendering.
 fn single_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -174,12 +324,13 @@ fn single_line(text: &str) -> String {
 /// Render the fixed-section handoff document plus the trailing structured
 /// block. Section order is contractual (entry-agnostic readers rely on it).
 pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
-    // Order: durable principles first, then lessons, newest tasks, state,
-    // goals, and the older rolling history last; lists newest-first.
-    let mut out = String::from("# HANDOFF\n");
-    render_items(&mut out, "公共原则/偏好与规范", &memory.preferences);
-    render_items(&mut out, "错题集", &memory.mistakes);
-    out.push_str("\n## 最新任务（剩余任务）\n");
+    // Only rules, the task list and source session paths; newest first.
+    // Agents may edit items in place (`- [id] text`, tasks
+    // `- [id] (status) text`); edits are folded back on the next tick.
+    let mut out = String::from("# HANDOFF\n\n## 规则\n");
+    render_items(&mut out, RULES_HEADING, &memory.preferences);
+    render_items(&mut out, MISTAKES_HEADING, &memory.mistakes);
+    out.push_str(&format!("\n\n## {TASKS_HEADING}\n"));
     for task in memory.tasks.iter().rev() {
         out.push_str(&format!(
             "\n- [{}] ({}) {}",
@@ -188,12 +339,8 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
             single_line(&task.text)
         ));
     }
-    out.push_str("\n\n## 当前状态\n\n");
-    out.push_str(memory.current_state.trim());
-    out.push('\n');
-    render_items(&mut out, "目标与计划", &memory.goals);
-    out.push_str("\n\n## 最近对话摘要\n");
-    for line in memory.recent.iter().rev() {
+    out.push_str("\n\n## 历史会话路径\n");
+    for line in memory.sources.iter().rev() {
         out.push_str(&format!("\n- {}", single_line(line)));
     }
     // `<!--` inside item text must never terminate the block early or shadow
@@ -205,8 +352,13 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
     out
 }
 
+const RULES_HEADING: &str = "公共原则/偏好规范";
+const MISTAKES_HEADING: &str = "错题集";
+const TASKS_HEADING: &str = "任务清单";
+const SOURCES_MAX: usize = 30;
+
 fn render_items(out: &mut String, heading: &str, items: &[RelayItem]) {
-    out.push_str(&format!("\n## {heading}\n"));
+    out.push_str(&format!("\n### {heading}\n"));
     for item in items.iter().rev() {
         out.push_str(&format!("\n- [{}] {}", item.id, single_line(&item.text)));
     }
@@ -401,6 +553,10 @@ fn enforce_budget(memory: &mut RelayMemory) {
             memory.recent.remove(0);
             continue;
         }
+        if memory.sources.len() > 5 {
+            memory.sources.remove(0);
+            continue;
+        }
         if let Some(index) = memory.tasks.iter().position(|task| task.status == "done") {
             memory.tasks.remove(index);
             continue;
@@ -516,6 +672,12 @@ fn compact_scope(
         // Merge base: structured memory from the relay-memory block, with a
         // legacy free-form document carried as context for migration.
         let (mut memory, legacy) = split_memory(&previous.handoff_md);
+        if let Ok(file_md) = fs::read_to_string(Path::new(worktree).join("HANDOFF.md"))
+            && file_md != previous.handoff_md
+        {
+            fold_file_edits(&mut memory, &file_md);
+        }
+        record_sources(&mut memory, &events);
         let prompt = compaction_prompt(&memory, &legacy, &events);
         let semantic_ops = summarizer
             .summarize(&prompt)
@@ -563,7 +725,7 @@ fn compaction_prompt(memory: &RelayMemory, legacy: &str, events: &[WorkEvent]) -
     let mut prompt = String::from(
         "You maintain one project relay memory shared across coding agents. Given the CURRENT structured memory (JSON), optional LEGACY context from an older free-form handoff, and NEW work events, return ONLY JSON of this exact shape:
 {\"goals\":[{\"op\":\"add|update|remove\",\"id\":\"g1\",\"text\":\"...\"}],\"preferences\":[{\"op\":\"add|update|remove\",\"id\":\"p1\",\"text\":\"...\"}],\"mistakes\":[{\"op\":\"add|update|remove\",\"id\":\"m1\",\"text\":\"what went wrong + correct approach\"}],\"tasks\":[{\"op\":\"add|update|remove\",\"id\":\"t1\",\"text\":\"...\",\"status\":\"todo|doing|done|blocked\"}],\"current_state\":\"short current state\",\"recent\":[\"provider: one-line summary\"]}
-Sections: 目标与计划=goals, 偏好与规范=preferences, 错题集=mistakes, 剩余任务=tasks. Rules: apply ONLY incremental ops; prefer update over remove and never remove a goal/preference/mistake unless the events clearly supersede it; reuse existing ids, new ids use the section prefix with an unused number; do not invent facts; omit sections with no change; \"recent\" lists ONLY new lines to append, each prefixed with its provider. In this input, line breaks are written as the two characters \\n; use plain single-line text inside list item fields.
+Sections that matter: 公共原则/偏好规范=preferences (durable principles, conventions, user preferences), 错题集=mistakes (what went wrong + the correct approach), 任务清单=tasks (latest remaining tasks with status). Continuously distill rules from the events. goals/current_state/recent are optional. Rules: apply ONLY incremental ops; prefer update over remove and never remove a goal/preference/mistake unless the events clearly supersede it; reuse existing ids, new ids use the section prefix with an unused number; do not invent facts; omit sections with no change; \"recent\" lists ONLY new lines to append, each prefixed with its provider. In this input, line breaks are written as the two characters \\n; use plain single-line text inside list item fields.
 
 Current memory JSON:
 ",
@@ -653,7 +815,25 @@ fn reconcile_handoff_files(store: &StateStore) -> Result<(), String> {
             // never produced a handoff.
             None => !state.handoff_md.trim().is_empty(),
         };
-        if needs_write && let Err(error) = write_handoff(worktree, &state.handoff_md) {
+        if !needs_write {
+            continue;
+        }
+        // An agent edited HANDOFF.md: fold its rules/tasks back into the
+        // stored memory instead of overwriting the edit.
+        let mut handoff = state.handoff_md.clone();
+        if let Ok(file_md) = fs::read_to_string(&target)
+            && let Some(mut memory) = parsed_memory(&state.handoff_md)
+            && fold_file_edits(&mut memory, &file_md)
+        {
+            handoff = render_handoff(&memory);
+            let mut updated = state.clone();
+            updated.handoff_md = handoff.clone();
+            if let Err(error) = store.put_work_state(&updated) {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        }
+        if let Err(error) = write_handoff(worktree, &handoff) {
             first_error.get_or_insert(error);
         }
     }
@@ -679,7 +859,13 @@ fn write_handoff(worktree: &Path, handoff: &str) -> Result<(), String> {
     }
     write_regular_file(&worktree.join("HANDOFF.md"), handoff, "HANDOFF.md")?;
     let mut created = vec!["HANDOFF.md"];
+    // Claude Code does not read AGENTS.md: only touch CLAUDE.md when it
+    // already exists or Claude Code worked in this folder.
+    let claude_used = handoff.lines().any(|line| line.starts_with("- claude "));
     for name in ["AGENTS.md", "CLAUDE.md"] {
+        if name == "CLAUDE.md" && !claude_used && !worktree.join(name).exists() {
+            continue;
+        }
         if ensure_handoff_block(&worktree.join(name))? {
             created.push(name);
         }
@@ -716,7 +902,7 @@ const AGENT_DOC_MAX_BYTES: u64 = 256 * 1024;
 
 fn handoff_block() -> String {
     format!(
-        "{HANDOFF_BLOCK_START}\n## Handoff (auto-maintained by herdr-mcp)\n\nBefore starting work in this folder, read `HANDOFF.md` first: it is the shared relay memory (preferences, mistakes to avoid, latest tasks, current state, goals, recent history) across all agents. It is regenerated automatically from session logs; do not edit it by hand. Only this marked block is managed by herdr-mcp.\n{HANDOFF_BLOCK_END}\n"
+        "{HANDOFF_BLOCK_START}\nRead `HANDOFF.md` (rules, task list, past session log paths; auto-maintained by herdr-mcp) before starting, and update it by editing its items in place (`- [id] text`, tasks `- [id] (status) text`) — your edits are merged automatically.\n{HANDOFF_BLOCK_END}\n"
     )
 }
 
@@ -1018,20 +1204,103 @@ mod audit_fix_tests {
             id: "p2".into(),
             text: "new pref".into(),
         });
+        memory.mistakes.push(RelayItem {
+            id: "m1".into(),
+            text: "tabs; use 4 spaces".into(),
+        });
+        memory.tasks.push(RelayTask {
+            id: "t1".into(),
+            text: "old task".into(),
+            status: "done".into(),
+        });
+        memory.tasks.push(RelayTask {
+            id: "t2".into(),
+            text: "new task".into(),
+            status: "todo".into(),
+        });
         memory.goals.push(RelayItem {
             id: "g1".into(),
-            text: "goal".into(),
+            text: "hidden goal".into(),
         });
-        memory.recent = vec!["pi: first".into(), "omp: second".into()];
+        memory.current_state = "hidden state".into();
+        memory.sources = vec![
+            "pi 2026-10-17 07:00 UTC /a.jsonl".into(),
+            "omp 2026-10-17 08:00 UTC /b.jsonl".into(),
+        ];
         let md = render_handoff(&memory);
-        let pos = |needle: &str| md.find(needle).unwrap();
-        assert!(pos("公共原则/偏好与规范") < pos("错题集"));
-        assert!(pos("错题集") < pos("最新任务"));
-        assert!(pos("最新任务") < pos("当前状态"));
-        assert!(pos("当前状态") < pos("目标与计划"));
-        assert!(pos("目标与计划") < pos("最近对话摘要"));
+        let body = &md[..md.find("<!--").unwrap()];
+        let pos = |needle: &str| body.find(needle).unwrap();
+        assert!(pos("## 规则") < pos("### 公共原则/偏好规范"));
+        assert!(pos("### 公共原则/偏好规范") < pos("### 错题集"));
+        assert!(pos("### 错题集") < pos("## 任务清单"));
+        assert!(pos("## 任务清单") < pos("## 历史会话路径"));
         assert!(pos("new pref") < pos("old pref"));
-        assert!(pos("omp: second") < pos("pi: first"));
+        assert!(pos("new task") < pos("old task"));
+        assert!(pos("/b.jsonl") < pos("/a.jsonl"));
+        assert!(!body.contains("hidden goal") && !body.contains("hidden state"));
+    }
+
+    #[test]
+    fn agent_edits_of_handoff_are_folded_back() {
+        let mut memory = RelayMemory::default();
+        memory.preferences.push(RelayItem {
+            id: "p1".into(),
+            text: "use tabs".into(),
+        });
+        memory.tasks.push(RelayTask {
+            id: "t1".into(),
+            text: "write add()".into(),
+            status: "doing".into(),
+        });
+        let edited = render_handoff(&memory)
+            .replace("- [p1] use tabs", "- [p1] use 4 spaces\n- never add deps")
+            .replace("- [t1] (doing) write add()", "- [t1] (done) write add()");
+        assert!(fold_file_edits(&mut memory, &edited));
+        let texts: Vec<_> = memory
+            .preferences
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect();
+        assert!(texts.contains(&"use 4 spaces") && texts.contains(&"never add deps"));
+        assert_eq!(
+            memory
+                .preferences
+                .iter()
+                .filter(|item| item.id == "p1")
+                .count(),
+            1
+        );
+        assert_eq!(memory.tasks[0].status, "done");
+        assert!(!fold_file_edits(&mut memory, "unrelated text"));
+    }
+
+    #[test]
+    fn sources_record_native_log_paths_newest_last_deduped() {
+        let mut memory = RelayMemory::default();
+        let event = |id: i64, src: &str| WorkEvent {
+            event_id: id,
+            ts: 1_792_220_000_000 + id,
+            project_ref: "p".into(),
+            worktree: "/w".into(),
+            provider: "pi".into(),
+            account: None,
+            kind: "user_prompt".into(),
+            summary: "x".into(),
+            source_ref: src.into(),
+        };
+        record_sources(
+            &mut memory,
+            &[
+                event(1, "native-log:/s/a.jsonl"),
+                event(2, "mcp:herdr_exec"),
+                event(3, "native-log:/s/b.jsonl"),
+                event(4, "native-log:/s/a.jsonl"),
+            ],
+        );
+        assert_eq!(memory.sources.len(), 2);
+        assert!(
+            memory.sources[1].ends_with(" /s/a.jsonl") && memory.sources[1].starts_with("pi 2026-")
+        );
     }
 
     #[test]
@@ -1120,9 +1389,9 @@ mod tests {
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(state.handoff_md.starts_with("# HANDOFF"));
-        assert!(state.handoff_md.contains("## 目标与计划"));
-        assert!(state.handoff_md.contains("- [g1] ship relay memory"));
-        assert!(state.handoff_md.contains("parser rework underway"));
+        assert!(state.handoff_md.contains("## 规则"));
+        assert!(state.handoff_md.contains("## 任务清单"));
+        assert!(state.handoff_md.contains("## 历史会话路径"));
         let memory = parsed_memory(&state.handoff_md).unwrap();
         assert_eq!(memory.goals.len(), 1);
         assert_eq!(memory.current_state, "parser rework underway");
@@ -1134,7 +1403,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(root.join(".git/info/exclude")).unwrap(),
-            "HANDOFF.md\nAGENTS.md\nCLAUDE.md\n"
+            "HANDOFF.md\nAGENTS.md\n"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1219,7 +1488,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(git_dir.join("info/exclude")).unwrap(),
-            "HANDOFF.md\nAGENTS.md\nCLAUDE.md\n"
+            "HANDOFF.md\nAGENTS.md\n"
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(git_dir).unwrap();
@@ -1525,6 +1794,7 @@ mod tests {
             }],
             current_state: "mid-implementation".to_owned(),
             recent: vec!["pi: started relay memory lane".to_owned()],
+            sources: Vec::new(),
         }
     }
 
@@ -1577,12 +1847,11 @@ mod tests {
         // The rendered document keeps the fixed section order and round-trips.
         let rendered = render_handoff(&memory);
         let order = [
-            "## 公共原则/偏好与规范",
-            "## 错题集",
-            "## 最新任务",
-            "## 当前状态",
-            "## 目标与计划",
-            "## 最近对话摘要",
+            "## 规则",
+            "### 公共原则/偏好规范",
+            "### 错题集",
+            "## 任务清单",
+            "## 历史会话路径",
         ]
         .iter()
         .map(|heading| rendered.find(heading).unwrap())
@@ -1648,7 +1917,7 @@ mod tests {
             text: format!("still open task keeps its text {}", "z".repeat(80)),
             status: "todo".to_owned(),
         });
-        memory.goals[0].text = "goal ".to_owned() + &"长".repeat(9_000);
+        memory.goals[0].text = "goal ".to_owned() + &"长".repeat(20_000);
         let base_len = render_handoff(&memory).chars().count();
         assert!(base_len > HANDOFF_MAX_CHARS * 2);
 
