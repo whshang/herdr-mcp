@@ -743,6 +743,31 @@ pane_id -> Codex thread/session
 
 不要为了 Issue #57 把 provider-specific `turn/steer` 塞进 Herdr core。
 
+2026-10-05 重新验收后，这个边界已经可以更精确地描述：
+
+- Codex app-server 的 provider primitive 本身可用。使用同版本、任务私有的
+  app-server 和显式 remote TUI，`thread/loaded/list` 能看到同一条 loaded
+  thread，`thread/read(includeTurns=true)` 能看到 `active` thread 与唯一
+  `inProgress` turn。
+- `turn/steer` 的 `expectedTurnId` 是有效 race fence。错误 turn id 会被
+  app-server 拒绝，原 active turn 保持不变；正确 turn id 返回同一个 turn，
+  UAT marker 随后出现在正在运行的 TUI turn 中，没有创建第二个 turn。
+- 当前阻塞点在 pane -> provider session/thread attribution。Codex shared
+  app-server daemon 会让 SessionStart hook 继承 daemon 的 Herdr pane/socket
+  环境，真实 TUI pane 可能没有 `agent_session`，或 session 被报告到 stale /
+  inherited pane。这个问题已由 Herdr upstream
+  `herdrdev/herdr#4814` 精确追踪；`herdrdev/herdr#4649` 也明确记录了 shared
+  daemon 下不能靠 cwd / timing 推断 pane ownership 的限制。
+- 因此当前 herdr-mcp 必须继续 fail closed：只有 pane 与 provider session/thread
+  的归属能被 Herdr / provider 精确证明时，才允许 provider-native steer。不得用
+  “同 cwd 最新 rollout”“唯一看起来 active 的 thread”或终端 Prompt 注入替代这个
+  身份证明。
+
+这意味着 Issue #57 的 browser transport、explicit target fencing、outcome
+contract 和 Codex provider primitive 都已验证；production true-steer 仍等待上游
+提供可靠的 per-pane provider session ownership。在上游条件满足前，
+`session_not_resolved` 是预期的安全结果。
+
 ### 12.3 race
 
 必须使用 `expectedTurnId`：
