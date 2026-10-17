@@ -185,17 +185,19 @@ enum FileOutcome {
 }
 
 /// Incrementally ingest supported native session logs below the current user's
-/// agent homes. This function only reads those logs and writes journal rows and
-/// cursors to `store`; scheduling belongs to the compaction lane.
+/// agent homes. `validated_roots` is the unified root surface (managed Git
+/// roots plus vcs-less operational roots); a vcs-less root scopes events to
+/// the folder itself. This function only reads those logs and writes journal
+/// rows and cursors to `store`; scheduling belongs to the compaction lane.
 pub(crate) fn ingest_native_logs(
     store: &StateStore,
-    managed_roots: &[PathBuf],
+    validated_roots: &[PathBuf],
     project_refs: &BTreeMap<PathBuf, String>,
     now_ms: i64,
 ) -> Result<usize, String> {
     ingest_from_dirs_with_refs(
         store,
-        managed_roots,
+        validated_roots,
         project_refs,
         now_ms,
         &LogDirs::discover(),
@@ -205,23 +207,23 @@ pub(crate) fn ingest_native_logs(
 #[cfg(test)]
 fn ingest_from_dirs(
     store: &StateStore,
-    managed_roots: &[PathBuf],
+    validated_roots: &[PathBuf],
     now_ms: i64,
     dirs: &LogDirs,
 ) -> Result<usize, String> {
-    ingest_from_dirs_with_refs(store, managed_roots, &BTreeMap::new(), now_ms, dirs)
+    ingest_from_dirs_with_refs(store, validated_roots, &BTreeMap::new(), now_ms, dirs)
 }
 
-/// `project_refs` maps a managed root to the same project_ref the tool_call
+/// `project_refs` maps a validated root to the same project_ref the tool_call
 /// capture uses, so native-log events and MCP events share one work_state row.
 fn ingest_from_dirs_with_refs(
     store: &StateStore,
-    managed_roots: &[PathBuf],
+    validated_roots: &[PathBuf],
     project_refs: &BTreeMap<PathBuf, String>,
     now_ms: i64,
     dirs: &LogDirs,
 ) -> Result<usize, String> {
-    let scopes = scopes(managed_roots, project_refs);
+    let scopes = scopes(validated_roots, project_refs);
     if scopes.is_empty() {
         return Ok(0);
     }

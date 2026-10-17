@@ -2,15 +2,28 @@ use crate::semantic::{SemanticChatMessage, SemanticChatOptions, SemanticService}
 use crate::state_cache::EventCache;
 use crate::state_store::StateStore;
 use crate::state_store::work_journal::{WorkEvent, WorkState, clip_chars};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const HANDOFF_MAX_CHARS: usize = 16_000;
-const FALLBACK_EVENT_LIMIT: usize = 20;
+/// Rendered-document budget (~4k tokens), including the embedded structured
+/// memory block.
+const HANDOFF_MAX_CHARS: usize = 12_000;
+/// Rolling recent-log bound, newest last.
+const RECENT_MAX_LINES: usize = 15;
+const CURRENT_STATE_MAX_CHARS: usize = 1_000;
+const EVENT_RECENT_MAX_CHARS: usize = 200;
+/// Item texts are only ever clipped, never dropped; this is the smallest
+/// clipping floor before budget enforcement gives up growing the document.
+const ITEM_TEXT_FLOOR: usize = 40;
+/// Trailing structured-memory block: everything after it is machine state,
+/// so the markdown above stays free to render for humans/agents.
+const MEMORY_OPEN: &str = "<!-- relay-memory: ";
+const MEMORY_CLOSE: &str = "-->";
 /// New events folded into the handoff per compaction batch.
 const EVENT_BATCH_SIZE: usize = 100;
 /// Bounded batches per scope per tick; larger backlogs resume on later ticks.
@@ -43,9 +56,407 @@ impl WorkSummarizer for SemanticService {
     }
 }
 
-#[derive(Deserialize)]
-struct HandoffResponse {
-    handoff_md: String,
+/// The structured relay memory: one shared per-project state that any agent
+/// entry point (tool capture, native-log tailer, MCP pickup) reads/writes.
+/// Long-lived sections hold id-keyed items so LLM edits apply as incremental
+/// merge ops and a rewrite can never silently wipe them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RelayMemory {
+    /// ## 目标与计划
+    #[serde(default)]
+    pub goals: Vec<RelayItem>,
+    /// ## 偏好与规范
+    #[serde(default)]
+    pub preferences: Vec<RelayItem>,
+    /// ## 错题集 (what went wrong + the correct approach)
+    #[serde(default)]
+    pub mistakes: Vec<RelayItem>,
+    /// ## 剩余任务
+    #[serde(default)]
+    pub tasks: Vec<RelayTask>,
+    /// ## 当前状态
+    #[serde(default)]
+    pub current_state: String,
+    /// ## 最近对话摘要 (each line prefixed with the provider, newest last)
+    #[serde(default)]
+    pub recent: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RelayItem {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RelayTask {
+    pub id: String,
+    pub text: String,
+    #[serde(default = "task_status_todo")]
+    pub status: String,
+}
+
+fn task_status_todo() -> String {
+    "todo".to_owned()
+}
+
+const TASK_STATUSES: [&str; 4] = ["todo", "doing", "done", "blocked"];
+
+/// Incremental ops the summarizer returns. Only these apply; the previous
+/// memory is the merge base, so an LLM rewrite cannot wipe sections.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct HandoffOps {
+    goals: Vec<ItemOp>,
+    preferences: Vec<ItemOp>,
+    mistakes: Vec<ItemOp>,
+    tasks: Vec<TaskOp>,
+    current_state: Option<String>,
+    recent: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemOp {
+    op: String,
+    id: Option<String>,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskOp {
+    op: String,
+    id: Option<String>,
+    text: Option<String>,
+    status: Option<String>,
+}
+
+/// The structured memory from a stored handoff, or `None` for a legacy
+/// free-form document (no decodable relay-memory block).
+pub(crate) fn parsed_memory(handoff_md: &str) -> Option<RelayMemory> {
+    let body = handoff_md.trim_end().strip_suffix(MEMORY_CLOSE)?;
+    let start = body.rfind(MEMORY_OPEN)?;
+    serde_json::from_str::<RelayMemory>(&body[start + MEMORY_OPEN.len()..]).ok()
+}
+
+/// Split a stored handoff into its structured memory and legacy context.
+/// When the trailing relay-memory block decodes, the rendered markdown above
+/// it is derived state, not context, so legacy is empty. Without a block the
+/// whole document is legacy free-form context awaiting migration.
+fn split_memory(handoff_md: &str) -> (RelayMemory, String) {
+    match parsed_memory(handoff_md) {
+        Some(memory) => (memory, String::new()),
+        None => (RelayMemory::default(), handoff_md.trim().to_owned()),
+    }
+}
+
+/// Whitespace-collapse a value onto one line for list rendering.
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Render the fixed-section handoff document plus the trailing structured
+/// block. Section order is contractual (entry-agnostic readers rely on it).
+pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
+    let mut out = String::from("# HANDOFF\n");
+    render_items(&mut out, "目标与计划", &memory.goals);
+    render_items(&mut out, "偏好与规范", &memory.preferences);
+    render_items(&mut out, "错题集", &memory.mistakes);
+    out.push_str("\n## 剩余任务\n");
+    for task in &memory.tasks {
+        out.push_str(&format!(
+            "\n- [{}] ({}) {}",
+            task.id,
+            task.status,
+            single_line(&task.text)
+        ));
+    }
+    out.push_str("\n\n## 当前状态\n\n");
+    out.push_str(memory.current_state.trim());
+    out.push_str("\n\n## 最近对话摘要\n");
+    for line in &memory.recent {
+        out.push_str(&format!("\n- {}", single_line(line)));
+    }
+    // `<!--` inside item text must never terminate the block early or shadow
+    // the outer open marker; \u0021 decodes back to `!` in valid JSON.
+    let json = serde_json::to_string(memory)
+        .unwrap_or_else(|_| "{}".to_owned())
+        .replace("<!--", "<\\u0021--");
+    out.push_str(&format!("\n\n{MEMORY_OPEN}{json}{MEMORY_CLOSE}\n"));
+    out
+}
+
+fn render_items(out: &mut String, heading: &str, items: &[RelayItem]) {
+    out.push_str(&format!("\n## {heading}\n"));
+    for item in items {
+        out.push_str(&format!("\n- [{}] {}", item.id, single_line(&item.text)));
+    }
+}
+
+fn next_id(items: &[RelayItem], prefix: &str) -> String {
+    let max = items
+        .iter()
+        .filter_map(|item| {
+            item.id
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.parse::<u64>().ok())
+        })
+        .max()
+        .unwrap_or(0);
+    format!("{prefix}{}", max + 1)
+}
+
+fn apply_item_ops(items: &mut Vec<RelayItem>, ops: Vec<ItemOp>, prefix: &str) {
+    for op in ops {
+        match op.op.as_str() {
+            "remove" => {
+                if let Some(id) = op.id.as_deref() {
+                    items.retain(|item| item.id != id);
+                }
+            }
+            "add" | "update" => {
+                let Some(text) = op
+                    .text
+                    .map(|text| text.trim().to_owned())
+                    .filter(|text| !text.is_empty())
+                else {
+                    continue;
+                };
+                match op
+                    .id
+                    .map(|id| id.trim().to_owned())
+                    .filter(|id| !id.is_empty())
+                {
+                    Some(id) => {
+                        if let Some(existing) = items.iter_mut().find(|item| item.id == id) {
+                            existing.text = text;
+                        } else {
+                            items.push(RelayItem { id, text });
+                        }
+                    }
+                    None => {
+                        let id = next_id(items, prefix);
+                        items.push(RelayItem { id, text });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_task_ops(tasks: &mut Vec<RelayTask>, ops: Vec<TaskOp>) {
+    for op in ops {
+        let id = op
+            .id
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty());
+        match op.op.as_str() {
+            "remove" => {
+                if let Some(id) = id {
+                    tasks.retain(|task| task.id != id);
+                }
+            }
+            "add" | "update" => {
+                let text = op
+                    .text
+                    .map(|text| text.trim().to_owned())
+                    .filter(|text| !text.is_empty());
+                let status = op
+                    .status
+                    .map(|status| status.trim().to_owned())
+                    .filter(|status| TASK_STATUSES.contains(&status.as_str()));
+                match id {
+                    Some(id) if tasks.iter().any(|task| task.id == id) => {
+                        let existing = tasks
+                            .iter_mut()
+                            .find(|task| task.id == id)
+                            .expect("checked");
+                        if let Some(text) = text {
+                            existing.text = text;
+                        }
+                        if let Some(status) = status {
+                            existing.status = status;
+                        }
+                    }
+                    _ => {
+                        let Some(text) = text else { continue };
+                        let id = id.unwrap_or_else(|| {
+                            next_id(
+                                &tasks
+                                    .iter()
+                                    .map(|task| RelayItem {
+                                        id: task.id.clone(),
+                                        text: String::new(),
+                                    })
+                                    .collect::<Vec<_>>(),
+                                "t",
+                            )
+                        });
+                        tasks.push(RelayTask {
+                            id,
+                            text,
+                            status: status.unwrap_or_else(task_status_todo),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Merge a valid semantic response into the memory. Sections the response
+/// does not mention keep their previous items by construction.
+fn apply_memory_ops(memory: &mut RelayMemory, ops: HandoffOps) {
+    apply_item_ops(&mut memory.goals, ops.goals, "g");
+    apply_item_ops(&mut memory.preferences, ops.preferences, "p");
+    apply_item_ops(&mut memory.mistakes, ops.mistakes, "m");
+    apply_task_ops(&mut memory.tasks, ops.tasks);
+    if let Some(state) = ops
+        .current_state
+        .map(|state| state.trim().to_owned())
+        .filter(|state| !state.is_empty())
+    {
+        memory.current_state = clip_chars(&state, CURRENT_STATE_MAX_CHARS);
+    }
+    for line in ops.recent {
+        let line = clip_chars(&single_line(&line), EVENT_RECENT_MAX_CHARS);
+        if !line.is_empty() {
+            memory.recent.push(line);
+        }
+    }
+    memory.recent = memory
+        .recent
+        .split_off(memory.recent.len().saturating_sub(RECENT_MAX_LINES));
+}
+
+/// One bounded, provider-prefixed rolling-log line for the fallback path.
+fn recent_line(event: &WorkEvent) -> String {
+    clip_chars(
+        &format!(
+            "{}: [{}] {}",
+            single_line(&event.provider),
+            event.kind,
+            single_line(&event.summary)
+        ),
+        EVENT_RECENT_MAX_CHARS,
+    )
+}
+
+/// Rule fallback (LLM failure/invalid JSON): long-lived sections and tasks
+/// stay byte-identical; only the rolling log and 当前状态 advance. Legacy
+/// free-form handoffs migrate into 当前状态 here.
+fn apply_fallback(memory: &mut RelayMemory, legacy: &str, events: &[WorkEvent]) {
+    for event in events {
+        memory.recent.push(recent_line(event));
+    }
+    memory.recent = memory
+        .recent
+        .split_off(memory.recent.len().saturating_sub(RECENT_MAX_LINES));
+    if !legacy.trim().is_empty() {
+        memory.current_state = clip_chars(legacy.trim(), CURRENT_STATE_MAX_CHARS);
+    } else if let Some(last) = events.last() {
+        let line = recent_line(last);
+        let previous = memory.current_state.trim();
+        memory.current_state = clip_chars(
+            &if previous.is_empty() {
+                line
+            } else {
+                format!("{line}\n{previous}")
+            },
+            CURRENT_STATE_MAX_CHARS,
+        );
+    }
+}
+
+/// Enforce the rendered budget: trim the rolling log first, then the oldest
+/// done tasks. Goals/preferences/mistakes are never dropped silently — their
+/// (and open tasks') text is clipped when everything else is exhausted.
+fn enforce_budget(memory: &mut RelayMemory) {
+    for _ in 0..200 {
+        if render_handoff(memory).chars().count() <= HANDOFF_MAX_CHARS {
+            return;
+        }
+        if !memory.recent.is_empty() {
+            memory.recent.remove(0);
+            continue;
+        }
+        if let Some(index) = memory.tasks.iter().position(|task| task.status == "done") {
+            memory.tasks.remove(index);
+            continue;
+        }
+        if !clip_longest_text(memory) {
+            return;
+        }
+    }
+}
+
+/// Halve the longest long-lived item text (floor-bounded) or the current
+/// state. Returns false when nothing over the floor remains to clip.
+fn clip_longest_text(memory: &mut RelayMemory) -> bool {
+    let mut best: Option<(u8, usize, usize)> = None;
+    let consider = |best: &mut Option<(u8, usize, usize)>, which, index, len: usize| {
+        if len > ITEM_TEXT_FLOOR && best.is_none_or(|(_, _, current)| len > current) {
+            *best = Some((which, index, len));
+        }
+    };
+    for (which, items) in [
+        (0_u8, &memory.goals),
+        (1, &memory.preferences),
+        (2, &memory.mistakes),
+    ] {
+        for (index, item) in items.iter().enumerate() {
+            consider(&mut best, which, index, item.text.chars().count());
+        }
+    }
+    for (index, task) in memory.tasks.iter().enumerate() {
+        consider(&mut best, 3, index, task.text.chars().count());
+    }
+    let state_len = memory.current_state.chars().count();
+    if state_len > 80 && best.is_none_or(|(_, _, current)| state_len > current) {
+        best = Some((4, 0, state_len));
+    }
+    let Some((which, index, len)) = best else {
+        return false;
+    };
+    let target = ITEM_TEXT_FLOOR.max(len / 2);
+    let text = match which {
+        0 => &mut memory.goals[index].text,
+        1 => &mut memory.preferences[index].text,
+        2 => &mut memory.mistakes[index].text,
+        3 => &mut memory.tasks[index].text,
+        _ => &mut memory.current_state,
+    };
+    *text = clip_chars(text, target);
+    true
+}
+
+/// Which agent-instruction files in `root` mention HANDOFF.md. `true` =
+/// exists and mentions it, `false` = exists without a mention (listed in
+/// `missing` so callers can tell the user), `null` = absent/unreadable. We
+/// never edit these files.
+pub(crate) fn handoff_reference(root: &Path) -> Value {
+    let mentions = |name: &str| -> Value {
+        let path = root.join(name);
+        let regular = fs::symlink_metadata(&path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file());
+        if !regular {
+            return Value::Null;
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => Value::Bool(content.contains("HANDOFF.md")),
+            Err(_) => Value::Null,
+        }
+    };
+    let agents_md = mentions("AGENTS.md");
+    let claude_md = mentions("CLAUDE.md");
+    let missing = [("AGENTS.md", &agents_md), ("CLAUDE.md", &claude_md)]
+        .into_iter()
+        .filter(|(_, value)| **value == Value::Bool(false))
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    json!({"agents_md": agents_md, "claude_md": claude_md, "missing": missing})
 }
 
 pub(crate) fn compact_tick(
@@ -110,17 +521,20 @@ fn compact_scope(
         };
         let done = events.len() < EVENT_BATCH_SIZE;
 
-        let prompt = compaction_prompt(&previous.handoff_md, &events);
-        let semantic_handoff = summarizer
+        // Merge base: structured memory from the relay-memory block, with a
+        // legacy free-form document carried as context for migration.
+        let (mut memory, legacy) = split_memory(&previous.handoff_md);
+        let prompt = compaction_prompt(&memory, &legacy, &events);
+        let semantic_ops = summarizer
             .summarize(&prompt)
             .ok()
-            .and_then(|content| serde_json::from_str::<HandoffResponse>(&content).ok())
-            .map(|response| response.handoff_md)
-            .filter(|handoff| !handoff.trim().is_empty());
-        let handoff_md = match semantic_handoff {
-            Some(handoff) => clip_chars(handoff.trim(), HANDOFF_MAX_CHARS),
-            None => fallback_handoff(&previous.handoff_md, &events),
-        };
+            .and_then(|content| serde_json::from_str::<HandoffOps>(&content).ok());
+        match semantic_ops {
+            Some(ops) => apply_memory_ops(&mut memory, ops),
+            None => apply_fallback(&mut memory, &legacy, &events),
+        }
+        enforce_budget(&mut memory);
+        let handoff_md = render_handoff(&memory);
 
         store.put_work_state(&WorkState {
             project_ref: project_ref.to_owned(),
@@ -144,11 +558,19 @@ fn compact_scope(
     Ok(())
 }
 
-fn compaction_prompt(previous: &str, events: &[WorkEvent]) -> String {
+fn compaction_prompt(memory: &RelayMemory, legacy: &str, events: &[WorkEvent]) -> String {
+    let memory_json = serde_json::to_string(memory).unwrap_or_else(|_| "{}".to_owned());
     let mut prompt = String::from(
-        "Rewrite a concise engineering handoff from the previous handoff and new work events. Preserve decisions, current state, blockers, and next actions. Do not invent facts. Return only JSON shaped {\"handoff_md\":\"...\"}. Keep handoff_md under 16000 characters. In this input, line breaks are written as the two characters \\n; use real newlines in handoff_md.\n\nPrevious handoff:\n",
+        "You maintain one project relay memory shared across coding agents. Given the CURRENT structured memory (JSON), optional LEGACY context from an older free-form handoff, and NEW work events, return ONLY JSON of this exact shape:
+{\"goals\":[{\"op\":\"add|update|remove\",\"id\":\"g1\",\"text\":\"...\"}],\"preferences\":[{\"op\":\"add|update|remove\",\"id\":\"p1\",\"text\":\"...\"}],\"mistakes\":[{\"op\":\"add|update|remove\",\"id\":\"m1\",\"text\":\"what went wrong + correct approach\"}],\"tasks\":[{\"op\":\"add|update|remove\",\"id\":\"t1\",\"text\":\"...\",\"status\":\"todo|doing|done|blocked\"}],\"current_state\":\"short current state\",\"recent\":[\"provider: one-line summary\"]}
+Sections: 目标与计划=goals, 偏好与规范=preferences, 错题集=mistakes, 剩余任务=tasks. Rules: apply ONLY incremental ops; prefer update over remove and never remove a goal/preference/mistake unless the events clearly supersede it; reuse existing ids, new ids use the section prefix with an unused number; do not invent facts; omit sections with no change; \"recent\" lists ONLY new lines to append, each prefixed with its provider. In this input, line breaks are written as the two characters \\n; use plain single-line text inside list item fields.
+
+Current memory JSON:
+",
     );
-    prompt.push_str(&clip_chars(previous, HANDOFF_MAX_CHARS));
+    prompt.push_str(&clip_chars(&memory_json, HANDOFF_MAX_CHARS));
+    prompt.push_str("\n\nLegacy context (may be empty):\n");
+    prompt.push_str(&clip_chars(legacy, HANDOFF_MAX_CHARS / 2));
     prompt.push_str("\n\nNew events:\n");
     for event in events {
         prompt.push_str(&format_event(event));
@@ -188,18 +610,6 @@ fn clip_utf8_bytes(text: &str, max_bytes: usize) -> String {
     let mut out = text[..end].to_owned();
     out.push('…');
     out
-}
-
-fn fallback_handoff(previous: &str, events: &[WorkEvent]) -> String {
-    let mut handoff = clip_chars(previous.trim(), HANDOFF_MAX_CHARS / 2);
-    if !handoff.is_empty() {
-        handoff.push_str("\n\n");
-    }
-    handoff.push_str("## Recent work events\n");
-    for event in events.iter().rev().take(FALLBACK_EVENT_LIMIT).rev() {
-        handoff.push_str(&format_event(event));
-    }
-    clip_chars(&handoff, HANDOFF_MAX_CHARS)
 }
 
 fn format_event(event: &WorkEvent) -> String {
@@ -384,7 +794,12 @@ pub(crate) fn start_background(store: &StateStore, cache: Arc<EventCache>) {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     let store = StateStore::open(path)?;
                     let snapshot = cache.snapshot();
-                    let roots = crate::fs_security::managed_roots(&snapshot);
+                    // Relay memory scope = the unified validated-root surface:
+                    // managed Git roots plus vcs-less operational roots proven
+                    // by the live topology. Project key = the git root when
+                    // any, else the operational folder itself.
+                    let topology = crate::projects::derive_routing(&snapshot);
+                    let roots = crate::fs_security::validated_roots_from(&topology);
                     let refs = roots
                         .iter()
                         .map(|root| {
@@ -467,7 +882,7 @@ mod tests {
             .put_work_state(&WorkState {
                 project_ref: "proj".to_owned(),
                 worktree: root.to_string_lossy().into_owned(),
-                handoff_md: "old".to_owned(),
+                handoff_md: "legacy old handoff".to_owned(),
                 through_event_id: 0,
                 log_cursors_json: r#"{"pi":7}"#.to_owned(),
                 updated_at: 1,
@@ -477,7 +892,9 @@ mod tests {
         let calls = AtomicUsize::new(0);
         compact_tick(
             &store,
-            &FakeSummarizer(Ok(r##"{"handoff_md":"# New handoff"}"##)),
+            &FakeSummarizer(Ok(
+                r#"{"goals":[{"op":"add","id":"g1","text":"ship relay memory"}],"current_state":"parser rework underway","recent":["test: [edit] changed parser"]}"#,
+            )),
             &|_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(0)
@@ -490,11 +907,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(state.handoff_md, "# New handoff");
+        assert!(state.handoff_md.starts_with("# HANDOFF"));
+        assert!(state.handoff_md.contains("## 目标与计划"));
+        assert!(state.handoff_md.contains("- [g1] ship relay memory"));
+        assert!(state.handoff_md.contains("parser rework underway"));
+        let memory = parsed_memory(&state.handoff_md).unwrap();
+        assert_eq!(memory.goals.len(), 1);
+        assert_eq!(memory.current_state, "parser rework underway");
+        assert_eq!(memory.recent, vec!["test: [edit] changed parser"]);
         assert_eq!(state.log_cursors_json, r#"{"pi":7}"#);
         assert_eq!(
             fs::read_to_string(root.join("HANDOFF.md")).unwrap(),
-            "# New handoff"
+            state.handoff_md
         );
         assert_eq!(
             fs::read_to_string(root.join(".git/info/exclude")).unwrap(),
@@ -527,9 +951,19 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .handoff_md;
-            assert!(handoff.contains("# Previous"));
-            assert!(handoff.contains("observable change"));
+            // The legacy free-form handoff migrates into 当前状态.
+            assert!(handoff.contains("# Previous"), "{handoff}");
+            assert!(handoff.contains("observable change"), "{handoff}");
+            assert!(handoff.contains(MEMORY_OPEN), "{handoff}");
             assert!(handoff.chars().count() <= HANDOFF_MAX_CHARS);
+            let memory = parsed_memory(&handoff).unwrap();
+            assert!(memory.current_state.contains("# Previous"));
+            assert!(
+                memory
+                    .recent
+                    .iter()
+                    .any(|line| line.contains("observable change"))
+            );
             fs::remove_dir_all(root).unwrap();
         }
     }
@@ -636,7 +1070,7 @@ mod tests {
     impl WorkSummarizer for RecordingSummarizer {
         fn summarize(&self, prompt: &str) -> Result<String, String> {
             self.prompts.lock().unwrap().push(prompt.to_owned());
-            Ok(r##"{"handoff_md":"# compacted"}"##.to_owned())
+            Ok(r#"{"current_state":"compacted","recent":["test: folded batch"]}"#.to_owned())
         }
     }
 
@@ -836,7 +1270,7 @@ mod tests {
                 source_ref: format!("test:{index}"),
             })
             .collect();
-        let prompt = compaction_prompt(&cjk_previous, &events);
+        let prompt = compaction_prompt(&RelayMemory::default(), &cjk_previous, &events);
         assert!(prompt.len() <= SEMANTIC_PROMPT_MAX_BYTES);
         assert!(prompt.ends_with('…'));
 
@@ -845,7 +1279,7 @@ mod tests {
                 .chars()
                 .any(|ch| (ch as u32) < 0x20 || ch == '\u{7f}')
         );
-        let edged = compaction_prompt("a\nb\tc\u{1}", &[]);
+        let edged = compaction_prompt(&RelayMemory::default(), "a\nb\tc\u{1}", &[]);
         assert!(edged.contains("a\\nb\\tc "));
         assert!(!edged.chars().any(|ch| (ch as u32) < 0x20 || ch == '\u{7f}'));
 
@@ -856,5 +1290,264 @@ mod tests {
         let boundary = clip_utf8_bytes(&"汉".repeat(10), '…'.len_utf8() + 7);
         assert!(boundary.len() <= '…'.len_utf8() + 7);
         assert!((boundary.len() - '…'.len_utf8()).is_multiple_of('汉'.len_utf8()));
+    }
+
+    fn memory_with_sections() -> RelayMemory {
+        RelayMemory {
+            goals: vec![RelayItem {
+                id: "g1".to_owned(),
+                text: "ship unified relay memory".to_owned(),
+            }],
+            preferences: vec![RelayItem {
+                id: "p1".to_owned(),
+                text: "run the cargo gate before reporting green".to_owned(),
+            }],
+            mistakes: vec![RelayItem {
+                id: "m1".to_owned(),
+                text: "edited an applied migration once; never again".to_owned(),
+            }],
+            tasks: vec![RelayTask {
+                id: "t1".to_owned(),
+                text: "wire work.pickup".to_owned(),
+                status: "doing".to_owned(),
+            }],
+            current_state: "mid-implementation".to_owned(),
+            recent: vec!["pi: started relay memory lane".to_owned()],
+        }
+    }
+
+    /// relay memory merge | Given long-lived sections and a semantic rewrite
+    /// that touches nothing else | When ops apply | Then goals/preferences/
+    /// mistakes survive and only the requested fields change.
+    #[test]
+    fn merge_ops_never_wipe_long_lived_sections_on_rewrite() {
+        let mut memory = memory_with_sections();
+        let ops: HandoffOps = serde_json::from_str(
+            r#"{"goals":[{"op":"add","id":"g2","text":"land pickup resolution"}],"tasks":[{"op":"update","id":"t1","status":"done"},{"op":"add","text":"write tests"}],"current_state":"compacting","recent":["claude: folded new events"]}"#,
+        )
+        .unwrap();
+        apply_memory_ops(&mut memory, ops);
+        assert_eq!(memory.goals.len(), 2);
+        assert_eq!(
+            memory.preferences[0].text,
+            "run the cargo gate before reporting green"
+        );
+        assert_eq!(
+            memory.mistakes[0].text,
+            "edited an applied migration once; never again"
+        );
+        assert_eq!(memory.tasks[0].status, "done");
+        assert_eq!(memory.tasks[1].id, "t2");
+        assert_eq!(memory.tasks[1].status, "todo");
+        assert_eq!(memory.current_state, "compacting");
+        assert_eq!(memory.recent.len(), 2);
+
+        // An empty/sectionless response (a "rewrite" that mentions nothing)
+        // leaves every long-lived section intact.
+        let noop: HandoffOps = serde_json::from_str(r#"{"recent":["codex: heartbeat"]}"#).unwrap();
+        apply_memory_ops(&mut memory, noop);
+        assert_eq!(memory.goals.len(), 2);
+        assert_eq!(memory.preferences.len(), 1);
+        assert_eq!(memory.mistakes.len(), 1);
+        assert_eq!(memory.tasks.len(), 2);
+        assert_eq!(memory.recent.len(), 3);
+
+        // Removal requires an explicit id op; unknown ops are ignored.
+        let remove: HandoffOps = serde_json::from_str(
+            r#"{"goals":[{"op":"remove","id":"g1"}],"mistakes":[{"op":"clear"}]}"#,
+        )
+        .unwrap();
+        apply_memory_ops(&mut memory, remove);
+        assert_eq!(memory.goals.len(), 1);
+        assert_eq!(memory.goals[0].id, "g2");
+        assert_eq!(memory.mistakes.len(), 1);
+
+        // The rendered document keeps the fixed section order and round-trips.
+        let rendered = render_handoff(&memory);
+        let order = [
+            "## 目标与计划",
+            "## 偏好与规范",
+            "## 错题集",
+            "## 剩余任务",
+            "## 当前状态",
+            "## 最近对话摘要",
+        ]
+        .iter()
+        .map(|heading| rendered.find(heading).unwrap())
+        .collect::<Vec<_>>();
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{rendered}");
+        let parsed = parsed_memory(&rendered).unwrap();
+        assert_eq!(parsed, memory);
+    }
+
+    /// relay memory fallback | Given a provider failure | When the rule
+    /// fallback runs | Then long-lived sections stay byte-identical and new
+    /// events append to the bounded rolling log.
+    #[test]
+    fn fallback_keeps_sections_and_appends_recent_bounded() {
+        let mut memory = memory_with_sections();
+        memory.recent = (0..RECENT_MAX_LINES)
+            .map(|index| format!("pi: old line {index}"))
+            .collect();
+        let before = memory.clone();
+        let events: Vec<WorkEvent> = (0..5)
+            .map(|index| WorkEvent {
+                event_id: index as i64 + 1,
+                ts: index as i64,
+                project_ref: "proj".to_owned(),
+                worktree: "/repo".to_owned(),
+                provider: "codex".to_owned(),
+                account: None,
+                kind: "edit".to_owned(),
+                summary: format!("change {index}"),
+                source_ref: format!("test:{index}"),
+            })
+            .collect();
+        apply_fallback(&mut memory, "", &events);
+        assert_eq!(memory.goals, before.goals);
+        assert_eq!(memory.preferences, before.preferences);
+        assert_eq!(memory.mistakes, before.mistakes);
+        assert_eq!(memory.tasks, before.tasks);
+        assert_eq!(memory.recent.len(), RECENT_MAX_LINES);
+        assert_eq!(memory.recent.last().unwrap(), "codex: [edit] change 4");
+        assert!(!memory.recent.iter().any(|line| line == "pi: old line 0"));
+        assert!(memory.current_state.contains("codex: [edit] change 4"));
+        assert!(memory.current_state.contains("mid-implementation"));
+    }
+
+    /// relay memory budget | Given an over-budget memory | When enforce_budget
+    /// runs | Then recent lines go first, done tasks second, goals/preferences/
+    /// mistakes are clipped but never dropped.
+    #[test]
+    fn budget_trims_recent_then_done_tasks_and_never_drops_long_lived_items() {
+        let mut memory = memory_with_sections();
+        memory.recent = (0..40)
+            .map(|index| format!("pi: {}", "x".repeat(60) + &index.to_string()))
+            .collect();
+        memory.tasks = (0..30)
+            .map(|index| RelayTask {
+                id: format!("t{index}"),
+                text: "done work ".to_owned() + &"y".repeat(40),
+                status: "done".to_owned(),
+            })
+            .collect();
+        memory.tasks.push(RelayTask {
+            id: "tx".to_owned(),
+            text: format!("still open task keeps its text {}", "z".repeat(80)),
+            status: "todo".to_owned(),
+        });
+        memory.goals[0].text = "goal ".to_owned() + &"长".repeat(9_000);
+        let base_len = render_handoff(&memory).chars().count();
+        assert!(base_len > HANDOFF_MAX_CHARS * 2);
+
+        enforce_budget(&mut memory);
+        let rendered = render_handoff(&memory);
+        assert!(
+            rendered.chars().count() <= HANDOFF_MAX_CHARS,
+            "rendered {} chars",
+            rendered.chars().count()
+        );
+        // Recent trimmed first, then the done tasks; open task remains.
+        assert!(memory.recent.len() < RECENT_MAX_LINES);
+        assert!(memory.tasks.iter().all(|task| task.status != "done"));
+        assert_eq!(memory.tasks.len(), 1);
+        // Long-lived sections survive with clipped (not dropped) text.
+        assert_eq!(memory.goals.len(), 1);
+        assert!(!memory.goals[0].text.is_empty());
+        assert_eq!(
+            memory.preferences[0].text,
+            "run the cargo gate before reporting green"
+        );
+        assert_eq!(memory.mistakes.len(), 1);
+        assert!(parsed_memory(&rendered).is_some());
+    }
+
+    /// relay memory legacy migration | Given a legacy free-form handoff |
+    /// When the semantic path runs | Then the legacy text is offered as
+    /// context and the structured memory block is established.
+    #[test]
+    fn legacy_free_form_handoff_migrates_into_structured_memory() {
+        let legacy = "# Free form\nOld notes: migrating parser, blocked on review";
+        let (memory, context) = split_memory(&format!("{legacy}\n"));
+        assert!(memory.goals.is_empty());
+        assert_eq!(context, legacy);
+
+        // Round-trip: a rendered document splits back into memory, no legacy.
+        let rendered = render_handoff(&memory_with_sections());
+        assert!(rendered.contains(MEMORY_OPEN));
+        let (round_trip, context) = split_memory(&rendered);
+        assert_eq!(round_trip, memory_with_sections());
+        assert_eq!(context, "");
+        // An open marker inside item text cannot shadow the real block.
+        let mut hostile = memory_with_sections();
+        hostile.goals[0].text = "notes <!-- relay-memory: {\"goals\":[]}".to_owned();
+        let rendered = render_handoff(&hostile);
+        assert_eq!(split_memory(&rendered).0, hostile);
+
+        // Fallback migration: legacy lands in 当前状态.
+        let mut memory = RelayMemory::default();
+        apply_fallback(
+            &mut memory,
+            legacy,
+            &[WorkEvent {
+                event_id: 1,
+                ts: 1,
+                project_ref: "proj".to_owned(),
+                worktree: "/repo".to_owned(),
+                provider: "pi".to_owned(),
+                account: None,
+                kind: "edit".to_owned(),
+                summary: "touched parser".to_owned(),
+                source_ref: "test:1".to_owned(),
+            }],
+        );
+        assert!(memory.current_state.contains("Old notes"));
+        assert_eq!(memory.recent, vec!["pi: [edit] touched parser"]);
+
+        // Semantic migration: the prompt carries the legacy context.
+        let root = temp_dir("legacy");
+        let store = StateStore::open(":memory:").unwrap();
+        store
+            .put_work_state(&WorkState {
+                project_ref: "proj".to_owned(),
+                worktree: root.to_string_lossy().into_owned(),
+                handoff_md: legacy.to_owned(),
+                ..WorkState::default()
+            })
+            .unwrap();
+        append(&store, &root, "new event", 2);
+        let summarizer = RecordingSummarizer {
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        compact_tick(&store, &summarizer, &|_| Ok(0), 10).unwrap();
+        let prompts = summarizer.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("Old notes"), "{}", prompts[0]);
+        drop(prompts);
+        let handoff = store
+            .work_state("proj", root.to_str().unwrap())
+            .unwrap()
+            .unwrap()
+            .handoff_md;
+        let migrated = parsed_memory(&handoff).unwrap();
+        assert_eq!(migrated.current_state, "compacted");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn handoff_reference_reports_agents_and_claude_mentions() {
+        let root = temp_dir("handoff-reference");
+        let report = handoff_reference(&root);
+        assert_eq!(
+            report,
+            json!({"agents_md": null, "claude_md": null, "missing": []})
+        );
+        fs::write(root.join("AGENTS.md"), "read HANDOFF.md first\n").unwrap();
+        fs::write(root.join("CLAUDE.md"), "no mention here\n").unwrap();
+        let report = handoff_reference(&root);
+        assert_eq!(report["agents_md"], true);
+        assert_eq!(report["claude_md"], false);
+        assert_eq!(report["missing"], json!(["CLAUDE.md"]));
+        fs::remove_dir_all(root).unwrap();
     }
 }
