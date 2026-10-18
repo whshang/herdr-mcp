@@ -5,6 +5,7 @@ import {
   handleSemanticProxy,
   semanticBackoffMs,
   semanticModelPinned,
+  semanticRouteHealthSnapshot,
 } from "../dist/semantic-proxy.js";
 
 // The semantic proxy owns the Worker-wide route pool. These tests drive the real
@@ -346,6 +347,101 @@ test("user is protected from oversized batches | Given a state past the batch gu
 
     const accepted = await handleSemanticProxy(evaluateRequest(BODY), env);
     assert.equal(accepted.status, 200);
+  });
+  assert.equal(calls, 1);
+});
+
+test("user still reaches a healthy route behind over-budget routes | Given three routes whose token budget cannot fit one request and one healthy route | When evaluation runs | Then every call is answered by the healthy route and the skipped routes are never called", async () => {
+  const env = makeEnv([
+    route("skip-budget-a", "jev-2026-05-01", { max_tokens_per_second: 1 }),
+    route("skip-budget-b", "jev-2026-05-01", { max_tokens_per_second: 1 }),
+    route("skip-budget-c", "jev-2026-05-01", { max_tokens_per_second: 1 }),
+    route("skip-budget-healthy"),
+  ]);
+  const calls = [];
+  await withFetch(async (input) => {
+    calls.push(input instanceof Request ? input.url : String(input));
+    return providerAnswer();
+  }, async () => {
+    // The round-robin cursor advances per call, so running once per route covers
+    // every start position: a budget skip must not consume one of the three
+    // attempt-limit attempts from any of them.
+    for (let round = 0; round < 4; round += 1) {
+      const response = await handleSemanticProxy(evaluateRequest(BODY), env);
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).answers.useful.noul, 0.92);
+    }
+  });
+  assert.equal(calls.length, 4);
+  assert.deepEqual(
+    new Set(calls),
+    new Set(["https://skip-budget-healthy.example/systemone"]),
+    "only the healthy route may be called",
+  );
+});
+
+test("user keeps a long cooldown when failures complete out of order | Given a credential failure and a later retryable failure on one route | When both complete | Then the 300s cooldown survives the shorter backoff", async () => {
+  const env = makeEnv([route("out-of-order-health")]);
+  const credential = () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+  const retryable = () => new Response(JSON.stringify({ error: "boom" }), { status: 500 });
+  let calls = 0;
+  let releaseCredential;
+  let releaseRetryable;
+  let markBothInFlight;
+  const bothInFlight = new Promise((resolve) => {
+    markBothInFlight = resolve;
+  });
+  await withFetch(async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Promise((resolve) => {
+        releaseCredential = () => resolve(credential());
+      });
+    }
+    markBothInFlight();
+    return new Promise((resolve) => {
+      releaseRetryable = () => resolve(retryable());
+    });
+  }, async () => {
+    // Two requests are in flight on the same route before either failure is
+    // recorded, so their completions can arrive in either order.
+    const firstRequest = handleSemanticProxy(evaluateRequest(BODY), env);
+    const secondRequest = handleSemanticProxy(evaluateRequest(BODY), env);
+    await bothInFlight;
+
+    // The credential failure lands first and earns the fixed 300s cooldown.
+    releaseCredential();
+    assert.equal((await firstRequest).status, 502);
+
+    // The retryable failure finishes afterwards; its 1s backoff must not
+    // replace the 300s deadline already in force.
+    releaseRetryable();
+    assert.equal((await secondRequest).status, 502);
+
+    const health = semanticRouteHealthSnapshot("out-of-order-health");
+    assert.equal(health.consecutive_failures, 1);
+    assert.ok(
+      health.cooldown_remaining_ms > 250_000,
+      `cooldown was shortened to ${health.cooldown_remaining_ms}ms`,
+    );
+  });
+  assert.equal(calls, 2);
+});
+
+test("user is not rejected for astral characters in state | Given a state of 17,000 emoji | When evaluation is requested | Then the batch guard counts code points and accepts it", async () => {
+  const env = makeEnv([route("unicode-guard")]);
+  const state = "😀".repeat(17_000);
+  // 34,000 UTF-16 code units would trip the 32k guard; 17,000 code points (what
+  // the local runtime counts) does not.
+  assert.equal(state.length, 34_000);
+  let calls = 0;
+  await withFetch(async () => {
+    calls += 1;
+    return providerAnswer();
+  }, async () => {
+    const response = await handleSemanticProxy(evaluateRequest({ state, questions: QUESTIONS }), env);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).answers.useful.noul, 0.92);
   });
   assert.equal(calls, 1);
 });

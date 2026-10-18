@@ -20858,7 +20858,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_fast_path_choice_target_uses_choice_gate_and_ignores_hostile_state() {
+    fn browser_fast_path_choice_target_uses_choice_gate_and_injected_page_text_changes_nothing() {
         // The page text carries an injected instruction and fake answers. It is
         // data, so it cannot add candidates, questions, or confidence.
         let observation = json!({
