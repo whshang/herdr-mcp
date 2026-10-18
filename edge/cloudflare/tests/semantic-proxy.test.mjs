@@ -137,7 +137,7 @@ test("user fails over past a rate-limited route | Given a 429 route and a health
   assert.equal(calls.filter((url) => url.includes("healthy-b")).length, 2);
 });
 
-test("user gets progressive backoff | Given consecutive retryable failures | Then the cooldown doubles from 1s and caps at 60s", async () => {
+test("user gets progressive backoff | Given consecutive retryable failures | When each failure records a cooldown | Then the cooldown doubles from 1s and caps at 60s", async () => {
   assert.equal(semanticBackoffMs(1), 1_000);
   assert.equal(semanticBackoffMs(2), 2_000);
   assert.equal(semanticBackoffMs(3), 4_000);
@@ -163,7 +163,7 @@ test("user gets progressive backoff | Given consecutive retryable failures | The
   assert.equal(calls.length, 1);
 });
 
-test("user keeps credential failures in a long cooldown | Given a route that returns 500 twice and one that returns 401 | Then the retryable route backs off while the credential route is cooled for five minutes", async () => {
+test("user keeps credential failures in a long cooldown | Given a route that returns 500 twice and one that returns 401 | When requests fail over across them | Then the retryable route backs off while the credential route is cooled for five minutes", async () => {
   // 401/403 use the fixed 300s cooldown class; 5xx uses backoff. Both are
   // observable as "attempted once, then skipped".
   for (const [name, status] of [["auth-401", 401], ["boom-500", 500]]) {
