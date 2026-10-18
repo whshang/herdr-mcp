@@ -64,6 +64,15 @@ pub struct SemanticRouteConfig {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Per-route request budget (requests per 1s window). Absent or non-positive
+    /// means the default in `semantic.rs`. Mirrors the Worker secret field of
+    /// the same name in `edge/cloudflare/src/semantic-proxy.ts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_second: Option<u32>,
+    /// Per-route token budget (estimated tokens per 1s window). Absent or
+    /// non-positive means the default in `semantic.rs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens_per_second: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -733,6 +742,8 @@ mod tests {
                     url: Some("https://api.typesafe.ai/v1/systemone".to_owned()),
                     model: Some("jev-latest".to_owned()),
                     api_key: Some("test-key".to_owned()),
+                    max_requests_per_second: None,
+                    max_tokens_per_second: None,
                 }],
             },
         };
@@ -752,6 +763,8 @@ mod tests {
                     url: Some("https://api.typesafe.ai/v1/systemone".to_owned()),
                     model: Some("jev-latest".to_owned()),
                     api_key: Some("super-secret-key".to_owned()),
+                    max_requests_per_second: None,
+                    max_tokens_per_second: None,
                 }],
             },
             ..Config::default()
@@ -782,6 +795,39 @@ mod tests {
         .is_err());
         assert!(parse_json(
             r#"{"semantic":{"routes":[{"name":"fast","capability":"evaluate","protocol":"decision","url":"https://example.com","model":"m","api_key":"k"}]}}"#,
+            &InstanceId::default_instance()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn semantic_route_rate_budgets_are_optional_and_unknown_keys_still_fail() {
+        let legacy = parse_json(
+            r#"{"semantic":{"routes":[{"name":"fast","protocol":"decision","url":"https://example.com","model":"jev-2026-05-01","api_key":"k"}]}}"#,
+            &InstanceId::default_instance(),
+        )
+        .unwrap();
+        assert_eq!(legacy.semantic.routes[0].max_requests_per_second, None);
+        assert_eq!(legacy.semantic.routes[0].max_tokens_per_second, None);
+        // Absent budgets are not written back, so old config renders unchanged.
+        assert!(!legacy.render().contains("max_requests_per_second"));
+
+        let budgeted = parse_json(
+            r#"{"semantic":{"routes":[{"name":"fast","protocol":"decision","url":"https://example.com","model":"jev-2026-05-01","api_key":"k","max_requests_per_second":12,"max_tokens_per_second":5000}]}}"#,
+            &InstanceId::default_instance(),
+        )
+        .unwrap();
+        assert_eq!(
+            budgeted.semantic.routes[0].max_requests_per_second,
+            Some(12)
+        );
+        assert_eq!(
+            budgeted.semantic.routes[0].max_tokens_per_second,
+            Some(5000)
+        );
+
+        assert!(parse_json(
+            r#"{"semantic":{"routes":[{"name":"fast","protocol":"decision","url":"https://example.com","model":"jev-2026-05-01","api_key":"k","max_rps":5}]}}"#,
             &InstanceId::default_instance()
         )
         .is_err());

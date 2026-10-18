@@ -200,6 +200,7 @@ test("user keeps Worker semantic credentials at Edge | Given an enrolled device 
       name: "edge_fast",
       protocol: "decision",
       model: "jev-edge",
+      pinned: false,
     }],
   });
 
@@ -359,6 +360,7 @@ test("user uses one semantic route schema for chat | Given a Worker-wide openai-
       name: "chat_primary",
       protocol: "openai-chat",
       model: "chat-model",
+      pinned: false,
     }],
   });
 

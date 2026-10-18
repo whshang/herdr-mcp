@@ -72,6 +72,7 @@ mod runtime_meta;
 mod schema;
 mod semantic;
 mod semantic_cli;
+mod semantic_thresholds;
 mod service_lifecycle;
 mod service_manager;
 mod skill;

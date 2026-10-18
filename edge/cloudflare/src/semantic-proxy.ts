@@ -12,7 +12,7 @@
 import { extractLinkCredential } from "./auth.js";
 import { authenticateDeviceCredential } from "./device-directory.js";
 import type { Env } from "./env.js";
-import { readBodyBounded } from "./payload.js";
+import { byteLengthOf, readBodyBounded } from "./payload.js";
 
 // Local per-module helpers, deliberately duplicated instead of promoted into a
 // shared HTTP utility module: index.ts keeps its own copies for its own routes
@@ -43,11 +43,24 @@ type EdgeSemanticRoute = {
   url: string;
   model: string;
   apiKey: string;
+  maxRequestsPerSecond: number;
+  maxTokensPerSecond: number;
 };
+
+type SemanticRetryClass = "backoff" | "fixed" | "none";
 
 type SemanticRouteResult =
   | { ok: true; payload: Record<string, unknown> }
-  | { ok: false; fatal: boolean; status?: number; code: string };
+  | {
+    ok: false;
+    fatal: boolean;
+    status?: number;
+    code: string;
+    // How the pool should cool this route down. "none" means the failure is
+    // not the provider's fault (local rate-budget skip), so the route keeps
+    // serving the next request.
+    retry: SemanticRetryClass;
+  };
 
 const SEMANTIC_ROUTE_LIMIT = 8;
 const SEMANTIC_ATTEMPT_LIMIT = 3;
@@ -55,6 +68,22 @@ const SEMANTIC_BUDGET_MS = 3_000;
 const SEMANTIC_CHAT_BUDGET_MS = 15_000;
 const SEMANTIC_BACKGROUND_CHAT_BUDGET_MS = 60_000;
 const SEMANTIC_CHAT_MAX_TOKENS = 32_768;
+// Route-pool cooldown for retryable failures: 1s base, doubling per consecutive
+// failure, capped at 60s. Mirrors `COOLDOWN_BASE` / `COOLDOWN_CAP` in
+// crates/herdr-mcp/src/semantic.rs.
+const SEMANTIC_COOLDOWN_BASE_MS = 1_000;
+const SEMANTIC_COOLDOWN_MAX_MS = 60_000;
+// Fixed cooldown for credential/request-shape failures (401/403).
+const SEMANTIC_COOLDOWN_AUTH_MS = 5 * 60_000;
+// Per-route rate budgets, enforced with a 1s fixed window. Mirrors
+// `DEFAULT_MAX_REQUESTS_PER_SECOND` / `DEFAULT_MAX_TOKENS_PER_SECOND` in
+// crates/herdr-mcp/src/semantic.rs.
+const SEMANTIC_DEFAULT_MAX_REQUESTS_PER_SECOND = 80;
+const SEMANTIC_DEFAULT_MAX_TOKENS_PER_SECOND = 100_000;
+// Batch-size guard (characters). Mirrors `MAX_REQUEST_CHARS` /
+// `MAX_STATE_PLUS_QUESTION_CHARS` in crates/herdr-mcp/src/semantic.rs.
+const SEMANTIC_MAX_REQUEST_CHARS = 64 * 1024;
+const SEMANTIC_MAX_STATE_PLUS_QUESTION_CHARS = 32 * 1024;
 
 type SemanticChatOptions = {
   tier: "foreground" | "background";
@@ -102,6 +131,9 @@ export function parseSemanticChatOptions(body: Record<string, unknown>): Semanti
 }
 let semanticRouteCursor = 0;
 const semanticRouteCooldowns = new Map<string, number>();
+const semanticRouteStreaks = new Map<string, number>();
+const semanticRouteWindows = new Map<string, { second: number; requests: number; tokens: number }>();
+const semanticWarnedModels = new Set<string>();
 
 function semanticProtocol(value: unknown): SemanticProtocol | null {
   return value === "decision"
@@ -151,10 +183,33 @@ function semanticRoutes(env: Env): { ok: true; routes: EdgeSemanticRoute[] } | {
     const routes: EdgeSemanticRoute[] = [];
     for (const value of parsed) {
       if (!isRecord(value)) return { ok: false };
-      const allowed = new Set(["name", "protocol", "url", "model", "api_key"]);
+      // `max_requests_per_second` / `max_tokens_per_second` are optional:
+      // secrets written before they existed must parse identically.
+      const allowed = new Set([
+        "name",
+        "protocol",
+        "url",
+        "model",
+        "api_key",
+        "max_requests_per_second",
+        "max_tokens_per_second",
+      ]);
       if (Object.keys(value).some((key) => !allowed.has(key))) return { ok: false };
       const name = typeof value.name === "string" ? value.name.trim() : "";
       if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || names.has(name)) return { ok: false };
+      const budget = (raw: unknown, fallback: number): number | null => {
+        if (raw === undefined || raw === null) return fallback;
+        return typeof raw === "number" && Number.isInteger(raw) && raw > 0 ? raw : null;
+      };
+      const maxRequestsPerSecond = budget(
+        value.max_requests_per_second,
+        SEMANTIC_DEFAULT_MAX_REQUESTS_PER_SECOND,
+      );
+      const maxTokensPerSecond = budget(
+        value.max_tokens_per_second,
+        SEMANTIC_DEFAULT_MAX_TOKENS_PER_SECOND,
+      );
+      if (maxRequestsPerSecond === null || maxTokensPerSecond === null) return { ok: false };
 
       const protocol = semanticProtocol(value.protocol);
       if (!protocol) return { ok: false };
@@ -171,7 +226,14 @@ function semanticRoutes(env: Env): { ok: true; routes: EdgeSemanticRoute[] } | {
       const url = semanticUrl(rawUrl);
       if (!url) return { ok: false };
       names.add(name);
-      routes.push({ name, protocol, url, model, apiKey });
+      if (!semanticModelPinned(model) && !semanticWarnedModels.has(model)) {
+        semanticWarnedModels.add(model);
+        // Route name and model only; the credential never appears here.
+        console.warn(
+          `herdr-mcp semantic route ${name} uses unpinned model ${model}; a versioned model id is recommended`,
+        );
+      }
+      routes.push({ name, protocol, url, model, apiKey, maxRequestsPerSecond, maxTokensPerSecond });
     }
     return { ok: true, routes };
   } catch {
@@ -219,15 +281,59 @@ function normalizeSemanticPayload(
       return null;
     }
   }
-  return { model: route.model, answers };
+  return {
+    model: route.model,
+    answers,
+    ...(raw.usage !== undefined ? { usage: raw.usage } : {}),
+  };
 }
 
-function semanticCooldownMs(status?: number): number {
-  if (status === 401 || status === 403) return 5 * 60_000;
-  if (status === 408 || status === 409 || status === 429 || (status !== undefined && status >= 500)) {
-    return 30_000;
+/**
+ * A model is *pinned* when the route names a concrete version: it carries at
+ * least one digit and does not end with the floating `latest` alias. Unpinned
+ * models keep working and are reported per route (and warned about once).
+ */
+export function semanticModelPinned(model: string): boolean {
+  const normalized = model.trim().toLowerCase();
+  return normalized.length > 0 && !normalized.endsWith("latest") && /\d/.test(normalized);
+}
+
+/**
+ * Exponential backoff for `streak` consecutive retryable failures: 1s, 2s, 4s,
+ * ... capped at 60s. Identical to `backoff_duration` in
+ * crates/herdr-mcp/src/semantic.rs.
+ */
+export function semanticBackoffMs(streak: number): number {
+  const doublings = Math.min(Math.max(streak - 1, 0), 6);
+  return Math.min(SEMANTIC_COOLDOWN_BASE_MS * 2 ** doublings, SEMANTIC_COOLDOWN_MAX_MS);
+}
+
+/**
+ * Reserve one call and its estimated tokens in the route's current 1s window.
+ * Returns false when this call would exceed the route budget; the pool then
+ * moves to the next route without cooling this one down.
+ */
+function semanticBudgetAllows(route: EdgeSemanticRoute, estimatedTokens: number): boolean {
+  const second = Math.floor(Date.now() / 1000);
+  let window = semanticRouteWindows.get(route.name);
+  if (!window || window.second !== second) {
+    window = { second, requests: 0, tokens: 0 };
+    semanticRouteWindows.set(route.name, window);
   }
-  return 30_000;
+  if (window.requests + 1 > route.maxRequestsPerSecond) return false;
+  if (window.tokens + estimatedTokens > route.maxTokensPerSecond) return false;
+  window.requests += 1;
+  window.tokens += estimatedTokens;
+  return true;
+}
+
+/** Estimated token cost of one request body: 4 bytes per token, rounded up. */
+function semanticEstimatedTokens(body: string): number {
+  return Math.ceil(byteLengthOf(body) / 4);
+}
+
+function semanticRetryClassForStatus(status: number): SemanticRetryClass {
+  return status === 401 || status === 403 ? "fixed" : "backoff";
 }
 
 async function callSemanticRoute(
@@ -237,7 +343,9 @@ async function callSemanticRoute(
   timeoutMs: number,
 ): Promise<SemanticRouteResult> {
   const routeQuestions = semanticQuestionsForRoute(route, questions);
-  if (!routeQuestions) return { ok: false, fatal: true, code: "semantic_request_invalid" };
+  if (!routeQuestions) {
+    return { ok: false, fatal: true, code: "semantic_request_invalid", retry: "none" };
+  }
 
   const headers: Record<string, string> = {
     authorization: "Bearer " + route.apiKey,
@@ -252,11 +360,15 @@ async function callSemanticRoute(
     body = { state, questions: routeQuestions, model: route.model };
   }
 
+  const serialized = JSON.stringify(body);
+  if (!semanticBudgetAllows(route, semanticEstimatedTokens(serialized))) {
+    return { ok: false, fatal: false, code: "semantic_route_rate_limited", retry: "none" };
+  }
   try {
     const upstream = await fetch(route.url, {
       method: "POST",
       headers,
-      body: JSON.stringify(body),
+      body: serialized,
       signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
     });
     if (!upstream.ok) {
@@ -265,19 +377,30 @@ async function callSemanticRoute(
         fatal: upstream.status === 400 || upstream.status === 422,
         status: upstream.status,
         code: "semantic_provider_unavailable",
+        retry: semanticRetryClassForStatus(upstream.status),
       };
     }
     const text = await upstream.text();
     if (text.length > 256 * 1024) {
-      return { ok: false, fatal: false, code: "semantic_provider_invalid_response" };
+      return {
+        ok: false,
+        fatal: false,
+        code: "semantic_provider_invalid_response",
+        retry: "backoff",
+      };
     }
     const normalized = normalizeSemanticPayload(route, JSON.parse(text));
     if (!normalized) {
-      return { ok: false, fatal: false, code: "semantic_provider_invalid_response" };
+      return {
+        ok: false,
+        fatal: false,
+        code: "semantic_provider_invalid_response",
+        retry: "backoff",
+      };
     }
     return { ok: true, payload: normalized };
   } catch {
-    return { ok: false, fatal: false, code: "semantic_provider_unavailable" };
+    return { ok: false, fatal: false, code: "semantic_provider_unavailable", retry: "backoff" };
   }
 }
 
@@ -293,7 +416,7 @@ async function callSemanticChatRoute(
     || messages.length < 1
     || messages.length > 32
   ) {
-    return { ok: false, fatal: true, code: "semantic_request_invalid" };
+    return { ok: false, fatal: true, code: "semantic_request_invalid", retry: "none" };
   }
   for (const message of messages) {
     if (
@@ -302,8 +425,19 @@ async function callSemanticChatRoute(
       || !["system", "user", "assistant"].includes(String(message.role ?? ""))
       || !validSemanticValue(message.content, 64 * 1024)
     ) {
-      return { ok: false, fatal: true, code: "semantic_request_invalid" };
+      return { ok: false, fatal: true, code: "semantic_request_invalid", retry: "none" };
     }
+  }
+  const serialized = JSON.stringify({
+    model: route.model,
+    messages,
+    temperature: 0,
+    stream: false,
+    ...(options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {}),
+    ...(options.jsonResponse ? { response_format: { type: "json_object" } } : {}),
+  });
+  if (!semanticBudgetAllows(route, semanticEstimatedTokens(serialized))) {
+    return { ok: false, fatal: false, code: "semantic_route_rate_limited", retry: "none" };
   }
   try {
     const upstream = await fetch(route.url, {
@@ -312,14 +446,7 @@ async function callSemanticChatRoute(
         authorization: "Bearer " + route.apiKey,
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        model: route.model,
-        messages,
-        temperature: 0,
-        stream: false,
-        ...(options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {}),
-        ...(options.jsonResponse ? { response_format: { type: "json_object" } } : {}),
-      }),
+      body: serialized,
       signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
     });
     if (!upstream.ok) {
@@ -328,11 +455,17 @@ async function callSemanticChatRoute(
         fatal: false,
         status: upstream.status,
         code: "semantic_provider_unavailable",
+        retry: semanticRetryClassForStatus(upstream.status),
       };
     }
     const text = await upstream.text();
     if (text.length > 256 * 1024) {
-      return { ok: false, fatal: false, code: "semantic_provider_invalid_response" };
+      return {
+        ok: false,
+        fatal: false,
+        code: "semantic_provider_invalid_response",
+        retry: "backoff",
+      };
     }
     const payload = JSON.parse(text);
     const content = isRecord(payload)
@@ -343,7 +476,12 @@ async function callSemanticChatRoute(
       ? payload.choices[0].message.content.trim()
       : "";
     if (!content) {
-      return { ok: false, fatal: false, code: "semantic_provider_invalid_response" };
+      return {
+        ok: false,
+        fatal: false,
+        code: "semantic_provider_invalid_response",
+        retry: "backoff",
+      };
     }
     return {
       ok: true,
@@ -354,7 +492,7 @@ async function callSemanticChatRoute(
       },
     };
   } catch {
-    return { ok: false, fatal: false, code: "semantic_provider_unavailable" };
+    return { ok: false, fatal: false, code: "semantic_provider_unavailable", retry: "backoff" };
   }
 }
 
@@ -394,6 +532,7 @@ export async function handleSemanticProxy(
         name: route.name,
         protocol: route.protocol,
         model: route.model,
+        pinned: semanticModelPinned(route.model),
       })),
     });
   }
@@ -421,6 +560,23 @@ export async function handleSemanticProxy(
     const questionCount = Object.keys(parsed.value.questions).length;
     if (questionCount < 1 || questionCount > 32) {
       return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+    }
+    // Batch-size guard. The local runtime trims its state before sending, so
+    // anything still over budget here fails closed with a stable code instead
+    // of reaching a provider.
+    const stateChars = JSON.stringify(parsed.value.state).length;
+    let questionsChars = 0;
+    let longestQuestionChars = 0;
+    for (const [id, question] of Object.entries(parsed.value.questions)) {
+      const chars = id.length + JSON.stringify(question).length;
+      questionsChars += chars;
+      longestQuestionChars = Math.max(longestQuestionChars, chars);
+    }
+    if (
+      stateChars + questionsChars > SEMANTIC_MAX_REQUEST_CHARS
+      || stateChars + longestQuestionChars > SEMANTIC_MAX_STATE_PLUS_QUESTION_CHARS
+    ) {
+      return noStoreJsonResponse({ ok: false, code: "semantic_state_too_large" }, 413);
     }
   } else if (
     Object.keys(parsed.value).some((key) => !SEMANTIC_CHAT_KEYS.has(key))
@@ -461,11 +617,29 @@ export async function handleSemanticProxy(
       : await callSemanticRoute(route, parsed.value.state, parsed.value.questions as Record<string, unknown>, remaining);
     if (result.ok) {
       semanticRouteCooldowns.delete(route.name);
+      semanticRouteStreaks.delete(route.name);
+      if (mode === "evaluate") {
+        // One structured line per successful evaluate call: route name,
+        // requested model, returned model, and provider usage. Never a key.
+        console.log(JSON.stringify({
+          event: "semantic_evaluate",
+          route: route.name,
+          requested_model: route.model,
+          returned_model: typeof result.payload.model === "string" ? result.payload.model : null,
+          usage: result.payload.usage ?? null,
+        }));
+      }
       return noStoreJsonResponse(result.payload);
     }
     lastCode = result.code;
     if (result.fatal) return noStoreJsonResponse({ ok: false, code: result.code }, 400);
-    semanticRouteCooldowns.set(route.name, Date.now() + semanticCooldownMs(result.status));
+    if (result.retry === "fixed") {
+      semanticRouteCooldowns.set(route.name, Date.now() + SEMANTIC_COOLDOWN_AUTH_MS);
+    } else if (result.retry === "backoff") {
+      const streak = (semanticRouteStreaks.get(route.name) ?? 0) + 1;
+      semanticRouteStreaks.set(route.name, streak);
+      semanticRouteCooldowns.set(route.name, Date.now() + semanticBackoffMs(streak));
+    }
   }
   return noStoreJsonResponse({ ok: false, code: lastCode }, 502);
 }
