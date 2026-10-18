@@ -3000,7 +3000,11 @@ pub(crate) fn semantic_proxy_request(
     timeout: std::time::Duration,
 ) -> Result<Value, String> {
     semantic_proxy_request_to("/semantic/systemone", payload, timeout, |payload| {
-        payload.get("model").and_then(Value::as_str).is_some()
+        // The Worker nulls a provider model name it cannot safely report (see
+        // `sanitizeSemanticModel`), so `null` is a valid model here.
+        payload
+            .get("model")
+            .is_some_and(|model| model.is_null() || model.as_str().is_some())
             && payload.get("answers").and_then(Value::as_object).is_some()
     })
 }
@@ -3011,7 +3015,9 @@ pub(crate) fn semantic_proxy_chat_request(
     timeout: std::time::Duration,
 ) -> Result<Value, String> {
     semantic_proxy_request_to("/semantic/chat", payload, timeout, |payload| {
-        payload.get("model").and_then(Value::as_str).is_some()
+        payload
+            .get("model")
+            .is_some_and(|model| model.is_null() || model.as_str().is_some())
             && payload.get("content").and_then(Value::as_str).is_some()
     })
 }

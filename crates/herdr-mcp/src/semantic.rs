@@ -57,8 +57,28 @@ const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// multi-byte script is not penalized.
 const MAX_REQUEST_CHARS: usize = 64 * 1024;
 const MAX_STATE_PLUS_QUESTION_CHARS: usize = 32 * 1024;
+/// Byte budget for the serialized evaluate body (`state` + `questions`) the
+/// runtime sends to the Edge proxy. The Worker caps the whole request body at
+/// 96 KiB before it applies its character guard, so the runtime trims its state
+/// until this body fits `MAX_REQUEST_BYTES` (88 KiB) and keeps headroom for the
+/// HTTP envelope. Mirrored as `SEMANTIC_MAX_REQUEST_BYTES` in
+/// `edge/cloudflare/src/semantic-proxy.ts`; the Worker body cap itself is
+/// unchanged.
+const MAX_REQUEST_BYTES: usize = 88 * 1024;
 /// Marker prepended to a deterministically trimmed state string.
 const STATE_TRIM_MARKER: &str = "[...trimmed...]\n";
+/// The only `usage` fields a provider response may contribute. Everything else
+/// (strings, nested objects, provider diagnostics) is dropped, so a provider
+/// cannot smuggle a credential into a log line, trace, or status payload.
+const USAGE_TOKEN_FIELDS: [&str; 5] = [
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "input_tokens",
+    "output_tokens",
+];
+/// Longest provider-supplied model name that is kept; the rest is truncated.
+const MODEL_NAME_MAX_CHARS: usize = 128;
 const MAX_QUESTIONS: usize = 32;
 const MAX_CRITERIA: usize = 64;
 const MAX_CHAT_MESSAGES: usize = 32;
@@ -121,25 +141,34 @@ fn semantic_traces() -> &'static Mutex<BTreeMap<&'static str, SemanticTrace>> {
     SEMANTIC_TRACES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// The one structured log line per successful call. Route name, requested
+/// model, sanitized returned model, and projected provider usage only: no
+/// credential can be here. `None` when the call failed (that line is built from
+/// the error detail) or when no route was tried.
+fn semantic_trace_log_line(boundary: &str, trace: &SemanticTrace) -> Option<String> {
+    if trace.detail.is_some() || trace.route == "none" {
+        return None;
+    }
+    Some(format!(
+        "herdr-mcp semantic {boundary} route={} requested_model={} returned_model={} usage={}",
+        trace.route,
+        trace.requested_model.as_deref().unwrap_or(""),
+        trace.returned_model.as_deref().unwrap_or(""),
+        trace
+            .usage
+            .as_ref()
+            .map_or_else(String::new, |usage| usage.to_string()),
+    ))
+}
+
 fn record_semantic_trace(boundary: &'static str, trace: SemanticTrace) {
     if let Some(detail) = &trace.detail {
         eprintln!(
             "herdr-mcp semantic {boundary} route={} failed: {detail}",
             trace.route
         );
-    } else if trace.route != "none" {
-        // One structured line per successful call. Route name, requested model,
-        // returned model, and provider usage only: no credential is ever here.
-        eprintln!(
-            "herdr-mcp semantic {boundary} route={} requested_model={} returned_model={} usage={}",
-            trace.route,
-            trace.requested_model.as_deref().unwrap_or(""),
-            trace.returned_model.as_deref().unwrap_or(""),
-            trace
-                .usage
-                .as_ref()
-                .map_or_else(String::new, |usage| usage.to_string()),
-        );
+    } else if let Some(line) = semantic_trace_log_line(boundary, &trace) {
+        eprintln!("{line}");
     }
     if let Ok(mut traces) = semantic_traces().lock() {
         traces.insert(boundary, trace);
@@ -334,6 +363,33 @@ impl SemanticRequest {
         serde_json::to_string(value).map_or(usize::MAX, |text| text.chars().count())
     }
 
+    /// UTF-8 byte length of one serialized JSON value.
+    fn json_bytes(value: &Value) -> usize {
+        serde_json::to_vec(value).map_or(usize::MAX, |text| text.len())
+    }
+
+    /// The question map exactly as it is serialized into a request body.
+    fn questions_json(&self) -> Map<String, Value> {
+        self.questions
+            .iter()
+            .map(|(id, question)| (id.clone(), question.to_json()))
+            .collect()
+    }
+
+    /// Bytes of the serialized evaluate body (`state` + `questions`) exactly as
+    /// the Edge proxy receives it. The Worker bounds this body by bytes before
+    /// it applies its character guard, so the runtime must bound it too.
+    fn proxy_body_bytes_with(&self, state: &Value) -> usize {
+        Self::json_bytes(&json!({
+            "state": state,
+            "questions": self.questions_json(),
+        }))
+    }
+
+    fn proxy_body_bytes(&self) -> usize {
+        self.proxy_body_bytes_with(&self.state)
+    }
+
     fn questions_chars(&self) -> usize {
         self.questions
             .iter()
@@ -373,6 +429,22 @@ impl SemanticRequest {
                 return Err(SemanticError::new("state_too_large"));
             }
         }
+        // Byte budget. The guard above counts characters, but the Edge proxy
+        // bounds the *serialized* body (96 KiB) before it applies that guard,
+        // so a state made of multi-byte characters can pass the character
+        // budget and still be rejected with HTTP 413. Trim until the body the
+        // runtime actually sends fits `MAX_REQUEST_BYTES`, and fail closed with
+        // the same stable code when even a trimmed state cannot.
+        if request.proxy_body_bytes() > MAX_REQUEST_BYTES {
+            let overhead =
+                request.proxy_body_bytes_with(&Value::Null) - Self::json_bytes(&Value::Null);
+            request.state = trim_state_with(&request.state, MAX_REQUEST_BYTES, |candidate| {
+                overhead + Self::json_bytes(candidate)
+            });
+            if request.proxy_body_bytes() > MAX_REQUEST_BYTES {
+                return Err(SemanticError::new("state_too_large"));
+            }
+        }
         Ok(request)
     }
 
@@ -407,6 +479,14 @@ impl SemanticRequest {
 /// * an array keeps its most recent (trailing) entries,
 /// * an object keeps the trailing entries of its serialization order.
 fn trim_state(value: &Value, max_chars: usize) -> Value {
+    trim_state_with(value, max_chars, SemanticRequest::json_chars)
+}
+
+/// [`trim_state`] generalized over the budget unit: `cost` reports how much of
+/// the budget one candidate state consumes. Character trimming passes the
+/// serialized character count, byte trimming passes the whole serialized body
+/// size, so the same deterministic tail-keeping logic serves both budgets.
+fn trim_state_with(value: &Value, max_cost: usize, cost: impl Fn(&Value) -> usize) -> Value {
     match value {
         Value::String(text) => {
             let build = |keep: usize| {
@@ -420,19 +500,18 @@ fn trim_state(value: &Value, max_chars: usize) -> Value {
                     .collect::<String>();
                 Value::String(format!("{STATE_TRIM_MARKER}{tail}"))
             };
-            // Reserve the serialized cost of the marker (quotes and the escaped
-            // newline included) and shrink further if the kept tail itself
-            // needs escaping.
-            let mut keep = max_chars.saturating_sub(SemanticRequest::json_chars(&Value::String(
-                STATE_TRIM_MARKER.to_owned(),
-            )));
+            // Reserve the cost of the marker (quotes and the escaped newline
+            // included) and shrink further if the kept tail itself needs
+            // escaping.
+            let marker = Value::String(STATE_TRIM_MARKER.to_owned());
+            let mut keep = max_cost.saturating_sub(cost(&marker));
             let mut trimmed = build(keep);
             while keep > 0 {
-                let size = SemanticRequest::json_chars(&trimmed);
-                if size <= max_chars {
+                let size = cost(&trimmed);
+                if size <= max_cost {
                     break;
                 }
-                keep = keep.saturating_sub(size - max_chars);
+                keep = keep.saturating_sub((size - max_cost).max(1));
                 trimmed = build(keep);
             }
             trimmed
@@ -442,8 +521,7 @@ fn trim_state(value: &Value, max_chars: usize) -> Value {
             let mut high = items.len();
             while drop < high {
                 let middle = (drop + high) / 2;
-                if SemanticRequest::json_chars(&Value::Array(items[middle..].to_vec())) <= max_chars
-                {
+                if cost(&Value::Array(items[middle..].to_vec())) <= max_cost {
                     high = middle;
                 } else {
                     drop = middle + 1;
@@ -461,7 +539,7 @@ fn trim_state(value: &Value, max_chars: usize) -> Value {
                     .iter()
                     .map(|key| (key.clone(), map[key].clone()))
                     .collect::<Map<_, _>>();
-                if SemanticRequest::json_chars(&Value::Object(candidate)) <= max_chars {
+                if cost(&Value::Object(candidate)) <= max_cost {
                     high = middle;
                 } else {
                     drop = middle + 1;
@@ -570,8 +648,11 @@ fn semantic_truth_result(probability: f64) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct SemanticResponse {
     pub provider: String,
-    pub model: String,
-    /// Provider-reported token usage when the provider returned `usage`.
+    /// Provider-reported model, sanitized: only `[A-Za-z0-9._:/@+-]`, capped
+    /// at 128 characters, and `None` when it carried the route credential.
+    pub model: Option<String>,
+    /// Provider-reported token usage, projected onto the numeric token-count
+    /// allowlist (see [`project_usage`]).
     usage: Option<Value>,
     answers: BTreeMap<String, SemanticAnswer>,
 }
@@ -755,8 +836,10 @@ impl SemanticChatMessage {
 #[derive(Debug, Clone)]
 pub struct SemanticChatResponse {
     pub provider: String,
-    pub model: String,
+    /// Sanitized provider model, like [`SemanticResponse::model`].
+    pub model: Option<String>,
     pub content: String,
+    /// Provider usage projected onto the numeric token-count allowlist.
     pub usage: Option<Value>,
 }
 
@@ -1422,7 +1505,10 @@ impl SemanticService {
                             .find(|provider| provider.id() == route)
                             .map(|provider| provider.model().to_owned())
                             .filter(|model| !model.is_empty()),
-                        returned_model: result.as_ref().ok().map(|response| response.model.clone()),
+                        returned_model: result
+                            .as_ref()
+                            .ok()
+                            .and_then(|response| response.model.clone()),
                         usage: result
                             .as_ref()
                             .ok()
@@ -1534,7 +1620,10 @@ impl SemanticService {
                             .find(|provider| provider.id() == route)
                             .map(|provider| provider.model().to_owned())
                             .filter(|model| !model.is_empty()),
-                        returned_model: result.as_ref().ok().map(|response| response.model.clone()),
+                        returned_model: result
+                            .as_ref()
+                            .ok()
+                            .and_then(|response| response.model.clone()),
                         usage: result
                             .as_ref()
                             .ok()
@@ -1978,7 +2067,7 @@ impl SemanticProvider for EdgeSemanticProvider {
             timeout,
         )
         .map_err(|error| SemanticError::with_detail("edge_proxy_unavailable", error))?;
-        parse_response(EDGE_SEMANTIC_PROVIDER_ID, request, payload)
+        parse_response(EDGE_SEMANTIC_PROVIDER_ID, "", request, payload)
     }
 }
 
@@ -2002,7 +2091,7 @@ impl SemanticChatProvider for EdgeSemanticChatProvider {
         let payload =
             crate::worker::semantic_proxy_chat_request(&edge_chat_body(messages, options), timeout)
                 .map_err(|error| SemanticError::with_detail("edge_proxy_unavailable", error))?;
-        parse_chat_response("edge-semantic-chat", payload)
+        parse_chat_response("edge-semantic-chat", "", payload)
     }
 }
 
@@ -2287,9 +2376,9 @@ impl SemanticProvider for HttpSemanticProvider {
             .json::<Value>()
             .map_err(|_| SemanticError::new("invalid_response"))?;
         match self.protocol {
-            SemanticProtocol::Decision => parse_response(&self.id, request, payload),
+            SemanticProtocol::Decision => parse_response(&self.id, &self.api_key, request, payload),
             SemanticProtocol::DecisionVercel => {
-                parse_vercel_response(&self.id, &self.model, request, payload)
+                parse_vercel_response(&self.id, &self.api_key, &self.model, request, payload)
             }
             SemanticProtocol::OpenAiChat => Err(SemanticError::new("route_invalid")),
         }
@@ -2425,6 +2514,7 @@ impl SemanticChatProvider for OpenAiChatProvider {
         }
         parse_chat_response(
             &self.id,
+            &self.api_key,
             response
                 .json::<Value>()
                 .map_err(|_| SemanticError::new("invalid_response"))?,
@@ -2523,8 +2613,46 @@ fn semantic_endpoint_url(raw: &str) -> Result<Url, SemanticError> {
     Ok(url)
 }
 
+/// Project an arbitrary provider `usage` value onto the numeric token-count
+/// allowlist. A provider response is untrusted input: only non-negative finite
+/// integers of [`USAGE_TOKEN_FIELDS`] survive, and `None` means nothing did.
+fn project_usage(usage: Option<&Value>) -> Option<Value> {
+    let usage = usage?.as_object()?;
+    let mut projected = Map::new();
+    for field in USAGE_TOKEN_FIELDS {
+        if let Some(count) = usage.get(field).and_then(Value::as_u64) {
+            projected.insert(field.to_owned(), json!(count));
+        }
+    }
+    (!projected.is_empty()).then_some(Value::Object(projected))
+}
+
+/// Sanitize a provider-supplied model name before it is logged, traced, or
+/// returned: keep only `[A-Za-z0-9._:/@+-]`, cap it at
+/// [`MODEL_NAME_MAX_CHARS`], and drop it entirely when it carries the route
+/// credential or nothing survives sanitization.
+fn sanitize_model_name(raw: &str, secret: &str) -> Option<String> {
+    let carries_secret = |value: &str| !secret.is_empty() && value.contains(secret);
+    if carries_secret(raw) {
+        return None;
+    }
+    let sanitized = raw
+        .chars()
+        .filter(|value| {
+            value.is_ascii_alphanumeric()
+                || matches!(value, '.' | '_' | ':' | '/' | '@' | '+' | '-')
+        })
+        .take(MODEL_NAME_MAX_CHARS)
+        .collect::<String>();
+    if sanitized.is_empty() || carries_secret(&sanitized) {
+        return None;
+    }
+    Some(sanitized)
+}
+
 fn parse_chat_response(
     provider: &str,
+    secret: &str,
     payload: Value,
 ) -> Result<SemanticChatResponse, SemanticError> {
     if let Some(content) = payload.get("content").and_then(Value::as_str) {
@@ -2537,9 +2665,9 @@ fn parse_chat_response(
         }
         return Ok(SemanticChatResponse {
             provider: provider.to_owned(),
-            model: model.to_owned(),
+            model: sanitize_model_name(model, secret),
             content: content.to_owned(),
-            usage: payload.get("usage").cloned(),
+            usage: project_usage(payload.get("usage")),
         });
     }
     let model = payload
@@ -2557,14 +2685,15 @@ fn parse_chat_response(
         .ok_or_else(|| SemanticError::new("invalid_response"))?;
     Ok(SemanticChatResponse {
         provider: provider.to_owned(),
-        model: model.to_owned(),
+        model: sanitize_model_name(model, secret),
         content: content.to_owned(),
-        usage: payload.get("usage").cloned(),
+        usage: project_usage(payload.get("usage")),
     })
 }
 
 fn parse_vercel_response(
     provider: &str,
+    secret: &str,
     model: &str,
     request: &SemanticRequest,
     payload: Value,
@@ -2625,8 +2754,8 @@ fn parse_vercel_response(
     }
     Ok(SemanticResponse {
         provider: provider.to_owned(),
-        model: model.to_owned(),
-        usage: payload.get("usage").cloned(),
+        model: sanitize_model_name(model, secret),
+        usage: project_usage(payload.get("usage")),
         answers,
     })
 }
@@ -2640,15 +2769,17 @@ fn optional_probability_map(value: Option<&Value>) -> Result<BTreeMap<String, f6
 
 fn parse_response(
     provider: &str,
+    secret: &str,
     request: &SemanticRequest,
     payload: Value,
 ) -> Result<SemanticResponse, SemanticError> {
+    // A provider-reported model is informational: a missing, malformed, or
+    // credential-carrying name is reported as `null` instead of failing the
+    // answer set the caller asked for.
     let model = payload
         .get("model")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 128)
-        .ok_or_else(|| SemanticError::new("invalid_response"))?
-        .to_owned();
+        .and_then(|value| sanitize_model_name(value, secret));
     let raw_answers = payload
         .get("answers")
         .and_then(Value::as_object)
@@ -2707,7 +2838,7 @@ fn parse_response(
     Ok(SemanticResponse {
         provider: provider.to_owned(),
         model,
-        usage: payload.get("usage").cloned(),
+        usage: project_usage(payload.get("usage")),
         answers,
     })
 }
@@ -3178,7 +3309,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(chat.provider, "chat-good");
-        assert_eq!(chat.model, "chat-good");
+        assert_eq!(chat.model.as_deref(), Some("chat-good"));
         assert_eq!(chat.content, "continue");
     }
 
@@ -4000,7 +4131,7 @@ mod tests {
             SemanticQuestion::noul("Can work continue?", "yes", "no"),
         );
         let response = service.evaluate(&request).unwrap();
-        assert_eq!(response.model, "jev-2026-05-01");
+        assert_eq!(response.model.as_deref(), Some("jev-2026-05-01"));
         assert_eq!(response.provider, "pinned-route");
 
         let capability = service.capability_json();
@@ -4035,6 +4166,164 @@ mod tests {
         );
 
         clear_route_pool_state();
+    }
+
+    /// A provider response is untrusted: a `usage` object and a model name both
+    /// reach logs, traces, status JSON, and the returned payload, so anything
+    /// that is not an allowlisted token count has to be dropped first.
+    #[test]
+    fn provider_usage_and_model_are_projected_before_logging_and_returning() {
+        const KEY: &str = "sk-test-credential-123";
+        const TYPED_BODY: &str = r#"{"model":"sk-test-credential-123","answers":{"q":{"type":"noul","noul":0.9}},"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9,"diagnostic":"Bearer sk-test-credential-123","nested":{"x":"sk-test-credential-123"}}}"#;
+        const CHAT_BODY: &str = r#"{"model":"sk-test-credential-123","choices":[{"message":{"content":"continue"}}],"usage":{"prompt_tokens":5,"diagnostic":"Bearer sk-test-credential-123","nested":{"x":"sk-test-credential-123"}}}"#;
+
+        let _guard = crate::test_env::lock();
+        ROUTE_CURSOR.store(0, Ordering::Relaxed);
+        CHAT_ROUTE_CURSOR.store(0, Ordering::Relaxed);
+        if let Ok(mut traces) = semantic_traces().lock() {
+            traces.clear();
+        }
+        clear_route_pool_state();
+
+        let service = SemanticService {
+            providers: vec![Box::new(
+                HttpSemanticProvider::new(
+                    "untrusted-route".to_owned(),
+                    SemanticProtocol::Decision,
+                    KEY.to_owned(),
+                    one_shot_server(TYPED_BODY),
+                    "jev-2026-05-01".to_owned(),
+                )
+                .unwrap(),
+            )],
+            chat_providers: vec![Box::new(
+                OpenAiChatProvider::new(
+                    "untrusted-chat".to_owned(),
+                    KEY.to_owned(),
+                    one_shot_server(CHAT_BODY),
+                    "jev-2026-05-01".to_owned(),
+                )
+                .unwrap(),
+            )],
+        };
+        let request = SemanticRequest::new(json!({"task": "untrusted provider"})).ask(
+            "q",
+            SemanticQuestion::noul("Can work continue?", "yes", "no"),
+        );
+
+        let response = service.evaluate(&request).unwrap();
+        let chat = service
+            .chat_with_options(
+                &[SemanticChatMessage {
+                    role: "user".to_owned(),
+                    content: "continue?".to_owned(),
+                }],
+                Duration::from_secs(2),
+                &SemanticChatOptions::default(),
+            )
+            .unwrap();
+
+        // The credential-carrying model name is dropped, and only numeric token
+        // counts survive the usage projection.
+        assert_eq!(response.model, None);
+        assert_eq!(
+            response.usage,
+            Some(json!({"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}))
+        );
+        assert_eq!(chat.model, None);
+        assert_eq!(chat.usage, Some(json!({"prompt_tokens": 5})));
+        assert_eq!(chat.content, "continue");
+
+        // Nothing logged, traced, or returned may contain the credential. The
+        // log text is asserted through the exact line the trace prints.
+        let (typed_line, chat_line) = {
+            let traces = semantic_traces().lock().unwrap();
+            (
+                semantic_trace_log_line("typed_decision", &traces["typed_decision"]).unwrap(),
+                semantic_trace_log_line("chat_semantic", &traces["chat_semantic"]).unwrap(),
+            )
+        };
+        assert!(!typed_line.contains(KEY), "{typed_line}");
+        assert!(typed_line.contains("prompt_tokens"), "{typed_line}");
+        assert!(
+            typed_line.contains("returned_model= usage="),
+            "{typed_line}"
+        );
+        assert!(!chat_line.contains(KEY), "{chat_line}");
+        assert!(chat_line.contains("prompt_tokens"), "{chat_line}");
+        let capability = service.capability_json();
+        let typed_trace = &capability["trace"]["typed_decision"];
+        assert_eq!(typed_trace["route"], "untrusted-route");
+        assert_eq!(typed_trace["returned_model"], Value::Null);
+        assert_eq!(
+            typed_trace["usage"],
+            json!({"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9})
+        );
+        assert_eq!(
+            capability["trace"]["chat_semantic"]["usage"],
+            json!({"prompt_tokens": 5})
+        );
+        assert!(!capability.to_string().contains(KEY));
+        assert!(!response.to_json().to_string().contains(KEY));
+        assert!(
+            !semantic_trace_json("typed_decision")
+                .to_string()
+                .contains(KEY)
+        );
+        assert!(
+            !semantic_trace_json("chat_semantic")
+                .to_string()
+                .contains(KEY)
+        );
+
+        clear_route_pool_state();
+    }
+
+    /// A multi-byte state can pass the character budget and still overrun the
+    /// Worker's 96 KiB body cap, so the runtime trims on bytes as well.
+    #[test]
+    fn emoji_state_is_trimmed_to_the_edge_request_byte_budget() {
+        let request = SemanticRequest::new(json!("\u{1f600}".repeat(25_000))).ask(
+            "recent_entries",
+            SemanticQuestion::noul("Is work recent?", "yes", "no"),
+        );
+        // 100 KB of UTF-8 but only 25k characters: the character guard alone
+        // would let it through.
+        assert!(request.proxy_body_bytes() > MAX_REQUEST_BYTES);
+        assert!(SemanticRequest::json_chars(&request.state) < MAX_STATE_PLUS_QUESTION_CHARS);
+
+        let prepared = request.prepared().unwrap();
+        assert!(prepared.proxy_body_bytes() <= MAX_REQUEST_BYTES);
+        let state = prepared
+            .state
+            .as_str()
+            .expect("trimmed state stays a string");
+        assert!(state.starts_with(STATE_TRIM_MARKER));
+        assert!(!state[STATE_TRIM_MARKER.len()..].is_empty());
+        assert!(state.ends_with('\u{1f600}'));
+        // Questions are untouched by the byte trim.
+        assert_eq!(
+            prepared.questions.keys().cloned().collect::<Vec<_>>(),
+            vec!["recent_entries".to_owned()]
+        );
+        // Deterministic: the same input trims to the same output.
+        assert_eq!(prepared.state, request.prepared().unwrap().state);
+
+        // A batch whose questions alone leave no room for a state fails closed.
+        let oversized_question = SemanticQuestion::choice(
+            "Which candidate?",
+            (0..60)
+                .map(|index| (format!("candidate_{index}"), Some("\u{1f600}".repeat(400))))
+                .collect::<BTreeMap<_, _>>(),
+        );
+        assert_eq!(
+            SemanticRequest::new(json!("s"))
+                .ask("candidate", oversized_question)
+                .prepared()
+                .unwrap_err()
+                .code(),
+            "state_too_large"
+        );
     }
 
     #[test]

@@ -84,6 +84,27 @@ const SEMANTIC_DEFAULT_MAX_TOKENS_PER_SECOND = 100_000;
 // `MAX_STATE_PLUS_QUESTION_CHARS` in crates/herdr-mcp/src/semantic.rs.
 const SEMANTIC_MAX_REQUEST_CHARS = 64 * 1024;
 const SEMANTIC_MAX_STATE_PLUS_QUESTION_CHARS = 32 * 1024;
+// Byte budget for the serialized evaluate body the local runtime sends here.
+// Mirrors `MAX_REQUEST_BYTES` in crates/herdr-mcp/src/semantic.rs: the runtime
+// trims its state until the body fits 88 KiB, safely under this handler's
+// unchanged 96 KiB `readBodyBounded` cap. A body at or below this budget must
+// be accepted, never rejected with 413.
+export const SEMANTIC_MAX_REQUEST_BYTES = 88 * 1024;
+// The only `usage` fields a provider response may contribute. Everything else
+// (strings, nested objects, provider diagnostics) is dropped so a provider
+// cannot smuggle a credential into a log line or a response payload. Mirrors
+// `USAGE_TOKEN_FIELDS` in crates/herdr-mcp/src/semantic.rs.
+const SEMANTIC_USAGE_TOKEN_FIELDS = [
+  "prompt_tokens",
+  "completion_tokens",
+  "total_tokens",
+  "input_tokens",
+  "output_tokens",
+] as const;
+// Longest provider-supplied model name that is kept. Mirrors
+// `MODEL_NAME_MAX_CHARS` in crates/herdr-mcp/src/semantic.rs.
+const SEMANTIC_MODEL_NAME_MAX_CHARS = 128;
+const SEMANTIC_MODEL_NAME_ALLOWED = /^[A-Za-z0-9._:/@+-]$/;
 
 type SemanticChatOptions = {
   tier: "foreground" | "background";
@@ -262,14 +283,58 @@ function semanticQuestionsForRoute(
   return converted;
 }
 
+/**
+ * Project an arbitrary provider `usage` object onto the numeric token-count
+ * allowlist. A provider response is untrusted input: only non-negative safe
+ * integers of `SEMANTIC_USAGE_TOKEN_FIELDS` survive, and `null` means nothing
+ * did. The projected object is what may reach log lines, traces, status JSON,
+ * and chat usage counters.
+ */
+export function projectSemanticUsage(usage: unknown): Record<string, number> | null {
+  if (!isRecord(usage)) return null;
+  const projected: Record<string, number> = {};
+  for (const field of SEMANTIC_USAGE_TOKEN_FIELDS) {
+    const value = usage[field];
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+      projected[field] = value;
+    }
+  }
+  return Object.keys(projected).length > 0 ? projected : null;
+}
+
+/**
+ * Sanitize a provider-supplied model name before it is logged, traced, or
+ * returned: keep only `[A-Za-z0-9._:/@+-]`, cap it at 128 characters, and drop
+ * it (`null`) when it carries the route credential or nothing survives.
+ */
+export function sanitizeSemanticModel(model: unknown, apiKey: string): string | null {
+  if (typeof model !== "string") return null;
+  const carriesKey = (value: string): boolean => apiKey.length > 0 && value.includes(apiKey);
+  if (carriesKey(model)) return null;
+  const sanitized = [...model]
+    .filter((character) => SEMANTIC_MODEL_NAME_ALLOWED.test(character))
+    .slice(0, SEMANTIC_MODEL_NAME_MAX_CHARS)
+    .join("");
+  if (!sanitized || carriesKey(sanitized)) return null;
+  return sanitized;
+}
+
 function normalizeSemanticPayload(
   route: EdgeSemanticRoute,
   raw: unknown,
 ): Record<string, unknown> | null {
   if (!isRecord(raw) || !isRecord(raw.answers)) return null;
+  // Provider-supplied model and usage reach the runtime's traces, status JSON,
+  // and log lines, so both are sanitized here instead of passed through.
+  const usage = projectSemanticUsage(raw.usage);
+  const usageField = usage ? { usage } : {};
   if (route.protocol !== "decision-vercel") {
     if (typeof raw.model !== "string") return null;
-    return raw;
+    return {
+      model: sanitizeSemanticModel(raw.model, route.apiKey),
+      answers: raw.answers,
+      ...usageField,
+    };
   }
   const answers: Record<string, unknown> = {};
   for (const [id, value] of Object.entries(raw.answers)) {
@@ -284,9 +349,9 @@ function normalizeSemanticPayload(
     }
   }
   return {
-    model: route.model,
+    model: sanitizeSemanticModel(route.model, route.apiKey),
     answers,
-    ...(raw.usage !== undefined ? { usage: raw.usage } : {}),
+    ...usageField,
   };
 }
 
@@ -548,12 +613,16 @@ async function callSemanticChatRoute(
         retry: "backoff",
       };
     }
+    // Same trust boundary as the evaluate path: the chat payload's model and
+    // usage are forwarded to the runtime and its logs, so they are projected
+    // and sanitized here too.
+    const usage = isRecord(payload) ? projectSemanticUsage(payload.usage) : null;
     return {
       ok: true,
       payload: {
-        model: route.model,
+        model: sanitizeSemanticModel(route.model, route.apiKey),
         content,
-        ...(isRecord(payload) && payload.usage !== undefined ? { usage: payload.usage } : {}),
+        ...(usage ? { usage } : {}),
       },
     };
   } catch {
@@ -713,7 +782,7 @@ export async function handleSemanticProxy(
           event: "semantic_evaluate",
           route: route.name,
           requested_model: route.model,
-          returned_model: typeof result.payload.model === "string" ? result.payload.model : null,
+          returned_model: result.payload.model ?? null,
           usage: result.payload.usage ?? null,
         }));
       }

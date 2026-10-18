@@ -54,9 +54,18 @@ Budget state is process-wide and keyed by route name (plus tier scope for chat),
 
 A route's `model` is *pinned* when it names a concrete version: it contains a digit and does not end with the `latest` alias (case-insensitive). Unpinned models are **accepted** (existing production config keeps working) but are reported as `pinned: false` per route in `GET /semantic/status` and in the Rust `capability_json` (`routes` / `chat_routes`), with one warning per model per process/isolate. Every successful evaluate call logs the route name, requested model, returned model, and provider `usage` when present (Worker: one JSON `console.log` line; Rust: the semantic trace and its log line).
 
+Both values are provider-supplied and therefore untrusted, so they are sanitized before they reach a log line, a trace, status JSON, or a returned payload:
+
+- the returned model name keeps only `[A-Za-z0-9._:/@+-]`, is capped at 128 characters, and becomes `null`/`None` when it carries the route's api key or nothing survives sanitization (a null model never fails an otherwise valid answer set),
+- `usage` is projected onto numeric token counts only — `prompt_tokens`, `completion_tokens`, `total_tokens`, `input_tokens`, `output_tokens` — as non-negative integers; strings, nested objects, and provider diagnostics are dropped, and the projected object is what the logs, traces, status JSON, chat usage counters, and the Worker's evaluate/chat response payloads carry.
+
+Constants: `USAGE_TOKEN_FIELDS` / `MODEL_NAME_MAX_CHARS` in `crates/herdr-mcp/src/semantic.rs` and `SEMANTIC_USAGE_TOKEN_FIELDS` / `SEMANTIC_MODEL_NAME_MAX_CHARS` in `edge/cloudflare/src/semantic-proxy.ts`.
+
 ## Batching and state size
 
 Decision callers already batch every question into one request; that stays. Before sending, the runtime guards the batch: state + all questions ≤ 64k characters and state + longest question ≤ 32k characters. Characters are Unicode code points (Rust `str::chars().count()`, Worker `for (const _ of value)`), so an emoji costs one character on both sides and a 17,000-emoji state is not rejected for being 34,000 UTF-16 units. An oversized state is trimmed deterministically in code (arrays keep their most recent entries, objects keep their trailing serialization order, strings keep their most recent tail behind a `[...trimmed...]` marker). If a trimmed state still cannot fit, the call returns `state_too_large` and the caller falls back to its deterministic rules. The Worker rejects such a request with HTTP 413 and code `semantic_state_too_large`.
+
+The Worker also caps the whole request body at 96 KiB (`readBodyBounded`) *before* it applies that character guard, so a state made of multi-byte characters can pass the character budget and still be rejected. The runtime therefore enforces a second, byte-oriented budget: `MAX_REQUEST_BYTES` (88 KiB, safely under 96 KiB) bounds the serialized evaluate body (`state` + `questions`) exactly as the Edge proxy receives it, and the same deterministic trimming runs against bytes. Both budgets must hold; when even a trimmed state cannot fit, the call still returns `state_too_large`. The Worker keeps its unchanged 96 KiB cap and mirrors the constant name (`SEMANTIC_MAX_REQUEST_BYTES`) so a body at the runtime budget is accepted rather than rejected with 413.
 
 ## Confidence thresholds
 

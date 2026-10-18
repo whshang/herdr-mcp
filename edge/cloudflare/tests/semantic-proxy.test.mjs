@@ -2,7 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  SEMANTIC_MAX_REQUEST_BYTES,
   handleSemanticProxy,
+  projectSemanticUsage,
+  sanitizeSemanticModel,
   semanticBackoffMs,
   semanticModelPinned,
   semanticRouteHealthSnapshot,
@@ -440,6 +443,87 @@ test("user is not rejected for astral characters in state | Given a state of 17,
     return providerAnswer();
   }, async () => {
     const response = await handleSemanticProxy(evaluateRequest({ state, questions: QUESTIONS }), env);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).answers.useful.noul, 0.92);
+  });
+  assert.equal(calls, 1);
+});
+
+test("user never sees a credential echoed back through provider usage or model | Given a route key echoed in usage and model | When evaluation runs | Then logs, status, and the response keep only numeric token counts", async () => {
+  const env = makeEnv([route("echo-safe")]);
+  const key = "secret-for-echo-safe";
+  const logged = [];
+  const originalLog = console.log;
+  console.log = (...args) => logged.push(args.map(String).join(" "));
+  let responseText = "";
+  try {
+    await withFetch(async () => new Response(JSON.stringify({
+      model: key,
+      answers: { useful: { type: "noul", noul: 0.92 } },
+      usage: {
+        prompt_tokens: 5,
+        completion_tokens: 2,
+        total_tokens: 7,
+        diagnostic: `Bearer ${key}`,
+        nested: { x: key },
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } }), async () => {
+      const response = await handleSemanticProxy(evaluateRequest(BODY), env);
+      assert.equal(response.status, 200);
+      responseText = await response.text();
+    });
+    const status = await handleSemanticProxy(statusRequest(), env);
+    const statusText = await status.text();
+    assert.equal(statusText.includes(key), false);
+  } finally {
+    console.log = originalLog;
+  }
+
+  // The credential-carrying model is dropped and only allowlisted numeric
+  // token counts survive the usage projection.
+  const payload = JSON.parse(responseText);
+  assert.equal(payload.model, null);
+  assert.deepEqual(payload.usage, { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 });
+  assert.equal(responseText.includes(key), false);
+
+  const success = logged.find((line) => line.includes("semantic_evaluate"));
+  assert.ok(success, logged.join("\n"));
+  const parsed = JSON.parse(success);
+  assert.equal(parsed.route, "echo-safe");
+  assert.equal(parsed.returned_model, null);
+  assert.deepEqual(parsed.usage, { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 });
+  assert.equal(logged.join("\n").includes(key), false);
+
+  // The projection and sanitizer are the shared gate both paths use.
+  assert.deepEqual(
+    projectSemanticUsage({ prompt_tokens: 5, diagnostic: key, nested: { x: key } }),
+    { prompt_tokens: 5 },
+  );
+  assert.equal(projectSemanticUsage({ diagnostic: key }), null);
+  assert.equal(projectSemanticUsage({ prompt_tokens: -1, total_tokens: 2.5 }), null);
+  assert.equal(sanitizeSemanticModel(key, key), null);
+  assert.equal(sanitizeSemanticModel("!!!", key), null);
+  assert.equal(sanitizeSemanticModel("jev-2026-05-01", key), "jev-2026-05-01");
+  assert.equal(sanitizeSemanticModel(`jev ${"x".repeat(200)}`, key).length, 128);
+});
+
+test("user is accepted at the runtime request byte budget | Given an evaluate body at the 88 KiB runtime budget | When the proxy receives it | Then it is answered instead of rejected with 413", async () => {
+  const env = makeEnv([route("byte-budget")]);
+  // One emoji is four UTF-8 bytes but one code point: the state fills the byte
+  // budget without touching the character guard.
+  const state = "😀".repeat(Math.floor((SEMANTIC_MAX_REQUEST_BYTES - 512) / 4));
+  const body = { state, questions: QUESTIONS };
+  const bodyBytes = Buffer.byteLength(JSON.stringify(body));
+  assert.ok(bodyBytes <= SEMANTIC_MAX_REQUEST_BYTES, `${bodyBytes} bytes`);
+  assert.ok(bodyBytes > SEMANTIC_MAX_REQUEST_BYTES - 1024, `${bodyBytes} bytes`);
+
+  let calls = 0;
+  await withFetch(async () => {
+    calls += 1;
+    return providerAnswer();
+  }, async () => {
+    const response = await handleSemanticProxy(evaluateRequest(body), env);
+    assert.notEqual(response.status, 413);
     assert.equal(response.status, 200);
     assert.equal((await response.json()).answers.useful.noul, 0.92);
   });
