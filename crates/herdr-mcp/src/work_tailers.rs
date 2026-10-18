@@ -162,7 +162,9 @@ struct Scope {
 struct IngestedFile {
     scope: ScopeKey,
     cursor: Cursor,
-    appended: usize,
+    /// Events parsed from this file; persisted later in the same SQLite
+    /// transaction as the cursor advance.
+    events: Vec<NewWorkEvent>,
 }
 
 #[derive(Debug)]
@@ -247,13 +249,13 @@ fn ingest_from_dirs_with_refs(
     }
 
     let mut dirty = BTreeSet::<ScopeKey>::new();
-    let mut appended = 0usize;
+    let mut pending_events = Vec::<NewWorkEvent>::new();
     for log in discover_logs(dirs) {
         let path_key = log.path.to_string_lossy().into_owned();
         let previous = cursor_index.get(&path_key).cloned();
-        match ingest_file(store, &log, &path_key, previous.as_ref(), &scopes, now_ms) {
+        match ingest_file(&log, &path_key, previous.as_ref(), &scopes, now_ms) {
             Ok(FileOutcome::Ingested(result)) => {
-                appended += result.appended;
+                pending_events.extend(result.events);
                 if let Some((old_scope, _)) = previous.as_ref()
                     && old_scope != &result.scope
                 {
@@ -280,7 +282,7 @@ fn ingest_from_dirs_with_refs(
             }
             Err(error) => {
                 return Err(format!(
-                    "cannot store events from {} log {}: {error}",
+                    "cannot ingest {} log {}: {error}",
                     log.provider.name(),
                     log.path.display()
                 ));
@@ -288,25 +290,21 @@ fn ingest_from_dirs_with_refs(
         }
     }
 
-    // Persist only scopes whose cursors changed, and only their cursor field,
-    // so a concurrent compaction update of handoff_md/through_event_id is not
-    // clobbered by the stale snapshot loaded above.
-    for key in &dirty {
-        let Some(incoming) = states.get(key) else {
-            continue;
-        };
-        let mut row = store
-            .work_state(&key.0, &key.1)?
-            .unwrap_or_else(|| WorkState {
-                project_ref: key.0.clone(),
-                worktree: key.1.clone(),
-                ..WorkState::default()
-            });
-        row.log_cursors_json = incoming.log_cursors_json.clone();
-        row.updated_at = incoming.updated_at;
-        store.put_work_state(&row)?;
-    }
-    Ok(appended)
+    // Advance every dirty scope's cursors in the same SQLite transaction as the
+    // event inserts so a crash cannot leave the cursor ahead of committed rows.
+    let cursor_updates: Vec<(String, String, String, i64)> = dirty
+        .iter()
+        .filter_map(|key| {
+            let incoming = states.get(key)?;
+            Some((
+                key.0.clone(),
+                key.1.clone(),
+                incoming.log_cursors_json.clone(),
+                incoming.updated_at,
+            ))
+        })
+        .collect();
+    store.commit_work_tail_batch(&pending_events, &cursor_updates)
 }
 
 fn scopes(roots: &[PathBuf], project_refs: &BTreeMap<PathBuf, String>) -> Vec<Scope> {
@@ -503,12 +501,11 @@ fn collect_jsonl(
     }
 }
 
-/// Scan one log file from its stored cursor forward. `Err` is reserved for
-/// journal-store failures; per-file I/O problems are logged and reported as
-/// [`FileOutcome::Unreadable`], so one bad file never aborts the scan or
-/// discards the cursors of files that already succeeded.
+/// Scan one log file from its stored cursor forward. Per-file I/O problems are
+/// logged and reported as [`FileOutcome::Unreadable`], so one bad file never
+/// aborts the scan. Parsed events are returned for a later shared SQLite
+/// transaction with the cursor advance (persisted via StateStore::commit_work_tail_batch).
 fn ingest_file(
-    store: &StateStore,
     log: &LogFile,
     path_key: &str,
     previous: Option<&(ScopeKey, Cursor)>,
@@ -564,7 +561,7 @@ fn ingest_file(
     };
     let mut reader = std::io::BufReader::new(file);
     let mut offset = start;
-    let mut appended = 0usize;
+    let mut events = Vec::<NewWorkEvent>::new();
     let mut session_account = session_account;
 
     loop {
@@ -575,6 +572,10 @@ fn ingest_file(
         }) else {
             break;
         };
+        // Advance past every complete line (including unparseable ones) so the
+        // cursor never silently leaves bytes unaccounted; incomplete trailing
+        // lines stay behind the cursor via read_complete_line. Log parse
+        // failures explicitly — never skip without a record.
         offset += consumed;
         let value = match serde_json::from_slice::<Value>(&line) {
             Ok(value) => value,
@@ -633,7 +634,7 @@ fn ingest_file(
                 log.provider.name(),
                 path_key
             );
-            let event = NewWorkEvent {
+            events.push(NewWorkEvent {
                 ts: event.ts.unwrap_or(now_ms),
                 project_ref: project_ref.clone(),
                 worktree: worktree.clone(),
@@ -643,10 +644,7 @@ fn ingest_file(
                 summary: clip_chars(&summary, EVENT_TEXT_CHARS),
                 source_ref: format!("native-log:{path_key}"),
                 dedupe_key: Some(dedupe),
-            };
-            if store.append_work_event(&event)?.is_some() {
-                appended += 1;
-            }
+            });
         }
     }
 
@@ -658,7 +656,7 @@ fn ingest_file(
                 offset,
                 first_line_hash,
             },
-            appended,
+            events,
         }),
         None => FileOutcome::Unmanaged,
     })
