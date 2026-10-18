@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Mutex, OnceLock,
-    atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
 use url::Url;
@@ -86,8 +86,6 @@ const MAX_CHAT_MESSAGE_BYTES: usize = 64 * 1024;
 const EDGE_PROXY_PROBE_TTL: Duration = Duration::from_secs(60);
 static EDGE_PROXY_AVAILABILITY: Mutex<Option<(Instant, crate::worker::SemanticProxyCapabilities)>> =
     Mutex::new(None);
-static ROUTE_CURSOR: AtomicUsize = AtomicUsize::new(0);
-static CHAT_ROUTE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 /// Per-route pool health: consecutive retryable failures plus the cooldown
 /// deadline they earned. Streak and deadline live in one struct under one lock
 /// so an out-of-order completion can never shorten a cooldown that a stricter
@@ -1209,14 +1207,12 @@ impl RouteBudget {
 #[cfg(test)]
 fn execute_route_pool<T>(
     route_count: usize,
-    cursor: &AtomicUsize,
     budget: RouteBudget,
     mut route_id: impl FnMut(usize) -> String,
     call: impl FnMut(usize, Duration) -> Result<T, SemanticError>,
 ) -> Result<T, SemanticError> {
     execute_route_pool_with_observer(
         route_count,
-        cursor,
         budget,
         |index| RoutePlan {
             id: route_id(index),
@@ -1241,16 +1237,17 @@ struct RoutePlan {
 
 fn execute_route_pool_with_observer<T>(
     route_count: usize,
-    cursor: &AtomicUsize,
     budget: RouteBudget,
     mut route_plan: impl FnMut(usize) -> RoutePlan,
     mut call: impl FnMut(usize, Duration) -> Result<T, SemanticError>,
     mut observe: impl FnMut(&str, &'static str, Duration, &Result<T, SemanticError>),
 ) -> Result<T, SemanticError> {
-    // Round-robin: each call starts one route further than the previous one so
-    // the pool spreads load instead of always leaning on the configured first
-    // route. Routes inside their cooldown are skipped.
-    let start = cursor.fetch_add(1, AtomicOrdering::Relaxed) % route_count.max(1);
+    // Configuration order is the priority order (AGENTS.md rule 8): the first
+    // healthy route is the primary and keeps serving. The routes behind it are
+    // bounded fallbacks that only run after a failure, a cooldown, or a
+    // per-route budget skip. Round-robin load spreading is Worker-only
+    // behaviour (see docs/semantic-routing.md).
+    let start = 0;
     let deadline = Instant::now() + budget.total;
     let mut last = SemanticError::new("provider_unavailable");
     let mut attempted = false;
@@ -1460,7 +1457,6 @@ impl SemanticService {
         }
         execute_route_pool_with_observer(
             self.providers.len(),
-            &ROUTE_CURSOR,
             budget,
             |index| RoutePlan {
                 id: self.providers[index].id().to_owned(),
@@ -1575,7 +1571,6 @@ impl SemanticService {
         }
         let result = execute_route_pool_with_observer(
             self.chat_providers.len(),
-            &CHAT_ROUTE_CURSOR,
             options.tier.chat_budget(timeout),
             |index| RoutePlan {
                 id: self.chat_providers[index].id().to_owned(),
@@ -2877,7 +2872,7 @@ mod tests {
     use std::net::TcpListener;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     fn one_shot_server_with_status(status: u16, body: &'static str) -> String {
@@ -3110,7 +3105,6 @@ mod tests {
     #[test]
     fn explicit_route_budget_fails_over_before_total_timeout() {
         let _guard = crate::test_env::lock();
-        ROUTE_CURSOR.store(0, Ordering::Relaxed);
         clear_route_pool_state();
 
         let slow = one_shot_slow_server(
@@ -3178,57 +3172,133 @@ mod tests {
         assert_eq!(service.capability_json()["provider_state"], "degraded");
     }
 
-    #[test]
-    fn provider_pool_round_robins_across_routes() {
-        let _guard = crate::test_env::lock();
-        ROUTE_CURSOR.store(0, Ordering::Relaxed);
-        clear_route_pool_state();
-
-        let route_a =
-            one_shot_server(r#"{"model":"jev-a","answers":{"q":{"type":"noul","noul":0.91}}}"#);
-        let route_b =
-            one_shot_server(r#"{"model":"jev-b","answers":{"q":{"type":"noul","noul":0.92}}}"#);
-        let request = SemanticRequest::new(json!({"task":"route"})).ask(
+    fn noul_route_request() -> SemanticRequest {
+        SemanticRequest::new(json!({"task":"route"})).ask(
             "q",
             SemanticQuestion::noul("Can work continue?", "yes", "no"),
-        );
-        let service = SemanticService {
+        )
+    }
+
+    fn two_decision_routes(
+        primary: (&str, &str, &str),
+        fallback: (&str, &str, &str),
+    ) -> SemanticService {
+        let (primary_id, primary_url, primary_model) = primary;
+        let (fallback_id, fallback_url, fallback_model) = fallback;
+        SemanticService {
             providers: vec![
                 Box::new(
                     HttpSemanticProvider::new(
-                        "route-a".to_owned(),
+                        primary_id.to_owned(),
                         SemanticProtocol::Decision,
                         "key-a".to_owned(),
-                        route_a,
-                        "jev-a".to_owned(),
+                        primary_url.to_owned(),
+                        primary_model.to_owned(),
                     )
                     .unwrap(),
                 ),
                 Box::new(
                     HttpSemanticProvider::new(
-                        "route-b".to_owned(),
+                        fallback_id.to_owned(),
                         SemanticProtocol::Decision,
                         "key-b".to_owned(),
-                        route_b,
-                        "jev-b".to_owned(),
+                        fallback_url.to_owned(),
+                        fallback_model.to_owned(),
                     )
                     .unwrap(),
                 ),
             ],
             chat_providers: Vec::new(),
-        };
+        }
+    }
 
-        let first = service.evaluate(&request).unwrap();
-        let second = service.evaluate(&request).unwrap();
-        assert_eq!(first.provider, "route-a");
-        assert_eq!(second.provider, "route-b");
+    #[test]
+    fn configuration_order_decides_the_primary_route_on_every_call() {
+        let _guard = crate::test_env::lock();
+        clear_route_pool_state();
+
+        // AGENTS.md rule 8: the first healthy route is the primary. Load is not
+        // spread across the pool, so the fallback behind it stays untouched.
+        let primary_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let fallback_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let primary = counted_server(
+            r#"{"model":"jev-a","answers":{"q":{"type":"noul","noul":0.91}}}"#,
+            primary_requests.clone(),
+        );
+        let fallback = counted_server(
+            r#"{"model":"jev-b","answers":{"q":{"type":"noul","noul":0.92}}}"#,
+            fallback_requests.clone(),
+        );
+        let service = two_decision_routes(
+            ("route-a", &primary, "jev-a"),
+            ("route-b", &fallback, "jev-b"),
+        );
+        let request = noul_route_request();
+
+        for _ in 0..3 {
+            assert_eq!(service.evaluate(&request).unwrap().provider, "route-a");
+        }
+        assert_eq!(primary_requests.load(Ordering::Relaxed), 3);
+        assert_eq!(fallback_requests.load(Ordering::Relaxed), 0);
+
+        clear_route_pool_state();
+    }
+
+    #[test]
+    fn failed_primary_serves_from_the_fallback_until_its_cooldown_ends() {
+        let _guard = crate::test_env::lock();
+        clear_route_pool_state();
+
+        let primary_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let fallback_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        // The primary answers one 429 and then recovers, so the test can show
+        // both halves of the contract: failover while cooling down, and the
+        // primary taking its traffic back afterwards.
+        let primary = scripted_server(
+            vec![
+                (429, r#"{"error":"rate limited"}"#),
+                (
+                    200,
+                    r#"{"model":"jev-a","answers":{"q":{"type":"noul","noul":0.91}}}"#,
+                ),
+            ],
+            primary_requests.clone(),
+        );
+        let fallback = counted_server(
+            r#"{"model":"jev-b","answers":{"q":{"type":"noul","noul":0.92}}}"#,
+            fallback_requests.clone(),
+        );
+        let service = two_decision_routes(
+            ("route-a", &primary, "jev-a"),
+            ("route-b", &fallback, "jev-b"),
+        );
+        let request = noul_route_request();
+
+        // The primary's 429 is a bounded fallback trigger, not a rotation.
+        assert_eq!(service.evaluate(&request).unwrap().provider, "route-b");
+        assert!(route_is_cooling_down("route-a"));
+        // While the primary cools down every call goes to the fallback, and the
+        // cooling route is not contacted again.
+        assert_eq!(service.evaluate(&request).unwrap().provider, "route-b");
+        assert_eq!(service.evaluate(&request).unwrap().provider, "route-b");
+        assert_eq!(primary_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(fallback_requests.load(Ordering::Relaxed), 3);
+
+        // Cooldown state cleared (the deterministic form of "expired"): the
+        // configured first route is the primary again.
+        clear_route_pool_state();
+        let recovered = service.evaluate(&request).unwrap();
+        assert_eq!(recovered.provider, "route-a");
+        assert_eq!(recovered.model.as_deref(), Some("jev-a"));
+        assert_eq!(primary_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(fallback_requests.load(Ordering::Relaxed), 3);
+
+        clear_route_pool_state();
     }
 
     #[test]
     fn provider_pool_fails_over_for_typed_and_chat_requests() {
         let _guard = crate::test_env::lock();
-        ROUTE_CURSOR.store(0, Ordering::Relaxed);
-        CHAT_ROUTE_CURSOR.store(0, Ordering::Relaxed);
         clear_route_pool_state();
 
         let typed_bad = one_shot_server_with_status(500, r#"{"error":"temporary"}"#);
@@ -3552,13 +3622,11 @@ mod tests {
     fn a_slow_route_leaves_failover_budget_for_the_routes_behind_it() {
         let _guard = crate::test_env::lock();
         clear_route_pool_state();
-        let cursor = AtomicUsize::new(0);
         let budget = RouteBudget::split(Duration::from_millis(50), Duration::from_millis(200));
         let mut granted = Vec::new();
 
         let served = execute_route_pool(
             3,
-            &cursor,
             budget,
             |index| format!("budget-test-{index}"),
             |index, allowance| {
@@ -3577,10 +3645,8 @@ mod tests {
         assert_eq!(granted.len(), 2);
         assert!(granted.iter().all(|allowance| *allowance <= budget.attempt));
 
-        cursor.store(0, Ordering::Relaxed);
         let after_timeout = execute_route_pool(
             3,
-            &cursor,
             budget,
             |index| format!("budget-test-{index}"),
             |index, _| Ok(index),
@@ -3612,14 +3678,12 @@ mod tests {
     fn foreground_and_background_cooldowns_are_independent() {
         let _guard = crate::test_env::lock();
         clear_route_pool_state();
-        let cursor = AtomicUsize::new(0);
         let foreground = RouteBudget::split(Duration::from_millis(50), Duration::from_millis(200));
         let background = foreground.scoped(SemanticTier::Background.cooldown_scope());
 
         // A foreground timeout cools the route down for foreground callers only.
         let _ = execute_route_pool(
             1,
-            &cursor,
             foreground,
             |_| "tier-route".to_owned(),
             |_, _| Err::<usize, _>(SemanticError::new("timeout")),
@@ -3627,26 +3691,13 @@ mod tests {
         assert!(route_is_cooling_down("tier-route"));
         assert!(!route_is_cooling_down("background:tier-route"));
         assert_eq!(
-            execute_route_pool(
-                1,
-                &cursor,
-                foreground,
-                |_| "tier-route".to_owned(),
-                |_, _| Ok(1)
-            )
-            .unwrap_err()
-            .code(),
+            execute_route_pool(1, foreground, |_| "tier-route".to_owned(), |_, _| Ok(1))
+                .unwrap_err()
+                .code(),
             "routes_cooling_down"
         );
         assert_eq!(
-            execute_route_pool(
-                1,
-                &cursor,
-                background,
-                |_| "tier-route".to_owned(),
-                |_, _| Ok(7)
-            )
-            .unwrap(),
+            execute_route_pool(1, background, |_| "tier-route".to_owned(), |_, _| Ok(7)).unwrap(),
             7
         );
 
@@ -3654,7 +3705,6 @@ mod tests {
         clear_route_pool_state();
         let _ = execute_route_pool(
             1,
-            &cursor,
             background,
             |_| "tier-route".to_owned(),
             |_, _| Err::<usize, _>(SemanticError::new("timeout")),
@@ -3845,12 +3895,10 @@ mod tests {
 
         let _guard = crate::test_env::lock();
         clear_route_pool_state();
-        let cursor = AtomicUsize::new(0);
         let budget = RouteBudget::split(Duration::from_millis(50), Duration::from_millis(200));
         for expected_streak in 1..=3 {
             let _ = execute_route_pool(
                 1,
-                &cursor,
                 budget,
                 |_| "backoff-route".to_owned(),
                 |_, _| Err::<usize, _>(SemanticError::new("http_429")),
@@ -3862,17 +3910,10 @@ mod tests {
             clear_route_cooldowns();
         }
         // A single success resets the streak, so the next failure restarts at 1s.
-        let _ = execute_route_pool(
-            1,
-            &cursor,
-            budget,
-            |_| "backoff-route".to_owned(),
-            |_, _| Ok(1),
-        );
+        let _ = execute_route_pool(1, budget, |_| "backoff-route".to_owned(), |_, _| Ok(1));
         assert_eq!(current_route_failure_streak("backoff-route"), 0);
         let _ = execute_route_pool(
             1,
-            &cursor,
             budget,
             |_| "backoff-route".to_owned(),
             |_, _| Err::<usize, _>(SemanticError::new("http_429")),
@@ -3904,7 +3945,6 @@ mod tests {
     #[test]
     fn over_budget_route_is_skipped_without_cooldown() {
         let _guard = crate::test_env::lock();
-        ROUTE_CURSOR.store(0, Ordering::Relaxed);
         clear_route_pool_state();
 
         let first =
@@ -3948,7 +3988,6 @@ mod tests {
 
         // Second call in the same second would exceed route A's 1 rps budget, so
         // the pool moves on to route B instead of sending.
-        ROUTE_CURSOR.store(0, Ordering::Relaxed);
         let skipped = service.evaluate(&request).unwrap();
         assert_eq!(skipped.provider, "route-budget-b");
         assert!(!route_is_cooling_down("route-budget-a"));
@@ -3969,6 +4008,36 @@ mod tests {
                 requests.fetch_add(1, Ordering::Relaxed);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{}/v1", address.port())
+    }
+
+    /// Server that answers consecutive requests with the given `(status, body)`
+    /// pairs and counts them. Once the script is used up the last answer
+    /// repeats, so a wrong expectation shows up as a failed assertion rather
+    /// than as a refused connection.
+    fn scripted_server(
+        answers: Vec<(u16, &'static str)>,
+        requests: std::sync::Arc<AtomicUsize>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut script = answers.into_iter();
+            let mut last = (500_u16, r#"{"error":"unscripted"}"#);
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0_u8; 16 * 1024];
+                let _ = stream.read(&mut request);
+                requests.fetch_add(1, Ordering::Relaxed);
+                let (status, body) = script.next().unwrap_or(last);
+                last = (status, body);
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
@@ -4042,7 +4111,6 @@ mod tests {
     #[test]
     fn budget_skipped_routes_do_not_consume_the_attempt_limit() {
         let _guard = crate::test_env::lock();
-        ROUTE_CURSOR.store(0, Ordering::Relaxed);
         clear_route_pool_state();
 
         // Three routes whose token budget cannot fit even one request and one
@@ -4100,13 +4168,11 @@ mod tests {
     fn later_retryable_failure_cannot_shorten_a_credential_cooldown() {
         let _guard = crate::test_env::lock();
         clear_route_pool_state();
-        let cursor = AtomicUsize::new(0);
         let budget = RouteBudget::split(Duration::from_millis(50), Duration::from_millis(200));
 
         // A credential failure earns the fixed 300s cooldown.
         let _ = execute_route_pool(
             1,
-            &cursor,
             budget,
             |_| "out-of-order-health".to_owned(),
             |_, _| Err::<usize, _>(SemanticError::new("http_401")),
@@ -4129,7 +4195,6 @@ mod tests {
     #[test]
     fn capability_reports_model_pinning_and_never_leaks_the_api_key() {
         let _guard = crate::test_env::lock();
-        ROUTE_CURSOR.store(0, Ordering::Relaxed);
         if let Ok(mut traces) = semantic_traces().lock() {
             traces.clear();
         }
@@ -4217,8 +4282,6 @@ mod tests {
         const CHAT_BODY: &str = r#"{"model":"sk-test-credential-123","choices":[{"message":{"content":"continue"}}],"usage":{"prompt_tokens":5,"diagnostic":"Bearer sk-test-credential-123","nested":{"x":"sk-test-credential-123"}}}"#;
 
         let _guard = crate::test_env::lock();
-        ROUTE_CURSOR.store(0, Ordering::Relaxed);
-        CHAT_ROUTE_CURSOR.store(0, Ordering::Relaxed);
         if let Ok(mut traces) = semantic_traces().lock() {
             traces.clear();
         }

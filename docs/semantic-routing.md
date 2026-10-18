@@ -9,7 +9,7 @@ Two code paths share one set of routing semantics for semantic judgment calls:
 | Cloudflare Worker proxy | `edge/cloudflare/src/semantic-proxy.ts` | `HERDR_SEMANTIC_ROUTES` secret (JSON array) |
 | Local runtime | `crates/herdr-mcp/src/semantic.rs` (+ `config.rs`) | `config.json` `semantic.routes` |
 
-Change one and you must change the other. Each file points at the other in a comment next to its routing constants. `work_compactor.rs` reuses the same local `SemanticService`, so it inherits all of the behavior below.
+Route fields, cooldown/backoff, rate budgets, model pinning, and the confidence gates are shared: change one path and you must change the other. Route **selection order** is the one deliberate difference — the standalone runtime prefers the first healthy route, the Worker spreads load (see [Load balancing](#load-balancing)). Each file points at the other in a comment next to its routing constants. `work_compactor.rs` reuses the same local `SemanticService`, so it inherits all of the behavior below.
 
 ## Route fields
 
@@ -32,7 +32,12 @@ Change one and you must change the other. Each file points at the other in a com
 
 ## Load balancing
 
-Each pool keeps a start cursor and begins one route further along on every call (round-robin), so the configured first route is not the only one used. Routes inside their cooldown window are skipped. The existing attempt limit (3 attempts, plus the per-tier deadline) still bounds a single call.
+The two paths select routes differently, on purpose.
+
+- **Standalone runtime** (`crates/herdr-mcp/src/semantic.rs`): configuration order **is** priority order (AGENTS.md rule 8). The first route that is healthy is the primary and serves every call. The routes behind it are bounded fallbacks that only run when an earlier route fails, is inside its cooldown window, or is skipped by its own rate budget. Failover does not rotate the primary, so an earlier route takes the traffic back as soon as it recovers.
+- **Cloudflare Worker** (`edge/cloudflare/src/semantic-proxy.ts`): round-robin across healthy routes. Each call starts one route further along than the previous one, so no single route carries the whole pool.
+
+On both paths routes inside their cooldown window are skipped, and the existing attempt limit (3 attempts, plus the per-tier deadline) still bounds a single call.
 
 A route skipped by its own rate budget does **not** use one of those attempts: the budget is reserved before an attempt is counted, so three over-budget routes in front of a healthy route cannot starve it.
 
@@ -52,7 +57,7 @@ Budget state is process-wide and keyed by route name (plus tier scope for chat),
 
 ## Model pinning
 
-A route's `model` is *pinned* when it names a concrete version: it contains a digit and does not end with the `latest` alias (case-insensitive). Unpinned models are **accepted** (existing production config keeps working) but are reported as `pinned: false` per route in `GET /semantic/status` and in the Rust `capability_json` (`routes` / `chat_routes`), with one warning per model per process/isolate. Every successful evaluate call logs the route name, requested model, returned model, and provider `usage` when present (Worker: one JSON `console.log` line; Rust: the semantic trace and its log line).
+A route's `model` is *pinned* when it names a concrete version: it contains a digit and does not end with the `latest` alias (case-insensitive). An unpinned model is **flagged, never refused**: it is accepted and used (existing production config keeps working) but is reported as `pinned: false` per route in `GET /semantic/status` and in the Rust `capability_json` (`routes` / `chat_routes`), with one warning per model per process/isolate. Every successful evaluate call logs the route name, requested model, returned model, and provider `usage` when present (Worker: one JSON `console.log` line; Rust: the semantic trace and its log line).
 
 Both values are provider-supplied and therefore untrusted, so they are sanitized before they reach a log line, a trace, status JSON, or a returned payload:
 
