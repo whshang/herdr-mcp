@@ -211,7 +211,7 @@ test("user never exceeds a route rate budget | Given a route with a token budget
   });
 });
 
-test("user keeps old semantic secrets working | Given a secret without budget fields and one with budgets | Then both parse and invalid budgets are rejected", async () => {
+test("user keeps old semantic secrets working | Given a secret without budget fields and one with budgets | When the routes are parsed | Then both parse and invalid budgets are rejected", async () => {
   const legacy = makeEnv([route("legacy-route")]);
   const legacyStatus = await handleSemanticProxy(statusRequest(), legacy);
   assert.equal(legacyStatus.status, 200);
