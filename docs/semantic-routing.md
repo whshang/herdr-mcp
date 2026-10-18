@@ -1,0 +1,90 @@
+# Semantic routing (jev decision protocol)
+
+Last reviewed: 2026-10-18 23:10 +08:00
+
+Two code paths share one set of routing semantics for semantic judgment calls:
+
+| Path | Code | Route source |
+| --- | --- | --- |
+| Cloudflare Worker proxy | `edge/cloudflare/src/semantic-proxy.ts` | `HERDR_SEMANTIC_ROUTES` secret (JSON array) |
+| Local runtime | `crates/herdr-mcp/src/semantic.rs` (+ `config.rs`) | `config.json` `semantic.routes` |
+
+Route fields, cooldown/backoff, rate budgets, model pinning, and the confidence gates are shared: change one path and you must change the other. Route **selection order** is the one deliberate difference — the standalone runtime prefers the first healthy route, the Worker spreads load (see [Load balancing](#load-balancing)). Each file points at the other in a comment next to its routing constants. `work_compactor.rs` reuses the same local `SemanticService`, so it inherits all of the behavior below.
+
+## Route fields
+
+```json
+[{
+  "name": "primary",
+  "protocol": "decision",
+  "url": "https://api.typesafe.ai/v1/systemone",
+  "model": "jev-2026-05-01",
+  "api_key": "<secret>",
+  "max_requests_per_second": 80,
+  "max_tokens_per_second": 100000
+}]
+```
+
+- `name`, `protocol` (`decision` | `decision-vercel` | `openai-chat`), `url`, `model`, `api_key` are required.
+- `max_requests_per_second` (default 80) and `max_tokens_per_second` (default 100000) are optional positive integers. A secret/`config.json` written before they existed parses and behaves exactly as before. The Worker rejects a non-integer or non-positive budget as `semantic_provider_misconfigured`; the local runtime falls back to the default, so a stale `0` cannot silently disable a route.
+- Unknown keys are rejected (Worker: `semantic_provider_misconfigured`; Rust: `deny_unknown_fields`).
+- Credentials never appear in status JSON, traces, logs, errors, `Debug` output, or handoff/memory files. Only the route name and model are ever reported.
+
+## Load balancing
+
+The two paths select routes differently, on purpose.
+
+- **Standalone runtime** (`crates/herdr-mcp/src/semantic.rs`): configuration order **is** priority order (AGENTS.md rule 8). The first route that is healthy is the primary and serves every call. The routes behind it are bounded fallbacks that only run when an earlier route fails, is inside its cooldown window, or is skipped by its own rate budget. Failover does not rotate the primary, so an earlier route takes the traffic back as soon as it recovers.
+- **Cloudflare Worker** (`edge/cloudflare/src/semantic-proxy.ts`): round-robin across healthy routes. Each call starts one route further along than the previous one, so no single route carries the whole pool.
+
+On both paths routes inside their cooldown window are skipped, and the existing attempt limit (3 attempts, plus the per-tier deadline) still bounds a single call.
+
+A route skipped by its own rate budget does **not** use one of those attempts: the budget is reserved before an attempt is counted, so three over-budget routes in front of a healthy route cannot starve it.
+
+## Cooldown and backoff
+
+- Retryable failures — `429`, `5xx`, `408`, timeout, network error, invalid provider response — cool the route down with exponential backoff: 1s base, doubling per consecutive failure, capped at 60s. A success resets the streak.
+- `401`/`403` (Worker) and additionally `400`/`404`/`422` (local) use a fixed 300s cooldown; a quick retry cannot help those.
+- Cooldown writes keep the **later** deadline (`max(existing, new)`), and the failure streak plus deadline live in one record under one lock. Failures that complete out of order therefore cannot shorten a longer cooldown already in force: a 1s backoff recorded after a 300s credential cooldown leaves the 300s in place.
+- A route skipped by its own rate budget is **not** cooled down — the pool simply tries the next route.
+- Pool health is inspectable without changing the status contract: `semanticRouteHealthSnapshot(name)` returns `consecutive_failures` and `cooldown_remaining_ms` for one route, and the local `capability_json` reports `consecutive_failures` per route. Neither ever includes a credential.
+
+## Rate budget
+
+Each route has a 1-second fixed window counting requests and estimated tokens (`ceil(serialized request body bytes / 4)`). Before an upstream call, if that call would exceed either budget the route is skipped and the next route is tried, with no cooldown, no provider request, and no attempt-limit attempt consumed. Defaults are deliberately generous; they exist to stop one route from draining a provider quota, not to shape normal traffic.
+
+Budget state is process-wide and keyed by route name (plus tier scope for chat), with the limits read from the route config at call time. The local runtime rebuilds `SemanticService::from_config()` on every call, so a per-provider-object window would never limit anything.
+
+## Model pinning
+
+A route's `model` is *pinned* when it names a concrete version: it contains a digit and does not end with the `latest` alias (case-insensitive). An unpinned model is **flagged, never refused**: it is accepted and used (existing production config keeps working) but is reported as `pinned: false` per route in `GET /semantic/status` and in the Rust `capability_json` (`routes` / `chat_routes`), with one warning per model per process/isolate. Every successful evaluate call logs the route name, requested model, returned model, and provider `usage` when present (Worker: one JSON `console.log` line; Rust: the semantic trace and its log line).
+
+Both values are provider-supplied and therefore untrusted, so they are sanitized before they reach a log line, a trace, status JSON, or a returned payload:
+
+- the model name keeps only `[A-Za-z0-9._:/@+-]` and is capped at 128 characters. A provider name that carries the route's api key or sanitizes to nothing is discarded. The Worker then reports the sanitized configured route model, and `unknown-model` if that is unusable too, so a Worker evaluate/chat response **never** carries `model: null`. The local runtime treats a reported model as optional metadata: it stores `None` when the name is absent, `null`, malformed, or carries the credential, and a missing model never fails an otherwise valid answer set or chat content,
+- `usage` is projected onto numeric token counts only — `prompt_tokens`, `completion_tokens`, `total_tokens`, `input_tokens`, `output_tokens` — as non-negative integers; strings, nested objects, and provider diagnostics are dropped, and the projected object is what the logs, traces, status JSON, chat usage counters, and the Worker's evaluate/chat response payloads carry.
+
+Constants: `USAGE_TOKEN_FIELDS` / `MODEL_NAME_MAX_CHARS` in `crates/herdr-mcp/src/semantic.rs` and `SEMANTIC_USAGE_TOKEN_FIELDS` / `SEMANTIC_MODEL_NAME_MAX_CHARS` / `SEMANTIC_UNKNOWN_MODEL` in `edge/cloudflare/src/semantic-proxy.ts`.
+
+## Batching and state size
+
+Decision callers already batch every question into one request; that stays. Before sending, the runtime guards the batch: state + all questions ≤ 64k characters and state + longest question ≤ 32k characters. Characters are Unicode code points (Rust `str::chars().count()`, Worker `for (const _ of value)`), so an emoji costs one character on both sides and a 17,000-emoji state is not rejected for being 34,000 UTF-16 units. An oversized state is trimmed deterministically in code (arrays keep their most recent entries, objects keep their trailing serialization order, strings keep their most recent tail behind a `[...trimmed...]` marker). If a trimmed state still cannot fit, the call returns `state_too_large` and the caller falls back to its deterministic rules. The Worker rejects such a request with HTTP 413 and code `semantic_state_too_large`.
+
+The Worker also caps the whole request body at 96 KiB (`readBodyBounded`) *before* it applies that character guard, so a state made of multi-byte characters can pass the character budget and still be rejected. The runtime therefore enforces a second, byte-oriented budget: `MAX_REQUEST_BYTES` (88 KiB, safely under 96 KiB) bounds the serialized evaluate body (`state` + `questions`) exactly as the Edge proxy receives it, and the same deterministic trimming runs against bytes. Both budgets must hold; when even a trimmed state cannot fit, the call still returns `state_too_large`. The Worker keeps its unchanged 96 KiB cap and mirrors the constant name (`SEMANTIC_MAX_REQUEST_BYTES`) so a body at the runtime budget is accepted rather than rejected with 413.
+
+## Confidence thresholds
+
+All decision thresholds live in exactly one reviewable file: `crates/herdr-mcp/src/semantic_thresholds.rs` — `CHOICE_MIN_CONFIDENCE`, `SCORE_MIN_CONFIDENCE`, `NOUL_TRUE_THRESHOLD`, `NOUL_FALSE_THRESHOLD`, `DESTRUCTIVE_ACTION_MIN_CONFIDENCE`, plus the `gate_choice` / `gate_destructive` helpers. `DEFAULT_DECISION_THRESHOLD` and `DEFAULT_NEGATIVE_DECISION_THRESHOLD` are re-exported from `semantic.rs` as compatibility aliases of the Noul thresholds.
+
+A Noul probability threshold must never gate a Choice answer, and cleanup — a destructive recommendation — requires the destructive gate (0.9). Below a gate the caller keeps its deterministic/rule result.
+
+## Injected state text
+
+Model input state (page text, branch names, task descriptions, history) is **data**. It is never an instruction source, and injected text cannot bypass the deterministic gates around it:
+
+- question ids, candidate lists, counts, dates, and arithmetic are computed in code; they are never asked of the model, and the request sent upstream always carries exactly the caller's question set, candidates, and model — an injected instruction cannot add a candidate, a question, or a threshold,
+- injected text such as "IGNORE PREVIOUS INSTRUCTIONS" or fake JSON answers changes nothing: a provider answer that echoes the injected instruction still has to clear its own gate, so an echoed destructive answer at 0.4 confidence — or even at 0.89, just under the 0.90 destructive gate — falls back to the deterministic path,
+- a model answer below its threshold falls back to the deterministic path; a destructive action additionally requires the destructive gate,
+- deterministic guards (delivery evidence, permissions, cleanup `safe_to_delete`, idempotency) remain authoritative regardless of any semantic answer.
+
+Tests assert these properties end to end against a local provider: what is sent, what a compliant-but-injected answer yields, and how a near-gate destructive answer is downgraded. They do not claim any resistance the model itself would have to provide.
