@@ -279,6 +279,70 @@ impl StateStore {
         Ok(())
     }
 
+    /// Append work events and persist log cursors in one SQLite transaction.
+    /// Cursor rows update only `log_cursors_json` / `updated_at` after reloading
+    /// the current `work_state` row so a concurrent handoff write is not clobbered.
+    /// Returns the number of newly inserted events (dedupe hits excluded).
+    pub(crate) fn commit_work_tail_batch(
+        &self,
+        events: &[NewWorkEvent],
+        cursor_updates: &[(String, String, String, i64)],
+    ) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("cannot begin work-tail transaction: {error}"))?;
+        let mut appended = 0usize;
+        for event in events {
+            let summary = clip_chars(event.summary.trim(), WORK_SUMMARY_MAX_CHARS);
+            let changed = tx
+                .execute(
+                    "INSERT OR IGNORE INTO work_events (ts, project_ref, worktree, provider, account,                      kind, summary, source_ref, dedupe_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        event.ts,
+                        event.project_ref,
+                        event.worktree,
+                        event.provider,
+                        event.account,
+                        event.kind,
+                        summary,
+                        event.source_ref,
+                        event.dedupe_key,
+                    ],
+                )
+                .map_err(sql_err("cannot append work event"))?;
+            if changed == 1 {
+                appended += 1;
+            }
+        }
+        for (project_ref, worktree, log_cursors_json, updated_at) in cursor_updates {
+            let existing = tx
+                .query_row(
+                    "SELECT handoff_md, through_event_id FROM work_state                      WHERE project_ref = ?1 AND worktree = ?2",
+                    params![project_ref, worktree],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(sql_err("cannot read work state"))?;
+            let (handoff_md, through_event_id) = existing.unwrap_or_default();
+            tx.execute(
+                "INSERT INTO work_state (project_ref, worktree, handoff_md, through_event_id,                  log_cursors_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)                  ON CONFLICT(project_ref, worktree) DO UPDATE SET                  log_cursors_json = excluded.log_cursors_json, updated_at = excluded.updated_at",
+                params![
+                    project_ref,
+                    worktree,
+                    handoff_md,
+                    through_event_id,
+                    log_cursors_json,
+                    updated_at,
+                ],
+            )
+            .map_err(sql_err("cannot save work state"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit work-tail transaction: {error}"))?;
+        Ok(appended)
+    }
+
     /// Retention: delete events older than 30 days. `work_state` is kept.
     pub(crate) fn delete_expired_work_events(&self, now_ms: i64) -> Result<usize, String> {
         self.conn
