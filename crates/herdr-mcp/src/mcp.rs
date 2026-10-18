@@ -9232,7 +9232,9 @@ fn browser_page_action_call(
             "key": bridge_params["key"],
         })
     } else {
-        // Keep the preexisting click/fill hash identical across upgrades.
+        // Keep preexisting click/fill hashes identical when expected_url is absent.
+        // When click carries expected_url, include it so a reused key with a different
+        // navigation postcondition conflicts instead of replaying the prior result.
         json!({
             "operation": BROWSER_PAGE_ACTION_METHOD,
             "endpoint_ref": endpoint_ref,
@@ -9242,6 +9244,11 @@ fn browser_page_action_call(
             "ref": bridge_params["ref"],
             "value_digest": if action == "fill" {
                 bridge_params.get("value").and_then(Value::as_str).map(browser_sha256)
+            } else {
+                None
+            },
+            "expected_url": if action == "click" {
+                bridge_params.get("expected_url").and_then(Value::as_str)
             } else {
                 None
             },
@@ -20377,21 +20384,37 @@ mod tests {
         assert_eq!(denied["code"], "invalid_params");
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
 
+        // Same idempotency key with a different expected_url must conflict, not replay.
+        let mut nav_a = params.clone();
+        nav_a["idempotency_key"] = json!("page-click-expected-url-1");
+        nav_a["expected_url"] = json!("https://example.com/a");
+        let applied_nav = browser_page_action_call(&store, &nav_a, &grants, Some(&actuator));
+        assert_eq!(applied_nav["ok"], true, "{applied_nav}");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
+        let mut nav_b = nav_a.clone();
+        nav_b["expected_url"] = json!("https://example.com/b");
+        let nav_conflict = browser_page_action_call(&store, &nav_b, &grants, Some(&actuator));
+        assert_eq!(nav_conflict["code"], "idempotency_key_conflict");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
+        let nav_replay = browser_page_action_call(&store, &nav_a, &grants, Some(&actuator));
+        assert_eq!(nav_replay["idempotent_replay"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
+
         let mut hover = params.clone();
         hover["action"] = json!("hover");
         hover["idempotency_key"] = json!("page-hover-1");
         let hovered = browser_page_action_call(&store, &hover, &grants, Some(&actuator));
         assert_eq!(hovered["ok"], true, "{hovered}");
         assert_eq!(hovered["delivery_state"], "applied");
-        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 4);
         let replay = browser_page_action_call(&store, &hover, &grants, Some(&actuator));
         assert_eq!(replay["idempotent_replay"], true);
-        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 4);
         hover["value"] = json!("unallowed");
         hover["idempotency_key"] = json!("page-hover-invalid");
         let refused = browser_page_action_call(&store, &hover, &grants, Some(&actuator));
         assert_eq!(refused["code"], "invalid_params");
-        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]
