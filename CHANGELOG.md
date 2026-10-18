@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## v1.1.0-rc.3 — 2026-10-18
+
+- **1.1 第三个预发布（仅 preview 通道）：** Phase 2 浏览器/prompt 修复、endpoint 在线判定与 generation 切换恢复、Generic Browser Page、relay cursor 同事务、Linux native host / DEV sync 加固、Semantic background tier、Page Assist grant migration。stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.3.md](docs/releases/v1.1.0-rc.3.md)。 [PR #655](https://github.com/whshang/herdr-mcp/pull/655) [PR #636](https://github.com/whshang/herdr-mcp/pull/636) [PR #628](https://github.com/whshang/herdr-mcp/pull/628) [PR #642](https://github.com/whshang/herdr-mcp/pull/642) [PR #641](https://github.com/whshang/herdr-mcp/pull/641) [PR #639](https://github.com/whshang/herdr-mcp/pull/639) [PR #633](https://github.com/whshang/herdr-mcp/pull/633) [PR #632](https://github.com/whshang/herdr-mcp/issues/632) [PR #643](https://github.com/whshang/herdr-mcp/pull/643) [PR #647](https://github.com/whshang/herdr-mcp/pull/647) [PR #645](https://github.com/whshang/herdr-mcp/pull/645) [PR #630](https://github.com/whshang/herdr-mcp/pull/630)
 - **#632 浏览器端点在线判定（先升级扩展）：** Runtime 不再把「只轮询 `/push/events`、但未在本 Runtime generation 注册」的 browser endpoint 判为在线；SSE hello 新增 `endpoint_registered`。22s 超时时若命令仍在队列中、从未被扩展取走，则原子移出队列并返回可重试的 `not_delivered`，只有已交给扩展的命令才保留 `delivery_unknown`。**升级顺序：先升级浏览器扩展，再切换 Runtime。** 旧扩展在 Runtime generation 切换后会显示离线，直到其 service worker 重启（chrome://extensions 中重载扩展 service worker，无需重启 Chrome）。 [#632](https://github.com/whshang/herdr-mcp/issues/632)
 
 ## v1.1.0-rc.2 — 2026-10-12

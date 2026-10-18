@@ -41,7 +41,7 @@ Use the cheapest deterministic layer that can finish the work.
 1. Get one aggregate baseline with `herdr_inspect` when live state matters.
 2. Use direct tools for file, Git, and bounded execution work.
 3. Use `herdr_since(cursor)` for incremental change instead of rebuilding the same full snapshot.
-4. Use `herdr_methods(query)` only when an unknown native/private method schema is needed; cache and reuse the discovered shape.
+4. For native Herdr, Skill, and authorized browser actions without dedicated public tools, discover the method with `herdr_methods(query)` and use `herdr_call`. Preserve full `herdr_exec` shell capability when scoped file/Git tools are insufficient.
 5. Delegate only work that benefits from independent reasoning, parallel investigation, or a separate implementation/review lane.
 
 Load the domain Skill when its trigger appears:
@@ -101,7 +101,7 @@ A resumed journal is historical evidence; refresh live state before mutation. Ne
 
 For ChatGPT/WebChat handoff, use the canonical Herdr handoff path from `workstation-control`; preserve one continuity chain and one idempotency identity. Uncertain delivery is reconciliation-only, not an automatic replay.
 
-The browser extension is the browser-side execution/observation boundary for supported WebChat. It is not general RPA and not file transport.
+The browser extension is the execution/observation boundary for supported WebChat and capability-gated Generic Web operations. It is not file transport or an unrestricted browser RPA engine.
 
 ## 7. Herdr-MCP maintenance
 

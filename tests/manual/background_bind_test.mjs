@@ -2937,6 +2937,9 @@ console.log("\n[project handoff]");
   ok(continuityTurnRequests.length === turnRequestsBeforeStarted + 1
       && continuityTurnRequests.at(-1)?.continuity_id === durableContinuityId
       && continuityTurnRequests.at(-1)?.project_id === PROJECT_ID
+      && continuityTurnRequests.at(-1)?.provider === "chatgpt"
+      && continuityTurnRequests.at(-1)?.account == null
+      && continuityTurnRequests.at(-1)?.project === PROJECT_ID
       && String(continuityTurnRequests.at(-1)?.title || "").includes("herdr-mcp")
       && continuityTurnRequests.at(-1)?.role === "user"
       && continuityTurnRequests.at(-1)?.text === "continue durable work",

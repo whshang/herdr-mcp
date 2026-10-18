@@ -8,7 +8,7 @@ use crate::state_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -102,6 +102,11 @@ struct PromptTaskRecord {
     parent_target: Option<String>,
     #[serde(default)]
     parent_session_ref: Option<String>,
+    /// EventCache boot epoch at registration time. Cross-boot reconcile
+    /// cannot trust the persisted cursor against a new process's cache:
+    /// fail closed instead of correlating unrelated later events.
+    #[serde(default)]
+    boot_epoch: Option<String>,
     notification_state: String,
     #[serde(default)]
     notification_attempts: u32,
@@ -172,9 +177,42 @@ struct PromptRecord {
     state: RecordState,
 }
 
+struct HandoffInjection {
+    text: String,
+    marked_now: bool,
+}
+
+impl HandoffInjection {
+    fn not_marked(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            marked_now: false,
+        }
+    }
+
+    fn marked(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            marked_now: true,
+        }
+    }
+}
+
+/// True only when the result proves the prompt never reached the agent
+/// (pre-dispatch resolve failure or a pre-submission socket error). Success
+/// and uncertain delivery (`delivery_uncertain`) both return false: the pane
+/// keeps its handoff mark so we never risk a duplicate injection.
+fn dispatch_definitely_not_delivered(result: &Value) -> bool {
+    result.get("ok").and_then(Value::as_bool) == Some(false)
+        && result.get("delivery_uncertain").and_then(Value::as_bool) != Some(true)
+        && (result.get("delivery_state").and_then(Value::as_str) == Some("not_delivered")
+            || result.get("retryable").and_then(Value::as_bool) == Some(true))
+}
+
 #[derive(Default)]
 struct PromptRegistryInner {
     records: Mutex<HashMap<String, PromptRecord>>,
+    handoff_injected_panes: Mutex<HashSet<String>>,
     store: Option<Arc<Mutex<StateStore>>>,
     cache: Option<Arc<EventCache>>,
     client: Option<HerdrClient>,
@@ -202,6 +240,7 @@ impl PromptRegistry {
         Self {
             inner: Arc::new(PromptRegistryInner {
                 records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
                 client: None,
@@ -217,6 +256,7 @@ impl PromptRegistry {
         let registry = Self {
             inner: Arc::new(PromptRegistryInner {
                 records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: Some(cache),
                 client: Some(client),
@@ -308,6 +348,53 @@ impl PromptRegistry {
         Ok(())
     }
 
+    /// Outcome of a first-dispatch handoff injection attempt. `marked_now` is
+    /// true only when this call placed the per-pane mark, so a clearly failed
+    /// dispatch can un-mark exactly the mark it created.
+    fn inject_handoff_once(&self, pane_id: &str, worktree: &str, text: &str) -> HandoffInjection {
+        let Ok(mut injected) = self.inner.handoff_injected_panes.lock() else {
+            return HandoffInjection::not_marked(text);
+        };
+        if !injected.insert(pane_id.to_owned()) {
+            return HandoffInjection::not_marked(text);
+        }
+        let Some(store) = &self.inner.store else {
+            return HandoffInjection::marked(text);
+        };
+        let Ok(store) = store.lock() else {
+            return HandoffInjection::marked(text);
+        };
+        let Ok(states) = store.work_states() else {
+            return HandoffInjection::marked(text);
+        };
+        let Some(state) = states
+            .into_iter()
+            .filter(|state| state.worktree == worktree && !state.handoff_md.trim().is_empty())
+            .max_by_key(|state| state.updated_at)
+        else {
+            return HandoffInjection::marked(text);
+        };
+        let handoff = crate::state_store::work_journal::clip_chars(&state.handoff_md, 16_000);
+        HandoffInjection {
+            text: format!("## Handoff context\n\n{handoff}\n\n---\n\n{text}"),
+            marked_now: true,
+        }
+    }
+
+    /// Release the per-pane injection mark after a dispatch that provably
+    /// never reached the agent, so the next successful first dispatch still
+    /// delivers the handoff. Never called for uncertain delivery.
+    fn unmark_handoff_injected(&self, pane_id: &str) {
+        if let Ok(mut injected) = self.inner.handoff_injected_panes.lock() {
+            injected.remove(pane_id);
+        }
+    }
+
+    fn pane_worktree(&self, pane_id: &str) -> Option<String> {
+        let snapshot = self.inner.cache.as_ref()?.snapshot();
+        pane_worktree_from_snapshot(&snapshot, pane_id, self.workspace_for_pane(pane_id))
+    }
+
     fn current_task_cursor(&self) -> u64 {
         self.inner
             .cache
@@ -396,6 +483,11 @@ impl PromptRegistry {
             terminal_at_ms: None,
             parent_target: parent_target.map(str::to_owned),
             parent_session_ref: parent_session_ref.map(str::to_owned),
+            boot_epoch: self
+                .inner
+                .cache
+                .as_ref()
+                .map(|cache| cache.boot_id().to_owned()),
             notification_state: "pending".to_owned(),
             notification_attempts: 0,
             notification_at_ms: None,
@@ -865,6 +957,31 @@ impl PromptRegistry {
         let Some(cache) = self.inner.cache.as_ref() else {
             return Ok(Some(task));
         };
+        // Boot-epoch fence: the persisted cursor is only meaningful against
+        // the EventCache of the process that recorded it. A different (or
+        // unknown, for pre-epoch records) boot means the cursor cannot be
+        // trusted and later events from the new cache may belong to unrelated
+        // conversations — fail closed, never optimistically complete.
+        let boot_mismatch = match task.boot_epoch.as_deref() {
+            Some(epoch) => epoch != cache.boot_id(),
+            None => true, // legacy record without an epoch: fail closed
+        };
+        if boot_mismatch {
+            let reason = if task.boot_epoch.is_some() {
+                "runtime_boot_changed"
+            } else {
+                "runtime_boot_unknown"
+            };
+            changed |= mark_delivery_uncertain(&mut task, now_ms(), reason);
+            if changed {
+                self.save_task(&task, None)?;
+                self.maybe_notify_parent(&task);
+                if let Some(reloaded) = self.load_task(task_id)? {
+                    task = reloaded;
+                }
+            }
+            return Ok(Some(task));
+        }
         let digest = cache.digest_since(task.last_cursor);
         if digest.cursor.saturating_sub(task.last_cursor) > 2048 {
             changed |= mark_delivery_uncertain(&mut task, now_ms(), "event_history_gap");
@@ -1505,12 +1622,27 @@ pub fn run_with_parent_session(
 
     let start_cursor = registry.current_task_cursor();
     let before = agent_state_of(client, target);
+    let pane_id = before
+        .as_ref()
+        .and_then(|state| state.pane_id.as_deref())
+        .or_else(|| registry.pane_worktree(target).map(|_| target));
+    let handoff_target = pane_id.and_then(|pane_id| {
+        registry
+            .pane_worktree(pane_id)
+            .map(|worktree| (pane_id.to_owned(), worktree))
+    });
+    let injection = handoff_target
+        .as_ref()
+        .map(|(pane_id, worktree)| registry.inject_handoff_once(pane_id, worktree, text));
+    let dispatch_text = injection
+        .as_ref()
+        .map_or_else(|| text.to_owned(), |injection| injection.text.clone());
     // Native Herdr 0.9.x wait is lifecycle/status based and cannot identify the
     // prompt turn. Submit exactly once without native wait, then wait on the
     // Runtime-owned task ledger below.
     let params = json!({
         "target": target,
-        "text": text,
+        "text": dispatch_text,
     });
 
     let mut result = match client.call_with_timeout(
@@ -1530,6 +1662,16 @@ pub fn run_with_parent_session(
         Err(error) => prompt_failure(client, target, before.as_ref(), false, error, task_id),
     };
     insert_task_id(&mut result, task_id);
+
+    // A dispatch that provably never reached the agent releases the mark it
+    // created so the next first dispatch re-attaches the handoff. Success and
+    // uncertain delivery keep the mark: the handoff may already be delivered.
+    if let (Some((pane_id, _)), Some(injection)) = (&handoff_target, &injection)
+        && injection.marked_now
+        && dispatch_definitely_not_delivered(&result)
+    {
+        registry.unmark_handoff_injected(pane_id);
+    }
 
     let submitted = result.get("submitted").and_then(Value::as_bool);
     let after = agent_state_from_result(&result);
@@ -2258,6 +2400,48 @@ fn invalid(message: &str) -> Value {
     json!({"ok": false, "code": "invalid_params", "message": message})
 }
 
+/// Worktree for a pane: the herdr-managed worktree checkout of its workspace
+/// when present, otherwise the deepest managed Git project root containing the
+/// pane (plain workspaces opened on a repo carry no `worktree` metadata). This
+/// matches the worktree the tool_call capture and tailers key work_state by.
+fn pane_worktree_from_snapshot(
+    snapshot: &Value,
+    pane_id: &str,
+    workspace_id: Option<String>,
+) -> Option<String> {
+    let from_metadata = workspace_id.and_then(|workspace_id| {
+        snapshot
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .and_then(|workspaces| {
+                workspaces.iter().find(|workspace| {
+                    workspace
+                        .get("workspace_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| workspace.get("id").and_then(Value::as_str))
+                        == Some(&workspace_id)
+                })
+            })
+            .and_then(|workspace| workspace.get("worktree"))
+            .and_then(Value::as_object)
+            .and_then(|worktree| {
+                worktree
+                    .get("checkout_path")
+                    .and_then(Value::as_str)
+                    .or_else(|| worktree.get("path").and_then(Value::as_str))
+            })
+            .map(str::to_owned)
+    });
+    from_metadata.or_else(|| {
+        crate::projects::derive_routing(snapshot)
+            .projects
+            .values()
+            .filter(|project| project.managed && project.pane_ids.iter().any(|p| p == pane_id))
+            .max_by_key(|project| project.root.components().count())
+            .map(|project| project.root.to_string_lossy().into_owned())
+    })
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -2400,6 +2584,194 @@ mod tests {
             parse_wait(Some(&json!({"timeout_ms": 0}))).unwrap_err()["code"],
             "invalid_params"
         );
+    }
+
+    #[test]
+    fn first_pane_dispatch_injects_bounded_handoff_once() {
+        use crate::state_store::work_journal::WorkState;
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "project-a".to_owned(),
+                worktree: "/repo".to_owned(),
+                handoff_md: "important context".to_owned(),
+                through_event_id: 4,
+                log_cursors_json: "{}".to_owned(),
+                updated_at: 5,
+            })
+            .unwrap();
+        let registry = PromptRegistry::with_store(store);
+        let first = registry.inject_handoff_once("w1:p1", "/repo", "do next");
+        assert!(first.marked_now);
+        assert!(
+            first
+                .text
+                .starts_with("## Handoff context\n\nimportant context")
+        );
+        assert!(first.text.ends_with("do next"));
+        let second = registry.inject_handoff_once("w1:p1", "/repo", "do another");
+        assert!(!second.marked_now);
+        assert_eq!(second.text, "do another");
+        assert!(
+            registry
+                .inject_handoff_once("w1:p2", "/repo", "other pane")
+                .text
+                .chars()
+                .count()
+                < 16_100
+        );
+    }
+
+    fn scripted_dispatch_server(
+        listener: UnixListener,
+        responses: Vec<Value>,
+        prompt_texts: Arc<Mutex<Vec<String>>>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            for mut response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                if request["method"] == "agent.prompt" {
+                    prompt_texts
+                        .lock()
+                        .unwrap()
+                        .push(request["params"]["text"].as_str().unwrap().to_owned());
+                }
+                response["id"] = request["id"].clone();
+                writeln!(stream, "{response}").unwrap();
+            }
+        })
+    }
+
+    fn handoff_registry() -> PromptRegistry {
+        use crate::state_store::work_journal::WorkState;
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "project-a".to_owned(),
+                worktree: "/repo".to_owned(),
+                handoff_md: "important context".to_owned(),
+                through_event_id: 4,
+                log_cursors_json: "{}".to_owned(),
+                updated_at: 5,
+            })
+            .unwrap();
+        let cache = Arc::new(EventCache::from_snapshot_for_test(json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1"}],
+            "agents": [],
+            "workspaces": [{"workspace_id": "w1", "worktree": {"checkout_path": "/repo"}}],
+        })));
+        PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(store),
+                cache: Some(cache),
+                client: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn clear_dispatch_failure_releases_handoff_mark_and_retry_injects() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let prompt_texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let idle = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}});
+        let not_delivered = json!({"error": {"code": "agent_not_found", "message": "agent target did not resolve"}});
+        let submitted = json!({"result": {"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}});
+        let server = scripted_dispatch_server(
+            listener,
+            vec![
+                idle.clone(),
+                not_delivered,
+                idle.clone(),
+                idle.clone(),
+                submitted.clone(),
+                idle,
+                submitted,
+            ],
+            Arc::clone(&prompt_texts),
+        );
+        let client = HerdrClient::new(&socket);
+        let registry = handoff_registry();
+
+        let failed = run(
+            &client,
+            &registry,
+            &json!({"target": "pi", "text": "first attempt"}),
+        );
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["delivery_state"], "not_delivered");
+
+        // The clearly failed dispatch released its mark: the next first
+        // dispatch attaches the handoff again instead of losing it forever.
+        let retried = run(
+            &client,
+            &registry,
+            &json!({"target": "pi", "text": "second attempt"}),
+        );
+        assert_eq!(retried["ok"], true);
+
+        // After a successful dispatch the mark holds: no re-injection.
+        let settled = run(
+            &client,
+            &registry,
+            &json!({"target": "pi", "text": "third attempt"}),
+        );
+        assert_eq!(settled["ok"], true);
+        server.join().unwrap();
+
+        let texts = prompt_texts.lock().unwrap();
+        assert_eq!(texts.len(), 3);
+        assert!(texts[0].starts_with("## Handoff context\n\nimportant context"));
+        assert!(texts[0].ends_with("first attempt"));
+        assert!(texts[1].starts_with("## Handoff context\n\nimportant context"));
+        assert!(texts[1].ends_with("second attempt"));
+        assert_eq!(texts[2], "third attempt");
+        fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn uncertain_dispatch_failure_keeps_handoff_mark() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let prompt_texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let idle = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}});
+        let lost_response = json!({"error": {"code": "socket_error", "message": "stream broke while reading the response"}});
+        let server = scripted_dispatch_server(
+            listener,
+            vec![idle.clone(), lost_response, idle],
+            Arc::clone(&prompt_texts),
+        );
+        let client = HerdrClient::new(&socket);
+        let registry = handoff_registry();
+
+        let failed = run(
+            &client,
+            &registry,
+            &json!({"target": "pi", "text": "maybe delivered"}),
+        );
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["delivery_uncertain"], true);
+        server.join().unwrap();
+        assert!(prompt_texts.lock().unwrap()[0].starts_with("## Handoff context"));
+        // Delivery was uncertain: the pane keeps its mark so a retry does not
+        // duplicate the handoff into the conversation.
+        let again = registry.inject_handoff_once("w1:p1", "/repo", "second attempt");
+        assert!(!again.marked_now);
+        assert_eq!(again.text, "second attempt");
+        fs::remove_file(socket).unwrap();
     }
 
     #[test]
@@ -2778,5 +3150,103 @@ mod tests {
         assert_eq!(result["recovery"]["start_method"], "agent.start");
         assert_eq!(result["recovery"]["split_method"], "pane.split");
         assert!(result.get("delivery_uncertain").is_none());
+    }
+
+    /// user owner | Given a nonterminal task persisted under another boot
+    /// | When a new runtime reconciles it | Then it fails closed as
+    /// delivery_uncertain (runtime_boot_changed / runtime_boot_unknown);
+    /// same-boot done events still complete normally.
+    #[test]
+    fn cross_boot_and_legacy_tasks_fail_closed_on_reconcile() {
+        let _guard = crate::test_env::lock();
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-boot-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        let cache = Arc::new(EventCache::from_snapshot_for_test(json!({"panes": []})));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(Arc::clone(&store)),
+                cache: Some(Arc::clone(&cache)),
+                client: None,
+            }),
+        };
+        let before = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("idle".to_owned()),
+            state_change_seq: Some(1),
+        };
+        let after = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("working".to_owned()),
+            state_change_seq: Some(2),
+        };
+        let initial = registry
+            .register_task(RegisterTaskInput {
+                task_id: "dispatch:prompt:boot-fence",
+                target: "child",
+                fingerprint: "fp",
+                before: Some(&before),
+                after: Some(&after),
+                submitted: Some(true),
+                start_cursor: 100,
+                parent_target: Some("parent"),
+                parent_session_ref: None,
+            })
+            .unwrap()
+            .unwrap();
+        assert!(initial.boot_epoch.is_some());
+
+        // Cross-boot: persisted epoch differs from the live cache's boot_id.
+        let mut cross = initial.clone();
+        cross.boot_epoch = Some("old-boot".to_owned());
+        registry.save_task(&cross, None).unwrap();
+        let fenced = registry
+            .reconcile_task("dispatch:prompt:boot-fence")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fenced.terminal_status.as_deref(),
+            Some("delivery_uncertain")
+        );
+        assert_eq!(
+            fenced.notification_error.as_deref(),
+            Some("runtime_boot_changed")
+        );
+
+        // Legacy record without an epoch.
+        let mut legacy = initial.clone();
+        legacy.task_id = "dispatch:prompt:boot-legacy".to_owned();
+        legacy.dispatch_id = legacy.task_id.clone();
+        legacy.boot_epoch = None;
+        registry.save_task(&legacy, None).unwrap();
+        let closed = registry
+            .reconcile_task("dispatch:prompt:boot-legacy")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            closed.terminal_status.as_deref(),
+            Some("delivery_uncertain")
+        );
+        assert_eq!(
+            closed.notification_error.as_deref(),
+            Some("runtime_boot_unknown")
+        );
+
+        // Same-boot done event still completes normally.
+        let mut live = initial.clone();
+        live.task_id = "dispatch:prompt:boot-same".to_owned();
+        live.dispatch_id = live.task_id.clone();
+        registry.save_task(&live, None).unwrap();
+        assert!(apply_task_event(
+            &mut live,
+            &json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})
+        ));
+        assert_eq!(live.lifecycle, PromptTaskLifecycle::Completed);
+        assert!(live.is_terminal());
     }
 }

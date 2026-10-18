@@ -50,6 +50,7 @@ function browserPageLifecycleHarness({
   artifactResponder = null,
   fetchResponder = null,
   scriptResponder = null,
+  hoverResponder = null,
   deferredCreate = false,
   windowFocused = true,
   documentFocused = true,
@@ -58,12 +59,18 @@ function browserPageLifecycleHarness({
   let nextTabId = Math.max(100, ...tabs.keys(), 0) + 1;
   const activatedListeners = new Set();
   const focusListeners = new Set();
+  const updatedListeners = new Set();
   const storageArea = {
     async get(key) { return { [key]: structuredClone(sessionStorage[key] || []) }; },
     async set(value) { Object.assign(sessionStorage, structuredClone(value)); },
   };
   const chrome = {
     storage: { session: storageArea },
+    debugger: hoverResponder ? {
+      attach: (target, version) => hoverResponder("attach", target, version),
+      sendCommand: (target, method, params) => hoverResponder("command", target, { method, params }),
+      detach: (target) => hoverResponder("detach", target),
+    } : undefined,
     tabs: {
       async get(tabId) {
         const tab = tabs.get(tabId);
@@ -122,6 +129,10 @@ function browserPageLifecycleHarness({
           },
         });
       },
+      onUpdated: {
+        addListener(listener) { updatedListeners.add(listener); },
+        removeListener(listener) { updatedListeners.delete(listener); },
+      },
       onActivated: {
         addListener(listener) { activatedListeners.add(listener); },
         removeListener(listener) { activatedListeners.delete(listener); },
@@ -150,10 +161,14 @@ function browserPageLifecycleHarness({
       async executeScript(details) {
         if (scriptResponder) return scriptResponder(details);
         if (typeof details?.func !== "function") return undefined;
+        const tab = tabs.get(details.target?.tabId);
         return [{
           result: {
             hasFocus: documentFocused,
             visibilityState: documentVisibilityState,
+            href: tab?.url,
+            origin: tab?.url ? new URL(tab.url).origin : undefined,
+            timeOrigin: tab?.documentTimeOrigin || 123456,
           },
         }];
       },
@@ -207,7 +222,12 @@ function browserPageLifecycleHarness({
       return fetchResponder(...args);
     },
   });
-  return { ...api, sessionStorage, tabs };
+  return {
+    ...api, sessionStorage, tabs,
+    emitTabUpdated(id, changeInfo) {
+      for (const listener of updatedListeners) listener(id, changeInfo);
+    },
+  };
 }
 
 test("user opens a loading generic page | Given Chrome returns only pendingUrl from tabs.create | When BrowserPage waits for navigation completion | Then the owned page is bound to the live URL and retained", async () => {
@@ -771,6 +791,282 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(uncertain.mutation_submitted, true);
 });
 
+test("user verifies an explicit same-origin history target | Given an observed button with no link URL | When click supplies a bounded expected URL | Then only the confirmed destination can retain page ownership", async () => {
+  const tab = { id: 83, url: "https://example.com/route-two", status: "complete", active: true };
+  const tabs = new Map([[tab.id, tab]]);
+  let clicks = 0;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_history_1", origin: "https://example.com",
+        url: tab.url, elements: [{ ref: "ref_pa_gen_history_1_0", text: "History back" }],
+      };
+      if (payload.action === "click") {
+        clicks++;
+        tab.url = "https://example.com/route-one";
+        return { ok: true, generation: payload.generation, ref: payload.ref };
+      }
+      throw new Error("unexpected action");
+    },
+  });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com",
+    url: tab.url, idempotencyKey: "history-claim-1",
+  });
+  assert.equal(claimed.ok, true);
+
+  const denied = await h.performBrowserPageActionRequest({
+    action: "click", pageRef: claimed.page_ref, generation: "pa_gen_history_1",
+    ref: "ref_pa_gen_history_1_0", expectedUrl: "https://other.example/path",
+  });
+  assert.equal(denied.error, "navigation_expectation_invalid");
+  assert.equal(denied.delivery_state, "not_applied");
+  assert.equal(denied.mutation_submitted, false);
+  assert.equal(clicks, 0);
+
+  const applied = await h.performBrowserPageActionRequest({
+    action: "click", pageRef: claimed.page_ref, generation: "pa_gen_history_1",
+    ref: "ref_pa_gen_history_1_0", expectedUrl: "https://example.com/route-one",
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.delivery_state, "applied");
+  assert.equal(applied.page_generation, 2);
+  assert.equal(h.browserPagesByRef.get(claimed.page_ref).canonical_url, "https://example.com/route-one");
+  assert.equal(clicks, 1);
+  const observed = await h.performBrowserPageActionRequest({ action: "observe", pageRef: claimed.page_ref });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.url, "https://example.com/route-one");
+
+  const unmatchedTab = { id: 84, url: "https://example.com/route-two", status: "complete", active: true };
+  const failing = browserPageLifecycleHarness({
+    tabs: new Map([[unmatchedTab.id, unmatchedTab]]),
+    contentResponder: (_tabId, payload) => {
+      unmatchedTab.url = "https://example.com/route-unexpected";
+      return { ok: true, generation: payload.generation, ref: payload.ref };
+    },
+  });
+  const initial = await failing.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com",
+    url: unmatchedTab.url, idempotencyKey: "history-claim-2",
+  });
+  const uncertain = await failing.performBrowserPageActionRequest({
+    action: "click", pageRef: initial.page_ref, generation: "pa_gen_history_1",
+    ref: "ref_pa_gen_history_1_0", expectedUrl: "https://example.com/route-one",
+  });
+  assert.equal(uncertain.ok, false);
+  assert.equal(uncertain.error, "navigation_postcondition_unverified");
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  assert.equal(uncertain.mutation_submitted, true);
+  assert.equal(unmatchedTab.url, "https://example.com/route-unexpected");
+  assert.equal(failing.browserPagesByRef.get(initial.page_ref).canonical_url, "https://example.com/route-two");
+});
+
+test("user reveals controls with a trusted hover | Given one owned generic page with a scoped card ref | When the debugger moves the virtual mouse | Then observe sees the edit button, focus stays unchanged, and debugger detaches", async () => {
+  let revealed = false;
+  let failAttach = false;
+  let failCommand = false;
+  const events = [];
+  const h = browserPageLifecycleHarness({
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_hover_1", origin: "https://example.com",
+        url: "https://example.com/card",
+        elements: revealed
+          ? [{ ref: "ref_pa_gen_hover_1_1", text: "Edit", tag: "button" }]
+          : [{ ref: "ref_pa_gen_hover_1_0", text: "Existing evaluation", hover_only: true }],
+      };
+      if (payload.action === "hover") return {
+        ok: true, generation: payload.generation, ref: payload.ref,
+        hover_point: { x: 94, y: 71 },
+      };
+      throw new Error("unexpected action");
+    },
+    hoverResponder(phase, target, data) {
+      events.push(phase);
+      if (phase === "attach" && failAttach) throw new Error("debugger in use");
+      if (phase === "command") {
+        if (data.method === "Page.getFrameTree") {
+          return { frameTree: { frame: {
+            id: "frame-hover-1", loaderId: "loader-hover-1", url: "https://example.com/card",
+          } } };
+        }
+        if (failCommand) throw new Error("mouse dispatch uncertain");
+        assert.equal(data.method, "Input.dispatchMouseEvent");
+        assert.equal(data.params.type, "mouseMoved");
+        assert.equal(data.params.x, 94);
+        assert.equal(data.params.y, 71);
+        revealed = true;
+      }
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/card", idempotencyKey: "hover-owned-1",
+  });
+  assert.equal(opened.ok, true);
+  const before = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  assert.equal(before.elements[0].hover_only, true);
+  const applied = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: before.generation,
+    ref: before.elements[0].ref,
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.delivery_state, "applied");
+  assert.equal(applied.postcondition_observed, false);
+  assert.equal(applied.hover_requires_observe, true);
+  assert.equal(Object.hasOwn(applied, "hover_point"), false);
+  assert.deepEqual(events, ["attach", "command", "command", "command", "detach"]);
+  const after = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  assert.equal(after.elements[0].text, "Edit");
+
+  failAttach = true;
+  const unavailable = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: after.generation,
+    ref: after.elements[0].ref,
+  });
+  assert.equal(unavailable.error, "browser_page_hover_unavailable");
+  assert.equal(unavailable.delivery_state, "not_applied");
+  assert.equal(unavailable.mutation_submitted, false);
+  assert.deepEqual(events.slice(-1), ["attach"]);
+
+  failAttach = false;
+  failCommand = true;
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: after.generation,
+    ref: after.elements[0].ref,
+  });
+  assert.equal(uncertain.error, "hover_delivery_unconfirmed");
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  assert.equal(uncertain.mutation_submitted, true);
+  assert.deepEqual(events.slice(-5), ["attach", "command", "command", "command", "detach"]);
+});
+
+test("user hovers with a fenced dispatch | Given the document navigates between hover-point preparation and the debugger dispatch | When the post-attach fence sees a different live document | Then no mouse event is dispatched and the hover fails closed retryably", async () => {
+  let mouseDispatches = 0;
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_hovrace_1", origin: "https://example.com",
+        url: "https://example.com/feed",
+        elements: [{ ref: "ref_pa_gen_hovrace_1_0", text: "Card", hover_only: true }],
+      };
+      if (payload.action === "hover") return {
+        ok: true, generation: payload.generation, ref: payload.ref,
+        hover_point: { x: 51, y: 49 },
+      };
+      throw new Error("unexpected action");
+    },
+    scriptResponder() {
+      // Document probe: report document A until the second in-hover probe,
+      // then report the navigated document (same URL, new timeOrigin) — the
+      // navigation commits between point preparation and the dispatch fence.
+      probeCalls += 1;
+      const navigated = probeCalls - hoverProbeBaseline >= 2;
+      return [{ result: {
+        href: "https://example.com/feed",
+        origin: "https://example.com",
+        timeOrigin: navigated ? 987654 : 123456,
+      } }];
+    },
+    hoverResponder(phase, _target, data) {
+      if (phase === "command" && data.method === "Input.dispatchMouseEvent") mouseDispatches += 1;
+      if (phase === "command" && data.method === "Page.getFrameTree") {
+        return { frameTree: { frame: {
+          id: "frame-race-1", loaderId: "loader-race-1", url: "https://example.com/feed",
+        } } };
+      }
+    },
+  });
+  let probeCalls = 0;
+  let hoverProbeBaseline = 0;
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/feed", idempotencyKey: "hover-race-1",
+  });
+  assert.equal(opened.ok, true);
+  const observed = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  // From here the next two probes belong to the hover request: the first is
+  // the pre-send anchor (document A), the second is the post-attach fence —
+  // which must already observe the navigated document B.
+  hoverProbeBaseline = probeCalls;
+  const fenced = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: observed.generation,
+    ref: observed.elements[0].ref,
+  });
+  assert.equal(fenced.ok, false);
+  assert.equal(fenced.error, "browser_page_hover_view_changed");
+  assert.equal(fenced.retryable, true);
+  assert.equal(fenced.delivery_state, "not_applied");
+  assert.equal(fenced.mutation_submitted, false);
+  assert.equal(mouseDispatches, 0, "no mouse event may be dispatched after a navigation");
+});
+
+test("user hovers with a fenced dispatch | Given a navigation fires while the final awaited fence leg is in flight | When the post-await gate re-reads the navigation flag | Then no mouse event is dispatched", async () => {
+  let mouseDispatches = 0;
+  let frameReads = 0;
+  const harness = browserPageLifecycleHarness({
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_hovgate_1", origin: "https://example.com",
+        url: "https://example.com/list",
+        elements: [{ ref: "ref_pa_gen_hovgate_1_0", text: "Row", hover_only: true }],
+      };
+      if (payload.action === "hover") return {
+        ok: true, generation: payload.generation, ref: payload.ref,
+        hover_point: { x: 40, y: 40 },
+      };
+      throw new Error("unexpected action");
+    },
+    hoverResponder(phase, target, data) {
+      if (phase === "command" && data.method === "Page.getFrameTree") {
+        frameReads += 1;
+        // Navigation commits during the final awaited leg: the tab-update
+        // listener fires after the tab query resolves but before the gate.
+        if (frameReads === 2) harness.emitTabUpdated(target.tabId, { status: "loading" });
+        return { frameTree: { frame: {
+          id: "frame-gate-1", loaderId: "loader-gate-1", url: "https://example.com/list",
+        } } };
+      }
+      if (phase === "command" && data.method === "Input.dispatchMouseEvent") mouseDispatches += 1;
+    },
+  });
+  const opened = await harness.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/list", idempotencyKey: "hover-gate-1",
+  });
+  assert.equal(opened.ok, true);
+  const observed = await harness.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  const fenced = await harness.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: observed.generation,
+    ref: observed.elements[0].ref,
+  });
+  assert.equal(fenced.ok, false);
+  assert.equal(fenced.error, "browser_page_hover_view_changed");
+  assert.equal(fenced.mutation_submitted, false);
+  assert.equal(mouseDispatches, 0, "navigation during the final await must yield zero mouse events");
+});
+
+test("user probes the hover document anchor | Given the real injected probe source | When it runs in a page-like world | Then it reads location and performance.timeOrigin, not Node globals", async () => {
+  const match = backgroundSource.match(/function h2wHoverDocumentProbe\(\) \{[\s\S]*?\n\}/);
+  assert.ok(match, "h2wHoverDocumentProbe source must stay extractable");
+  const probe = new Function("location", "performance", "globalThis",
+    `${match[0]}\nreturn h2wHoverDocumentProbe();`)(
+    { href: "https://example.com/feed", origin: "https://example.com" },
+    { timeOrigin: 123456.5 },
+    { document: { timeOrigin: 999999 } },
+  );
+  assert.deepEqual(probe, {
+    href: "https://example.com/feed",
+    origin: "https://example.com",
+    timeOrigin: 123456.5,
+  });
+});
+
 test("user rejects invalid native form states | Given unavailable dropdown or unsupported checkable state | When fill checks the observed control | Then delivery is not_applied and retry-safe", async () => {
   const tabs = new Map([[71, { id: 71, url: "https://example.com/form", active: true }]]);
   let rejection = "select_option_unavailable";
@@ -1250,6 +1546,130 @@ test("user captures bounded visual evidence | Given one visible claimed BrowserP
   assert.equal(racedResult.error, "browser_page_screenshot_view_changed");
   assert.equal(racedResult.retryable, true);
   assert.equal(artifactCalls, 1);
+
+  const urlRaced = browserPageLifecycleHarness({
+    sessionStorage, tabs,
+    screenshotResponder() {
+      tabs.get(61).url = "https://other.example/private";
+      urlRaced.emitTabUpdated(61, { url: "https://other.example/private", status: "loading" });
+      tabs.get(61).url = "https://example.com/app";
+      urlRaced.emitTabUpdated(61, { url: "https://example.com/app", status: "complete" });
+      return "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    },
+    artifactResponder() {
+      throw new Error("a visible screenshot with A-B-A navigation must never be stored");
+    },
+  });
+  const urlRaceResult = await urlRaced.performBrowserPageActionRequest({
+    action: "screenshot", pageRef: claimed.page_ref,
+  });
+  assert.equal(urlRaceResult.ok, false);
+  assert.equal(urlRaceResult.error, "browser_page_screenshot_view_changed");
+
+  const reloadRace = browserPageLifecycleHarness({
+    sessionStorage, tabs,
+    screenshotResponder() {
+      tabs.get(61).documentTimeOrigin = 234567;
+      return "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    },
+    artifactResponder() {
+      throw new Error("a visible screenshot of a replaced document must never be stored");
+    },
+  });
+  const reloadResult = await reloadRace.performBrowserPageActionRequest({
+    action: "screenshot", pageRef: claimed.page_ref,
+  });
+  assert.equal(reloadResult.ok, false);
+  assert.equal(reloadResult.error, "browser_page_screenshot_view_changed");
+});
+
+test("user screenshots an owned background tab without stealing focus | Given an inactive owned page | When capture uses trusted Chrome debugger | Then only bounded artifact metadata is returned and debugger detaches", async () => {
+  const userTab = { id: 91, windowId: 1, url: "https://example.com/user", active: true, status: "complete" };
+  const tabs = new Map([[91, userTab]]);
+  const calls = [];
+  let uploaded = 0;
+  let navigationMode = "none";
+  let loaderId = "load-1";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    windowFocused: true,
+    screenshotResponder() {
+      throw new Error("background screenshot must not capture the user's visible tab");
+    },
+    hoverResponder(phase, target, arg) {
+      calls.push(phase);
+      if (phase === "attach") {
+        assert.equal(arg, "1.3");
+        assert.notEqual(target.tabId, userTab.id);
+      }
+      if (phase === "command") {
+        if (arg.method === "Page.getFrameTree") {
+          return { frameTree: { frame: {
+            id: "frame-1", loaderId, url: "https://example.com/app",
+          } } };
+        }
+        assert.equal(arg.method, "Page.captureScreenshot");
+        assert.equal(arg.params.format, "jpeg");
+        assert.equal(arg.params.captureBeyondViewport, false);
+        if (navigationMode === "document_aba") {
+          tabs.get(target.tabId).url = "https://other.example/secret";
+          tabs.get(target.tabId).url = "https://example.com/app";
+          loaderId = "load-2";
+        }
+        if (navigationMode === "history_aba") {
+          h.emitTabUpdated(target.tabId, { url: "https://example.com/other" });
+          h.emitTabUpdated(target.tabId, { url: "https://example.com/app" });
+        }
+        return { data: "/9j/4AAQSkZJRg==" };
+      }
+    },
+    artifactResponder(image) {
+      uploaded++;
+      assert.match(image.source_id, /^bp_[a-f0-9]{64}$/);
+      assert.equal(image.mime, "image/jpeg");
+      assert.equal(image.bytes_b64, "/9j/4AAQSkZJRg==");
+      return {
+        ok: true,
+        artifact: {
+          artifact_id: "0123456789abcdef0123456789abcdef",
+          conversation_id: image.source_id,
+          file_id: image.artifact_key,
+          mime: "image/jpeg", bytes: 42, sha256: "b".repeat(64),
+          captured_at: 100, expires_at: 200,
+        },
+      };
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/app", idempotencyKey: "owned-background-capture-1",
+  });
+  assert.equal(opened.ok, true);
+  const ownedTab = [...tabs.values()].find(t => t.id !== 91);
+  assert.equal(ownedTab.active, false);
+  const captured = await h.performBrowserPageActionRequest({
+    action: "screenshot", pageRef: opened.page_ref,
+  });
+  assert.equal(captured.ok, true, JSON.stringify(captured));
+  assert.equal(captured.capture_scope, "owned_background");
+  assert.equal(captured.artifact.mime, "image/jpeg");
+  assert.equal(Object.hasOwn(captured, "bytes_b64"), false);
+  assert.deepEqual(calls, ["attach", "command", "command", "command", "detach"]);
+  assert.equal(tabs.get(91).active, true);
+  assert.equal(ownedTab.active, false);
+  assert.equal(uploaded, 1);
+
+  for (const mode of ["document_aba", "history_aba"]) {
+    navigationMode = mode;
+    const stale = await h.performBrowserPageActionRequest({
+      action: "screenshot", pageRef: opened.page_ref,
+    });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.error, "browser_page_screenshot_view_changed", mode);
+    assert.equal(stale.capture_scope, "owned_background");
+    assert.deepEqual(calls.slice(-5), ["attach", "command", "command", "command", "detach"]);
+    assert.equal(uploaded, 1, `${mode} must not upload a mismatched image`);
+  }
 });
 
 test("user reads a reviewed Bilibili transcript | Given one exact Bilibili BrowserPage | When the builtin read runs | Then bounded transcript data is returned and logged-out access fails closed", async () => {

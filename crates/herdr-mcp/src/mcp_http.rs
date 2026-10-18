@@ -253,6 +253,9 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
     runtime_started_at_ms();
     let exec = ExecRegistry::new_with_client(exec_state_dir, Some(client.clone()))?;
     let prompt = PromptRegistry::with_runtime(state_store.clone(), cache.clone(), client.clone());
+    if let Ok(store) = state_store.lock() {
+        crate::work_compactor::start_background(&store, cache.clone());
+    }
     let skill = SkillService::new();
     crate::schema::prewarm_async();
     // Herdr is a recoverable local dependency. EventCache owns reconnect/backoff,
@@ -1501,6 +1504,15 @@ async fn post_extension_continuity_turn(State(state): State<AppState>, body: Byt
     let project_id = payload.get("project_id").and_then(Value::as_str);
     let title = payload.get("title").and_then(Value::as_str);
     let fingerprint = payload.get("fingerprint").and_then(Value::as_str);
+    // The extension continuity journal (extension/continuity-journal.js)
+    // attaches browser identity (provider/account/project) to each turn. The
+    // continuity turn storage has no free-form metadata column — only typed
+    // browser-resource refs with their own semantics — and the schema must
+    // not change here, so these fields are journal-local for now: accepted
+    // without error and intentionally not persisted.
+    let _provider = payload.get("provider").and_then(Value::as_str);
+    let _account = payload.get("account").and_then(Value::as_str);
+    let _project = payload.get("project").and_then(Value::as_str);
     let appended = match state.state_store.lock() {
         Ok(mut store) => match store.append_continuity_turn(ContinuityTurnInput {
             continuity_id,
@@ -3594,6 +3606,56 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn continuity_turn_accepts_journal_local_browser_identity() {
+        let root = test_root("continuity-turn-browser-identity");
+        let mut extension_state = test_state(&root.join("extension"));
+        extension_state.trusted_extension_ipc = true;
+        let store = extension_state.state_store.clone();
+        let app = candidate_router(extension_state);
+
+        // provider/account/project from the extension continuity journal are
+        // accepted (journal-local; see comment in post_extension_continuity_turn).
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/extension/continuity/turn")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "continuity_id": "hc:identity",
+                    "conversation_id": "conv-identity",
+                    "workspace_id": "w21",
+                    "project_id": "project-1",
+                    "title": "identity test",
+                    "message_id": "msg-identity",
+                    "role": "user",
+                    "text": "continue with identity attached",
+                    "provider": "chatgpt",
+                    "account": "br_account",
+                    "project": "g-p-project",
+                    "observed_at": 1300
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["inserted"], true);
+
+        let resume = store
+            .lock()
+            .unwrap()
+            .continuity_resume("hc:identity", 32)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resume.turns.len(), 1);
+        assert_eq!(resume.turns[0].text, "continue with identity attached");
         let _ = std::fs::remove_dir_all(root);
     }
 
