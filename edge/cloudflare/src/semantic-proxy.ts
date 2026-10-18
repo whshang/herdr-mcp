@@ -53,6 +53,53 @@ const SEMANTIC_ROUTE_LIMIT = 8;
 const SEMANTIC_ATTEMPT_LIMIT = 3;
 const SEMANTIC_BUDGET_MS = 3_000;
 const SEMANTIC_CHAT_BUDGET_MS = 15_000;
+const SEMANTIC_BACKGROUND_CHAT_BUDGET_MS = 60_000;
+const SEMANTIC_CHAT_MAX_TOKENS = 32_768;
+
+type SemanticChatOptions = {
+  tier: "foreground" | "background";
+  maxTokens?: number;
+  jsonResponse: boolean;
+};
+
+const SEMANTIC_CHAT_KEYS = new Set(["messages", "max_tokens", "response_format", "tier"]);
+
+/**
+ * Parses the optional chat options. `max_tokens` is an integer in
+ * 1..=32768; `response_format` is "text" | "json" | "json_object" or
+ * `{type: "text" | "json_object"}`; `tier` is "foreground" | "background".
+ * Returns null for any invalid value so the request fails closed.
+ */
+export function parseSemanticChatOptions(body: Record<string, unknown>): SemanticChatOptions | null {
+  const options: SemanticChatOptions = { tier: "foreground", jsonResponse: false };
+  const tier = body.tier;
+  if (tier !== undefined && tier !== null) {
+    if (tier !== "foreground" && tier !== "background") return null;
+    options.tier = tier;
+  }
+  const maxTokens = body.max_tokens;
+  if (maxTokens !== undefined && maxTokens !== null) {
+    if (
+      typeof maxTokens !== "number"
+      || !Number.isInteger(maxTokens)
+      || maxTokens < 1
+      || maxTokens > SEMANTIC_CHAT_MAX_TOKENS
+    ) return null;
+    options.maxTokens = maxTokens;
+  }
+  const format = body.response_format;
+  if (format !== undefined && format !== null) {
+    const type = typeof format === "string"
+      ? format
+      : isRecord(format) && Object.keys(format).every((key) => key === "type") && typeof format.type === "string"
+        ? format.type
+        : null;
+    if (type === "text") options.jsonResponse = false;
+    else if (type === "json_object" || (type === "json" && typeof format === "string")) options.jsonResponse = true;
+    else return null;
+  }
+  return options;
+}
 let semanticRouteCursor = 0;
 const semanticRouteCooldowns = new Map<string, number>();
 
@@ -238,6 +285,7 @@ async function callSemanticChatRoute(
   route: EdgeSemanticRoute,
   messages: unknown,
   timeoutMs: number,
+  options: SemanticChatOptions = { tier: "foreground", jsonResponse: false },
 ): Promise<SemanticRouteResult> {
   if (
     route.protocol !== "openai-chat"
@@ -269,6 +317,8 @@ async function callSemanticChatRoute(
         messages,
         temperature: 0,
         stream: false,
+        ...(options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {}),
+        ...(options.jsonResponse ? { response_format: { type: "json_object" } } : {}),
       }),
       signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
     });
@@ -373,9 +423,13 @@ export async function handleSemanticProxy(
       return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
     }
   } else if (
-    Object.keys(parsed.value).some((key) => key !== "messages")
+    Object.keys(parsed.value).some((key) => !SEMANTIC_CHAT_KEYS.has(key))
     || !Array.isArray(parsed.value.messages)
   ) {
+    return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+  }
+  const chatOptions = mode === "chat" ? parseSemanticChatOptions(parsed.value) : null;
+  if (mode === "chat" && !chatOptions) {
     return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
   }
 
@@ -388,7 +442,12 @@ export async function handleSemanticProxy(
     if (until <= now) semanticRouteCooldowns.delete(name);
   }
   const start = semanticRouteCursor++ % eligibleRoutes.length;
-  const deadline = Date.now() + (mode === "chat" ? SEMANTIC_CHAT_BUDGET_MS : SEMANTIC_BUDGET_MS);
+  const budgetMs = mode !== "chat"
+    ? SEMANTIC_BUDGET_MS
+    : chatOptions?.tier === "background"
+      ? SEMANTIC_BACKGROUND_CHAT_BUDGET_MS
+      : SEMANTIC_CHAT_BUDGET_MS;
+  const deadline = Date.now() + budgetMs;
   let attempted = 0;
   let lastCode = "semantic_provider_unavailable";
   for (let offset = 0; offset < eligibleRoutes.length && attempted < SEMANTIC_ATTEMPT_LIMIT; offset++) {
@@ -398,7 +457,7 @@ export async function handleSemanticProxy(
     if (remaining <= 0) break;
     attempted++;
     const result = mode === "chat"
-      ? await callSemanticChatRoute(route, parsed.value.messages, remaining)
+      ? await callSemanticChatRoute(route, parsed.value.messages, remaining, chatOptions ?? undefined)
       : await callSemanticRoute(route, parsed.value.state, parsed.value.questions as Record<string, unknown>, remaining);
     if (result.ok) {
       semanticRouteCooldowns.delete(route.name);

@@ -47,6 +47,34 @@ export function continuityMessageId({ messageId, convKey, role, text, startedAt 
   }).slice(0, 16)}`;
 }
 
+function nullableText(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text || null;
+}
+
+/**
+ * Build one bounded-cache journal row with browser identity attached. Missing
+ * identity remains explicit null, and old stored rows remain valid because no
+ * reader requires these additive fields.
+ */
+export function continuityJournalEntry({
+  message_id,
+  role,
+  createdAt,
+  provider,
+  account,
+  project,
+} = {}) {
+  return {
+    message_id,
+    role,
+    createdAt,
+    provider: nullableText(provider),
+    account: nullableText(account),
+    project: nullableText(project),
+  };
+}
+
 /**
  * Compact seed reference the target conversation carries in place of the large
  * model-written HERDR_HANDOFF_V1 when Rust has acknowledged durable state. The
