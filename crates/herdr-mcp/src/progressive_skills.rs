@@ -4372,13 +4372,24 @@ mod tests {
         );
         assert_eq!(
             methods[20]["params"]["properties"]["action"]["enum"],
-            json!(["observe", "click", "fill", "expect", "screenshot"])
+            json!([
+                "observe",
+                "click",
+                "hover",
+                "fill",
+                "expect",
+                "screenshot",
+                "scroll",
+                "extract",
+                "extract_table",
+                "press"
+            ])
         );
         assert_eq!(
             methods[20]["params"]["properties"]["objective"]["maxLength"],
             1024
         );
-        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 5);
+        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 9);
         assert_eq!(methods[21]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
         assert_eq!(methods[21]["access"], "read_only");
         assert_eq!(
