@@ -3169,6 +3169,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(Arc::clone(&store)),
                 cache: Some(Arc::clone(&cache)),
                 client: None,
