@@ -102,6 +102,11 @@ struct PromptTaskRecord {
     parent_target: Option<String>,
     #[serde(default)]
     parent_session_ref: Option<String>,
+    /// EventCache boot epoch at registration time. Cross-boot reconcile
+    /// cannot trust the persisted cursor against a new process's cache:
+    /// fail closed instead of correlating unrelated later events.
+    #[serde(default)]
+    boot_epoch: Option<String>,
     notification_state: String,
     #[serde(default)]
     notification_attempts: u32,
@@ -478,6 +483,11 @@ impl PromptRegistry {
             terminal_at_ms: None,
             parent_target: parent_target.map(str::to_owned),
             parent_session_ref: parent_session_ref.map(str::to_owned),
+            boot_epoch: self
+                .inner
+                .cache
+                .as_ref()
+                .map(|cache| cache.boot_id().to_owned()),
             notification_state: "pending".to_owned(),
             notification_attempts: 0,
             notification_at_ms: None,
@@ -947,6 +957,31 @@ impl PromptRegistry {
         let Some(cache) = self.inner.cache.as_ref() else {
             return Ok(Some(task));
         };
+        // Boot-epoch fence: the persisted cursor is only meaningful against
+        // the EventCache of the process that recorded it. A different (or
+        // unknown, for pre-epoch records) boot means the cursor cannot be
+        // trusted and later events from the new cache may belong to unrelated
+        // conversations — fail closed, never optimistically complete.
+        let boot_mismatch = match task.boot_epoch.as_deref() {
+            Some(epoch) => epoch != cache.boot_id(),
+            None => true, // legacy record without an epoch: fail closed
+        };
+        if boot_mismatch {
+            let reason = if task.boot_epoch.is_some() {
+                "runtime_boot_changed"
+            } else {
+                "runtime_boot_unknown"
+            };
+            changed |= mark_delivery_uncertain(&mut task, now_ms(), reason);
+            if changed {
+                self.save_task(&task, None)?;
+                self.maybe_notify_parent(&task);
+                if let Some(reloaded) = self.load_task(task_id)? {
+                    task = reloaded;
+                }
+            }
+            return Ok(Some(task));
+        }
         let digest = cache.digest_since(task.last_cursor);
         if digest.cursor.saturating_sub(task.last_cursor) > 2048 {
             changed |= mark_delivery_uncertain(&mut task, now_ms(), "event_history_gap");
@@ -3115,5 +3150,103 @@ mod tests {
         assert_eq!(result["recovery"]["start_method"], "agent.start");
         assert_eq!(result["recovery"]["split_method"], "pane.split");
         assert!(result.get("delivery_uncertain").is_none());
+    }
+
+    /// user owner | Given a nonterminal task persisted under another boot
+    /// | When a new runtime reconciles it | Then it fails closed as
+    /// delivery_uncertain (runtime_boot_changed / runtime_boot_unknown);
+    /// same-boot done events still complete normally.
+    #[test]
+    fn cross_boot_and_legacy_tasks_fail_closed_on_reconcile() {
+        let _guard = crate::test_env::lock();
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-boot-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        let cache = Arc::new(EventCache::from_snapshot_for_test(json!({"panes": []})));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(Arc::clone(&store)),
+                cache: Some(Arc::clone(&cache)),
+                client: None,
+            }),
+        };
+        let before = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("idle".to_owned()),
+            state_change_seq: Some(1),
+        };
+        let after = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("working".to_owned()),
+            state_change_seq: Some(2),
+        };
+        let initial = registry
+            .register_task(RegisterTaskInput {
+                task_id: "dispatch:prompt:boot-fence",
+                target: "child",
+                fingerprint: "fp",
+                before: Some(&before),
+                after: Some(&after),
+                submitted: Some(true),
+                start_cursor: 100,
+                parent_target: Some("parent"),
+                parent_session_ref: None,
+            })
+            .unwrap()
+            .unwrap();
+        assert!(initial.boot_epoch.is_some());
+
+        // Cross-boot: persisted epoch differs from the live cache's boot_id.
+        let mut cross = initial.clone();
+        cross.boot_epoch = Some("old-boot".to_owned());
+        registry.save_task(&cross, None).unwrap();
+        let fenced = registry
+            .reconcile_task("dispatch:prompt:boot-fence")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fenced.terminal_status.as_deref(),
+            Some("delivery_uncertain")
+        );
+        assert_eq!(
+            fenced.notification_error.as_deref(),
+            Some("runtime_boot_changed")
+        );
+
+        // Legacy record without an epoch.
+        let mut legacy = initial.clone();
+        legacy.task_id = "dispatch:prompt:boot-legacy".to_owned();
+        legacy.dispatch_id = legacy.task_id.clone();
+        legacy.boot_epoch = None;
+        registry.save_task(&legacy, None).unwrap();
+        let closed = registry
+            .reconcile_task("dispatch:prompt:boot-legacy")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            closed.terminal_status.as_deref(),
+            Some("delivery_uncertain")
+        );
+        assert_eq!(
+            closed.notification_error.as_deref(),
+            Some("runtime_boot_unknown")
+        );
+
+        // Same-boot done event still completes normally.
+        let mut live = initial.clone();
+        live.task_id = "dispatch:prompt:boot-same".to_owned();
+        live.dispatch_id = live.task_id.clone();
+        registry.save_task(&live, None).unwrap();
+        assert!(apply_task_event(
+            &mut live,
+            &json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})
+        ));
+        assert_eq!(live.lifecycle, PromptTaskLifecycle::Completed);
+        assert!(live.is_terminal());
     }
 }
