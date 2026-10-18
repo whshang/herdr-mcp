@@ -312,6 +312,14 @@ Agent は次の順で進めます。
 - **変更は account スコープで直列化**されます。競合する変更を並列化しないでください。
 - **第二の状態権威を作らない。** ページ、Project、会話は Continuity/Work Memory の代替になりません。
 
+### ブラウザ endpoint の生存判定と Runtime 切り替え
+
+[#632](https://github.com/whshang/herdr-mcp/issues/632) を参照。
+
+- **生存判定。** browser endpoint がオンラインと見なされるのは、**現在の Runtime generation** のレジストリに登録されている（この Runtime の起動以降に登録または再観測された）うえで、拡張機能が `/push/events` をポーリングしている場合だけです。ポーリングしているだけで未登録の endpoint や、前の generation の古い登録しかない endpoint はオフライン扱いになり、ブラウザ操作はタイムアウトを待たずに再試行可能な `not_delivered`（例: `browser_page_unavailable`）を即座に返します。push の `hello` フレームは `endpoint_registered` を報告します。
+- **タイムアウト時の結果。** actuation のタイムアウト時点でコマンドがまだキューにあり、どの拡張機能にも取り出されていない場合、Runtime はそれをキューから取り除き（後から配送されることはありません）、`retry_safe: true` 付きの `not_delivered` を返します。元の意図を再試行して安全です。実際に拡張機能へ渡されたコマンドだけが `delivery_unknown` のままです。その場合は再観測し、盲目的に再試行しないでください。
+- **アップグレード順序。** Runtime を切り替える**前に**、ブラウザ拡張機能を `0.1.203` 以降へ更新してください。拡張機能 `0.1.203` は Runtime の `boot_id` が変わったとき、または `hello` が `endpoint_registered: false` を返したときに endpoint を自動で再登録します。古い拡張機能は Runtime 切り替え後、service worker が再起動するまでオフライン表示になります。回避策: `chrome://extensions` で拡張機能の service worker だけを再読み込みします（Chrome の再起動は不要）。
+
 ## 9. Continuity / Work Memory / Browser session の違い
 
 | 概念 | 役割 | 混同しやすいもの |
@@ -336,7 +344,7 @@ Agent は次の順で進めます。
 | 同じ会話が 2 つの browser endpoint から観測された | canonical URL は必ず 1 つの登録済み session に解決される必要があります。2 つの異なる session が同じ URL を共有する場合は曖昧として `browser_canonical_url_ambiguous` で fail closed し、最新の観測を選ぶことはありません。source-anchored create と handoff が別 profile/account の session へ向き先を変えることはありません。再観測してももう一方の session の記録は消えないため、この URL は source-anchored create と handoff では曖昧なままです。代わりに endpoint、provider、account、generation を明示した direct create を使ってください |
 | dispatch タイムアウト | まず `herdr-mcp webchat dispatch-status DISPATCH_ID` を読み、次に会話を観測してから判断 |
 | 変更の delivery が不確実 | まず再観測。新しい idempotency key で再送しない |
-| `code: "caller_grant_missing"` | 信頼されたローカル経路にいない（例：生の TCP MCP クライアント）。`herdr-mcp` CLI を使う。grant は TCP で自称できません |
+| `code: "caller_grant_missing"` | 2 つの原因のどちらか。(1) 信頼されたローカル経路にいない（例：生の TCP MCP クライアント）。grant は TCP で自称できないため、自分でローカル grant を付ける `herdr-mcp` CLI を使う。(2) 呼び出し元がリモート connector で、その Page Assist grant が存在しない／失効済み。Page Assist grant は `{connector_id, grant_generation, device_id, endpoint_ref}` にバインドされ、ChatGPT の再承認（新しい `connector_id`）や拡張 ID の変化（新しい `endpoint_ref`）で旧 grant は通知なく失効する。ワークステーション所有者が順に復旧する：`herdr-mcp connector list` → `browser_endpoint.list`（CLI：`herdr-mcp webchat endpoints`。live かつ最新バージョンの endpoint を選ぶ）→ `herdr-mcp connector page-assist allow CONNECTOR_ID DEVICE_ID ENDPOINT_REF --confirm` |
 | `code: "unsupported"` | 現在の対応マトリクス外の操作（「能力の検出」参照）。模擬せず報告する |
 | continuity は見つかるが browser session が無い | 先に永続状態を解決（`continuity resume`）し、対象セッションを作成／オープンする。ページ消失を履歴喪失とみなさない |
 | session はあるが `work_memory` が `null` | Continuity 層で止まる。使える `project_ref`/`repo_id`/`work_chain_id` は無く、合成もできない |

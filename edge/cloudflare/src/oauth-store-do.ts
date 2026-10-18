@@ -1,4 +1,19 @@
 import type { Env } from "./env.js";
+import type { MigrationPlan, MigrateRejectStage } from "./grant-migration.js";
+import {
+  appendMigrateAudit,
+  appendMigrateRejectAudit,
+  applyPlanIfFresh,
+  isMigrateRejectStage,
+  listAllOrphans,
+  listOrphans,
+  migratePostconditionSatisfied,
+  migrateRejectAuditEntry,
+  migrateRejectAuditKey,
+  migrationPlanDigest,
+  planMigration,
+} from "./grant-migration.js";
+import { createLogger } from "./logger.js";
 import { createOAuthIdentity, createRs256AccessTokenVerifier, hashOpaqueToken } from "./oauth-edge.js";
 import { issueRs256AccessJwt, randomBase64UrlToken } from "./oauth-token-crypto.js";
 import {
@@ -72,6 +87,11 @@ const MAX_ACTIVE_PENDING_TOTAL = 128;
 const MAX_ACTIVE_PENDING_PER_CLIENT = 4;
 const MAX_UNAPPROVED_DCR_CLIENTS = 256;
 const UNAPPROVED_DCR_TTL_MS = 60 * 60_000;
+const MIGRATE_IDEM_PREFIX = "migrate-idem:v1:";
+const MIGRATE_IDEM_TTL_MS = 24 * 60 * 60_000;
+const MIGRATE_IDEM_SWEEP_INTERVAL_MS = 60 * 60_000;
+const MIGRATE_IDEM_CAP = 256;
+const MIGRATE_IDEM_SWEEP_BATCH = 128;
 const CONNECTOR_USAGE_TOUCH_MS = 24 * 60 * 60_000;
 
 type StoredJwk = JsonWebKey & { kid?: string; alg?: string; use?: string };
@@ -151,6 +171,7 @@ async function boundedJson(request: Request): Promise<{ ok: true; value: unknown
 
 export class OAuthStoreDO {
   private signingKeyPromise: Promise<SigningKeyRecord> | undefined;
+  private readonly logger = createLogger("oauth-store-do");
 
   constructor(private readonly state: DurableObjectState, private readonly env: Env) {
     void this.env;
@@ -180,6 +201,10 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/get") return this.getGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/webchat-control") return this.setWebChatControlGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist") return this.setPageAssistGrant(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-orphans") return this.pageAssistOrphans(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-migrate") return this.pageAssistMigrate(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-migrate-reject") return this.pageAssistMigrateReject(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-migrate-alarm") return this.pageAssistMigrateAlarm();
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/get") return this.getConnector(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/find-active") return this.findActiveConnectorByClient(request);
@@ -861,6 +886,325 @@ export class OAuthStoreDO {
       return json({ ok: false, code: result.code }, status);
     }
     return json({ ok: true, record: result.record });
+  }
+
+  /** #626: read-only. Lists orphan rows or plans a migrate dry run; never writes. */
+  private async pageAssistOrphans(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const action = body?.action;
+    if (action !== "list" && action !== "plan") return json({ ok: false, code: "bad_request" }, 400);
+    const deviceId = body?.device_id;
+    // #626/#630 spec A: the plan is device-scoped too. `list` stays device-scoped
+    // (no unscoped listing); `plan` REQUIRES a device id and returns the filtered
+    // plan plus its digest, so the owner confirms only their own rows.
+    if (typeof deviceId !== "string" || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)) {
+      return json({ ok: false, code: action === "list" ? "orphans_invalid_device_id" : "migrate_invalid_device_id" }, 400);
+    }
+    const rows = await this.state.storage.list<OAuthConnectorGrantRecord>({ prefix: GRANT_PREFIX });
+    const records = [...rows.values()].map((raw) => normalizeConnectorGrant(raw));
+    // Records that fail normalization are never offered; report the count (fixed field).
+    const invalidRecords = records.filter((r) => r === null).length;
+    if (action === "list") {
+      const orphans = listAllOrphans(records).filter((row) => row.device_id === deviceId);
+      return json({ ok: true, orphans, invalid_records: invalidRecords });
+    }
+    const plan = planMigration(records, body?.from, body?.to, deviceId);
+    if (!plan.ok) return json({ ...plan, invalid_records: invalidRecords }, 409);
+    return json({ ...plan, plan_digest: await migrationPlanDigest(plan), dry_run: true, invalid_records: invalidRecords });
+  }
+
+  /**
+   * #630 `--confirm` transaction core (design doc §7.1-7.5), DO-internal only.
+   * One storage.transaction: idempotency lookup, re-read, fresh-plan recompute,
+   * digest compare, per-device scope, raw-record patch + audit, idempotency
+   * entry, post-write verification. Any throw rolls everything back. Nothing
+   * here relaxes verifiedControlGrantSnapshot or any grant check.
+   */
+  private async pageAssistMigrate(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const from = body?.from;
+    const to = body?.to;
+    const planDigest = body?.plan_digest;
+    const idempotencyKey = body?.idempotency_key;
+    const deviceId = body?.device_id;
+    const by = typeof body?.by === "string" && body.by.length > 0 && body.by.length <= 128 ? body.by : null;
+    if (typeof deviceId !== "string" || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)) {
+      // No authenticated device id: log the rejection only, never fabricate one.
+      return this.rejectMigrate({ status: 400, code: "migrate_invalid_device_id", stage: "validate", deviceId: null, planDigest, idempotencyKey });
+    }
+    if (idempotencyKey === undefined || idempotencyKey === null || idempotencyKey === "") {
+      return this.rejectMigrate({ status: 400, code: "migrate_idempotency_key_required", stage: "validate", deviceId, planDigest, idempotencyKey });
+    }
+    if (typeof idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(idempotencyKey)) {
+      return this.rejectMigrate({ status: 400, code: "migrate_idempotency_key_invalid", stage: "validate", deviceId, planDigest, idempotencyKey });
+    }
+    if (typeof from !== "string" || typeof to !== "string") {
+      return this.rejectMigrate({ status: 400, code: "bad_request", stage: "validate", deviceId, planDigest, idempotencyKey });
+    }
+    const idemKey = MIGRATE_IDEM_PREFIX + deviceId + ":" + idempotencyKey;
+
+    type Outcome =
+      | { ok: true; action: "connector_page_assist_migrated"; moved: number; audit_id: string }
+      | { ok: false; status: number; code: string; stage: MigrateRejectStage };
+    let outcome: Outcome = { ok: false, status: 500, code: "migrate_storage_failed", stage: "storage" };
+
+    try {
+      await this.state.storage.transaction(async (tx) => {
+        // 1. Idempotent replay: same key + same digest returns the stored
+        //    result with no further work. Same key + different digest is 409.
+        const stored = await tx.get<{ v: number; plan_digest: string; result: unknown; created_at_ms: number; expires_at_ms: number }>(idemKey);
+        if (stored && typeof stored.expires_at_ms === "number" && stored.expires_at_ms > Date.now()) {
+          if (stored.plan_digest === planDigest) {
+            outcome = stored.result as { ok: true; action: "connector_page_assist_migrated"; moved: number; audit_id: string };
+            return;
+          }
+          outcome = { ok: false, status: 409, code: "migrate_idempotency_conflict", stage: "idempotency" };
+          return;
+        }
+        if (stored) await tx.delete(idemKey); // expired: treat as absent
+
+        // 2. Re-read every grant record inside the transaction.
+        const rows = await tx.list<OAuthConnectorGrantRecord>({ prefix: GRANT_PREFIX });
+        const rawEntries = [...rows.entries()];
+        const records = rawEntries.map(([, value]) => normalizeConnectorGrant(value));
+
+        // 3. Dry-run plan recompute from the records just read, device-scoped
+        //    (spec A): any cross-device row in the matching set rejects the
+        //    whole plan before digest comparison and before any write.
+        const fresh = planMigration(records, from, to, deviceId);
+        if (!fresh.ok) {
+          // §7.1 step 2: request-shape selector errors are 400; state-dependent
+          // plan failures (target/conflict/cross-device) stay 409.
+          const requestShape = fresh.code === "migrate_from_required"
+            || fresh.code === "migrate_to_required"
+            || fresh.code === "migrate_invalid_connector_id"
+            || fresh.code === "migrate_source_is_current";
+          // The plan is device-scoped, so a matching row owned by another
+          // device is a device-scope rejection, not a plain re-plan failure.
+          const stage: MigrateRejectStage = requestShape
+            ? "validate"
+            : fresh.code === "migrate_cross_device_rows" ? "device_scope" : "replan";
+          outcome = { ok: false, status: requestShape ? 400 : 409, code: fresh.code, stage };
+          return;
+        }
+
+        // 4. Device scope re-check on the filtered plan (defense in depth: the
+        //    plan is already scoped, so this never fires in practice).
+        if (fresh.moves.some((move) => move.from.device_id !== deviceId)) {
+          outcome = { ok: false, status: 409, code: "migrate_cross_device_rows", stage: "device_scope" };
+          return;
+        }
+
+        // 5. Digest compare: the owner confirmed exactly this filtered plan.
+        const freshDigest = await migrationPlanDigest(fresh);
+        if (typeof planDigest !== "string" || !/^[0-9a-f]{64}$/.test(planDigest) || planDigest !== freshDigest) {
+          outcome = { ok: false, status: 409, code: "migrate_plan_stale", stage: "digest" };
+          return;
+        }
+
+        // 6. Patch the RAW stored record of the plan target (unknown keys survive).
+        const targetKey = rawEntries.find(([key]) => {
+          const normalized = normalizeConnectorGrant(rows.get(key));
+          return normalized !== null && normalized.connector_id === to;
+        })?.[0];
+        if (targetKey === undefined) {
+          outcome = { ok: false, status: 409, code: "migrate_plan_stale", stage: "replan" };
+          return;
+        }
+        const rawTarget = await tx.get<Record<string, unknown>>(targetKey);
+        if (!rawTarget || typeof rawTarget !== "object") {
+          outcome = { ok: false, status: 409, code: "migrate_plan_stale", stage: "storage" };
+          return;
+        }
+        const applied = applyPlanIfFresh(records, rawTarget, fresh, deviceId);
+        if (!applied.ok) {
+          outcome = { ok: false, status: 409, code: applied.code, stage: "replan" };
+          return;
+        }
+        const auditId = `mgr_${randomBase64UrlToken().slice(0, 22)}`;
+        const nowMs = Date.now();
+        const withAudit = appendMigrateAudit(applied.record, fresh, by ?? `device:${deviceId}`, nowMs, auditId);
+
+        await tx.put(targetKey, withAudit);
+
+        // 7. Post-write verification inside the same transaction.
+        const reread = normalizeConnectorGrant(await tx.get<OAuthConnectorGrantRecord>(targetKey));
+        if (!migratePostconditionSatisfied(reread, fresh)) {
+          throw new Error("migrate_postcondition_failed");
+        }
+
+        // 8. Idempotency entry in the same transaction (24h TTL, 256 per device;
+        //    the oldest entry is evicted first when the cap is reached).
+        const result = { ok: true as const, action: "connector_page_assist_migrated" as const, moved: fresh.moves.length, audit_id: auditId };
+        const idemPrefix = MIGRATE_IDEM_PREFIX + deviceId + ":";
+        const existing = await tx.list<{ created_at_ms?: number; expires_at_ms?: number }>({ prefix: idemPrefix });
+        if (existing.size >= MIGRATE_IDEM_CAP) {
+          const byAge = [...existing.entries()].sort((a, b) => (a[1].created_at_ms ?? 0) - (b[1].created_at_ms ?? 0));
+          for (const [key] of byAge.slice(0, Math.max(1, existing.size - MIGRATE_IDEM_CAP + 1))) {
+            await tx.delete(key);
+          }
+        }
+        await tx.put(idemKey, { v: 1, plan_digest: planDigest, result, created_at_ms: nowMs, expires_at_ms: nowMs + MIGRATE_IDEM_TTL_MS });
+        outcome = result;
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      outcome = message === "migrate_postcondition_failed"
+        ? { ok: false, status: 500, code: "migrate_postcondition_failed", stage: "postcondition" }
+        : { ok: false, status: 500, code: "migrate_storage_failed", stage: "storage" };
+    }
+    // B1: the committed idempotency entry must be covered by a scheduled alarm.
+    // The sweep can only re-arm an existing alarm, so first-schedule here —
+    // only after the transaction committed, and only when none is pending.
+    if (outcome.ok
+      && typeof this.state.storage.getAlarm === "function"
+      && typeof this.state.storage.setAlarm === "function"
+      && await this.state.storage.getAlarm() === null) {
+      await this.state.storage.setAlarm(Date.now() + MIGRATE_IDEM_SWEEP_INTERVAL_MS);
+    }
+
+    if (!outcome.ok) {
+      return this.rejectMigrate({ ...outcome, deviceId, planDigest, idempotencyKey });
+    }
+    return json(outcome);
+  }
+
+  /**
+   * #630 §7.8 Q4: a rejected confirm keeps its original response, records one
+   * slim entry in the separate per-device reject ring, and emits one structured
+   * `page_assist_migrate_rejected` line. Best effort by design: neither the
+   * audit write nor the log may change the rejection outcome.
+   */
+  private async rejectMigrate(args: {
+    status: number;
+    code: string;
+    stage: MigrateRejectStage;
+    deviceId: string | null;
+    planDigest: unknown;
+    idempotencyKey: unknown;
+  }): Promise<Response> {
+    await this.recordMigrateReject(args);
+    return json({ ok: false, code: args.code }, args.status);
+  }
+
+  private async recordMigrateReject(args: {
+    code: string;
+    stage: MigrateRejectStage;
+    deviceId: string | null;
+    planDigest: unknown;
+    idempotencyKey: unknown;
+  }): Promise<void> {
+    let planDigest: string | null = null;
+    let idempotencyKeySha256_8: string | null = null;
+    let rejectAuditWriteFailed = false;
+    try {
+      if (args.deviceId !== null) {
+        const entry = await migrateRejectAuditEntry({
+          atMs: Date.now(),
+          code: args.code,
+          stage: args.stage,
+          deviceId: args.deviceId,
+          planDigest: args.planDigest,
+          idempotencyKey: args.idempotencyKey,
+        });
+        planDigest = entry.plan_digest;
+        idempotencyKeySha256_8 = entry.idempotency_key_sha256_8;
+        // Separate transaction, started only after the main confirm
+        // transaction returned or rolled back: it never rewrites a grant
+        // record and never joins the main atomicity scope.
+        const key = migrateRejectAuditKey(args.deviceId);
+        await this.state.storage.transaction(async (tx) => {
+          await tx.put(key, appendMigrateRejectAudit(await tx.get(key), entry));
+        });
+      }
+    } catch {
+      // Nothing was stored (or it is unreadable): keep the original rejection
+      // status/code and only flag the failed write.
+      rejectAuditWriteFailed = true;
+    }
+    try {
+      this.logger.warn("page_assist_migrate_rejected", {
+        code: args.code,
+        stage: args.stage,
+        device_id: args.deviceId,
+        plan_digest: planDigest,
+        idempotency_key_sha256_8: idempotencyKeySha256_8,
+        reject_audit_write_failed: rejectAuditWriteFailed,
+      });
+    } catch {
+      // Logging is best effort too: it must never change the rejection outcome.
+    }
+  }
+
+  /**
+   * #630 §7.6/§7.8 Q4: record the reject entry for a confirm that the Edge
+   * route rejected after owner auth but before the confirm transaction (shape,
+   * selector, digest, or idempotency-key validation). Internal route only: it
+   * carries no request body, reads no grant record, and mutates nothing beyond
+   * the caller's own reject ring. The device id comes from the Edge route's
+   * authenticated identity, and the entry shape is still the fixed Q4 set.
+   */
+  private async pageAssistMigrateReject(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const deviceId = body?.device_id;
+    const code = body?.code;
+    const stage = body?.stage;
+    if (typeof deviceId !== "string" || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)) {
+      return json({ ok: false, code: "migrate_invalid_device_id" }, 400);
+    }
+    if (typeof code !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(code) || !isMigrateRejectStage(stage)) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    await this.recordMigrateReject({
+      code,
+      stage,
+      deviceId,
+      planDigest: body?.plan_digest,
+      idempotencyKey: body?.idempotency_key,
+    });
+    return json({ ok: true });
+  }
+
+  /**
+   * #630 idempotency sweep (design §7.3 Q2): delete expired `migrate-idem:v1:`
+   * entries in batches; re-arm while any entry remains. Shared by the platform
+   * `alarm()` handler and the DO-internal route; never touches grant records.
+   */
+  private async sweepMigrateIdempotencyEntries(): Promise<{ deleted: number; live: number }> {
+    const now = Date.now();
+    let deleted = 0;
+    let live = 0;
+    await this.state.storage.transaction(async (tx) => {
+      const entries = await tx.list<{ created_at_ms?: number; expires_at_ms?: number }>({ prefix: MIGRATE_IDEM_PREFIX });
+      for (const [key, value] of entries) {
+        if (typeof value?.expires_at_ms === "number" && value.expires_at_ms <= now) {
+          if (deleted < MIGRATE_IDEM_SWEEP_BATCH) {
+            await tx.delete(key);
+            deleted += 1;
+          } else {
+            live += 1; // batch full; next sweep run gets the rest
+          }
+        } else {
+          live += 1;
+        }
+      }
+    });
+    // Re-arm while unexpired (or not-yet-swept) entries remain so the alarm
+    // stays periodic; nothing to arm when the prefix is empty.
+    if (live > 0 && typeof this.state.storage.setAlarm === "function") {
+      await this.state.storage.setAlarm(now + MIGRATE_IDEM_SWEEP_INTERVAL_MS);
+    }
+    return { deleted, live };
+  }
+
+  /** Platform DO alarm contract: the scheduled alarm performs the TTL sweep. */
+  async alarm(): Promise<void> {
+    await this.sweepMigrateIdempotencyEntries();
+  }
+
+  private async pageAssistMigrateAlarm(): Promise<Response> {
+    const { deleted, live } = await this.sweepMigrateIdempotencyEntries();
+    return json({ ok: true, deleted, live });
   }
 
   private async setPageAssistGrant(request: Request): Promise<Response> {

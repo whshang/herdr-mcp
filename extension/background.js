@@ -22,7 +22,7 @@ import {
   newContinuityId, newTransferId, shouldDiscardRetiredSourceTab,
 } from "./continuity-core.js";
 import {
-  CONTINUITY_JOURNAL_STORAGE_KEY, turnFingerprint,
+  CONTINUITY_JOURNAL_STORAGE_KEY, continuityJournalEntry, turnFingerprint,
 } from "./continuity-journal.js";
 import {
   classifyCheckpointPutError, createBoundedSupervisorAdapter, deriveGoalLedger,
@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.202";
+const H2W_SCRIPT_VERSION = "0.1.203";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -2301,7 +2301,7 @@ function browserEndpointView(endpoint) {
 }
 
 async function setLocalBrowserWebchatControlConsent() {
-  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const endpoint = await currentBrowserEndpoint();
   const current = browserEndpointView(endpoint);
   if (!endpoint?.endpoint_ref || !current) throw new Error("browser-endpoint-unavailable");
   const profileSeed = await getOrCreateBrowserProfileSeed();
@@ -2348,7 +2348,98 @@ async function recoverOpenChatGptBrowserRegistry() {
   return { observed };
 }
 
-async function registerLocalBrowserEndpoint() {
+// ---- #632 browser endpoint runtime reconciliation (begin) ----
+// One owner for endpoint registration: every caller (push hello, keepalive
+// runtime check, stream reconnect, rebuild, consent) goes through the
+// single-flight registerLocalBrowserEndpoint(), so concurrent triggers share one
+// endpoint.register. A runtime generation switch (new boot_id) or a hello that
+// reports endpoint_registered:false clears the cached endpoint and re-registers
+// at most once per boot_id, without needing a service-worker restart.
+let browserEndpointRegistration = null;
+let browserEndpointHelloBootId = null;
+let browserEndpointReregisteredBootId = null;
+// #632: the runtime evaluates endpoint registration when the push stream opens,
+// so a stream it opened while reporting endpoint_registered:false keeps refusing
+// actuation even after the same derived endpoint_ref is re-registered. This
+// demand survives a failed registration attempt and is cleared once one actually
+// succeeded, so the refresh is claimed at most once per boot_id.
+let browserEndpointStreamRefreshPending = false;
+
+function registerLocalBrowserEndpoint() {
+  if (!browserEndpointRegistration) {
+    browserEndpointRegistration = registerLocalBrowserEndpointOnce().finally(() => {
+      browserEndpointRegistration = null;
+    });
+  }
+  return browserEndpointRegistration;
+}
+
+/** Cached endpoint, or the in-flight / a fresh single-flight registration. */
+async function currentBrowserEndpoint() {
+  if (browserEndpointRegistration) return browserEndpointRegistration;
+  return browserEndpoint || registerLocalBrowserEndpoint();
+}
+
+/**
+ * Drop the cached endpoint and re-register (single-flight). Returns null when a
+ * re-register was already triggered for this boot_id, so a runtime that keeps
+ * reporting endpoint_registered:false cannot cause a registration loop.
+ */
+function invalidateBrowserEndpointForRuntime(bootId, reason) {
+  const id = String(bootId || "").trim();
+  if (id && browserEndpointReregisteredBootId === id) return null;
+  if (id) browserEndpointReregisteredBootId = id;
+  callLog(`browser endpoint re-register (${reason}) boot=${id || "-"}`);
+  browserEndpointStreamRefreshPending = true;
+  browserEndpoint = null;
+  return registerLocalBrowserEndpoint();
+}
+
+/**
+ * #632: the runtime only re-evaluates registration when the push stream opens,
+ * so a stream opened before the endpoint's registration became visible must be
+ * replaced. A failed registration attempt leaves the demand pending for the next
+ * trigger (keepalive, control center) instead of dropping the recovery, and the
+ * demand is cleared only once the replacement is actually scheduled.
+ */
+async function refreshPushStreamAfterEndpointRegistration() {
+  if (!browserEndpointStreamRefreshPending) return false;
+  if (!pushStream) {
+    // No stream was opened as unregistered, so nothing has to be replaced.
+    browserEndpointStreamRefreshPending = false;
+    return false;
+  }
+  const bindings = await loadBindings();
+  browserEndpointStreamRefreshPending = false;
+  callLog("push stream refreshed after browser endpoint re-register");
+  stopPushStream();
+  ensurePushStream(bindings);
+  return true;
+}
+
+/** Push hello: detect a runtime switch or a missing registration and self-heal. */
+async function reconcileBrowserEndpointForHello(data, streamCtrl) {
+  const bootId = String(data?.boot_id || "").trim() || null;
+  const previousBootId = browserEndpointHelloBootId;
+  if (bootId) browserEndpointHelloBootId = bootId;
+  let reason = null;
+  if (data?.endpoint_registered === false) reason = "endpoint_registered=false";
+  else if (previousBootId && bootId && previousBootId !== bootId) reason = `boot_id ${previousBootId} -> ${bootId}`;
+  if (!reason) return null;
+  const registration = invalidateBrowserEndpointForRuntime(bootId, reason);
+  if (!registration) return null;
+  const endpoint = await registration;
+  // The runtime evaluates registration when the stream opens, so reconnect
+  // this stream with the freshly registered endpoint_ref.
+  if (endpoint && pushStream?.ctrl === streamCtrl) {
+    stopPushStream();
+    ensurePushStream(await loadBindings());
+  }
+  return endpoint;
+}
+// ---- #632 browser endpoint runtime reconciliation (end) ----
+
+async function registerLocalBrowserEndpointOnce() {
   await configReady;
   try {
     const profileSeed = await getOrCreateBrowserProfileSeed();
@@ -2368,6 +2459,14 @@ async function registerLocalBrowserEndpoint() {
       browserEndpoint = parsed.endpoint;
       await getBrowserObservationGeneration();
       await recoverOpenChatGptBrowserRegistry();
+      await refreshPushStreamAfterEndpointRegistration().catch((error) => {
+        // The endpoint is registered; a failed stream replacement must keep the
+        // pending demand for the next trigger, not fail the registration.
+        callLog(
+          "push stream refresh after browser endpoint re-register failed:",
+          error?.message || String(error),
+        );
+      });
       return browserEndpoint;
     }
     callLog(
@@ -2447,7 +2546,14 @@ async function journalAppendContinuityTurn(payload) {
     const rows = Array.isArray(pending[continuityId]) ? pending[continuityId] : [];
     const now = Date.now();
     if (!rows.some((r) => r.message_id === messageId)) {
-      rows.push({ message_id: messageId, role, createdAt: now });
+      rows.push(continuityJournalEntry({
+        message_id: messageId,
+        role,
+        createdAt: now,
+        provider: payload?.provider,
+        account: payload?.account,
+        project: payload?.project,
+      }));
       if (rows.length > CONTINUITY_TURN_MAX_CACHED) rows.splice(0, rows.length - CONTINUITY_TURN_MAX_CACHED);
     }
     await saveContinuityCache({ ...cache, pending: { ...pending, [continuityId]: rows } });
@@ -2458,6 +2564,9 @@ async function journalAppendContinuityTurn(payload) {
     conversation_id: payload?.conversation_id || convKey,
     workspace_id: payload?.workspace_id || null,
     project_id: payload?.project_id || null,
+    provider: payload?.provider || null,
+    account: payload?.account || null,
+    project: payload?.project || null,
     title: payload?.title || null,
     message_id: messageId,
     role,
@@ -2958,6 +3067,8 @@ function reconcilePushStreamRuntime(state) {
   const streamBootId = String(pushStream?.bootId || "").trim();
   if (!pushStream || !currentBootId || !streamBootId || currentBootId === streamBootId) return false;
   callLog(`push stream runtime changed ${streamBootId} -> ${currentBootId}; forcing reconnect`);
+  // #632: a new runtime generation has its own registry; never reuse the cache.
+  void invalidateBrowserEndpointForRuntime(currentBootId, "runtime boot changed");
   stopPushStream();
   return true;
 }
@@ -2981,7 +3092,16 @@ async function runPushStream(ctrl) {
     let stallTimer = null;
     let relayAbort = null;
     try {
-      const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+      const endpoint = await currentBrowserEndpoint();
+      // #633: a stream replacement can abort this controller while the lookup
+      // above is still awaiting a (re-)registration that then succeeds:
+      // refreshPushStreamAfterEndpointRegistration() calls stopPushStream(),
+      // which aborts ctrl, and then schedules the replacement stream. Resuming
+      // here would open a second live push transport beside that replacement,
+      // so the loop must stop before opening a stream. The controller is
+      // re-checked after the await because the abort listener can only be
+      // attached once a stream exists.
+      if (ctrl.signal.aborted) break;
       const browserEndpointRef = String(endpoint?.endpoint_ref || "").trim();
       if (!browserEndpointRef) throw new Error("browser-endpoint-unavailable");
       const decoder = new TextDecoder();
@@ -4410,6 +4530,9 @@ async function handlePushBlock(block, streamCtrl = null) {
   if (event === "hello") {
     if (pushStream?.ctrl === streamCtrl) {
       pushStream.bootId = String(data.boot_id || "").trim() || null;
+      // #632: off the dispatch chain so registration never blocks push events.
+      void reconcileBrowserEndpointForHello(data, streamCtrl)
+        .catch((e) => callLog("browser endpoint reconcile failed:", e?.message || String(e)));
     }
     // A reconnect is the reconciliation boundary for the Control Center.
     // Fetch exactly one authoritative snapshot; steady-state changes remain
@@ -11227,6 +11350,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conversation_id: msg?.conversation_id || convKey,
         workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
         project_id: primary?.project_id || null,
+        provider: primary?.site || browserConversationInfoFromSupportedUrl(convKey)?.site || null,
+        account: primary?.browser_account_ref || null,
+        project: primary?.project_id || primary?.browser_space_ref || null,
         title: primary?.workspace_label || primary?.workspace_id || null,
         role: "user",
         text: userText,
@@ -11266,6 +11392,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conversation_id: msg?.conversation_id || convKey,
         project_id: primary?.project_id || null,
         workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
+        provider: primary?.site || browserConversationInfoFromSupportedUrl(convKey)?.site || null,
+        account: primary?.browser_account_ref || null,
+        project: primary?.project_id || primary?.browser_space_ref || null,
         title: primary?.workspace_label || primary?.workspace_id || null,
         userMessageId: msg?.userMessageId || null,
         userText,
@@ -11355,6 +11484,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conv_key: msg?.convKey || null,
         project_id: msg?.project_id || primaryBinding?.project_id || null,
         workspace_id: msg?.workspace_id || primaryBinding?.workspace_id || normalizeWorkspaceId(primaryBinding) || null,
+        provider: msg?.provider || primaryBinding?.site || browserConversationInfoFromSupportedUrl(msg?.convKey || "")?.site || null,
+        account: msg?.account || primaryBinding?.browser_account_ref || null,
+        project: msg?.project || msg?.project_id || primaryBinding?.project_id || primaryBinding?.browser_space_ref || null,
         title: primaryBinding?.workspace_label || primaryBinding?.workspace_id || null,
         conversation_id: msg?.conversation_id || null,
         userText: msg?.userText || null,
@@ -11472,7 +11604,7 @@ async function rebuildStreams() {
   }
   // Bootstrap Browser Registry before the long-lived Native Messaging push
   // stream so endpoint identity does not depend on opening Control Center later.
-  if (!browserEndpoint) await registerLocalBrowserEndpoint();
+  if (!browserEndpoint) await currentBrowserEndpoint();
   const bindings = await loadBindings();
   callLog(
     `rebuild streams v${H2W_SCRIPT_VERSION}: ${Object.keys(bindings).length} binding(s),`,
@@ -11498,7 +11630,7 @@ async function ensureAlive(preloaded, runtimeState = null) {
   // Endpoint bootstrap can legitimately fail when the extension starts before
   // a runtime that exposes Browser Registry is active. Reuse the existing
   // keepalive instead of introducing another retry timer/state owner.
-  if (!browserEndpoint) await registerLocalBrowserEndpoint();
+  if (!browserEndpoint) await currentBrowserEndpoint();
   const bindings = preloaded || await loadBindings();
   ensurePushStream(bindings);
   // Restore every missing Auto watcher, including settled conversations whose
