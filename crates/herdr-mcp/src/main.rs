@@ -90,6 +90,7 @@ mod updater;
 mod updater_store;
 #[cfg(target_os = "windows")]
 mod windows_service_manager;
+mod work_tailers;
 mod workstation_profile;
 // The stable PATH link is a Unix ownership primitive shared by launchd and
 // systemd-user installations; on Windows it is a stable `%USERPROFILE%` user
@@ -98,6 +99,8 @@ mod workstation_profile;
 mod user_cli;
 mod utility_exec;
 mod web_artifact_cache;
+mod work_capture;
+mod work_compactor;
 mod worker;
 mod worker_bootstrap;
 mod workstation;
