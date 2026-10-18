@@ -319,6 +319,23 @@ export function sanitizeSemanticModel(model: unknown, apiKey: string): string | 
   return sanitized;
 }
 
+/**
+ * Floor for a reported model name. Released runtimes require a non-empty
+ * string, so a response never carries `"model": null`.
+ */
+export const SEMANTIC_UNKNOWN_MODEL = "unknown-model";
+
+/**
+ * Model name this Worker reports for one route attempt: the sanitized
+ * provider-supplied name, else the sanitized configured route model, else the
+ * fixed placeholder. Always a non-empty string, and never the route key.
+ */
+export function semanticResponseModel(providerModel: unknown, route: EdgeSemanticRoute): string {
+  return sanitizeSemanticModel(providerModel, route.apiKey)
+    ?? sanitizeSemanticModel(route.model, route.apiKey)
+    ?? SEMANTIC_UNKNOWN_MODEL;
+}
+
 function normalizeSemanticPayload(
   route: EdgeSemanticRoute,
   raw: unknown,
@@ -331,7 +348,9 @@ function normalizeSemanticPayload(
   if (route.protocol !== "decision-vercel") {
     if (typeof raw.model !== "string") return null;
     return {
-      model: sanitizeSemanticModel(raw.model, route.apiKey),
+      // A provider name that carries the key or sanitizes to nothing falls
+      // back to the configured model instead of reaching the runtime as null.
+      model: semanticResponseModel(raw.model, route),
       answers: raw.answers,
       ...usageField,
     };
@@ -349,7 +368,7 @@ function normalizeSemanticPayload(
     }
   }
   return {
-    model: sanitizeSemanticModel(route.model, route.apiKey),
+    model: semanticResponseModel(route.model, route),
     answers,
     ...usageField,
   };
@@ -620,7 +639,7 @@ async function callSemanticChatRoute(
     return {
       ok: true,
       payload: {
-        model: sanitizeSemanticModel(route.model, route.apiKey),
+        model: semanticResponseModel(route.model, route),
         content,
         ...(usage ? { usage } : {}),
       },
@@ -663,6 +682,7 @@ export async function handleSemanticProxy(
       evaluate_available: evaluateAvailable,
       chat_available: chatAvailable,
       routes: routes.map((route) => ({
+        // Status reports the configured route model, not a provider response.
         name: route.name,
         protocol: route.protocol,
         model: route.model,
@@ -782,7 +802,7 @@ export async function handleSemanticProxy(
           event: "semantic_evaluate",
           route: route.name,
           requested_model: route.model,
-          returned_model: result.payload.model ?? null,
+          returned_model: semanticResponseModel(result.payload.model, route),
           usage: result.payload.usage ?? null,
         }));
       }

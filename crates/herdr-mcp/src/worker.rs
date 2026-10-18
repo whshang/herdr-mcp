@@ -3000,8 +3000,9 @@ pub(crate) fn semantic_proxy_request(
     timeout: std::time::Duration,
 ) -> Result<Value, String> {
     semantic_proxy_request_to("/semantic/systemone", payload, timeout, |payload| {
-        // The Worker nulls a provider model name it cannot safely report (see
-        // `sanitizeSemanticModel`), so `null` is a valid model here.
+        // Current Workers always send a non-empty model string, but a legacy
+        // Worker's `sanitizeSemanticModel` could null it out, so a null model is
+        // still accepted here as optional metadata.
         payload
             .get("model")
             .is_some_and(|model| model.is_null() || model.as_str().is_some())
@@ -3015,6 +3016,8 @@ pub(crate) fn semantic_proxy_chat_request(
     timeout: std::time::Duration,
 ) -> Result<Value, String> {
     semantic_proxy_request_to("/semantic/chat", payload, timeout, |payload| {
+        // Same tolerance as the evaluate path: a null model is optional
+        // metadata, never a reason to reject usable content.
         payload
             .get("model")
             .is_some_and(|model| model.is_null() || model.as_str().is_some())

@@ -56,10 +56,10 @@ A route's `model` is *pinned* when it names a concrete version: it contains a di
 
 Both values are provider-supplied and therefore untrusted, so they are sanitized before they reach a log line, a trace, status JSON, or a returned payload:
 
-- the returned model name keeps only `[A-Za-z0-9._:/@+-]`, is capped at 128 characters, and becomes `null`/`None` when it carries the route's api key or nothing survives sanitization (a null model never fails an otherwise valid answer set),
+- the model name keeps only `[A-Za-z0-9._:/@+-]` and is capped at 128 characters. A provider name that carries the route's api key or sanitizes to nothing is discarded. The Worker then reports the sanitized configured route model, and `unknown-model` if that is unusable too, so a Worker evaluate/chat response **never** carries `model: null`. The local runtime treats a reported model as optional metadata: it stores `None` when the name is absent, `null`, malformed, or carries the credential, and a missing model never fails an otherwise valid answer set or chat content,
 - `usage` is projected onto numeric token counts only — `prompt_tokens`, `completion_tokens`, `total_tokens`, `input_tokens`, `output_tokens` — as non-negative integers; strings, nested objects, and provider diagnostics are dropped, and the projected object is what the logs, traces, status JSON, chat usage counters, and the Worker's evaluate/chat response payloads carry.
 
-Constants: `USAGE_TOKEN_FIELDS` / `MODEL_NAME_MAX_CHARS` in `crates/herdr-mcp/src/semantic.rs` and `SEMANTIC_USAGE_TOKEN_FIELDS` / `SEMANTIC_MODEL_NAME_MAX_CHARS` in `edge/cloudflare/src/semantic-proxy.ts`.
+Constants: `USAGE_TOKEN_FIELDS` / `MODEL_NAME_MAX_CHARS` in `crates/herdr-mcp/src/semantic.rs` and `SEMANTIC_USAGE_TOKEN_FIELDS` / `SEMANTIC_MODEL_NAME_MAX_CHARS` / `SEMANTIC_UNKNOWN_MODEL` in `edge/cloudflare/src/semantic-proxy.ts`.
 
 ## Batching and state size
 

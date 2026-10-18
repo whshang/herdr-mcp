@@ -449,7 +449,7 @@ test("user is not rejected for astral characters in state | Given a state of 17,
   assert.equal(calls, 1);
 });
 
-test("user never sees a credential echoed back through provider usage or model | Given a route key echoed in usage and model | When evaluation runs | Then logs, status, and the response keep only numeric token counts", async () => {
+test("user never sees a credential echoed back through provider usage or model | Given a route key echoed in usage and model | When evaluation runs | Then logs, status, and the response report the configured model and only numeric token counts", async () => {
   const env = makeEnv([route("echo-safe")]);
   const key = "secret-for-echo-safe";
   const logged = [];
@@ -479,10 +479,10 @@ test("user never sees a credential echoed back through provider usage or model |
     console.log = originalLog;
   }
 
-  // The credential-carrying model is dropped and only allowlisted numeric
-  // token counts survive the usage projection.
+  // The credential-carrying model falls back to the configured route model and
+  // only allowlisted numeric token counts survive the usage projection.
   const payload = JSON.parse(responseText);
-  assert.equal(payload.model, null);
+  assert.equal(payload.model, "jev-2026-05-01");
   assert.deepEqual(payload.usage, { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 });
   assert.equal(responseText.includes(key), false);
 
@@ -490,7 +490,7 @@ test("user never sees a credential echoed back through provider usage or model |
   assert.ok(success, logged.join("\n"));
   const parsed = JSON.parse(success);
   assert.equal(parsed.route, "echo-safe");
-  assert.equal(parsed.returned_model, null);
+  assert.equal(parsed.returned_model, "jev-2026-05-01");
   assert.deepEqual(parsed.usage, { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 });
   assert.equal(logged.join("\n").includes(key), false);
 
@@ -505,6 +505,39 @@ test("user never sees a credential echoed back through provider usage or model |
   assert.equal(sanitizeSemanticModel("!!!", key), null);
   assert.equal(sanitizeSemanticModel("jev-2026-05-01", key), "jev-2026-05-01");
   assert.equal(sanitizeSemanticModel(`jev ${"x".repeat(200)}`, key).length, 128);
+});
+
+test("user always receives a non-empty model name | Given a provider model that sanitizes away or echoes the route key | When evaluation runs | Then the response and log report the configured model and never the key", async () => {
+  const env = makeEnv([route("fallback-model", "jev-2026-05-01")]);
+  const key = "secret-for-fallback-model";
+  const logged = [];
+  const originalLog = console.log;
+  console.log = (...args) => logged.push(args.map(String).join(" "));
+  try {
+    for (const providerModel of ["!!!", key]) {
+      await withFetch(async () => new Response(JSON.stringify({
+        model: providerModel,
+        answers: { useful: { type: "noul", noul: 0.92 } },
+      }), { status: 200, headers: { "content-type": "application/json" } }), async () => {
+        const response = await handleSemanticProxy(evaluateRequest(BODY), env);
+        assert.equal(response.status, 200);
+        const text = await response.text();
+        const payload = JSON.parse(text);
+        // Never null (released runtimes require a string) and never the key.
+        assert.equal(payload.model, "jev-2026-05-01");
+        assert.equal(text.includes(key), false);
+      });
+    }
+  } finally {
+    console.log = originalLog;
+  }
+
+  const models = logged
+    .filter((line) => line.includes("semantic_evaluate"))
+    .map((line) => JSON.parse(line).returned_model);
+  assert.equal(models.length, 2, logged.join("\n"));
+  assert.deepEqual(models, ["jev-2026-05-01", "jev-2026-05-01"]);
+  assert.equal(logged.join("\n").includes(key), false);
 });
 
 test("user is accepted at the runtime request byte budget | Given an evaluate body at the 88 KiB runtime budget | When the proxy receives it | Then it is answered instead of rejected with 413", async () => {

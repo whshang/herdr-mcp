@@ -2655,25 +2655,24 @@ fn parse_chat_response(
     secret: &str,
     payload: Value,
 ) -> Result<SemanticChatResponse, SemanticError> {
+    // The reported model is optional metadata on both provider shapes: an Edge
+    // proxy response may omit it or carry `null`, exactly like the typed
+    // decision path, so a usable model is never a precondition for content.
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .and_then(|value| sanitize_model_name(value, secret));
     if let Some(content) = payload.get("content").and_then(Value::as_str) {
-        let model = payload
-            .get("model")
-            .and_then(Value::as_str)
-            .ok_or_else(|| SemanticError::new("invalid_response"))?;
         if content.trim().is_empty() {
             return Err(SemanticError::new("invalid_response"));
         }
         return Ok(SemanticChatResponse {
             provider: provider.to_owned(),
-            model: sanitize_model_name(model, secret),
+            model,
             content: content.to_owned(),
             usage: project_usage(payload.get("usage")),
         });
     }
-    let model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| SemanticError::new("invalid_response"))?;
     let content = payload
         .get("choices")
         .and_then(Value::as_array)
@@ -2685,7 +2684,7 @@ fn parse_chat_response(
         .ok_or_else(|| SemanticError::new("invalid_response"))?;
     Ok(SemanticChatResponse {
         provider: provider.to_owned(),
-        model: sanitize_model_name(model, secret),
+        model,
         content: content.to_owned(),
         usage: project_usage(payload.get("usage")),
     })
@@ -3702,6 +3701,46 @@ mod tests {
         );
         assert_eq!(tuned["max_tokens"], json!(256));
         assert_eq!(tuned["response_format"], json!({"type": "json_object"}));
+    }
+
+    #[test]
+    fn edge_shaped_chat_payload_with_null_model_keeps_content() {
+        // The Edge Worker's chat response is shaped `{"model": ..., "content":
+        // ...}`; a null (or absent, or credential-carrying) model is optional
+        // metadata and must not invalidate the content.
+        let response = parse_chat_response(
+            "edge-semantic-chat",
+            "",
+            json!({"model": null, "content": "continue the task"}),
+        )
+        .expect("a null model is optional metadata");
+        assert_eq!(response.model, None);
+        assert_eq!(response.content, "continue the task");
+
+        let missing = parse_chat_response("edge-semantic-chat", "", json!({"content": "ok"}))
+            .expect("a missing model is optional metadata");
+        assert_eq!(missing.model, None);
+        assert_eq!(missing.content, "ok");
+
+        let secret = "sk-chat-secret";
+        let carrying = parse_chat_response(
+            "chat-route",
+            secret,
+            json!({"model": secret, "content": "ok"}),
+        )
+        .expect("a credential-carrying model is optional metadata");
+        assert_eq!(carrying.model, None);
+        assert_eq!(carrying.content, "ok");
+
+        // The OpenAI-shaped payload keeps the same tolerance.
+        let openai = parse_chat_response(
+            "chat-route",
+            "",
+            json!({"model": null, "choices": [{"message": {"content": "next step"}}]}),
+        )
+        .expect("a null model is optional metadata on the choices shape too");
+        assert_eq!(openai.model, None);
+        assert_eq!(openai.content, "next step");
     }
 
     #[test]
