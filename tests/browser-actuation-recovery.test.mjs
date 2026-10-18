@@ -2024,6 +2024,7 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     const location = { get href() { return currentUrl; } };
     const runtimeAlive = () => true;
     const browserAccountNativeIdentity = async () => "opaque-account";
+    const browserAccountObservation = async () => ({ nativeIdentity: await browserAccountNativeIdentity(), email: null });
     const chatGptProjectCatalog = async () => [];
     const currentChatGptProjectFromCatalog = () => null;
     const sendBg = async (payload) => new Promise((resolve) => pending.push({ payload, resolve }));
@@ -2903,6 +2904,10 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     wakeArgs: [],
     reservationWrites: [],
     reservationRemovals: 0,
+    now: 0,
+    delivered: false,
+    submitted: false,
+    blocked: false,
   };
 
   const act = new Function("ctx", `
@@ -2932,19 +2937,30 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     const currentHerdrRequiredApps = () => ["herdr"];
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
-    const isTurnInProgress = () => false;
+    const isTurnInProgress = () => ctx.delivered && ctx.submitted;
     const runtimeAlive = () => true;
-    const wait = async () => {};
+    const Date = { now: () => ctx.now };
+    const wait = async () => { ctx.now += 1000; };
     const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
     const fetchChatGptConversationSnapshot = async (timeoutMs) => {
       ctx.snapshotTimeouts.push(timeoutMs);
-      return { ok: false };
+      return ctx.delivered
+        ? (ctx.submitted
+          ? { ok: true, userMessageId: "new-user-message", userText: "next turn" }
+          : { ok: true, userMessageId: "prior-user-message", userText: "prior turn" })
+        : { ok: false };
     };
     const performWake = async (args) => {
       ctx.wakeArgs.push(args);
+      if (ctx.blocked) return { ok: false, attempted: true, uncertain: true, blocked: "submit-uncertain" };
+      ctx.submitted = true;
       return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
     };
     const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
+    const exactDomAcceptedUserMessageRef = () => null;
+    const providerUserTextMatchesSubmitted = (value, baseline) => value === baseline.messageText;
+    const providerAcceptanceDigests = async () => ({ accepted_user_text_sha256: "a".repeat(64) });
+    const acceptedDispatchAssignments = new Map();
     ${evidenceSource}
     ${commandSource}
     return performBrowserActuationCommand;
@@ -2957,7 +2973,9 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   });
 
   assert.equal(ctx.wakeArgs[0].browserActuation, true);
-  assert.deepEqual(ctx.snapshotTimeouts, [1200]);
+  assert.ok(ctx.snapshotTimeouts.length > 1, "unconfirmed submit continues bounded readback");
+  assert.ok(ctx.snapshotTimeouts.every((ms) => ms === 1200));
+  const firstReadbacks = ctx.snapshotTimeouts.length;
   assert.equal(result.command_accepted, true);
   assert.equal(result.rejected, false);
   assert.equal(result.accepted_message_observed, false);
@@ -2975,12 +2993,41 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   });
 
   assert.equal(ctx.wakeArgs[1].browserActuation, true);
-  assert.deepEqual(ctx.snapshotTimeouts, [1200, 1200]);
+  assert.ok(ctx.snapshotTimeouts.length > firstReadbacks + 1, "unconfirmed create also continues bounded readback");
+  assert.ok(ctx.snapshotTimeouts.every((ms) => ms === 1200));
   assert.equal(create.command_accepted, true);
   assert.equal(create.rejected, false);
   assert.equal(create.stable_resource_ref_observed, false);
   assert.deepEqual(ctx.reservationWrites, [["herdrBrowserSessionReservationV1", reservationRef]]);
   assert.equal(ctx.reservationRemovals, 0);
+
+  ctx.delivered = true;
+  ctx.submitted = false;
+  const late = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    params: { message: "next turn", required_apps: [] },
+  });
+  assert.equal(late.command_accepted, true);
+  assert.equal(late.accepted_message_observed, true, "exact provider ref upgrades late acceptance");
+  assert.equal(late.result?.accepted_user_message_ref, "new-user-message");
+  assert.equal(late.generation_owner, 17);
+  assert.equal(ctx.wakeArgs.length, 3, "each simulated intent invokes one provider submit only");
+
+  ctx.delivered = false;
+  ctx.submitted = false;
+  ctx.blocked = true;
+  const snapshotsBeforeLatchedAttempt = ctx.snapshotTimeouts.length;
+  const latched = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    params: { message: "next turn", required_apps: [] },
+  });
+  assert.equal(latched.command_accepted, true);
+  assert.equal(latched.accepted_message_observed, false);
+  assert.equal(ctx.submitted, false, "latched uncertainty must never dispatch again");
+  assert.equal(ctx.snapshotTimeouts.length, snapshotsBeforeLatchedAttempt + 1,
+    "a different dispatch must not claim readback for a prior latched submit");
 });
 
 test("user waits through transient fresh ChatGPT composer busy without a second submit | Given the new Project tab is scoped but still hydrating | When composer readiness changes from busy to idle | Then the same actuation submits once and keeps its reservation", async () => {
@@ -2996,6 +3043,7 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
     busyChecks: 0,
     busySequence: [true, true, false, true, false, false, false, true],
     waits: 0,
+    now: 0,
     wakeCalls: 0,
     reservationRemovals: 0,
   };
@@ -3033,7 +3081,8 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
       return value;
     };
     const runtimeAlive = () => true;
-    const wait = async () => { ctx.waits += 1; };
+    const Date = { now: () => ctx.now };
+    const wait = async () => { ctx.waits += 1; ctx.now += 1000; };
     const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
     const fetchChatGptConversationSnapshot = async () => ({ ok: false });
     const performWake = async () => {
@@ -3041,6 +3090,7 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
       return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
     };
     const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
+    const exactDomAcceptedUserMessageRef = () => null;
     ${evidenceSource}
     ${commandSource}
     return performBrowserActuationCommand;
@@ -3062,6 +3112,15 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
   assert.equal(result.command_accepted, true);
   assert.equal(result.rejected, false);
   assert.equal(ctx.reservationRemovals, 0, "uncertain delivery keeps the reservation for reconciliation");
+});
+
+test("user receives a bounded dispatch failure reason | Given a pre-submit refusal | When the failure is classified | Then known errors stay precise and untrusted errors stay generic", () => {
+  const start = wakeSource.indexOf("const dispatchRefusal = {");
+  const end = wakeSource.indexOf("\n      const rejectedEvidence", start);
+  assert.ok(start >= 0 && end > start, "dispatch refusal classification must remain inspectable");
+  const classify = new Function("result", `${wakeSource.slice(start, end)}; return dispatchRefusal || "browser_dispatch_submit_failed";`);
+  assert.equal(classify({ error: "insert-failed" }), "browser_dispatch_insert_failed");
+  assert.equal(classify({ error: "raw-password:secret" }), "browser_dispatch_submit_failed");
 });
 
 test("user receives exact content rejection reasons | Given browser controls reject before provider mutation | When create dispatch or stop is attempted | Then each result has a bounded machine reason", async () => {

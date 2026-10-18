@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.214";
+const H2W_CONTENT_VERSION = "0.1.216";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2643,13 +2643,19 @@ function normalizeHerdrMentionAlias(value) {
       expectedConvKey: command?.expectedConvKey ?? null,
       requiredApps,
     });
-    if (!result?.ok) {
-      if (boundedChatGptSubmit && result?.uncertain === true) {
-        evidence.command_accepted = true;
-        evidence.resource_available = true;
-        evidence.canonical_url_observed = providerCanonicalConversationObserved();
-        return evidence;
-      }
+    // A prior uncertain send latched in this document cannot be attributed
+    // to a different dispatch. Preserve its uncertainty without a new readback.
+    if (boundedChatGptSubmit && result?.blocked === "submit-uncertain") {
+      evidence.command_accepted = true;
+      evidence.resource_available = true;
+      evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      return evidence;
+    }
+    // A single provider submit can be accepted after its immediate UI ACK
+    // times out. Keep the one-shot fence and use the existing exact readback
+    // loop; missing proof still remains uncertain and is never resubmitted.
+    const submitUnconfirmed = boundedChatGptSubmit && result?.uncertain === true;
+    if (!result?.ok && !submitUnconfirmed) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
@@ -2657,9 +2663,23 @@ function normalizeHerdrMentionAlias(value) {
       if (ADAPTER.name === "chatgpt") {
         try { draftCleanup = await clearAutomationDraft(message); } catch (_) { draftCleanup = "clear_failed"; }
       }
+      // Keep diagnostics bounded to known pre-submit refusal classes; never
+      // forward raw provider, DOM, composer, or extension error strings.
+      const dispatchRefusal = {
+        "context-invalidated": "browser_dispatch_context_invalidated",
+        "wake-in-flight": "browser_dispatch_wake_in_flight",
+        dedupe: "browser_dispatch_duplicate",
+        "user-typing": "browser_dispatch_user_editing",
+        "composer-busy": "browser_dispatch_composer_busy",
+        "insert-failed": "browser_dispatch_insert_failed",
+        "no-input": "browser_dispatch_input_unavailable",
+        "submit-unavailable": "browser_dispatch_submit_unavailable",
+        "submit-input-unavailable": "browser_dispatch_submit_input_unavailable",
+        "submit-enter-failed": "browser_dispatch_submit_enter_failed",
+      }[result?.error || result?.blocked];
       const rejectedEvidence = browserRejectedEvidence(
         evidence,
-        creatingSession ? "browser_create_submit_failed" : "browser_dispatch_submit_failed",
+        creatingSession ? "browser_create_submit_failed" : (dispatchRefusal || "browser_dispatch_submit_failed"),
       );
       if (draftCleanup) rejectedEvidence.result.automation_draft_cleanup = draftCleanup;
       return rejectedEvidence;
