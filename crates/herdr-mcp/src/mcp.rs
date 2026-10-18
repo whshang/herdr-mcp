@@ -21,7 +21,7 @@ use crate::progressive_skills::{
     BROWSER_SPACE_OPEN_METHOD, DOUBAO_IMAGE_GENERATE_METHOD, DOUBAO_IMAGE_STATUS_METHOD,
     EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
     WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
+    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
 use crate::semantic::{
@@ -319,6 +319,11 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             true,
         ));
     }
+    let _work_capture = ToolCallCapture {
+        name,
+        arguments: &arguments,
+        context,
+    };
 
     let output = match name {
         "herdr_methods" => {
@@ -366,6 +371,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 continuity_call(context.state_store, method, &params)
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
+            } else if method == WORK_PICKUP_METHOD {
+                work_pickup_call(
+                    context.state_store,
+                    &params,
+                    Some(&context.cache.snapshot()),
+                )
             } else if method == BROWSER_SOURCE_RESOLVE_METHOD {
                 browser_source_resolve(context.state_store, &params, context.trusted_local_ipc)
             } else if method == BROWSER_HANDOFF_PREPARE_METHOD {
@@ -592,6 +603,34 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     ))
 }
 
+struct ToolCallCapture<'a, 'context> {
+    name: &'a str,
+    arguments: &'a Value,
+    context: &'a RuntimeContext<'context>,
+}
+
+impl Drop for ToolCallCapture<'_, '_> {
+    fn drop(&mut self) {
+        // Capture is best-effort and must never panic out of Drop (a panic
+        // during unwind would abort the process).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let snapshot = self.context.cache.snapshot();
+            let Some(event) =
+                crate::work_capture::event_for_tool_call(self.name, self.arguments, &snapshot)
+            else {
+                return;
+            };
+            // This drop runs after the tool output is computed, so this
+            // thread does not hold the store lock; a normal lock avoids
+            // try_lock silently dropping events. Poisoned locks (a caller
+            // panicked while holding the store) stay ignored as before.
+            if let Ok(store) = self.context.state_store.lock() {
+                let _ = store.append_work_event(&event);
+            }
+        }));
+    }
+}
+
 /// ChatGPT's composer rewrites a pasted chatgpt.com conversation URL into a
 /// conversation chip, so the inserted text never reads back verbatim and the
 /// bounded submit reports `browser_create_submit_failed`. Reference a ChatGPT
@@ -698,6 +737,221 @@ fn browser_conversation_url_ref(raw: &str) -> Option<BrowserConversationUrlRef> 
         }
         _ => None,
     }
+}
+
+fn work_pickup_call(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    snapshot: Option<&Value>,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "work_pickup_params_invalid"});
+    };
+    const ALLOWED: &[&str] = &["worktree", "project_root", "project_ref", "cwd", "pane"];
+    if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+        return json!({"ok": false, "code": "work_pickup_params_invalid"});
+    }
+    let bounded_str = |key: &str, max: usize| -> Result<Option<String>, Value> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(value) => match value.as_str() {
+                Some(text) if !text.trim().is_empty() && text.len() <= max => {
+                    Ok(Some(text.to_owned()))
+                }
+                _ => Err(json!({"ok": false, "code": "work_pickup_params_invalid"})),
+            },
+        }
+    };
+    let worktree = match bounded_str("worktree", 4096) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let project_root = match bounded_str("project_root", 4096) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let project_ref = match bounded_str("project_ref", 512) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let cwd = match bounded_str("cwd", 4096) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let pane = match bounded_str("pane", 256) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if usize::from(worktree.is_some()) + usize::from(project_root.is_some()) > 1 {
+        return json!({"ok": false, "code": "work_pickup_params_invalid"});
+    }
+    let Ok(store) = store.lock() else {
+        return json!({"ok": false, "code": "work_store_unavailable"});
+    };
+
+    if let Some(worktree) = worktree.or(project_root) {
+        let state = match pickup_state(&store, &worktree, project_ref.as_deref()) {
+            Ok(state) => state,
+            Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+        };
+        // Only inspect AGENTS.md/CLAUDE.md for a root the relay actually
+        // recorded (capture validated it against the topology); never for an
+        // arbitrary caller-supplied path.
+        let root = state.as_ref().map(|state| state.worktree.clone());
+        return pickup_response(state, root.as_deref());
+    }
+
+    // Caller-context resolution: a cwd (or the pane's cwd) that resolves to a
+    // project hands back that project's handoff directly.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(cwd) = cwd {
+        candidates.push(cwd);
+    }
+    if let Some(pane_cwd) = pane
+        .as_deref()
+        .and_then(|pane| snapshot.and_then(|snapshot| pickup_pane_cwd(snapshot, pane)))
+    {
+        candidates.push(pane_cwd);
+    }
+    if !candidates.is_empty() {
+        let resolved = pickup_resolve_root(snapshot, &candidates);
+        let states = match store.work_states() {
+            Ok(states) => states,
+            Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+        };
+        // Prefer the topology-resolved root; fall back to the deepest recorded
+        // handoff whose worktree contains the caller path (covers folders
+        // that compacted before this snapshot or were dropped from it).
+        let state = resolved
+            .as_ref()
+            .and_then(|root| {
+                let root = root.to_string_lossy();
+                states
+                    .iter()
+                    .filter(|state| state.worktree == root.as_ref())
+                    .max_by_key(|state| state.updated_at)
+                    .cloned()
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .flat_map(|candidate| {
+                        let candidate = std::path::Path::new(candidate);
+                        states.iter().filter(move |state| {
+                            candidate.starts_with(std::path::Path::new(&state.worktree))
+                        })
+                    })
+                    .max_by_key(|state| std::path::Path::new(&state.worktree).components().count())
+                    .cloned()
+            });
+        let root = resolved
+            .map(|root| root.to_string_lossy().into_owned())
+            .or_else(|| state.as_ref().map(|state| state.worktree.clone()));
+        return pickup_response(state, root.as_deref());
+    }
+
+    // No selector at all: list projects that have a handoff so the caller can
+    // present them or follow up with worktree/project_root.
+    let states = match store.work_states() {
+        Ok(states) => states,
+        Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+    };
+    let mut projects = states
+        .into_iter()
+        .filter(|state| !state.handoff_md.trim().is_empty())
+        .map(|state| {
+            json!({
+                "worktree": state.worktree,
+                "project_ref": state.project_ref,
+                "updated_at": state.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    projects.sort_by_key(|project| std::cmp::Reverse(project["updated_at"].as_i64().unwrap_or(0)));
+    let total = projects.len();
+    projects.truncate(50);
+    json!({"ok": true, "projects": projects, "total": total})
+}
+
+fn pickup_state(
+    store: &StateStore,
+    worktree: &str,
+    project_ref: Option<&str>,
+) -> Result<Option<crate::state_store::work_journal::WorkState>, String> {
+    if let Some(project_ref) = project_ref {
+        return store.work_state(project_ref, worktree);
+    }
+    Ok(store
+        .work_states()?
+        .into_iter()
+        .filter(|state| state.worktree == worktree)
+        .max_by_key(|state| state.updated_at))
+}
+
+/// The resolved handoff payload: rendered markdown, the structured sections
+/// (when the document carries a decodable relay-memory block), and the
+/// agent-instruction reference report for the project root.
+fn pickup_response(
+    state: Option<crate::state_store::work_journal::WorkState>,
+    root: Option<&str>,
+) -> Value {
+    let _ = root;
+    let handoff_md = state
+        .as_ref()
+        .map(|state| state.handoff_md.clone())
+        .unwrap_or_default();
+    let sections = crate::work_compactor::parsed_memory(&handoff_md)
+        .and_then(|memory| serde_json::to_value(memory).ok())
+        .unwrap_or(Value::Null);
+    let response = json!({
+        "ok": true,
+        "handoff_md": handoff_md,
+        "through_event_id": state.as_ref().map_or(0, |state| state.through_event_id),
+        "updated_at": state.as_ref().map_or(0, |state| state.updated_at),
+        "updated_at_local": state
+            .as_ref()
+            .map(|state| crate::work_compactor::relay_time(state.updated_at)),
+        "sections": sections,
+        // Live git context (branch, changed files, next step) of the worktree.
+        "workspace": state
+            .as_ref()
+            .and_then(|state| crate::work_compactor::git_context(std::path::Path::new(&state.worktree))),
+    });
+    response
+}
+
+fn pickup_pane_cwd(snapshot: &Value, pane: &str) -> Option<String> {
+    ["panes", "agents"].into_iter().find_map(|key| {
+        snapshot
+            .get(key)
+            .and_then(Value::as_array)?
+            .iter()
+            .filter(|item| item.get("pane_id").and_then(Value::as_str) == Some(pane))
+            .find_map(|item| {
+                item.get("cwd")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("foreground_cwd").and_then(Value::as_str))
+                    .map(str::to_owned)
+            })
+    })
+}
+
+/// Resolve a caller path to the deepest validated project root containing it
+/// (managed Git root or proven vcs-less operational root).
+fn pickup_resolve_root(
+    snapshot: Option<&Value>,
+    candidates: &[String],
+) -> Option<std::path::PathBuf> {
+    let topology = crate::projects::derive_routing(snapshot?);
+    let roots = crate::fs_security::validated_roots_from(&topology);
+    candidates.iter().find_map(|candidate| {
+        let candidate = std::path::Path::new(candidate);
+        roots
+            .iter()
+            .filter(|root| candidate.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned()
+    })
 }
 
 fn continuity_call(
@@ -3816,6 +4070,36 @@ fn browser_session_create_reconcile_uncertain_inner(
                 Ok(None) => {}
                 Err(error) => return browser_store_error(error),
             }
+            // The initial late acceptance ran before the polling window, when
+            // async reservation materialization (state "pending" ->
+            // "materialized" via the extension's resource registration) may
+            // not have completed. Re-attempt it with the freshly loaded record:
+            // if materialization caught up during the poll and the readback
+            // finds the accepted message, the create promotes instead of
+            // returning a false uncertain.
+            drop(guard);
+            if let Ok(promoted) = browser_session_create_late_acceptance_readback(
+                store,
+                &latest,
+                params,
+                actuator,
+                expected_generation,
+            ) {
+                let Ok(mut guard) = store.lock() else {
+                    return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+                };
+                return browser_session_create_success(
+                    &mut guard,
+                    &promoted.reservation_ref,
+                    params,
+                    replayed,
+                    true,
+                    caller_authorization,
+                );
+            }
+            let Ok(guard) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
             match browser_session_materialized_uncertain(&guard, &latest, replayed) {
                 Ok(Some(result)) => return result,
                 Ok(None) => {}
@@ -3991,6 +4275,7 @@ fn browser_session_create_params_from_source(
     };
     const ALLOWED: &[&str] = &[
         "source_url",
+        "source_session_ref",
         "message",
         "idempotency_key",
         "work_chain_id",
@@ -4026,7 +4311,17 @@ fn browser_session_create_params_from_source(
     let required_apps = browser_required_apps(params, true)?;
     let work_chain_id = browser_optional_string(params, "work_chain_id", 128)?;
     let lane_id = browser_optional_string(params, "lane_id", 160)?;
-    let route = browser_source_route(store, source_url).map_err(browser_store_error)?;
+    let source_session_ref = match object.get("source_session_ref") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 96)
+                .ok_or_else(|| json!({"ok": false, "code": "browser_operation_params_invalid"}))?,
+        ),
+        None => None,
+    };
+    let route =
+        browser_source_route(store, source_url, source_session_ref).map_err(browser_store_error)?;
     if route.provider != "chatgpt" {
         return Err(json!({
             "ok": false,
@@ -4125,12 +4420,58 @@ struct BrowserSourceRoute {
 fn browser_source_route(
     store: &StateStore,
     source_url: &str,
+    selected_session_ref: Option<&str>,
 ) -> Result<BrowserSourceRoute, String> {
+    // Reject URLs carrying credentials or a non-default port: neither form
+    // appears in a legitimately observed ChatGPT conversation URL, and
+    // accepting them could route a source through a lookalike origin.
+    if source_url.contains("://")
+        && let Ok(parsed) = url::Url::parse(source_url.trim())
+        && (parsed.username().len() + parsed.password().map_or(0, |p| p.len()) > 0
+            || parsed.port().is_some())
+    {
+        return Err("browser_source_url_invalid".to_owned());
+    }
     let source = browser_conversation_url_ref(source_url)
         .ok_or_else(|| "browser_source_url_invalid".to_owned())?;
-    let session_ref = store
-        .browser_session_ref_for_canonical_url(source_url)?
-        .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+    // ChatGPT renders project-scoped conversation URLs with a display-name
+    // suffix (`/g/g-p-<hex>-name/c/<uuid>`) while the registry stores the
+    // canonical form (`/g/g-p-<hex>/c/<uuid>`). Reconstruct the canonical URL
+    // from the parsed identity so the locator lookup matches the registered
+    // session regardless of which URL variant the caller supplied. The
+    // conversation/project identity itself is unchanged; the locator still
+    // rejects all duplicate canonical URLs without an explicit session ref.
+    let canonical_url = match &source.project_id {
+        Some(project_id) => {
+            format!(
+                "https://chatgpt.com/g/{}/c/{}",
+                project_id, source.conversation_id
+            )
+        }
+        None => format!("https://chatgpt.com/c/{}", source.conversation_id),
+    };
+    let session_ref = if let Some(selected) = selected_session_ref {
+        // An explicit observed ref selects the intended account when the URL
+        // exists in multiple browser profiles. The locator must be the same
+        // canonical page at the same generation; never infer by recency.
+        let resource = store
+            .browser_resource(selected)?
+            .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+        let locator = store
+            .browser_resource_locator(selected)?
+            .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+        if resource.kind != "session"
+            || locator.canonical_url != canonical_url
+            || locator.observation_generation != resource.observation_generation
+        {
+            return Err("browser_source_scope_mismatch".to_owned());
+        }
+        selected.to_owned()
+    } else {
+        store
+            .browser_session_ref_for_canonical_url(&canonical_url)?
+            .ok_or_else(|| "browser_source_session_not_found".to_owned())?
+    };
     let session = store
         .browser_resource(&session_ref)?
         .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
@@ -4202,7 +4543,7 @@ fn browser_source_resolve(
     let Ok(store) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
-    match browser_source_route(&store, source_url) {
+    match browser_source_route(&store, source_url, None) {
         Ok(route) => json!({
             "ok": true,
             "route": {
@@ -4289,26 +4630,26 @@ fn browser_handoff_prepare(
         // ambiguous source (two distinct sessions on one canonical URL) resolves to no
         // route and is therefore refused for automatic delivery while the manual packet
         // still returns.
-        let (route, route_error, route_session_ref) = match browser_source_route(&store, source_url)
-        {
-            Ok(route) => {
-                let route_session_ref = route.session_ref.clone();
-                (
-                    json!({
-                        "session_ref": route.session_ref,
-                        "provider": route.provider,
-                        "endpoint_ref": route.endpoint_ref,
-                        "account_ref": route.account_ref,
-                        "space_ref": route.space_ref,
-                        "display_label": route.display_label,
-                        "expected_generation": route.expected_generation,
-                    }),
-                    Value::Null,
-                    Some(route_session_ref),
-                )
-            }
-            Err(error) => (Value::Null, json!(error), None),
-        };
+        let (route, route_error, route_session_ref) =
+            match browser_source_route(&store, source_url, None) {
+                Ok(route) => {
+                    let route_session_ref = route.session_ref.clone();
+                    (
+                        json!({
+                            "session_ref": route.session_ref,
+                            "provider": route.provider,
+                            "endpoint_ref": route.endpoint_ref,
+                            "account_ref": route.account_ref,
+                            "space_ref": route.space_ref,
+                            "display_label": route.display_label,
+                            "expected_generation": route.expected_generation,
+                        }),
+                        Value::Null,
+                        Some(route_session_ref),
+                    )
+                }
+                Err(error) => (Value::Null, json!(error), None),
+            };
         (record, work_chain_id, route, route_error, route_session_ref)
     };
     let latest_source_ref = record
@@ -10945,6 +11286,176 @@ mod tests {
     }
     use super::*;
 
+    #[test]
+    fn work_pickup_returns_latest_matching_state_or_empty_success() {
+        use crate::state_store::work_journal::WorkState;
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "project-a".to_owned(),
+                worktree: "/repo".to_owned(),
+                handoff_md: "# Ready".to_owned(),
+                through_event_id: 9,
+                log_cursors_json: "{}".to_owned(),
+                updated_at: 12,
+            })
+            .unwrap();
+        let found = work_pickup_call(
+            &store,
+            &json!({"project_root": "/repo", "project_ref": "project-a"}),
+            None,
+        );
+        assert_eq!(found["ok"], true);
+        assert_eq!(found["handoff_md"], "# Ready");
+        assert_eq!(found["through_event_id"], 9);
+        assert_eq!(found["updated_at"], 12);
+        // A legacy free-form handoff has no structured sections block.
+        assert_eq!(found["sections"], Value::Null);
+
+        let empty = work_pickup_call(&store, &json!({"worktree": "/other"}), None);
+        assert_eq!(empty["ok"], true);
+        assert_eq!(empty["handoff_md"], "");
+        assert_eq!(empty["through_event_id"], 0);
+        assert_eq!(empty["updated_at"], 0);
+
+        for bad in [
+            json!({"worktree": "/repo", "project_root": "/repo"}),
+            json!({"nope": 1}),
+            json!({"cwd": ""}),
+            json!({"pane": 7}),
+        ] {
+            assert_eq!(
+                work_pickup_call(&store, &bad, None)["code"],
+                "work_pickup_params_invalid",
+                "{bad}"
+            );
+        }
+    }
+
+    /// user pickup without selectors | Given recorded handoffs | When
+    /// work.pickup is called with no worktree/project_root/cwd/pane | Then it
+    /// lists the projects with handoffs instead of failing.
+    #[test]
+    fn work_pickup_without_params_lists_projects_with_handoffs() {
+        use crate::state_store::work_journal::WorkState;
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        for (worktree, project_ref, handoff, updated_at) in [
+            ("/a", "dir:/a", "# A", 3),
+            ("/b", "git:example/b", "# B", 9),
+            ("/empty", "dir:/empty", "   ", 7),
+        ] {
+            store
+                .lock()
+                .unwrap()
+                .put_work_state(&WorkState {
+                    project_ref: project_ref.to_owned(),
+                    worktree: worktree.to_owned(),
+                    handoff_md: handoff.to_owned(),
+                    updated_at,
+                    ..WorkState::default()
+                })
+                .unwrap();
+        }
+        let listed = work_pickup_call(&store, &json!({}), None);
+        assert_eq!(listed["ok"], true);
+        let projects = listed["projects"].as_array().unwrap();
+        // Empty-handoff scopes stay out; newest first.
+        assert_eq!(projects.len(), 2);
+        assert_eq!(
+            projects[0],
+            json!({"worktree": "/b", "project_ref": "git:example/b", "updated_at": 9})
+        );
+        assert_eq!(
+            projects[1],
+            json!({"worktree": "/a", "project_ref": "dir:/a", "updated_at": 3})
+        );
+    }
+
+    /// user pickup via caller cwd | Given a handoff under a managed Git root
+    /// and a caller cwd inside it | When work.pickup passes only cwd | Then
+    /// the project handoff resolves, with structured sections and the
+    /// handoff-reference report.
+    #[test]
+    fn work_pickup_resolves_cwd_to_project_handoff() {
+        use crate::state_store::work_journal::WorkState;
+        use crate::work_compactor::{RelayItem, RelayMemory, render_handoff};
+        use std::sync::{Arc, Mutex};
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-work-pickup-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "see HANDOFF.md\n").unwrap();
+
+        let memory = RelayMemory {
+            goals: vec![RelayItem {
+                id: "g1".to_owned(),
+                text: "ship relay".to_owned(),
+            }],
+            current_state: "green".to_owned(),
+            ..RelayMemory::default()
+        };
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "git:example/repo".to_owned(),
+                worktree: root.to_string_lossy().into_owned(),
+                handoff_md: render_handoff(&memory),
+                through_event_id: 4,
+                updated_at: 5,
+                ..WorkState::default()
+            })
+            .unwrap();
+        let snapshot = json!({
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.join("src").to_string_lossy()
+            }],
+            "agents": []
+        });
+
+        // cwd resolution through the topology project root.
+        let by_cwd = work_pickup_call(
+            &store,
+            &json!({"cwd": root.join("src").to_string_lossy()}),
+            Some(&snapshot),
+        );
+        assert_eq!(by_cwd["ok"], true);
+        assert_eq!(by_cwd["through_event_id"], 4);
+        assert!(by_cwd["handoff_md"].as_str().unwrap().contains("## 规则"));
+        assert_eq!(by_cwd["sections"]["goals"][0]["text"], "ship relay");
+
+        // pane resolution goes through the pane's live cwd the same way.
+        let by_pane = work_pickup_call(&store, &json!({"pane": "w1:p1"}), Some(&snapshot));
+        assert_eq!(by_pane["handoff_md"], by_cwd["handoff_md"]);
+
+        // A cwd that resolves to no project and no recorded worktree is an
+        // empty success, never an error.
+        let unknown = work_pickup_call(
+            &store,
+            &json!({"cwd": "/definitely/nowhere"}),
+            Some(&snapshot),
+        );
+        assert_eq!(unknown["ok"], true);
+        assert_eq!(unknown["handoff_md"], "");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Accepted-text evidence a real content script now reports alongside the
     /// provider user-message identity. Applied fixtures must carry it because
     /// the runtime re-verifies the accepted provider text digest.
@@ -15385,6 +15896,154 @@ mod tests {
         }
     }
 
+    /// user owner | Given a materialized uncertain create whose initial
+    /// late-acceptance readback fails | When the post-polling retry runs with
+    /// the same actuator | Then the retry promotes the create to applied
+    /// from the accepted-message identity, not from an optimistic guess.
+    #[test]
+    fn browser_session_create_retries_late_acceptance_after_reconcile_polling() {
+        use crate::state_store::{
+            BrowserResourceObservationInput, BrowserSessionReservation,
+            BrowserSessionReservationInput,
+        };
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        let (store, endpoint_ref, observed_session_ref) = browser_dispatch_reconcile_fixture();
+        let (reservation, params) = {
+            let mut guard = store.lock().unwrap();
+            let account_ref = guard
+                .browser_resource(&observed_session_ref)
+                .unwrap()
+                .unwrap()
+                .parent_ref
+                .unwrap();
+            let reservation = match guard
+                .reserve_browser_session(BrowserSessionReservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    account_ref: &account_ref,
+                    space_ref: None,
+                    display_label: "Late acceptance retry",
+                    expected_generation: 7,
+                    idempotency_key_digest: &browser_sha256("late-retry-key"),
+                    request_digest: &browser_sha256("late-retry-request"),
+                    created_at: 40,
+                    expires_at: 4000,
+                })
+                .unwrap()
+            {
+                BrowserSessionReservation::Reserved(record) => record,
+                BrowserSessionReservation::Existing(_) => panic!("must be new"),
+            };
+            let created = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account_ref),
+                    native_identity: "late-retry-created",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 41,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &created.resource_ref,
+                    "https://chatgpt.com/c/late-retry",
+                    7,
+                    41,
+                )
+                .unwrap();
+            guard
+                .materialize_browser_session_reservation(
+                    &reservation.reservation_ref,
+                    &created.resource_ref,
+                    42,
+                )
+                .unwrap();
+            guard
+                .update_browser_session_reservation_delivery(
+                    &reservation.reservation_ref,
+                    7,
+                    BrowserDeliveryState::Uncertain,
+                    None,
+                    43,
+                )
+                .unwrap();
+            (
+                guard
+                    .browser_session_reservation(&reservation.reservation_ref)
+                    .unwrap()
+                    .unwrap(),
+                json!({"message": "late accepted turn"}),
+            )
+        };
+
+        struct FlakyReadbackActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for FlakyReadbackActuator {
+            fn actuate(
+                &self,
+                _: &str,
+                _: &Value,
+                _: i64,
+                _: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Err("unavailable".to_owned())
+            }
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                _: &Value,
+                expected_generation: i64,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_SESSION_ARCHIVE_STATUS_METHOD);
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First call (initial late acceptance): fail to simulate
+                    // a transient readback error (or a pending-state guard).
+                    return Err("transient readback failure".to_owned());
+                }
+                // Second call (post-polling retry): return the accepted message.
+                let mut result = accepted_text_evidence("late accepted turn");
+                let object = result.as_object_mut().unwrap();
+                object.insert(
+                    "accepted_user_message_ref".to_owned(),
+                    json!("provider-late-user"),
+                );
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.resource_available = true;
+                evidence.stable_resource_ref_observed = true;
+                evidence.lifecycle_observed = true;
+                evidence.result = Some(result);
+                Ok(evidence)
+            }
+        }
+
+        let actuator = FlakyReadbackActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let result = browser_session_create_reconcile_uncertain(
+            &store,
+            &reservation,
+            &params,
+            Some(&actuator),
+            7,
+            false,
+            None,
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["delivery_state"], "applied");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn browser_evidence_accepted_user_message_ref_is_narrowly_validated() {
         let mut evidence = BrowserPostconditionEvidence::resource_unavailable(7);
@@ -16982,6 +17641,219 @@ mod tests {
         assert_eq!(duplicate_app["code"], "browser_required_apps_invalid");
     }
 
+    /// user owner | Given a session registered under the canonical project URL
+    /// | When the equivalent vanity URL variant (display-name suffix) is used
+    /// | Then the same session route is resolved; unrelated and malformed URLs
+    /// still fail closed.
+    #[test]
+    fn user_source_route_given_vanity_url_variant_when_resolved_then_same_session_as_canonical() {
+        use crate::state_store::{
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        const CANONICAL: &str = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/6ace54d2-4fbc-83e9-8c9f-b99360c5b44f";
+        const VANITY: &str = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978-herdr-mcp/c/6ace54d2-4fbc-83e9-8c9f-b99360c5b44f";
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, account_ref, session_ref);
+        {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "vanity-route-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.212",
+                    observed_at: 10,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.create"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "vanity-route-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "vanity-route-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(&session.resource_ref, CANONICAL, 7, 12)
+                .unwrap();
+            endpoint_ref = endpoint.endpoint_ref;
+            account_ref = account.resource_ref;
+            session_ref = session.resource_ref;
+        }
+        let store = Arc::new(Mutex::new(store));
+
+        // Vanity URL resolves to the same registered session.
+        let vanity = browser_source_resolve(&store, &json!({"source_url": VANITY}), true);
+        assert_eq!(vanity["ok"], true, "{vanity}");
+        assert_eq!(vanity["route"]["session_ref"], session_ref);
+        assert_eq!(vanity["route"]["endpoint_ref"], endpoint_ref);
+        assert_eq!(vanity["route"]["account_ref"], account_ref);
+
+        // Canonical URL still resolves identically (no regression).
+        let canonical = browser_source_resolve(&store, &json!({"source_url": CANONICAL}), true);
+        assert_eq!(canonical["ok"], true);
+        assert_eq!(canonical["route"]["session_ref"], session_ref);
+
+        // Unrelated conversation URL does not route.
+        let unrelated = browser_source_resolve(
+            &store,
+            &json!({"source_url": "https://chatgpt.com/c/unrelated-conversation-id"}),
+            true,
+        );
+        assert_eq!(unrelated["code"], "browser_source_session_not_found");
+
+        // Malformed URL fails at parse, not at lookup.
+        let malformed = browser_source_resolve(&store, &json!({"source_url": "not-a-url"}), true);
+        assert_eq!(malformed["code"], "browser_source_url_invalid");
+
+        // Non-chatgpt origin does not route.
+        let foreign = browser_source_resolve(
+            &store,
+            &json!({"source_url": "https://claude.ai/c/some-conversation"}),
+            true,
+        );
+        assert_eq!(foreign["code"], "browser_source_url_invalid");
+    }
+
+    /// user owner | Given a source URL with credentials or a custom port
+    /// | When browser_source_route runs | Then the URL is rejected as invalid
+    /// before any locator lookup; a harmless query/fragment still routes.
+    #[test]
+    fn user_source_route_rejects_userinfo_and_custom_port() {
+        use crate::state_store::{
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput,
+        };
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, _account_ref, session_ref);
+        {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "port-reject-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.212",
+                    observed_at: 10,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.create"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "port-reject-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "port-reject-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            const CANONICAL: &str = "https://chatgpt.com/c/port-reject-conv";
+            store
+                .upsert_browser_resource_locator(&session.resource_ref, CANONICAL, 7, 12)
+                .unwrap();
+            endpoint_ref = endpoint.endpoint_ref;
+            _account_ref = account.resource_ref;
+            session_ref = session.resource_ref;
+        }
+        // Userinfo URLs are rejected before lookup.
+        let userinfo = browser_source_route(
+            &store,
+            "https://user:pass@chatgpt.com/c/port-reject-conv",
+            None,
+        );
+        assert_eq!(
+            userinfo.err(),
+            Some("browser_source_url_invalid".to_owned())
+        );
+
+        // Custom port URLs are rejected.
+        let port =
+            browser_source_route(&store, "https://chatgpt.com:8443/c/port-reject-conv", None);
+        assert_eq!(port.err(), Some("browser_source_url_invalid".to_owned()));
+
+        // Harmless query/fragment still routes to the same session.
+        let query = browser_source_route(
+            &store,
+            "https://chatgpt.com/c/port-reject-conv?ref=share",
+            None,
+        )
+        .unwrap();
+        assert_eq!(query.session_ref, session_ref);
+        assert_eq!(query.endpoint_ref, endpoint_ref);
+    }
+
+    /// user owner | Given a source_session_ref exceeding 96 chars
+    /// | When browser_session_create_params_from_source validates it
+    /// | Then the param is rejected as invalid before any store lookup.
+    #[test]
+    fn user_source_route_rejects_oversized_source_session_ref() {
+        let store = StateStore::open(":memory:").unwrap();
+        let long_ref = "br_".to_owned() + &"a".repeat(100);
+        let result = browser_session_create_params_from_source(
+            &store,
+            &json!({
+                "source_url": "https://chatgpt.com/c/some-conv",
+                "source_session_ref": long_ref,
+                "message": "must reject",
+                "idempotency_key": "oversized-ref-1",
+            }),
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err["code"], "browser_operation_params_invalid");
+    }
+
     /// Register one ChatGPT browser profile (endpoint + provider + consent + account +
     /// session) whose single session observes `url`, and return the session ref. Used by
     /// the strict source-route coverage so the only varying input is profile identity and
@@ -17123,6 +17995,43 @@ mod tests {
         assert_eq!(result["ok"], false);
         assert_eq!(result["code"], "browser_canonical_url_ambiguous");
         assert!(result.get("reservation_ref").is_none());
+
+        // Explicit observed source session selects exactly one of the two
+        // accounts. The same ref cannot authorize an unrelated URL.
+        {
+            let guard = store.lock().unwrap();
+            let sessions = guard
+                .browser_resources(None, Some("chatgpt"), Some("session"), None, 10)
+                .unwrap();
+            assert_eq!(sessions.len(), 2);
+            for session in sessions {
+                let params = json!({
+                    "source_url": URL,
+                    "source_session_ref": session.resource_ref,
+                    "message": "explicit account continuation",
+                    "idempotency_key": "ambiguous-source-explicit-1",
+                });
+                let (normalized, chosen) =
+                    browser_session_create_params_from_source(&guard, &params)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(chosen, session.resource_ref);
+                assert_eq!(normalized["endpoint_ref"], session.endpoint_ref);
+                assert_eq!(
+                    normalized["account_ref"],
+                    browser_resource_account_ref(&guard, &session).unwrap()
+                );
+
+                let wrong = json!({
+                    "source_url": "https://chatgpt.com/c/unrelated-conversation",
+                    "source_session_ref": session.resource_ref,
+                    "message": "must refuse",
+                    "idempotency_key": "ambiguous-source-wrong-url-1",
+                });
+                let err = browser_session_create_params_from_source(&guard, &wrong).unwrap_err();
+                assert_eq!(err["code"], "browser_source_scope_mismatch");
+            }
+        }
         // Durable state proves the refusal happened before any reservation: the strict
         // source lookup fails closed during normalization, so no create can be replayed
         // against the wrong identity later.

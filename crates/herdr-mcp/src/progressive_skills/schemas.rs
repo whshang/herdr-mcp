@@ -19,7 +19,7 @@ use super::{
     LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD, TEXT_READ_METHOD, TEXT_WRITE_METHOD,
     VALIDATION_ADVISE_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
     WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
+    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
@@ -266,6 +266,22 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 },
                 "required": ["path", "content", "sha256"],
                 "empty": false,
+            },
+        }),
+        json!({
+            "method": WORK_PICKUP_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "worktree": {"type": "string", "maxLength": 4096},
+                    "project_root": {"type": "string", "maxLength": 4096},
+                    "project_ref": {"type": "string", "maxLength": 512},
+                    "cwd": {"type": "string", "maxLength": 4096},
+                    "pane": {"type": "string", "maxLength": 256},
+                },
+                "required": [],
+                "description": "Pass worktree or project_root (or cwd/pane to resolve the caller's project); with no selector, lists projects that have handoffs.",
             },
         }),
         json!({
@@ -540,6 +556,11 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "params": {
                 "properties": {
                     "source_url": {"type": ["string", "null"], "maxLength": 2048},
+                    "source_session_ref": {
+                        "type": "string",
+                        "maxLength": 96,
+                        "description": "Optional exact observed source session for source_url ambiguity across accounts; URL and resource generation must match."
+                    },
                     "endpoint_ref": {"type": "string", "maxLength": 96},
                     "provider": {"type": "string", "maxLength": 32},
                     "account_ref": {"type": "string", "maxLength": 96},

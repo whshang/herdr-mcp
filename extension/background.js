@@ -22,7 +22,7 @@ import {
   newContinuityId, newTransferId, shouldDiscardRetiredSourceTab,
 } from "./continuity-core.js";
 import {
-  CONTINUITY_JOURNAL_STORAGE_KEY, turnFingerprint,
+  CONTINUITY_JOURNAL_STORAGE_KEY, continuityJournalEntry, turnFingerprint,
 } from "./continuity-journal.js";
 import {
   classifyCheckpointPutError, createBoundedSupervisorAdapter, deriveGoalLedger,
@@ -2546,7 +2546,14 @@ async function journalAppendContinuityTurn(payload) {
     const rows = Array.isArray(pending[continuityId]) ? pending[continuityId] : [];
     const now = Date.now();
     if (!rows.some((r) => r.message_id === messageId)) {
-      rows.push({ message_id: messageId, role, createdAt: now });
+      rows.push(continuityJournalEntry({
+        message_id: messageId,
+        role,
+        createdAt: now,
+        provider: payload?.provider,
+        account: payload?.account,
+        project: payload?.project,
+      }));
       if (rows.length > CONTINUITY_TURN_MAX_CACHED) rows.splice(0, rows.length - CONTINUITY_TURN_MAX_CACHED);
     }
     await saveContinuityCache({ ...cache, pending: { ...pending, [continuityId]: rows } });
@@ -2557,6 +2564,9 @@ async function journalAppendContinuityTurn(payload) {
     conversation_id: payload?.conversation_id || convKey,
     workspace_id: payload?.workspace_id || null,
     project_id: payload?.project_id || null,
+    provider: payload?.provider || null,
+    account: payload?.account || null,
+    project: payload?.project || null,
     title: payload?.title || null,
     message_id: messageId,
     role,
@@ -11641,6 +11651,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conversation_id: msg?.conversation_id || convKey,
         workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
         project_id: primary?.project_id || null,
+        provider: primary?.site || browserConversationInfoFromSupportedUrl(convKey)?.site || null,
+        account: primary?.browser_account_ref || null,
+        project: primary?.project_id || primary?.browser_space_ref || null,
         title: primary?.workspace_label || primary?.workspace_id || null,
         role: "user",
         text: userText,
@@ -11680,6 +11693,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conversation_id: msg?.conversation_id || convKey,
         project_id: primary?.project_id || null,
         workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
+        provider: primary?.site || browserConversationInfoFromSupportedUrl(convKey)?.site || null,
+        account: primary?.browser_account_ref || null,
+        project: primary?.project_id || primary?.browser_space_ref || null,
         title: primary?.workspace_label || primary?.workspace_id || null,
         userMessageId: msg?.userMessageId || null,
         userText,
@@ -11769,6 +11785,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conv_key: msg?.convKey || null,
         project_id: msg?.project_id || primaryBinding?.project_id || null,
         workspace_id: msg?.workspace_id || primaryBinding?.workspace_id || normalizeWorkspaceId(primaryBinding) || null,
+        provider: msg?.provider || primaryBinding?.site || browserConversationInfoFromSupportedUrl(msg?.convKey || "")?.site || null,
+        account: msg?.account || primaryBinding?.browser_account_ref || null,
+        project: msg?.project || msg?.project_id || primaryBinding?.project_id || primaryBinding?.browser_space_ref || null,
         title: primaryBinding?.workspace_label || primaryBinding?.workspace_id || null,
         conversation_id: msg?.conversation_id || null,
         userText: msg?.userText || null,
