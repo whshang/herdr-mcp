@@ -38,6 +38,7 @@ pub const WORK_MEMORY_APPEND_EVIDENCE_METHOD: &str = "work_memory.append_evidenc
 pub const WORK_MEMORY_CHECKPOINT_PUT_METHOD: &str = "work_memory.checkpoint.put";
 pub const WORK_MEMORY_RESUME_METHOD: &str = "work_memory.resume";
 pub const WORK_MEMORY_SEARCH_METHOD: &str = "work_memory.search";
+pub const WORK_PICKUP_METHOD: &str = "work.pickup";
 pub const BROWSER_ENDPOINT_LIST_METHOD: &str = "herdr_mcp.browser_endpoint.list";
 pub const BROWSER_ENDPOINT_INSPECT_METHOD: &str = "herdr_mcp.browser_endpoint.inspect";
 pub const BROWSER_RESOURCE_LIST_METHOD: &str = "herdr_mcp.browser_resource.list";
@@ -4248,6 +4249,13 @@ mod tests {
             "same workflow and required gates remain valid; only advisory ordering/classification is absent"
         );
 
+        let pickup = local_method_schemas("work.pickup");
+        assert_eq!(pickup.len(), 1);
+        assert_eq!(pickup[0]["method"], WORK_PICKUP_METHOD);
+        assert_eq!(pickup[0]["access"], "read_only");
+        assert!(pickup[0]["params"]["properties"]["cwd"].is_object());
+        assert!(pickup[0]["params"]["properties"]["pane"].is_object());
+
         let methods = local_method_schemas("work_memory.");
         assert_eq!(methods.len(), 6);
         assert_eq!(methods[0]["method"], WORK_MEMORY_BIND_METHOD);
@@ -4364,13 +4372,24 @@ mod tests {
         );
         assert_eq!(
             methods[20]["params"]["properties"]["action"]["enum"],
-            json!(["observe", "click", "fill", "expect", "screenshot"])
+            json!([
+                "observe",
+                "click",
+                "hover",
+                "fill",
+                "expect",
+                "screenshot",
+                "scroll",
+                "extract",
+                "extract_table",
+                "press"
+            ])
         );
         assert_eq!(
             methods[20]["params"]["properties"]["objective"]["maxLength"],
             1024
         );
-        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 5);
+        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 9);
         assert_eq!(methods[21]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
         assert_eq!(methods[21]["access"], "read_only");
         assert_eq!(
