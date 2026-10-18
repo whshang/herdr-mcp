@@ -5,7 +5,7 @@
 //! host, so endpoint registration and every browser operation silently fail.
 //!
 //! The pure comparison lives here (ungated) so it is testable on every
-//! platform; the macOS-only install lifecycle in `native_host_install` only
+//! platform; the macOS and Linux install lifecycle in `native_host_install`
 //! wires the pieces together.
 
 use serde_json::{Value, json};
