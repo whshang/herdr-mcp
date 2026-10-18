@@ -556,6 +556,11 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "params": {
                 "properties": {
                     "source_url": {"type": ["string", "null"], "maxLength": 2048},
+                    "source_session_ref": {
+                        "type": "string",
+                        "maxLength": 96,
+                        "description": "Optional exact observed source session for source_url ambiguity across accounts; URL and resource generation must match."
+                    },
                     "endpoint_ref": {"type": "string", "maxLength": 96},
                     "provider": {"type": "string", "maxLength": 32},
                     "account_ref": {"type": "string", "maxLength": 96},
