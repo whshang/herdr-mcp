@@ -2691,23 +2691,16 @@ fn browser_delivery_state_from_postcondition(
             evidence.stable_resource_ref_observed && evidence.lifecycle_observed
         }
         BrowserOperation::SessionCreate => {
-            evidence.stable_resource_ref_observed
-                && evidence.lifecycle_observed
-                && evidence.canonical_url_observed
-                && (evidence.accepted_message_observed || evidence.message_baseline_advanced)
-                // The exact provider user-message identity is terminal proof that
-                // the first assignment crossed the browser/provider boundary.
-                // Assistant generation can begin after the bounded create
-                // observation window, so generation-status timing must not turn an
-                // already accepted message into delivery-uncertain. Session
-                // materialization + locator generation above still fence the new
-                // resource to the requested browser generation.
-                && browser_evidence_accepted_user_message_ref(evidence)?.is_some()
-                // Re-verify the accepted provider text against the submitted
-                // message so a content-script acceptance bug cannot materialize a
-                // foreign conversation as this create's session.
-                && browser_evidence_accepted_text_matches(params, evidence)?
-                && browser_required_apps_match_evidence(params, evidence)?
+            // The exact provider user-message identity is terminal proof that
+            // the first assignment crossed the browser/provider boundary.
+            // Assistant generation can begin after the bounded create
+            // observation window, so generation-status timing must not turn an
+            // already accepted message into delivery-uncertain. Session
+            // materialization + locator generation above still fence the new
+            // resource to the requested browser generation. The checks are
+            // evaluated individually so an uncertain classification can name
+            // which proof was missing.
+            browser_session_create_uncertain_classification_reason(params, evidence)?.is_none()
         }
         BrowserOperation::SpaceOpen | BrowserOperation::SessionOpen => {
             evidence.stable_resource_ref_observed
@@ -2870,6 +2863,77 @@ fn browser_session_create_evidence_accepted_ref(
         return Ok(None);
     }
     browser_evidence_accepted_user_message_ref(evidence)
+}
+
+/// Evaluate the SessionCreate postcondition checks individually, in the same
+/// order `browser_delivery_state_from_postcondition` combines them, and name
+/// the first one whose proof is missing. `None` means every check passed.
+/// Re-verify the accepted provider text against the submitted message so a
+/// content-script acceptance bug cannot materialize a foreign conversation as
+/// this create's session.
+fn browser_session_create_uncertain_classification_reason(
+    params: &Value,
+    evidence: &BrowserPostconditionEvidence,
+) -> Result<Option<&'static str>, String> {
+    if !evidence.stable_resource_ref_observed {
+        return Ok(Some("stable_resource_ref_missing"));
+    }
+    if !evidence.lifecycle_observed {
+        return Ok(Some("lifecycle_missing"));
+    }
+    if !evidence.canonical_url_observed {
+        return Ok(Some("canonical_url_missing"));
+    }
+    if !evidence.accepted_message_observed && !evidence.message_baseline_advanced {
+        return Ok(Some("accepted_message_missing"));
+    }
+    if browser_evidence_accepted_user_message_ref(evidence)?.is_none() {
+        return Ok(Some("accepted_ref_missing"));
+    }
+    if !browser_evidence_accepted_text_matches(params, evidence)? {
+        return Ok(Some("text_digest_mismatch"));
+    }
+    if !browser_required_apps_match_evidence(params, evidence)? {
+        return Ok(Some("apps_mismatch"));
+    }
+    Ok(None)
+}
+
+/// The title projection object the browser actuation evidence reported for a
+/// created session, if any. Only object-shaped projections count; anything
+/// else is treated as unobserved.
+fn browser_evidence_title_projection(evidence: &BrowserPostconditionEvidence) -> Option<Value> {
+    evidence
+        .result
+        .as_ref()
+        .and_then(|result| result.get("title_projection"))
+        .filter(|value| value.is_object())
+        .cloned()
+}
+
+/// Attach the create's observed title projection to an ok:true session.create
+/// success response. Evidence that reported no projection object still
+/// reports the field as explicitly unobserved instead of omitting it.
+fn browser_session_apply_title_projection(response: &mut Value, projection: Option<&Value>) {
+    if response.get("ok") != Some(&Value::Bool(true)) {
+        return;
+    }
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "title_projection".to_owned(),
+            projection
+                .cloned()
+                .unwrap_or_else(|| json!({"status": "unobserved"})),
+        );
+    }
+}
+
+/// Attach the reason the create was classified uncertain to a session.create
+/// response that originated from that uncertain classification.
+fn browser_session_apply_classification_reason(response: &mut Value, reason: Option<&'static str>) {
+    if let (Some(reason), Some(object)) = (reason, response.as_object_mut()) {
+        object.insert("classification_reason".to_owned(), json!(reason));
+    }
 }
 
 fn browser_dispatch_submit(
@@ -3745,6 +3809,32 @@ fn browser_session_create_success(
     })
 }
 
+/// A session.create success settled by the reconcile path: the same shape as
+/// the direct success response, plus the title projection observed for the
+/// create (polled evidence first, then the first actuation evidence, else
+/// explicitly unobserved) and the reason the create was classified uncertain.
+fn browser_session_create_reconcile_success(
+    store: &mut StateStore,
+    reservation_ref: &str,
+    params: &Value,
+    replayed: bool,
+    caller_authorization: Option<&BrowserCallerAuthorization>,
+    title_projection: Option<&Value>,
+    classification_reason: Option<&'static str>,
+) -> Value {
+    let mut value = browser_session_create_success(
+        store,
+        reservation_ref,
+        params,
+        replayed,
+        true,
+        caller_authorization,
+    );
+    browser_session_apply_title_projection(&mut value, title_projection);
+    browser_session_apply_classification_reason(&mut value, classification_reason);
+    value
+}
+
 // Bound the post-wait dispatch-reconciliation sweep to ~5s after the browser
 // broker's 80s create actuation wait. Callers that budget for the create
 // (local CLI 90s) must stay above the actuation wait plus this sweep so the
@@ -3918,6 +4008,7 @@ fn browser_session_create_late_acceptance_readback(
         .map_err(|_| "promotion_failed")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn browser_session_create_reconcile_uncertain(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     reservation: &BrowserSessionReservationRecord,
@@ -3926,6 +4017,8 @@ fn browser_session_create_reconcile_uncertain(
     expected_generation: i64,
     replayed: bool,
     caller_authorization: Option<&BrowserCallerAuthorization>,
+    first_title_projection: Option<Value>,
+    classification_reason: Option<&'static str>,
 ) -> Value {
     // Surface why late acceptance did not promote (fixed token, no content).
     let mut late_reason = None;
@@ -3937,6 +4030,8 @@ fn browser_session_create_reconcile_uncertain(
         expected_generation,
         replayed,
         caller_authorization,
+        first_title_projection,
+        classification_reason,
         &mut late_reason,
     );
     if value.get("delivery_state").and_then(Value::as_str) == Some("uncertain")
@@ -3956,6 +4051,8 @@ fn browser_session_create_reconcile_uncertain_inner(
     expected_generation: i64,
     replayed: bool,
     caller_authorization: Option<&BrowserCallerAuthorization>,
+    first_title_projection: Option<Value>,
+    mut classification_reason: Option<&'static str>,
     late_reason_out: &mut Option<&'static str>,
 ) -> Value {
     let current = {
@@ -3975,13 +4072,14 @@ fn browser_session_create_reconcile_uncertain_inner(
             expected_generation,
         ) {
             Ok(Some(promoted)) => {
-                return browser_session_create_success(
+                return browser_session_create_reconcile_success(
                     &mut guard,
                     &promoted.reservation_ref,
                     params,
                     replayed,
-                    true,
                     caller_authorization,
+                    first_title_projection.as_ref(),
+                    classification_reason,
                 );
             }
             Ok(None) => {}
@@ -4002,13 +4100,14 @@ fn browser_session_create_reconcile_uncertain_inner(
                 let Ok(mut guard) = store.lock() else {
                     return json!({"ok": false, "code": "browser_operation_store_unavailable"});
                 };
-                return browser_session_create_success(
+                return browser_session_create_reconcile_success(
                     &mut guard,
                     &promoted.reservation_ref,
                     params,
                     replayed,
-                    true,
                     caller_authorization,
+                    first_title_projection.as_ref(),
+                    classification_reason,
                 );
             }
             Err(reason) => *late_reason_out = Some(reason),
@@ -4020,11 +4119,14 @@ fn browser_session_create_reconcile_uncertain_inner(
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
         match browser_session_materialized_uncertain(&guard, &current, replayed) {
-            Ok(Some(result)) => return result,
+            Ok(Some(mut result)) => {
+                browser_session_apply_classification_reason(&mut result, classification_reason);
+                return result;
+            }
             Ok(None) => {}
             Err(error) => return browser_store_error(error),
         }
-        return json!({
+        let mut value = json!({
             "ok": false,
             "code": "uncertain",
             "reservation_ref": current.reservation_ref,
@@ -4033,6 +4135,8 @@ fn browser_session_create_reconcile_uncertain_inner(
             "replayed": replayed,
             "reconciled": false,
         });
+        browser_session_apply_classification_reason(&mut value, classification_reason);
+        return value;
     };
     let evidence = match browser_session_create_reconcile_evidence(
         store,
@@ -4058,13 +4162,14 @@ fn browser_session_create_reconcile_uncertain_inner(
                 expected_generation,
             ) {
                 Ok(Some(promoted)) => {
-                    return browser_session_create_success(
+                    return browser_session_create_reconcile_success(
                         &mut guard,
                         &promoted.reservation_ref,
                         params,
                         replayed,
-                        true,
                         caller_authorization,
+                        first_title_projection.as_ref(),
+                        classification_reason,
                     );
                 }
                 Ok(None) => {}
@@ -4101,11 +4206,14 @@ fn browser_session_create_reconcile_uncertain_inner(
                 return json!({"ok": false, "code": "browser_operation_store_unavailable"});
             };
             match browser_session_materialized_uncertain(&guard, &latest, replayed) {
-                Ok(Some(result)) => return result,
+                Ok(Some(mut result)) => {
+                    browser_session_apply_classification_reason(&mut result, classification_reason);
+                    return result;
+                }
                 Ok(None) => {}
                 Err(error) => return browser_store_error(error),
             }
-            return json!({
+            let mut value = json!({
                 "ok": false,
                 "code": "uncertain",
                 "reservation_ref": latest.reservation_ref,
@@ -4114,9 +4222,15 @@ fn browser_session_create_reconcile_uncertain_inner(
                 "replayed": replayed,
                 "reconciled": false,
             });
+            browser_session_apply_classification_reason(&mut value, classification_reason);
+            return value;
         }
         Err(error) => return browser_store_error(error),
     };
+    let polled_title_projection = browser_evidence_title_projection(&evidence);
+    let title_projection = polled_title_projection
+        .as_ref()
+        .or(first_title_projection.as_ref());
     let delivery_state = match browser_delivery_state_from_postcondition(
         BrowserOperation::SessionCreate,
         params,
@@ -4144,14 +4258,31 @@ fn browser_session_create_reconcile_uncertain_inner(
         Ok(record) => record,
         Err(error) => return browser_store_error(error),
     };
+    if delivery_state == BrowserDeliveryState::Uncertain {
+        // The polled evidence again claimed success but did not prove every
+        // postcondition: name the missing proof like the first classification.
+        let polled_reason =
+            match browser_session_create_uncertain_classification_reason(params, &evidence) {
+                Ok(reason) => reason,
+                Err(error) => return browser_store_error(error),
+            };
+        if let Some(reason) = polled_reason {
+            eprintln!(
+                "browser session.create classified uncertain: reason={reason} reservation={}",
+                reservation.reservation_ref
+            );
+        }
+        classification_reason = polled_reason.or(classification_reason);
+    }
     if delivery_state == BrowserDeliveryState::Applied {
-        return browser_session_create_success(
+        return browser_session_create_reconcile_success(
             &mut guard,
             &settled.reservation_ref,
             params,
             replayed,
-            true,
             caller_authorization,
+            title_projection,
+            classification_reason,
         );
     }
     if delivery_state == BrowserDeliveryState::Uncertain {
@@ -4161,20 +4292,24 @@ fn browser_session_create_reconcile_uncertain_inner(
             expected_generation,
         ) {
             Ok(Some(promoted)) => {
-                return browser_session_create_success(
+                return browser_session_create_reconcile_success(
                     &mut guard,
                     &promoted.reservation_ref,
                     params,
                     replayed,
-                    true,
                     caller_authorization,
+                    title_projection,
+                    classification_reason,
                 );
             }
             Ok(None) => {}
             Err(error) => return browser_store_error(error),
         }
         match browser_session_materialized_uncertain(&guard, &settled, replayed) {
-            Ok(Some(result)) => return result,
+            Ok(Some(mut result)) => {
+                browser_session_apply_classification_reason(&mut result, classification_reason);
+                return result;
+            }
             Ok(None) => {}
             Err(error) => return browser_store_error(error),
         }
@@ -4240,7 +4375,7 @@ fn browser_session_create_reconcile_uncertain_inner(
         }
         (!out.is_empty()).then_some(Value::Object(out))
     });
-    json!({
+    let mut value = json!({
         "ok": false,
         "code": delivery_state.as_str(),
         "reservation_ref": settled.reservation_ref,
@@ -4250,7 +4385,9 @@ fn browser_session_create_reconcile_uncertain_inner(
         "app_selection_probe": app_selection_probe,
         "replayed": replayed,
         "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
-    })
+    });
+    browser_session_apply_classification_reason(&mut value, classification_reason);
+    value
 }
 
 fn browser_session_create_params_from_source(
@@ -5004,7 +5141,7 @@ fn browser_session_create(
         let Ok(mut guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
-        return browser_session_create_success(
+        let mut result = browser_session_create_success(
             &mut guard,
             &reservation.reservation_ref,
             params,
@@ -5012,6 +5149,10 @@ fn browser_session_create(
             false,
             caller_authorization,
         );
+        // A pure replay holds no actuation evidence in hand, so the projection
+        // is explicitly unobserved rather than omitted.
+        browser_session_apply_title_projection(&mut result, None);
+        return result;
     }
     if current_delivery == BrowserDeliveryState::Uncertain {
         return browser_session_create_reconcile_uncertain(
@@ -5022,6 +5163,10 @@ fn browser_session_create(
             expected_generation,
             true,
             caller_authorization,
+            // No actuation evidence is held on replay; a polled evidence can
+            // still contribute a projection and a fresh classification.
+            None,
+            None,
         );
     }
     if current_delivery != BrowserDeliveryState::NotApplied {
@@ -5110,12 +5255,7 @@ fn browser_session_create(
             Ok(value) => value,
             Err(error) => return browser_store_error(error),
         };
-    let title_projection = evidence
-        .result
-        .as_ref()
-        .and_then(|result| result.get("title_projection"))
-        .filter(|value| value.is_object())
-        .cloned();
+    let title_projection = browser_evidence_title_projection(&evidence);
     let Ok(mut guard) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
@@ -5138,12 +5278,24 @@ fn browser_session_create(
             false,
             caller_authorization,
         );
-        if let (Some(object), Some(title_projection)) = (result.as_object_mut(), title_projection) {
-            object.insert("title_projection".to_owned(), title_projection);
-        }
+        browser_session_apply_title_projection(&mut result, title_projection.as_ref());
         return result;
     }
     if delivery_state == BrowserDeliveryState::Uncertain {
+        // The extension claimed the create succeeded, but the postcondition
+        // checks did not all pass: name the first missing proof and carry it
+        // (plus the first evidence's title projection) through reconciliation.
+        let classification_reason =
+            match browser_session_create_uncertain_classification_reason(params, &evidence) {
+                Ok(reason) => reason,
+                Err(error) => return browser_store_error(error),
+            };
+        if let Some(reason) = classification_reason {
+            eprintln!(
+                "browser session.create classified uncertain: reason={reason} reservation={}",
+                updated.reservation_ref
+            );
+        }
         drop(guard);
         return browser_session_create_reconcile_uncertain(
             store,
@@ -5153,6 +5305,8 @@ fn browser_session_create(
             expected_generation,
             replayed,
             caller_authorization,
+            title_projection,
+            classification_reason,
         );
     }
     json!({
@@ -15961,6 +16115,8 @@ mod tests {
             7,
             false,
             None,
+            None,
+            None,
         );
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(result["delivery_state"], "applied");
@@ -19086,6 +19242,751 @@ mod tests {
         assert_eq!(replayed["reconciled"], false);
         assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
         assert_eq!(delayed.reconcile_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Seed a minimal chatgpt endpoint/account fixture for the session.create
+    /// title-projection and classification-reason tests: endpoint registration,
+    /// provider capabilities, account launcher locator, and webchat consent.
+    fn session_create_projection_store()
+    -> (std::sync::Arc<std::sync::Mutex<StateStore>>, String, String) {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, account_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "session-create-projection-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json:
+                        r#"{"operations":["session.create","session.open","composer.submit","composer.select_tool"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "session-create-projection-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &account.resource_ref,
+                    "https://chatgpt.com",
+                    7,
+                    12,
+                )
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 13,
+                })
+                .unwrap();
+            (endpoint.endpoint_ref, account.resource_ref)
+        };
+        (store, endpoint_ref, account_ref)
+    }
+
+    /// Land the provider registry observation for a create reservation, as the
+    /// extension's delayed registration readback would.
+    fn session_create_projection_materialize(
+        store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+        reservation_ref: &str,
+        expected_generation: i64,
+    ) {
+        use crate::state_store::BrowserResourceObservationInput;
+        let mut guard = store.lock().unwrap();
+        let reservation = guard
+            .browser_session_reservation(reservation_ref)
+            .unwrap()
+            .unwrap();
+        let session = guard
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &reservation.endpoint_ref,
+                provider: &reservation.provider,
+                kind: "session",
+                parent_ref: reservation
+                    .space_ref
+                    .as_deref()
+                    .or(Some(&reservation.account_ref)),
+                native_identity: &format!("created-{reservation_ref}"),
+                display_label: None,
+                observation_generation: expected_generation,
+                observed_at: 20,
+            })
+            .unwrap();
+        guard
+            .upsert_browser_resource_locator(
+                &session.resource_ref,
+                &format!("https://chatgpt.com/c/{reservation_ref}"),
+                expected_generation,
+                20,
+            )
+            .unwrap();
+        guard
+            .materialize_browser_session_reservation(reservation_ref, &session.resource_ref, 20)
+            .unwrap();
+    }
+
+    /// Actuation evidence with exactly one SessionCreate postcondition check
+    /// failing (`defect`, `"none"` = fully applied), optionally carrying a
+    /// `title_projection` object inside `result`.
+    fn session_create_defect_evidence(
+        message: &str,
+        expected_generation: i64,
+        defect: &str,
+        title_projection: Option<Value>,
+    ) -> BrowserPostconditionEvidence {
+        let mut result = match defect {
+            "accepted_ref_missing" => accepted_text_evidence(message),
+            "text_digest_mismatch" => {
+                let mut value = accepted_result(message, "provider-created-session-user");
+                let foreign = browser_sha256("a foreign provider turn");
+                for key in [
+                    "accepted_user_text_sha256",
+                    "accepted_user_body_sha256",
+                    "accepted_user_text_canonical_sha256",
+                    "accepted_user_body_canonical_sha256",
+                ] {
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .insert(key.to_owned(), json!(foreign));
+                }
+                value
+            }
+            _ => accepted_result(message, "provider-created-session-user"),
+        };
+        if let Some(title_projection) = title_projection {
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("title_projection".to_owned(), title_projection);
+        }
+        let mut evidence = BrowserPostconditionEvidence {
+            observed_generation: expected_generation,
+            command_accepted: true,
+            browser_online: true,
+            resource_available: true,
+            rejected: false,
+            stable_resource_ref_observed: true,
+            lifecycle_observed: true,
+            canonical_url_observed: true,
+            accepted_message_observed: true,
+            message_baseline_advanced: true,
+            reasoning_effort_readback: None,
+            required_apps_readback: if defect == "apps_mismatch" {
+                vec!["other-app".to_owned()]
+            } else {
+                Vec::new()
+            },
+            generation_owner: Some(expected_generation),
+            generation_status_observed: true,
+            generation_stopped: false,
+            result: Some(result),
+        };
+        match defect {
+            "stable_resource_ref_missing" => evidence.stable_resource_ref_observed = false,
+            "lifecycle_missing" => evidence.lifecycle_observed = false,
+            "canonical_url_missing" => evidence.canonical_url_observed = false,
+            "accepted_message_missing" => {
+                evidence.accepted_message_observed = false;
+                evidence.message_baseline_advanced = false;
+            }
+            _ => {}
+        }
+        evidence
+    }
+
+    /// Evidence a successful late-acceptance readback probe reports for the
+    /// new conversation's single accepted user message.
+    fn session_create_readback_evidence(
+        message: &str,
+        expected_generation: i64,
+    ) -> BrowserPostconditionEvidence {
+        let result = json!({
+            "accepted_user_message_ref": "provider-created-session-user",
+            "accepted_user_text_sha256": browser_sha256(message.trim()),
+        });
+        BrowserPostconditionEvidence {
+            observed_generation: expected_generation,
+            command_accepted: true,
+            browser_online: true,
+            resource_available: true,
+            rejected: false,
+            stable_resource_ref_observed: true,
+            lifecycle_observed: true,
+            canonical_url_observed: true,
+            accepted_message_observed: true,
+            message_baseline_advanced: true,
+            reasoning_effort_readback: None,
+            required_apps_readback: Vec::new(),
+            generation_owner: Some(expected_generation),
+            generation_status_observed: true,
+            generation_stopped: false,
+            result: Some(result),
+        }
+    }
+
+    /// Fake extension actuator for the title-projection and
+    /// classification-reason paths: the first create actuation fails exactly
+    /// one postcondition check, reconcile polls report a second evidence, and
+    /// the late-acceptance readback probe is available only when asked for.
+    struct SessionCreateProjectionActuator {
+        store: std::sync::Arc<std::sync::Mutex<StateStore>>,
+        actuate_defect: &'static str,
+        actuate_title_projection: Option<Value>,
+        poll_defect: Option<&'static str>,
+        poll_title_projection: Option<Value>,
+        materialize_on_actuate: bool,
+        // Materialize the reservation during every evidence-less reconcile
+        // poll, simulating the provider registry's delayed readback landing
+        // while the runtime reconciles.
+        materialize_on_poll: bool,
+        readback: bool,
+        last_message: std::sync::Mutex<String>,
+    }
+
+    impl BrowserActuator for SessionCreateProjectionActuator {
+        fn actuate(
+            &self,
+            operation: &str,
+            params: &Value,
+            expected_generation: i64,
+            dispatch_id: Option<&str>,
+        ) -> Result<BrowserPostconditionEvidence, String> {
+            let _ = dispatch_id;
+            if operation == BROWSER_SESSION_ARCHIVE_STATUS_METHOD {
+                if !self.readback {
+                    return Err("browser_actuation_unavailable".to_owned());
+                }
+                let message = self.last_message.lock().unwrap().clone();
+                return Ok(session_create_readback_evidence(
+                    &message,
+                    expected_generation,
+                ));
+            }
+            assert_eq!(operation, BrowserOperation::SessionCreate.method());
+            let message = params["message"].as_str().unwrap().to_owned();
+            *self.last_message.lock().unwrap() = message.clone();
+            if self.materialize_on_actuate {
+                session_create_projection_materialize(
+                    &self.store,
+                    params["reservation_ref"].as_str().unwrap(),
+                    expected_generation,
+                );
+            }
+            Ok(session_create_defect_evidence(
+                &message,
+                expected_generation,
+                self.actuate_defect,
+                self.actuate_title_projection.clone(),
+            ))
+        }
+
+        fn reconcile_dispatch(
+            &self,
+            dispatch_id: &str,
+            expected_generation: i64,
+        ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+            if self.materialize_on_poll {
+                // The provider registry readback lands late: this poll
+                // materializes the reservation and reports no evidence.
+                session_create_projection_materialize(
+                    &self.store,
+                    dispatch_id,
+                    expected_generation,
+                );
+                return Ok(None);
+            }
+            let Some(defect) = self.poll_defect else {
+                return Ok(None);
+            };
+            let message = self.last_message.lock().unwrap().clone();
+            Ok(Some(session_create_defect_evidence(
+                &message,
+                expected_generation,
+                defect,
+                self.poll_title_projection.clone(),
+            )))
+        }
+    }
+
+    fn session_create_projection_params(
+        endpoint_ref: &str,
+        account_ref: &str,
+        label: &str,
+        idempotency_key: &str,
+    ) -> Value {
+        json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": label,
+            "message": "do the bounded projection task",
+            "expected_generation": 7,
+            "idempotency_key": idempotency_key,
+        })
+    }
+
+    #[test]
+    fn browser_session_create_uncertain_materialization_promotion_carries_evidence_title_projection()
+     {
+        let (store, endpoint_ref, account_ref) = session_create_projection_store();
+        let actuator = SessionCreateProjectionActuator {
+            store: store.clone(),
+            // The provider registry materializes the reservation, but the
+            // actuation evidence lacks the stable-resource observation, so the
+            // create settles through reconcile and promotes via the retained
+            // accepted-message identity.
+            actuate_defect: "stable_resource_ref_missing",
+            actuate_title_projection: Some(json!({
+                "status": "verified",
+                "changed": true,
+                "projection_source": "actuation"
+            })),
+            poll_defect: None,
+            poll_title_projection: None,
+            materialize_on_actuate: true,
+            materialize_on_poll: false,
+            readback: false,
+            last_message: std::sync::Mutex::new(String::new()),
+        };
+        let params = session_create_projection_params(
+            &endpoint_ref,
+            &account_ref,
+            "Worker projection materialization",
+            "session-create-projection-materialization-1",
+        );
+        let created = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["delivery_state"], "applied");
+        assert_eq!(created["reconciled"], true);
+        assert_eq!(created["title_projection"]["status"], "verified");
+        assert_eq!(
+            created["title_projection"]["projection_source"],
+            "actuation"
+        );
+        assert_eq!(
+            created["classification_reason"],
+            "stable_resource_ref_missing"
+        );
+    }
+
+    #[test]
+    fn browser_session_create_uncertain_late_acceptance_promotion_carries_evidence_title_projection()
+     {
+        let (store, endpoint_ref, account_ref) = session_create_projection_store();
+        let actuator = SessionCreateProjectionActuator {
+            store: store.clone(),
+            // The accepted-text digest does not match the submitted message,
+            // so the identity is not retained and the create promotes only
+            // through the late-acceptance readback probe.
+            actuate_defect: "text_digest_mismatch",
+            actuate_title_projection: Some(json!({
+                "status": "verified",
+                "changed": true,
+                "projection_source": "actuation"
+            })),
+            poll_defect: None,
+            poll_title_projection: None,
+            materialize_on_actuate: true,
+            materialize_on_poll: false,
+            readback: true,
+            last_message: std::sync::Mutex::new(String::new()),
+        };
+        let params = session_create_projection_params(
+            &endpoint_ref,
+            &account_ref,
+            "Worker projection readback",
+            "session-create-projection-readback-1",
+        );
+        let created = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["delivery_state"], "applied");
+        assert_eq!(created["reconciled"], true);
+        assert_eq!(created["title_projection"]["status"], "verified");
+        assert_eq!(
+            created["title_projection"]["projection_source"],
+            "actuation"
+        );
+        assert_eq!(created["classification_reason"], "text_digest_mismatch");
+    }
+
+    #[test]
+    fn browser_session_create_direct_success_without_projection_reports_title_projection_unobserved()
+     {
+        let (store, endpoint_ref, account_ref) = session_create_projection_store();
+        let actuator = SessionCreateProjectionActuator {
+            store: store.clone(),
+            actuate_defect: "none",
+            actuate_title_projection: None,
+            poll_defect: None,
+            poll_title_projection: None,
+            materialize_on_actuate: true,
+            materialize_on_poll: false,
+            readback: false,
+            last_message: std::sync::Mutex::new(String::new()),
+        };
+        let params = session_create_projection_params(
+            &endpoint_ref,
+            &account_ref,
+            "Worker direct unobserved",
+            "session-create-projection-direct-unobserved-1",
+        );
+        let created = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["reconciled"], false);
+        assert_eq!(created["title_projection"]["status"], "unobserved");
+    }
+
+    #[test]
+    fn browser_session_create_reconcile_success_without_projection_reports_title_projection_unobserved()
+     {
+        let (store, endpoint_ref, account_ref) = session_create_projection_store();
+        let actuator = SessionCreateProjectionActuator {
+            store: store.clone(),
+            actuate_defect: "text_digest_mismatch",
+            actuate_title_projection: None,
+            poll_defect: None,
+            poll_title_projection: None,
+            materialize_on_actuate: true,
+            materialize_on_poll: false,
+            readback: true,
+            last_message: std::sync::Mutex::new(String::new()),
+        };
+        let params = session_create_projection_params(
+            &endpoint_ref,
+            &account_ref,
+            "Worker reconcile unobserved",
+            "session-create-projection-reconcile-unobserved-1",
+        );
+        let created = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["reconciled"], true);
+        assert_eq!(created["title_projection"]["status"], "unobserved");
+        assert_eq!(created["classification_reason"], "text_digest_mismatch");
+    }
+
+    #[test]
+    fn browser_session_create_reconcile_prefers_polled_evidence_title_projection() {
+        let (store, endpoint_ref, account_ref) = session_create_projection_store();
+        let actuator = SessionCreateProjectionActuator {
+            store: store.clone(),
+            // The first actuation evidence carries a projection, but the
+            // reconcile poll's own applied evidence carries a newer one; the
+            // polled projection must win.
+            actuate_defect: "text_digest_mismatch",
+            actuate_title_projection: Some(json!({
+                "status": "verified",
+                "projection_source": "actuation"
+            })),
+            poll_defect: Some("none"),
+            poll_title_projection: Some(json!({
+                "status": "verified",
+                "projection_source": "polled"
+            })),
+            materialize_on_actuate: true,
+            materialize_on_poll: false,
+            readback: false,
+            last_message: std::sync::Mutex::new(String::new()),
+        };
+        let params = session_create_projection_params(
+            &endpoint_ref,
+            &account_ref,
+            "Worker polled projection",
+            "session-create-projection-polled-1",
+        );
+        let created = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["reconciled"], true);
+        assert_eq!(created["title_projection"]["status"], "verified");
+        assert_eq!(created["title_projection"]["projection_source"], "polled");
+        assert_eq!(created["classification_reason"], "text_digest_mismatch");
+    }
+
+    #[test]
+    fn browser_session_create_poll_promotion_carries_first_title_projection() {
+        let (store, endpoint_ref, account_ref) = session_create_projection_store();
+        let actuator = SessionCreateProjectionActuator {
+            store: store.clone(),
+            // The first actuation evidence retains the accepted-message
+            // identity but misses the stable-resource proof, and the provider
+            // registry has not materialized the reservation yet: the first
+            // reconcile poll reports no evidence and materializes it, so the
+            // create promotes after the poll and must carry the first
+            // evidence's title projection.
+            actuate_defect: "stable_resource_ref_missing",
+            actuate_title_projection: Some(json!({
+                "status": "verified",
+                "projection_source": "actuation"
+            })),
+            poll_defect: None,
+            poll_title_projection: None,
+            materialize_on_actuate: false,
+            materialize_on_poll: true,
+            readback: false,
+            last_message: std::sync::Mutex::new(String::new()),
+        };
+        let params = session_create_projection_params(
+            &endpoint_ref,
+            &account_ref,
+            "Worker poll materialization projection",
+            "session-create-projection-poll-materialization-1",
+        );
+        let created = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["delivery_state"], "applied");
+        assert_eq!(created["reconciled"], true);
+        assert_eq!(
+            created["title_projection"],
+            json!({
+                "status": "verified",
+                "projection_source": "actuation"
+            })
+        );
+        assert_eq!(
+            created["classification_reason"],
+            "stable_resource_ref_missing"
+        );
+    }
+
+    #[test]
+    fn browser_session_create_uncertain_poll_promotion_carries_title_projection() {
+        for (poll_title_projection, expected_projection) in [
+            (
+                Some(json!({
+                    "status": "verified",
+                    "projection_source": "polled"
+                })),
+                json!({
+                    "status": "verified",
+                    "projection_source": "polled"
+                }),
+            ),
+            (
+                None,
+                json!({
+                    "status": "verified",
+                    "projection_source": "actuation"
+                }),
+            ),
+        ] {
+            let (store, endpoint_ref, account_ref) = session_create_projection_store();
+            let actuator = SessionCreateProjectionActuator {
+                store: store.clone(),
+                // The first actuation digest does not match the submitted
+                // message (identity not retained), so the create can only
+                // promote from the polled evidence. That evidence again
+                // misses the stable-resource proof, so the create stays
+                // uncertain after the poll and promotes through the polled
+                // evidence's retained identity; the carried projection must
+                // prefer the polled evidence's projection and fall back to
+                // the first actuation's when the poll reports none.
+                actuate_defect: "text_digest_mismatch",
+                actuate_title_projection: Some(json!({
+                    "status": "verified",
+                    "projection_source": "actuation"
+                })),
+                poll_defect: Some("stable_resource_ref_missing"),
+                poll_title_projection,
+                materialize_on_actuate: true,
+                materialize_on_poll: false,
+                readback: false,
+                last_message: std::sync::Mutex::new(String::new()),
+            };
+            let params = session_create_projection_params(
+                &endpoint_ref,
+                &account_ref,
+                "Worker uncertain poll projection",
+                "session-create-projection-uncertain-poll-1",
+            );
+            let created = browser_operation_call_with_grant(
+                &store,
+                "herdr_mcp.browser_session.create",
+                &params,
+                true,
+                Some(&actuator),
+            );
+            assert_eq!(created["ok"], true, "projection: {expected_projection}");
+            assert_eq!(created["delivery_state"], "applied");
+            assert_eq!(created["reconciled"], true);
+            assert_eq!(created["title_projection"], expected_projection);
+            assert_eq!(
+                created["classification_reason"],
+                "stable_resource_ref_missing"
+            );
+        }
+    }
+
+    fn assert_session_create_uncertain_classification_reason(
+        defect: &'static str,
+        expected_reason: &'static str,
+    ) {
+        let (store, endpoint_ref, account_ref) = session_create_projection_store();
+        let mut params = session_create_projection_params(
+            &endpoint_ref,
+            &account_ref,
+            "Worker classification reason",
+            &format!("session-create-reason-{defect}"),
+        );
+        if defect == "apps_mismatch" {
+            params
+                .as_object_mut()
+                .unwrap()
+                .insert("required_apps".to_owned(), json!(["app-a"]));
+        }
+        let evidence =
+            session_create_defect_evidence(params["message"].as_str().unwrap(), 7, defect, None);
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::SessionCreate,
+                &params,
+                7,
+                &evidence
+            )
+            .unwrap(),
+            BrowserDeliveryState::Uncertain
+        );
+        assert_eq!(
+            browser_session_create_uncertain_classification_reason(&params, &evidence).unwrap(),
+            Some(expected_reason)
+        );
+        let actuator = SessionCreateProjectionActuator {
+            store: store.clone(),
+            actuate_defect: defect,
+            actuate_title_projection: None,
+            poll_defect: Some(defect),
+            poll_title_projection: None,
+            materialize_on_actuate: false,
+            materialize_on_poll: false,
+            readback: false,
+            last_message: std::sync::Mutex::new(String::new()),
+        };
+        let response = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(response["ok"], false, "full response: {response}");
+        assert_eq!(response["code"], "uncertain", "full response: {response}");
+        assert_eq!(response["classification_reason"], expected_reason);
+    }
+
+    #[test]
+    fn browser_session_create_uncertain_reason_stable_resource_ref_missing() {
+        assert_session_create_uncertain_classification_reason(
+            "stable_resource_ref_missing",
+            "stable_resource_ref_missing",
+        );
+    }
+
+    #[test]
+    fn browser_session_create_uncertain_reason_lifecycle_missing() {
+        assert_session_create_uncertain_classification_reason(
+            "lifecycle_missing",
+            "lifecycle_missing",
+        );
+    }
+
+    #[test]
+    fn browser_session_create_uncertain_reason_canonical_url_missing() {
+        assert_session_create_uncertain_classification_reason(
+            "canonical_url_missing",
+            "canonical_url_missing",
+        );
+    }
+
+    #[test]
+    fn browser_session_create_uncertain_reason_accepted_message_missing() {
+        assert_session_create_uncertain_classification_reason(
+            "accepted_message_missing",
+            "accepted_message_missing",
+        );
+    }
+
+    #[test]
+    fn browser_session_create_uncertain_reason_accepted_ref_missing() {
+        assert_session_create_uncertain_classification_reason(
+            "accepted_ref_missing",
+            "accepted_ref_missing",
+        );
+    }
+
+    #[test]
+    fn browser_session_create_uncertain_reason_text_digest_mismatch() {
+        assert_session_create_uncertain_classification_reason(
+            "text_digest_mismatch",
+            "text_digest_mismatch",
+        );
+    }
+
+    #[test]
+    fn browser_session_create_uncertain_reason_apps_mismatch() {
+        assert_session_create_uncertain_classification_reason("apps_mismatch", "apps_mismatch");
     }
 
     #[test]
