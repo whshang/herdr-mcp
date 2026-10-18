@@ -56,6 +56,9 @@ herdr_mcp.browser_page.action
       value?, timeout_ms? }
   screenshot:
     { endpoint_ref, page_ref, action:"screenshot" }
+  navigate:
+    { endpoint_ref, page_ref, action:"navigate", target_origin, url,
+      page_generation, idempotency_key }
 ```
 
 Rules:
@@ -68,6 +71,11 @@ Rules:
   `objective` may request Semantic/Jev advisory, but Adapter correctness cannot depend on it.
 - `click` and `fill` require the fresh generation/ref from the current observation and one stable
   idempotency key for that intended mutation. Never replay after uncertain delivery.
+- `navigate` accepts only an exact HTTP(S) URL on the BrowserPage's existing origin, requires the
+  current `page_generation` plus one stable idempotency key, and never activates another tab. A
+  navigation attempt permanently stales the old operation ref; claim the exact destination URL to
+  obtain a fresh ref. Release the destination claim after use, then release an original claimed ref
+  or finalize an original owned cleanup ref.
 - `expect` is read-only. `document_ready` takes no value; the other conditions require a bounded
   value. Use it to prove the deterministic postcondition when the page exposes one.
 - `screenshot` is read-only visual evidence for the exact visible BrowserPage. It is optional

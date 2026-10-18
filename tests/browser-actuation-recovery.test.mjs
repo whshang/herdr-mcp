@@ -11,16 +11,24 @@ const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "b
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
+const browserPageActionStart = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
+const browserPageActionEnd = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', browserPageActionStart);
+assert.ok(browserPageActionStart > 0 && browserPageActionEnd > browserPageActionStart);
+const browserPageActionBridge = backgroundSource.slice(browserPageActionStart, browserPageActionEnd);
+
 test("user scrolls a browser page | Given a typed Rust actuation payload | When the extension bridge forwards it | Then direction and amount reach the normal Page Assist action path", () => {
-  const start = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
-  const end = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', start);
-  assert.ok(start > 0 && end > start);
-  const bridge = backgroundSource.slice(start, end);
+  const bridge = browserPageActionBridge;
   assert.match(bridge, /pageRef:\s*params\.page_ref/);
   assert.match(bridge, /action:\s*params\.action/);
   assert.match(bridge, /generation:\s*params\.generation/);
   assert.match(bridge, /direction:\s*params\.direction/);
   assert.match(bridge, /amount:\s*params\.amount/);
+});
+
+test("user requests exact navigation | Given a typed Rust actuation payload | When the extension bridge forwards it | Then origin URL and page generation reach the existing BrowserPage action path", () => {
+  assert.match(browserPageActionBridge, /targetOrigin:\s*params\.target_origin/);
+  assert.match(browserPageActionBridge, /url:\s*params\.url/);
+  assert.match(browserPageActionBridge, /pageGeneration:\s*params\.page_generation/);
 });
 
 const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
@@ -38,6 +46,7 @@ function browserPageLifecycleHarness({
   artifactResponder = null,
   fetchResponder = null,
   scriptResponder = null,
+  tabUpdateResponder = null,
   deferredCreate = false,
   windowFocused = true,
   documentFocused = true,
@@ -79,6 +88,7 @@ function browserPageLifecycleHarness({
       async update(tabId, info = {}) {
         const tab = tabs.get(tabId);
         if (!tab) throw new Error("tab missing");
+        if (tabUpdateResponder) await tabUpdateResponder(tabId, info, tab);
         if (info.active === true) {
           for (const candidate of tabs.values()) {
             if (candidate.windowId === tab.windowId) candidate.active = candidate.id === tabId;
@@ -731,6 +741,118 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(uncertain.delivery_state, "delivery_unknown");
   assert.equal(uncertain.retry_safe, false);
   assert.equal(uncertain.mutation_submitted, true);
+});
+
+test("user navigates within an approved origin | Given an owned BrowserPage and exact destination | When navigate runs once | Then stale and out-of-scope requests fail before navigation and the old page ref cannot act on the new document", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") {
+        return { ok: true, generation: "pa_gen_after_navigation", text: "Destination", elements: [] };
+      }
+      throw new Error(`unexpected action ${payload.action}`);
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/start",
+    idempotencyKey: "open-navigation-1",
+  });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.ownership, "owned");
+
+  const stale = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    targetOrigin: "https://example.com",
+    url: "https://example.com/next",
+    pageGeneration: opened.page_generation + 1,
+  });
+  assert.equal(stale.error, "browser_page_generation_stale");
+  assert.equal(stale.delivery_state, "not_applied");
+  assert.equal([...tabs.values()][0].url, "https://example.com/start");
+
+  const outOfScope = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    targetOrigin: "https://other.example",
+    url: "https://other.example/next",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(outOfScope.error, "browser_page_navigation_out_of_scope");
+  assert.equal(outOfScope.delivery_state, "not_applied");
+  assert.equal([...tabs.values()][0].url, "https://example.com/start");
+
+  const navigated = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    targetOrigin: "https://example.com",
+    url: "https://example.com/next",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(navigated.ok, true);
+  assert.equal(navigated.delivery_state, "applied");
+  assert.equal(navigated.navigated_url, "https://example.com/next");
+  assert.equal(navigated.page_generation, opened.page_generation + 1);
+  assert.equal([...tabs.values()][0].url, "https://example.com/next");
+  assert.equal(h.browserPagesByRef.get(opened.page_ref)?.stale, true);
+
+  const oldRef = await h.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(oldRef.error, "browser_page_stale");
+
+  const destination = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/next",
+    idempotencyKey: "claim-navigation-destination-1",
+  });
+  assert.equal(destination.ok, true);
+  assert.equal(destination.ownership, "claimed");
+  assert.notEqual(destination.page_ref, opened.page_ref);
+  const released = await h.performBrowserPageLifecycleRequest({
+    action: "release",
+    pageRef: destination.page_ref,
+  });
+  assert.equal(released.tab_closed, false);
+  const finalized = await h.performBrowserPageLifecycleRequest({
+    action: "finalize",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(finalized.tab_closed, true);
+  assert.equal(finalized.tab_cleanup_verified, true);
+  assert.equal(tabs.size, 0);
+
+  const uncertainTabs = new Map();
+  const uncertainHarness = browserPageLifecycleHarness({
+    tabs: uncertainTabs,
+    tabUpdateResponder(_tabId, info) {
+      if (info.url) throw new Error("navigation response channel lost");
+    },
+  });
+  const uncertainPage = await uncertainHarness.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/start",
+    idempotencyKey: "open-navigation-unknown-1",
+  });
+  const uncertain = await uncertainHarness.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: uncertainPage.page_ref,
+    targetOrigin: "https://example.com",
+    url: "https://example.com/next",
+    pageGeneration: uncertainPage.page_generation,
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  assert.equal(uncertain.mutation_submitted, true);
+  assert.equal(uncertainHarness.browserPagesByRef.get(uncertainPage.page_ref)?.stale, true);
 });
 
 test("user rejects invalid native form states | Given unavailable dropdown or unsupported checkable state | When fill checks the observed control | Then delivery is not_applied and retry-safe", async () => {

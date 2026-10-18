@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.157";
+const H2W_SCRIPT_VERSION = "0.1.158";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -3461,6 +3461,9 @@ async function handleBrowserActuation(command) {
         timeoutMs: params.timeout_ms,
         direction: params.direction,
         amount: params.amount,
+        targetOrigin: params.target_origin,
+        url: params.url,
+        pageGeneration: params.page_generation,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -8055,6 +8058,9 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "control_already_in_state",
   "scroll_params_invalid",
   "scroll_unavailable",
+  "browser_page_generation_stale",
+  "browser_page_navigation_out_of_scope",
+  "browser_page_navigation_unchanged",
 ]);
 
 function browserPageMutationEnvelope(result, page, sendAttempted) {
@@ -8116,6 +8122,81 @@ async function adoptAppliedBrowserPageNavigation(page, tabId, rawNavigationUrl, 
     await sleep(100);
   }
   return false;
+}
+
+async function staleBrowserPageForNavigation(page) {
+  const previous = {
+    stale: page.stale,
+    page_generation: page.page_generation,
+    observation_generation: page.observation_generation,
+    last_seen_at: page.last_seen_at,
+  };
+  page.stale = true;
+  page.page_generation = Number.isSafeInteger(page.page_generation)
+    ? page.page_generation + 1
+    : 1;
+  page.observation_generation = await getBrowserObservationGeneration();
+  page.last_seen_at = Date.now();
+  if (await persistBrowserPages()) return true;
+  Object.assign(page, previous);
+  return false;
+}
+
+async function navigateBrowserPage(page, tabId, msg) {
+  const targetOrigin = String(msg?.targetOrigin || "").toLowerCase();
+  const canonicalUrl = browserPageCanonicalUrl(msg?.url, targetOrigin);
+  const pageGeneration = Number(msg?.pageGeneration);
+  if (targetOrigin !== page.origin
+      || browserPageOrigin(targetOrigin) !== targetOrigin
+      || !canonicalUrl) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_out_of_scope",
+    }, page, false);
+  }
+  if (!Number.isSafeInteger(pageGeneration) || pageGeneration !== page.page_generation) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_generation_stale",
+    }, page, false);
+  }
+  if (canonicalUrl === page.canonical_url) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_unchanged",
+    }, page, false);
+  }
+
+  const persisted = await staleBrowserPageForNavigation(page);
+  if (!persisted) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_storage_unavailable",
+    }, page, false);
+  }
+  try {
+    await chrome.tabs.update(tabId, { url: canonicalUrl });
+  } catch (error) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_transport_failed",
+      detail: String(error?.message || error || ""),
+    }, page, true);
+  }
+
+  const readyTab = await waitForTabComplete(tabId, 5000);
+  const liveUrl = browserPageCanonicalUrl(readyTab?.url, page.origin);
+  if (readyTab?.status !== "complete" || liveUrl !== canonicalUrl) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_unverified",
+    }, page, true);
+  }
+  return browserPageMutationEnvelope({
+    ok: true,
+    navigated: true,
+    navigated_url: canonicalUrl,
+  }, page, true);
 }
 
 function browserImageArtifactMetadata(response) {
@@ -8271,7 +8352,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "fill", "expect", "screenshot", "scroll", "extract"].includes(action)) {
+  if (!["observe", "click", "fill", "expect", "screenshot", "scroll", "extract", "navigate"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -8281,7 +8362,7 @@ async function performBrowserPageActionRequest(msg) {
 
   const pageRef = String(msg?.pageRef || "");
   if (!validBrowserPageRef(pageRef)) {
-    return action === "click" || action === "fill" || action === "scroll"
+    return action === "click" || action === "fill" || action === "scroll" || action === "navigate"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
       : { ok: false, error: "browser_page_ref_invalid" };
   }
@@ -8289,12 +8370,12 @@ async function performBrowserPageActionRequest(msg) {
   await loadBrowserPages();
   const record = browserPagesByRef.get(pageRef);
   if (!record) {
-    return action === "click" || action === "fill" || action === "scroll"
+    return action === "click" || action === "fill" || action === "scroll" || action === "navigate"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
       : { ok: false, error: "browser_page_not_found" };
   }
   if (record.endpoint_ref !== endpointRef) {
-    return action === "click" || action === "fill" || action === "scroll"
+    return action === "click" || action === "fill" || action === "scroll" || action === "navigate"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
       : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
   }
@@ -8307,18 +8388,21 @@ async function performBrowserPageActionRequest(msg) {
       reason: "host_permission_missing",
       origin: record.origin,
     };
-    return action === "click" || action === "fill" || action === "scroll"
+    return action === "click" || action === "fill" || action === "scroll" || action === "navigate"
       ? browserPageMutationEnvelope(denied, record, false)
       : withBrowserPageIdentity(denied, record);
   }
 
   const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
   if (!resolved.ok) {
-    return action === "click" || action === "fill" || action === "scroll"
+    return action === "click" || action === "fill" || action === "scroll" || action === "navigate"
       ? browserPageMutationEnvelope(resolved, record, false)
       : withBrowserPageIdentity(resolved, record);
   }
   const page = resolved.page;
+  if (action === "navigate") {
+    return navigateBrowserPage(page, resolved.tab.id, msg);
+  }
   if (action === "screenshot") {
     return captureBrowserPageScreenshot(page, resolved.tab);
   }

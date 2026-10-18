@@ -7455,6 +7455,9 @@ fn browser_page_action_call(
         "objective",
         "direction",
         "amount",
+        "target_origin",
+        "url",
+        "page_generation",
     ];
     if let Some(key) = object
         .keys()
@@ -7518,13 +7521,14 @@ fn browser_page_action_call(
     };
     let action = match object.get("action").and_then(Value::as_str) {
         Some(
-            value @ ("observe" | "click" | "fill" | "expect" | "screenshot" | "scroll" | "extract"),
+            value @ ("observe" | "click" | "fill" | "expect" | "screenshot" | "scroll" | "extract"
+            | "navigate"),
         ) => value,
         _ => {
             return json!({
                 "ok": false,
                 "code": "invalid_params",
-                "message": "action must be observe, click, fill, expect, screenshot, scroll, or extract",
+                "message": "action must be observe, click, fill, expect, screenshot, scroll, extract, or navigate",
             });
         }
     };
@@ -7541,12 +7545,19 @@ fn browser_page_action_call(
         "page_ref": page_ref,
         "action": action,
     });
-    let mutation = matches!(action, "click" | "fill" | "scroll");
+    let mutation = matches!(action, "click" | "fill" | "scroll" | "navigate");
     let mut mutation_key: Option<&str> = None;
     let mut semantic_objective: Option<&str> = None;
 
     if action != "scroll" && (object.contains_key("direction") || object.contains_key("amount")) {
         return json!({"ok": false, "code": "invalid_params", "message": "direction/amount are accepted only for scroll"});
+    }
+    if action != "navigate"
+        && (object.contains_key("target_origin")
+            || object.contains_key("url")
+            || object.contains_key("page_generation"))
+    {
+        return json!({"ok": false, "code": "invalid_params", "message": "target_origin/url/page_generation are accepted only for navigate"});
     }
 
     match action {
@@ -7729,6 +7740,97 @@ fn browser_page_action_call(
             bridge_params["generation"] = json!(generation);
             bridge_params["ref"] = json!(element_ref);
             bridge_params["max_chars"] = json!(max_chars);
+        }
+        "navigate" => {
+            for disallowed in [
+                "max_chars",
+                "generation",
+                "ref",
+                "value",
+                "condition",
+                "timeout_ms",
+                "objective",
+                "direction",
+                "amount",
+            ] {
+                if object.contains_key(disallowed) {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": format!("{disallowed} is not accepted for navigate"),
+                    });
+                }
+            }
+            let target_origin_raw = match object
+                .get("target_origin")
+                .and_then(Value::as_str)
+                .map(str::trim)
+            {
+                Some(value) if !value.is_empty() && value.len() <= 4096 => value,
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "target_origin is required for navigate"});
+                }
+            };
+            let target_origin_url = match url::Url::parse(target_origin_raw) {
+                Ok(url)
+                    if matches!(url.scheme(), "http" | "https")
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.host_str().is_some() =>
+                {
+                    url
+                }
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "target_origin must be a valid http or https origin"});
+                }
+            };
+            let target_origin = target_origin_url.origin().ascii_serialization();
+            let raw_url = match object.get("url").and_then(Value::as_str).map(str::trim) {
+                Some(value) if !value.is_empty() && value.len() <= 4096 => value,
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "url is required for navigate"});
+                }
+            };
+            let target_url = match url::Url::parse(raw_url) {
+                Ok(url)
+                    if matches!(url.scheme(), "http" | "https")
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.host_str().is_some()
+                        && url.origin().ascii_serialization() == target_origin =>
+                {
+                    url
+                }
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "url must be a valid http or https URL on target_origin"});
+                }
+            };
+            let page_generation = match object.get("page_generation").and_then(Value::as_u64) {
+                Some(value) if value > 0 && value <= i64::MAX as u64 => value,
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "page_generation must be a positive integer"});
+                }
+            };
+            let idempotency_key = match object
+                .get("idempotency_key")
+                .and_then(Value::as_str)
+                .map(str::trim)
+            {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 256
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "idempotency_key is required for a browser page mutation"});
+                }
+            };
+            bridge_params["target_origin"] = json!(target_origin);
+            bridge_params["url"] = json!(target_url.to_string());
+            bridge_params["page_generation"] = json!(page_generation);
+            mutation_key = Some(idempotency_key);
         }
         "click" | "fill" | "scroll" => {
             for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
@@ -7925,6 +8027,16 @@ fn browser_page_action_call(
             "generation": bridge_params["generation"],
             "direction": bridge_params["direction"],
             "amount": bridge_params["amount"],
+        })
+    } else if action == "navigate" {
+        json!({
+            "operation": BROWSER_PAGE_ACTION_METHOD,
+            "endpoint_ref": endpoint_ref,
+            "page_ref": page_ref,
+            "action": action,
+            "target_origin": bridge_params["target_origin"],
+            "url": bridge_params["url"],
+            "page_generation": bridge_params["page_generation"],
         })
     } else {
         // Keep the preexisting click/fill hash identical across upgrades.
@@ -16581,6 +16693,97 @@ mod tests {
         assert_eq!(
             browser_page_action_call(&store, &changed_direction, &grants, Some(&actuator))["code"],
             "idempotency_key_conflict"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn browser_page_navigation_is_same_origin_generation_fenced_and_idempotent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct NavigateActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for NavigateActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("navigate must use the exact browser endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert!(dispatch_id.is_some());
+                assert_eq!(params["action"], "navigate");
+                assert_eq!(params["target_origin"], "https://example.com");
+                assert_eq!(params["url"], "https://example.com/next");
+                assert_eq!(params["page_generation"], 1);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "navigated": true,
+                    "navigated_url": "https://example.com/next",
+                    "delivery_state": "applied",
+                    "retry_safe": false,
+                    "mutation_submitted": true,
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = NavigateActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "navigate",
+            "target_origin": "https://example.com",
+            "url": "https://example.com/next",
+            "page_generation": 1,
+            "idempotency_key": "navigate-once-1",
+        });
+
+        let applied = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(applied["ok"], true);
+        assert_eq!(applied["delivery_state"], "applied");
+        let replay = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        let mut conflict = params.clone();
+        conflict["url"] = json!("https://example.com/other");
+        assert_eq!(
+            browser_page_action_call(&store, &conflict, &grants, Some(&actuator))["code"],
+            "idempotency_key_conflict"
+        );
+        let mut out_of_scope = params.clone();
+        out_of_scope["url"] = json!("https://other.example/next");
+        assert_eq!(
+            browser_page_action_call(&store, &out_of_scope, &grants, Some(&actuator))["code"],
+            "invalid_params"
         );
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
     }
