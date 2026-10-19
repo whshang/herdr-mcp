@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.221";
+const H2W_SCRIPT_VERSION = "0.1.224";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -4528,7 +4528,14 @@ async function handlePushBlock(block, streamCtrl = null) {
   }
   if (!event || !data) return;
   if (event === "browser_actuation") {
-    await handleBrowserActuation(data);
+    if (data.operation === "herdr_mcp.browser_dispatch.submit") {
+      // A ChatGPT submit makes nested content-to-background MAIN-world calls.
+      // Keep the single attempt running without blocking the shared push queue.
+      void handleBrowserActuation(data)
+        .catch((error) => callLog("dispatch actuation failed:", error?.message || String(error)));
+    } else {
+      await handleBrowserActuation(data);
+    }
     return;
   }
   if (event === "hello") {

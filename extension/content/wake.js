@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.221";
+const H2W_CONTENT_VERSION = "0.1.224";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3698,8 +3698,8 @@ function normalizeHerdrMentionAlias(value) {
     // Verify this exact conversation is readable in the current signed-in
     // provider session before publishing any account/session association.
     if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
-      const proof = await fetchChatGptConversationSnapshot(1200).catch(() => ({ ok: false }));
-      if (!proof?.ok) {
+      const proof = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+      if (!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim()) {
         if (registeredConvKey === convKey) {
           registeredConvKey = null;
           registeredBrowserSessionRef = null;

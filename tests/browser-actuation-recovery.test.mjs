@@ -2135,8 +2135,8 @@ function archiveCleanupHarness({
   };
 }
 
-function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", { provider = "claude", routeAuthorized = true } = {}) {
-  return new Function("provider", "routeAuthorized", `
+function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", { provider = "claude", routeAuthorized = true, messageIdAvailable = true } = {}) {
+  return new Function("provider", "routeAuthorized", "messageIdAvailable", `
     let currentConvKey = ${JSON.stringify(initialConvKey)};
     let currentUrl = currentConvKey;
     let registeredConvKey = currentConvKey;
@@ -2157,7 +2157,11 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     const sendBg = async (payload) => new Promise((resolve) => pending.push({ payload, resolve }));
     const ensureConversationHealth = async () => {};
     const chatGptConversationId = () => provider === "chatgpt" ? "6ad1c73f-a03c-83ea-a661-27a64edee2a0" : null;
-    const fetchChatGptConversationSnapshot = async () => ({ ok: routeAuthorized });
+    const registrationReadbackTimeouts = [];
+    const fetchChatGptConversationSnapshot = async (timeoutMs = 6000) => {
+      registrationReadbackTimeouts.push(timeoutMs);
+      return { ok: routeAuthorized, userMessageId: messageIdAvailable ? "prior-user-message" : null };
+    };
     const refreshQueuedInsertStatus = () => {};
     const backfillCurrentChatGptContinuity = () => {};
     const restoreBrowserResultAssignment = () => {};
@@ -2172,6 +2176,7 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     return {
       register: registerCurrentConversation,
       pending,
+      registrationReadbackTimeouts,
       setRoute(value) { currentConvKey = value; currentUrl = value; },
       state() {
         return {
@@ -2182,7 +2187,7 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
         };
       },
     };
-  `)(provider, routeAuthorized);
+  `)(provider, routeAuthorized, messageIdAvailable);
 }
 
 async function flushRegistrationToSend(harness, expected = 1) {
@@ -2731,10 +2736,20 @@ test("user rejects cross-account registration | Given the current account cannot
   assert.equal(denied.pending.length, 0, "unreadable previous-account conversation must never be registered");
   assert.equal(await deniedAttempt, null);
 
+  const empty = registrationHarness(url, { provider: "chatgpt", routeAuthorized: true, messageIdAvailable: false });
+  const emptyAttempt = empty.register("empty-provider-snapshot");
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const emptyPublished = empty.pending.length;
+  for (const pending of empty.pending) pending.resolve(null);
+  await emptyAttempt;
+  assert.equal(emptyPublished, 0, "HTTP success without a real user-message ID cannot associate another account's conversation");
+
   const valid = registrationHarness(url, { provider: "chatgpt", routeAuthorized: true });
   const started = valid.register("current-account");
   await flushRegistrationToSend(valid);
   assert.equal(valid.pending.length, 1);
+  assert.deepEqual(valid.registrationReadbackTimeouts, [6000],
+    "account validation should use the existing bounded provider readback budget");
   valid.pending[0].resolve({ browser_session_ref: "br_verified", browser_generation: 9, bound: true });
   await started;
   assert.equal(valid.state().sessionRef, "br_verified");
@@ -5250,6 +5265,31 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
     return performBrowserActuationCommand;
   `)({ crypto: webcrypto, ...ctx });
 }
+
+test("user can service nested submit requests | Given one Dispatch with a pending content response | When the browser actuation push event arrives | Then the shared push handler releases without waiting for content", async () => {
+  const start = backgroundSource.indexOf("async function handlePushBlock(");
+  const end = backgroundSource.indexOf('  if (event === "hello")', start);
+  assert.ok(start >= 0 && end > start);
+  let releaseContent;
+  const content = new Promise((resolve) => { releaseContent = resolve; });
+  let evidencePosted = false;
+  const handler = new Function("handleBrowserActuation", "callLog",
+    backgroundSource.slice(start, end) + "\n}\nreturn handlePushBlock;")(
+    async () => { await content; evidencePosted = true; },
+    () => {},
+  );
+  const pushEvent = 'event: browser_actuation\ndata: {"operation":"herdr_mcp.browser_dispatch.submit"}';
+  const processing = handler(pushEvent);
+  let pushReleased = false;
+  void processing.then(() => { pushReleased = true; });
+  for (let i = 0; i < 6; i += 1) await Promise.resolve();
+  const releasedBeforeContent = pushReleased;
+  releaseContent();
+  await processing;
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  assert.equal(releasedBeforeContent, true, "Dispatch must not starve nested service-worker requests");
+  assert.equal(evidencePosted, true, "the original attempt still completes exactly once");
+});
 
 test("user refuses dispatch without a provider baseline | Given the prior user-message ID cannot be read | When submit starts | Then no provider mutation is attempted", async () => {
   const act = browserSubmitAcceptanceHarness({
