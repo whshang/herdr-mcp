@@ -2976,7 +2976,7 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
 
   assert.equal(ctx.wakeArgs[0].browserActuation, true);
   assert.ok(ctx.snapshotTimeouts.length > 1, "unconfirmed submit continues bounded readback");
-  assert.ok(ctx.snapshotTimeouts.every((ms) => ms === 1200));
+  assert.ok(ctx.snapshotTimeouts.every((ms) => ms === 3000), "dispatch allows bounded provider readback latency");
   const firstReadbacks = ctx.snapshotTimeouts.length;
   assert.equal(result.command_accepted, true);
   assert.equal(result.rejected, false);
@@ -2996,7 +2996,7 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
 
   assert.equal(ctx.wakeArgs[1].browserActuation, true);
   assert.ok(ctx.snapshotTimeouts.length > firstReadbacks + 1, "unconfirmed create also continues bounded readback");
-  assert.ok(ctx.snapshotTimeouts.every((ms) => ms === 1200));
+  assert.ok(ctx.snapshotTimeouts.slice(firstReadbacks).every((ms) => ms === 1200));
   assert.equal(create.command_accepted, true);
   assert.equal(create.rejected, false);
   assert.equal(create.stable_resource_ref_observed, false);
