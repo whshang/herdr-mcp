@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.216";
+const H2W_CONTENT_VERSION = "0.1.218";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3695,13 +3695,38 @@ function normalizeHerdrMentionAlias(value) {
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
       ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
       : [];
+    // A previous account's tab can keep its DOM after account switching.
+    // Authenticate this exact conversation before publishing its association.
+    if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
+      const proof = await fetchChatGptConversationSnapshot(1200).catch(() => ({ ok: false }));
+      if (!proof?.ok) {
+        if (registeredConvKey === convKey) {
+          registeredConvKey = null;
+          registeredBrowserSessionRef = null;
+          registeredBrowserGeneration = null;
+          registeredHerdrAppKeyword = null;
+          registeredConversationBound = false;
+        }
+        return null;
+      }
+    }
+    const currentAccount = await browserAccountObservation();
+    const currentProject = typeof ADAPTER.getProjectIdentity === "function"
+      ? ADAPTER.getProjectIdentity()
+      : adapterProject;
+    if (registrationAttempt !== browserRegistrationAttempt
+        || ADAPTER.getConversationKey() !== convKey
+        || currentAccount.nativeIdentity !== accountNativeIdentity
+        || (currentProject?.id || null) !== (adapterProject?.id || null)) {
+      return null;
+    }
     const response = await sendBg({
       type: "h2w_register",
       convKey,
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
-      accountDisplayEmail: accountObservation.email,
+      accountDisplayEmail: currentAccount.email,
       browserProjects,
       browserAppKeywords,
       browserCurrentProjectId: browserCurrentProject?.id || null,

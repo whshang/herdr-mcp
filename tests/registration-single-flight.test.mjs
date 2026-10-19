@@ -70,6 +70,10 @@ function registrationHarness(initialConvKey = KEY_A) {
     const location = { get href() { return currentUrl; } };
     const runtimeAlive = () => true;
     const browserAccountNativeIdentity = () => accountBox.promise.then((value) => value);
+    const browserAccountObservation = async () => ({
+      nativeIdentity: await browserAccountNativeIdentity(),
+      email: null,
+    });
     const chatGptProjectCatalog = () => catalogBox.promise.then((projects) => projects);
     const currentChatGptProjectFromCatalog = () => null;
     const sendBg = async (payload) => new Promise((resolve) => pending.push({ payload, resolve }));
