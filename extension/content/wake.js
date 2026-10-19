@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.217";
+const H2W_CONTENT_VERSION = "0.1.221";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2628,12 +2628,19 @@ function normalizeHerdrMentionAlias(value) {
     const boundedChatGptSubmit = exactChatGptDispatchIdentity || (
       ADAPTER.name === "chatgpt" && creatingSession
     );
-    const snapshotTimeoutMs = exactChatGptDispatchIdentity || creatingSession ? 1200 : 6000;
+    let snapshotTimeoutMs = 6000;
+    if (creatingSession) snapshotTimeoutMs = 1200;
+    if (exactChatGptDispatchIdentity) snapshotTimeoutMs = 3000;
     const beforeServer = ADAPTER.name === "chatgpt"
       ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
       : { ok: false };
     const beforeDom = providerMessageSnapshot("user");
     const beforeAssistant = providerMessageSnapshot("assistant");
+    // Dispatch needs a provider-owned pre-submit user ID to prove advancement.
+    // Refuse before touching the composer when that baseline is unavailable.
+    if (exactChatGptDispatchIdentity && (!beforeServer?.ok || !beforeServer.userMessageId)) {
+      return browserRejectedEvidence(evidence, "browser_dispatch_baseline_unavailable");
+    }
     const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
     const result = await performWake({
       template: message,
@@ -2803,9 +2810,16 @@ function normalizeHerdrMentionAlias(value) {
         afterAssistant.text
         && afterAssistant.text !== beforeAssistant.text,
       );
+      const providerAssistantAdvanced = Boolean(
+        conversationStillExpected && serverAdvanced
+        && typeof beforeServer?.messageId === "string" && beforeServer.messageId
+        && typeof afterServer?.messageId === "string" && afterServer.messageId
+        && afterServer.messageId !== beforeServer.messageId,
+      );
       evidence.generation_status_observed = Boolean(
         isTurnInProgress()
-        || assistantAdvanced,
+        || assistantAdvanced
+        || providerAssistantAdvanced,
       );
       if (evidence.accepted_message_observed
           && (creatingSession || evidence.generation_status_observed)
@@ -3680,6 +3694,22 @@ function normalizeHerdrMentionAlias(value) {
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
       ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
       : [];
+    // A previous account's tab can retain its old DOM after account switching.
+    // Verify this exact conversation is readable in the current signed-in
+    // provider session before publishing any account/session association.
+    if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
+      const proof = await fetchChatGptConversationSnapshot(1200).catch(() => ({ ok: false }));
+      if (!proof?.ok) {
+        if (registeredConvKey === convKey) {
+          registeredConvKey = null;
+          registeredBrowserSessionRef = null;
+          registeredBrowserGeneration = null;
+          registeredHerdrAppKeyword = null;
+          registeredConversationBound = false;
+        }
+        return null;
+      }
+    }
     // Async project discovery can outlive an account or project switch.
     // Fence the registration against the current page before publishing it.
     const currentAccount = await browserAccountObservation();
