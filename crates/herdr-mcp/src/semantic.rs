@@ -831,6 +831,19 @@ impl SemanticChatMessage {
     }
 }
 
+/// The chat request validation itself: exactly what
+/// [`SemanticService::chat_with_options`] checks before any provider call, so
+/// a producer (e.g. the handoff compactor) can prove its request is accepted.
+pub(crate) fn chat_request_valid(
+    messages: &[SemanticChatMessage],
+    options: &SemanticChatOptions,
+) -> bool {
+    !messages.is_empty()
+        && messages.len() <= MAX_CHAT_MESSAGES
+        && messages.iter().all(SemanticChatMessage::valid)
+        && options.valid()
+}
+
 #[derive(Debug, Clone)]
 pub struct SemanticChatResponse {
     pub provider: String,
@@ -1541,11 +1554,7 @@ impl SemanticService {
         timeout: Duration,
         options: &SemanticChatOptions,
     ) -> Result<SemanticChatResponse, SemanticError> {
-        if messages.is_empty()
-            || messages.len() > MAX_CHAT_MESSAGES
-            || messages.iter().any(|message| !message.valid())
-            || !options.valid()
-        {
+        if !chat_request_valid(messages, options) {
             return Err(SemanticError::new("invalid_request"));
         }
         if self.chat_providers.is_empty() {

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **relay/HANDOFF 压缩器去重与任务收尾：** 规则/错题/任务写入时按规范化文本（大小写、空白、尾随省略号与标点）去重：文本完全相等，或较短一方以 `…`/`...` 结尾（截断副本）时合并到原条目（保留较早 id 与更完整文本），`test` 不会吞掉 `test deployment`；预算不再句中截断条目文本（只丢滚动日志、多余来源与已完成任务，必要时以完整条目超预算写出）；压缩提示词严格不超过语义接口 65,536 字节上限（超限时先省略 recent/current_state/workspace，再丢 legacy 上下文，最后从提示词中省略最旧的完整条目——内存中保留，只有事件尾部会被截断）；任务按 `origin/main` 中真正的合并证据（subject 末尾 `(#N)` 或 `Merge pull request #N`，并按 token 边界匹配已合并分支）或 30 天无更新自动关闭，`done` 任务不再渲染，且每个 tick 都会对每个已存 work_state 执行（不依赖新事件）；命令中按顺序求值每个 `cd`（相对路径接续当前 cwd、`~/` 展开、词法规范化 `.`/`..`），任一步落到 scope 根目录之外即不记入当前项目。
+
 ## v1.1.0-rc.3 — 2026-10-18
 
 - **1.1 第三个预发布（仅 preview 通道）：** Phase 2 浏览器/prompt 修复、endpoint 在线判定与 generation 切换恢复、Generic Browser Page、relay cursor 同事务、Linux native host / DEV sync 加固、Semantic background tier、Page Assist grant migration。stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.3.md](docs/releases/v1.1.0-rc.3.md)。 [PR #655](https://github.com/whshang/herdr-mcp/pull/655) [PR #636](https://github.com/whshang/herdr-mcp/pull/636) [PR #628](https://github.com/whshang/herdr-mcp/pull/628) [PR #642](https://github.com/whshang/herdr-mcp/pull/642) [PR #641](https://github.com/whshang/herdr-mcp/pull/641) [PR #639](https://github.com/whshang/herdr-mcp/pull/639) [PR #633](https://github.com/whshang/herdr-mcp/pull/633) [PR #632](https://github.com/whshang/herdr-mcp/issues/632) [PR #643](https://github.com/whshang/herdr-mcp/pull/643) [PR #647](https://github.com/whshang/herdr-mcp/pull/647) [PR #645](https://github.com/whshang/herdr-mcp/pull/645) [PR #630](https://github.com/whshang/herdr-mcp/pull/630)

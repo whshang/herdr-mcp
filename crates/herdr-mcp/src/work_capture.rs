@@ -79,8 +79,17 @@ pub(crate) fn event_for_tool_call(
     // high-entropy redaction can mangle long path tokens, which would drop
     // the event. project_ref/worktree are topology-derived, not user text.
     let scope = resolve_scope(arguments, snapshot)?;
-    let arguments = &sanitized;
     let kind = classify(tool_name, arguments);
+    // Project scoping: a command that changes directory (`cd`, `pushd`,
+    // `popd`) may act on another project, so its cwd is unknown and the
+    // caller's workspace must not inherit its work (e.g. a herdr-mcp session
+    // running `cd ~/Documents/novos-cockpit && ls`). Fail closed instead of
+    // resolving the target. Every command-bearing argument is checked, not
+    // just the freeform `command` text.
+    if kind == "command" && arguments_change_directory(arguments) {
+        return None;
+    }
+    let arguments = &sanitized;
     let summary = summarize(tool_name, arguments);
     Some(NewWorkEvent {
         ts: now_ms(),
@@ -204,6 +213,51 @@ fn compact_value(value: &Value) -> String {
 struct WorkScope {
     project_ref: String,
     worktree: PathBuf,
+}
+
+/// Does this command line change the working directory? Any `cd`, `pushd` or
+/// `popd` word means the captured cwd is unknown, so the caller must not
+/// attribute the work to its own project. A word is a maximal run of
+/// non-whitespace, non-operator characters: shell separators and quoting
+/// (`;`, `&`, `|`, `(`, `)`, backtick, `'`, `"`, newline) split words too, so
+/// `x;cd /x`, `(cd /x)` and `FOO=1 cd /x` all count. No target is resolved:
+/// the directory a command ends up in is only knowable to a running shell, and
+/// guessing it is what let another project's work leak into the scope root.
+fn command_changes_directory(command: &str) -> bool {
+    command
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '`' | '\'' | '"')
+        })
+        .any(|word| matches!(word, "cd" | "pushd" | "popd"))
+}
+
+/// Does any command-bearing argument change the working directory? A freeform
+/// `command`, `herdr_exec_start`'s `program`/`args`, and `herdr_exec`'s
+/// `steps[].program`/`steps[].args[]` can all carry a `cd`, so the check must
+/// cover every one of them rather than only the `command` field.
+fn arguments_change_directory(arguments: &Value) -> bool {
+    let mut commands: Vec<&str> = ["command", "program"]
+        .iter()
+        .filter_map(|key| arguments.get(*key).and_then(Value::as_str))
+        .collect();
+    commands.extend(string_array(arguments.get("args")));
+    for step in arguments
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        commands.extend(step.get("program").and_then(Value::as_str));
+        commands.extend(string_array(step.get("args")));
+    }
+    commands.into_iter().any(command_changes_directory)
+}
+
+fn string_array(value: Option<&Value>) -> Vec<&str> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
 }
 
 fn resolve_scope(arguments: &Value, snapshot: &Value) -> Option<WorkScope> {
@@ -598,6 +652,110 @@ mod tests {
             .is_none()
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user command that changes directory | Given /repo as the resolved
+    /// project | When the command contains a `cd`/`pushd`/`popd` word
+    /// anywhere, whatever the target, the separators or the quoting | Then
+    /// the cwd is unknown and the call is not attributed to /repo.
+    #[test]
+    fn user_command_that_changes_directory_is_not_attributed() {
+        let event = |command: &str| {
+            event_for_tool_call(
+                "herdr_exec",
+                &json!({"project_root": "/repo", "command": command}),
+                &test_snapshot(),
+            )
+        };
+        for changed in [
+            "cd /repo/src && ls",
+            "cd ~/Documents/novos-cockpit && ls",
+            "FOO=1 cd /x",
+            "if true; then cd /x; fi",
+            "x;cd /x",
+            "pushd /x",
+            "popd",
+            // Quoting and operators split words, so these are still `cd`.
+            "echo \"cd /x\"",
+            "(cd /x)",
+            "cd",
+        ] {
+            assert!(event(changed).is_none(), "must drop: {changed}");
+        }
+    }
+
+    /// user structured command that changes directory | Given /repo as the
+    /// resolved project | When the `cd` hides in `program`, in a string of
+    /// `args`, or in `steps[].program` / `steps[].args[]` instead of the
+    /// freeform `command` text | Then the cwd is still unknown and the call is
+    /// not attributed to /repo.
+    #[test]
+    fn user_structured_command_that_changes_directory_is_not_attributed() {
+        for arguments in [
+            json!({"project_root": "/repo", "program": "cd"}),
+            json!({"project_root": "/repo", "program": "sh", "args": ["-c", "cd /other && ls"]}),
+            json!({"project_root": "/repo", "program": "bash", "args": ["-lc", "pushd /x"]}),
+        ] {
+            assert!(
+                event_for_tool_call("herdr_exec_start", &arguments, &test_snapshot()).is_none(),
+                "must drop: {arguments}"
+            );
+        }
+        assert!(
+            event_for_tool_call(
+                "herdr_exec",
+                &json!({
+                    "project_root": "/repo",
+                    "steps": [{"program": "bash", "args": ["-c", "cd /x"]}]
+                }),
+                &test_snapshot(),
+            )
+            .is_none(),
+            "must drop steps whose program changes directory"
+        );
+        assert!(
+            event_for_tool_call(
+                "herdr_exec",
+                &json!({"project_root": "/repo", "steps": [{"program": "cd"}]}),
+                &test_snapshot(),
+            )
+            .is_none(),
+            "must drop a step whose program is cd"
+        );
+        let kept = event_for_tool_call(
+            "herdr_exec_start",
+            &json!({"project_root": "/repo", "program": "ls", "args": ["/repo"]}),
+            &test_snapshot(),
+        )
+        .expect("a directory-stable program/args invocation keeps its event");
+        assert_eq!(kept.worktree, "/repo");
+        let steps_kept = event_for_tool_call(
+            "herdr_exec",
+            &json!({
+                "project_root": "/repo",
+                "steps": [{"program": "git", "args": ["-C", "/repo", "status"]}]
+            }),
+            &test_snapshot(),
+        )
+        .expect("directory-stable steps keep their event");
+        assert_eq!(steps_kept.worktree, "/repo");
+    }
+
+    /// user command without a directory change | Given /repo as the resolved
+    /// project | When the command mentions no `cd`/`pushd`/`popd` word, even
+    /// with a path argument or a `-C` chdir flag | Then the resolved
+    /// workspace stays authoritative and the call is journaled.
+    #[test]
+    fn user_command_without_directory_change_keeps_its_event() {
+        for command in ["ls /repo/src", "echo abcd", "git -C /repo status"] {
+            let captured = event_for_tool_call(
+                "herdr_exec",
+                &json!({"project_root": "/repo", "command": command}),
+                &test_snapshot(),
+            )
+            .unwrap_or_else(|| panic!("must keep: {command}"));
+            assert_eq!(captured.worktree, "/repo");
+        }
     }
 
     /// herdr_exec targeting a workspace by LABEL | Given a workspace whose
