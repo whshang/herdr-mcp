@@ -932,12 +932,21 @@ struct MergedRefs {
 
 impl MergedRefs {
     fn matched_by(&self, text: &str) -> bool {
+        // A number only closes a task when the text uses PR semantics, so a
+        // bare `#N` or `issue #N` reference never closes it. No word-boundary
+        // anchor before `PR`: CJK text can sit directly against the marker
+        // (`完成PR#456合并`), while a following letter (`PRs`, `PR-456`) still
+        // fails because only whitespace or `#` may separate it from the number.
         static PR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let pr = PR.get_or_init(|| regex::Regex::new(r"#(\d+)").expect("pr regex"));
+        let pr = PR.get_or_init(|| {
+            regex::Regex::new(r"(?i)PR(?:\s*#\s*|\s+|#)\s*(\d+)|/pull/(\d+)").expect("pr regex")
+        });
         pr.captures_iter(text).any(|caps| {
-            caps[1]
-                .parse::<u64>()
-                .is_ok_and(|number| self.prs.contains(&number))
+            caps.iter()
+                .skip(1)
+                .flatten()
+                .find_map(|number| number.as_str().parse::<u64>().ok())
+                .is_some_and(|number| self.prs.contains(&number))
         }) || self
             .branches
             .iter()
@@ -2887,7 +2896,7 @@ mod tests {
             tasks: vec![
                 task("t1", "跟进 issue #123 的根因"),
                 task("t2", "完成 PR #456 的合并验证"),
-                task("t3", "收尾 Merge pull request #789"),
+                task("t3", "收尾 /pull/789 的合并"),
                 task("t4", "收尾 fix/foo 分支"),
                 task("t5", "收尾 fix/foobar 分支"),
             ],
@@ -2897,6 +2906,38 @@ mod tests {
         let ids: Vec<&str> = memory.tasks.iter().map(|task| task.id.as_str()).collect();
         assert_eq!(ids, ["t1", "t5"]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// relay tasks | Given a merged PR number | When the task text references
+    /// it as an issue or as a bare `#N` | Then the task stays open, and only
+    /// explicit PR semantics close it.
+    #[test]
+    fn only_pr_semantics_close_a_task_by_merged_number() {
+        let refs = MergedRefs {
+            prs: vec![456],
+            branches: Vec::new(),
+        };
+        for closed in [
+            "完成 PR #456 合并",
+            "完成 PR#456 合并",
+            "完成 pr 456 合并",
+            "完成 PR  #456 合并",
+            "https://github.com/example/repo/pull/456",
+            // CJK text can sit directly against the marker.
+            "完成PR#456合并",
+        ] {
+            assert!(refs.matched_by(closed), "must close: {closed}");
+        }
+        for open in [
+            "调查 issue #456",
+            "看下 #456 的原因",
+            "issue #456 的根因",
+            "PR 4567",
+            "PRs #456",
+            "PR-456",
+        ] {
+            assert!(!refs.matched_by(open), "must stay open: {open}");
+        }
     }
 
     /// relay tasks | Given a stored handoff whose only task is stale and no
