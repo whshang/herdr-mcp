@@ -218,28 +218,43 @@ struct WorkScope {
 /// Does this command line ever run outside the scope root? The line is first
 /// split into simple commands on the shell operators that start a new one
 /// (`;`, `&&`, `||`, `|`, newlines and a leading `(`); each simple command is
-/// then judged by its own `cd`: the cwd starts at the scope root, a relative
-/// target joins the running cwd, `~/` expands $HOME, a `--` separator and
-/// surrounding quotes are dropped, and `.`/`..` are resolved lexically. A
-/// command that ends up outside the root acts on another project (e.g. a
-/// herdr-mcp session running `cd ~/Documents/novos-cockpit && ls`), so the
-/// caller's workspace must not inherit its work. A bare `cd` means `$HOME`.
-/// Unresolvable targets (`cd -`, `~other`) count as outside: never guess a
-/// project.
+/// then judged by its own `cd` (also spelled `command cd`, `builtin cd` or
+/// `pushd`): the cwd starts at the scope root, a relative target joins the
+/// running cwd, `~/` expands $HOME, a `--` separator and surrounding quotes are
+/// dropped, and `.`/`..` are resolved lexically. A command that ends up outside
+/// the root acts on another project (e.g. a herdr-mcp session running
+/// `cd ~/Documents/novos-cockpit && ls`), so the caller's workspace must not
+/// inherit its work. A bare `cd` means `$HOME`. Unresolvable targets (`cd -`,
+/// `~other`, `$VAR`, `$(...)`, a glob, a `pushd` dir-stack entry) count as
+/// outside: never guess a project.
 fn command_leaves_scope(command: &str, root: &Path) -> bool {
     let root = normalize_lexically(root);
     let mut cwd = root.clone();
     for simple in split_simple_commands(command) {
-        let mut words = simple.split_whitespace();
-        if words.next().map(unquote_word) != Some("cd") {
-            continue;
+        let mut words = simple.split_whitespace().map(unquote_word);
+        // `command cd` / `builtin cd` run the same `cd`; `pushd` moves the cwd
+        // too, so all three are judged like a plain `cd`.
+        let mut verb = words.next();
+        while matches!(verb, Some("command" | "builtin")) {
+            verb = words.next();
         }
+        let pushd = match verb {
+            Some("cd") => false,
+            Some("pushd") => true,
+            _ => continue,
+        };
         // `cd -- dir` / `cd --`: the separator is not the target; no target at
-        // all (bare `cd`) is `$HOME`.
-        let target = words
-            .find(|word| *word != "--")
-            .map(unquote_word)
-            .unwrap_or("~");
+        // all (bare `cd`) is `$HOME`. `pushd` without a directory swaps in a
+        // dir-stack entry nobody can resolve statically, and `pushd +N`/`-N`
+        // address the stack itself.
+        let target = if pushd {
+            let Some(target) = words.next().filter(|word| !word.starts_with('+')) else {
+                return true;
+            };
+            target
+        } else {
+            words.find(|word| *word != "--").unwrap_or("~")
+        };
         let Some(next) = cd_target_path(target, &cwd) else {
             return true;
         };
@@ -304,10 +319,26 @@ fn cd_target_path(target: &str, cwd: &Path) -> Option<PathBuf> {
     if target == "-" {
         return None;
     }
-    let path = if let Some(rest) = target.strip_prefix("~/") {
-        PathBuf::from(std::env::var_os("HOME")?).join(rest)
+    let path = if let Some(rest) = home_prefix_suffix(target) {
+        // A leading `$HOME`/`${HOME}` is the one variable a static judge can
+        // expand; anything shell-only behind it stays unresolvable.
+        if has_shell_expansion(rest) {
+            return None;
+        }
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        if rest.is_empty() {
+            home
+        } else {
+            home.join(rest.trim_start_matches('/'))
+        }
+    } else if has_shell_expansion(target) {
+        // `$VAR`, `${...}`, backticks/`$(...)` and globs only have a value
+        // inside a running shell: outside scope rather than a guessed project.
+        return None;
     } else if target == "~" {
         PathBuf::from(std::env::var_os("HOME")?)
+    } else if let Some(rest) = target.strip_prefix("~/") {
+        PathBuf::from(std::env::var_os("HOME")?).join(rest)
     } else if target.starts_with('~') {
         // Another user's home: not resolvable here.
         return None;
@@ -319,6 +350,25 @@ fn cd_target_path(target: &str, cwd: &Path) -> Option<PathBuf> {
     } else {
         normalize_lexically(&cwd.join(path))
     })
+}
+
+/// The suffix after a leading `$HOME`/`${HOME}` (empty for the bare form).
+/// The variable name must end at a path boundary, so `$HOMEDIR` stays unknown.
+fn home_prefix_suffix(target: &str) -> Option<&str> {
+    for prefix in ["${HOME}", "$HOME"] {
+        if let Some(rest) = target.strip_prefix(prefix)
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Constructs whose value is only known to a running shell: variables,
+/// command substitution (backticks and `$(...)`) and globs.
+fn has_shell_expansion(target: &str) -> bool {
+    target.contains(['$', '`', '*', '?', '['])
 }
 
 /// Resolve `.`/`..` without touching the filesystem (the target may not exist
@@ -838,6 +888,61 @@ mod tests {
             "(cd /repo/src)",
             "echo 'cd /other'",
             "echo \"cd /other; ls\"",
+        ] {
+            let captured = event(inside).unwrap_or_else(|| panic!("must keep: {inside}"));
+            assert_eq!(captured.worktree, "/repo");
+        }
+    }
+
+    /// user command with a dynamically computed cd target | Given /repo as
+    /// the resolved project and a target that only a running shell can
+    /// evaluate | When the command changes directory through `$VAR`, a
+    /// command substitution, a glob or another user's home, or spells the
+    /// change as `command cd` / `builtin cd` / `pushd` | Then the event is
+    /// dropped, except for a leading `$HOME`/`${HOME}` which expands to HOME
+    /// exactly like `~`.
+    #[test]
+    fn user_dynamic_cd_target_is_outside_scope_but_home_still_expands() {
+        let event = |command: &str| {
+            event_for_tool_call(
+                "herdr_exec",
+                &json!({"project_root": "/repo", "command": command}),
+                &test_snapshot(),
+            )
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set in tests"));
+        let home_inside = home.starts_with("/repo");
+        for expanded in [
+            "cd \"$HOME\" && ls",
+            "cd ${HOME} && ls",
+            "cd $HOME/src && ls",
+        ] {
+            assert_eq!(
+                event(expanded).is_some(),
+                home_inside,
+                "home form: {expanded}"
+            );
+        }
+        for outside in [
+            "cd $OTHER_REPO && ls",
+            "cd ${OTHER_REPO} && ls",
+            "cd $HOME/$OTHER_REPO && ls",
+            "cd \"$(git rev-parse --show-toplevel)\" && ls",
+            "cd `git rev-parse --show-toplevel` && ls",
+            "cd /repo/*/src && ls",
+            "cd ~other/src && ls",
+            "command cd /other && ls",
+            "builtin cd /other && ls",
+            "pushd /other && ls",
+        ] {
+            assert!(event(outside).is_none(), "must drop: {outside}");
+        }
+        // A statically known target keeps working through the builtin forms.
+        for inside in [
+            "cd /repo/src",
+            "command cd /repo/src && ls",
+            "builtin cd /repo/src && ls",
+            "pushd /repo/src && ls",
         ] {
             let captured = event(inside).unwrap_or_else(|| panic!("must keep: {inside}"));
             assert_eq!(captured.worktree, "/repo");

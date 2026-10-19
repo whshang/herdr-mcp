@@ -1114,9 +1114,6 @@ fn compact_scope(
             ..WorkState::default()
         });
     let worktree_path = Path::new(worktree);
-    // One merged-ref read per worktree per tick (and none when no task is
-    // open); every batch below reuses it.
-    let merged_refs = merged.for_memory(&split_memory(&previous.handoff_md).0, worktree_path);
 
     for _ in 0..EVENT_BATCHES_PER_TICK {
         let events = store.work_events_after(
@@ -1136,7 +1133,7 @@ fn compact_scope(
         let workspace = git_context(Path::new(worktree));
         // Rebuild from the merge base + whatever HANDOFF.md currently holds,
         // so a retry after a concurrent agent edit folds that edit in too.
-        let build = |file_md: Option<&str>, ops: Option<&HandoffOps>| {
+        let mut build = |file_md: Option<&str>, ops: Option<&HandoffOps>| {
             let mut memory = base.clone();
             if let Some(file_md) = file_md
                 && file_md != previous.handoff_md
@@ -1153,7 +1150,13 @@ fn compact_scope(
                     memory.current_state = clip_chars(legacy.trim(), CURRENT_STATE_MAX_CHARS);
                 }
             }
-            refresh_tasks(&mut memory, merged_refs, now_ms);
+            // Merged-ref evidence comes from the memory actually being
+            // refreshed (after the file fold and the semantic ops), so a
+            // finished task the agent just added is closed in this tick; the
+            // git read itself stays cached per worktree per tick, and is
+            // skipped entirely while no task is open.
+            let refs = merged.for_memory(&memory, worktree_path);
+            refresh_tasks(&mut memory, refs, now_ms);
             memory
         };
         let target = Path::new(worktree).join("HANDOFF.md");
@@ -1244,9 +1247,9 @@ fn compaction_prompt(memory: &RelayMemory, legacy: &str, events: &[WorkEvent]) -
     // whole text of everything it is shown, otherwise it re-adds items it
     // cannot see and the document doubles. Under byte pressure the
     // re-derivable fields go first (rolling log, current state, git context),
-    // then the legacy free-form context, then the OLDEST whole items — they
-    // stay in memory, and the dedupe on write handles a re-add. Only the
-    // event tail is ever cut.
+    // then the legacy free-form context, then whole source-path entries, then
+    // the OLDEST whole items — all of them stay in memory, and the dedupe on
+    // write handles a re-add. Only the event tail is ever cut.
     for (candidate, legacy) in [
         (memory, legacy.as_str()),
         (&thinned, legacy.as_str()),
@@ -1263,6 +1266,15 @@ fn compaction_prompt(memory: &RelayMemory, legacy: &str, events: &[WorkEvent]) -
         let head = escape_control_chars(&prompt_head(&kept, ""));
         if head.len() + reserve <= SEMANTIC_PROMPT_MAX_BYTES {
             return finish_prompt(head, &events);
+        }
+        // Source-session paths are re-derivable bookkeeping the summarizer
+        // does not need to distill, so whole entries leave first (oldest
+        // first — the list is newest-last): the memory JSON is never clipped
+        // and the distilled items stay.
+        if !kept.sources.is_empty() {
+            let drop_count = kept.sources.len().div_ceil(8).max(1);
+            kept.sources.drain(..drop_count);
+            continue;
         }
         // Drop whole items from the largest section's old end, so every
         // section keeps its newest entries and no text is ever cut.
@@ -1355,11 +1367,6 @@ fn reconcile_handoff_files(
         // it carries no agent edit.
         let recorded = state.handoff_md.clone();
         let base = parsed_memory(&recorded);
-        // Merged-ref evidence is read at most once per worktree per tick, and
-        // not at all when the memory holds no open task to close.
-        let refs = base
-            .as_ref()
-            .and_then(|memory| merged.for_memory(memory, worktree));
         // The tick render: fold an agent-edited file first (stamping its edits
         // with the current tick, not the state's last write time, so an old
         // file cannot instantaneously age the tasks it adds), then close the
@@ -1367,12 +1374,18 @@ fn reconcile_handoff_files(
         // keeps its age, so a task closed by this tick is not resurrected by
         // the stale copy still on disk. Task auto-close must not depend on new
         // events arriving at all.
-        let render = |file_md: Option<&str>| match &base {
+        let mut render = |file_md: Option<&str>| match &base {
             Some(memory) => {
                 let mut memory = memory.clone();
                 if let Some(file_md) = file_md.filter(|file_md| *file_md != recorded) {
                     fold_file_edits(&mut memory, file_md, now_ms);
                 }
+                // Merged-ref evidence is read from the memory actually being
+                // refreshed, i.e. after the file fold, so a merged-PR task the
+                // agent just added is closed in this same tick. The read is
+                // still once per worktree per tick and skipped while the
+                // memory holds no open task.
+                let refs = merged.for_memory(&memory, worktree);
                 refresh_tasks(&mut memory, refs, now_ms);
                 render_handoff(&memory)
             }
@@ -1468,8 +1481,12 @@ enum GuardedWrite {
 /// Lost-update guard: render from the HANDOFF.md content just read, then
 /// re-read right before the (atomic temp+rename) write; when an agent edited
 /// the file in between, render again from the new content (folding the edit
-/// in) instead of overwriting it. Bounded attempts.
-fn write_handoff_guarded(worktree: &Path, render: impl Fn(Option<&str>) -> String) -> GuardedWrite {
+/// in) instead of overwriting it. Bounded attempts. The renderer may keep
+/// per-tick state (the merged-ref cache), hence `FnMut`.
+fn write_handoff_guarded(
+    worktree: &Path,
+    mut render: impl FnMut(Option<&str>) -> String,
+) -> GuardedWrite {
     let target = worktree.join("HANDOFF.md");
     for _ in 0..HANDOFF_WRITE_ATTEMPTS {
         let seen = read_handoff_file(&target);
@@ -2629,6 +2646,63 @@ mod tests {
         assert_eq!(memory.tasks[0].id, "t3");
     }
 
+    /// relay prompt | Given a memory whose 30 source-path entries alone
+    /// exceed the semantic message budget | When the compaction prompt is
+    /// built | Then whole sources are dropped oldest-first rather than cutting
+    /// anything, the prompt fits the cap, its memory JSON still parses and the
+    /// new events survive.
+    #[test]
+    fn compaction_prompt_drops_whole_sources_before_clipping_anything() {
+        let memory = RelayMemory {
+            sources: (0..30)
+                .map(|index| {
+                    format!(
+                        "pi 2026-10-{:02} 10:00 UTC /logs/{index}.jsonl {}",
+                        index + 1,
+                        "x".repeat(3_000)
+                    )
+                })
+                .collect(),
+            ..RelayMemory::default()
+        };
+        let events: Vec<WorkEvent> = (0..3)
+            .map(|index| WorkEvent {
+                event_id: index as i64 + 1,
+                ts: index as i64,
+                project_ref: "proj".to_owned(),
+                worktree: "/repo".to_owned(),
+                provider: "test".to_owned(),
+                account: None,
+                kind: "edit".to_owned(),
+                summary: format!("source drop {index}"),
+                source_ref: format!("test:{index}"),
+            })
+            .collect();
+        let prompt = compaction_prompt(&memory, "", &events);
+        assert!(
+            prompt.len() <= SEMANTIC_PROMPT_MAX_BYTES,
+            "{}",
+            prompt.len()
+        );
+        let json = prompt
+            .split("Current memory JSON:\\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\\n\\nLegacy context").next())
+            .expect("memory JSON in the prompt");
+        // Parsing the whole document is the real invariant: the memory JSON is
+        // never clipped, only whole entries may leave the prompt copy.
+        let parsed: RelayMemory = serde_json::from_str(json).expect("whole memory JSON");
+        assert!(parsed.sources.len() < memory.sources.len());
+        for source in &parsed.sources {
+            assert!(memory.sources.contains(source), "source text is never cut");
+        }
+        assert!(prompt.contains("New events:"));
+        for index in 0..3 {
+            assert!(prompt.contains(&format!("source drop {index}")), "{index}");
+        }
+        assert_eq!(memory.sources.len(), 30, "the stored memory keeps them all");
+    }
+
     /// relay prompt | Given 400 long rules that cannot fit the semantic
     /// message budget | When the compaction prompt is built | Then it never
     /// exceeds the limit, its memory JSON still parses, every item it carries
@@ -2868,6 +2942,56 @@ mod tests {
         assert!(memory.tasks.is_empty(), "{:?}", memory.tasks);
         let on_disk = fs::read_to_string(root.join("HANDOFF.md")).unwrap();
         assert!(!on_disk.contains("[t1]"), "{on_disk}");
+        assert_eq!(on_disk, state.handoff_md);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// relay tasks | Given a stored memory with no open task and a worktree
+    /// whose PR is already merged into origin/main | When an agent adds that
+    /// task to HANDOFF.md and the tick folds the edit | Then merged-ref
+    /// evidence comes from the memory actually refreshed, so the task is
+    /// closed in the same tick.
+    #[test]
+    fn task_added_by_file_edit_is_closed_by_merged_refs_in_the_same_tick() {
+        let root = temp_dir("reconcile-merged-edit");
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("a.txt"), "a").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "feat(relay): compactor (#42)"]);
+        git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+        let store = StateStore::open(":memory:").unwrap();
+        let now = now_ms();
+        let handoff = render_handoff(&RelayMemory::default());
+        store
+            .put_work_state(&WorkState {
+                project_ref: "proj".to_owned(),
+                worktree: root.to_string_lossy().into_owned(),
+                handoff_md: handoff.clone(),
+                updated_at: now,
+                ..WorkState::default()
+            })
+            .unwrap();
+        // The stored memory holds no open task, so merged-ref evidence is only
+        // needed after the agent edit below is folded in.
+        fs::write(
+            root.join("HANDOFF.md"),
+            handoff.replace(
+                "## 任务清单\n",
+                "## 任务清单\n\n- [t4] (todo) 完成 PR #42 的收尾\n",
+            ),
+        )
+        .unwrap();
+
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), now).unwrap();
+        let state = store
+            .work_state("proj", root.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let memory = parsed_memory(&state.handoff_md).unwrap();
+        assert!(memory.tasks.is_empty(), "{:?}", memory.tasks);
+        let on_disk = fs::read_to_string(root.join("HANDOFF.md")).unwrap();
+        assert!(!on_disk.contains("PR #42"), "{on_disk}");
         assert_eq!(on_disk, state.handoff_md);
         fs::remove_dir_all(root).unwrap();
     }
