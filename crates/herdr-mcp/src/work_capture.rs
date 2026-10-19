@@ -3,7 +3,7 @@ use crate::state_store::work_journal::{NewWorkEvent, WORK_SUMMARY_MAX_CHARS, cli
 use regex::Regex;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -85,8 +85,7 @@ pub(crate) fn event_for_tool_call(
     // herdr-mcp session running `cd ~/Documents/novos-cockpit && ls`).
     if kind == "command"
         && let Some(command) = arguments.get("command").and_then(Value::as_str)
-        && let Some(target) = command_cd_target(command)
-        && !target.starts_with(&scope.worktree)
+        && command_leaves_scope(command, &scope.worktree)
     {
         return None;
     }
@@ -216,24 +215,80 @@ struct WorkScope {
     worktree: PathBuf,
 }
 
-/// The first `cd` target of a shell command line (`cd x && ls`) when it is an
-/// absolute or `~/`-relative directory; `None` for relative/unknown targets.
-fn command_cd_target(command: &str) -> Option<PathBuf> {
-    let mut tokens = command.split_whitespace();
-    while let Some(token) = tokens.next() {
-        if token.trim_start_matches(['&', ';', '|', '(']) != "cd" {
+/// Does this command line ever run outside the scope root? Every `cd` is
+/// evaluated in order: the cwd starts at the scope root, a relative target
+/// joins the running cwd, `~/` expands $HOME, a `--` separator and surrounding
+/// quotes are dropped, and `.`/`..` are resolved lexically. A command that
+/// ends up outside the root acts on another project (e.g. a herdr-mcp session
+/// running `cd ~/Documents/novos-cockpit && ls`), so the caller's workspace
+/// must not inherit its work. Unresolvable targets (`cd -`, `~other`) count as
+/// outside: never guess a project.
+fn command_leaves_scope(command: &str, root: &Path) -> bool {
+    let root = normalize_lexically(root);
+    let mut cwd = root.clone();
+    let mut pending_cd = false;
+    for raw in command.split_whitespace() {
+        if pending_cd {
+            let target = raw.trim_matches(['\'', '"', ';', '&', '|', '(', ')']);
+            // `cd -- dir` / `cd --`: the separator is not the target.
+            if target.is_empty() || target == "--" {
+                continue;
+            }
+            pending_cd = false;
+            let Some(next) = cd_target_path(target, &cwd) else {
+                return true;
+            };
+            if !next.starts_with(&root) {
+                return true;
+            }
+            cwd = next;
             continue;
         }
-        let target = tokens
-            .next()?
-            .trim_matches(['\'', '"', ';', '&', '|', '(', ')']);
-        let path = match target.strip_prefix("~/") {
-            Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
-            None => PathBuf::from(target),
-        };
-        return path.is_absolute().then_some(path);
+        if raw.trim_start_matches(['&', ';', '|', '(']) == "cd" {
+            pending_cd = true;
+        }
     }
-    None
+    false
+}
+
+fn cd_target_path(target: &str, cwd: &Path) -> Option<PathBuf> {
+    if target == "-" {
+        return None;
+    }
+    let path = if let Some(rest) = target.strip_prefix("~/") {
+        PathBuf::from(std::env::var_os("HOME")?).join(rest)
+    } else if target == "~" {
+        PathBuf::from(std::env::var_os("HOME")?)
+    } else if target.starts_with('~') {
+        // Another user's home: not resolvable here.
+        return None;
+    } else {
+        PathBuf::from(target)
+    };
+    Some(if path.is_absolute() {
+        normalize_lexically(&path)
+    } else {
+        normalize_lexically(&cwd.join(path))
+    })
+}
+
+/// Resolve `.`/`..` without touching the filesystem (the target may not exist
+/// yet, and a symlinked checkout must still compare by its lexical path).
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Keep a leading `..` of an already-relative path.
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn resolve_scope(arguments: &Value, snapshot: &Value) -> Option<WorkScope> {
@@ -663,6 +718,42 @@ mod tests {
         )
         .expect("a plain command keeps the event");
         assert_eq!(plain.worktree, "/repo");
+    }
+
+    /// user command with several cd steps | Given /repo as the resolved
+    /// project | When every `cd` in the command is evaluated in order | Then a
+    /// command that ever leaves /repo is dropped while one that stays inside
+    /// is captured, including relative and lexically normalized targets.
+    #[test]
+    fn user_command_cd_chain_is_judged_by_its_final_directory() {
+        let event = |command: &str| {
+            event_for_tool_call(
+                "herdr_exec",
+                &json!({"project_root": "/repo", "command": command}),
+                &test_snapshot(),
+            )
+        };
+        for outside in [
+            "cd ../other && ls",
+            "cd /repo/../other && ls",
+            "cd /repo && cd /other && ls",
+            "cd -- ../other && ls",
+            "cd - && ls",
+        ] {
+            assert!(event(outside).is_none(), "must drop: {outside}");
+        }
+        for inside in [
+            "cd src && ls",
+            "cd /repo/src",
+            "cd /repo/./src/../tests && ls",
+            "cd -- /repo/src && ls",
+        ] {
+            let captured = event(inside).unwrap_or_else(|| panic!("must keep: {inside}"));
+            assert_eq!(captured.worktree, "/repo");
+        }
+        // Quoted targets resolve the same way.
+        assert!(event("cd '../other' && ls").is_none());
+        assert!(event("cd '/repo/src' && ls").is_some());
     }
 
     /// herdr_exec targeting a workspace by LABEL | Given a workspace whose

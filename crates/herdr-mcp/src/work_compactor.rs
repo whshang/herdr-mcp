@@ -39,21 +39,29 @@ pub(crate) trait WorkSummarizer: Send + Sync {
     fn summarize(&self, prompt: &str) -> Result<String, String>;
 }
 
+/// The summarizer request shape: one user message plus JSON-mode options. Both
+/// the live call and the prompt-size test go through this, so a test proves the
+/// real request is accepted instead of a lookalike.
+fn summarizer_message(prompt: &str) -> SemanticChatMessage {
+    SemanticChatMessage {
+        role: "user".to_owned(),
+        content: prompt.to_owned(),
+    }
+}
+
+fn summarizer_options() -> SemanticChatOptions {
+    SemanticChatOptions {
+        max_tokens: Some(SUMMARY_MAX_TOKENS),
+        json_response: true,
+        ..SemanticChatOptions::default()
+    }
+}
+
 impl WorkSummarizer for SemanticService {
     fn summarize(&self, prompt: &str) -> Result<String, String> {
-        self.chat_background(
-            &[SemanticChatMessage {
-                role: "user".to_owned(),
-                content: prompt.to_owned(),
-            }],
-            SemanticChatOptions {
-                max_tokens: Some(SUMMARY_MAX_TOKENS),
-                json_response: true,
-                ..SemanticChatOptions::default()
-            },
-        )
-        .map(|response| response.content)
-        .map_err(|error| error.code().to_owned())
+        self.chat_background(&[summarizer_message(prompt)], summarizer_options())
+            .map(|response| response.content)
+            .map_err(|error| error.code().to_owned())
     }
 }
 
@@ -380,17 +388,18 @@ pub(crate) fn fold_file_edits(memory: &mut RelayMemory, file_md: &str, now_ms: i
     if !saw_any {
         return false;
     }
+    // Duplicate lines are resolved by the dedupe pass below: the rendered
+    // file is newest-first, so reversing gives the oldest line (and id) first
+    // and the fuller text wins over an older clipped copy.
     let to_items = |parsed: Vec<(Option<String>, String)>, prefix: &str| {
         let mut items: Vec<RelayItem> = Vec::new();
         for (id, text) in parsed.into_iter().rev() {
-            if items.iter().any(|item| same_text(&item.text, &text)) {
-                continue;
-            }
             let id = id
                 .filter(|id| !id.is_empty() && !items.iter().any(|item| &item.id == id))
                 .unwrap_or_else(|| next_id(&items, prefix));
             items.push(RelayItem { id, text });
         }
+        dedupe_items(&mut items);
         items
     };
     memory.preferences = to_items(rules, "p");
@@ -398,9 +407,6 @@ pub(crate) fn fold_file_edits(memory: &mut RelayMemory, file_md: &str, now_ms: i
     let previous = std::mem::take(&mut memory.tasks);
     let mut folded: Vec<RelayTask> = Vec::new();
     for (id, text, status) in tasks.into_iter().rev() {
-        if folded.iter().any(|task| same_text(&task.text, &text)) {
-            continue;
-        }
         let id = id
             .filter(|id| !id.is_empty() && !folded.iter().any(|task| &task.id == id))
             .unwrap_or_else(|| {
@@ -426,6 +432,7 @@ pub(crate) fn fold_file_edits(memory: &mut RelayMemory, file_md: &str, now_ms: i
             updated_ms,
         });
     }
+    dedupe_tasks(&mut folded);
     memory.tasks = folded;
     true
 }
@@ -533,11 +540,73 @@ fn normalize_text(text: &str) -> String {
     }
 }
 
-/// Same rule/task? Equal after normalization, or one is a truncated/expanded
-/// form of the other (a clipped duplicate must not become a second item).
+/// Same rule/task? Equal after normalization, or the shorter one is a
+/// clipped copy: a prefix match merges only when the SHORTER ORIGINAL text
+/// ends with an explicit truncation marker, so `test` never swallows
+/// `test deployment` while a clipped duplicate still folds into its source.
 fn same_text(a: &str, b: &str) -> bool {
-    let (a, b) = (normalize_text(a), normalize_text(b));
-    !a.is_empty() && !b.is_empty() && (a.starts_with(&b) || b.starts_with(&a))
+    let (key_a, key_b) = (normalize_text(a), normalize_text(b));
+    if key_a.is_empty() || key_b.is_empty() {
+        return false;
+    }
+    if key_a == key_b {
+        return true;
+    }
+    let (shorter, shorter_key, longer_key) = if key_a.len() <= key_b.len() {
+        (a, key_a.as_str(), key_b.as_str())
+    } else {
+        (b, key_b.as_str(), key_a.as_str())
+    };
+    is_clipped(shorter) && longer_key.starts_with(shorter_key)
+}
+
+/// A text ending in `…` or `...` was clipped by some producer, so its
+/// normalized key is only a prefix of the full text.
+fn is_clipped(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    trimmed.ends_with('…') || trimmed.ends_with("...")
+}
+
+/// Final dedupe pass over one section: ops (and a file fold) can leave the
+/// same text under two ids. Keep the earliest id and the longest (never a
+/// clipped) text, so one rule is never listed twice.
+fn dedupe_items(items: &mut Vec<RelayItem>) {
+    let mut deduped: Vec<RelayItem> = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        match deduped
+            .iter_mut()
+            .find(|kept| same_text(&kept.text, &item.text))
+        {
+            Some(kept) => {
+                if normalize_text(&item.text).len() > normalize_text(&kept.text).len() {
+                    kept.text = item.text;
+                }
+            }
+            None => deduped.push(item),
+        }
+    }
+    *items = deduped;
+}
+
+/// Same as [`dedupe_items`] for tasks: the merged task keeps the earliest id,
+/// the fuller text and the freshest touch stamp.
+fn dedupe_tasks(tasks: &mut Vec<RelayTask>) {
+    let mut deduped: Vec<RelayTask> = Vec::with_capacity(tasks.len());
+    for task in tasks.drain(..) {
+        match deduped
+            .iter_mut()
+            .find(|kept| same_text(&kept.text, &task.text))
+        {
+            Some(kept) => {
+                if normalize_text(&task.text).len() > normalize_text(&kept.text).len() {
+                    kept.text = task.text;
+                }
+                kept.updated_ms = kept.updated_ms.max(task.updated_ms);
+            }
+            None => deduped.push(task),
+        }
+    }
+    *tasks = deduped;
 }
 
 /// Render the fixed-section handoff document plus the trailing structured
@@ -761,6 +830,13 @@ fn apply_memory_ops(memory: &mut RelayMemory, ops: HandoffOps, now_ms: i64) {
     memory.recent = memory
         .recent
         .split_off(memory.recent.len().saturating_sub(RECENT_MAX_LINES));
+    // One final dedupe pass: an explicit-id update can re-state another item
+    // (`update p2 -> "alpha."` when p1 already says `Alpha`), which must not
+    // leave the section with two copies of the same text.
+    dedupe_items(&mut memory.goals);
+    dedupe_items(&mut memory.preferences);
+    dedupe_items(&mut memory.mistakes);
+    dedupe_tasks(&mut memory.tasks);
 }
 
 /// One bounded, provider-prefixed rolling-log line for the fallback path.
@@ -850,8 +926,22 @@ impl MergedRefs {
         }) || self
             .branches
             .iter()
-            .any(|branch| text.contains(branch.as_str()))
+            .any(|branch| names_branch(text, branch))
     }
+}
+
+/// Token-bounded branch match: the task text must contain the branch name as
+/// one token, split on whitespace and punctuation except `/`, `-`, `.`, `_`
+/// (branch-name characters), so `fix/foo` never matches `fix/foobar`.
+fn names_branch(text: &str, branch: &str) -> bool {
+    !branch.is_empty()
+        && text
+            .split(is_branch_token_separator)
+            .any(|token| token == branch)
+}
+
+fn is_branch_token_separator(ch: char) -> bool {
+    !(ch.is_alphanumeric() || matches!(ch, '/' | '-' | '.' | '_'))
 }
 
 /// Read merged PR numbers / branch names from the worktree's `origin/main`.
@@ -881,15 +971,26 @@ fn merged_refs(worktree: &Path) -> MergedRefs {
             }
         }
     }
-    static PR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let pr = PR.get_or_init(|| regex::Regex::new(r"#(\d+)").expect("pr regex"));
+    static PR_TRAILING: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let trailing = PR_TRAILING
+        .get_or_init(|| regex::Regex::new(r"\(#(\d+)\)\s*$").expect("trailing pr regex"));
+    static PR_MERGE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let merge = PR_MERGE.get_or_init(|| {
+        regex::Regex::new(r"^Merge pull request #(\d+)\b").expect("merge pr regex")
+    });
     for line in log.lines() {
-        for caps in pr.captures_iter(line) {
-            if let Ok(number) = caps[1].parse::<u64>()
-                && !refs.prs.contains(&number)
-            {
-                refs.prs.push(number);
-            }
+        // `--oneline` prints "<sha> <subject>"; only merge evidence in the
+        // subject counts, so a body/commit message mentioning "#123" ("fix:
+        // workaround for #123 (#456)") never closes the wrong task.
+        let subject = line.split_once(' ').map_or(line, |(_, subject)| subject);
+        let capture = merge
+            .captures(subject)
+            .or_else(|| trailing.captures(subject));
+        if let Some(caps) = capture
+            && let Ok(number) = caps[1].parse::<u64>()
+            && !refs.prs.contains(&number)
+        {
+            refs.prs.push(number);
         }
     }
     refs
@@ -897,18 +998,42 @@ fn merged_refs(worktree: &Path) -> MergedRefs {
 
 /// Close finished tasks: `done` tasks leave the memory entirely, and an open
 /// task is closed when its PR/branch is already merged into `origin/main` or
-/// when nothing touched it for STALE_TASK_DAYS. Legacy tasks without an
-/// update stamp start their clock now instead of being dropped on first load.
-fn refresh_tasks(memory: &mut RelayMemory, worktree: &Path, now_ms: i64) {
+/// when nothing touched it for STALE_TASK_DAYS. `merged` is `None` when the
+/// caller already knows there is no open task, so git is not consulted at all.
+/// Legacy tasks without an update stamp start their clock now instead of being
+/// dropped on first load.
+fn refresh_tasks(memory: &mut RelayMemory, merged: Option<&MergedRefs>, now_ms: i64) {
     for task in &mut memory.tasks {
         task.updated_ms.get_or_insert(now_ms);
     }
-    let merged = merged_refs(worktree);
     memory.tasks.retain(|task| {
         task.status != "done"
             && now_ms.saturating_sub(task.updated_ms.unwrap_or(now_ms)) <= STALE_TASK_DAYS * DAY_MS
-            && !merged.matched_by(&task.text)
+            && !merged.is_some_and(|merged| merged.matched_by(&task.text))
     });
+}
+
+/// Merged PR/branch evidence per worktree: computed at most once per tick, and
+/// only when that worktree still holds an open task.
+#[derive(Default)]
+struct MergedRefCache {
+    entries: std::collections::HashMap<String, MergedRefs>,
+}
+
+impl MergedRefCache {
+    fn for_memory(&mut self, memory: &RelayMemory, worktree: &Path) -> Option<&MergedRefs> {
+        // Nothing to close: skip git entirely.
+        if !memory.tasks.iter().any(|task| task.status != "done") {
+            return None;
+        }
+        let key = worktree.to_string_lossy().into_owned();
+        let root = worktree.to_path_buf();
+        Some(
+            self.entries
+                .entry(key)
+                .or_insert_with(|| merged_refs(&root)),
+        )
+    }
 }
 
 pub(crate) fn compact_tick(
@@ -920,9 +1045,19 @@ pub(crate) fn compact_tick(
     let mut first_error = ingest(store).err();
     let scopes = store.work_scopes_with_new_events()?;
     let mut compacted = 0;
+    // Merged-ref evidence is per worktree per tick, shared by compaction and
+    // the task auto-close pass below.
+    let mut merged = MergedRefCache::default();
 
     for (project_ref, worktree) in scopes {
-        if let Err(error) = compact_scope(store, summarizer, &project_ref, &worktree, now_ms) {
+        if let Err(error) = compact_scope(
+            store,
+            summarizer,
+            &project_ref,
+            &worktree,
+            now_ms,
+            &mut merged,
+        ) {
             first_error.get_or_insert(error);
         } else {
             compacted += 1;
@@ -931,7 +1066,9 @@ pub(crate) fn compact_tick(
 
     // The file export can fail after the cursor advanced (or the worktree was
     // reset afterwards); re-derive HANDOFF.md whenever it drifts from state.
-    if let Err(error) = reconcile_handoff_files(store) {
+    // This pass also closes finished tasks on every tick, including ticks with
+    // no new events at all.
+    if let Err(error) = reconcile_handoff_files(store, &mut merged, now_ms) {
         first_error.get_or_insert(error);
     }
 
@@ -947,6 +1084,7 @@ fn compact_scope(
     project_ref: &str,
     worktree: &str,
     now_ms: i64,
+    merged: &mut MergedRefCache,
 ) -> Result<(), String> {
     // Process new events oldest-first in bounded batches. The cursor only
     // advances to the last event actually folded into the handoff, so a
@@ -960,6 +1098,10 @@ fn compact_scope(
             log_cursors_json: "{}".to_owned(),
             ..WorkState::default()
         });
+    let worktree_path = Path::new(worktree);
+    // One merged-ref read per worktree per tick (and none when no task is
+    // open); every batch below reuses it.
+    let merged_refs = merged.for_memory(&split_memory(&previous.handoff_md).0, worktree_path);
 
     for _ in 0..EVENT_BATCHES_PER_TICK {
         let events = store.work_events_after(
@@ -996,7 +1138,7 @@ fn compact_scope(
                     memory.current_state = clip_chars(legacy.trim(), CURRENT_STATE_MAX_CHARS);
                 }
             }
-            refresh_tasks(&mut memory, Path::new(worktree), now_ms);
+            refresh_tasks(&mut memory, merged_refs, now_ms);
             memory
         };
         let target = Path::new(worktree).join("HANDOFF.md");
@@ -1053,41 +1195,96 @@ Sections that matter: 公共原则/偏好规范=preferences (durable principles,
 Current memory JSON:
 ";
 
+/// Event-tail room kept when a huge memory has to give up its oldest whole
+/// items, so the summarizer always sees some of the new work.
+const PROMPT_EVENTS_RESERVE_BYTES: usize = 2_000;
+
+fn prompt_head(memory: &RelayMemory, legacy: &str) -> String {
+    let memory_json = serde_json::to_string(memory).unwrap_or_else(|_| "{}".to_owned());
+    format!(
+        "{COMPACTION_PROMPT_HEAD}{memory_json}\n\nLegacy context (may be empty):\n{legacy}\n\nNew events:\n"
+    )
+}
+
+/// Append the event tail, clipping only it to the bytes the head leaves.
+fn finish_prompt(head: String, events: &str) -> String {
+    let budget = SEMANTIC_PROMPT_MAX_BYTES.saturating_sub(head.len());
+    let mut prompt = head;
+    prompt.push_str(&clip_utf8_bytes(events, budget));
+    prompt
+}
+
 fn compaction_prompt(memory: &RelayMemory, legacy: &str, events: &[WorkEvent]) -> String {
     let mut thinned = memory.clone();
     thinned.recent.clear();
     thinned.current_state.clear();
     thinned.workspace = None;
     let legacy = clip_chars(legacy, HANDOFF_MAX_CHARS / 2);
+    // The Edge /semantic/chat contract rejects message content containing any
+    // control character (U+0000-U+001F, U+007F) with semantic_request_invalid,
+    // so encode line breaks/tabs as visible escapes; the cap is measured in
+    // BYTES, not chars.
     let events = escape_control_chars(&events.iter().map(format_event).collect::<String>());
-    // The memory JSON is NEVER clipped: the summarizer must see every item id
-    // and its whole text, otherwise it re-adds items it cannot see and the
-    // document doubles. Under byte pressure the re-derivable fields go first
-    // (rolling log, current state, git context), then the legacy free-form
-    // context; list items stay complete. Only the event tail is ever cut.
-    let mut head = String::new();
-    for (memory, legacy) in [
+    // The memory JSON is NEVER clipped: the summarizer must see the id and the
+    // whole text of everything it is shown, otherwise it re-adds items it
+    // cannot see and the document doubles. Under byte pressure the
+    // re-derivable fields go first (rolling log, current state, git context),
+    // then the legacy free-form context, then the OLDEST whole items — they
+    // stay in memory, and the dedupe on write handles a re-add. Only the
+    // event tail is ever cut.
+    for (candidate, legacy) in [
         (memory, legacy.as_str()),
         (&thinned, legacy.as_str()),
         (&thinned, ""),
     ] {
-        let memory_json = serde_json::to_string(memory).unwrap_or_else(|_| "{}".to_owned());
-        head = format!(
-            "{COMPACTION_PROMPT_HEAD}{memory_json}\n\nLegacy context (may be empty):\n{legacy}\n\nNew events:\n"
-        );
-        if escape_control_chars(&head).len() + events.len() <= SEMANTIC_PROMPT_MAX_BYTES {
-            break;
+        let head = escape_control_chars(&prompt_head(candidate, legacy));
+        if head.len() + events.len() <= SEMANTIC_PROMPT_MAX_BYTES {
+            return finish_prompt(head, &events);
         }
     }
-    // The Edge /semantic/chat contract rejects message content containing any
-    // control character (U+0000-U+001F, U+007F) with semantic_request_invalid,
-    // so encode line breaks/tabs as visible escapes before the byte clip. The
-    // semantic message cap is measured in bytes, not chars; truncate on a
-    // UTF-8 char boundary against the byte budget.
-    let mut prompt = escape_control_chars(&head);
-    let budget = SEMANTIC_PROMPT_MAX_BYTES.saturating_sub(prompt.len());
-    prompt.push_str(&clip_utf8_bytes(&events, budget));
-    prompt
+    let reserve = events.len().min(PROMPT_EVENTS_RESERVE_BYTES);
+    let mut kept = thinned.clone();
+    loop {
+        let head = escape_control_chars(&prompt_head(&kept, ""));
+        if head.len() + reserve <= SEMANTIC_PROMPT_MAX_BYTES {
+            return finish_prompt(head, &events);
+        }
+        // Drop whole items from the largest section's old end, so every
+        // section keeps its newest entries and no text is ever cut.
+        let biggest = [
+            (0usize, kept.goals.len()),
+            (1, kept.preferences.len()),
+            (2, kept.mistakes.len()),
+            (3, kept.tasks.len()),
+        ]
+        .into_iter()
+        .max_by_key(|(_, len)| *len)
+        .filter(|(_, len)| *len > 0);
+        let Some((section, len)) = biggest else {
+            // The fixed skeleton plus an empty memory always fits; keep the
+            // hard byte invariant even if that ever stopped being true.
+            return if head.len() > SEMANTIC_PROMPT_MAX_BYTES {
+                clip_utf8_bytes(&head, SEMANTIC_PROMPT_MAX_BYTES)
+            } else {
+                finish_prompt(head, &events)
+            };
+        };
+        let drop_count = len.div_ceil(8).max(1);
+        match section {
+            0 => {
+                kept.goals.drain(..drop_count);
+            }
+            1 => {
+                kept.preferences.drain(..drop_count);
+            }
+            2 => {
+                kept.mistakes.drain(..drop_count);
+            }
+            _ => {
+                kept.tasks.drain(..drop_count);
+            }
+        }
+    }
 }
 
 fn escape_control_chars(text: &str) -> String {
@@ -1129,11 +1326,53 @@ fn format_event(event: &WorkEvent) -> String {
 /// (Re)write HANDOFF.md for every work_state whose file content differs from
 /// (or is missing) the recorded handoff, independent of new events. This is
 /// the retry path for a failed export and for worktrees reset after the fact.
-fn reconcile_handoff_files(store: &StateStore) -> Result<(), String> {
+/// It is also where finished tasks are closed on every tick, including ticks
+/// that carried no new events for the scope.
+fn reconcile_handoff_files(
+    store: &StateStore,
+    merged: &mut MergedRefCache,
+    now_ms: i64,
+) -> Result<(), String> {
     let mut first_error: Option<String> = None;
-    for state in store.work_states()? {
+    for mut state in store.work_states()? {
         let worktree = Path::new(&state.worktree);
+        // The handoff as recorded before this tick: a file that still matches
+        // it carries no agent edit.
+        let recorded = state.handoff_md.clone();
+        let base = parsed_memory(&recorded);
+        // Merged-ref evidence is read at most once per worktree per tick, and
+        // not at all when the memory holds no open task to close.
+        let refs = base
+            .as_ref()
+            .and_then(|memory| merged.for_memory(memory, worktree));
+        // The tick render: fold an agent-edited file first (stamping its edits
+        // with the current tick, not the state's last write time, so an old
+        // file cannot instantaneously age the tasks it adds), then close the
+        // finished tasks. Folding before refreshing means an unchanged line
+        // keeps its age, so a task closed by this tick is not resurrected by
+        // the stale copy still on disk. Task auto-close must not depend on new
+        // events arriving at all.
+        let render = |file_md: Option<&str>| match &base {
+            Some(memory) => {
+                let mut memory = memory.clone();
+                if let Some(file_md) = file_md.filter(|file_md| *file_md != recorded) {
+                    fold_file_edits(&mut memory, file_md, now_ms);
+                }
+                refresh_tasks(&mut memory, refs, now_ms);
+                render_handoff(&memory)
+            }
+            // A legacy free-form handoff has no memory to refresh yet; it is
+            // migrated by compaction when new events arrive.
+            None => recorded.clone(),
+        };
         if !worktree.is_dir() {
+            let refreshed = render(None);
+            if refreshed != recorded {
+                state.handoff_md = refreshed;
+                if let Err(error) = store.put_work_state(&state) {
+                    first_error.get_or_insert(error);
+                }
+            }
             continue;
         }
         let target = worktree.join("HANDOFF.md");
@@ -1154,39 +1393,30 @@ fn reconcile_handoff_files(store: &StateStore) -> Result<(), String> {
                 continue;
             }
         };
-        let needs_write = match current {
-            Some(content) => content != state.handoff_md,
+        let refreshed = match &current {
+            Some(content) => render(Some(content)),
+            None => render(None),
+        };
+        let needs_write = match &current {
+            Some(content) => *content != refreshed,
             // Do not materialize empty placeholder files in worktrees that
             // never produced a handoff.
-            None => !state.handoff_md.trim().is_empty(),
+            None => !recorded.trim().is_empty(),
         };
-        if !needs_write {
-            continue;
+        let mut handoff = refreshed;
+        let mut error: Option<String> = None;
+        if needs_write {
+            (handoff, error) = match write_handoff_guarded(worktree, render) {
+                GuardedWrite::Written(handoff) => (handoff, None),
+                GuardedWrite::Failed(handoff, error) => (handoff, Some(error)),
+                // The file kept changing: keep the recorded memory so the next
+                // tick retries instead of racing the agent edit.
+                GuardedWrite::Conflict => (recorded, Some(HANDOFF_CONFLICT_ERROR.to_owned())),
+            };
         }
-        // An agent edited HANDOFF.md: fold its rules/tasks back into the
-        // stored memory instead of overwriting the edit.
-        let result = write_handoff_guarded(worktree, |file_md| {
-            if let Some(file_md) = file_md
-                && let Some(mut memory) = parsed_memory(&state.handoff_md)
-                && fold_file_edits(&mut memory, file_md, state.updated_at)
-            {
-                render_handoff(&memory)
-            } else {
-                state.handoff_md.clone()
-            }
-        });
-        let (handoff, error) = match result {
-            GuardedWrite::Written(handoff) => (handoff, None),
-            GuardedWrite::Failed(handoff, error) => (handoff, Some(error)),
-            GuardedWrite::Conflict => (
-                state.handoff_md.clone(),
-                Some(HANDOFF_CONFLICT_ERROR.to_owned()),
-            ),
-        };
         if handoff != state.handoff_md {
-            let mut updated = state.clone();
-            updated.handoff_md = handoff;
-            if let Err(error) = store.put_work_state(&updated) {
+            state.handoff_md = handoff;
+            if let Err(error) = store.put_work_state(&state) {
                 first_error.get_or_insert(error);
             }
         }
@@ -2174,19 +2404,68 @@ mod tests {
         assert_eq!(items[0].id, "p133");
         assert_eq!(items[0].text, "Always run the full test suite.");
 
-        // A clipped copy adds nothing and must not shorten the item; a fuller
-        // restatement updates that same item instead of pushing a new id.
+        // A clipped copy adds nothing and must not shorten the item.
         let ops: Vec<ItemOp> = serde_json::from_str(
-            r#"[{"op":"add","id":"p136","text":"Always run the full test…"},{"op":"update","id":"p137","text":"Always run the full test suite before reporting green."}]"#,
+            r#"[{"op":"add","id":"p136","text":"Always run the full test…"}]"#,
         )
         .unwrap();
         apply_item_ops(&mut items, ops, "p");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "p133");
-        assert_eq!(
-            items[0].text,
-            "Always run the full test suite before reporting green."
-        );
+        assert_eq!(items[0].text, "Always run the full test suite.");
+    }
+
+    /// relay memory dedupe | Given a prefix-related but not clipped pair of
+    /// texts | When duplicate detection runs | Then neither swallows the
+    /// other, while an explicitly clipped copy still folds into its source.
+    #[test]
+    fn prefix_dedupe_only_merges_a_clipped_copy() {
+        assert!(!same_text("test", "test deployment"));
+        let mut items: Vec<RelayItem> = Vec::new();
+        let ops: Vec<ItemOp> = serde_json::from_str(
+            r#"[{"op":"add","id":"p1","text":"test"},{"op":"add","id":"p2","text":"test deployment"}]"#,
+        )
+        .unwrap();
+        apply_item_ops(&mut items, ops, "p");
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].text, "test");
+        assert_eq!(items[1].text, "test deployment");
+
+        assert!(same_text("test deploy…", "test deployment"));
+        assert!(same_text("test deploy...", "test deployment"));
+        let ops: Vec<ItemOp> =
+            serde_json::from_str(r#"[{"op":"add","id":"p3","text":"test deploy…"}]"#).unwrap();
+        apply_item_ops(&mut items, ops, "p");
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[1].id, "p2");
+        assert_eq!(items[1].text, "test deployment");
+    }
+
+    /// relay memory dedupe | Given an explicit-id update that restates another
+    /// item | When ops apply | Then the section holds one item with the
+    /// earliest id.
+    #[test]
+    fn explicit_update_restating_another_item_leaves_one_item() {
+        let mut memory = RelayMemory {
+            preferences: vec![
+                RelayItem {
+                    id: "p1".to_owned(),
+                    text: "Alpha".to_owned(),
+                },
+                RelayItem {
+                    id: "p2".to_owned(),
+                    text: "Beta".to_owned(),
+                },
+            ],
+            ..RelayMemory::default()
+        };
+        let ops: HandoffOps =
+            serde_json::from_str(r#"{"preferences":[{"op":"update","id":"p2","text":"alpha."}]}"#)
+                .unwrap();
+        apply_memory_ops(&mut memory, ops, 5);
+        assert_eq!(memory.preferences.len(), 1, "{:?}", memory.preferences);
+        assert_eq!(memory.preferences[0].id, "p1");
+        assert_eq!(memory.preferences[0].text, "Alpha");
     }
 
     /// relay task dedupe | Given the same task added under fresh ids | When
@@ -2205,6 +2484,22 @@ mod tests {
         assert_eq!(tasks[0].updated_ms, Some(5));
     }
 
+    /// relay file edits | Given a newer full line above an older clipped copy
+    /// of the same rule | When the file is folded back | Then one item keeps
+    /// the oldest id and the longer, non-truncated text.
+    #[test]
+    fn duplicate_file_lines_keep_the_oldest_id_and_fullest_text() {
+        let file = "## 规则\n\n### 公共原则/偏好规范\n\n- [p9] Always run the full test suite before reporting green.\n- [p1] Always run the full test…\n";
+        let mut memory = RelayMemory::default();
+        assert!(fold_file_edits(&mut memory, file, 7));
+        assert_eq!(memory.preferences.len(), 1, "{:?}", memory.preferences);
+        assert_eq!(memory.preferences[0].id, "p1");
+        assert_eq!(
+            memory.preferences[0].text,
+            "Always run the full test suite before reporting green."
+        );
+    }
+
     /// relay file edits | Given duplicate rule and task lines in HANDOFF.md |
     /// When the file is folded back | Then each duplicate collapses to the
     /// oldest id (the file is rendered newest-first).
@@ -2219,39 +2514,73 @@ mod tests {
         assert_eq!(memory.tasks[0].id, "t3");
     }
 
-    /// relay prompt | Given a memory with more items than the byte budget can
-    /// hold | When the compaction prompt is built | Then the memory part is
-    /// whole valid JSON carrying every item id and its full text.
+    /// relay prompt | Given 400 long rules that cannot fit the semantic
+    /// message budget | When the compaction prompt is built | Then it never
+    /// exceeds the limit, its memory JSON still parses, every item it carries
+    /// is whole, and the real summarizer request is accepted.
     #[test]
-    fn compaction_prompt_sends_the_whole_memory_json() {
+    fn compaction_prompt_stays_inside_the_semantic_message_limit() {
         let mut memory = memory_with_sections();
         for index in 0..400 {
             memory.preferences.push(RelayItem {
-                id: format!("p{index}"),
+                id: format!("p{}", 1000 + index),
                 text: format!("rule {index} {}", "x".repeat(400)),
             });
         }
-        let prompt = compaction_prompt(&memory, "", &[]);
+        let events: Vec<WorkEvent> = (0..5)
+            .map(|index| WorkEvent {
+                event_id: index as i64 + 1,
+                ts: index as i64,
+                project_ref: "proj".to_owned(),
+                worktree: "/repo".to_owned(),
+                provider: "test".to_owned(),
+                account: None,
+                kind: "edit".to_owned(),
+                summary: format!("change {index}"),
+                source_ref: format!("test:{index}"),
+            })
+            .collect();
+        let prompt = compaction_prompt(&memory, "", &events);
+        assert!(
+            prompt.len() <= SEMANTIC_PROMPT_MAX_BYTES,
+            "{}",
+            prompt.len()
+        );
         let json = prompt
             .split("Current memory JSON:\\n")
             .nth(1)
             .and_then(|rest| rest.split("\\n\\nLegacy context").next())
             .expect("memory JSON in the prompt");
         let parsed: RelayMemory = serde_json::from_str(json).expect("whole memory JSON");
-        assert_eq!(parsed.preferences.len(), 401);
-        // Every item id and its whole text reach the summarizer; a cut JSON
-        // would make it re-add the rules it could not see.
+
+        // Only the OLDEST whole items are left out of the prompt; what is
+        // included is complete, and the memory itself keeps everything.
+        assert!(!parsed.preferences.is_empty());
+        assert!(parsed.preferences.len() < memory.preferences.len());
+        assert_eq!(memory.preferences.len(), 401);
         for item in &parsed.preferences {
-            assert!(
-                prompt.contains(&format!("\"{}\"", item.id)),
-                "item id missing: {}",
-                item.id
-            );
-            assert!(item.text.ends_with(&"x".repeat(400)) || item.id == "p1");
+            let source = memory
+                .preferences
+                .iter()
+                .find(|source| source.id == item.id)
+                .expect("included item exists in memory");
+            assert_eq!(item.text, source.text, "item text was cut: {}", item.id);
+            assert!(!item.text.ends_with('…'), "clipped item: {}", item.id);
         }
-        // Items are never cut, so an oversized memory produces an oversized
-        // prompt rather than a mangled item list.
-        assert!(prompt.len() > SEMANTIC_PROMPT_MAX_BYTES);
+        // The newest rule survives and some events still ride along.
+        assert_eq!(
+            parsed.preferences.last().unwrap().id,
+            "p1399",
+            "newest rule must be kept"
+        );
+        for index in 0..5 {
+            assert!(prompt.contains(&format!("change {index}")), "event missing");
+        }
+        // The request the summarizer actually sends passes semantic validation.
+        assert!(crate::semantic::chat_request_valid(
+            &[summarizer_message(&prompt)],
+            &summarizer_options()
+        ));
     }
 
     /// relay tasks | Given a merged PR, a merged branch, a stale task, a done
@@ -2292,7 +2621,7 @@ mod tests {
             ],
             ..RelayMemory::default()
         };
-        refresh_tasks(&mut memory, &root, now);
+        refresh_tasks(&mut memory, Some(&merged_refs(&root)), now);
         let ids: Vec<&str> = memory.tasks.iter().map(|task| task.id.as_str()).collect();
         assert_eq!(ids, ["t4"]);
         // Closed work is not rendered either.
@@ -2306,12 +2635,172 @@ mod tests {
             tasks: vec![task("t6", "没有时间戳的旧任务", "todo", None)],
             ..RelayMemory::default()
         };
-        refresh_tasks(&mut legacy, &root, now);
+        let refs = merged_refs(&root);
+        refresh_tasks(&mut legacy, Some(&refs), now);
         assert_eq!(legacy.tasks.len(), 1);
         assert_eq!(legacy.tasks[0].updated_ms, Some(now));
         // ... and ages out only once it is genuinely stale.
-        refresh_tasks(&mut legacy, &root, now + (STALE_TASK_DAYS + 1) * DAY_MS);
+        refresh_tasks(
+            &mut legacy,
+            Some(&refs),
+            now + (STALE_TASK_DAYS + 1) * DAY_MS,
+        );
         assert!(legacy.tasks.is_empty());
+
+        // No open task closes nothing: git is not consulted at all.
+        let mut closed_only = RelayMemory {
+            tasks: vec![task("t7", "已完成的旧任务", "done", Some(now))],
+            ..RelayMemory::default()
+        };
+        let mut cache = MergedRefCache::default();
+        assert!(cache.for_memory(&closed_only, &root).is_none());
+        refresh_tasks(&mut closed_only, None, now);
+        assert!(closed_only.tasks.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// relay tasks | Given merge evidence in origin/main subjects and a merged
+    /// branch | When the task list is refreshed | Then only a trailing `(#N)`
+    /// or `Merge pull request #N` and a token-bounded branch name close a task.
+    #[test]
+    fn only_trailing_pr_and_token_bounded_branch_evidence_closes_tasks() {
+        let root = temp_dir("merged-evidence");
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("a.txt"), "a").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "fix: workaround for #123 (#456)"]);
+        fs::write(root.join("b.txt"), "b").unwrap();
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &["commit", "-qm", "Merge pull request #789 from x/fix-b"],
+        );
+        git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(
+            &root,
+            &["update-ref", "refs/remotes/origin/fix/foo", "HEAD"],
+        );
+
+        let refs = merged_refs(&root);
+        assert!(refs.prs.contains(&456), "{:?}", refs.prs);
+        assert!(refs.prs.contains(&789), "{:?}", refs.prs);
+        // "#123" is an issue reference inside the subject, not merge evidence.
+        assert!(!refs.prs.contains(&123), "{:?}", refs.prs);
+
+        let now = now_ms();
+        let task = |id: &str, text: &str| RelayTask {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            status: "doing".to_owned(),
+            updated_ms: Some(now),
+        };
+        let mut memory = RelayMemory {
+            tasks: vec![
+                task("t1", "跟进 issue #123 的根因"),
+                task("t2", "完成 PR #456 的合并验证"),
+                task("t3", "收尾 Merge pull request #789"),
+                task("t4", "收尾 fix/foo 分支"),
+                task("t5", "收尾 fix/foobar 分支"),
+            ],
+            ..RelayMemory::default()
+        };
+        refresh_tasks(&mut memory, Some(&refs), now);
+        let ids: Vec<&str> = memory.tasks.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(ids, ["t1", "t5"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// relay tasks | Given a stored handoff whose only task is stale and no
+    /// new work events | When a real tick runs | Then the task is closed and
+    /// HANDOFF.md is re-rendered without it.
+    #[test]
+    fn tick_closes_stale_tasks_without_new_events() {
+        let root = temp_dir("tick-autoclose");
+        fs::create_dir(root.join(".git")).unwrap();
+        let store = StateStore::open(":memory:").unwrap();
+        let now = now_ms();
+        let stale = now - (STALE_TASK_DAYS + 1) * DAY_MS;
+        let handoff = render_handoff(&RelayMemory {
+            tasks: vec![RelayTask {
+                id: "t1".to_owned(),
+                text: "30 天没动过的旧任务".to_owned(),
+                status: "todo".to_owned(),
+                updated_ms: Some(stale),
+            }],
+            ..RelayMemory::default()
+        });
+        fs::write(root.join("HANDOFF.md"), &handoff).unwrap();
+        store
+            .put_work_state(&WorkState {
+                project_ref: "proj".to_owned(),
+                worktree: root.to_string_lossy().into_owned(),
+                handoff_md: handoff.clone(),
+                updated_at: stale,
+                ..WorkState::default()
+            })
+            .unwrap();
+
+        // No appended events: `work_scopes_with_new_events` is empty, so only
+        // the per-tick task refresh can close this task.
+        assert!(store.work_scopes_with_new_events().unwrap().is_empty());
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), now).unwrap();
+
+        let state = store
+            .work_state("proj", root.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let memory = parsed_memory(&state.handoff_md).unwrap();
+        assert!(memory.tasks.is_empty(), "{:?}", memory.tasks);
+        let on_disk = fs::read_to_string(root.join("HANDOFF.md")).unwrap();
+        assert!(!on_disk.contains("[t1]"), "{on_disk}");
+        assert_eq!(on_disk, state.handoff_md);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// relay tasks | Given a state last written 31 days ago and an agent edit
+    /// that adds a task | When the next tick folds that edit | Then the new
+    /// task is stamped with the tick, not the old state time, and survives.
+    #[test]
+    fn folded_file_edit_uses_the_tick_time_not_the_stale_state_time() {
+        let root = temp_dir("reconcile-clock");
+        fs::create_dir(root.join(".git")).unwrap();
+        let store = StateStore::open(":memory:").unwrap();
+        let now = now_ms();
+        let stale = now - (STALE_TASK_DAYS + 1) * DAY_MS;
+        let handoff = render_handoff(&RelayMemory::default());
+        store
+            .put_work_state(&WorkState {
+                project_ref: "proj".to_owned(),
+                worktree: root.to_string_lossy().into_owned(),
+                handoff_md: handoff.clone(),
+                updated_at: stale,
+                ..WorkState::default()
+            })
+            .unwrap();
+        // An agent adds a task to the file long after the state was written.
+        fs::write(
+            root.join("HANDOFF.md"),
+            handoff.replace("## 任务清单\n", "## 任务清单\n\n- [t9] (todo) 新接的任务\n"),
+        )
+        .unwrap();
+
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), now).unwrap();
+        let state = store
+            .work_state("proj", root.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let memory = parsed_memory(&state.handoff_md).unwrap();
+        assert_eq!(memory.tasks.len(), 1, "{:?}", memory.tasks);
+        assert_eq!(memory.tasks[0].text, "新接的任务");
+        assert_eq!(memory.tasks[0].updated_ms, Some(now));
+
+        // A later tick keeps it: the fold no longer back-dates the task.
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), now + 1000).unwrap();
+        let state = store
+            .work_state("proj", root.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed_memory(&state.handoff_md).unwrap().tasks.len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
