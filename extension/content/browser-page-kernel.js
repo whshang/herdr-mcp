@@ -267,12 +267,21 @@
     if (!doc) return { ok: false, error: "document_unavailable" };
 
     const candidates = doc.querySelectorAll(OBSERVABLE_CONTROL_SELECTOR);
+    // Expose table refs even when a long navigation consumes the normal limit.
+    function* tableFirstCandidates() {
+      for (const el of candidates) {
+        if (el.tagName?.toLowerCase() === "table") yield el;
+      }
+      for (const el of candidates) {
+        if (el.tagName?.toLowerCase() !== "table") yield el;
+      }
+    }
 
     const elements = [];
     let elementIndex = 0;
     let hoverTargets = 0;
 
-    for (const el of candidates) {
+    for (const el of tableFirstCandidates()) {
       if (elements.length >= MAX_ELEMENTS) break;
       const tag = (el.tagName || "").toLowerCase();
 
