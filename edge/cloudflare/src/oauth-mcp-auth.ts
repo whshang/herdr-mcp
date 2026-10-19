@@ -37,6 +37,7 @@ export type McpAuthResult =
       deviceId?: string;
       webchatControlGrants?: readonly AuthWebChatControlGrant[];
       pageAssistGrants?: readonly AuthPageAssistGrant[];
+      platformAccount?: string | null;
     }
   | { ok: false; code: "mcp_auth_failed" };
 
@@ -48,6 +49,7 @@ export interface OAuthMcpAuthDeps {
     grantGeneration?: number;
     principalType?: string;
     deviceId?: string;
+    platformAccount?: string | null;
     webchatControlGrants?: readonly AuthWebChatControlGrant[];
     pageAssistGrants?: readonly AuthPageAssistGrant[];
   }>;
@@ -199,6 +201,7 @@ export async function authenticateMcpRequest(
           ...(edge.connectorId
             ? { connectorId: edge.connectorId, grantGeneration: edge.grantGeneration }
             : {}),
+          ...(edge.platformAccount ? { platformAccount: edge.platformAccount } : {}),
           ...(edge.principalType ? { principalType: edge.principalType } : {}),
           ...(edge.deviceId ? { deviceId: edge.deviceId } : {}),
           ...(edge.webchatControlGrants ? { webchatControlGrants: edge.webchatControlGrants } : {}),

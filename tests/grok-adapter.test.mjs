@@ -278,6 +278,20 @@ test("Grok adapter hashes same-origin session userId before returning native ide
   assert.equal(await h.adapter.getAccountNativeIdentity(), null);
 });
 
+test("user sees a Grok account label | Given a session userId and email | When the account is observed | Then the native identity stays the userId hash and the email is display metadata", async () => {
+  const h = harness();
+  const userId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const expected = createHash("sha256").update(userId).digest("hex");
+  h.setSessionPayload({
+    status: "authenticated",
+    session: { userId, user: { email: "Whshang@gmail.com" } },
+  });
+  assert.equal(JSON.stringify(await h.adapter.getAccountObservation()), JSON.stringify({
+    nativeIdentity: `grok-account-sha256:${expected}`,
+    email: "whshang@gmail.com",
+  }));
+});
+
 test("user gets one exact Grok settled result | Given one accepted user turn | When the matching assistant result finishes | Then settlement links the exact user and assistant refs", () => {
   const h = harness();
   const userContainer = element({ attrs: { id: "response-11111111-2222-4333-8444-555555555555" } });

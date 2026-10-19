@@ -403,11 +403,15 @@ function renderPageContext(state) {
 
   pageContextCard.hidden = false;
   pageContextTitle.textContent = siteLabel(info.site);
-  pageContextMeta.textContent = info.is_site_home
+  const accountDisplay = typeof pageContext.response?.accountDisplay === "string"
+    ? pageContext.response.accountDisplay
+    : "";
+  const statusText = info.is_site_home
     ? t("cc_page_site_home_meta")
     : bindings.length
       ? t("cc_page_binding_count", { count: bindings.length })
       : t("cc_page_unbound");
+  pageContextMeta.textContent = accountDisplay ? `${accountDisplay} · ${statusText}` : statusText;
   const identity = [];
   if (info.project_id) identity.push(t("cc_page_project_id", { value: shortIdentity(info.project_id, 48) }));
   if (info.conversation_id) identity.push(t("cc_page_conversation_id", { value: shortIdentity(info.conversation_id, 48) }));
