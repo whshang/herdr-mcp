@@ -79,8 +79,18 @@ pub(crate) fn event_for_tool_call(
     // high-entropy redaction can mangle long path tokens, which would drop
     // the event. project_ref/worktree are topology-derived, not user text.
     let scope = resolve_scope(arguments, snapshot)?;
-    let arguments = &sanitized;
     let kind = classify(tool_name, arguments);
+    // Project scoping: a command that `cd`s into another project acts on that
+    // project, so the caller's workspace must not inherit its work (e.g. a
+    // herdr-mcp session running `cd ~/Documents/novos-cockpit && ls`).
+    if kind == "command"
+        && let Some(command) = arguments.get("command").and_then(Value::as_str)
+        && let Some(target) = command_cd_target(command)
+        && !target.starts_with(&scope.worktree)
+    {
+        return None;
+    }
+    let arguments = &sanitized;
     let summary = summarize(tool_name, arguments);
     Some(NewWorkEvent {
         ts: now_ms(),
@@ -204,6 +214,26 @@ fn compact_value(value: &Value) -> String {
 struct WorkScope {
     project_ref: String,
     worktree: PathBuf,
+}
+
+/// The first `cd` target of a shell command line (`cd x && ls`) when it is an
+/// absolute or `~/`-relative directory; `None` for relative/unknown targets.
+fn command_cd_target(command: &str) -> Option<PathBuf> {
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token.trim_start_matches(['&', ';', '|', '(']) != "cd" {
+            continue;
+        }
+        let target = tokens
+            .next()?
+            .trim_matches(['\'', '"', ';', '&', '|', '(', ')']);
+        let path = match target.strip_prefix("~/") {
+            Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+            None => PathBuf::from(target),
+        };
+        return path.is_absolute().then_some(path);
+    }
+    None
 }
 
 fn resolve_scope(arguments: &Value, snapshot: &Value) -> Option<WorkScope> {
@@ -598,6 +628,41 @@ mod tests {
             .is_none()
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user command into another project | Given herdr-mcp as the resolved
+    /// project | When herdr_exec `cd`s into a different project directory |
+    /// Then the call is not attributed to herdr-mcp, while a `cd` inside the
+    /// project root keeps its event.
+    #[test]
+    fn user_command_cd_into_another_project_is_not_attributed() {
+        let elsewhere = event_for_tool_call(
+            "herdr_exec",
+            &json!({
+                "project_root": "/repo",
+                "command": "cd ~/Documents/novos-cockpit && ls"
+            }),
+            &test_snapshot(),
+        );
+        assert!(
+            elsewhere.is_none(),
+            "a command in another project must not be journaled for /repo"
+        );
+        let inside = event_for_tool_call(
+            "herdr_exec",
+            &json!({"project_root": "/repo", "command": "cd /repo/src && ls"}),
+            &test_snapshot(),
+        )
+        .expect("a cd inside the project root keeps the event");
+        assert_eq!(inside.worktree, "/repo");
+        // Without a `cd`, the resolved workspace stays authoritative.
+        let plain = event_for_tool_call(
+            "herdr_exec",
+            &json!({"project_root": "/repo", "command": "cargo test"}),
+            &test_snapshot(),
+        )
+        .expect("a plain command keeps the event");
+        assert_eq!(plain.worktree, "/repo");
     }
 
     /// herdr_exec targeting a workspace by LABEL | Given a workspace whose
