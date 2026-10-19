@@ -219,8 +219,9 @@ struct WorkScope {
 /// split into simple commands on the shell operators that start a new one
 /// (`;`, `&&`, `||`, `|`, newlines and a leading `(`); each simple command is
 /// then judged by its own `cd` (also spelled `command cd`, `builtin cd` or
-/// `pushd`): the cwd starts at the scope root, a relative target joins the
-/// running cwd, `~/` expands $HOME, a `--` separator and surrounding quotes are
+/// `pushd`): the cwd starts at the scope root, option words in front of the
+/// verb or of the directory (`-P`, `-L`, `-q`, `--`) are skipped, a relative
+/// target joins the running cwd, `~/` expands $HOME and surrounding quotes are
 /// dropped, and `.`/`..` are resolved lexically. A command that ends up outside
 /// the root acts on another project (e.g. a herdr-mcp session running
 /// `cd ~/Documents/novos-cockpit && ls`), so the caller's workspace must not
@@ -233,27 +234,35 @@ fn command_leaves_scope(command: &str, root: &Path) -> bool {
     for simple in split_simple_commands(command) {
         let mut words = simple.split_whitespace().map(unquote_word);
         // `command cd` / `builtin cd` run the same `cd`; `pushd` moves the cwd
-        // too, so all three are judged like a plain `cd`.
-        let mut verb = words.next();
+        // too, so all three are judged like a plain `cd`. Option words in front
+        // of the verb (`command -- cd`) are skipped rather than ending the
+        // search.
+        let mut verb = words.find(|word| !word.starts_with('-'));
         while matches!(verb, Some("command" | "builtin")) {
-            verb = words.next();
+            verb = words.find(|word| !word.starts_with('-'));
         }
         let pushd = match verb {
             Some("cd") => false,
             Some("pushd") => true,
             _ => continue,
         };
-        // `cd -- dir` / `cd --`: the separator is not the target; no target at
-        // all (bare `cd`) is `$HOME`. `pushd` without a directory swaps in a
-        // dir-stack entry nobody can resolve statically, and `pushd +N`/`-N`
-        // address the stack itself.
+        // `cd -P dir` / `pushd -q dir`: option words come before the directory,
+        // so they are skipped instead of being read as the target (and `--` is
+        // just one of them). A lone `-` is not an option but `$OLDPWD` (the
+        // previous directory, unknowable here), so it stays visible for
+        // cd_target_path to reject. `cd` with no target left (bare `cd`,
+        // `cd --`) is `$HOME`. `pushd` without a directory swaps in a dir-stack
+        // entry nobody can resolve statically, and `pushd +N`/`-N` address the
+        // stack itself.
         let target = if pushd {
-            let Some(target) = words.next().filter(|word| !word.starts_with('+')) else {
+            let Some(target) = words.find(|word| !word.starts_with(['-', '+'])) else {
                 return true;
             };
             target
         } else {
-            words.find(|word| *word != "--").unwrap_or("~")
+            words
+                .find(|word| *word == "-" || !word.starts_with('-'))
+                .unwrap_or("~")
         };
         let Some(next) = cd_target_path(target, &cwd) else {
             return true;
@@ -947,6 +956,50 @@ mod tests {
             let captured = event(inside).unwrap_or_else(|| panic!("must keep: {inside}"));
             assert_eq!(captured.worktree, "/repo");
         }
+    }
+
+    /// user command with cd options before the directory | Given /repo as the
+    /// resolved project | When `cd`/`pushd` is spelled with option words
+    /// (`-P`, `-L`, `-q`, `--`) in front of the directory, possibly behind
+    /// `command --` / `builtin` | Then the directory after the options is the
+    /// judged target, so an outside target still drops the event and an inside
+    /// one is kept; `cd -` stays unresolvable.
+    #[test]
+    fn user_command_cd_option_forms_move_the_target_past_the_options() {
+        let event = |command: &str| {
+            event_for_tool_call(
+                "herdr_exec",
+                &json!({"project_root": "/repo", "command": command}),
+                &test_snapshot(),
+            )
+        };
+        for outside in [
+            "cd -P /other",
+            "pushd -q /other",
+            "command -- cd /other",
+            "builtin cd -L /other",
+            "cd -",
+            "cd -P -",
+            "cd -LP /other && ls",
+        ] {
+            assert!(event(outside).is_none(), "must drop: {outside}");
+        }
+        for inside in [
+            "cd -P /repo/src",
+            "cd -- /repo/src",
+            "pushd -q /repo/src && ls",
+            "command -- cd /repo/src",
+            "builtin cd -L /repo/src && ls",
+        ] {
+            let captured = event(inside).unwrap_or_else(|| panic!("must keep: {inside}"));
+            assert_eq!(captured.worktree, "/repo");
+        }
+        // `cd -` is $OLDPWD, not $HOME: even with $HOME as the scope root it
+        // stays outside scope, while the bare `cd` form resolves to $HOME.
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set in tests"));
+        assert!(command_leaves_scope("cd -", &home));
+        assert!(command_leaves_scope("cd -P -", &home));
+        assert!(!command_leaves_scope("cd", &home));
     }
 
     /// user command with a bare cd | Given /repo as the resolved project |
