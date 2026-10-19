@@ -2723,7 +2723,7 @@ test("user keeps provider-specific Project resolution inside the adapter | Given
   assert.doesNotMatch(projectIdentitySource, /ADAPTER\.name/);
 });
 
-test("user rejects a stale other-account ChatGPT conversation before Browser Registry registration", async () => {
+test("user rejects cross-account registration | Given the current account cannot read an exact ChatGPT conversation | When registration starts | Then no stale account-session association is published", async () => {
   const url = "https://chatgpt.com/g/g-p-6ab246bef27c81918744ac4fc330dac2/c/6ab474db-ced0-83ec-9a37-cd6b4e183d96";
   const denied = registrationHarness(url, { provider: "chatgpt", routeAuthorized: false });
   const deniedAttempt = denied.register("account-switched");
@@ -5251,7 +5251,7 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
   `)({ crypto: webcrypto, ...ctx });
 }
 
-test("user refuses dispatch before mutation when provider baseline is unreadable", async () => {
+test("user refuses dispatch without a provider baseline | Given the prior user-message ID cannot be read | When submit starts | Then no provider mutation is attempted", async () => {
   const act = browserSubmitAcceptanceHarness({
     currentConvKey: "https://chatgpt.com/c/current",
     snapshots: [{ ok: false }, { ok: false }],
