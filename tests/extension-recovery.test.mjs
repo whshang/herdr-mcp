@@ -547,13 +547,31 @@ test("reply timeout, recovery attempt, reload gate, and rollover remain fail-clo
   const policy = { ...recovery.DEFAULT_RECOVERY_POLICY, replyTimeoutMs: 1000, reloadCooldownMs: 5000 };
 
   let record = health.markReplyWaiting(health.createConversationHealth("c"), 1000);
-  assert.equal(recovery.classifyReplyTimeout(record, 1999, 1000).state, "reply_waiting");
-  record = recovery.classifyReplyTimeout(record, 2000, 1000);
+  // Only a proven terminal provider fact may escalate, so the timeout check is
+  // exercised with the same evidence the page passes at runtime.
+  const settledEmpty = { dom: {}, server: { ok: true, currentNodeRole: "assistant", messageId: "a1", text: "", finished: true, userMessageId: "u1", userCreatedAt: 1000 } };
+  assert.equal(recovery.classifyReplyTimeout(record, 1999, 1000, settledEmpty).state, "reply_waiting");
+  record = recovery.classifyReplyTimeout(record, 2000, 1000, settledEmpty);
   assert.equal(record.state, "reply_suspect");
-  assert.equal(recovery.shouldSendRecovery(record, policy, 2000), true);
+  assert.equal(recovery.shouldSendRecovery(record, policy, 2000, settledEmpty), true);
   record = recovery.markRecoverySent(record, 2001);
   assert.equal(record.recovery_attempt, 1);
-  assert.equal(recovery.shouldSendRecovery(record, policy, 3000), false);
+  assert.equal(recovery.shouldSendRecovery(record, policy, 3000, settledEmpty), false);
+  // Only the correlation check may reject this one: the tip IS a terminal empty
+  // assistant with a message id and a carrying user message id, but the user
+  // message is far outside the submit window, so it belongs to another turn.
+  assert.equal(recovery.recoveryProbeAllowed({
+    dom: { assistantText: "" },
+    server: {
+      ok: true,
+      currentNodeRole: "assistant",
+      messageId: "assistant-old",
+      text: "",
+      finished: true,
+      userMessageId: "user-old",
+      userCreatedAt: 1000 + 300000,
+    },
+  }, 1000), null, "a terminal tip whose user message is outside the submit window must not authorize a probe");
 
   const safe = {
     composerBusy: false,
@@ -623,6 +641,144 @@ test("observed assistant progress cancels a stale ChatGPT reply timeout", () => 
   assert.equal(record.state, "healthy");
   assert.equal(record.last_assistant_progress_at, 1500);
   assert.equal(recovery.classifyReplyTimeout(record, 120000, 1000).state, "healthy");
+});
+
+test("user keeps a live ChatGPT turn untouched | Given the provider still reports the assistant turn as generating while the page exposes no streaming or tool DOM | When the reply-timeout policy runs past the 30s mark | Then no reply timeout is suspected and no recovery-check user turn is authorized", () => {
+  const context = loadClassicExtensionScripts();
+  const health = context.H2W_CONVERSATION_HEALTH;
+  const recovery = context.H2W_RECOVERY_CONTROLLER;
+  const policy = { ...recovery.DEFAULT_RECOVERY_POLICY };
+  const submittedAt = 1000000;
+  const at = submittedAt + policy.replyTimeoutMs + 1000;
+  const record = health.markReplyWaiting(health.createConversationHealth("chatgpt-project-conversation"), submittedAt);
+
+  // Observed evidence at the 30s mark. The page exposes none of the DOM
+  // affordances the old policy used to call the turn live, which is exactly the
+  // window that produced the false "reply timeout suspected" HUD state, but the
+  // provider snapshot proves the current turn is still being generated.
+  const evidence = {
+    dom: { streaming: false, toolRunning: false, composerBusy: false, permissionCardActive: false },
+    server: {
+      ok: true,
+      currentNodeRole: "assistant",
+      messageId: "assistant-live-1",
+      status: "in_progress",
+      finished: false,
+      updatedAt: at - 2000,
+    },
+  };
+
+  const classified = recovery.classifyReplyTimeout(record, at, policy.replyTimeoutMs, evidence);
+  // Observable harm first: this authorization is what submitted a real
+  // "Herdr recovery check" user turn into the live conversation.
+  assert.equal(
+    recovery.shouldSendRecovery(classified, policy, at, evidence),
+    false,
+    "no recovery-check user turn may be authorized while the provider reports the assistant turn still generating",
+  );
+  assert.notEqual(
+    classified.state,
+    "reply_suspect",
+    "a still-generating assistant turn must not be labelled a reply timeout",
+  );
+
+  // A reply_suspect record persisted by an older build must not authorize a
+  // probe either: live evidence is re-checked at send time, not only once.
+  const staleSuspect = { ...record, state: "reply_suspect", suspect_reason: "reply_timeout" };
+  assert.equal(
+    recovery.shouldSendRecovery(staleSuspect, policy, at, evidence),
+    false,
+    "a persisted suspect state must not override live provider evidence",
+  );
+  const demoted = recovery.classifyReplyTimeout(staleSuspect, at, policy.replyTimeoutMs, evidence);
+  assert.notEqual(demoted.state, "reply_suspect", "a suspect label must be cleared once the turn is proven live");
+  assert.equal(demoted.state, "reply_waiting");
+});
+
+test("user recovers a ChatGPT reply that never produced output | Given the provider closed the turn without any assistant output and the page shows none either | When the reply-timeout policy runs past the 30s mark | Then exactly one recovery-check user turn is authorized and unknown, in-progress, and quiet user-node states all fail closed", () => {
+  const context = loadClassicExtensionScripts();
+  const health = context.H2W_CONVERSATION_HEALTH;
+  const recovery = context.H2W_RECOVERY_CONTROLLER;
+  const policy = { ...recovery.DEFAULT_RECOVERY_POLICY };
+  const submittedAt = 2000000;
+  const at = submittedAt + policy.replyTimeoutMs + 1000;
+  const record = health.markReplyWaiting(health.createConversationHealth("chatgpt-project-conversation"), submittedAt);
+  const quietDom = { streaming: false, toolRunning: false, composerBusy: false, permissionCardActive: false };
+
+  // Genuine failure: the provider closed the turn and produced no output in
+  // either the provider snapshot or the page.
+  const settledEmpty = {
+    dom: { ...quietDom, assistantText: "" },
+    server: {
+      ok: true,
+      currentNodeRole: "assistant",
+      messageId: "assistant-1",
+      text: "",
+      finished: true,
+      updatedAt: at - 1000,
+      userMessageId: "user-1",
+      userCreatedAt: submittedAt + 800,
+    },
+  };
+  const classified = recovery.classifyReplyTimeout(record, at, policy.replyTimeoutMs, settledEmpty);
+  assert.equal(classified.state, "reply_suspect");
+  assert.equal(recovery.shouldSendRecovery(classified, policy, at, settledEmpty), true);
+  const sent = recovery.markRecoverySent(classified, at + 1);
+  assert.equal(recovery.shouldSendRecovery(sent, policy, at + 2, settledEmpty), false, "a probe is never resent");
+
+  // Provider evidence may only be fetched while a reply is genuinely pending.
+  // A settled turn keeps last_user_submit_at, so the ended record and Auto-off
+  // both have to fail closed before any authenticated snapshot request.
+  assert.equal(
+    recovery.shouldObserveRecoveryEvidence(classified, { automationEnabled: true, now: at }),
+    true,
+    "a pending, due reply is what the evidence fetch exists for",
+  );
+  const endedTurn = health.markTurnEnded(classified, at + 2);
+  assert.equal(endedTurn.last_user_submit_at, submittedAt, "markTurnEnded keeps the submit timestamp");
+  assert.equal(
+    recovery.shouldObserveRecoveryEvidence(endedTurn, { automationEnabled: true, now: at + 10 * 60 * 1000 }),
+    false,
+    "an ended turn must not keep fetching the provider snapshot",
+  );
+  assert.equal(
+    recovery.shouldObserveRecoveryEvidence(classified, { automationEnabled: false, now: at }),
+    false,
+    "Auto off must not fetch the provider snapshot",
+  );
+
+  // Satisfied output already reached the user: a probe would create a needless
+  // second user turn.
+  for (const finishedWithOutput of [
+    { dom: { ...quietDom, assistantText: "already delivered answer" }, server: { ok: true, messageId: "assistant-1", text: "already delivered answer", finished: true } },
+    { dom: { ...quietDom, assistantText: "" }, server: { ok: true, messageId: "assistant-1", text: "already delivered answer", finished: true } },
+  ]) {
+    assert.equal(recovery.shouldSendRecovery(classified, policy, at, finishedWithOutput), false);
+  }
+
+  // Fail closed: a quiet page whose provider turn is unreadable or still open
+  // may be nothing but long model reasoning, so it never authorizes a turn.
+  const failClosed = [
+    { dom: quietDom, server: { ok: false, reason: "fetch-failed" } },
+    { dom: quietDom, server: { ok: true, currentNodeRole: "user", messageId: null, finished: null, userMessageId: "user-1" } },
+    { dom: quietDom, server: { ok: true, currentNodeRole: "assistant", messageId: "assistant-live-1", status: "in_progress", finished: false } },
+    { dom: quietDom, server: { ok: true, currentNodeRole: "tool", messageId: "assistant-live-1", finished: null } },
+    { dom: { ...quietDom, toolRunning: true }, server: { ok: true, messageId: null, finished: null } },
+    // A terminal OLDER assistant turn must never be read as this turn's outcome:
+    // the snapshot walks back from the provider tip, so its assistant message is
+    // still the previous turn while the current one has produced nothing.
+    { dom: quietDom, server: { ok: true, currentNodeRole: "user", messageId: "assistant-old", text: "", finished: true } },
+    { dom: quietDom, server: { ok: true, currentNodeRole: "tool", messageId: "assistant-old", text: "", finished: true } },
+    // A terminal assistant at the tip whose carrying user message is NOT the
+    // submitted turn (failed/uncertain Send) must not authorize a second turn.
+    { dom: quietDom, server: { ok: true, currentNodeRole: "assistant", messageId: "assistant-old", text: "", finished: true, userMessageId: "user-old", userCreatedAt: submittedAt - 600000 } },
+    { dom: quietDom, server: { ok: true, currentNodeRole: "assistant", messageId: "assistant-old", text: "", finished: true, userMessageId: "user-old" } },
+    null,
+  ];
+  for (const evidence of failClosed) {
+    assert.equal(recovery.shouldSendRecovery(classified, policy, at, evidence), false,
+      `evidence ${JSON.stringify(evidence)} must not authorize a recovery-check turn`);
+  }
 });
 
 test("freshness classification distinguishes synced, server-ahead, and server-stalled views", () => {
