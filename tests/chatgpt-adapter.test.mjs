@@ -150,7 +150,7 @@ function matchesSimple(element, selector) {
   return true;
 }
 
-function loadAdapterWithDocument(document) {
+function loadAdapterWithDocument(document, fetch = undefined) {
   let adapter;
   class BaseAdapter {
     elementVisible(element) { return element?.visible === true; }
@@ -159,6 +159,10 @@ function loadAdapterWithDocument(document) {
     BaseAdapter,
     registerH2WAdapter: (registered) => { adapter = registered; },
     document,
+    fetch,
+    AbortController,
+    setTimeout,
+    clearTimeout,
     location: { origin: "https://chatgpt.com", pathname: "/c/current" },
   }, { filename: "chatgpt.js" });
   return adapter;
@@ -268,4 +272,22 @@ test("user never accepts plain text as an App identity | Given an accepted turn 
   assert.deepEqual(identityOf("user-with-path"), [{ name: "herdr", path: "connectors/herdr" }]);
   assert.deepEqual(identityOf("user-dup"), [], "an ambiguous carrier of the same id fails closed");
   assert.deepEqual(identityOf(""), []);
+});
+
+
+test("user rejects mismatched ChatGPT login identities | Given conflicting auth endpoints | When account registration reads identity | Then the previous account is not reused", async () => {
+  const payloads = {
+    "/backend-api/me": { id: "previous-user", email: "previous@example.com" },
+    "/api/auth/session": { user: { id: "current-user", email: "current@example.com" } },
+  };
+  const fetch = async (url) => ({ ok: true, json: async () => payloads[url] });
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const conflict = await adapter.getAccountObservation();
+  assert.equal(conflict.nativeIdentity, null);
+  assert.equal(conflict.email, null);
+
+  payloads["/api/auth/session"].user.id = "previous-user";
+  const consistent = await adapter.getAccountObservation();
+  assert.equal(consistent.nativeIdentity, "previous-user");
+  assert.equal(consistent.email, "previous@example.com");
 });
