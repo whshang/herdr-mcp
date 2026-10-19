@@ -2910,6 +2910,8 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     delivered: false,
     submitted: false,
     blocked: false,
+    serverAssistantProgressOnly: false,
+    baselineAvailable: true,
   };
 
   const act = new Function("ctx", `
@@ -2939,7 +2941,7 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     const currentHerdrRequiredApps = () => ["herdr"];
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
-    const isTurnInProgress = () => ctx.delivered && ctx.submitted;
+    const isTurnInProgress = () => ctx.delivered && ctx.submitted && !ctx.serverAssistantProgressOnly;
     const runtimeAlive = () => true;
     const Date = { now: () => ctx.now };
     const wait = async () => { ctx.now += 1000; };
@@ -2948,9 +2950,11 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
       ctx.snapshotTimeouts.push(timeoutMs);
       return ctx.delivered
         ? (ctx.submitted
-          ? { ok: true, userMessageId: "new-user-message", userText: "next turn" }
-          : { ok: true, userMessageId: "prior-user-message", userText: "prior turn" })
-        : { ok: false };
+          ? { ok: true, userMessageId: "new-user-message", userText: "next turn", messageId: "new-assistant" }
+          : { ok: true, userMessageId: "prior-user-message", userText: "prior turn", messageId: "prior-assistant" })
+        : (ctx.baselineAvailable
+          ? { ok: true, userMessageId: "prior-user-message", userText: "prior turn", messageId: "prior-assistant" }
+          : { ok: false });
     };
     const performWake = async (args) => {
       ctx.wakeArgs.push(args);
@@ -3005,6 +3009,7 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
 
   ctx.delivered = true;
   ctx.submitted = false;
+  ctx.serverAssistantProgressOnly = true;
   const late = await act({
     operation: "herdr_mcp.browser_dispatch.submit",
     expected_generation: 17,
@@ -3013,6 +3018,7 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   assert.equal(late.command_accepted, true);
   assert.equal(late.accepted_message_observed, true, "exact provider ref upgrades late acceptance");
   assert.equal(late.result?.accepted_user_message_ref, "new-user-message");
+  assert.equal(late.generation_status_observed, true, "exact new provider assistant ID proves generation progress");
   assert.equal(late.generation_owner, 17);
   assert.equal(ctx.wakeArgs.length, 3, "each simulated intent invokes one provider submit only");
 
@@ -3030,6 +3036,18 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   assert.equal(ctx.submitted, false, "latched uncertainty must never dispatch again");
   assert.equal(ctx.snapshotTimeouts.length, snapshotsBeforeLatchedAttempt + 1,
     "a different dispatch must not claim readback for a prior latched submit");
+
+  ctx.blocked = false;
+  ctx.baselineAvailable = false;
+  const sendsBefore = ctx.wakeArgs.length;
+  const missingBaseline = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    params: { message: "next turn", required_apps: [] },
+  });
+  assert.equal(missingBaseline.rejected, true, "an unavailable exact provider baseline must refuse the mutation");
+  assert.equal(missingBaseline.result?.error, "browser_dispatch_baseline_unavailable");
+  assert.equal(ctx.wakeArgs.length, sendsBefore, "a missing provider baseline must not submit to ChatGPT");
 });
 
 test("user waits through transient fresh ChatGPT composer busy without a second submit | Given the new Project tab is scoped but still hydrating | When composer readiness changes from busy to idle | Then the same actuation submits once and keeps its reservation", async () => {
@@ -5115,7 +5133,7 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
   `)({ crypto: webcrypto, ...ctx });
 }
 
-test("user dispatch stays uncertain | Given the before snapshot fails and the latest user id is unchanged | When dispatch.submit acknowledges | Then the previous user message is not recorded", async () => {
+test("user refuses dispatch before mutation when provider baseline is unreadable", async () => {
   const act = browserSubmitAcceptanceHarness({
     currentConvKey: "https://chatgpt.com/c/current",
     snapshots: [{ ok: false }, { ok: false }],
@@ -5130,11 +5148,11 @@ test("user dispatch stays uncertain | Given the before snapshot fails and the la
     params: { message: "next turn", required_apps: [] },
   });
 
-  assert.equal(result.command_accepted, true);
+  assert.equal(result.command_accepted, false);
+  assert.equal(result.rejected, true);
   assert.equal(result.accepted_message_observed, false);
-  assert.equal(result.message_baseline_advanced, false);
   assert.equal(result.generation_owner, null);
-  assert.equal(result.result, undefined, "no provider identity may be recorded without a before snapshot or an exact new turn");
+  assert.equal(result.result?.error, "browser_dispatch_baseline_unavailable");
 });
 
 test("user dispatch does not adopt a short overlapping turn | Given a submitted prompt that contains 'ok' | When a new user turn is only 'ok' | Then delivery stays uncertain and no accepted user message is recorded", async () => {

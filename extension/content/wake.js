@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.219";
+const H2W_CONTENT_VERSION = "0.1.221";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2636,6 +2636,11 @@ function normalizeHerdrMentionAlias(value) {
       : { ok: false };
     const beforeDom = providerMessageSnapshot("user");
     const beforeAssistant = providerMessageSnapshot("assistant");
+    // Dispatch needs a provider-owned pre-submit user ID to prove advancement.
+    // Refuse before touching the composer when that baseline is unavailable.
+    if (exactChatGptDispatchIdentity && (!beforeServer?.ok || !beforeServer.userMessageId)) {
+      return browserRejectedEvidence(evidence, "browser_dispatch_baseline_unavailable");
+    }
     const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
     const result = await performWake({
       template: message,
@@ -2820,9 +2825,16 @@ function normalizeHerdrMentionAlias(value) {
         afterAssistant.text
         && afterAssistant.text !== beforeAssistant.text,
       );
+      const providerAssistantAdvanced = Boolean(
+        conversationStillExpected && serverAdvanced
+        && typeof beforeServer?.messageId === "string" && beforeServer.messageId
+        && typeof afterServer?.messageId === "string" && afterServer.messageId
+        && afterServer.messageId !== beforeServer.messageId,
+      );
       evidence.generation_status_observed = Boolean(
         isTurnInProgress()
-        || assistantAdvanced,
+        || assistantAdvanced
+        || providerAssistantAdvanced,
       );
       if (evidence.accepted_message_observed
           && (creatingSession || evidence.generation_status_observed)
