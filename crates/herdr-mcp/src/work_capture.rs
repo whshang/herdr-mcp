@@ -3,7 +3,7 @@ use crate::state_store::work_journal::{NewWorkEvent, WORK_SUMMARY_MAX_CHARS, cli
 use regex::Regex;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -80,12 +80,14 @@ pub(crate) fn event_for_tool_call(
     // the event. project_ref/worktree are topology-derived, not user text.
     let scope = resolve_scope(arguments, snapshot)?;
     let kind = classify(tool_name, arguments);
-    // Project scoping: a command that `cd`s into another project acts on that
-    // project, so the caller's workspace must not inherit its work (e.g. a
-    // herdr-mcp session running `cd ~/Documents/novos-cockpit && ls`).
+    // Project scoping: a command that changes directory (`cd`, `pushd`,
+    // `popd`) may act on another project, so its cwd is unknown and the
+    // caller's workspace must not inherit its work (e.g. a herdr-mcp session
+    // running `cd ~/Documents/novos-cockpit && ls`). Fail closed instead of
+    // resolving the target.
     if kind == "command"
         && let Some(command) = arguments.get("command").and_then(Value::as_str)
-        && command_leaves_scope(command, &scope.worktree)
+        && command_changes_directory(command)
     {
         return None;
     }
@@ -215,188 +217,20 @@ struct WorkScope {
     worktree: PathBuf,
 }
 
-/// Does this command line ever run outside the scope root? The line is first
-/// split into simple commands on the shell operators that start a new one
-/// (`;`, `&&`, `||`, `|`, newlines and a leading `(`); each simple command is
-/// then judged by its own `cd` (also spelled `command cd`, `builtin cd` or
-/// `pushd`): the cwd starts at the scope root, option words in front of the
-/// verb or of the directory (`-P`, `-L`, `-q`, `--`) are skipped, a relative
-/// target joins the running cwd, `~/` expands $HOME and surrounding quotes are
-/// dropped, and `.`/`..` are resolved lexically. A command that ends up outside
-/// the root acts on another project (e.g. a herdr-mcp session running
-/// `cd ~/Documents/novos-cockpit && ls`), so the caller's workspace must not
-/// inherit its work. A bare `cd` means `$HOME`. Unresolvable targets (`cd -`,
-/// `~other`, `$VAR`, `$(...)`, a glob, a `pushd` dir-stack entry) count as
-/// outside: never guess a project.
-fn command_leaves_scope(command: &str, root: &Path) -> bool {
-    let root = normalize_lexically(root);
-    let mut cwd = root.clone();
-    for simple in split_simple_commands(command) {
-        let mut words = simple.split_whitespace().map(unquote_word);
-        // `command cd` / `builtin cd` run the same `cd`; `pushd` moves the cwd
-        // too, so all three are judged like a plain `cd`. Option words in front
-        // of the verb (`command -- cd`) are skipped rather than ending the
-        // search.
-        let mut verb = words.find(|word| !word.starts_with('-'));
-        while matches!(verb, Some("command" | "builtin")) {
-            verb = words.find(|word| !word.starts_with('-'));
-        }
-        let pushd = match verb {
-            Some("cd") => false,
-            Some("pushd") => true,
-            _ => continue,
-        };
-        // `cd -P dir` / `pushd -q dir`: option words come before the directory,
-        // so they are skipped instead of being read as the target (and `--` is
-        // just one of them). A lone `-` is not an option but `$OLDPWD` (the
-        // previous directory, unknowable here), so it stays visible for
-        // cd_target_path to reject. `cd` with no target left (bare `cd`,
-        // `cd --`) is `$HOME`. `pushd` without a directory swaps in a dir-stack
-        // entry nobody can resolve statically, and `pushd +N`/`-N` address the
-        // stack itself.
-        let target = if pushd {
-            let Some(target) = words.find(|word| !word.starts_with(['-', '+'])) else {
-                return true;
-            };
-            target
-        } else {
-            words
-                .find(|word| *word == "-" || !word.starts_with('-'))
-                .unwrap_or("~")
-        };
-        let Some(next) = cd_target_path(target, &cwd) else {
-            return true;
-        };
-        if !next.starts_with(&root) {
-            return true;
-        }
-        cwd = next;
-    }
-    false
-}
-
-/// Split a command line into simple commands on `;`, `&`, `|`, `(` and
-/// newlines, ignoring separators inside quotes. Enough of a shell scanner to
-/// keep `cd /repo;cd /other` from hiding its second `cd` behind the first
-/// target; a `(` only separates when it opens a subshell at a command start,
-/// so `$(...)` command substitution stays one word.
-fn split_simple_commands(command: &str) -> Vec<String> {
-    let mut commands = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for ch in command.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' && quote != Some('\'') {
-            escaped = true;
-            current.push(ch);
-            continue;
-        }
-        if let Some(active) = quote {
-            if ch == active {
-                quote = None;
-            }
-            current.push(ch);
-            continue;
-        }
-        match ch {
-            '\'' | '"' => {
-                quote = Some(ch);
-                current.push(ch);
-            }
-            ';' | '&' | '|' | '\n' | '\r' => commands.push(std::mem::take(&mut current)),
-            '(' if current.trim().is_empty() => current.clear(),
-            _ => current.push(ch),
-        }
-    }
-    commands.push(current);
-    commands.retain(|simple| !simple.trim().is_empty());
-    commands
-}
-
-/// Drop the surrounding shell quoting (and a closing subshell paren) from one
-/// word.
-fn unquote_word(word: &str) -> &str {
-    word.trim_matches(['\'', '"', '(', ')'])
-}
-
-fn cd_target_path(target: &str, cwd: &Path) -> Option<PathBuf> {
-    if target == "-" {
-        return None;
-    }
-    let path = if let Some(rest) = home_prefix_suffix(target) {
-        // A leading `$HOME`/`${HOME}` is the one variable a static judge can
-        // expand; anything shell-only behind it stays unresolvable.
-        if has_shell_expansion(rest) {
-            return None;
-        }
-        let home = PathBuf::from(std::env::var_os("HOME")?);
-        if rest.is_empty() {
-            home
-        } else {
-            home.join(rest.trim_start_matches('/'))
-        }
-    } else if has_shell_expansion(target) {
-        // `$VAR`, `${...}`, backticks/`$(...)` and globs only have a value
-        // inside a running shell: outside scope rather than a guessed project.
-        return None;
-    } else if target == "~" {
-        PathBuf::from(std::env::var_os("HOME")?)
-    } else if let Some(rest) = target.strip_prefix("~/") {
-        PathBuf::from(std::env::var_os("HOME")?).join(rest)
-    } else if target.starts_with('~') {
-        // Another user's home: not resolvable here.
-        return None;
-    } else {
-        PathBuf::from(target)
-    };
-    Some(if path.is_absolute() {
-        normalize_lexically(&path)
-    } else {
-        normalize_lexically(&cwd.join(path))
-    })
-}
-
-/// The suffix after a leading `$HOME`/`${HOME}` (empty for the bare form).
-/// The variable name must end at a path boundary, so `$HOMEDIR` stays unknown.
-fn home_prefix_suffix(target: &str) -> Option<&str> {
-    for prefix in ["${HOME}", "$HOME"] {
-        if let Some(rest) = target.strip_prefix(prefix)
-            && (rest.is_empty() || rest.starts_with('/'))
-        {
-            return Some(rest);
-        }
-    }
-    None
-}
-
-/// Constructs whose value is only known to a running shell: variables,
-/// command substitution (backticks and `$(...)`) and globs.
-fn has_shell_expansion(target: &str) -> bool {
-    target.contains(['$', '`', '*', '?', '['])
-}
-
-/// Resolve `.`/`..` without touching the filesystem (the target may not exist
-/// yet, and a symlinked checkout must still compare by its lexical path).
-fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // Keep a leading `..` of an already-relative path.
-                if !normalized.pop() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
+/// Does this command line change the working directory? Any `cd`, `pushd` or
+/// `popd` word means the captured cwd is unknown, so the caller must not
+/// attribute the work to its own project. A word is a maximal run of
+/// non-whitespace, non-operator characters: shell separators and quoting
+/// (`;`, `&`, `|`, `(`, `)`, backtick, `'`, `"`, newline) split words too, so
+/// `x;cd /x`, `(cd /x)` and `FOO=1 cd /x` all count. No target is resolved:
+/// the directory a command ends up in is only knowable to a running shell, and
+/// guessing it is what let another project's work leak into the scope root.
+fn command_changes_directory(command: &str) -> bool {
+    command
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '`' | '\'' | '"')
+        })
+        .any(|word| matches!(word, "cd" | "pushd" | "popd"))
 }
 
 fn resolve_scope(arguments: &Value, snapshot: &Value) -> Option<WorkScope> {
@@ -793,47 +627,12 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// user command into another project | Given herdr-mcp as the resolved
-    /// project | When herdr_exec `cd`s into a different project directory |
-    /// Then the call is not attributed to herdr-mcp, while a `cd` inside the
-    /// project root keeps its event.
+    /// user command that changes directory | Given /repo as the resolved
+    /// project | When the command contains a `cd`/`pushd`/`popd` word
+    /// anywhere, whatever the target, the separators or the quoting | Then
+    /// the cwd is unknown and the call is not attributed to /repo.
     #[test]
-    fn user_command_cd_into_another_project_is_not_attributed() {
-        let elsewhere = event_for_tool_call(
-            "herdr_exec",
-            &json!({
-                "project_root": "/repo",
-                "command": "cd ~/Documents/novos-cockpit && ls"
-            }),
-            &test_snapshot(),
-        );
-        assert!(
-            elsewhere.is_none(),
-            "a command in another project must not be journaled for /repo"
-        );
-        let inside = event_for_tool_call(
-            "herdr_exec",
-            &json!({"project_root": "/repo", "command": "cd /repo/src && ls"}),
-            &test_snapshot(),
-        )
-        .expect("a cd inside the project root keeps the event");
-        assert_eq!(inside.worktree, "/repo");
-        // Without a `cd`, the resolved workspace stays authoritative.
-        let plain = event_for_tool_call(
-            "herdr_exec",
-            &json!({"project_root": "/repo", "command": "cargo test"}),
-            &test_snapshot(),
-        )
-        .expect("a plain command keeps the event");
-        assert_eq!(plain.worktree, "/repo");
-    }
-
-    /// user command with several cd steps | Given /repo as the resolved
-    /// project | When every `cd` in the command is evaluated in order | Then a
-    /// command that ever leaves /repo is dropped while one that stays inside
-    /// is captured, including relative and lexically normalized targets.
-    #[test]
-    fn user_command_cd_chain_is_judged_by_its_final_directory() {
+    fn user_command_that_changes_directory_is_not_attributed() {
         let event = |command: &str| {
             event_for_tool_call(
                 "herdr_exec",
@@ -841,193 +640,38 @@ mod tests {
                 &test_snapshot(),
             )
         };
-        for outside in [
-            "cd ../other && ls",
-            "cd /repo/../other && ls",
-            "cd /repo && cd /other && ls",
-            "cd -- ../other && ls",
-            "cd - && ls",
+        for changed in [
+            "cd /repo/src && ls",
+            "cd ~/Documents/novos-cockpit && ls",
+            "FOO=1 cd /x",
+            "if true; then cd /x; fi",
+            "x;cd /x",
+            "pushd /x",
+            "popd",
+            // Quoting and operators split words, so these are still `cd`.
+            "echo \"cd /x\"",
+            "(cd /x)",
+            "cd",
         ] {
-            assert!(event(outside).is_none(), "must drop: {outside}");
+            assert!(event(changed).is_none(), "must drop: {changed}");
         }
-        for inside in [
-            "cd src && ls",
-            "cd /repo/src",
-            "cd /repo/./src/../tests && ls",
-            "cd -- /repo/src && ls",
-        ] {
-            let captured = event(inside).unwrap_or_else(|| panic!("must keep: {inside}"));
+    }
+
+    /// user command without a directory change | Given /repo as the resolved
+    /// project | When the command mentions no `cd`/`pushd`/`popd` word, even
+    /// with a path argument or a `-C` chdir flag | Then the resolved
+    /// workspace stays authoritative and the call is journaled.
+    #[test]
+    fn user_command_without_directory_change_keeps_its_event() {
+        for command in ["ls /repo/src", "echo abcd", "git -C /repo status"] {
+            let captured = event_for_tool_call(
+                "herdr_exec",
+                &json!({"project_root": "/repo", "command": command}),
+                &test_snapshot(),
+            )
+            .unwrap_or_else(|| panic!("must keep: {command}"));
             assert_eq!(captured.worktree, "/repo");
         }
-        // Quoted targets resolve the same way.
-        assert!(event("cd '../other' && ls").is_none());
-        assert!(event("cd '/repo/src' && ls").is_some());
-    }
-
-    /// user command with concatenated cd steps | Given /repo as the resolved
-    /// project | When the shell operators or a newline are the only separator
-    /// between `cd`s (or the `cd` sits in a subshell) | Then every simple
-    /// command is judged, so a jump to another directory still drops the
-    /// event while separators inside quotes stay inert.
-    #[test]
-    fn user_command_cd_without_surrounding_spaces_is_judged_per_simple_command() {
-        let event = |command: &str| {
-            event_for_tool_call(
-                "herdr_exec",
-                &json!({"project_root": "/repo", "command": command}),
-                &test_snapshot(),
-            )
-        };
-        for outside in [
-            "cd /repo;cd /other && ls",
-            "cd /repo&&cd /other",
-            "cd /repo||cd /other",
-            "cd /repo|cd /other",
-            "cd /repo&&cd /other&&ls",
-            "(cd /other)",
-            "cd /repo; (cd /other); ls",
-            "cd\ncd /other",
-            "cd /repo;cd ../other",
-        ] {
-            assert!(event(outside).is_none(), "must drop: {outside}");
-        }
-        for inside in [
-            "cd /repo/;cd /repo/src && ls",
-            "cd src&&cd tests",
-            "(cd /repo/src)",
-            "echo 'cd /other'",
-            "echo \"cd /other; ls\"",
-        ] {
-            let captured = event(inside).unwrap_or_else(|| panic!("must keep: {inside}"));
-            assert_eq!(captured.worktree, "/repo");
-        }
-    }
-
-    /// user command with a dynamically computed cd target | Given /repo as
-    /// the resolved project and a target that only a running shell can
-    /// evaluate | When the command changes directory through `$VAR`, a
-    /// command substitution, a glob or another user's home, or spells the
-    /// change as `command cd` / `builtin cd` / `pushd` | Then the event is
-    /// dropped, except for a leading `$HOME`/`${HOME}` which expands to HOME
-    /// exactly like `~`.
-    #[test]
-    fn user_dynamic_cd_target_is_outside_scope_but_home_still_expands() {
-        let event = |command: &str| {
-            event_for_tool_call(
-                "herdr_exec",
-                &json!({"project_root": "/repo", "command": command}),
-                &test_snapshot(),
-            )
-        };
-        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set in tests"));
-        let home_inside = home.starts_with("/repo");
-        for expanded in [
-            "cd \"$HOME\" && ls",
-            "cd ${HOME} && ls",
-            "cd $HOME/src && ls",
-        ] {
-            assert_eq!(
-                event(expanded).is_some(),
-                home_inside,
-                "home form: {expanded}"
-            );
-        }
-        for outside in [
-            "cd $OTHER_REPO && ls",
-            "cd ${OTHER_REPO} && ls",
-            "cd $HOME/$OTHER_REPO && ls",
-            "cd \"$(git rev-parse --show-toplevel)\" && ls",
-            "cd `git rev-parse --show-toplevel` && ls",
-            "cd /repo/*/src && ls",
-            "cd ~other/src && ls",
-            "command cd /other && ls",
-            "builtin cd /other && ls",
-            "pushd /other && ls",
-        ] {
-            assert!(event(outside).is_none(), "must drop: {outside}");
-        }
-        // A statically known target keeps working through the builtin forms.
-        for inside in [
-            "cd /repo/src",
-            "command cd /repo/src && ls",
-            "builtin cd /repo/src && ls",
-            "pushd /repo/src && ls",
-        ] {
-            let captured = event(inside).unwrap_or_else(|| panic!("must keep: {inside}"));
-            assert_eq!(captured.worktree, "/repo");
-        }
-    }
-
-    /// user command with cd options before the directory | Given /repo as the
-    /// resolved project | When `cd`/`pushd` is spelled with option words
-    /// (`-P`, `-L`, `-q`, `--`) in front of the directory, possibly behind
-    /// `command --` / `builtin` | Then the directory after the options is the
-    /// judged target, so an outside target still drops the event and an inside
-    /// one is kept; `cd -` stays unresolvable.
-    #[test]
-    fn user_command_cd_option_forms_move_the_target_past_the_options() {
-        let event = |command: &str| {
-            event_for_tool_call(
-                "herdr_exec",
-                &json!({"project_root": "/repo", "command": command}),
-                &test_snapshot(),
-            )
-        };
-        for outside in [
-            "cd -P /other",
-            "pushd -q /other",
-            "command -- cd /other",
-            "builtin cd -L /other",
-            "cd -",
-            "cd -P -",
-            "cd -LP /other && ls",
-        ] {
-            assert!(event(outside).is_none(), "must drop: {outside}");
-        }
-        for inside in [
-            "cd -P /repo/src",
-            "cd -- /repo/src",
-            "pushd -q /repo/src && ls",
-            "command -- cd /repo/src",
-            "builtin cd -L /repo/src && ls",
-        ] {
-            let captured = event(inside).unwrap_or_else(|| panic!("must keep: {inside}"));
-            assert_eq!(captured.worktree, "/repo");
-        }
-        // `cd -` is $OLDPWD, not $HOME: even with $HOME as the scope root it
-        // stays outside scope, while the bare `cd` form resolves to $HOME.
-        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set in tests"));
-        assert!(command_leaves_scope("cd -", &home));
-        assert!(command_leaves_scope("cd -P -", &home));
-        assert!(!command_leaves_scope("cd", &home));
-    }
-
-    /// user command with a bare cd | Given /repo as the resolved project |
-    /// When the command only says `cd` | Then it is treated as `cd $HOME`, so
-    /// the event is dropped unless $HOME itself is inside the project root.
-    #[test]
-    fn user_command_bare_cd_resolves_to_home() {
-        let event = |command: &str| {
-            event_for_tool_call(
-                "herdr_exec",
-                &json!({"project_root": "/repo", "command": command}),
-                &test_snapshot(),
-            )
-        };
-        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set in tests"));
-        let home_inside = home.starts_with("/repo");
-        for bare in ["cd", "cd && ls", "cd;ls", "cd\nls", "cd --; ls"] {
-            assert_eq!(event(bare).is_some(), home_inside, "bare form: {bare}");
-        }
-        for explicit in ["cd ~", "cd ~ && ls"] {
-            assert_eq!(
-                event(explicit).is_some(),
-                home_inside,
-                "explicit form: {explicit}"
-            );
-        }
-        // A bare `cd` and `cd ~` are the same destination.
-        assert_eq!(event("cd").is_some(), event("cd ~").is_some());
     }
 
     /// herdr_exec targeting a workspace by LABEL | Given a workspace whose
