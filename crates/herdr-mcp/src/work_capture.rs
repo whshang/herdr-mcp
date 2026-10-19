@@ -215,40 +215,89 @@ struct WorkScope {
     worktree: PathBuf,
 }
 
-/// Does this command line ever run outside the scope root? Every `cd` is
-/// evaluated in order: the cwd starts at the scope root, a relative target
-/// joins the running cwd, `~/` expands $HOME, a `--` separator and surrounding
-/// quotes are dropped, and `.`/`..` are resolved lexically. A command that
-/// ends up outside the root acts on another project (e.g. a herdr-mcp session
-/// running `cd ~/Documents/novos-cockpit && ls`), so the caller's workspace
-/// must not inherit its work. Unresolvable targets (`cd -`, `~other`) count as
-/// outside: never guess a project.
+/// Does this command line ever run outside the scope root? The line is first
+/// split into simple commands on the shell operators that start a new one
+/// (`;`, `&&`, `||`, `|`, newlines and a leading `(`); each simple command is
+/// then judged by its own `cd`: the cwd starts at the scope root, a relative
+/// target joins the running cwd, `~/` expands $HOME, a `--` separator and
+/// surrounding quotes are dropped, and `.`/`..` are resolved lexically. A
+/// command that ends up outside the root acts on another project (e.g. a
+/// herdr-mcp session running `cd ~/Documents/novos-cockpit && ls`), so the
+/// caller's workspace must not inherit its work. A bare `cd` means `$HOME`.
+/// Unresolvable targets (`cd -`, `~other`) count as outside: never guess a
+/// project.
 fn command_leaves_scope(command: &str, root: &Path) -> bool {
     let root = normalize_lexically(root);
     let mut cwd = root.clone();
-    let mut pending_cd = false;
-    for raw in command.split_whitespace() {
-        if pending_cd {
-            let target = raw.trim_matches(['\'', '"', ';', '&', '|', '(', ')']);
-            // `cd -- dir` / `cd --`: the separator is not the target.
-            if target.is_empty() || target == "--" {
-                continue;
-            }
-            pending_cd = false;
-            let Some(next) = cd_target_path(target, &cwd) else {
-                return true;
-            };
-            if !next.starts_with(&root) {
-                return true;
-            }
-            cwd = next;
+    for simple in split_simple_commands(command) {
+        let mut words = simple.split_whitespace();
+        if words.next().map(unquote_word) != Some("cd") {
             continue;
         }
-        if raw.trim_start_matches(['&', ';', '|', '(']) == "cd" {
-            pending_cd = true;
+        // `cd -- dir` / `cd --`: the separator is not the target; no target at
+        // all (bare `cd`) is `$HOME`.
+        let target = words
+            .find(|word| *word != "--")
+            .map(unquote_word)
+            .unwrap_or("~");
+        let Some(next) = cd_target_path(target, &cwd) else {
+            return true;
+        };
+        if !next.starts_with(&root) {
+            return true;
         }
+        cwd = next;
     }
     false
+}
+
+/// Split a command line into simple commands on `;`, `&`, `|`, `(` and
+/// newlines, ignoring separators inside quotes. Enough of a shell scanner to
+/// keep `cd /repo;cd /other` from hiding its second `cd` behind the first
+/// target; a `(` only separates when it opens a subshell at a command start,
+/// so `$(...)` command substitution stays one word.
+fn split_simple_commands(command: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            current.push(ch);
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            current.push(ch);
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            ';' | '&' | '|' | '\n' | '\r' => commands.push(std::mem::take(&mut current)),
+            '(' if current.trim().is_empty() => current.clear(),
+            _ => current.push(ch),
+        }
+    }
+    commands.push(current);
+    commands.retain(|simple| !simple.trim().is_empty());
+    commands
+}
+
+/// Drop the surrounding shell quoting (and a closing subshell paren) from one
+/// word.
+fn unquote_word(word: &str) -> &str {
+    word.trim_matches(['\'', '"', '(', ')'])
 }
 
 fn cd_target_path(target: &str, cwd: &Path) -> Option<PathBuf> {
@@ -754,6 +803,73 @@ mod tests {
         // Quoted targets resolve the same way.
         assert!(event("cd '../other' && ls").is_none());
         assert!(event("cd '/repo/src' && ls").is_some());
+    }
+
+    /// user command with concatenated cd steps | Given /repo as the resolved
+    /// project | When the shell operators or a newline are the only separator
+    /// between `cd`s (or the `cd` sits in a subshell) | Then every simple
+    /// command is judged, so a jump to another directory still drops the
+    /// event while separators inside quotes stay inert.
+    #[test]
+    fn user_command_cd_without_surrounding_spaces_is_judged_per_simple_command() {
+        let event = |command: &str| {
+            event_for_tool_call(
+                "herdr_exec",
+                &json!({"project_root": "/repo", "command": command}),
+                &test_snapshot(),
+            )
+        };
+        for outside in [
+            "cd /repo;cd /other && ls",
+            "cd /repo&&cd /other",
+            "cd /repo||cd /other",
+            "cd /repo|cd /other",
+            "cd /repo&&cd /other&&ls",
+            "(cd /other)",
+            "cd /repo; (cd /other); ls",
+            "cd\ncd /other",
+            "cd /repo;cd ../other",
+        ] {
+            assert!(event(outside).is_none(), "must drop: {outside}");
+        }
+        for inside in [
+            "cd /repo/;cd /repo/src && ls",
+            "cd src&&cd tests",
+            "(cd /repo/src)",
+            "echo 'cd /other'",
+            "echo \"cd /other; ls\"",
+        ] {
+            let captured = event(inside).unwrap_or_else(|| panic!("must keep: {inside}"));
+            assert_eq!(captured.worktree, "/repo");
+        }
+    }
+
+    /// user command with a bare cd | Given /repo as the resolved project |
+    /// When the command only says `cd` | Then it is treated as `cd $HOME`, so
+    /// the event is dropped unless $HOME itself is inside the project root.
+    #[test]
+    fn user_command_bare_cd_resolves_to_home() {
+        let event = |command: &str| {
+            event_for_tool_call(
+                "herdr_exec",
+                &json!({"project_root": "/repo", "command": command}),
+                &test_snapshot(),
+            )
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set in tests"));
+        let home_inside = home.starts_with("/repo");
+        for bare in ["cd", "cd && ls", "cd;ls", "cd\nls", "cd --; ls"] {
+            assert_eq!(event(bare).is_some(), home_inside, "bare form: {bare}");
+        }
+        for explicit in ["cd ~", "cd ~ && ls"] {
+            assert_eq!(
+                event(explicit).is_some(),
+                home_inside,
+                "explicit form: {explicit}"
+            );
+        }
+        // A bare `cd` and `cd ~` are the same destination.
+        assert_eq!(event("cd").is_some(), event("cd ~").is_some());
     }
 
     /// herdr_exec targeting a workspace by LABEL | Given a workspace whose

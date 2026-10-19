@@ -567,8 +567,20 @@ fn is_clipped(text: &str) -> bool {
     trimmed.ends_with('…') || trimmed.ends_with("...")
 }
 
+/// Should `candidate` replace `current` when both are copies of the same
+/// text? A text without a truncation marker always beats a clipped copy of
+/// itself (the marker is lost content, not extra content), and among equally
+/// clipped/full text the longer one wins — judged on the normalized key, so a
+/// duplicate that only differs in spacing or punctuation cannot win.
+fn prefers_replacement(current: &str, candidate: &str) -> bool {
+    if is_clipped(current) != is_clipped(candidate) {
+        return is_clipped(current);
+    }
+    normalize_text(candidate).len() > normalize_text(current).len()
+}
+
 /// Final dedupe pass over one section: ops (and a file fold) can leave the
-/// same text under two ids. Keep the earliest id and the longest (never a
+/// same text under two ids. Keep the earliest id and the fuller (never a
 /// clipped) text, so one rule is never listed twice.
 fn dedupe_items(items: &mut Vec<RelayItem>) {
     let mut deduped: Vec<RelayItem> = Vec::with_capacity(items.len());
@@ -578,7 +590,7 @@ fn dedupe_items(items: &mut Vec<RelayItem>) {
             .find(|kept| same_text(&kept.text, &item.text))
         {
             Some(kept) => {
-                if normalize_text(&item.text).len() > normalize_text(&kept.text).len() {
+                if prefers_replacement(&kept.text, &item.text) {
                     kept.text = item.text;
                 }
             }
@@ -589,7 +601,9 @@ fn dedupe_items(items: &mut Vec<RelayItem>) {
 }
 
 /// Same as [`dedupe_items`] for tasks: the merged task keeps the earliest id,
-/// the fuller text and the freshest touch stamp.
+/// the fuller text, the freshest touch stamp and the status that stamp
+/// belongs to (a duplicate marked done must stay done and get closed, so a
+/// tie goes to the duplicate seen later).
 fn dedupe_tasks(tasks: &mut Vec<RelayTask>) {
     let mut deduped: Vec<RelayTask> = Vec::with_capacity(tasks.len());
     for task in tasks.drain(..) {
@@ -598,8 +612,11 @@ fn dedupe_tasks(tasks: &mut Vec<RelayTask>) {
             .find(|kept| same_text(&kept.text, &task.text))
         {
             Some(kept) => {
-                if normalize_text(&task.text).len() > normalize_text(&kept.text).len() {
+                if prefers_replacement(&kept.text, &task.text) {
                     kept.text = task.text;
+                }
+                if task.updated_ms.unwrap_or(i64::MIN) >= kept.updated_ms.unwrap_or(i64::MIN) {
+                    kept.status = task.status;
                 }
                 kept.updated_ms = kept.updated_ms.max(task.updated_ms);
             }
@@ -721,9 +738,7 @@ fn apply_item_ops(items: &mut Vec<RelayItem>, ops: Vec<ItemOp>, prefix: &str) {
                 // The summarizer cannot see items it was not shown, so it
                 // re-adds them under fresh ids; without this the file doubles.
                 if let Some(existing) = items.iter_mut().find(|item| same_text(&item.text, &text)) {
-                    // "Longer" is judged on the normalized key, so a duplicate
-                    // that only differs in spacing cannot win.
-                    if normalize_text(&text).len() > normalize_text(&existing.text).len() {
+                    if prefers_replacement(&existing.text, &text) {
                         existing.text = text;
                     }
                     continue;
@@ -768,11 +783,11 @@ fn apply_task_ops(tasks: &mut Vec<RelayTask>, ops: Vec<TaskOp>, now_ms: i64) {
                 });
                 if let Some(index) = target {
                     let existing = &mut tasks[index];
-                    // A duplicate only wins when it is the longer text; an
-                    // explicit update is taken as given.
+                    // A duplicate only wins when it is the fuller text (a
+                    // non-clipped, longer copy); an explicit update is taken
+                    // as given.
                     if let Some(text) = text
-                        && (explicit.is_some()
-                            || normalize_text(&text).len() > normalize_text(&existing.text).len())
+                        && (explicit.is_some() || prefers_replacement(&existing.text, &text))
                     {
                         existing.text = text;
                     }
@@ -2413,6 +2428,106 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "p133");
         assert_eq!(items[0].text, "Always run the full test suite.");
+    }
+
+    /// relay memory dedupe | Given an older rule that ends in a truncation
+    /// marker and a newer full copy of it | When dedupe merges the pair | Then
+    /// the text without the marker is kept even though the clipped copy is not
+    /// shorter.
+    #[test]
+    fn user_rule_dedupe_keeps_the_untruncated_text() {
+        let mut items = vec![
+            RelayItem {
+                id: "p1".to_owned(),
+                text: "Always run the full test…".to_owned(),
+            },
+            RelayItem {
+                id: "p2".to_owned(),
+                text: "Always run the full test.".to_owned(),
+            },
+        ];
+        dedupe_items(&mut items);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].id, "p1");
+        assert_eq!(items[0].text, "Always run the full test.");
+
+        // Same choice on the write path (a later add restating the clipped id)
+        // and for tasks.
+        let mut written: Vec<RelayItem> = Vec::new();
+        let ops: Vec<ItemOp> = serde_json::from_str(
+            r#"[{"op":"add","id":"p1","text":"Always run the full test…"},{"op":"add","id":"p2","text":"Always run the full test."}]"#,
+        )
+        .unwrap();
+        apply_item_ops(&mut written, ops, "p");
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert_eq!(written[0].text, "Always run the full test.");
+
+        let mut tasks = vec![
+            RelayTask {
+                id: "t1".to_owned(),
+                text: "Always run the full test…".to_owned(),
+                status: "doing".to_owned(),
+                updated_ms: Some(3),
+            },
+            RelayTask {
+                id: "t2".to_owned(),
+                text: "Always run the full test.".to_owned(),
+                status: "doing".to_owned(),
+                updated_ms: Some(9),
+            },
+        ];
+        dedupe_tasks(&mut tasks);
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0].text, "Always run the full test.");
+    }
+
+    /// relay task dedupe | Given the same task under two ids where the newer
+    /// copy is done | When ops apply, dedupe runs and finished tasks are
+    /// refreshed away | Then the merged task keeps the newer status and no
+    /// open duplicate of it survives.
+    #[test]
+    fn user_task_dedupe_keeps_the_newest_status() {
+        let mut memory = RelayMemory::default();
+        let add: HandoffOps = serde_json::from_str(
+            r#"{"tasks":[{"op":"add","id":"t1","text":"Alpha","status":"todo"},{"op":"add","id":"t2","text":"Beta","status":"doing"}]}"#,
+        )
+        .unwrap();
+        apply_memory_ops(&mut memory, add, 5);
+        assert_eq!(memory.tasks.len(), 2, "{:?}", memory.tasks);
+
+        // An explicit update of the newer id restates t1's text as done.
+        let update: HandoffOps = serde_json::from_str(
+            r#"{"tasks":[{"op":"update","id":"t2","text":"Alpha","status":"done"}]}"#,
+        )
+        .unwrap();
+        apply_memory_ops(&mut memory, update, 9);
+        assert_eq!(memory.tasks.len(), 1, "{:?}", memory.tasks);
+        assert_eq!(memory.tasks[0].id, "t1");
+        assert_eq!(memory.tasks[0].status, "done");
+        assert_eq!(memory.tasks[0].updated_ms, Some(9));
+
+        refresh_tasks(&mut memory, None, 10);
+        assert!(
+            !memory.tasks.iter().any(|task| task.status != "done"),
+            "no open duplicate survives: {:?}",
+            memory.tasks
+        );
+    }
+
+    /// relay file edits | Given two lines for one task with conflicting statuses
+    /// | When the file is folded back | Then the task keeps the status of the
+    /// copy that was rendered higher up (the newest line).
+    #[test]
+    fn user_task_file_fold_keeps_the_newest_status() {
+        let file =
+            "## 任务清单\n\n- [t9] (done) 补齐 HANDOFF 去重\n- [t3] (todo) 补齐 HANDOFF 去重\n";
+        let mut memory = RelayMemory::default();
+        assert!(fold_file_edits(&mut memory, file, 7));
+        assert_eq!(memory.tasks.len(), 1, "{:?}", memory.tasks);
+        assert_eq!(memory.tasks[0].id, "t3");
+        assert_eq!(memory.tasks[0].status, "done");
+        refresh_tasks(&mut memory, None, 8);
+        assert!(memory.tasks.is_empty(), "{:?}", memory.tasks);
     }
 
     /// relay memory dedupe | Given a prefix-related but not clipped pair of
