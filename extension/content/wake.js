@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.212";
+const H2W_CONTENT_VERSION = "0.1.217";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2643,13 +2643,18 @@ function normalizeHerdrMentionAlias(value) {
       expectedConvKey: command?.expectedConvKey ?? null,
       requiredApps,
     });
-    if (!result?.ok) {
-      if (boundedChatGptSubmit && result?.uncertain === true) {
-        evidence.command_accepted = true;
-        evidence.resource_available = true;
-        evidence.canonical_url_observed = providerCanonicalConversationObserved();
-        return evidence;
-      }
+    // A previously latched uncertain submit cannot be attributed to this
+    // dispatch. Preserve uncertainty without attempting another provider send.
+    if (boundedChatGptSubmit && result?.blocked === "submit-uncertain") {
+      evidence.command_accepted = true;
+      evidence.resource_available = true;
+      evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      return evidence;
+    }
+    // A one-shot send may succeed after its immediate UI acknowledgement
+    // expires. Use existing bounded exact-message readback without resubmitting.
+    const submitUnconfirmed = boundedChatGptSubmit && result?.uncertain === true;
+    if (!result?.ok && !submitUnconfirmed) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }

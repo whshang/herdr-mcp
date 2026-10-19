@@ -3031,6 +3031,9 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     wakeArgs: [],
     reservationWrites: [],
     reservationRemovals: 0,
+    now: 0,
+    delivered: false,
+    submitted: false,
   };
 
   const act = new Function("ctx", `
@@ -3060,19 +3063,29 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     const currentHerdrRequiredApps = () => ["herdr"];
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
-    const isTurnInProgress = () => false;
+    const isTurnInProgress = () => ctx.delivered && ctx.submitted;
     const runtimeAlive = () => true;
-    const wait = async () => {};
+    const Date = { now: () => ctx.now };
+    const wait = async () => { ctx.now += 1000; };
     const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
     const fetchChatGptConversationSnapshot = async (timeoutMs) => {
       ctx.snapshotTimeouts.push(timeoutMs);
-      return { ok: false };
+      return ctx.delivered
+        ? (ctx.submitted
+          ? { ok: true, userMessageId: "new-user-message", userText: "next turn" }
+          : { ok: true, userMessageId: "prior-user-message", userText: "prior turn" })
+        : { ok: false };
     };
     const performWake = async (args) => {
       ctx.wakeArgs.push(args);
+      ctx.submitted = true;
       return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
     };
     const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
+    const exactDomAcceptedUserMessageRef = () => null;
+    const providerUserTextMatchesSubmitted = (value, baseline) => value === baseline.messageText;
+    const providerAcceptanceDigests = async () => ({ accepted_user_text_sha256: "a".repeat(64) });
+    const acceptedDispatchAssignments = new Map();
     ${evidenceSource}
     ${commandSource}
     return performBrowserActuationCommand;
@@ -3085,7 +3098,9 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   });
 
   assert.equal(ctx.wakeArgs[0].browserActuation, true);
-  assert.deepEqual(ctx.snapshotTimeouts, [1200]);
+  assert.ok(ctx.snapshotTimeouts.length > 1, "unconfirmed submit continues bounded readback");
+  assert.ok(ctx.snapshotTimeouts.every((ms) => ms === 1200));
+  const firstReadbacks = ctx.snapshotTimeouts.length;
   assert.equal(result.command_accepted, true);
   assert.equal(result.rejected, false);
   assert.equal(result.accepted_message_observed, false);
@@ -3103,12 +3118,27 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   });
 
   assert.equal(ctx.wakeArgs[1].browserActuation, true);
-  assert.deepEqual(ctx.snapshotTimeouts, [1200, 1200]);
+  assert.ok(ctx.snapshotTimeouts.length > firstReadbacks + 1, "unconfirmed create also continues bounded readback");
+  assert.ok(ctx.snapshotTimeouts.every((ms) => ms === 1200));
   assert.equal(create.command_accepted, true);
   assert.equal(create.rejected, false);
   assert.equal(create.stable_resource_ref_observed, false);
   assert.deepEqual(ctx.reservationWrites, [["herdrBrowserSessionReservationV1", reservationRef]]);
   assert.equal(ctx.reservationRemovals, 0);
+
+  ctx.delivered = true;
+  ctx.submitted = false;
+  const late = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    params: { message: "next turn", required_apps: [] },
+  });
+  assert.equal(late.command_accepted, true);
+  assert.equal(late.accepted_message_observed, true, "exact provider ref upgrades late acceptance");
+  assert.equal(late.result?.accepted_user_message_ref, "new-user-message");
+  assert.equal(late.generation_owner, 17);
+  assert.equal(ctx.wakeArgs.length, 3, "each simulated intent invokes one provider submit only");
+
 });
 
 test("user waits through transient fresh ChatGPT composer busy without a second submit | Given the new Project tab is scoped but still hydrating | When composer readiness changes from busy to idle | Then the same actuation submits once and keeps its reservation", async () => {
@@ -3124,6 +3154,7 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
     busyChecks: 0,
     busySequence: [true, true, false, true, false, false, false, true],
     waits: 0,
+    now: 0,
     wakeCalls: 0,
     reservationRemovals: 0,
   };
@@ -3161,7 +3192,8 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
       return value;
     };
     const runtimeAlive = () => true;
-    const wait = async () => { ctx.waits += 1; };
+    const Date = { now: () => ctx.now };
+    const wait = async () => { ctx.waits += 1; ctx.now += 1000; };
     const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
     const fetchChatGptConversationSnapshot = async () => ({ ok: false });
     const performWake = async () => {
@@ -3169,6 +3201,7 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
       return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
     };
     const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
+    const exactDomAcceptedUserMessageRef = () => null;
     ${evidenceSource}
     ${commandSource}
     return performBrowserActuationCommand;
