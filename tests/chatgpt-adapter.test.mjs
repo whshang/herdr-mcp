@@ -150,7 +150,7 @@ function matchesSimple(element, selector) {
   return true;
 }
 
-function loadAdapterWithDocument(document) {
+function loadAdapterWithDocument(document, fetch = undefined) {
   let adapter;
   class BaseAdapter {
     elementVisible(element) { return element?.visible === true; }
@@ -159,6 +159,10 @@ function loadAdapterWithDocument(document) {
     BaseAdapter,
     registerH2WAdapter: (registered) => { adapter = registered; },
     document,
+    fetch,
+    AbortController,
+    setTimeout,
+    clearTimeout,
     location: { origin: "https://chatgpt.com", pathname: "/c/current" },
   }, { filename: "chatgpt.js" });
   return adapter;
@@ -217,6 +221,27 @@ test("user app search fails closed without a composer-owned popup | Given a matc
   const adapter = loadAdapterWithDocument(document);
   assert.equal(adapter.getComposerAppCandidates("herdr").length, 0);
   assert.equal(adapter.getComposerAppSuggestionButtons("herdr").length, 0);
+});
+
+test("user rejects inconsistent ChatGPT account identity | Given authenticated endpoints name different users | When the adapter observes login | Then registration identity is unavailable", async () => {
+  const payloads = {
+    "/backend-api/me": { id: "prior-login", email: "prior@example.com" },
+    "/api/auth/session": { user: { id: "new-login", email: "current@example.com" } },
+  };
+  const fetch = async (url) => ({ ok: true, json: async () => payloads[url] });
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const mismatch = await adapter.getAccountObservation();
+  assert.equal(mismatch.nativeIdentity, null);
+  assert.equal(mismatch.email, null);
+
+  payloads["/api/auth/session"].user.id = "prior-login";
+  const emailConflict = await adapter.getAccountObservation();
+  assert.equal(emailConflict.nativeIdentity, null, "conflicting verified emails also fail closed");
+  assert.equal(emailConflict.email, null);
+  payloads["/api/auth/session"].user.email = "prior@example.com";
+  const consistent = await adapter.getAccountObservation();
+  assert.equal(consistent.nativeIdentity, "prior-login");
+  assert.equal(consistent.email, "prior@example.com");
 });
 
 test("user never accepts plain text as an App identity | Given an accepted turn with only the text @herdr | When the accepted message identity is read | Then no App is reported", () => {

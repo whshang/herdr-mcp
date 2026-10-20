@@ -66,6 +66,8 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   async getAccountObservation(timeoutMs = 1500) {
+    let nativeIdentity = null;
+    let email = null;
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -80,14 +82,23 @@ class ChatGPTAdapter extends BaseAdapter {
         if (!response.ok) continue;
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-        const nativeIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
-        if (nativeIdentity) return { nativeIdentity, email: this.displayEmailFromPayload(payload) };
+        const observedIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+        if (!observedIdentity) continue;
+        const observedEmail = this.displayEmailFromPayload(payload);
+        // An old tab can retain the former account's authenticated /me response
+        // after a ChatGPT account switch. Reject conflicting provider identities.
+        if ((nativeIdentity && observedIdentity !== nativeIdentity)
+            || (email && observedEmail && email !== observedEmail)) {
+          return { nativeIdentity: null, email: null };
+        }
+        nativeIdentity = observedIdentity;
+        email ||= observedEmail;
       } catch (_) {
       } finally {
         clearTimeout(timer);
       }
     }
-    return { nativeIdentity: null, email: null };
+    return { nativeIdentity, email };
   }
 
   async getAccountNativeIdentity(timeoutMs = 1500) {
