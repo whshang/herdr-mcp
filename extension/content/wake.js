@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.225";
+const H2W_CONTENT_VERSION = "0.1.227";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3218,6 +3218,7 @@ function normalizeHerdrMentionAlias(value) {
             browserProjectName: project?.name || null,
             browserSessionRef: identityMatchesRoute ? registeredBrowserSessionRef : null,
             browserGeneration: identityMatchesRoute ? registeredBrowserGeneration : null,
+            registrationStatus: lastBrowserRegistrationStatus,
           });
         })();
         return true;
@@ -3631,6 +3632,8 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   const registrationInFlight = new Map();
+  // Privacy-preserving registration diagnostics: finite states only, never IDs.
+  let lastBrowserRegistrationStatus = "not_observed";
 
   async function browserAccountObservation() {
     try {
@@ -3643,6 +3646,12 @@ function normalizeHerdrMentionAlias(value) {
         return {
           nativeIdentity,
           email: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null,
+          reason: [
+            "native_id_conflict_matching_email",
+            "native_id_conflict_different_email",
+            "native_id_conflict_unverified_email",
+            "email_conflict",
+          ].includes(observed?.reason) ? observed.reason : null,
         };
       }
     } catch (_) {}
@@ -3652,6 +3661,18 @@ function normalizeHerdrMentionAlias(value) {
   async function runConversationRegistration(reason, convKey, registrationAttempt) {
     const accountObservation = await browserAccountObservation();
     const accountNativeIdentity = accountObservation.nativeIdentity;
+    const conflictStatuses = {
+      native_id_conflict_matching_email: "id_conflict_matching_email",
+      native_id_conflict_different_email: "id_conflict_different_email",
+      native_id_conflict_unverified_email: "id_conflict_unverified_email",
+      email_conflict: "email_conflict",
+    };
+    lastBrowserRegistrationStatus = accountNativeIdentity ? "identity_observed"
+      : conflictStatuses[accountObservation?.reason] || "identity_unavailable";
+    // Never attempt to associate a ChatGPT route when no authenticated
+    // identity is available. A fresh tab can have conflicting login endpoints
+    // during an account switch; report only a bounded diagnostic state.
+    if (ADAPTER.name === "chatgpt" && !accountNativeIdentity) return null;
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
       try {
@@ -3700,6 +3721,7 @@ function normalizeHerdrMentionAlias(value) {
     if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
       const proof = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
       if (!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim()) {
+        lastBrowserRegistrationStatus = "provider_readback_unavailable";
         if (registeredConvKey === convKey) {
           registeredConvKey = null;
           registeredBrowserSessionRef = null;
@@ -3735,6 +3757,10 @@ function normalizeHerdrMentionAlias(value) {
       browserCurrentProjectName: browserCurrentProject?.name || null,
       browserSessionReservationRef,
     });
+    lastBrowserRegistrationStatus = response === null ? "background_unavailable"
+      : Number.isSafeInteger(response?.browser_generation) && response.browser_generation > 0
+        && typeof response?.browser_account_ref === "string" && response.browser_account_ref
+        ? "registry_observed" : "registry_unobserved";
     if (response !== null) {
       if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
         if (registeredConvKey === convKey) {

@@ -4187,6 +4187,23 @@ test("shared native push stream fences retired runtime boots and reconnects", ()
   assert.match(agentsSegment, /await ensureAlive\(undefined, state\)/);
 });
 
+test("user learns safe registration failures | Given a create scope handshake after account switch | When registration cannot publish a scope | Then diagnostics are enum-only and no account IDs are exposed", () => {
+  assert.match(wakeSource, /registrationStatus:\s*lastBrowserRegistrationStatus/);
+  const registrationStart = wakeSource.indexOf("async function runConversationRegistration");
+  const registrationStatus = wakeSource.slice(registrationStart, registrationStart + 1300);
+  assert.match(registrationStatus, /lastBrowserRegistrationStatus\s*=\s*accountNativeIdentity/);
+  assert.match(registrationStatus, /"id_conflict_matching_email"/);
+  assert.match(registrationStatus, /"id_conflict_different_email"/);
+  const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
+  const end = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")', start);
+  assert.ok(start >= 0 && end > start);
+  const createSegment = backgroundSource.slice(start, end);
+  assert.match(createSegment, /registration_status:\s*probeRegistrationStatus/);
+  assert.match(createSegment, /identityProbeResponded = true/);
+  assert.match(createSegment, /message_submitted:\s*false/);
+  assert.doesNotMatch(createSegment, /registration_status:\s*(?:accountRefCreate|accountNativeIdentity)/);
+});
+
 test("ChatGPT session.create carries one durable reservation across the new-conversation route", () => {
   const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
   const end = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")', start);

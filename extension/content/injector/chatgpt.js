@@ -87,9 +87,15 @@ class ChatGPTAdapter extends BaseAdapter {
         const observedEmail = this.displayEmailFromPayload(payload);
         // An old tab can retain the former account's authenticated /me response
         // after a ChatGPT account switch. Reject conflicting provider identities.
-        if ((nativeIdentity && observedIdentity !== nativeIdentity)
-            || (email && observedEmail && email !== observedEmail)) {
-          return { nativeIdentity: null, email: null };
+        if (nativeIdentity && observedIdentity !== nativeIdentity) {
+          const reason = email && observedEmail
+            ? (email === observedEmail
+              ? "native_id_conflict_matching_email" : "native_id_conflict_different_email")
+            : "native_id_conflict_unverified_email";
+          return { nativeIdentity: null, email: null, reason };
+        }
+        if (email && observedEmail && email !== observedEmail) {
+          return { nativeIdentity: null, email: null, reason: "email_conflict" };
         }
         nativeIdentity = observedIdentity;
         email ||= observedEmail;
@@ -98,7 +104,9 @@ class ChatGPTAdapter extends BaseAdapter {
         clearTimeout(timer);
       }
     }
-    return { nativeIdentity, email };
+    return nativeIdentity
+      ? { nativeIdentity, email }
+      : { nativeIdentity: null, email: null, reason: "authenticated_identity_unavailable" };
   }
 
   async getAccountNativeIdentity(timeoutMs = 1500) {

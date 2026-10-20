@@ -233,11 +233,18 @@ test("user rejects inconsistent ChatGPT account identity | Given authenticated e
   const mismatch = await adapter.getAccountObservation();
   assert.equal(mismatch.nativeIdentity, null);
   assert.equal(mismatch.email, null);
+  assert.equal(mismatch.reason, "native_id_conflict_different_email");
+  payloads["/api/auth/session"].user.email = "prior@example.com";
+  const sameEmailDifferentId = await adapter.getAccountObservation();
+  assert.equal(sameEmailDifferentId.nativeIdentity, null);
+  assert.equal(sameEmailDifferentId.reason, "native_id_conflict_matching_email");
+  payloads["/api/auth/session"].user.email = "current@example.com";
 
   payloads["/api/auth/session"].user.id = "prior-login";
   const emailConflict = await adapter.getAccountObservation();
   assert.equal(emailConflict.nativeIdentity, null, "conflicting verified emails also fail closed");
   assert.equal(emailConflict.email, null);
+  assert.equal(emailConflict.reason, "email_conflict");
   payloads["/api/auth/session"].user.email = "prior@example.com";
   const consistent = await adapter.getAccountObservation();
   assert.equal(consistent.nativeIdentity, "prior-login");

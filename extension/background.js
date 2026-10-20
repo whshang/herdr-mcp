@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.225";
+const H2W_SCRIPT_VERSION = "0.1.227";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -3851,6 +3851,7 @@ async function handleBrowserActuation(command) {
     let lastObservedScope = null;
     let identityProbeResponded = false;
     let identityProbeFailed = false;
+    let probeRegistrationStatus = "probe_not_completed";
     const scopeDeadline = Date.now() + BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS;
     let nextProbeAt = 0;
     let probeInFlight = false;
@@ -3877,8 +3878,18 @@ async function handleBrowserActuation(command) {
         probeInFlight = true;
         nextProbeAt = now + 500;
         void chrome.tabs.sendMessage(createdTab.id, { type: "h2w_get_convkey" })
-          .then(() => {
+          .then((response) => {
             identityProbeResponded = true;
+            // Only a small allowlisted enum crosses into failed-create
+            // evidence. Do not copy any URL, email, account ID, or raw reply.
+            const status = response?.registrationStatus;
+            if ([
+              "not_observed", "identity_observed", "identity_unavailable",
+              "id_conflict_matching_email", "id_conflict_different_email",
+              "id_conflict_unverified_email", "email_conflict",
+              "provider_readback_unavailable",
+              "background_unavailable", "registry_observed", "registry_unobserved",
+            ].includes(status)) probeRegistrationStatus = status;
           })
           .catch(() => {
             identityProbeFailed = true;
@@ -3938,6 +3949,7 @@ async function handleBrowserActuation(command) {
             },
             observed_scope: observedScope,
             scope_failure: scopeFailure,
+            registration_status: probeRegistrationStatus,
             tab_opened: true,
             tab_closed: tabClosed,
             tab_cleanup_verified: tabCleanupVerified,
