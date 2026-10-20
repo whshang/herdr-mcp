@@ -65,7 +65,22 @@ class ChatGPTAdapter extends BaseAdapter {
     return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null;
   }
 
+  noteAccountIdentity429(response) {
+    const retryAfter = Number.parseInt(response?.headers?.get?.("retry-after") || "", 10);
+    const boundedRetryAfterMs = Number.isSafeInteger(retryAfter)
+      && retryAfter >= 0 && retryAfter <= 86_400 ? retryAfter * 1000 : 0;
+    this._accountIdentity429Count = Math.min(8, (this._accountIdentity429Count || 0) + 1);
+    const policyMs = Math.min(120_000, 30_000 * (2 ** Math.min(2, this._accountIdentity429Count - 1)));
+    this._accountIdentity429Until = Math.max(
+      this._accountIdentity429Until || 0,
+      Date.now() + Math.max(30_000, policyMs, boundedRetryAfterMs),
+    );
+  }
+
   async getAccountObservation(timeoutMs = 1500) {
+    if (Date.now() < (this._accountIdentity429Until || 0)) {
+      return { nativeIdentity: null, email: null, reason: "authenticated_rate_limited" };
+    }
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -77,7 +92,12 @@ class ChatGPTAdapter extends BaseAdapter {
           headers: { accept: "application/json" },
           signal: controller.signal,
         });
+        if (response.status === 429) {
+          this.noteAccountIdentity429(response);
+          return { nativeIdentity: null, email: null, reason: "authenticated_rate_limited" };
+        }
         if (!response.ok) continue;
+        this._accountIdentity429Count = 0;
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
         const nativeIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
