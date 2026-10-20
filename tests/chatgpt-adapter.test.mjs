@@ -234,6 +234,19 @@ test("user rejects inconsistent ChatGPT account identity | Given authenticated e
   assert.equal(mismatch.nativeIdentity, null);
   assert.equal(mismatch.email, null);
   assert.equal(mismatch.reason, "native_id_conflict_different_email");
+  payloads["/api/auth/session"].account = { id: "prior-login" };
+  const accountIdMatchesMe = await adapter.getAccountObservation();
+  assert.equal(accountIdMatchesMe.nativeIdentity, null, "do not silently reconcile different identity namespaces");
+  assert.equal(accountIdMatchesMe.idRelation, "me_matches_session_account_id");
+  assert.equal(accountIdMatchesMe.emailProof, "emails_differ");
+  payloads["/api/auth/session"].account.id = "other-account";
+  const accountIdDiffersMe = await adapter.getAccountObservation();
+  assert.equal(accountIdDiffersMe.idRelation, "me_differs_session_user_and_account_id");
+  assert.equal(accountIdDiffersMe.emailProof, "emails_differ");
+  delete payloads["/api/auth/session"].account;
+  const noAccountId = await adapter.getAccountObservation();
+  assert.equal(noAccountId.idRelation, "me_differs_session_user_without_account_id");
+
   payloads["/api/auth/session"].user.email = "prior@example.com";
   const sameEmailDifferentId = await adapter.getAccountObservation();
   assert.equal(sameEmailDifferentId.nativeIdentity, null);
@@ -249,6 +262,85 @@ test("user rejects inconsistent ChatGPT account identity | Given authenticated e
   const consistent = await adapter.getAccountObservation();
   assert.equal(consistent.nativeIdentity, "prior-login");
   assert.equal(consistent.email, "prior@example.com");
+});
+
+test("user safely adopts a bearer-verified session identity | Given conflicting cookie and session IDs | When the active bearer proves the session user | Then the canonical account identity is bounded and cache-safe", async () => {
+  let bearerCalls = 0;
+  const payloads = {
+    "/backend-api/me": { id: "old-identity" },
+    "/api/auth/session": {
+      user: { id: "current-user", email: "current@example.com" },
+      account: { id: "current-account" },
+      accessToken: "test-token-not-for-logging",
+    },
+  };
+  const fetch = async (url, options = {}) => {
+    if (url === "/backend-api/me" && options.headers?.authorization) {
+      bearerCalls++;
+      assert.equal(options.headers.authorization, "Bearer test-token-not-for-logging");
+      return { ok: true, json: async () => ({ id: "current-user" }) };
+    }
+    return { ok: true, json: async () => payloads[url] };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const observed = await adapter.getAccountObservation();
+  assert.equal(observed.nativeIdentity, "current-user", "bearer-proven active session user becomes the canonical identity");
+  assert.equal(observed.email, "current@example.com");
+  assert.equal(observed.identityVerification, "bearer_verified_session_user");
+  assert.equal(observed.bearerRelation, "bearer_matches_session_user");
+  assert.equal(observed.emailProof, "me_email_missing");
+  assert.equal(bearerCalls, 1);
+  const again = await adapter.getAccountObservation();
+  assert.equal(again.nativeIdentity, "current-user");
+  assert.equal(again.bearerRelation, "bearer_matches_session_user");
+  assert.equal(bearerCalls, 1, "do not hammer /backend-api/me on every registration poll");
+
+  payloads["/api/auth/session"].user.id = "new-session-user";
+  const changed = await adapter.getAccountObservation();
+  assert.equal(changed.nativeIdentity, null);
+  assert.equal(changed.bearerRelation, "bearer_differs_from_session");
+  assert.equal(bearerCalls, 2, "a changed authenticated identity invalidates the cached proof");
+});
+
+test("user refuses unproven bearer login identity | Given a mismatched cookie user | When bearer verification fails or session email is unsafe | Then no account is registered", async () => {
+  const payloads = {
+    "/backend-api/me": { id: "stale-cookie-user" },
+    "/api/auth/session": {
+      user: { id: "live-session-user", email: "current@example.com" },
+      accessToken: "private-token",
+    },
+  };
+  let bearerStatus = 403;
+  const fetch = async (url, options = {}) => {
+    if (url === "/backend-api/me" && options.headers?.authorization) {
+      return bearerStatus === 200
+        ? { ok: true, json: async () => ({ id: "live-session-user" }) }
+        : { ok: false, status: bearerStatus };
+    }
+    return { ok: true, json: async () => payloads[url] };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const denied = await adapter.getAccountObservation();
+  assert.equal(denied.nativeIdentity, null);
+  assert.equal(denied.bearerRelation, "bearer_not_authorized");
+
+  payloads["/api/auth/session"].user.id = "different-active-user";
+  bearerStatus = 429;
+  const limited = await adapter.getAccountObservation();
+  assert.equal(limited.nativeIdentity, null);
+  assert.equal(limited.bearerRelation, "bearer_rate_limited");
+
+  payloads["/backend-api/me"].email = "different@example.com";
+  bearerStatus = 200;
+  payloads["/api/auth/session"].user.id = "live-session-user";
+  const disagree = await adapter.getAccountObservation();
+  assert.equal(disagree.nativeIdentity, null, "different authenticated emails must reject even a valid session bearer");
+
+  delete payloads["/backend-api/me"].email;
+  delete payloads["/api/auth/session"].user.email;
+  payloads["/api/auth/session"].user.id = "changed-session-user";
+  const noEmail = await adapter.getAccountObservation();
+  assert.equal(noEmail.nativeIdentity, null, "bearer proof alone cannot publish an unlabeled account");
 });
 
 test("user never accepts plain text as an App identity | Given an accepted turn with only the text @herdr | When the accepted message identity is read | Then no App is reported", () => {

@@ -92,7 +92,90 @@ class ChatGPTAdapter extends BaseAdapter {
             ? (email === observedEmail
               ? "native_id_conflict_matching_email" : "native_id_conflict_different_email")
             : "native_id_conflict_unverified_email";
-          return { nativeIdentity: null, email: null, reason };
+          // Only compare identity equality and source shape. Never return the
+          // raw identifiers or session/account payload to the extension host.
+          const sessionAccountId = typeof payload?.account?.id === "string"
+            ? payload.account.id.trim() : "";
+          const idRelation = url === "/api/auth/session"
+            ? (sessionAccountId
+              ? (nativeIdentity === sessionAccountId
+                ? "me_matches_session_account_id" : "me_differs_session_user_and_account_id")
+              : "me_differs_session_user_without_account_id")
+            : "unclassified";
+          const emailProof = email && observedEmail
+            ? (email === observedEmail ? "emails_match" : "emails_differ")
+            : (email ? "session_email_missing"
+              : (observedEmail ? "me_email_missing" : "both_emails_missing"));
+          let bearerRelation = "bearer_token_unavailable";
+          // Probe only after conflicting cookie-authenticated responses. The
+          // bearer token remains in this page's memory and never enters a
+          // background message, log, Registry record or diagnostic payload.
+          if (url === "/api/auth/session" && typeof payload?.accessToken === "string"
+              && payload.accessToken.trim()) {
+            const now = Date.now();
+            const cached = this._bearerIdentityProbe;
+            if (cached && cached.meId === nativeIdentity
+                && cached.sessionUserId === observedIdentity
+                && cached.sessionAccountId === sessionAccountId
+                && now - cached.checkedAt < 30_000) {
+              bearerRelation = cached.relation;
+            } else {
+              const bearerController = new AbortController();
+              const bearerTimer = setTimeout(() => bearerController.abort(), timeoutMs);
+              try {
+                const verified = await fetch("/backend-api/me", {
+                  method: "GET",
+                  credentials: "include",
+                  cache: "no-store",
+                  headers: {
+                    accept: "application/json",
+                    authorization: `Bearer ${payload.accessToken}`,
+                  },
+                  signal: bearerController.signal,
+                });
+                if (!verified.ok) {
+                  bearerRelation = verified.status === 401 || verified.status === 403
+                    ? "bearer_not_authorized" : verified.status === 429
+                      ? "bearer_rate_limited" : "bearer_response_unavailable";
+                } else {
+                  const identity = await verified.json();
+                  const candidateId = identity?.id || identity?.user?.id || identity?.account?.id;
+                  const bearerId = typeof candidateId === "string" ? candidateId.trim() : "";
+                  bearerRelation = !bearerId ? "bearer_identity_missing"
+                    : bearerId === observedIdentity ? "bearer_matches_session_user"
+                    : bearerId === sessionAccountId ? "bearer_matches_session_account"
+                    : bearerId === nativeIdentity ? "bearer_matches_cookie_me"
+                    : "bearer_differs_from_session";
+                }
+              } catch (_) {
+                bearerRelation = "bearer_network_unavailable";
+              } finally {
+                clearTimeout(bearerTimer);
+              }
+              this._bearerIdentityProbe = {
+                meId: nativeIdentity,
+                sessionUserId: observedIdentity,
+                sessionAccountId,
+                relation: bearerRelation,
+                checkedAt: now,
+              };
+            }
+          }
+          // The cookie-backed /me ID may come from a stale account or a
+          // different ID namespace. Accept only a current-session user ID
+          // independently confirmed by /me using that session's bearer token,
+          // with a valid current email and no contradictory email evidence.
+          // All other conflicts continue to fail closed.
+          if (bearerRelation === "bearer_matches_session_user"
+              && observedEmail && (!email || email === observedEmail)) {
+            return {
+              nativeIdentity: observedIdentity,
+              email: observedEmail,
+              identityVerification: "bearer_verified_session_user",
+              idRelation, emailProof, bearerRelation,
+            };
+          }
+          return { nativeIdentity: null, email: null, reason, idRelation, emailProof, bearerRelation };
         }
         if (email && observedEmail && email !== observedEmail) {
           return { nativeIdentity: null, email: null, reason: "email_conflict" };

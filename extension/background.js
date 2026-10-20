@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.227";
+const H2W_SCRIPT_VERSION = "0.1.230";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -3852,6 +3852,9 @@ async function handleBrowserActuation(command) {
     let identityProbeResponded = false;
     let identityProbeFailed = false;
     let probeRegistrationStatus = "probe_not_completed";
+    let probeIdentityRelation = "not_observed";
+    let probeEmailProof = "not_observed";
+    let probeBearerRelation = "not_observed";
     const scopeDeadline = Date.now() + BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS;
     let nextProbeAt = 0;
     let probeInFlight = false;
@@ -3890,6 +3893,27 @@ async function handleBrowserActuation(command) {
               "provider_readback_unavailable",
               "background_unavailable", "registry_observed", "registry_unobserved",
             ].includes(status)) probeRegistrationStatus = status;
+            const relation = response?.identityRelation;
+            if ([
+              "me_matches_session_account_id",
+              "me_differs_session_user_and_account_id",
+              "me_differs_session_user_without_account_id",
+              "unclassified", "not_observed",
+            ].includes(relation)) probeIdentityRelation = relation;
+            const contactProof = response?.contactProof;
+            if ([
+              "emails_match", "emails_differ", "session_email_missing",
+              "me_email_missing", "both_emails_missing", "not_observed",
+            ].includes(contactProof)) probeEmailProof = contactProof;
+            const bearerRelation = response?.bearerRelation;
+            if ([
+              "bearer_token_unavailable", "bearer_not_authorized",
+              "bearer_rate_limited", "bearer_response_unavailable",
+              "bearer_identity_missing", "bearer_matches_session_user",
+              "bearer_matches_session_account", "bearer_matches_cookie_me",
+              "bearer_differs_from_session", "bearer_network_unavailable",
+              "not_observed",
+            ].includes(bearerRelation)) probeBearerRelation = bearerRelation;
           })
           .catch(() => {
             identityProbeFailed = true;
@@ -3950,6 +3974,9 @@ async function handleBrowserActuation(command) {
             observed_scope: observedScope,
             scope_failure: scopeFailure,
             registration_status: probeRegistrationStatus,
+            identity_relation: probeIdentityRelation,
+            contact_proof: probeEmailProof,
+            bearer_relation: probeBearerRelation,
             tab_opened: true,
             tab_closed: tabClosed,
             tab_cleanup_verified: tabCleanupVerified,

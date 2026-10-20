@@ -4199,6 +4199,12 @@ test("user learns safe registration failures | Given a create scope handshake af
   assert.ok(start >= 0 && end > start);
   const createSegment = backgroundSource.slice(start, end);
   assert.match(createSegment, /registration_status:\s*probeRegistrationStatus/);
+  assert.match(createSegment, /identity_relation:\s*probeIdentityRelation/);
+  assert.match(createSegment, /contact_proof:\s*probeEmailProof/);
+  assert.match(createSegment, /bearer_relation:\s*probeBearerRelation/);
+  assert.match(wakeSource, /bearerRelation:\s*lastBrowserBearerRelation/);
+  assert.match(wakeSource, /identityRelation:\s*lastBrowserIdentityRelation/);
+  assert.match(wakeSource, /contactProof:\s*lastBrowserContactProof/);
   assert.match(createSegment, /identityProbeResponded = true/);
   assert.match(createSegment, /message_submitted:\s*false/);
   assert.doesNotMatch(createSegment, /registration_status:\s*(?:accountRefCreate|accountNativeIdentity)/);

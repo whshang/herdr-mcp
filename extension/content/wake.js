@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.227";
+const H2W_CONTENT_VERSION = "0.1.230";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3219,6 +3219,9 @@ function normalizeHerdrMentionAlias(value) {
             browserSessionRef: identityMatchesRoute ? registeredBrowserSessionRef : null,
             browserGeneration: identityMatchesRoute ? registeredBrowserGeneration : null,
             registrationStatus: lastBrowserRegistrationStatus,
+            identityRelation: lastBrowserIdentityRelation,
+            contactProof: lastBrowserContactProof,
+            bearerRelation: lastBrowserBearerRelation,
           });
         })();
         return true;
@@ -3634,6 +3637,9 @@ function normalizeHerdrMentionAlias(value) {
   const registrationInFlight = new Map();
   // Privacy-preserving registration diagnostics: finite states only, never IDs.
   let lastBrowserRegistrationStatus = "not_observed";
+  let lastBrowserIdentityRelation = "not_observed";
+  let lastBrowserContactProof = "not_observed";
+  let lastBrowserBearerRelation = "not_observed";
 
   async function browserAccountObservation() {
     try {
@@ -3652,6 +3658,23 @@ function normalizeHerdrMentionAlias(value) {
             "native_id_conflict_unverified_email",
             "email_conflict",
           ].includes(observed?.reason) ? observed.reason : null,
+          idRelation: [
+            "me_matches_session_account_id",
+            "me_differs_session_user_and_account_id",
+            "me_differs_session_user_without_account_id",
+            "unclassified",
+          ].includes(observed?.idRelation) ? observed.idRelation : null,
+          emailProof: [
+            "emails_match", "emails_differ", "session_email_missing",
+            "me_email_missing", "both_emails_missing",
+          ].includes(observed?.emailProof) ? observed.emailProof : null,
+          bearerRelation: [
+            "bearer_token_unavailable", "bearer_not_authorized",
+            "bearer_rate_limited", "bearer_response_unavailable",
+            "bearer_identity_missing", "bearer_matches_session_user",
+            "bearer_matches_session_account", "bearer_matches_cookie_me",
+            "bearer_differs_from_session", "bearer_network_unavailable",
+          ].includes(observed?.bearerRelation) ? observed.bearerRelation : null,
         };
       }
     } catch (_) {}
@@ -3669,6 +3692,9 @@ function normalizeHerdrMentionAlias(value) {
     };
     lastBrowserRegistrationStatus = accountNativeIdentity ? "identity_observed"
       : conflictStatuses[accountObservation?.reason] || "identity_unavailable";
+    lastBrowserIdentityRelation = accountObservation?.idRelation || "not_observed";
+    lastBrowserContactProof = accountObservation?.emailProof || "not_observed";
+    lastBrowserBearerRelation = accountObservation?.bearerRelation || "not_observed";
     // Never attempt to associate a ChatGPT route when no authenticated
     // identity is available. A fresh tab can have conflicting login endpoints
     // during an account switch; report only a bounded diagnostic state.
