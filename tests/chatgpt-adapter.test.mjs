@@ -365,7 +365,8 @@ test("user cools authenticated identity reads | Given the first ChatGPT identity
   rateLimited = false;
   const resumed = await adapter.getAccountObservation();
   assert.equal(resumed.nativeIdentity, "current-user", "identity probing must resume after cooldown");
-  assert.equal(requests.length, 2);
+  assert.deepEqual(requests, ["/backend-api/me", "/backend-api/me", "/api/auth/session"],
+    "resumed identity must cross-check both authenticated endpoints after cooldown");
 });
 
 test("user cools secondary identity reads | Given /me lacks a user ID and auth/session returns HTTP 429 | When a new registration arrives | Then repeated probes are suppressed", async () => {
