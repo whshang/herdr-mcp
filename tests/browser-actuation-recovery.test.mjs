@@ -3201,6 +3201,32 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   assert.equal(ctx.wakeArgs.length, priorSends, "unreadable provider baseline must never submit");
 });
 
+test("user preserves late browser dispatch evidence | Given content completes after the broker initial wait | When the same fenced content message resolves | Then Dispatch waits within late-completion TTL without any second send", async () => {
+  const timeoutMatch = backgroundSource.match(/const BROWSER_DISPATCH_CONTENT_TIMEOUT_MS = ([0-9_]+);/);
+  assert.ok(timeoutMatch, "dispatch needs a dedicated bounded content-response timeout");
+  const timeoutMs = Number(timeoutMatch[1].replace(/_/g, ""));
+  assert.ok(timeoutMs > 22000 && timeoutMs <= 45000, "allow proof after the 22s broker wait but before 60s late TTL");
+  const start = backgroundSource.indexOf("async function sendBrowserActuationTabMessage(");
+  const end = backgroundSource.indexOf("\nasync function handoffMessageWithRequiredApps(", start);
+  assert.ok(start >= 0 && end > start);
+  const calls = [];
+  const func = new Function("sendTabMessageWithTimeout", "BROWSER_DISPATCH_CONTENT_TIMEOUT_MS",
+    backgroundSource.slice(start, end) + "\nreturn sendBrowserActuationTabMessage;")(
+    async (_tabId, command, timeout) => {
+      calls.push({ op: command.command.operation, timeout });
+      // A simulated 25s single physical response must not be abandoned.
+      return timeout >= 25000 ? { evidence: { accepted_message_observed: true } } : { evidence: null };
+    },
+    timeoutMs,
+  );
+  const accepted = await func(9, { command: { operation: "herdr_mcp.browser_dispatch.submit" } });
+  assert.equal(accepted?.evidence?.accepted_message_observed, true);
+  assert.equal(calls.length, 1, "never replay a sent command");
+  assert.equal(calls[0].timeout, timeoutMs);
+  await func(9, { command: { operation: "herdr_mcp.browser_session.archive" } });
+  assert.equal(calls[1].timeout, 18000, "non-Dispatch operations retain their previous bound");
+});
+
 test("user can classify an unavailable Provider dispatch baseline | Given authenticated readback or user-ID failures | When the bounded pre-submit baseline rejects | Then the error is an enum and there is no second submit", () => {
   const start = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
   const end = wakeSource.indexOf("  async function performBrowserActuationCommand(", start);
