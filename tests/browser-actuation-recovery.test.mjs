@@ -2828,7 +2828,10 @@ test("user Given unavailable browser actuation When the content script rejects i
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart, "browser evidence helpers must remain extractable");
   assert.ok(commandStart >= 0 && commandEnd > commandStart, "browser actuation command must remain extractable");
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
 
   function makeActuator(ctx = {}) {
     return new Function("ctx", `
@@ -2941,7 +2944,10 @@ test("user can stop a live answer | Given an explicit visible stop control while
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
   const ctx = { clicked: false };
   const act = new Function("ctx", `
     const stopButton = {
@@ -3058,7 +3064,10 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
   const ctx = {
     snapshotTimeouts: [],
     wakeArgs: [],
@@ -3192,6 +3201,24 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   assert.equal(ctx.wakeArgs.length, priorSends, "unreadable provider baseline must never submit");
 });
 
+test("user can classify an unavailable Provider dispatch baseline | Given authenticated readback or user-ID failures | When the bounded pre-submit baseline rejects | Then the error is an enum and there is no second submit", () => {
+  const start = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  const end = wakeSource.indexOf("  async function performBrowserActuationCommand(", start);
+  assert.ok(start >= 0 && end > start);
+  const classify = new Function(wakeSource.slice(start, end) + "\nreturn chatGptDispatchBaselineRejectionReason;")();
+  assert.equal(classify({ ok: false, reason: "http-429" }), "browser_dispatch_baseline_http429");
+  assert.equal(classify({ ok: false, reason: "timeout" }), "browser_dispatch_baseline_timeout");
+  assert.equal(classify({ ok: false, reason: "auth" }), "browser_dispatch_baseline_auth");
+  assert.equal(classify({ ok: false, reason: "http-403" }), "browser_dispatch_baseline_forbidden");
+  assert.equal(classify({ ok: false, reason: "http-404" }), "browser_dispatch_baseline_not_found");
+  assert.equal(classify({ ok: false, reason: "fetch-failed" }), "browser_dispatch_baseline_network");
+  assert.equal(classify({ ok: false, reason: "http-500" }), "browser_dispatch_baseline_server");
+  assert.equal(classify({ ok: true, userMessageId: null }), "browser_dispatch_baseline_user_id_missing");
+  assert.equal(classify({ ok: false, reason: "some-untrusted-text" }), "browser_dispatch_baseline_unavailable");
+  const command = wakeSource.slice(end, wakeSource.indexOf("  async function reportBrowserResultSettlement(", end));
+  assert.match(command, /return browserRejectedEvidence\(evidence, chatGptDispatchBaselineRejectionReason\(beforeServer\)\)/);
+});
+
 test("user waits through transient fresh ChatGPT composer busy without a second submit | Given the new Project tab is scoped but still hydrating | When composer readiness changes from busy to idle | Then the same actuation submits once and keeps its reservation", async () => {
   const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
   const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
@@ -3200,7 +3227,10 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
   const ctx = {
     busyChecks: 0,
     busySequence: [true, true, false, true, false, false, false, true],
@@ -3284,7 +3314,10 @@ test("user receives exact content rejection reasons | Given browser controls rej
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
 
   function makeActuator(ctx = {}) {
     return new Function("ctx", `
@@ -5220,7 +5253,10 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
   assert.ok(helperStart >= 0 && helperEnd > helperStart, "exact acceptance helpers must remain extractable");
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
   const helperSource = wakeSource.slice(helperStart, helperEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
   return new Function("ctx", `
     const crypto = ctx.crypto;
     const ADAPTER = {
