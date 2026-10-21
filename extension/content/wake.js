@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.230";
+const H2W_CONTENT_VERSION = "0.1.231";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2428,6 +2428,21 @@ function normalizeHerdrMentionAlias(value) {
     return evidence;
   }
 
+  function chatGptDispatchBaselineRejectionReason(snapshot) {
+    // The returned error is a fixed enum: never forward URLs, status bodies,
+    // user messages, or raw Provider errors. This remains a pre-send refusal.
+    if (snapshot?.ok && !snapshot.userMessageId) return "browser_dispatch_baseline_user_id_missing";
+    const reason = String(snapshot?.reason || "");
+    if (reason === "http-429") return "browser_dispatch_baseline_http429";
+    if (reason === "auth" || reason === "http-401") return "browser_dispatch_baseline_auth";
+    if (reason === "http-403") return "browser_dispatch_baseline_forbidden";
+    if (reason === "http-404") return "browser_dispatch_baseline_not_found";
+    if (reason === "timeout") return "browser_dispatch_baseline_timeout";
+    if (reason === "fetch-failed") return "browser_dispatch_baseline_network";
+    if (/^http-5[0-9][0-9]$/.test(reason)) return "browser_dispatch_baseline_server";
+    return "browser_dispatch_baseline_unavailable";
+  }
+
   async function performBrowserActuationCommand(command) {
     const dispatchId = typeof command?.dispatch_id === "string" ? command.dispatch_id : "";
     const expectedGeneration = Number(command?.expected_generation || 0);
@@ -2639,7 +2654,7 @@ function normalizeHerdrMentionAlias(value) {
     // Dispatch needs a provider-owned pre-submit user ID to prove advancement.
     // Refuse before touching the composer when that baseline is unavailable.
     if (exactChatGptDispatchIdentity && (!beforeServer?.ok || !beforeServer.userMessageId)) {
-      return browserRejectedEvidence(evidence, "browser_dispatch_baseline_unavailable");
+      return browserRejectedEvidence(evidence, chatGptDispatchBaselineRejectionReason(beforeServer));
     }
     const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
     const result = await performWake({
