@@ -1726,7 +1726,7 @@ fn task_event_status(event: &Value) -> Option<&str> {
 
 fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
     let cursor = event.get("cursor").and_then(Value::as_u64).unwrap_or(0);
-    if cursor <= task.start_cursor || cursor <= task.last_cursor {
+    if task.is_terminal() || cursor <= task.start_cursor || cursor <= task.last_cursor {
         return false;
     }
     let pane_id = event.get("pane_id").and_then(Value::as_str).or_else(|| {
@@ -1819,6 +1819,8 @@ const FINAL_EXCERPT_MAX_BYTES: usize = 2_000;
 /// The one-shot excerpt read shares the native socket path but keeps its own
 /// short bound so a terminal reconcile never stalls on a slow agent read.
 const FINAL_EXCERPT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// If the pane's state cannot be revalidated promptly, omit the excerpt.
+const FINAL_EXCERPT_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Applies cache events to a durable task record and, exactly once at an
 /// eligible terminal transition, captures the bounded final excerpt of the
@@ -1830,16 +1832,34 @@ fn apply_events_with_final_excerpt(
     events: &[Value],
 ) -> bool {
     let mut changed = false;
+    let mut terminal_state_change_seq = None;
     for event in events {
+        let was_terminal = task.is_terminal();
         if apply_task_event(task, event) {
             changed = true;
+            if !was_terminal && task.is_terminal() && final_excerpt_eligible(task) {
+                terminal_state_change_seq = task_event_state_change_seq(event);
+            }
         }
     }
     if changed && task.is_terminal() && task.final_excerpt.is_none() && final_excerpt_eligible(task)
     {
-        task.final_excerpt = read_final_excerpt(client, task);
+        task.final_excerpt =
+            terminal_state_change_seq.and_then(|seq| read_final_excerpt(client, task, seq));
     }
     changed
+}
+
+fn task_event_state_change_seq(event: &Value) -> Option<u64> {
+    event
+        .get("state_change_seq")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            event
+                .get("pane")
+                .and_then(|pane| pane.get("state_change_seq"))
+                .and_then(Value::as_u64)
+        })
 }
 
 /// Terminal lifecycles that can carry a captured outcome. Excludes
@@ -1857,7 +1877,11 @@ fn final_excerpt_eligible(task: &PromptTaskRecord) -> bool {
 
 /// Reads the child's recent unwrapped output through the same native Herdr
 /// socket path the prompt dispatch uses, then bounds it for durable storage.
-fn read_final_excerpt(client: Option<&HerdrClient>, task: &PromptTaskRecord) -> Option<String> {
+fn read_final_excerpt(
+    client: Option<&HerdrClient>,
+    task: &PromptTaskRecord,
+    expected_state_change_seq: u64,
+) -> Option<String> {
     let client = client?;
     let target = task.pane_id.as_deref().unwrap_or(task.target.as_str());
     let response = client
@@ -1877,7 +1901,27 @@ fn read_final_excerpt(client: Option<&HerdrClient>, task: &PromptTaskRecord) -> 
         .into_iter()
         .find_map(|key| read.get(key).and_then(Value::as_str))?;
     let excerpt = shape_final_excerpt(text);
-    (!excerpt.trim().is_empty()).then_some(excerpt)
+    if excerpt.trim().is_empty() {
+        return None;
+    }
+
+    // A pane may be reused between terminal-event observation and this read.
+    // Reject output if the pane's state sequence advanced during capture.
+    let current = client
+        .call_with_timeout(
+            "agent.get",
+            json!({"target": target}),
+            FINAL_EXCERPT_VERIFY_TIMEOUT,
+        )
+        .ok()?;
+    let state = agent_state_from_value(&current)?;
+    if state.pane_id.as_deref() != Some(target)
+        || state.state_change_seq != Some(expected_state_change_seq)
+        || state.agent_status.as_deref() != task.terminal_status.as_deref()
+    {
+        return None;
+    }
+    Some(excerpt)
 }
 
 /// Strips ANSI/control noise, drops trailing blank lines, and keeps at most
@@ -4928,7 +4972,7 @@ mod tests {
             listener,
             vec![
                 json!({"result": {"read": {"content": "analyzing module\n\u{1b}[32mprogress: 50%\u{1b}[0m\nDONE: report at /tmp/report.md\n\n\n"}}}),
-                json!({"result": {"read": {"content": "SECOND READ MUST NEVER REPLACE THE EXCERPT"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
             ],
             Arc::clone(&requests),
         );
@@ -4938,7 +4982,10 @@ mod tests {
         let changed = apply_events_with_final_excerpt(
             Some(&client),
             &mut task,
-            &[json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})],
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
         );
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
@@ -4951,26 +4998,75 @@ mod tests {
         assert!(excerpt.ends_with("DONE: report at /tmp/report.md\n"));
 
         let recorded = requests.lock().unwrap();
-        assert_eq!(recorded.len(), 1, "capture must issue exactly one read");
+        assert_eq!(recorded.len(), 2, "capture must read once and verify once");
         assert_eq!(recorded[0].0, "agent.read");
         assert_eq!(recorded[0].1["target"], "w1:p1");
         assert_eq!(recorded[0].1["source"], "recent_unwrapped");
         assert_eq!(recorded[0].1["lines"], FINAL_EXCERPT_LINES);
         assert_eq!(recorded[0].1["strip_ansi"], true);
+        assert_eq!(recorded[1].0, "agent.get");
+        assert_eq!(recorded[1].1["target"], "w1:p1");
         drop(recorded);
 
-        // A second transition pass must never read or overwrite the excerpt.
+        // A terminal task is immutable and must never trigger another read.
         let changed_again = apply_events_with_final_excerpt(
             Some(&client),
             &mut task,
-            &[json!({"cursor": 102, "pane_id": "w1:p1", "agent_status": "done"})],
+            &[json!({
+                "cursor": 102,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
         );
-        assert!(changed_again);
+        assert!(!changed_again);
         assert_eq!(task.final_excerpt.as_deref(), Some(excerpt.as_str()));
-        assert_eq!(requests.lock().unwrap().len(), 1);
-        // The scripted thread keeps its extra response pending on purpose;
-        // joining would block forever, so leave the thread to the process.
-        drop(server);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.join().unwrap();
+    }
+
+    /// user owner | Given a pane is reused before an old task is reconciled |
+    /// When the event batch contains the old terminal event and newer activity |
+    /// Then the old task stays terminal and never adopts the newer pane output.
+    #[test]
+    fn final_excerpt_is_omitted_when_the_pane_state_advanced() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"read": {"content": "OUTPUT FROM A DIFFERENT TASK"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 3}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-pane-reused");
+
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            &mut task,
+            &[
+                json!({
+                    "cursor": 101,
+                    "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+                }),
+                json!({
+                    "cursor": 102,
+                    "pane": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 3}
+                }),
+            ],
+        );
+
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(task.terminal_status.as_deref(), Some("done"));
+        assert!(task.final_excerpt.is_none());
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, "agent.read");
+        assert_eq!(recorded[1].0, "agent.get");
+        drop(recorded);
+        server.join().unwrap();
     }
 
     /// user owner | Given terminal output longer than the byte cap | When the
@@ -5084,7 +5180,10 @@ mod tests {
         let changed = apply_events_with_final_excerpt(
             Some(&client),
             &mut task,
-            &[json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})],
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
         );
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
