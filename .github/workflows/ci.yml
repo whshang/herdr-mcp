@@ -61,6 +61,10 @@ jobs:
         env:
           TEST_POLICY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
         run: node scripts/lint-test-policy.mjs "$TEST_POLICY_BASE_SHA"
+      - name: Findings/rule promotion gate
+        run: |
+          node scripts/lint-findings.mjs
+          node scripts/lint-findings.mjs --candidates
       - name: Select Node test scope
         id: node_scope
         env:
