@@ -9,15 +9,19 @@ Own: `herdr_prompt`. Combine this policy with live facts from `herdr_inspect`/`h
 
 Call shape: target one explicit live Agent name or pane identity and use one stable `idempotency_key` for the intended prompt submission. Normal orchestration is asynchronous; retain the returned task/dispatch identity instead of blocking on a global Agent state. After timeout or transport failure, retry only when delivery evidence says `not_delivered` or live state proves the prompt did not apply.
 
+Delegate non-trivial implementation per `development-orchestration`'s main-brain rule; delegation never removes the planner's own fs/exec capability.
+
 ## Selection
 
-1. Delegation is optional. The Web planner decides whether independent reasoning, implementation, review, test analysis, or a capability-specific task has enough value to justify it.
+1. Delegation stays a planner choice, not a side effect of idle workers or candidate availability.
 2. Filter live candidates by auto-dispatch policy, project/cwd, status, lane ownership, mutation conflict, and capabilities the task actually requires.
 3. Expose compatible candidates with known quality/cost/latency evidence to the Web planner. Unknown capability fields stay unknown; candidate availability never requires dispatch.
-4. When the planner chooses delegation, submit one bounded task with explicit ownership and validation boundary, then verify delivery through prompt evidence plus live state.
+4. Submit one bounded task card: objective, role declaration (executor — implement and report; do not dispatch other agents, merge, or push unless the card says so), worktree/branch, file scope, validation commands, report boundary. Give the executor only the context the card needs — not the chat transcript, not planner-only dispatch rules — and keep the card well under 12 KB. Then verify delivery through prompt evidence plus live state.
 5. Record a progress checkpoint for delegated work. On the next relevant planner turn and before integration, use `herdr_since` plus the lane's Git/output evidence to confirm progress; when evidence shows drift or a stall, tighten the prompt, stop the lane, or reassign it before starting another worker.
 
 A user-specified agent/model/pane target has priority and is never silently replaced. A busy preferred worker may fall back only to a reliably equivalent compatible worker; do not silently lower capability or quality.
+
+Project or user instructions (`AGENTS.md`, `HANDOFF.md`) may declare a role mapping such as `Coder: pi -> omp; Reviewer: grok -> droid`. Honor that order for that project, still subject to live availability, capability, and occupancy; the mapping is project policy, not a ranking this Skill may encode. Review lane and advisor triggers are owned by `development-orchestration`.
 
 Generic same-project reasoning may consider an idle allowed worker even when optional model/edit/vision traits are unknown. A task that actually requires one of those traits must fail closed until the capability is verified.
 
