@@ -51,12 +51,32 @@ function browserPageLifecycleHarness({
   fetchResponder = null,
   scriptResponder = null,
   hoverResponder = null,
+  navigationResponder = null,
   deferredCreate = false,
   windowFocused = true,
   documentFocused = true,
   documentVisibilityState = "visible",
 } = {}) {
   let nextTabId = Math.max(100, ...tabs.keys(), 0) + 1;
+  async function stepHistory(kind, tabId, delta) {
+    const tab = tabs.get(tabId);
+    if (!tab) throw new Error("tab missing");
+    if (!Array.isArray(tab.history)) tab.history = [tab.url];
+    if (!Number.isInteger(tab.historyIndex)) tab.historyIndex = tab.history.length - 1;
+    const nextIndex = tab.historyIndex + delta;
+    if (nextIndex < 0 || nextIndex >= tab.history.length) {
+      throw new Error("Cannot find a next page in history.");
+    }
+    tab.historyIndex = nextIndex;
+    tab.url = tab.history[nextIndex];
+    tab.status = "loading";
+    for (const listener of updatedListeners) listener(tabId, { status: "loading" });
+    if (navigationResponder) await navigationResponder(kind, tabId, {}, tab);
+    tab.pendingUrl = null;
+    tab.status = "complete";
+    for (const listener of updatedListeners) listener(tabId, { url: tab.url, status: "complete" });
+    return { ...tab };
+  }
   const activatedListeners = new Set();
   const focusListeners = new Set();
   const updatedListeners = new Set();
@@ -91,6 +111,8 @@ function browserPageLifecycleHarness({
           pendingUrl: deferredCreate ? info.url : null,
           status: deferredCreate ? "loading" : "complete",
           active: info.active === true,
+          history: [info.url],
+          historyIndex: 0,
         };
         tabs.set(tab.id, tab);
         return { ...tab };
@@ -106,8 +128,45 @@ function browserPageLifecycleHarness({
             listener({ tabId, windowId: tab.windowId });
           }
         }
+        if (typeof info.url === "string") {
+          tab.status = "loading";
+          for (const listener of updatedListeners) listener(tabId, { status: "loading" });
+          let destination = info.url;
+          if (navigationResponder) {
+            const outcome = await navigationResponder("update", tabId, { url: info.url }, tab);
+            if (outcome && typeof outcome === "object" && typeof outcome.url === "string") {
+              destination = outcome.url;
+            }
+          }
+          tab.url = destination;
+          tab.pendingUrl = null;
+          if (!Array.isArray(tab.history)) tab.history = [tab.url];
+          if (!Number.isInteger(tab.historyIndex)) tab.historyIndex = tab.history.length - 1;
+          tab.history = tab.history.slice(0, tab.historyIndex + 1);
+          tab.history.push(destination);
+          tab.historyIndex = tab.history.length - 1;
+          tab.status = "complete";
+          for (const listener of updatedListeners) listener(tabId, { url: destination, status: "complete" });
+          return { ...tab };
+        }
         Object.assign(tab, info);
         return { ...tab };
+      },
+      async reload(tabId) {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error("tab missing");
+        tab.status = "loading";
+        for (const listener of updatedListeners) listener(tabId, { status: "loading" });
+        if (navigationResponder) await navigationResponder("reload", tabId, {}, tab);
+        tab.pendingUrl = null;
+        tab.status = "complete";
+        for (const listener of updatedListeners) listener(tabId, { url: tab.url, status: "complete" });
+      },
+      async goBack(tabId) {
+        return stepHistory("back", tabId, -1);
+      },
+      async goForward(tabId) {
+        return stepHistory("forward", tabId, 1);
       },
       async remove(tabId) {
         if (!tabs.delete(tabId)) throw new Error("tab missing");
@@ -5756,4 +5815,430 @@ test("user avoids re-reading ChatGPT while rate limited | Given a conversation G
   context.now = 48000;
   await read({ conversationId: "conv-1" });
   assert.equal(context.urls.length, 5, "auth endpoint 429 must also block repeated reads");
+});
+
+test("user drives bounded page navigation | Given a typed Rust actuation payload for navigation | When the extension bridge forwards it | Then the destination URL, expected history URL and page generation reach the BrowserPage action path", () => {
+  const start = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
+  const end = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', start);
+  assert.ok(start > 0 && end > start);
+  const bridge = backgroundSource.slice(start, end);
+  assert.match(bridge, /url:\s*params\.url/);
+  assert.match(bridge, /expectedUrl:\s*params\.expected_url/);
+  assert.match(bridge, /pageGeneration:\s*params\.page_generation/);
+});
+
+test("user navigates one owned page to an exact same-origin URL | Given an owned BrowserPage and its current page generation | When navigate receives stale, out-of-scope, unchanged and valid destinations | Then only the exact destination navigates and the same page handle adopts it", async () => {
+  const tabs = new Map();
+  let updates = 0;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    navigationResponder(kind) {
+      if (kind === "update") updates += 1;
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/start",
+    idempotencyKey: "open-navigate-1",
+  });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.ownership, "owned");
+  assert.equal(opened.page_generation, 1);
+
+  const stale = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: "https://example.com/next",
+    pageGeneration: opened.page_generation + 1,
+  });
+  assert.equal(stale.error, "browser_page_generation_stale");
+  assert.equal(stale.delivery_state, "not_applied");
+  assert.equal(stale.retry_safe, true);
+  assert.equal(stale.mutation_submitted, false);
+  assert.equal(updates, 0);
+  assert.equal([...tabs.values()][0].url, "https://example.com/start");
+
+  const outOfScope = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: "https://other.example/next",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(outOfScope.error, "browser_page_navigation_out_of_scope");
+  assert.equal(outOfScope.delivery_state, "not_applied");
+  assert.equal(updates, 0);
+
+  const credentialBearing = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: "https://user:secret@example.com/next",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(credentialBearing.error, "browser_page_navigation_out_of_scope");
+  assert.equal(credentialBearing.delivery_state, "not_applied");
+  assert.equal(updates, 0);
+
+  const unchanged = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: opened.canonical_url,
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(unchanged.error, "browser_page_navigation_unchanged");
+  assert.equal(unchanged.delivery_state, "not_applied");
+  assert.equal(updates, 0);
+
+  const navigated = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: "https://example.com/next?view=2",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(navigated.ok, true);
+  assert.equal(navigated.delivery_state, "applied");
+  assert.equal(navigated.navigated, true);
+  assert.equal(navigated.navigated_url, "https://example.com/next?view=2");
+  assert.equal(navigated.page_generation, opened.page_generation + 1);
+  assert.equal(navigated.retry_safe, false);
+  assert.equal(navigated.mutation_submitted, true);
+  assert.equal(updates, 1);
+  const live = [...tabs.values()][0];
+  assert.equal(live.url, "https://example.com/next?view=2");
+  const record = h.browserPagesByRef.get(opened.page_ref);
+  assert.equal(record.canonical_url, "https://example.com/next?view=2");
+  assert.equal(record.stale, false);
+
+  const oldGeneration = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: "https://example.com/third",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(oldGeneration.error, "browser_page_generation_stale");
+  assert.equal(oldGeneration.delivery_state, "not_applied");
+  assert.equal(updates, 1);
+  assert.equal(live.url, "https://example.com/next?view=2");
+
+  // A claimed user tab may still be navigated explicitly on its own origin,
+  // just like a click on a same-origin link. Reload/history stay owned-only.
+  const claimedTabs = new Map([[93, { id: 93, url: "https://example.com/claimed-start", status: "complete", active: true }]]);
+  const claimedHarness = browserPageLifecycleHarness({ tabs: claimedTabs });
+  const claimed = await claimedHarness.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/claimed-start",
+    idempotencyKey: "claim-navigate-1",
+  });
+  const claimedNavigate = await claimedHarness.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: claimed.page_ref,
+    url: "https://example.com/claimed-next",
+    pageGeneration: claimed.page_generation,
+  });
+  assert.equal(claimedNavigate.ok, true);
+  assert.equal(claimedNavigate.delivery_state, "applied");
+  assert.equal(claimedNavigate.navigated_url, "https://example.com/claimed-next");
+  assert.equal(claimedNavigate.page_generation, claimed.page_generation + 1);
+  assert.equal(claimedTabs.get(93).url, "https://example.com/claimed-next");
+  assert.equal(claimedHarness.browserPagesByRef.get(claimed.page_ref)?.stale, false);
+});
+
+test("user refuses to guess after an unverified navigation | Given Chrome accepts the navigation call but lands on another document | When the destination document cannot be proven | Then delivery stays unknown and the old page handle is stale", async () => {
+  const mismatchedTabs = new Map();
+  const mismatched = browserPageLifecycleHarness({
+    tabs: mismatchedTabs,
+    navigationResponder(kind) {
+      if (kind === "update") return { url: "https://example.com/interstitial" };
+    },
+  });
+  const opened = await mismatched.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/start",
+    idempotencyKey: "open-navigate-mismatch-1",
+  });
+  const result = await mismatched.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: "https://example.com/next",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "browser_page_navigation_mismatch");
+  assert.equal(result.delivery_state, "delivery_unknown");
+  assert.equal(result.retry_safe, false);
+  assert.equal(result.mutation_submitted, true);
+  assert.equal(mismatched.browserPagesByRef.get(opened.page_ref)?.stale, true);
+  const afterMismatch = await mismatched.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(afterMismatch.error, "browser_page_stale");
+
+  const escapedTabs = new Map();
+  const escaped = browserPageLifecycleHarness({
+    tabs: escapedTabs,
+    navigationResponder(kind) {
+      if (kind === "update") return { url: "https://other.example/landing" };
+    },
+  });
+  const escapedOpened = await escaped.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/start",
+    idempotencyKey: "open-navigate-escape-1",
+  });
+  const escapedResult = await escaped.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: escapedOpened.page_ref,
+    url: "https://example.com/next",
+    pageGeneration: escapedOpened.page_generation,
+  });
+  assert.equal(escapedResult.error, "browser_page_navigation_out_of_scope");
+  assert.equal(escapedResult.delivery_state, "delivery_unknown");
+  assert.equal(escapedResult.retry_safe, false);
+  assert.equal(escaped.browserPagesByRef.get(escapedOpened.page_ref)?.stale, true);
+
+  const lostTabs = new Map();
+  const lost = browserPageLifecycleHarness({
+    tabs: lostTabs,
+    navigationResponder(kind) {
+      if (kind === "update") throw new Error("navigation response channel lost");
+    },
+  });
+  const lostOpened = await lost.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/start",
+    idempotencyKey: "open-navigate-lost-1",
+  });
+  const lostResult = await lost.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: lostOpened.page_ref,
+    url: "https://example.com/next",
+    pageGeneration: lostOpened.page_generation,
+  });
+  assert.equal(lostResult.error, "browser_page_navigation_transport_failed");
+  assert.equal(lostResult.delivery_state, "delivery_unknown");
+  assert.equal(lostResult.retry_safe, false);
+  assert.equal(lostResult.mutation_submitted, true);
+  assert.equal(lost.browserPagesByRef.get(lostOpened.page_ref)?.stale, true);
+});
+
+test("user reloads only a task-owned page | Given an owned BrowserPage and a claimed user tab | When reload runs with a current page generation | Then the owned page reloads in place, advances its document generation and the claimed tab is refused", async () => {
+  const claimedTabs = new Map([[91, { id: 91, url: "https://example.com/claimed", status: "complete", active: true }]]);
+  const claimedHarness = browserPageLifecycleHarness({ tabs: claimedTabs });
+  const claimed = await claimedHarness.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/claimed",
+    idempotencyKey: "claim-reload-1",
+  });
+  const refused = await claimedHarness.performBrowserPageActionRequest({
+    action: "reload",
+    pageRef: claimed.page_ref,
+    pageGeneration: claimed.page_generation,
+  });
+  assert.equal(refused.error, "browser_page_navigation_owned_only");
+  assert.equal(refused.delivery_state, "not_applied");
+  assert.equal(refused.retry_safe, true);
+  assert.equal(claimedTabs.get(91).status, "complete");
+
+  const tabs = new Map();
+  let reloads = 0;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    navigationResponder(kind) {
+      if (kind === "reload") reloads += 1;
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-reload-1",
+  });
+  assert.equal(opened.ok, true);
+
+  const stale = await h.performBrowserPageActionRequest({
+    action: "reload",
+    pageRef: opened.page_ref,
+    pageGeneration: opened.page_generation + 1,
+  });
+  assert.equal(stale.error, "browser_page_generation_stale");
+  assert.equal(stale.delivery_state, "not_applied");
+  assert.equal(reloads, 0);
+
+  const reloaded = await h.performBrowserPageActionRequest({
+    action: "reload",
+    pageRef: opened.page_ref,
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(reloaded.ok, true);
+  assert.equal(reloaded.delivery_state, "applied");
+  assert.equal(reloaded.reloaded, true);
+  assert.equal(reloaded.reloaded_url, "https://example.com/app");
+  assert.equal(reloaded.page_generation, opened.page_generation + 1);
+  assert.equal(reloaded.mutation_submitted, true);
+  assert.equal(reloads, 1);
+  const live = [...tabs.values()][0];
+  assert.equal(live.url, "https://example.com/app");
+  const record = h.browserPagesByRef.get(opened.page_ref);
+  assert.equal(record.canonical_url, "https://example.com/app");
+  assert.equal(record.stale, false);
+
+  const oldGeneration = await h.performBrowserPageActionRequest({
+    action: "reload",
+    pageRef: opened.page_ref,
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(oldGeneration.error, "browser_page_generation_stale");
+  assert.equal(reloads, 1);
+});
+
+test("user refuses a redirected reload | Given an owned page reload that lands on a different document | When the reloaded URL is not the recorded page URL | Then delivery stays unknown and the handle is stale instead of pretending the page is intact", async () => {
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({
+    tabs,
+    navigationResponder(kind, tabId, _info, tab) {
+      if (kind === "reload") tab.url = "https://example.com/signed-out";
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-reload-redirect-1",
+  });
+  const result = await h.performBrowserPageActionRequest({
+    action: "reload",
+    pageRef: opened.page_ref,
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "browser_page_navigation_mismatch");
+  assert.equal(result.delivery_state, "delivery_unknown");
+  assert.equal(result.retry_safe, false);
+  assert.equal(result.mutation_submitted, true);
+  assert.equal([...tabs.values()][0].url, "https://example.com/signed-out");
+  assert.equal(h.browserPagesByRef.get(opened.page_ref)?.stale, true);
+});
+
+test("user moves through task-owned history | Given an owned page with three same-origin history entries | When back and forward name the exact expected URL | Then each verified move is adopted and fenced by the advanced page generation", async () => {
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({ tabs });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/first",
+    idempotencyKey: "open-history-1",
+  });
+  const second = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: "https://example.com/second",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(second.ok, true);
+  const third = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: "https://example.com/third",
+    pageGeneration: second.page_generation,
+  });
+  assert.equal(third.ok, true);
+
+  const crossOrigin = await h.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://other.example/second",
+    pageGeneration: third.page_generation,
+  });
+  assert.equal(crossOrigin.error, "browser_page_navigation_out_of_scope");
+  assert.equal(crossOrigin.delivery_state, "not_applied");
+  assert.equal([...tabs.values()][0].url, "https://example.com/third");
+
+  const back = await h.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://example.com/second",
+    pageGeneration: third.page_generation,
+  });
+  assert.equal(back.ok, true);
+  assert.equal(back.delivery_state, "applied");
+  assert.equal(back.navigated_url, "https://example.com/second");
+  assert.equal(back.page_generation, third.page_generation + 1);
+  assert.equal([...tabs.values()][0].url, "https://example.com/second");
+
+  const staleBack = await h.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://example.com/first",
+    pageGeneration: third.page_generation,
+  });
+  assert.equal(staleBack.error, "browser_page_generation_stale");
+  assert.equal(staleBack.delivery_state, "not_applied");
+  assert.equal([...tabs.values()][0].url, "https://example.com/second");
+
+  const forward = await h.performBrowserPageActionRequest({
+    action: "forward",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://example.com/third",
+    pageGeneration: back.page_generation,
+  });
+  assert.equal(forward.ok, true);
+  assert.equal(forward.delivery_state, "applied");
+  assert.equal(forward.navigated_url, "https://example.com/third");
+  assert.equal(forward.page_generation, back.page_generation + 1);
+  assert.equal([...tabs.values()][0].url, "https://example.com/third");
+
+  const claimedTabs = new Map([[95, { id: 95, url: "https://example.com/third", status: "complete", active: true }]]);
+  const claimedHarness = browserPageLifecycleHarness({ tabs: claimedTabs });
+  const claimed = await claimedHarness.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/third",
+    idempotencyKey: "claim-history-1",
+  });
+  const claimedBack = await claimedHarness.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: claimed.page_ref,
+    expectedUrl: "https://example.com/second",
+    pageGeneration: claimed.page_generation,
+  });
+  assert.equal(claimedBack.error, "browser_page_navigation_owned_only");
+  assert.equal(claimedBack.delivery_state, "not_applied");
+});
+
+test("user refuses history that lands outside the named entry | Given task-owned history whose previous entry differs from the expected URL | When back settles on the other same-origin entry | Then delivery stays unknown and the page handle is stale", async () => {
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({ tabs });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/first",
+    idempotencyKey: "open-history-mismatch-1",
+  });
+  const next = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: "https://example.com/second",
+    pageGeneration: opened.page_generation,
+  });
+  const live = [...tabs.values()][0];
+  live.history[live.historyIndex - 1] = "https://example.com/landing";
+  const result = await h.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://example.com/first",
+    pageGeneration: next.page_generation,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "browser_page_navigation_mismatch");
+  assert.equal(result.delivery_state, "delivery_unknown");
+  assert.equal(result.retry_safe, false);
+  assert.equal(result.mutation_submitted, true);
+  assert.equal(live.url, "https://example.com/landing");
+  assert.equal(h.browserPagesByRef.get(opened.page_ref)?.stale, true);
 });
