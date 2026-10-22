@@ -148,8 +148,10 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "params": {
                 "properties": {
                     "task_id": {"type": "string", "maxLength": 128},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                    "target": {"type": "string", "maxLength": 256},
                 },
-                "required": ["task_id"],
+                "required": [],
                 "empty": false,
             },
         }),
