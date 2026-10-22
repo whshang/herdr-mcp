@@ -22,6 +22,8 @@ const SEPARATOR = "---";
 const SEEN_LINE = /^\s*(?:[-*+]\s+)?Seen\s+(\d+)\s*[\u00d7xX]\s*\((.*)\)\s*\.?\s*$/;
 const HEADLINE_LINE = /^\s*\*\*(.+)\*\*\s*$/;
 const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+// Trailing sentence punctuation and case are presentation, not lesson identity.
+const TRAILING_PUNCTUATION = /[.\u3002!\uff1f?\s]+$/;
 
 const USAGE = [
   "USAGE: node scripts/lint-findings.mjs [--candidates] [--findings <path>] [--rules <path>]",
@@ -73,8 +75,15 @@ function isCalendarDate(value) {
   return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
 }
 
-function normalizeHeadline(value) {
+function cleanHeadline(value) {
   return value.replace(/\s+/g, " ").trim();
+}
+
+// Identity key for "same one-line rule": differs only by surrounding whitespace,
+// a trailing sentence punctuation run, or letter case counts as the same lesson.
+// Backticks and quotes are NOT stripped - they may change what the rule says.
+function normalizeHeadline(value) {
+  return cleanHeadline(value).replace(TRAILING_PUNCTUATION, "").toLowerCase();
 }
 
 function quote(entry) {
@@ -107,7 +116,7 @@ function parseDocument(path) {
     const headline = line.match(HEADLINE_LINE);
     if (headline) {
       flushLoose();
-      current = { label, headline: normalizeHeadline(headline[1]), lines: [] };
+      current = { label, headline: cleanHeadline(headline[1]), lines: [] };
       entries.push(current);
       continue;
     }
@@ -169,23 +178,38 @@ function collectIssues(findingsDoc, rulesDoc) {
   }
 
   const byHeadline = new Map();
-  for (const doc of [findingsDoc, rulesDoc]) {
+  const documents = [
+    { role: "findings", doc: findingsDoc },
+    { role: "rules", doc: rulesDoc },
+  ];
+  for (const { role, doc } of documents) {
     for (const entry of doc.entries) {
-      const occurrences = byHeadline.get(entry.headline) ?? [];
-      occurrences.push(doc.label);
-      byHeadline.set(entry.headline, occurrences);
+      const key = normalizeHeadline(entry.headline);
+      const occurrence = byHeadline.get(key) ?? { headline: entry.headline, roles: [], labels: [] };
+      occurrence.roles.push(role);
+      occurrence.labels.push(doc.label);
+      byHeadline.set(key, occurrence);
     }
   }
 
-  for (const [headline, labels] of byHeadline) {
+  for (const { headline, roles, labels } of byHeadline.values()) {
     if (labels.length < 2) continue;
-    const inFindings = labels.includes("FINDINGS.md");
-    const inRules = labels.includes("RULES.md");
+    const inFindings = roles.includes("findings");
+    const inRules = roles.includes("rules");
     const reason =
       inFindings && inRules
-        ? "headline appears in both FINDINGS.md and RULES.md; a promoted lesson must be removed from FINDINGS.md"
-        : "headline appears " + labels.length + "× in " + [...new Set(labels)].join(" / ") + "; edit the existing entry instead of adding a duplicate";
-    issues.push("FINDINGS.md: " + JSON.stringify(headline) + " — " + reason);
+        ? "headline appears in both " +
+          findingsDoc.label +
+          " and " +
+          rulesDoc.label +
+          "; a promoted lesson must be removed from " +
+          findingsDoc.label
+        : "headline appears " +
+          labels.length +
+          "× in " +
+          [...new Set(labels)].join(" / ") +
+          "; edit the existing entry instead of adding a duplicate";
+    issues.push(JSON.stringify(headline) + " — " + reason);
   }
 
   for (const entry of findingsDoc.entries) {

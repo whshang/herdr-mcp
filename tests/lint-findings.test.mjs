@@ -139,3 +139,37 @@ test("user sees what is due for promotion | Given a 2-date entry and a 3-date en
   assert.match(result.stdout, /required now \(3\+ distinct review dates;[^\n]*\):\n {4}- 3× Matured lesson/);
   assert.match(result.stdout, /1 entry must be promoted \(candidates mode does not fail\)/);
 });
+
+test("user cannot fork a lesson with a trailing period | Given the headlines **Rule one** and **Rule one.** in FINDINGS.md | When the gate runs | Then it treats both as the same lesson and fails", async () => {
+  const root = await fixture({
+    findings:
+      FINDINGS_PREAMBLE +
+      entry("Rule one", "- Seen 1× (2026-10-10).") +
+      entry("Rule one.", "- Seen 1× (2026-10-11)."),
+  });
+  const result = lint(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /"Rule one" — headline appears 2× in FINDINGS\.md/);
+});
+
+test("user cannot punctuate a promoted lesson to keep it alive | Given FINDINGS.md **Rule one.** and RULES.md **Rule one** | When the gate runs | Then it reports the same headline in both files", async () => {
+  const root = await fixture({
+    findings: FINDINGS_PREAMBLE + entry("Rule one.", "- Seen 2× (2026-10-10, 2026-10-11)."),
+    rules: RULES_PREAMBLE + entry("Rule one", "- Seen 3× (2026-10-10, 2026-10-11, 2026-10-12)."),
+  });
+  const result = lint(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /"Rule one\." — headline appears in both FINDINGS\.md and RULES\.md/);
+});
+
+test("user keeps formatting meaningful | Given two headlines that differ only by code formatting | When the gate runs | Then they stay distinct lessons and it passes", async () => {
+  const root = await fixture({
+    findings:
+      FINDINGS_PREAMBLE +
+      entry("Keep `runtime/current` symlinked", "- Seen 1× (2026-10-10).") +
+      entry("Keep runtime/current symlinked", "- Seen 1× (2026-10-11)."),
+  });
+  const result = lint(root);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /findings-lint: PASS/);
+});
