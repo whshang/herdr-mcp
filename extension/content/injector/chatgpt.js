@@ -604,6 +604,7 @@ if (Date.now() < (this._accountIdentity429Until || 0)) {
       'button[aria-label="Stop streaming" i]',
       'button[aria-label="停止生成"]',
       'button[aria-label="停止流式"]',
+      'button[aria-label="停止"]',
     ];
     const seen = new Set();
     const out = [];

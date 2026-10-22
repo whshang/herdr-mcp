@@ -858,7 +858,7 @@ ok(
   const composerStop = { id: "composer-stop" };
   const unrelatedStop = { id: "unrelated-stop" };
   const composerScope = {
-    querySelectorAll: () => [composerStop],
+    querySelectorAll: (selector) => selector === 'button[aria-label="停止"]' ? [composerStop] : [],
   };
   const composerInput = {
     closest: (selector) => selector === "form" ? composerScope : null,
@@ -877,8 +877,8 @@ ok(
   });
   vm.runInContext(baseCode, stopCtx);
   vm.runInContext(chatgptCode, stopCtx);
-  ok(vm.runInContext("window.__H2W_ADAPTER__.getStopButtonCandidates().length", stopCtx) === 1,
-    "ChatGPT busy detection scopes Stop candidates to the composer instead of unrelated page controls");
+  ok(vm.runInContext("window.__H2W_ADAPTER__.getStopButtonCandidates()[0]", stopCtx) === composerStop,
+    "ChatGPT recognises the Chinese Stop button only inside the observed composer scope");
 }
 {
   const normal = "https://chatgpt.com/c/6a89c95e-70bc-83ea-bf3d-fab6b83fc86e";
