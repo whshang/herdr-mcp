@@ -41,7 +41,7 @@ For multiple lines, reason with a lightweight lane: `objective`, `project_root`,
 
 ## Supervision triggers
 
-On a mechanical trigger — never self-judged confidence — stop iterating and consult an independent advisor with a clean, read-only context: the same lane used 3 repair rounds; two consecutive gate rounds each reporting new failures; a reviewer `BLOCK` twice on the same lane; or an evidence-confirmed stall. The advisor card has three parts: mechanical facts, the planner's current judgment, and the answer the planner hopes to hear, offered so it can be challenged. The advisor may recommend abandoning the approach. Never auto-redispatch a lane whose outcome is uncertain.
+On a mechanical trigger — never self-judged confidence — stop iterating and consult an independent advisor with a clean, read-only context: the same lane used 3 repair rounds; two consecutive gate rounds each reporting new failures; a reviewer `BLOCK` twice on the same lane; or an evidence-confirmed stall. `agent.task.inbox` reports the dispatch-count, failed/blocked-streak, and stall facts as `escalation.signals`; treat them as mechanical evidence, and add review/gate rounds from your own record. The advisor card has three parts: mechanical facts, the planner's current judgment, and the answer the planner hopes to hear, offered so it can be challenged. The advisor may recommend abandoning the approach. Never auto-redispatch a lane whose outcome is uncertain.
 
 ## Worktrees and ownership
 
