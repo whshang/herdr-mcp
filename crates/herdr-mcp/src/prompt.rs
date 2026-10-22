@@ -118,6 +118,11 @@ struct PromptTaskRecord {
     terminal_status: Option<String>,
     terminal_cursor: Option<u64>,
     terminal_at_ms: Option<u64>,
+    /// Bounded tail of the child's recent output captured once at the
+    /// terminal transition. Absent when capture was not eligible or failed;
+    /// skipped on the wire so older runtimes keep loading stored records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_excerpt: Option<String>,
     parent_target: Option<String>,
     #[serde(default)]
     parent_session_ref: Option<String>,
@@ -144,7 +149,7 @@ impl PromptTaskRecord {
     }
 
     fn public_json(&self) -> Value {
-        json!({
+        let mut public = json!({
             "task_id": self.task_id,
             "dispatch_id": self.dispatch_id,
             "target": self.target,
@@ -179,7 +184,13 @@ impl PromptTaskRecord {
             "acknowledged": self.acknowledged_at_ms.is_some(),
             "created_at_ms": self.created_at_ms,
             "updated_at_ms": self.updated_at_ms,
-        })
+        });
+        if let Some(excerpt) = &self.final_excerpt
+            && let Some(object) = public.as_object_mut()
+        {
+            object.insert("final_excerpt".to_owned(), json!(excerpt));
+        }
+        public
     }
 }
 
@@ -503,6 +514,7 @@ impl PromptRegistry {
             terminal_status: None,
             terminal_cursor: None,
             terminal_at_ms: None,
+            final_excerpt: None,
             parent_target: parent_target.map(str::to_owned),
             parent_session_ref: parent_session_ref.map(str::to_owned),
             boot_epoch: self
@@ -1087,6 +1099,9 @@ impl PromptRegistry {
             let attention_state = task_attention_state(&attention, &task.task_id)
                 .map(|state| format!(" [attention={state}]"))
                 .unwrap_or_default();
+            // The final excerpt deliberately stays out of the wake text: child
+            // pane output must not be typed into the parent's prompt, and TUI
+            // agents end their screen with chrome rather than the outcome.
             lines.push(format!(
                 "- {}: {} (child {}, turn {}, terminal_seq {}){}",
                 task.task_id,
@@ -1193,11 +1208,11 @@ impl PromptRegistry {
         if digest.cursor.saturating_sub(task.last_cursor) > 2048 {
             changed |= mark_delivery_uncertain(&mut task, now_ms(), "event_history_gap");
         } else {
-            for event in &digest.events {
-                if apply_task_event(&mut task, event) {
-                    changed = true;
-                }
-            }
+            changed |= apply_events_with_final_excerpt(
+                self.inner.client.as_ref(),
+                &mut task,
+                &digest.events,
+            );
         }
         if digest.cursor > task.last_cursor {
             task.last_cursor = digest.cursor;
@@ -1337,7 +1352,9 @@ enum InboxView {
 
 /// Fields kept by `view: compact`. Attention facts are only carried when the
 /// task object already exposes them; the raw `parent_session_ref` never is.
-const COMPACT_TASK_FIELDS: [&str; 8] = [
+/// `final_excerpt` is present only when captured and spares the planner an
+/// `agent.read` round trip.
+const COMPACT_TASK_FIELDS: [&str; 9] = [
     "task_id",
     "target",
     "pane_id",
@@ -1346,6 +1363,7 @@ const COMPACT_TASK_FIELDS: [&str; 8] = [
     "acknowledged",
     "terminal_at_ms",
     "updated_at_ms",
+    "final_excerpt",
 ];
 
 fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
@@ -1792,6 +1810,157 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Lines of recent unwrapped child output captured at the terminal transition.
+const FINAL_EXCERPT_LINES: usize = 40;
+/// Hard byte cap for the stored excerpt, measured from its end.
+const FINAL_EXCERPT_MAX_BYTES: usize = 2_000;
+/// The one-shot excerpt read shares the native socket path but keeps its own
+/// short bound so a terminal reconcile never stalls on a slow agent read.
+const FINAL_EXCERPT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Applies cache events to a durable task record and, exactly once at an
+/// eligible terminal transition, captures the bounded final excerpt of the
+/// child's recent output. A failed capture only leaves `final_excerpt`
+/// unset; lifecycle, notification, and ack state are untouched.
+fn apply_events_with_final_excerpt(
+    client: Option<&HerdrClient>,
+    task: &mut PromptTaskRecord,
+    events: &[Value],
+) -> bool {
+    let mut changed = false;
+    for event in events {
+        if apply_task_event(task, event) {
+            changed = true;
+        }
+    }
+    if changed && task.is_terminal() && task.final_excerpt.is_none() && final_excerpt_eligible(task)
+    {
+        task.final_excerpt = read_final_excerpt(client, task);
+    }
+    changed
+}
+
+/// Terminal lifecycles that can carry a captured outcome. Excludes
+/// `delivery_uncertain` and pane closure/exiting, which have no readable
+/// agent outcome.
+fn final_excerpt_eligible(task: &PromptTaskRecord) -> bool {
+    matches!(
+        task.lifecycle,
+        PromptTaskLifecycle::Completed | PromptTaskLifecycle::Blocked | PromptTaskLifecycle::Failed
+    ) && !matches!(
+        task.terminal_status.as_deref(),
+        Some("pane_closed" | "pane_exited")
+    )
+}
+
+/// Reads the child's recent unwrapped output through the same native Herdr
+/// socket path the prompt dispatch uses, then bounds it for durable storage.
+fn read_final_excerpt(client: Option<&HerdrClient>, task: &PromptTaskRecord) -> Option<String> {
+    let client = client?;
+    let target = task.pane_id.as_deref().unwrap_or(task.target.as_str());
+    let response = client
+        .call_with_timeout(
+            "agent.read",
+            json!({
+                "target": target,
+                "source": "recent_unwrapped",
+                "lines": FINAL_EXCERPT_LINES,
+                "strip_ansi": true,
+            }),
+            FINAL_EXCERPT_READ_TIMEOUT,
+        )
+        .ok()?;
+    let read = response.get("read").unwrap_or(&response);
+    let text = ["content", "text", "output"]
+        .into_iter()
+        .find_map(|key| read.get(key).and_then(Value::as_str))?;
+    let excerpt = shape_final_excerpt(text);
+    (!excerpt.trim().is_empty()).then_some(excerpt)
+}
+
+/// Strips ANSI/control noise, drops trailing blank lines, and keeps at most
+/// `FINAL_EXCERPT_MAX_BYTES` bytes from the end on a UTF-8 boundary; a
+/// leading `…` marks truncation inside the same byte budget.
+fn shape_final_excerpt(text: &str) -> String {
+    let stripped = strip_ansi_and_control(text);
+    let trimmed = trim_trailing_blank_lines(&stripped);
+    cap_bytes_from_end(trimmed, FINAL_EXCERPT_MAX_BYTES)
+}
+
+/// Removes ANSI escape sequences and control characters while keeping
+/// newlines and tabs so the excerpt stays line-structured.
+fn strip_ansi_and_control(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(current) = chars.next() {
+        match current {
+            '\u{1b}' => skip_ansi_sequence(&mut chars),
+            '\n' | '\t' => out.push(current),
+            current if current.is_control() => {}
+            current => out.push(current),
+        }
+    }
+    out
+}
+
+fn skip_ansi_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.peek() {
+        // CSI: parameters run until the alphabetic final byte.
+        Some('[') => {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        // OSC: runs until BEL or the ESC \\ string terminator.
+        Some(']') => {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == '\u{7}' {
+                    break;
+                }
+                if next == '\u{1b}' {
+                    let _ = chars.next();
+                    break;
+                }
+            }
+        }
+        // Two-byte escapes: consume the single terminator byte.
+        _ => {
+            let _ = chars.next();
+        }
+    }
+}
+
+/// Drops trailing blank lines (the line plus its newline) from the end.
+fn trim_trailing_blank_lines(text: &str) -> &str {
+    let mut end = text.len();
+    for line in text.lines().rev() {
+        if line.trim().is_empty() {
+            end = end.saturating_sub(line.len() + 1);
+        } else {
+            break;
+        }
+    }
+    &text[..end.min(text.len())]
+}
+
+/// Keeps at most `max_bytes` bytes measured from the end; the `…` truncation
+/// marker fits inside the same budget so the result never exceeds it.
+fn cap_bytes_from_end(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let marker_len = '…'.len_utf8().min(max_bytes);
+    let mut start = text.len() + marker_len - max_bytes;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &text[start..])
 }
 
 fn begin_persisted(
@@ -3959,6 +4128,7 @@ mod tests {
             terminal_status: terminal.then(|| lifecycle.as_str().to_owned()),
             terminal_cursor: None,
             terminal_at_ms: terminal.then(|| now.saturating_sub(age_ms)),
+            final_excerpt: None,
             parent_target: Some("parent".to_owned()),
             parent_session_ref: None,
             boot_epoch: None,
@@ -4375,6 +4545,7 @@ mod tests {
             100,
         );
         task.parent_session_ref = Some("session:private-owner".to_owned());
+        task.final_excerpt = Some("DONE: report ready".to_owned());
         registry.save_task(&task, None).unwrap();
 
         let compact = task_call_with_parent_session(
@@ -4390,6 +4561,7 @@ mod tests {
             keys,
             vec![
                 "acknowledged",
+                "final_excerpt",
                 "lifecycle",
                 "pane_id",
                 "target",
@@ -4684,5 +4856,375 @@ mod tests {
         drop(registry);
         remove_task_db(&db_path);
         fs::remove_file(&socket).ok();
+    }
+
+    fn scripted_read_server(
+        listener: UnixListener,
+        responses: Vec<Value>,
+        requests: Arc<Mutex<Vec<(String, Value)>>>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            for mut response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                requests.lock().unwrap().push((
+                    request["method"].as_str().unwrap_or_default().to_owned(),
+                    request["params"].clone(),
+                ));
+                response["id"] = request["id"].clone();
+                writeln!(stream, "{response}").unwrap();
+            }
+        })
+    }
+
+    fn excerpt_test_task(task_id: &str) -> PromptTaskRecord {
+        PromptTaskRecord {
+            schema_version: 1,
+            task_id: task_id.to_owned(),
+            dispatch_id: task_id.to_owned(),
+            target: "child".to_owned(),
+            idempotency_key_digest: None,
+            pane_id: Some("w1:p1".to_owned()),
+            workspace_id: Some("w1".to_owned()),
+            baseline_status: Some("idle".to_owned()),
+            baseline_seq: Some(1),
+            start_cursor: 100,
+            last_cursor: 100,
+            lifecycle: PromptTaskLifecycle::Running,
+            activity_observed: true,
+            prior_settle_observed: true,
+            turn_id: Some(runtime_turn_id(task_id, "dispatch")),
+            exact_native_turn: false,
+            terminal_status: None,
+            terminal_cursor: None,
+            terminal_at_ms: None,
+            final_excerpt: None,
+            parent_target: None,
+            parent_session_ref: None,
+            boot_epoch: Some("boot-excerpt-test".to_owned()),
+            notification_state: "pending".to_owned(),
+            notification_attempts: 0,
+            notification_at_ms: None,
+            notification_error: None,
+            acknowledged_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    /// user owner | Given a running child whose pane reports done | When the
+    /// terminal transition is reconciled | Then exactly one bounded native
+    /// read is captured with ANSI stripped and trailing blanks trimmed.
+    #[test]
+    fn final_excerpt_is_captured_once_at_terminal_transition() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"read": {"content": "analyzing module\n\u{1b}[32mprogress: 50%\u{1b}[0m\nDONE: report at /tmp/report.md\n\n\n"}}}),
+                json!({"result": {"read": {"content": "SECOND READ MUST NEVER REPLACE THE EXCERPT"}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-once");
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            &mut task,
+            &[json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})],
+        );
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        let excerpt = task
+            .final_excerpt
+            .clone()
+            .expect("terminal transition captures an excerpt");
+        assert!(excerpt.contains("progress: 50%"));
+        assert!(!excerpt.contains('\u{1b}'));
+        assert!(excerpt.ends_with("DONE: report at /tmp/report.md\n"));
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "capture must issue exactly one read");
+        assert_eq!(recorded[0].0, "agent.read");
+        assert_eq!(recorded[0].1["target"], "w1:p1");
+        assert_eq!(recorded[0].1["source"], "recent_unwrapped");
+        assert_eq!(recorded[0].1["lines"], FINAL_EXCERPT_LINES);
+        assert_eq!(recorded[0].1["strip_ansi"], true);
+        drop(recorded);
+
+        // A second transition pass must never read or overwrite the excerpt.
+        let changed_again = apply_events_with_final_excerpt(
+            Some(&client),
+            &mut task,
+            &[json!({"cursor": 102, "pane_id": "w1:p1", "agent_status": "done"})],
+        );
+        assert!(changed_again);
+        assert_eq!(task.final_excerpt.as_deref(), Some(excerpt.as_str()));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        // The scripted thread keeps its extra response pending on purpose;
+        // joining would block forever, so leave the thread to the process.
+        drop(server);
+    }
+
+    /// user owner | Given terminal output longer than the byte cap | When the
+    /// excerpt is shaped | Then at most 2 000 bytes are kept from the end on
+    /// a UTF-8 boundary, prefixed with `…` and still ending on the last line.
+    #[test]
+    fn final_excerpt_is_byte_capped_from_the_end() {
+        let filler = "背景 context line with multibyte text\n".repeat(80);
+        let text = format!("{filler}\nFINAL-MARKER-LINE\n");
+        let excerpt = shape_final_excerpt(&text);
+        assert!(excerpt.len() <= FINAL_EXCERPT_MAX_BYTES);
+        assert!(excerpt.starts_with('…'));
+        assert!(excerpt.trim_end().ends_with("FINAL-MARKER-LINE"));
+    }
+
+    /// user owner | Given a pane-closed terminal event | When the transition
+    /// is reconciled | Then no excerpt is captured and no read is issued.
+    #[test]
+    fn pane_closed_tasks_get_no_final_excerpt() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let _server = scripted_read_server(
+            listener,
+            vec![json!({"result": {"read": {"content": "must not be read"}}})],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-pane-closed");
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            &mut task,
+            &[json!({"cursor": 101, "pane_id": "w1:p1", "type": "pane.closed"})],
+        );
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Failed);
+        assert_eq!(task.final_excerpt, None);
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "pane closure must not trigger a native read"
+        );
+    }
+
+    /// user owner | Given a task that times out awaiting activity | When the
+    /// public task status is reconciled | Then it stays delivery_uncertain
+    /// with no excerpt and no native read.
+    #[test]
+    fn delivery_uncertain_tasks_get_no_final_excerpt() {
+        let _guard = crate::test_env::lock();
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let _server = scripted_read_server(
+            listener,
+            vec![json!({"result": {"read": {"content": "must not be read"}}})],
+            Arc::clone(&requests),
+        );
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-excerpt-uncertain-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(store),
+                cache: None,
+                client: Some(HerdrClient::new(&socket)),
+            }),
+        };
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-uncertain");
+        task.lifecycle = PromptTaskLifecycle::AwaitingActivity;
+        task.activity_observed = false;
+        task.updated_at_ms = now_ms().saturating_sub(PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS + 1_000);
+        registry.save_task(&task, None).unwrap();
+
+        let status = registry.task_status("dispatch:prompt:excerpt-uncertain");
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["task"]["lifecycle"], "delivery_uncertain");
+        assert!(
+            status["task"].get("final_excerpt").is_none(),
+            "uncertain tasks never expose an excerpt"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+
+        drop(registry);
+        fs::remove_file(&db_path).ok();
+        fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
+        fs::remove_file(db_path.with_extension("sqlite-shm")).ok();
+    }
+
+    /// user owner | Given a native read that fails | When the terminal
+    /// transition is reconciled | Then the task stays completed with no
+    /// excerpt and lifecycle/notification state unchanged.
+    #[test]
+    fn final_excerpt_read_failure_keeps_lifecycle_and_notification() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let _server = scripted_read_server(
+            listener,
+            vec![json!({"error": {"code": "agent_not_found", "message": "agent gone"}})],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-read-fails");
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            &mut task,
+            &[json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})],
+        );
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(task.terminal_status.as_deref(), Some("done"));
+        assert_eq!(task.notification_state, "pending");
+        assert_eq!(task.final_excerpt, None);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-excerpt-failure-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        let registry = PromptRegistry::with_store(Arc::clone(&store));
+        registry.save_task(&task, None).unwrap();
+        let status = registry.task_status("dispatch:prompt:excerpt-read-fails");
+        assert_eq!(status["task"]["lifecycle"], "completed");
+        assert!(status["task"].get("final_excerpt").is_none());
+
+        drop(registry);
+        drop(store);
+        fs::remove_file(&db_path).ok();
+        fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
+        fs::remove_file(db_path.with_extension("sqlite-shm")).ok();
+    }
+
+    /// user owner | Given stored records with and without the excerpt field |
+    /// When the ledger JSON is decoded | Then old rows still load, None is
+    /// skipped on the wire, and the field round-trips.
+    #[test]
+    fn final_excerpt_field_is_rollback_safe_and_round_trips() {
+        let base = excerpt_test_task("dispatch:prompt:excerpt-serde");
+        assert_eq!(base.final_excerpt, None);
+        let old_shape = serde_json::to_string(&base).unwrap();
+        assert!(!old_shape.contains("final_excerpt"));
+        let old_decoded: PromptTaskRecord = serde_json::from_str(&old_shape).unwrap();
+        assert_eq!(old_decoded.final_excerpt, None);
+
+        let mut upgraded = base.clone();
+        upgraded.final_excerpt = Some("…final report line\n".to_owned());
+        let encoded = serde_json::to_string(&upgraded).unwrap();
+        assert!(encoded.contains("final_excerpt"));
+        // Older runtimes tolerate the extra field: the record has no
+        // deny_unknown_fields and unknown keys are ignored.
+        let with_unknown = encoded.replace('}', ",\"future_field\": 42}");
+        let decoded: PromptTaskRecord = serde_json::from_str(&with_unknown).unwrap();
+        assert_eq!(decoded, upgraded);
+    }
+
+    /// user owner | Given multibyte child output longer than the budget | When
+    /// it is shaped | Then the excerpt stays within the byte cap on a char
+    /// boundary for every truncation offset.
+    #[test]
+    fn final_excerpt_cap_holds_for_multibyte_truncation() {
+        for prefix in 0..4 {
+            let text = format!("{}{}", "a".repeat(prefix), "界".repeat(1_000));
+            let excerpt = shape_final_excerpt(&text);
+            assert!(
+                excerpt.len() <= FINAL_EXCERPT_MAX_BYTES,
+                "{}",
+                excerpt.len()
+            );
+            assert!(excerpt.starts_with('…'));
+            assert!(excerpt.ends_with('界'));
+        }
+    }
+
+    /// user owner | Given a terminal child with a captured excerpt | When the
+    /// parent is woken | Then the wake text carries task facts only and never
+    /// echoes child pane output into the parent's prompt.
+    #[test]
+    fn parent_wake_line_never_echoes_child_excerpt() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let wake_texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let wake_capture = Arc::clone(&wake_texts);
+        let server = thread::spawn(move || {
+            let responses = vec![
+                json!({"result": {"agent": {"pane_id": "w9:p9", "agent_status": "idle", "state_change_seq": 9}}}),
+                json!({"result": {"ok": true}}),
+            ];
+            for mut response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                requests.lock().unwrap().push((
+                    request["method"].as_str().unwrap_or_default().to_owned(),
+                    request["params"].clone(),
+                ));
+                if request["method"] == "agent.prompt" {
+                    wake_capture
+                        .lock()
+                        .unwrap()
+                        .push(request["params"]["text"].as_str().unwrap().to_owned());
+                }
+                response["id"] = request["id"].clone();
+                writeln!(stream, "{response}").unwrap();
+            }
+        });
+
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-excerpt-wake-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(store),
+                cache: None,
+                client: Some(HerdrClient::new(&socket)),
+            }),
+        };
+        let mut task = excerpt_test_task("dispatch:prompt:tail-wake");
+        task.lifecycle = PromptTaskLifecycle::Completed;
+        task.terminal_status = Some("done".to_owned());
+        task.terminal_cursor = Some(101);
+        task.parent_target = Some("parent".to_owned());
+        task.final_excerpt = Some(format!("working notes\n{}\n", "x".repeat(1_000)));
+        registry.save_task(&task, None).unwrap();
+
+        registry.maybe_notify_parent(&task);
+        server.join().unwrap();
+
+        let wake = wake_texts.lock().unwrap();
+        assert_eq!(wake.len(), 1, "parent wake must be delivered once");
+        let text = &wake[0];
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("- dispatch:prompt:tail-wake:"))
+            .expect("wake lists the terminal task");
+        assert!(line.ends_with("terminal_seq 101)"));
+        assert!(!text.contains("working notes"));
+        assert!(!text.contains("xxxx"));
     }
 }

@@ -180,7 +180,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "view": {
                         "type": "string",
                         "enum": ["full", "compact"],
-                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags and timestamps."
+                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps and the bounded final_excerpt when captured."
                     },
                 },
                 "required": [],
