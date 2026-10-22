@@ -671,7 +671,7 @@ impl ProgressiveSkillService {
         let global_digest = Digest::from_content(global_content);
         let catalog = self.catalog();
         let content = format!(
-            "{}\n\n## Progressive load contract\n\nUse the compact `catalog` field to select policy modules. Load all required domains in one call:\n\n```text\nherdr_call(method=\"{}\", params={{\"ids\":[\"files-search\",\"git-repository\"]}})\n```\n\nFor non-trivial task planning, `herdr_call(method=\"{}\", ...)` returns evidence-backed direct/delegation/parallelism advice without choosing or starting an Agent. Loaded text is sticky in the current context while source identity and digest are unchanged. A new user turn does not reload it. Refresh live worker/pane/runtime facts through inspect/since.",
+            "{}\n\n## Progressive load contract\n\nUse the compact `catalog` field to select policy modules. Load all required domains in one call:\n\n```text\nherdr_call(method=\"{}\", params={{\"ids\":[\"files-search\",\"git-repository\"]}})\n```\n\nFor non-trivial task planning, `herdr_call(method=\"{}\", ...)` returns evidence-backed direct/delegation/parallelism advice without choosing or starting an Agent. Loaded text is sticky in the current context while source identity and digest are unchanged. A new user turn does not reload it. Revalidate sticky ids with `expected_digests` plus `omit_unchanged: true` so unchanged bodies are not returned again. Refresh live worker/pane/runtime facts through inspect/since.",
             global_content, LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD
         );
         json!({
@@ -691,6 +691,7 @@ impl ProgressiveSkillService {
                 "params": {
                     "ids": "required array<string>, batched, first-request order preserved",
                     "expected_digests": "optional object keyed by skill id; mismatch fails closed",
+                    "omit_unchanged": "optional boolean; default false; a matching expected_digests entry returns unchanged=true without content",
                     "project_root": "optional string; enables deterministic project-local .agents/skills resolution"
                 },
                 "sticky": "conversation/task-context until source identity or digest changes, new capability domain, handoff, or explicit refresh",
@@ -2093,9 +2094,10 @@ impl ProgressiveSkillService {
     }
 
     fn load_method(&self, params: &Value, snapshot: &Value) -> Value {
-        if let Err(error) =
-            validate_object_keys(params, &["ids", "expected_digests", "project_root"])
-        {
+        if let Err(error) = validate_object_keys(
+            params,
+            &["ids", "expected_digests", "project_root", "omit_unchanged"],
+        ) {
             return error;
         }
         let Some(ids) = params.get("ids").and_then(Value::as_array) else {
@@ -2108,6 +2110,11 @@ impl ProgressiveSkillService {
             None | Some(Value::Null) => None,
             Some(Value::Object(value)) => Some(value),
             Some(_) => return invalid_params("expected_digests must be an object when provided"),
+        };
+        let omit_unchanged = match params.get("omit_unchanged") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return invalid_params("omit_unchanged must be a boolean when provided"),
         };
         let project_root = match optional_project_root(params) {
             Ok(value) => value,
@@ -2135,9 +2142,10 @@ impl ProgressiveSkillService {
                 return json!({"ok": false, "code": "unknown_skill", "id": id});
             };
             let descriptor = &entry.descriptor;
-            if let Some(expected_digest) = expected
+            let expected_digest = expected
                 .and_then(|map| map.get(&id))
-                .and_then(Value::as_str)
+                .and_then(Value::as_str);
+            if let Some(expected_digest) = expected_digest
                 && expected_digest != descriptor.identity.digest.as_str()
             {
                 return json!({
@@ -2148,6 +2156,7 @@ impl ProgressiveSkillService {
                     "actual_digest": descriptor.identity.digest.as_str(),
                 });
             }
+            let unchanged = omit_unchanged && expected_digest.is_some();
             let content = entry.content.clone();
             let (content, cache_hit) = match self.load_verified(&descriptor.identity, &content) {
                 Ok(value) => value,
@@ -2168,9 +2177,14 @@ impl ProgressiveSkillService {
                 loaded_at: now_rfc3339(),
             };
             let mut item = load_evidence_json(&evidence);
-            item.as_object_mut()
-                .expect("load evidence must be an object")
-                .insert("content".to_owned(), json!(content.as_ref()));
+            let object = item
+                .as_object_mut()
+                .expect("load evidence must be an object");
+            if unchanged {
+                object.insert("unchanged".to_owned(), json!(true));
+            } else {
+                object.insert("content".to_owned(), json!(content.as_ref()));
+            }
             loaded.push(item);
         }
         json!({
@@ -3594,6 +3608,175 @@ mod tests {
             .unwrap();
         assert_eq!(result["ok"], false);
         assert_eq!(result["code"], "skill_digest_mismatch");
+        assert_eq!(service.cache_len(), 0);
+    }
+
+    #[test]
+    fn omit_unchanged_skips_content_when_the_expected_digest_matches() {
+        let service = ProgressiveSkillService::new();
+        let _ = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["files-search"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        let baseline = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["files-search"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        let digest = baseline["skills"][0]["digest"].clone();
+        let omitted = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({
+                    "ids": ["files-search"],
+                    "expected_digests": {"files-search": digest},
+                    "omit_unchanged": true
+                }),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(omitted["ok"], true);
+        let entry = &omitted["skills"][0];
+        assert_eq!(entry["unchanged"], true);
+        assert!(entry.get("content").is_none());
+        for key in [
+            "id",
+            "source_identity",
+            "uri",
+            "digest",
+            "version",
+            "bytes",
+            "cache_hit",
+        ] {
+            assert_eq!(
+                entry[key], baseline["skills"][0][key],
+                "{key} must stay identical when content is omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn omit_unchanged_only_omits_ids_with_a_matching_expected_digest() {
+        let service = ProgressiveSkillService::new();
+        let warm = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["files-search", "git-repository"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        let mixed = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({
+                    "ids": ["files-search", "git-repository"],
+                    "expected_digests": {"files-search": warm["skills"][0]["digest"]},
+                    "omit_unchanged": true
+                }),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(mixed["ok"], true);
+        assert_eq!(mixed["skills"][0]["unchanged"], true);
+        assert!(mixed["skills"][0].get("content").is_none());
+        assert_eq!(mixed["skills"][1]["id"], "git-repository");
+        assert!(mixed["skills"][1].get("unchanged").is_none());
+        assert!(mixed["skills"][1]["content"].as_str().is_some());
+    }
+
+    #[test]
+    fn omit_unchanged_keeps_digest_mismatch_fail_closed() {
+        let service = ProgressiveSkillService::new();
+        let baseline = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({
+                    "ids": ["files-search"],
+                    "expected_digests": {"files-search": "sha256:wrong"}
+                }),
+                &snapshot(),
+            )
+            .unwrap();
+        let omitted = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({
+                    "ids": ["files-search"],
+                    "expected_digests": {"files-search": "sha256:wrong"},
+                    "omit_unchanged": true
+                }),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(omitted, baseline);
+        assert_eq!(omitted["code"], "skill_digest_mismatch");
+        assert_eq!(service.cache_len(), 0);
+    }
+
+    #[test]
+    fn omit_unchanged_absent_or_false_keeps_todays_response_shape() {
+        let service = ProgressiveSkillService::new();
+        let absent = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["execution"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        let disabled = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["execution"], "omit_unchanged": false}),
+                &snapshot(),
+            )
+            .unwrap();
+        for response in [&absent, &disabled] {
+            assert_eq!(response["ok"], true);
+            assert_eq!(response["count"], 1);
+            let entry = &response["skills"][0];
+            assert_eq!(entry["id"], "execution");
+            assert!(entry.get("unchanged").is_none());
+            assert!(entry["content"].as_str().is_some());
+        }
+        let keys = absent["skills"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "bytes".to_owned(),
+                "cache_hit".to_owned(),
+                "content".to_owned(),
+                "digest".to_owned(),
+                "id".to_owned(),
+                "loaded_at".to_owned(),
+                "source_identity".to_owned(),
+                "uri".to_owned(),
+                "version".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn omit_unchanged_rejects_non_boolean_values() {
+        let service = ProgressiveSkillService::new();
+        let result = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["execution"], "omit_unchanged": "true"}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "invalid_params");
         assert_eq!(service.cache_len(), 0);
     }
 
