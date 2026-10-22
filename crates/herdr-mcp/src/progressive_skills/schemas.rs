@@ -167,6 +167,17 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "include_acknowledged": {"type": "boolean"},
                     "advisory": {"type": "boolean"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 512},
+                    "wait_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 60000,
+                        "description": "Optional bounded long-poll budget. Returns as soon as an unacknowledged terminal task is in scope; deterministic task facts only, no advisory or semantic work."
+                    },
+                    "view": {
+                        "type": "string",
+                        "enum": ["full", "compact"],
+                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags and timestamps."
+                    },
                 },
                 "required": [],
                 "empty": true,
@@ -179,8 +190,16 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "params": {
                 "properties": {
                     "task_id": {"type": "string", "maxLength": 128},
+                    "task_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 128},
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "uniqueItems": true,
+                        "description": "Optional batch alternative to task_id; out-of-scope or unknown ids are reported as not_found."
+                    },
                 },
-                "required": ["task_id"],
+                "required": [],
                 "empty": false,
             },
         }),

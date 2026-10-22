@@ -24,6 +24,10 @@ const MAX_REPLAY_JSON_BYTES: usize = 128 * 1024;
 const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WAIT_MS: u64 = 25_000;
 const MAX_WAIT_MS: u64 = 60_000;
+/// Poll cadence for the bounded inbox long-poll (durable facts only).
+const INBOX_WAIT_POLL: Duration = Duration::from_millis(250);
+/// One batch ack may acknowledge at most this many tasks.
+const MAX_TASK_ACK_BATCH: usize = 32;
 const DEFAULT_CALL_TIMEOUT_MS: u64 = 30_000;
 /// Only task chains touched in the last 6h are live escalation evidence.
 const ESCALATION_WINDOW_MS: u64 = 6 * 60 * 60_000;
@@ -619,91 +623,191 @@ impl PromptRegistry {
         advisory: bool,
         limit: usize,
     ) -> Value {
-        self.reconcile_active_tasks();
-        match self.list_tasks(512) {
-            Ok(tasks) => {
-                let scoped = tasks
-                    .iter()
-                    .filter(|task| {
-                        task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
-                    })
-                    .filter(|task| {
-                        !task.is_terminal()
-                            || include_acknowledged
-                            || task.acknowledged_at_ms.is_none()
-                    })
-                    .collect::<Vec<_>>();
-
-                let mut terminal = scoped
-                    .iter()
-                    .copied()
-                    .filter(|task| task.is_terminal())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                terminal.sort_by(|left, right| {
-                    task_notification_priority(right)
-                        .cmp(&task_notification_priority(left))
-                        .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
-                });
-                terminal.truncate(limit.clamp(1, 512));
-
-                let mut running = 0_u64;
-                let mut completed = 0_u64;
-                let mut blocked = 0_u64;
-                let mut failed = 0_u64;
-                let mut uncertain = 0_u64;
-                for task in &scoped {
-                    match task.lifecycle {
-                        PromptTaskLifecycle::Running
-                        | PromptTaskLifecycle::AwaitingActivity
-                        | PromptTaskLifecycle::AwaitingPriorSettle => running += 1,
-                        PromptTaskLifecycle::DeliveryUncertain => uncertain += 1,
-                        PromptTaskLifecycle::Completed => completed += 1,
-                        PromptTaskLifecycle::Blocked => blocked += 1,
-                        PromptTaskLifecycle::Failed => failed += 1,
-                    }
-                }
-
-                let attention = if advisory && !terminal.is_empty() {
-                    task_attention_advice(scoped.iter().copied())
-                } else {
-                    json!({
-                        "ok": true,
-                        "attempted": false,
-                        "used": false,
-                        "reason": if advisory { "no_pending_terminal" } else { "not_requested" },
-                        "advisory_only": true,
-                        "children": [],
-                    })
-                };
-
-                // Deterministic escalation facts use the scope filter only
-                // (acknowledged rows still count) and are never gated on the
-                // semantic `advisory` opt-in.
-                let escalation = task_escalation(tasks.iter().filter(|task| {
-                    task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
-                }));
-
-                json!({
-                    "ok": true,
-                    "summary": {
-                        "running": running,
-                        "completed": completed,
-                        "blocked": blocked,
-                        "failed": failed,
-                        "uncertain": uncertain,
-                    },
-                    "tasks": terminal.into_iter().map(|task| task.public_json()).collect::<Vec<_>>(),
-                    "attention": attention,
-                    "escalation": escalation,
-                })
-            }
+        let query = InboxQuery {
+            workspace_id,
+            parent_target,
+            parent_session_ref,
+            include_acknowledged,
+            advisory,
+            limit,
+        };
+        match self.inbox_payload(&query) {
+            Ok(payload) => payload,
             Err(error) => json!({
                 "ok": false,
                 "code": "agent_task_store_unavailable",
                 "message": error,
             }),
         }
+    }
+
+    /// Bounded inbox long-poll: returns immediately when an unacknowledged
+    /// terminal task is already in scope, otherwise reconciles the durable task
+    /// facts until one appears or `wait_ms` elapses. The returned payload is the
+    /// normal inbox shape plus one `wait` object.
+    fn task_inbox_waiting(&self, query: &InboxQuery, wait_ms: u64) -> Value {
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(wait_ms);
+        let woke = loop {
+            match self.inbox_has_pending_terminal(query) {
+                Ok(true) => break "terminal_task",
+                Ok(false) => {}
+                Err(error) => {
+                    return json!({
+                        "ok": false,
+                        "code": "agent_task_store_unavailable",
+                        "message": error,
+                    });
+                }
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break "timeout";
+            }
+            thread::sleep(remaining.min(INBOX_WAIT_POLL));
+        };
+        let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut payload = match self.inbox_payload(query) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "code": "agent_task_store_unavailable",
+                    "message": error,
+                });
+            }
+        };
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "wait".to_owned(),
+                json!({"waited_ms": waited_ms, "woke": woke}),
+            );
+        }
+        payload
+    }
+
+    /// Wake predicate for the inbox long-poll: an unacknowledged terminal task
+    /// inside the caller's scope. `include_acknowledged` deliberately does not
+    /// relax it; the returned payload still honors the caller's own filter.
+    ///
+    /// Only the caller's own nonterminal tasks are reconciled here. The poll
+    /// path must not sweep every lane's already-terminal notification
+    /// bookkeeping, because that would run parent probes and attention advice
+    /// on each tick instead of only on the returned snapshot.
+    fn inbox_has_pending_terminal(&self, query: &InboxQuery) -> Result<bool, String> {
+        let in_scope = |task: &PromptTaskRecord| {
+            task_matches_scope(
+                task,
+                query.workspace_id,
+                query.parent_target,
+                query.parent_session_ref,
+            )
+        };
+        let pending = |task: &PromptTaskRecord| {
+            in_scope(task) && task.is_terminal() && task.acknowledged_at_ms.is_none()
+        };
+        let tasks = self.list_tasks(512)?;
+        if tasks.iter().any(pending) {
+            return Ok(true);
+        }
+        let reconcilable = tasks
+            .iter()
+            .filter(|task| in_scope(task) && !task.is_terminal())
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
+        if reconcilable.is_empty() {
+            return Ok(false);
+        }
+        for task_id in &reconcilable {
+            self.reconcile_task(task_id)?;
+        }
+        Ok(self.list_tasks(512)?.iter().any(pending))
+    }
+
+    fn inbox_payload(&self, query: &InboxQuery) -> Result<Value, String> {
+        let InboxQuery {
+            workspace_id,
+            parent_target,
+            parent_session_ref,
+            include_acknowledged,
+            advisory,
+            limit,
+        } = *query;
+        self.reconcile_active_tasks();
+        let tasks = self.list_tasks(512)?;
+        let scoped = tasks
+            .iter()
+            .filter(|task| {
+                task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
+            })
+            .filter(|task| {
+                !task.is_terminal() || include_acknowledged || task.acknowledged_at_ms.is_none()
+            })
+            .collect::<Vec<_>>();
+
+        let mut terminal = scoped
+            .iter()
+            .copied()
+            .filter(|task| task.is_terminal())
+            .cloned()
+            .collect::<Vec<_>>();
+        terminal.sort_by(|left, right| {
+            task_notification_priority(right)
+                .cmp(&task_notification_priority(left))
+                .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
+        });
+        terminal.truncate(limit.clamp(1, 512));
+
+        let mut running = 0_u64;
+        let mut completed = 0_u64;
+        let mut blocked = 0_u64;
+        let mut failed = 0_u64;
+        let mut uncertain = 0_u64;
+        for task in &scoped {
+            match task.lifecycle {
+                PromptTaskLifecycle::Running
+                | PromptTaskLifecycle::AwaitingActivity
+                | PromptTaskLifecycle::AwaitingPriorSettle => running += 1,
+                PromptTaskLifecycle::DeliveryUncertain => uncertain += 1,
+                PromptTaskLifecycle::Completed => completed += 1,
+                PromptTaskLifecycle::Blocked => blocked += 1,
+                PromptTaskLifecycle::Failed => failed += 1,
+            }
+        }
+
+        let attention = if advisory && !terminal.is_empty() {
+            task_attention_advice(scoped.iter().copied())
+        } else {
+            json!({
+                "ok": true,
+                "attempted": false,
+                "used": false,
+                "reason": if advisory { "no_pending_terminal" } else { "not_requested" },
+                "advisory_only": true,
+                "children": [],
+            })
+        };
+
+        // Deterministic escalation facts use the scope filter only
+        // (acknowledged rows still count) and are never gated on the
+        // semantic `advisory` opt-in.
+        let escalation = task_escalation(tasks.iter().filter(|task| {
+            task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
+        }));
+
+        Ok(json!({
+            "ok": true,
+            "summary": {
+                "running": running,
+                "completed": completed,
+                "blocked": blocked,
+                "failed": failed,
+                "uncertain": uncertain,
+            },
+            "tasks": terminal.into_iter().map(|task| task.public_json()).collect::<Vec<_>>(),
+            "attention": attention,
+            "escalation": escalation,
+        }))
     }
 
     pub fn task_ack_for_parent_session(&self, task_id: &str, parent_session_ref: &str) -> Value {
@@ -751,6 +855,36 @@ impl PromptRegistry {
                 "message": error,
             }),
         }
+    }
+
+    /// Batch ack. Ids are processed in input order; unknown ids and ids owned
+    /// by another parent session are reported as `not_found` and never acked.
+    fn task_ack_many(&self, task_ids: &[&str], parent_session_ref: Option<&str>) -> Value {
+        let mut acked = Vec::with_capacity(task_ids.len());
+        let mut not_found = Vec::new();
+        for task_id in task_ids {
+            let outcome = match parent_session_ref {
+                Some(parent_session_ref) => {
+                    self.task_ack_for_parent_session(task_id, parent_session_ref)
+                }
+                None => self.task_ack(task_id),
+            };
+            match outcome.get("ok").and_then(Value::as_bool) {
+                Some(true) => acked.push(*task_id),
+                Some(false) => {
+                    if matches!(
+                        outcome.get("code").and_then(Value::as_str),
+                        Some("agent_task_not_found" | "agent_task_parent_mismatch")
+                    ) {
+                        not_found.push(*task_id);
+                    } else {
+                        return outcome;
+                    }
+                }
+                None => return outcome,
+            }
+        }
+        json!({"ok": true, "acked": acked, "not_found": not_found})
     }
 
     fn wait_task(&self, task_id: &str, wait: &Value) -> Value {
@@ -1180,6 +1314,110 @@ fn mark_delivery_uncertain(task: &mut PromptTaskRecord, now_ms: u64, reason: &st
     task.notification_error = Some(reason.to_owned());
     task.updated_at_ms = now_ms;
     true
+}
+
+/// Scope and presentation inputs for one `agent.task.inbox` read.
+#[derive(Debug, Clone, Copy)]
+struct InboxQuery<'a> {
+    workspace_id: Option<&'a str>,
+    parent_target: Option<&'a str>,
+    parent_session_ref: Option<&'a str>,
+    include_acknowledged: bool,
+    advisory: bool,
+    limit: usize,
+}
+
+/// Inbox task projection: `full` keeps today's payload, `compact` drops the
+/// fields a supervising planner does not need for a round trip.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum InboxView {
+    Full,
+    Compact,
+}
+
+/// Fields kept by `view: compact`. Attention facts are only carried when the
+/// task object already exposes them; the raw `parent_session_ref` never is.
+const COMPACT_TASK_FIELDS: [&str; 8] = [
+    "task_id",
+    "target",
+    "pane_id",
+    "lifecycle",
+    "terminal",
+    "acknowledged",
+    "terminal_at_ms",
+    "updated_at_ms",
+];
+
+fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
+    task.into_iter()
+        .filter(|(key, _)| {
+            COMPACT_TASK_FIELDS.contains(&key.as_str()) || key.starts_with("attention")
+        })
+        .collect()
+}
+
+fn apply_inbox_view(payload: Value, view: InboxView) -> Value {
+    if view == InboxView::Full {
+        return payload;
+    }
+    let Value::Object(mut object) = payload else {
+        return payload;
+    };
+    if let Some(Value::Array(tasks)) = object.get_mut("tasks") {
+        for task in tasks.iter_mut() {
+            if let Value::Object(task) = task {
+                *task = compact_task(std::mem::take(task));
+            }
+        }
+    }
+    Value::Object(object)
+}
+
+fn parse_inbox_view(params: &Value) -> Result<InboxView, Value> {
+    let Some(view) = params.get("view") else {
+        return Ok(InboxView::Full);
+    };
+    match view.as_str() {
+        Some("full") => Ok(InboxView::Full),
+        Some("compact") => Ok(InboxView::Compact),
+        _ => Err(invalid(r#"view must be "full" or "compact""#)),
+    }
+}
+
+fn parse_inbox_wait_ms(params: &Value) -> Result<Option<u64>, Value> {
+    let Some(wait_ms) = params.get("wait_ms") else {
+        return Ok(None);
+    };
+    match wait_ms.as_u64() {
+        Some(wait_ms) if (1..=MAX_WAIT_MS).contains(&wait_ms) => Ok(Some(wait_ms)),
+        _ => Err(invalid("wait_ms must be an integer between 1 and 60000")),
+    }
+}
+
+fn parse_task_ids(value: &Value) -> Result<Vec<String>, Value> {
+    let Some(values) = value.as_array() else {
+        return Err(invalid("task_ids must be an array of strings"));
+    };
+    if values.is_empty() || values.len() > MAX_TASK_ACK_BATCH {
+        return Err(invalid("task_ids must contain between 1 and 32 ids"));
+    }
+    let mut seen = HashSet::new();
+    let mut ids = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(task_id) = value.as_str() else {
+            return Err(invalid("task_ids must be an array of strings"));
+        };
+        if task_id.is_empty() || task_id.len() > 128 {
+            return Err(invalid(
+                "task_ids entries must be non-empty strings up to 128 bytes",
+            ));
+        }
+        if !seen.insert(task_id) {
+            return Err(invalid("task_ids must be unique"));
+        }
+        ids.push(task_id.to_owned());
+    }
+    Ok(ids)
 }
 
 fn task_matches_scope(
@@ -1832,16 +2070,47 @@ pub fn task_call_with_parent_session(
                 .and_then(Value::as_u64)
                 .unwrap_or(50)
                 .clamp(1, 512) as usize;
-            registry.task_inbox(
+            let wait_ms = match parse_inbox_wait_ms(params) {
+                Ok(wait_ms) => wait_ms,
+                Err(error) => return error,
+            };
+            let view = match parse_inbox_view(params) {
+                Ok(view) => view,
+                Err(error) => return error,
+            };
+            let query = InboxQuery {
                 workspace_id,
                 parent_target,
                 parent_session_ref,
                 include_acknowledged,
                 advisory,
                 limit,
-            )
+            };
+            let inbox = match wait_ms {
+                Some(wait_ms) => registry.task_inbox_waiting(&query, wait_ms),
+                None => registry.task_inbox(
+                    workspace_id,
+                    parent_target,
+                    parent_session_ref,
+                    include_acknowledged,
+                    advisory,
+                    limit,
+                ),
+            };
+            apply_inbox_view(inbox, view)
         }
         AGENT_TASK_ACK_METHOD => {
+            if let Some(task_ids) = params.get("task_ids") {
+                if params.get("task_id").is_some() {
+                    return invalid("choose task_id or task_ids, not both");
+                }
+                let task_ids = match parse_task_ids(task_ids) {
+                    Ok(task_ids) => task_ids,
+                    Err(error) => return error,
+                };
+                let borrowed = task_ids.iter().map(String::as_str).collect::<Vec<_>>();
+                return registry.task_ack_many(&borrowed, caller_parent_session_ref);
+            }
             let Some(task_id) = params.get("task_id").and_then(Value::as_str) else {
                 return invalid("task_id is required");
             };
@@ -3931,5 +4200,489 @@ mod tests {
 
         drop(registry);
         remove_escalation_db(&db_path);
+    }
+
+    fn task_registry(tag: &str) -> (PathBuf, PromptRegistry) {
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-inbox-{}-{}-{}.sqlite",
+            tag,
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        (db_path, PromptRegistry::with_store(store))
+    }
+
+    fn remove_task_db(db_path: &std::path::Path) {
+        fs::remove_file(db_path).ok();
+        fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
+        fs::remove_file(db_path.with_extension("sqlite-shm")).ok();
+    }
+
+    /// user parent | Given an unacknowledged terminal task already in scope |
+    /// When the inbox is read with a long `wait_ms` | Then it returns
+    /// immediately with `woke: terminal_task` instead of blocking.
+    #[test]
+    fn inbox_wait_returns_immediately_when_an_unacknowledged_terminal_task_exists() {
+        let (db_path, registry) = task_registry("wait-ready");
+        let task = escalation_task(
+            "dispatch:prompt:ready",
+            "child",
+            PromptTaskLifecycle::Completed,
+            1_000,
+        );
+        registry.save_task(&task, None).unwrap();
+
+        let started = std::time::Instant::now();
+        let inbox = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_target": "parent", "wait_ms": 60_000}),
+            None,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(inbox["ok"], true);
+        assert_eq!(inbox["wait"]["woke"], "terminal_task");
+        assert!(
+            inbox["wait"]["waited_ms"].as_u64().unwrap() < 1_000,
+            "an already-pending inbox must not consume the wait budget"
+        );
+        assert_eq!(inbox["tasks"][0]["task_id"], "dispatch:prompt:ready");
+        assert!(elapsed < Duration::from_secs(5));
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user parent | Given only a running child task | When the inbox waits and
+    /// the task turns terminal during the wait | Then it wakes on the new
+    /// terminal fact instead of waiting for the timeout.
+    #[test]
+    fn inbox_wait_wakes_when_a_running_task_completes() {
+        let (db_path, registry) = task_registry("wait-wakes");
+        let running = escalation_task(
+            "dispatch:prompt:slow",
+            "child",
+            PromptTaskLifecycle::Running,
+            0,
+        );
+        registry.save_task(&running, None).unwrap();
+
+        let mut terminal = running.clone();
+        terminal.lifecycle = PromptTaskLifecycle::Completed;
+        terminal.terminal_status = Some("completed".to_owned());
+        terminal.terminal_at_ms = Some(now_ms());
+        terminal.updated_at_ms = now_ms();
+        terminal.notification_state = "delivered".to_owned();
+        let writer = registry.clone();
+        let writer_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            writer.save_task(&terminal, None).unwrap();
+        });
+
+        let inbox = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_target": "parent", "wait_ms": 800}),
+            None,
+        );
+        writer_handle.join().unwrap();
+
+        assert_eq!(inbox["wait"]["woke"], "terminal_task");
+        assert!(
+            inbox["wait"]["waited_ms"].as_u64().unwrap() >= 40,
+            "waited_ms must report the observed wait window"
+        );
+        assert_eq!(inbox["tasks"][0]["task_id"], "dispatch:prompt:slow");
+        assert_eq!(inbox["tasks"][0]["lifecycle"], "completed");
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user parent | Given a running task that never settles | When the inbox
+    /// waits | Then it times out with `woke: timeout` and the same task facts a
+    /// non-waiting read would return.
+    #[test]
+    fn inbox_wait_times_out_with_the_same_task_facts() {
+        let (db_path, registry) = task_registry("wait-timeout");
+        let running = escalation_task(
+            "dispatch:prompt:still-running",
+            "child",
+            PromptTaskLifecycle::Running,
+            0,
+        );
+        registry.save_task(&running, None).unwrap();
+
+        let inbox = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_target": "parent", "wait_ms": 120}),
+            None,
+        );
+        let plain = registry.task_inbox(None, Some("parent"), None, false, false, 50);
+
+        assert_eq!(inbox["wait"]["woke"], "timeout");
+        assert!(inbox["wait"]["waited_ms"].as_u64().unwrap() >= 120);
+        assert_eq!(inbox["summary"], plain["summary"]);
+        assert_eq!(inbox["tasks"], plain["tasks"]);
+        assert_eq!(inbox["escalation"], plain["escalation"]);
+        assert_eq!(inbox["summary"]["running"], 1);
+        assert!(inbox["tasks"].as_array().unwrap().is_empty());
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user parent | Given a `wait_ms` outside 1..=60000 | When the inbox is
+    /// read | Then the call is rejected with the existing invalid-params style.
+    #[test]
+    fn inbox_rejects_wait_ms_outside_the_bounded_range() {
+        let registry = PromptRegistry::new();
+        for wait_ms in [
+            json!(0),
+            json!(60_001),
+            json!("300"),
+            json!(1.5),
+            json!(null),
+        ] {
+            let inbox = task_call_with_parent_session(
+                &registry,
+                AGENT_TASK_INBOX_METHOD,
+                &json!({"wait_ms": wait_ms}),
+                None,
+            );
+            assert_eq!(inbox["ok"], false, "wait_ms={wait_ms} must be rejected");
+            assert_eq!(inbox["code"], "invalid_params");
+            assert!(
+                inbox["message"].as_str().unwrap().contains("wait_ms"),
+                "rejection must name wait_ms"
+            );
+        }
+    }
+
+    /// user parent | Given a terminal task | When the inbox is read with
+    /// `view: compact` | Then each task keeps only the projection fields, never
+    /// the raw parent session reference, while the full view is unchanged.
+    #[test]
+    fn inbox_compact_view_projects_listed_fields_only() {
+        let (db_path, registry) = task_registry("compact");
+        let mut task = escalation_task(
+            "dispatch:prompt:compact",
+            "child",
+            PromptTaskLifecycle::Completed,
+            100,
+        );
+        task.parent_session_ref = Some("session:private-owner".to_owned());
+        registry.save_task(&task, None).unwrap();
+
+        let compact = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_target": "parent", "view": "compact"}),
+            Some("session:private-owner"),
+        );
+        let projected = compact["tasks"][0].as_object().unwrap();
+        let mut keys = projected.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "acknowledged",
+                "lifecycle",
+                "pane_id",
+                "target",
+                "task_id",
+                "terminal",
+                "terminal_at_ms",
+                "updated_at_ms",
+            ]
+        );
+        assert_eq!(projected["task_id"], "dispatch:prompt:compact");
+        assert_eq!(projected["target"], "child");
+        assert_eq!(projected["pane_id"], "w1:p1");
+        assert_eq!(projected["lifecycle"], "completed");
+        assert_eq!(projected["terminal"], true);
+        assert_eq!(projected["acknowledged"], false);
+        assert!(projected["terminal_at_ms"].is_u64());
+        assert!(projected["updated_at_ms"].is_u64());
+        assert!(!compact.to_string().contains("session:private-owner"));
+        assert_eq!(compact["summary"]["completed"], 1);
+        assert_eq!(compact["escalation"]["redispatch"], "never_automatic");
+        assert!(compact.get("wait").is_none());
+
+        let full = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_target": "parent"}),
+            Some("session:private-owner"),
+        );
+        let full_task = &full["tasks"][0];
+        assert_eq!(full_task["parent_session_ref"], "session:private-owner");
+        assert_eq!(full_task["dispatch_id"], "dispatch:prompt:compact");
+        assert!(full_task.as_object().unwrap().len() > 8);
+        assert!(full.get("wait").is_none());
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user parent | Given an unknown `view` value | When the inbox is read |
+    /// Then the call is rejected with the existing invalid-params style.
+    #[test]
+    fn inbox_rejects_an_unknown_view() {
+        let registry = PromptRegistry::new();
+        let inbox = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"view": "brief"}),
+            None,
+        );
+        assert_eq!(inbox["code"], "invalid_params");
+        assert!(inbox["message"].as_str().unwrap().contains("view"));
+    }
+
+    /// user parent | Given in-scope, out-of-scope, and unknown task ids | When
+    /// one batch ack is submitted | Then only in-scope ids are acked and the
+    /// rest are reported as `not_found` in input order.
+    #[test]
+    fn batch_ack_acks_in_scope_ids_and_reports_the_rest_as_not_found() {
+        let (db_path, registry) = task_registry("ack-batch");
+        for (task_id, session) in [
+            ("dispatch:prompt:ack-a", Some("session:parent")),
+            ("dispatch:prompt:ack-b", Some("session:parent")),
+            ("dispatch:prompt:ack-other", Some("session:other")),
+        ] {
+            let mut task = escalation_task(task_id, "child", PromptTaskLifecycle::Completed, 100);
+            task.parent_session_ref = session.map(str::to_owned);
+            registry.save_task(&task, None).unwrap();
+        }
+
+        let result = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_ACK_METHOD,
+            &json!({"task_ids": [
+                "dispatch:prompt:ack-b",
+                "dispatch:prompt:ack-a",
+                "dispatch:prompt:ack-other",
+                "dispatch:prompt:unknown",
+            ]}),
+            Some("session:parent"),
+        );
+        assert_eq!(
+            result,
+            json!({
+                "ok": true,
+                "acked": ["dispatch:prompt:ack-b", "dispatch:prompt:ack-a"],
+                "not_found": ["dispatch:prompt:ack-other", "dispatch:prompt:unknown"],
+            })
+        );
+        for task_id in ["dispatch:prompt:ack-a", "dispatch:prompt:ack-b"] {
+            assert!(
+                registry
+                    .load_task(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .acknowledged_at_ms
+                    .is_some(),
+                "{task_id} must be acknowledged"
+            );
+        }
+        assert_eq!(
+            registry
+                .load_task("dispatch:prompt:ack-other")
+                .unwrap()
+                .unwrap()
+                .acknowledged_at_ms,
+            None,
+            "an out-of-scope task must never be acked"
+        );
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user parent | Given malformed `task_ids` batches | When a batch ack is
+    /// submitted | Then every malformed batch is rejected before any mutation.
+    #[test]
+    fn batch_ack_rejects_empty_oversized_duplicate_or_mixed_batches() {
+        let (db_path, registry) = task_registry("ack-invalid");
+        let mut duplicate = escalation_task(
+            "dispatch:prompt:dup",
+            "child",
+            PromptTaskLifecycle::Completed,
+            100,
+        );
+        duplicate.parent_session_ref = Some("session:parent".to_owned());
+        registry.save_task(&duplicate, None).unwrap();
+
+        let oversized = (0..33)
+            .map(|index| format!("dispatch:prompt:many-{index}"))
+            .collect::<Vec<_>>();
+        for params in [
+            json!({"task_ids": []}),
+            json!({"task_ids": oversized}),
+            json!({"task_ids": ["dispatch:prompt:dup", "dispatch:prompt:dup"]}),
+            json!({"task_id": "dispatch:prompt:dup", "task_ids": ["dispatch:prompt:dup"]}),
+            json!({"task_ids": "dispatch:prompt:dup"}),
+            json!({"task_ids": [7]}),
+            json!({"task_ids": [""]}),
+        ] {
+            let result = task_call_with_parent_session(
+                &registry,
+                AGENT_TASK_ACK_METHOD,
+                &params,
+                Some("session:parent"),
+            );
+            assert_eq!(
+                result["code"], "invalid_params",
+                "{params} must be rejected"
+            );
+        }
+        assert_eq!(
+            registry
+                .load_task("dispatch:prompt:dup")
+                .unwrap()
+                .unwrap()
+                .acknowledged_at_ms,
+            None,
+            "a rejected batch must not acknowledge anything"
+        );
+
+        // The single-task path keeps today's response shape.
+        let single = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_ACK_METHOD,
+            &json!({"task_id": "dispatch:prompt:dup"}),
+            Some("session:parent"),
+        );
+        assert_eq!(single["ok"], true);
+        assert_eq!(single["task"]["task_id"], "dispatch:prompt:dup");
+        assert_eq!(single["task"]["acknowledged"], true);
+        assert!(single.get("acked").is_none());
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+    fn counting_agent_server(
+        listener: UnixListener,
+        prompt_texts: Arc<Mutex<Vec<String>>>,
+        state_probes: Arc<AtomicU64>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            while !stop.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let mut response = match request["method"].as_str() {
+                    Some("agent.prompt") => {
+                        prompt_texts
+                            .lock()
+                            .unwrap()
+                            .push(request["params"]["text"].as_str().unwrap_or("").to_owned());
+                        json!({"error": {"code": "agent_not_found", "message": "agent target did not resolve"}})
+                    }
+                    _ => {
+                        state_probes.fetch_add(1, Ordering::SeqCst);
+                        json!({"result": {"agent": {
+                            "pane_id": "w1:p2",
+                            "agent_status": "working",
+                            "state_change_seq": 5
+                        }}})
+                    }
+                };
+                response["id"] = request["id"].clone();
+                writeln!(stream, "{response}").ok();
+            }
+        })
+    }
+
+    /// user parent | Given an acknowledged terminal task whose notification is
+    /// still pending and a busy parent agent | When the inbox waits | Then the
+    /// poll ticks stay on durable task facts instead of re-probing the parent on
+    /// every tick; only the returned snapshot may notify.
+    #[test]
+    fn inbox_wait_poll_does_not_repeat_parent_notification_probes() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let prompt_texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let state_probes = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = counting_agent_server(
+            listener,
+            Arc::clone(&prompt_texts),
+            Arc::clone(&state_probes),
+            Arc::clone(&stop),
+        );
+
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-inbox-probe-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(store),
+                cache: None,
+                client: Some(HerdrClient::new(&socket)),
+            }),
+        };
+        let mut task = escalation_task(
+            "dispatch:prompt:pending-notify",
+            "child",
+            PromptTaskLifecycle::Completed,
+            500,
+        );
+        task.acknowledged_at_ms = Some(now_ms());
+        task.notification_state = "pending".to_owned();
+        registry.save_task(&task, None).unwrap();
+
+        let inbox = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_target": "parent", "wait_ms": 700}),
+            None,
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&socket);
+        server.join().unwrap();
+
+        assert_eq!(inbox["wait"]["woke"], "timeout");
+        assert_eq!(
+            state_probes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the returned snapshot may probe the parent agent"
+        );
+        assert!(
+            prompt_texts.lock().unwrap().is_empty(),
+            "a busy parent must not receive a notification"
+        );
+        assert_eq!(
+            registry
+                .load_task("dispatch:prompt:pending-notify")
+                .unwrap()
+                .unwrap()
+                .notification_attempts,
+            0
+        );
+
+        drop(registry);
+        remove_task_db(&db_path);
+        fs::remove_file(&socket).ok();
     }
 }
