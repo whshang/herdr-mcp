@@ -420,6 +420,9 @@ impl LocalMcpTransport {
             return Ok(None);
         };
         let object = value.as_object().ok_or(())?;
+        // The authorization wire is exactly three fields. A fourth
+        // (platform_account) must never ride the header: old runtimes
+        // reject the extra field and new runtimes do not consume it.
         if object.len() != 3
             || !object.contains_key("principal_ref")
             || !object.contains_key("connector_id")

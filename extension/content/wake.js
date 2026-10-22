@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.212";
+const H2W_CONTENT_VERSION = "0.1.232";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2428,6 +2428,21 @@ function normalizeHerdrMentionAlias(value) {
     return evidence;
   }
 
+  function chatGptDispatchBaselineRejectionReason(snapshot) {
+    // The returned error is a fixed enum: never forward URLs, status bodies,
+    // user messages, or raw Provider errors. This remains a pre-send refusal.
+    if (snapshot?.ok && !snapshot.userMessageId) return "browser_dispatch_baseline_user_id_missing";
+    const reason = String(snapshot?.reason || "");
+    if (reason === "http-429") return "browser_dispatch_baseline_http429";
+    if (reason === "auth" || reason === "http-401") return "browser_dispatch_baseline_auth";
+    if (reason === "http-403") return "browser_dispatch_baseline_forbidden";
+    if (reason === "http-404") return "browser_dispatch_baseline_not_found";
+    if (reason === "timeout") return "browser_dispatch_baseline_timeout";
+    if (reason === "fetch-failed") return "browser_dispatch_baseline_network";
+    if (/^http-5[0-9][0-9]$/.test(reason)) return "browser_dispatch_baseline_server";
+    return "browser_dispatch_baseline_unavailable";
+  }
+
   async function performBrowserActuationCommand(command) {
     const dispatchId = typeof command?.dispatch_id === "string" ? command.dispatch_id : "";
     const expectedGeneration = Number(command?.expected_generation || 0);
@@ -2628,12 +2643,19 @@ function normalizeHerdrMentionAlias(value) {
     const boundedChatGptSubmit = exactChatGptDispatchIdentity || (
       ADAPTER.name === "chatgpt" && creatingSession
     );
-    const snapshotTimeoutMs = exactChatGptDispatchIdentity || creatingSession ? 1200 : 6000;
+    let snapshotTimeoutMs = 6000;
+    if (creatingSession) snapshotTimeoutMs = 1200;
+    if (exactChatGptDispatchIdentity) snapshotTimeoutMs = 3000;
     const beforeServer = ADAPTER.name === "chatgpt"
       ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
       : { ok: false };
     const beforeDom = providerMessageSnapshot("user");
     const beforeAssistant = providerMessageSnapshot("assistant");
+    // Dispatch needs a provider-owned pre-submit user ID to prove advancement.
+    // Refuse before touching the composer when that baseline is unavailable.
+    if (exactChatGptDispatchIdentity && (!beforeServer?.ok || !beforeServer.userMessageId)) {
+      return browserRejectedEvidence(evidence, chatGptDispatchBaselineRejectionReason(beforeServer));
+    }
     const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
     const result = await performWake({
       template: message,
@@ -2643,13 +2665,18 @@ function normalizeHerdrMentionAlias(value) {
       expectedConvKey: command?.expectedConvKey ?? null,
       requiredApps,
     });
-    if (!result?.ok) {
-      if (boundedChatGptSubmit && result?.uncertain === true) {
-        evidence.command_accepted = true;
-        evidence.resource_available = true;
-        evidence.canonical_url_observed = providerCanonicalConversationObserved();
-        return evidence;
-      }
+    // A previously latched uncertain submit cannot be attributed to this
+    // dispatch. Preserve uncertainty without attempting another provider send.
+    if (boundedChatGptSubmit && result?.blocked === "submit-uncertain") {
+      evidence.command_accepted = true;
+      evidence.resource_available = true;
+      evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      return evidence;
+    }
+    // A one-shot send may succeed after its immediate UI acknowledgement
+    // expires. Use existing bounded exact-message readback without resubmitting.
+    const submitUnconfirmed = boundedChatGptSubmit && result?.uncertain === true;
+    if (!result?.ok && !submitUnconfirmed) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
@@ -2798,9 +2825,16 @@ function normalizeHerdrMentionAlias(value) {
         afterAssistant.text
         && afterAssistant.text !== beforeAssistant.text,
       );
+      const providerAssistantAdvanced = Boolean(
+        conversationStillExpected && serverAdvanced
+        && typeof beforeServer?.messageId === "string" && beforeServer.messageId
+        && typeof afterServer?.messageId === "string" && afterServer.messageId
+        && afterServer.messageId !== beforeServer.messageId,
+      );
       evidence.generation_status_observed = Boolean(
         isTurnInProgress()
-        || assistantAdvanced,
+        || assistantAdvanced
+        || providerAssistantAdvanced,
       );
       if (evidence.accepted_message_observed
           && (creatingSession || evidence.generation_status_observed)
@@ -3199,6 +3233,10 @@ function normalizeHerdrMentionAlias(value) {
             browserProjectName: project?.name || null,
             browserSessionRef: identityMatchesRoute ? registeredBrowserSessionRef : null,
             browserGeneration: identityMatchesRoute ? registeredBrowserGeneration : null,
+            registrationStatus: lastBrowserRegistrationStatus,
+            identityRelation: lastBrowserIdentityRelation,
+            contactProof: lastBrowserContactProof,
+            bearerRelation: lastBrowserBearerRelation,
           });
         })();
         return true;
@@ -3612,9 +3650,70 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   const registrationInFlight = new Map();
+  // Privacy-preserving registration diagnostics: finite states only, never IDs.
+  let lastBrowserRegistrationStatus = "not_observed";
+  let lastBrowserIdentityRelation = "not_observed";
+  let lastBrowserContactProof = "not_observed";
+  let lastBrowserBearerRelation = "not_observed";
+
+  async function browserAccountObservation() {
+    try {
+      if (typeof ADAPTER.getAccountObservation === "function") {
+        const observed = await ADAPTER.getAccountObservation();
+        const nativeIdentity = typeof observed?.nativeIdentity === "string" && observed.nativeIdentity.trim()
+          ? observed.nativeIdentity.trim()
+          : null;
+        const email = typeof observed?.email === "string" ? observed.email.trim().toLowerCase() : "";
+        return {
+          nativeIdentity,
+          email: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null,
+          reason: [
+            "native_id_conflict_matching_email",
+            "native_id_conflict_different_email",
+            "native_id_conflict_unverified_email",
+            "email_conflict",
+          ].includes(observed?.reason) ? observed.reason : null,
+          idRelation: [
+            "me_matches_session_account_id",
+            "me_differs_session_user_and_account_id",
+            "me_differs_session_user_without_account_id",
+            "unclassified",
+          ].includes(observed?.idRelation) ? observed.idRelation : null,
+          emailProof: [
+            "emails_match", "emails_differ", "session_email_missing",
+            "me_email_missing", "both_emails_missing",
+          ].includes(observed?.emailProof) ? observed.emailProof : null,
+          bearerRelation: [
+            "bearer_token_unavailable", "bearer_not_authorized",
+            "bearer_rate_limited", "bearer_response_unavailable",
+            "bearer_identity_missing", "bearer_matches_session_user",
+            "bearer_matches_session_account", "bearer_matches_cookie_me",
+            "bearer_differs_from_session", "bearer_network_unavailable",
+          ].includes(observed?.bearerRelation) ? observed.bearerRelation : null,
+        };
+      }
+    } catch (_) {}
+    return { nativeIdentity: await browserAccountNativeIdentity(), email: null };
+  }
 
   async function runConversationRegistration(reason, convKey, registrationAttempt) {
-    const accountNativeIdentity = await browserAccountNativeIdentity();
+    const accountObservation = await browserAccountObservation();
+    const accountNativeIdentity = accountObservation.nativeIdentity;
+    const conflictStatuses = {
+      native_id_conflict_matching_email: "id_conflict_matching_email",
+      native_id_conflict_different_email: "id_conflict_different_email",
+      native_id_conflict_unverified_email: "id_conflict_unverified_email",
+      email_conflict: "email_conflict",
+    };
+    lastBrowserRegistrationStatus = accountNativeIdentity ? "identity_observed"
+      : conflictStatuses[accountObservation?.reason] || "identity_unavailable";
+    lastBrowserIdentityRelation = accountObservation?.idRelation || "not_observed";
+    lastBrowserContactProof = accountObservation?.emailProof || "not_observed";
+    lastBrowserBearerRelation = accountObservation?.bearerRelation || "not_observed";
+    // Never attempt to associate a ChatGPT route when no authenticated
+    // identity is available. A fresh tab can have conflicting login endpoints
+    // during an account switch; report only a bounded diagnostic state.
+    if (ADAPTER.name === "chatgpt" && !accountNativeIdentity) return null;
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
       try {
@@ -3657,18 +3756,52 @@ function normalizeHerdrMentionAlias(value) {
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
       ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
       : [];
+    // A previous account's tab can retain its old DOM after account switching.
+    // Verify this exact conversation is readable in the current signed-in
+    // provider session before publishing any account/session association.
+    if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
+      const proof = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+      if (!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim()) {
+        lastBrowserRegistrationStatus = "provider_readback_unavailable";
+        if (registeredConvKey === convKey) {
+          registeredConvKey = null;
+          registeredBrowserSessionRef = null;
+          registeredBrowserGeneration = null;
+          registeredHerdrAppKeyword = null;
+          registeredConversationBound = false;
+        }
+        return null;
+      }
+    }
+    // Async project discovery can outlive an account or project switch.
+    // Fence the registration against the current page before publishing it.
+    const currentAccount = await browserAccountObservation();
+    const currentProject = typeof ADAPTER.getProjectIdentity === "function"
+      ? ADAPTER.getProjectIdentity()
+      : adapterProject;
+    if (registrationAttempt !== browserRegistrationAttempt
+        || ADAPTER.getConversationKey() !== convKey
+        || currentAccount.nativeIdentity !== accountNativeIdentity
+        || (currentProject?.id || null) !== (adapterProject?.id || null)) {
+      return null;
+    }
     const response = await sendBg({
       type: "h2w_register",
       convKey,
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
+      accountDisplayEmail: currentAccount.email,
       browserProjects,
       browserAppKeywords,
       browserCurrentProjectId: browserCurrentProject?.id || null,
       browserCurrentProjectName: browserCurrentProject?.name || null,
       browserSessionReservationRef,
     });
+    lastBrowserRegistrationStatus = response === null ? "background_unavailable"
+      : Number.isSafeInteger(response?.browser_generation) && response.browser_generation > 0
+        && typeof response?.browser_account_ref === "string" && response.browser_account_ref
+        ? "registry_observed" : "registry_unobserved";
     if (response !== null) {
       if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
         if (registeredConvKey === convKey) {

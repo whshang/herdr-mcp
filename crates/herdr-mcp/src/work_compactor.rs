@@ -2059,18 +2059,23 @@ mod audit_fix_tests {
 
     #[test]
     fn scope_guard_refuses_home_ancestors_and_global_agent_dirs() {
-        let home = Path::new("/home/someone");
-        let allowed = |p: &str| is_allowed_project_root_with_home(Path::new(p), Some(home));
-        assert!(!allowed("/"));
-        assert!(!allowed("/home"));
-        assert!(!allowed("/home/someone"));
-        assert!(!allowed("/home/someone/.agents"));
-        assert!(!allowed("/home/someone/.claude"));
-        assert!(!allowed("/home/someone/.codex"));
-        assert!(!allowed("/home/someone/.config/foo"));
-        assert!(allowed("/home/someone/code/proj"));
-        assert!(allowed("/workspace/proj"));
-        assert!(allowed("/home/someone/code/.hidden-proj"));
+        let base = std::env::temp_dir().join(format!("herdr-scope-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let base = fs::canonicalize(base).unwrap();
+        let home = base.join("home/someone");
+        fs::create_dir_all(&home).unwrap();
+        let allowed = |path: &Path| is_allowed_project_root_with_home(path, Some(&home));
+        assert!(!allowed(Path::new("/")));
+        assert!(!allowed(&base));
+        assert!(!allowed(&base.join("home")));
+        assert!(!allowed(&home));
+        for hidden in [".agents", ".claude", ".codex", ".config/foo"] {
+            assert!(!allowed(&home.join(hidden)), "{hidden}");
+        }
+        assert!(allowed(&home.join("code/proj")));
+        assert!(allowed(Path::new("/workspace/proj")));
+        assert!(allowed(&home.join("code/.hidden-proj")));
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

@@ -38,6 +38,7 @@ import {
   bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
 } from "./artifact-capture-gate.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
+import { formatPlatformAccountDisplay } from "./account-display.js";
 import { jsonBridgeRpc, normalizeJsonBridgeBatch, runJsonBridgeBatch } from "./background/json-bridge.js";
 import { NATIVE_HOST_NOT_INSTALLED, NATIVE_ORIGIN_NOT_ACTIVE } from "./native-host-diagnostics.js";
 import { captureImageArtifactNative, captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
@@ -56,8 +57,12 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.212";
+const H2W_SCRIPT_VERSION = "0.1.232";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
+// Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
+// fence. Keep listening for the ORIGINAL content reply within that fence;
+// never issue a second provider mutation when the initial wait expires.
+const BROWSER_DISPATCH_CONTENT_TIMEOUT_MS = 40_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -2131,6 +2136,7 @@ async function observeBrowserConversation({
   convKey,
   pageInfo,
   accountNativeIdentity,
+  accountDisplayLabel = null,
   projects = [],
   reservationRef = null,
 }) {
@@ -2161,7 +2167,7 @@ async function observeBrowserConversation({
     kind: "account",
     parent_ref: null,
     native_identity: accountNativeIdentity,
-    display_label: null,
+    display_label: accountDisplayLabel,
     canonical_url: accountLaunchUrl,
     observation_generation: observationGeneration,
     observed_at: Date.now(),
@@ -2218,6 +2224,7 @@ async function observeBrowserConversation({
     spaceRef,
     projectId: pageInfo.project_id || null,
     projectName: pageInfo.project_name || null,
+    accountDisplay: accountDisplayLabel,
     observationGeneration,
     lastSeenAt: Date.now(),
   });
@@ -2915,13 +2922,15 @@ async function sendChatGptTabMessage(tabId, message, responseTimeoutMs = 0) {
 }
 
 async function sendBrowserActuationTabMessage(tabId, message, responseTimeoutMs = 0) {
-  // Browser dispatch stays a single fenced mutation attempt. Bound the content
-  // response so one stale view cannot block the shared push queue past the
-  // runtime actuation deadline; never reload or resend a submit/stop command.
-  if (Number(responseTimeoutMs) > 0) {
-    return sendTabMessageWithTimeout(tabId, message, Number(responseTimeoutMs));
-  }
-  return sendTabMessageWithTimeout(tabId, message, 18000);
+  // Preserve a single fenced physical mutation. A Dispatch response may finish
+  // after the Runtime's initial 22s wait; the Runtime retains exact late
+  // completion for 60s. This callback runs off the shared SSE push queue, so
+  // waiting for the original proof cannot starve later events. Never retry
+  // or reload a tab after uncertain submission.
+  const defaultTimeoutMs = message?.command?.operation === "herdr_mcp.browser_dispatch.submit"
+    ? BROWSER_DISPATCH_CONTENT_TIMEOUT_MS : 18000;
+  const timeoutMs = Number(responseTimeoutMs) > 0 ? Number(responseTimeoutMs) : defaultTimeoutMs;
+  return sendTabMessageWithTimeout(tabId, message, timeoutMs);
 }
 
 async function handoffMessageWithRequiredApps(site, message) {
@@ -3848,6 +3857,10 @@ async function handleBrowserActuation(command) {
     let lastObservedScope = null;
     let identityProbeResponded = false;
     let identityProbeFailed = false;
+    let probeRegistrationStatus = "probe_not_completed";
+    let probeIdentityRelation = "not_observed";
+    let probeEmailProof = "not_observed";
+    let probeBearerRelation = "not_observed";
     const scopeDeadline = Date.now() + BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS;
     let nextProbeAt = 0;
     let probeInFlight = false;
@@ -3874,8 +3887,39 @@ async function handleBrowserActuation(command) {
         probeInFlight = true;
         nextProbeAt = now + 500;
         void chrome.tabs.sendMessage(createdTab.id, { type: "h2w_get_convkey" })
-          .then(() => {
+          .then((response) => {
             identityProbeResponded = true;
+            // Only a small allowlisted enum crosses into failed-create
+            // evidence. Do not copy any URL, email, account ID, or raw reply.
+            const status = response?.registrationStatus;
+            if ([
+              "not_observed", "identity_observed", "identity_unavailable",
+              "id_conflict_matching_email", "id_conflict_different_email",
+              "id_conflict_unverified_email", "email_conflict",
+              "provider_readback_unavailable",
+              "background_unavailable", "registry_observed", "registry_unobserved",
+            ].includes(status)) probeRegistrationStatus = status;
+            const relation = response?.identityRelation;
+            if ([
+              "me_matches_session_account_id",
+              "me_differs_session_user_and_account_id",
+              "me_differs_session_user_without_account_id",
+              "unclassified", "not_observed",
+            ].includes(relation)) probeIdentityRelation = relation;
+            const contactProof = response?.contactProof;
+            if ([
+              "emails_match", "emails_differ", "session_email_missing",
+              "me_email_missing", "both_emails_missing", "not_observed",
+            ].includes(contactProof)) probeEmailProof = contactProof;
+            const bearerRelation = response?.bearerRelation;
+            if ([
+              "bearer_token_unavailable", "bearer_not_authorized",
+              "bearer_rate_limited", "bearer_response_unavailable",
+              "bearer_identity_missing", "bearer_matches_session_user",
+              "bearer_matches_session_account", "bearer_matches_cookie_me",
+              "bearer_differs_from_session", "bearer_network_unavailable",
+              "not_observed",
+            ].includes(bearerRelation)) probeBearerRelation = bearerRelation;
           })
           .catch(() => {
             identityProbeFailed = true;
@@ -3935,6 +3979,10 @@ async function handleBrowserActuation(command) {
             },
             observed_scope: observedScope,
             scope_failure: scopeFailure,
+            registration_status: probeRegistrationStatus,
+            identity_relation: probeIdentityRelation,
+            contact_proof: probeEmailProof,
+            bearer_relation: probeBearerRelation,
             tab_opened: true,
             tab_closed: tabClosed,
             tab_cleanup_verified: tabCleanupVerified,
@@ -4525,7 +4573,14 @@ async function handlePushBlock(block, streamCtrl = null) {
   }
   if (!event || !data) return;
   if (event === "browser_actuation") {
-    await handleBrowserActuation(data);
+    if (data.operation === "herdr_mcp.browser_dispatch.submit") {
+      // A ChatGPT submit makes nested content-to-background MAIN-world calls.
+      // Keep the single attempt running without blocking the shared push queue.
+      void handleBrowserActuation(data)
+        .catch((error) => callLog("dispatch actuation failed:", error?.message || String(error)));
+    } else {
+      await handleBrowserActuation(data);
+    }
     return;
   }
   if (event === "hello") {
@@ -10584,6 +10639,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
       const accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
+      const accountDisplayLabel = formatPlatformAccountDisplay(
+        registeringSite,
+        String(msg.accountDisplayEmail || ""),
+      );
       if (registeringSite === "chatgpt" && sender.tab?.id && !accountNativeIdentity) {
         browserTabScopes.delete(sender.tab.id);
         for (const [sessionRef, target] of browserSessionTargets) {
@@ -10598,6 +10657,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           convKey: String(msg.convKey || ""),
           pageInfo: browserPageInfo,
           accountNativeIdentity,
+          accountDisplayLabel,
           projects: Array.isArray(msg.browserProjects) ? msg.browserProjects : [],
           reservationRef: String(msg.browserSessionReservationRef || "").trim() || null,
         };
@@ -11239,6 +11299,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({
         convInfo,
         pageInfo,
+        accountDisplay: msg.tabId ? (browserTabScopes.get(msg.tabId)?.accountDisplay || null) : null,
         bindingKey,
         browserEndpoint: browserEndpointView(browserEndpoint),
         binding: bindingViewOne,

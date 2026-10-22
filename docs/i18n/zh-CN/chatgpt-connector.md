@@ -269,3 +269,27 @@ Herdr Agent: working ... working ... done
 - 长任务场景下，安装扩展后能收到 progress / settled 回推。
 
 当这些都成立时，ChatGPT 才真正从“远程聊天窗口”变成连接到本机 Herdr 的开发 planner。
+
+## 平台账号
+
+`connector_id` 与 `grant_generation` 仍然是授权主体。`platform_account` 只是 `<platform>-<email>` 形式的显示元数据，例如 `grokbot-whshang@gmail.com`。OAuth 的 `client_name`（例如 `Cursor`）不是账号。所有者按 `connector_id` 设置或清除标签：
+
+```bash
+herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> --clear
+```
+
+`connector list` 会在 `client_name` 旁边显示 `platform_account`。WebChat control 与 Page Assist 的授权命令只在某个 `platform_account` 恰好对应一个有效 connector 时，才可以用它代替 `connector_id`。零个或多个匹配都会失败。
+
+相同标签不是共享授权。一个标签对应多个有效 connector 时是错误。将来的分组需要自己的主体和 generation，以及明确的所有者绑定。不得从 `client_name` 推断。
+
+## 设备级 WebChat control
+
+已认证的所有者设备可以对同一 fleet 中任何未撤销的设备执行 `allow-device` 或 `deny-device`。请求者仍然必须是所有者设备。非所有者请求会被 `connector_owner_device_required` 拒绝。在本 fleet 中不存在或已撤销的目标是 `connector_owner_device_mismatch`。设备注册表无法读取时返回 `connector_target_device_unresolved`，并且不会写入授权。必须带 `--confirm`。审计事件记录 `requesterDeviceId`、`targetDeviceId` 和 `connectorId`。
+
+```bash
+herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
+herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm
+```
+
+设备级范围保存 endpoint `*`、provider `*` 和 account `*`。它只覆盖该设备上的 WebChat endpoint。按 endpoint 的 allow 与 deny 不变。Page Assist 授权不变。授权仍然绑定 `{connector_id, grant_generation, device_id, endpoint_ref}`。
