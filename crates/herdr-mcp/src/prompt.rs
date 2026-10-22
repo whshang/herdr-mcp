@@ -1410,11 +1410,23 @@ fn begin_persisted(
             // Reusing a key after its short replay reservation expires must
             // never submit new work while the durable task still owns it.
             let digest = stable_digest(&[b"herdr_prompt/task_key", key.as_bytes()]);
-            let existing = store.task_operation_ids_by_key_digest(
-                PROMPT_TASK_OPERATION_KIND,
-                &digest,
-                i64::try_from(now).unwrap_or(i64::MAX),
-            );
+            let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+            let existing = store
+                .task_operation_ids_by_key_digest(PROMPT_TASK_OPERATION_KIND, &digest, now_i64)
+                .and_then(|mut ids| {
+                    if ids.is_empty() {
+                        // Before this release, task rows were not indexed by key.
+                        // Their deterministic task_id still guards exact retries.
+                        let old_id = dispatch_id(Some(key), fingerprint);
+                        if let Some(record) = store.operation_ledger(&old_id)?
+                            && record.kind == PROMPT_TASK_OPERATION_KIND
+                            && record.expires_at.is_none_or(|expiry| expiry > now_i64)
+                        {
+                            ids.push(old_id);
+                        }
+                    }
+                    Ok(ids)
+                });
             if matches!(&existing, Ok(ids) if ids.is_empty()) {
                 return Ok(BeginPrompt::Reserved(Some(op_id)));
             }
@@ -3159,6 +3171,21 @@ mod tests {
         assert_eq!(after_ack["summary"]["completed"], 0);
         assert!(after_ack["tasks"].as_array().unwrap().is_empty());
         assert_eq!(after_ack["attention"]["reason"], "no_pending_terminal");
+
+        // Older task rows did not store a key digest; the stable task_id
+        // must still fence a replay after the shorter reservation expires.
+        let mut legacy = task.clone();
+        legacy.task_id = dispatch_id(Some("legacy-review-key"), "legacy-fingerprint");
+        legacy.dispatch_id = legacy.task_id.clone();
+        legacy.idempotency_key_digest = None;
+        reopened.save_task(&legacy, None).unwrap();
+        let reused_legacy = begin_persisted(
+            reopened.inner.store.as_ref().unwrap(),
+            "legacy-review-key",
+            "legacy-fingerprint",
+        )
+        .unwrap_err();
+        assert_eq!(reused_legacy["code"], "agent_task_idempotency_key_in_use");
 
         // Recover even when the original task is older than the bounded inbox.
         for index in 0..520 {
