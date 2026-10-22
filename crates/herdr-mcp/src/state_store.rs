@@ -1079,6 +1079,31 @@ impl StateStore {
             .map_err(|error| format!("cannot read operation ledger: {error}"))
     }
 
+    pub fn task_operation_ids_by_key_digest(
+        &self,
+        kind: &str,
+        digest: &str,
+        now_ms: i64,
+    ) -> Result<Vec<String>, String> {
+        // Search all live task records. Two matches already make ownership
+        // ambiguous, regardless of which targets or sessions they contain.
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT op_id FROM operations
+             WHERE kind = ?1
+               AND idempotency_key = ?2
+               AND (expires_at IS NULL OR expires_at > ?3)
+             LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare task lookup: {error}"))?;
+        statement
+            .query_map(params![kind, digest, now_ms], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query task lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read task lookup: {error}"))
+    }
+
     pub fn operation_ledgers(
         &self,
         kind: &str,
