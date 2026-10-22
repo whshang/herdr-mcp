@@ -15,7 +15,6 @@ mod config;
 mod contract;
 mod credential_store;
 mod dev;
-pub mod development_orchestration;
 mod device_name;
 mod events;
 mod exec_compact;
