@@ -1135,12 +1135,18 @@ test("user keeps process output while advisory prose is removed | Given Herdr-ge
           content: [{ type: "text", text: JSON.stringify({
             ok: true,
             content: "planner policy text",
-            project_skill: { origin: "bundled" },
+            hint: "load more policy",
+            instructions: "use another tool",
+            skills: [{ id: "git-repository", content: "## Git policy", next_action: "load more" }],
+            project_skill: { origin: "bundled", retry_hint: "retry this way" },
           }) }],
           structuredContent: {
             ok: true,
             content: "planner policy text",
-            project_skill: { origin: "bundled" },
+            hint: "load more policy",
+            instructions: "use another tool",
+            skills: [{ id: "git-repository", content: "## Git policy", next_action: "load more" }],
+            project_skill: { origin: "bundled", retry_hint: "retry this way" },
           },
         },
       },
@@ -1151,12 +1157,20 @@ test("user keeps process output while advisory prose is removed | Given Herdr-ge
     "w1",
     skillDeps.value,
   );
-  assert.equal(skill.body.result.structuredContent.content, undefined);
+  assert.equal(skill.body.result.structuredContent.content, "planner policy text");
+  assert.equal(skill.body.result.structuredContent.hint, undefined);
+  assert.equal(skill.body.result.structuredContent.instructions, undefined);
+  assert.equal(skill.body.result.structuredContent.skills[0].content, "## Git policy");
+  assert.equal(skill.body.result.structuredContent.skills[0].next_action, undefined);
   assert.equal(skill.body.result.structuredContent.project_skill.origin, "bundled");
-  assert.equal(skill.body.result.structuredContent.reference_text_exposed, false);
+  assert.equal(skill.body.result.structuredContent.project_skill.retry_hint, undefined);
+  assert.equal(skill.body.result.structuredContent.reference_text_exposed, true);
   const skillText = JSON.parse(skill.body.result.content[0].text);
-  assert.equal(skillText.content, undefined);
-  assert.equal(skillText.reference_text_exposed, false);
+  assert.equal(skillText.content, "planner policy text");
+  assert.equal(skillText.hint, undefined);
+  assert.equal(skillText.skills[0].content, "## Git policy");
+  assert.equal(skillText.skills[0].next_action, undefined);
+  assert.equal(skillText.reference_text_exposed, true);
 
   const legacySkillDeps = deps({
     forward: async () => new Response(JSON.stringify({
@@ -1175,9 +1189,11 @@ test("user keeps process output while advisory prose is removed | Given Herdr-ge
     "w1",
     legacySkillDeps.value,
   );
-  assert.deepEqual(JSON.parse(legacySkill.body.result.content[0].text), { reference_text_exposed: false });
+  // A non-JSON skill text item is caller-facing text the Edge cannot inspect,
+  // so it passes through byte-for-byte instead of being replaced.
+  assert.equal(legacySkill.body.result.content[0].text, "legacy planner policy text");
   assert.equal(legacySkill.body.result.structuredContent.project_skill.origin, "legacy");
-  assert.equal(legacySkill.body.result.structuredContent.reference_text_exposed, false);
+  assert.equal(legacySkill.body.result.structuredContent.reference_text_exposed, true);
 });
 
 test("herdr_skill is public while unknown tools are rejected before forwarding", async () => {
