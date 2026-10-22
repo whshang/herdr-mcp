@@ -42,7 +42,7 @@ remain open, so the parent item stays open.
 | Screenshot | `screenshot` | `action screenshot` | verified-real | earlier UAT |
 | Navigate / goto | `goto`, `navigate` | `action navigate` (0.1.233) | unit-test-only | explicit same-origin `url` + `page_generation` + idempotency key; verified destination adopted, mismatch/off-origin stays delivery-unknown and stale; Chrome UAT pending |
 | Reload | `reload` | `action reload` (0.1.233) | unit-test-only | owned pages only; same-URL reload verified through a loading/complete cycle, generation advanced; page-reload-mid-dispatch recovery UAT still pending |
-| Back / forward | `back`, `forward` | `action back/forward` (0.1.233) | unit-test-only | owned pages only; caller states the exact same-origin `expected_url`, the move is verified and adopted; history never guesses a destination; Chrome UAT pending |
+| Back / forward | `back`, `forward` | `action back/forward` (0.1.233) | unit-test-only | owned pages only; caller states the exact same-origin `expected_url`; CDP `Page.getNavigationHistory` preflight proves the current and exact adjacent entry before `Page.navigateToHistoryEntry` (never blind `goBack`), so a cross-origin adjacent entry fails closed; Chrome UAT pending |
 | Tab list / select | `tab list` | `webchat resources`, claim by URL | unit-test-only | no generic tab enumeration action; claim needs an exact URL |
 | Keyboard press / hotkeys | `press`, `keys` | `action press` (single-key vocabulary, 0.1.192) | unit-test-only | fixed 14-key vocabulary, optional observed ref to focus; no text/modifier combos; Chrome UAT script ready in `v1.1-browser-adapter-platform.md` pending section |
 | Hover / double-click / drag | `hover`, `dblclick`, `drag` | none | later | |
