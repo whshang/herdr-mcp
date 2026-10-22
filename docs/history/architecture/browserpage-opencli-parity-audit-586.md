@@ -40,9 +40,9 @@ remain open, so the parent item stays open.
 | Targeted text extract | `get text`, `extract` | `action extract` | verified-real | 0.1.156, generation + ref bound |
 | Table extract | `extract` (table reads) | `action extract_table` (0.1.192) | unit-test-only | observed table refs, bounded headers/rows (max_rows 1..100, 32 cols, 200 chars/cell), visible-only cell text, hidden rows dropped, rowspan/colspan flattened per occurrence; Chrome UAT script ready in `v1.1-browser-adapter-platform.md` pending section |
 | Screenshot | `screenshot` | `action screenshot` | verified-real | earlier UAT |
-| Navigate / goto | `goto`, `navigate` | (in progress on `feat/v11-next-navigation-20261009`, another lane) | missing-needed-for-1.1 | needed for post-submit route recovery; must reuse the mutation ledger |
-| Reload | `reload` | none | missing-needed-for-1.1 | the page-reload-mid-dispatch recovery test is still blocked; add next to `navigate` in the same lane |
-| Back / forward | `back`, `forward` | none | later | SPA navigation is covered by click + reopen; no 1.1 workflow needs history yet |
+| Navigate / goto | `goto`, `navigate` | `action navigate` (0.1.217) | unit-test-only | explicit same-origin `url` + `page_generation` + idempotency key; verified destination adopted, mismatch/off-origin stays delivery-unknown and stale; Chrome UAT pending |
+| Reload | `reload` | `action reload` (0.1.217) | unit-test-only | owned pages only; same-URL reload verified through a loading/complete cycle, generation advanced; page-reload-mid-dispatch recovery UAT still pending |
+| Back / forward | `back`, `forward` | `action back/forward` (0.1.217) | unit-test-only | owned pages only; caller states the exact same-origin `expected_url`, the move is verified and adopted; history never guesses a destination; Chrome UAT pending |
 | Tab list / select | `tab list` | `webchat resources`, claim by URL | unit-test-only | no generic tab enumeration action; claim needs an exact URL |
 | Keyboard press / hotkeys | `press`, `keys` | `action press` (single-key vocabulary, 0.1.192) | unit-test-only | fixed 14-key vocabulary, optional observed ref to focus; no text/modifier combos; Chrome UAT script ready in `v1.1-browser-adapter-platform.md` pending section |
 | Hover / double-click / drag | `hover`, `dblclick`, `drag` | none | later | |
@@ -83,9 +83,10 @@ remain open, so the parent item stays open.
 
 ## Gaps that 1.1 needs
 
-1. `navigate` + `reload` in the existing action path (coordinate with the
-   navigation lane, which has uncommitted `navigate` work) -> then the
-   page-reload-mid-dispatch recovery UAT.
+1. Navigation is implemented in the existing action path as 0.1.217
+   `navigate`/`reload`/`back`/`forward` (unit-tested); the remaining work is
+   real Chrome UAT, including page-reload-mid-dispatch recovery and
+   history-destination verification.
 2. Keyboard `press` for forms and feeds: implemented as a unit-test-only
    bounded single-key action (0.1.192); the live Chrome proof script (form
    control, page-owned key handler, vocabulary and unsafe-target negatives)

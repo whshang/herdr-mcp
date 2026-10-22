@@ -1323,6 +1323,10 @@ if (pageActionStart >= 0 && pageIdentityStart > pageActionStart && pageIdentityE
     configReady: Promise.resolve(),
     browserEndpoint: { endpoint_ref: "bep_test" },
     browserEndpointView: (endpoint) => endpoint,
+    BROWSER_PAGE_NAVIGATION_ACTIONS: new Set(["navigate", "reload", "back", "forward"]),
+    isBrowserPageMutation: (action) => [
+      "click", "hover", "fill", "scroll", "press", "navigate", "reload", "back", "forward",
+    ].includes(action),
     validBrowserPageRef: (value) => value === pageRef,
     loadBrowserPages: async () => {},
     browserPagesByRef: new Map([[pageRef, { endpoint_ref: "bep_test" }]]),

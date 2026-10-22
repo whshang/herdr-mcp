@@ -4570,14 +4570,18 @@ mod tests {
                 "scroll",
                 "extract",
                 "extract_table",
-                "press"
+                "press",
+                "navigate",
+                "reload",
+                "back",
+                "forward"
             ])
         );
         assert_eq!(
             methods[20]["params"]["properties"]["objective"]["maxLength"],
             1024
         );
-        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 9);
+        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 12);
         assert_eq!(methods[21]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
         assert_eq!(methods[21]["access"], "read_only");
         assert_eq!(

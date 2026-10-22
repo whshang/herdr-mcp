@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.216";
+const H2W_SCRIPT_VERSION = "0.1.217";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -3656,6 +3656,8 @@ async function handleBrowserActuation(command) {
         maxRows: params.max_rows,
         expectedUrl: params.expected_url,
         elementOffset: params.element_offset,
+        url: params.url,
+        pageGeneration: params.page_generation,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -8669,6 +8671,10 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "scroll_unavailable",
   "press_params_invalid",
   "press_unavailable",
+  "browser_page_generation_stale",
+  "browser_page_navigation_owned_only",
+  "browser_page_navigation_unchanged",
+  "browser_page_navigation_unavailable",
   "hover_only_target",
   "hover_target_offscreen",
   "hover_target_obscured",
@@ -8733,6 +8739,207 @@ async function adoptAppliedBrowserPageNavigation(page, tabId, rawNavigationUrl, 
     await sleep(100);
   }
   return false;
+}
+
+const BROWSER_PAGE_NAVIGATION_ACTIONS = new Set(["navigate", "reload", "back", "forward"]);
+const BROWSER_PAGE_NAVIGATION_TIMEOUT_MS = 5000;
+
+function isBrowserPageMutation(action) {
+  return action === "click"
+    || action === "hover"
+    || action === "fill"
+    || action === "scroll"
+    || action === "press"
+    || BROWSER_PAGE_NAVIGATION_ACTIONS.has(action);
+}
+
+// Navigation destinations are bounded to the exact authorized page origin. The
+// caller states the destination explicitly; a history move never guesses one.
+function browserPageNavigationUrl(rawUrl, page) {
+  try {
+    const parsed = new URL(String(rawUrl || ""));
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    if (parsed.username || parsed.password) return null;
+    if (!page?.origin || parsed.origin.toLowerCase() !== page.origin) return null;
+    return parsed.href;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function markBrowserPageNavigationStale(page) {
+  page.stale = true;
+  page.last_seen_at = Date.now();
+  await persistBrowserPages();
+}
+
+// Track only after Chrome settles a document this action actually produced.
+// reload has no URL change to prove progress, so it must observe a loading
+// event first; navigate/back/forward must observe the different destination
+// URL. The listener exists before the dispatch, and any read started before
+// the dispatch is finished before the tracker accepts evidence, so a stale
+// pre-navigation snapshot can never be mistaken for the result.
+async function trackBrowserPageNavigation(tabId, page, { reload = false, timeoutMs = BROWSER_PAGE_NAVIGATION_TIMEOUT_MS } = {}) {
+  const previousUrl = page.canonical_url;
+  let loadingSeen = false;
+  let done = false;
+  let timer = null;
+  let resolveWait = null;
+  const inspect = async () => {
+    let tab = null;
+    try { tab = await chrome.tabs.get(tabId); } catch (_) { return null; }
+    if (!tab?.url) return null;
+    const liveUrl = browserPageNavigationUrl(tab.url, page);
+    const urlChanged = Boolean(liveUrl && liveUrl !== previousUrl);
+    const leftOrigin = Boolean(tab.url) && !liveUrl;
+    if (tab.status === "complete" && (urlChanged || leftOrigin || (reload && loadingSeen))) {
+      return { tab, liveUrl, originChanged: leftOrigin };
+    }
+    return null;
+  };
+
+  // Baseline: this read was started before the dispatch, so its result cannot
+  // be evidence of the navigation. Do not attach the listener until it settles.
+  await inspect();
+
+  const deadline = Date.now() + timeoutMs;
+  const promise = new Promise((resolve) => { resolveWait = resolve; });
+  const finish = (value) => {
+    if (done) return;
+    done = true;
+    if (timer) clearTimeout(timer);
+    try { chrome.tabs.onUpdated.removeListener(listener); } catch (_) {}
+    resolveWait(value);
+  };
+  let stepping = false;
+  const step = () => {
+    if (done || stepping) return;
+    stepping = true;
+    inspect().then((value) => {
+      stepping = false;
+      if (done) return;
+      if (value) return finish(value);
+      if (Date.now() >= deadline) return finish(null);
+      timer = setTimeout(step, 50);
+    }).catch(() => {
+      stepping = false;
+      finish(null);
+    });
+  };
+  const listener = (updatedTabId, changeInfo) => {
+    if (updatedTabId !== tabId) return;
+    if (changeInfo?.status === "loading" || changeInfo?.pendingUrl) loadingSeen = true;
+    if (changeInfo?.status === "complete" || typeof changeInfo?.url === "string") step();
+  };
+  chrome.tabs.onUpdated.addListener(listener);
+  step();
+  return { wait: () => promise, stop: () => finish(null) };
+}
+
+async function settleBrowserPageNavigation(outcome, page, destination, { reload = false } = {}) {
+  const liveUrl = outcome ? browserPageNavigationUrl(outcome.tab?.url, page) : null;
+  if (!outcome || outcome.tab?.status !== "complete" || liveUrl !== destination) {
+    await markBrowserPageNavigationStale(page);
+    const error = outcome && outcome.originChanged
+      ? "browser_page_navigation_out_of_scope"
+      : outcome
+        ? "browser_page_navigation_mismatch"
+        : "browser_page_navigation_unverified";
+    return { ok: false, error };
+  }
+  const previous = {
+    canonical_url: page.canonical_url,
+    page_generation: page.page_generation,
+    observation_generation: page.observation_generation,
+    last_seen_at: page.last_seen_at,
+  };
+  page.canonical_url = destination;
+  page.page_generation = Number.isSafeInteger(page.page_generation)
+    ? page.page_generation + 1
+    : 1;
+  page.observation_generation = await getBrowserObservationGeneration();
+  page.last_seen_at = Date.now();
+  if (!await persistBrowserPages()) {
+    Object.assign(page, previous);
+    return { ok: false, error: "browser_page_storage_unavailable" };
+  }
+  return reload
+    ? { ok: true, reloaded: true, reloaded_url: destination }
+    : { ok: true, navigated: true, navigated_url: destination };
+}
+
+async function performBrowserPageNavigation(page, tab, action, msg) {
+  const pageGeneration = Number(msg?.pageGeneration);
+  if (!Number.isSafeInteger(pageGeneration) || pageGeneration !== page.page_generation) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_generation_stale",
+    }, page, false);
+  }
+  // Reload and history rewrite a user's tab state, so they stay task-owned.
+  // navigate is explicit and same-origin, like a click on a link.
+  if (action !== "navigate" && page.ownership !== "owned") {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_owned_only",
+    }, page, false);
+  }
+  const destination = action === "navigate"
+    ? browserPageNavigationUrl(msg?.url, page)
+    : (action === "back" || action === "forward")
+      ? browserPageNavigationUrl(msg?.expectedUrl, page)
+      : page.canonical_url;
+  if (!destination) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_out_of_scope",
+    }, page, false);
+  }
+  if (action !== "reload" && destination === page.canonical_url) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_unchanged",
+    }, page, false);
+  }
+  if (tab?.status !== "complete") {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_unavailable",
+    }, page, false);
+  }
+  if ((action === "back" && typeof chrome.tabs.goBack !== "function")
+      || (action === "forward" && typeof chrome.tabs.goForward !== "function")) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_unavailable",
+    }, page, false);
+  }
+
+  const tracked = await trackBrowserPageNavigation(tab.id, page, { reload: action === "reload" });
+  try {
+    if (action === "navigate") {
+      await chrome.tabs.update(tab.id, { url: destination });
+    } else if (action === "reload") {
+      await chrome.tabs.reload(tab.id);
+    } else if (action === "back") {
+      await chrome.tabs.goBack(tab.id);
+    } else {
+      await chrome.tabs.goForward(tab.id);
+    }
+  } catch (error) {
+    tracked.stop();
+    await markBrowserPageNavigationStale(page);
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_transport_failed",
+      detail: String(error?.message || error || ""),
+    }, page, true);
+  }
+
+  const settled = await settleBrowserPageNavigation(await tracked.wait(), page, destination, {
+    reload: action === "reload",
+  });
+  return browserPageMutationEnvelope(settled, page, true);
 }
 
 function browserImageArtifactMetadata(response) {
@@ -9019,7 +9226,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table"].includes(action)) {
+  if (!["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table", "navigate", "reload", "back", "forward"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -9029,7 +9236,7 @@ async function performBrowserPageActionRequest(msg) {
 
   const pageRef = String(msg?.pageRef || "");
   if (!validBrowserPageRef(pageRef)) {
-    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
+    return isBrowserPageMutation(action)
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
       : { ok: false, error: "browser_page_ref_invalid" };
   }
@@ -9037,12 +9244,12 @@ async function performBrowserPageActionRequest(msg) {
   await loadBrowserPages();
   const record = browserPagesByRef.get(pageRef);
   if (!record) {
-    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
+    return isBrowserPageMutation(action)
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
       : { ok: false, error: "browser_page_not_found" };
   }
   if (record.endpoint_ref !== endpointRef) {
-    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
+    return isBrowserPageMutation(action)
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
       : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
   }
@@ -9055,18 +9262,21 @@ async function performBrowserPageActionRequest(msg) {
       reason: "host_permission_missing",
       origin: record.origin,
     };
-    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
+    return isBrowserPageMutation(action)
       ? browserPageMutationEnvelope(denied, record, false)
       : withBrowserPageIdentity(denied, record);
   }
 
   const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
   if (!resolved.ok) {
-    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
+    return isBrowserPageMutation(action)
       ? browserPageMutationEnvelope(resolved, record, false)
       : withBrowserPageIdentity(resolved, record);
   }
   const page = resolved.page;
+  if (BROWSER_PAGE_NAVIGATION_ACTIONS.has(action)) {
+    return performBrowserPageNavigation(page, resolved.tab, action, msg);
+  }
   if (action === "screenshot") {
     return captureBrowserPageScreenshot(page, resolved.tab);
   }
@@ -9101,7 +9311,7 @@ async function performBrowserPageActionRequest(msg) {
     ...(action === "fill" ? { mainWorldFill: true } : {}),
   };
 
-  const mutation = action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press";
+  const mutation = isBrowserPageMutation(action);
   let sendAttempted = false;
   const send = async () => {
     sendAttempted = true;
