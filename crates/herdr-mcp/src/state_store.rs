@@ -1092,13 +1092,13 @@ impl StateStore {
             .prepare(
                 "SELECT op_id FROM operations
              WHERE kind = ?1
-               AND (expires_at IS NULL OR expires_at > ?2)
-               AND json_extract(result_json, '$.idempotency_key_digest') = ?3
+               AND idempotency_key = ?2
+               AND (expires_at IS NULL OR expires_at > ?3)
              LIMIT 2",
             )
             .map_err(|error| format!("cannot prepare task lookup: {error}"))?;
         statement
-            .query_map(params![kind, now_ms, digest], |row| row.get::<_, String>(0))
+            .query_map(params![kind, digest, now_ms], |row| row.get::<_, String>(0))
             .map_err(|error| format!("cannot query task lookup: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot read task lookup: {error}"))

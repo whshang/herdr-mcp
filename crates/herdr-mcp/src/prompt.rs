@@ -1133,7 +1133,7 @@ impl PromptRegistry {
         store.put_operation_ledger(OperationLedgerInput {
             op_id: &task.task_id,
             kind: PROMPT_TASK_OPERATION_KIND,
-            idempotency_key: None,
+            idempotency_key: task.idempotency_key_digest.as_deref(),
             request_hash,
             phase: if task.is_terminal() {
                 "terminal"
@@ -1406,7 +1406,43 @@ fn begin_persisted(
         })?;
 
     match reservation {
-        OperationReservation::Reserved => Ok(BeginPrompt::Reserved(Some(op_id))),
+        OperationReservation::Reserved => {
+            // Reusing a key after its short replay reservation expires must
+            // never submit new work while the durable task still owns it.
+            let digest = stable_digest(&[b"herdr_prompt/task_key", key.as_bytes()]);
+            let existing = store.task_operation_ids_by_key_digest(
+                PROMPT_TASK_OPERATION_KIND,
+                &digest,
+                i64::try_from(now).unwrap_or(i64::MAX),
+            );
+            if matches!(&existing, Ok(ids) if ids.is_empty()) {
+                return Ok(BeginPrompt::Reserved(Some(op_id)));
+            }
+            store
+                .release_operation_reservation(
+                    PROMPT_OPERATION_KIND,
+                    &key_hash,
+                    fingerprint,
+                    &op_id,
+                )
+                .map_err(|error| {
+                    json!({"ok": false, "code": "idempotency_store_unavailable", "message": error, "retryable": false})
+                })?;
+            match existing {
+                Ok(_) => Err(json!({
+                    "ok": false,
+                    "code": "agent_task_idempotency_key_in_use",
+                    "retryable": false,
+                    "hint": "A durable task still owns this key. Query agent.task.status with idempotency_key and target, or use a new key for new work."
+                })),
+                Err(error) => Err(json!({
+                    "ok": false,
+                    "code": "idempotency_store_unavailable",
+                    "message": error,
+                    "retryable": false,
+                })),
+            }
+        }
         OperationReservation::Existing(record) => {
             if record.request_hash != fingerprint {
                 return Err(json!({
@@ -3078,6 +3114,17 @@ mod tests {
         assert_eq!(found["task"]["task_id"], task_id);
         assert_eq!(found["task"]["lifecycle"], "completed");
         assert!(found["task"].get("idempotency_key_digest").is_none());
+        // Reusing a key after its short-lived replay reservation expires must
+        // not dispatch new work while the durable task still owns the key.
+        for fingerprint in ["fingerprint", "different-work"] {
+            let reused = begin_persisted(
+                reopened.inner.store.as_ref().unwrap(),
+                "review-project-19-sha",
+                fingerprint,
+            )
+            .unwrap_err();
+            assert_eq!(reused["code"], "agent_task_idempotency_key_in_use");
+        }
         assert_eq!(
             reopened.task_status_by_idempotency("review-project-19-sha", "wrong-target", None)["code"],
             "agent_task_not_found"
@@ -3127,10 +3174,11 @@ mod tests {
         let mut duplicate = task.clone();
         duplicate.task_id = "dispatch:prompt:duplicate".to_owned();
         duplicate.dispatch_id = duplicate.task_id.clone();
-        reopened.save_task(&duplicate, None).unwrap();
+        // The existing unique task-key index rejects a second owner.
+        assert!(reopened.save_task(&duplicate, None).is_err());
         assert_eq!(
-            reopened.task_status_by_idempotency("review-project-19-sha", "child", None)["code"],
-            "agent_task_lookup_ambiguous"
+            reopened.task_status_by_idempotency("review-project-19-sha", "child", None)["task"]["task_id"],
+            task_id
         );
 
         let mut session_bound = task.clone();
