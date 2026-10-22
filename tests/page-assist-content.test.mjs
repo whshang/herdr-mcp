@@ -356,6 +356,32 @@ function tableHarness({ rows, extraElements = [] }) {
   return { h, table };
 }
 
+test("user reads a table after long navigation | Given more than 128 links before a visible table | When inspect assigns bounded refs | Then the table can still be extracted", () => {
+  const navigation = Array.from({ length: 140 }, (_, index) => createElement({
+    tag: "a", text: `Nav ${index}`, attrs: { href: `/nav/${index}` },
+  }));
+  const table = createElement({ tag: "table" });
+  const h = harness({ elements: [...navigation, table] });
+  const doc = table.ownerDocument;
+  attachTableRows(table, [
+    tableDomRow({ doc, cells: [tableDomNode({ doc, tag: "th", text: "Name" })] }),
+    tableDomRow({ doc, cells: [tableDomNode({ doc, text: "Alpha" })] }),
+  ]);
+
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 128);
+  const tableRef = observed.elements.find((element) => element.tag === "table")?.ref;
+  assert.ok(tableRef, "long navigation must not hide the table from observed refs");
+
+  const extracted = h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: tableRef, maxRows: 2,
+  });
+  assert.equal(extracted.ok, true);
+  assert.deepEqual(Array.from(extracted.headers), ["Name"]);
+  assert.deepEqual(Array.from(extracted.rows[0]), ["Alpha"]);
+});
+
 test("user extracts one observed table | Given a page with a visible table ref | When extract_table requests bounded rows | Then headers and cell text return without markup or hidden values", () => {
   const longCell = "v".repeat(400);
   const button = createElement({ tag: "button", text: "Filter" });

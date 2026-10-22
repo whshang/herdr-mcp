@@ -373,6 +373,49 @@ test("user refuses unproven bearer login identity | Given a mismatched cookie us
   assert.equal(noEmail.nativeIdentity, null, "bearer proof alone cannot publish an unlabeled account");
 });
 
+test("user cools authenticated identity reads | Given the first ChatGPT identity endpoint reports HTTP 429 | When account registration observes again | Then no additional auth read runs during bounded cooldown", async () => {
+  const requests = [];
+  let rateLimited = true;
+  const fetch = async (url) => {
+    requests.push(url);
+    return rateLimited
+      ? { ok: false, status: 429, headers: { get: (key) => key.toLowerCase() === "retry-after" ? "45" : null } }
+      : { ok: true, status: 200, json: async () => ({ id: "current-user", email: "current@example.com" }) };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const first = await adapter.getAccountObservation();
+  assert.equal(first.nativeIdentity, null);
+  assert.equal(first.reason, "authenticated_rate_limited");
+  assert.deepEqual(requests, ["/backend-api/me"], "429 must stop the second authenticated fetch");
+  const second = await adapter.getAccountObservation();
+  assert.equal(second.nativeIdentity, null);
+  assert.equal(second.reason, "authenticated_rate_limited");
+  assert.equal(requests.length, 1, "back-to-back identity observations must not hammer provider");
+  adapter._accountIdentity429Until = Date.now() - 1;
+  rateLimited = false;
+  const resumed = await adapter.getAccountObservation();
+  assert.equal(resumed.nativeIdentity, "current-user", "identity probing must resume after cooldown");
+  assert.deepEqual(requests, ["/backend-api/me", "/backend-api/me", "/api/auth/session"],
+    "resumed identity must cross-check both authenticated endpoints after cooldown");
+});
+
+test("user cools secondary identity reads | Given /me lacks a user ID and auth/session returns HTTP 429 | When a new registration arrives | Then repeated probes are suppressed", async () => {
+  const requests = [];
+  const fetch = async (url) => {
+    requests.push(url);
+    return url === "/backend-api/me"
+      ? { ok: true, status: 200, json: async () => ({}) }
+      : { ok: false, status: 429, headers: { get: () => "30" } };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const first = await adapter.getAccountObservation();
+  assert.equal(first.nativeIdentity, null);
+  assert.equal(first.reason, "authenticated_rate_limited");
+  assert.deepEqual(requests, ["/backend-api/me", "/api/auth/session"]);
+  await adapter.getAccountObservation();
+  assert.equal(requests.length, 2);
+});
+
 test("user never accepts plain text as an App identity | Given an accepted turn with only the text @herdr | When the accepted message identity is read | Then no App is reported", () => {
   const hidden = makeEl({ attrs: { role: "menu", "data-keyword": "herdr" } });
   const plain = makeEl({
