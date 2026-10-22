@@ -25,6 +25,18 @@ const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WAIT_MS: u64 = 25_000;
 const MAX_WAIT_MS: u64 = 60_000;
 const DEFAULT_CALL_TIMEOUT_MS: u64 = 30_000;
+/// Only task chains touched in the last 6h are live escalation evidence.
+const ESCALATION_WINDOW_MS: u64 = 6 * 60 * 60_000;
+/// 1 initial dispatch + 3 repair rounds exhausts one lane's mechanical budget.
+const ESCALATION_REPAIR_BUDGET_TASKS: usize = 4;
+/// Two consecutive failed/blocked terminals are repeated unsuccessful rounds.
+const ESCALATION_UNSUCCESSFUL_STREAK: usize = 2;
+/// A lane with no observed activity for 20min is worth a progress verify.
+const ESCALATION_STALL_IDLE_MS: u64 = 20 * 60_000;
+/// Bound the signal list so escalation hints cannot bloat the inbox payload.
+const ESCALATION_MAX_SIGNALS: usize = 16;
+/// Bound the per-signal task-id evidence (most recent first).
+const ESCALATION_MAX_TASK_IDS: usize = 8;
 static NEXT_DISPATCH_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -665,6 +677,13 @@ impl PromptRegistry {
                     })
                 };
 
+                // Deterministic escalation facts use the scope filter only
+                // (acknowledged rows still count) and are never gated on the
+                // semantic `advisory` opt-in.
+                let escalation = task_escalation(tasks.iter().filter(|task| {
+                    task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
+                }));
+
                 json!({
                     "ok": true,
                     "summary": {
@@ -676,6 +695,7 @@ impl PromptRegistry {
                     },
                     "tasks": terminal.into_iter().map(|task| task.public_json()).collect::<Vec<_>>(),
                     "attention": attention,
+                    "escalation": escalation,
                 })
             }
             Err(error) => json!({
@@ -1184,6 +1204,173 @@ fn task_notification_priority(task: &PromptTaskRecord) -> u32 {
         PromptTaskLifecycle::Completed => 100,
         _ => 0,
     }
+}
+
+/// Deterministic escalation hints derived only from existing durable task
+/// records.
+///
+/// Advisory only: no semantic call, no state mutation, and no automatic
+/// re-dispatch (`redispatch` is fixed to `never_automatic`). Uncertainty is not
+/// failure: `delivery_uncertain` neither extends an unsuccessful streak nor
+/// produces a consult hint. The raw `parent_session_ref` value stays private;
+/// callers only learn whether the lane is session scoped.
+fn task_escalation<'a>(tasks: impl IntoIterator<Item = &'a PromptTaskRecord>) -> Value {
+    let now = now_ms();
+    let mut lanes: HashMap<(&str, Option<&str>), Vec<&PromptTaskRecord>> = HashMap::new();
+    for task in tasks {
+        if now.saturating_sub(task.updated_at_ms) > ESCALATION_WINDOW_MS {
+            continue;
+        }
+        lanes
+            .entry((task.target.as_str(), task.parent_session_ref.as_deref()))
+            .or_default()
+            .push(task);
+    }
+
+    // Sort key keeps the externally specified (kind, then target) order and
+    // adds internal lane/evidence tiebreaks so ordering stays total.
+    let mut signals: Vec<((String, String, String, String), Value)> = Vec::new();
+    for ((target, parent_ref), mut lane) in lanes {
+        lane.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+                .then_with(|| right.task_id.cmp(&left.task_id))
+        });
+        let pane_id = lane[0].pane_id.as_deref();
+        let lane_key = |kind: &str, task_id: &str| {
+            (
+                kind.to_owned(),
+                target.to_owned(),
+                parent_ref.unwrap_or_default().to_owned(),
+                task_id.to_owned(),
+            )
+        };
+        let recent_task_ids = |limit: usize| {
+            lane.iter()
+                .take(limit)
+                .map(|task| task.task_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        if lane.len() >= ESCALATION_REPAIR_BUDGET_TASKS {
+            let mut signal = escalation_signal(
+                "repair_budget_exhausted",
+                "consult_advisor",
+                target,
+                pane_id,
+                parent_ref,
+            );
+            signal.insert("dispatch_count".to_owned(), json!(lane.len()));
+            signal.insert(
+                "task_ids".to_owned(),
+                json!(recent_task_ids(ESCALATION_MAX_TASK_IDS)),
+            );
+            signals.push((
+                lane_key("repair_budget_exhausted", &lane[0].task_id),
+                Value::Object(signal),
+            ));
+        }
+
+        // Only terminal outcomes form the streak: a still-running dispatch is
+        // not an unsuccessful round, and uncertainty is not a failure.
+        let streak = lane
+            .iter()
+            .copied()
+            .filter(|task| task.is_terminal())
+            .take_while(|task| {
+                matches!(
+                    task.lifecycle,
+                    PromptTaskLifecycle::Failed | PromptTaskLifecycle::Blocked
+                )
+            })
+            .collect::<Vec<_>>();
+        if streak.len() >= ESCALATION_UNSUCCESSFUL_STREAK {
+            let mut signal = escalation_signal(
+                "unsuccessful_streak",
+                "consult_advisor",
+                target,
+                pane_id,
+                parent_ref,
+            );
+            signal.insert("streak_length".to_owned(), json!(streak.len()));
+            signal.insert(
+                "task_ids".to_owned(),
+                json!(
+                    streak
+                        .iter()
+                        .take(ESCALATION_MAX_TASK_IDS)
+                        .map(|task| task.task_id.clone())
+                        .collect::<Vec<_>>()
+                ),
+            );
+            signals.push((
+                lane_key("unsuccessful_streak", &streak[0].task_id),
+                Value::Object(signal),
+            ));
+        }
+
+        for task in lane.iter().copied().filter(|task| {
+            matches!(
+                task.lifecycle,
+                PromptTaskLifecycle::Running | PromptTaskLifecycle::AwaitingActivity
+            )
+        }) {
+            let idle_ms = now.saturating_sub(task.updated_at_ms);
+            if idle_ms < ESCALATION_STALL_IDLE_MS {
+                continue;
+            }
+            let mut signal = escalation_signal(
+                "stall_suspected",
+                "verify_progress",
+                target,
+                task.pane_id.as_deref(),
+                parent_ref,
+            );
+            signal.insert("task_id".to_owned(), json!(task.task_id));
+            signal.insert("lifecycle".to_owned(), json!(task.lifecycle.as_str()));
+            signal.insert("idle_ms".to_owned(), json!(idle_ms));
+            signals.push((
+                lane_key("stall_suspected", &task.task_id),
+                Value::Object(signal),
+            ));
+        }
+    }
+
+    signals.sort_by(|left, right| left.0.cmp(&right.0));
+    let signals = signals
+        .into_iter()
+        .map(|(_, signal)| signal)
+        .take(ESCALATION_MAX_SIGNALS)
+        .collect::<Vec<_>>();
+    json!({
+        "advisory_only": true,
+        "redispatch": "never_automatic",
+        "signals": signals,
+    })
+}
+
+fn escalation_signal(
+    kind: &str,
+    recommended_action: &str,
+    target: &str,
+    pane_id: Option<&str>,
+    parent_session_ref: Option<&str>,
+) -> Map<String, Value> {
+    let mut signal = Map::new();
+    signal.insert("kind".to_owned(), json!(kind));
+    signal.insert("recommended_action".to_owned(), json!(recommended_action));
+    signal.insert("target".to_owned(), json!(target));
+    if let Some(pane_id) = pane_id {
+        signal.insert("pane_id".to_owned(), json!(pane_id));
+    }
+    // Callers only learn whether the lane is session scoped, never the value.
+    signal.insert(
+        "parent_session_ref_present".to_owned(),
+        json!(parent_session_ref.is_some()),
+    );
+    signal
 }
 
 fn task_attention_advice<'a>(tasks: impl IntoIterator<Item = &'a PromptTaskRecord>) -> Value {
@@ -3454,5 +3641,295 @@ mod tests {
         ));
         assert_eq!(live.lifecycle, PromptTaskLifecycle::Completed);
         assert!(live.is_terminal());
+    }
+
+    fn escalation_registry(tag: &str) -> (PathBuf, PromptRegistry) {
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-escalation-{}-{}-{}.sqlite",
+            tag,
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        (db_path, PromptRegistry::with_store(store))
+    }
+
+    fn remove_escalation_db(db_path: &std::path::Path) {
+        fs::remove_file(db_path).ok();
+        fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
+        fs::remove_file(db_path.with_extension("sqlite-shm")).ok();
+    }
+
+    /// Durable task fixture with a controlled activity age, so escalation
+    /// thresholds can be exercised through the real `task_inbox` entrypoint.
+    fn escalation_task(
+        task_id: &str,
+        target: &str,
+        lifecycle: PromptTaskLifecycle,
+        age_ms: u64,
+    ) -> PromptTaskRecord {
+        let now = now_ms();
+        let terminal = lifecycle.is_terminal();
+        PromptTaskRecord {
+            schema_version: 1,
+            task_id: task_id.to_owned(),
+            dispatch_id: task_id.to_owned(),
+            target: target.to_owned(),
+            idempotency_key_digest: None,
+            pane_id: Some("w1:p1".to_owned()),
+            workspace_id: Some("w1".to_owned()),
+            baseline_status: None,
+            baseline_seq: None,
+            start_cursor: 0,
+            last_cursor: 0,
+            activity_observed: lifecycle != PromptTaskLifecycle::AwaitingActivity,
+            prior_settle_observed: false,
+            lifecycle: lifecycle.clone(),
+            turn_id: None,
+            exact_native_turn: false,
+            terminal_status: terminal.then(|| lifecycle.as_str().to_owned()),
+            terminal_cursor: None,
+            terminal_at_ms: terminal.then(|| now.saturating_sub(age_ms)),
+            parent_target: Some("parent".to_owned()),
+            parent_session_ref: None,
+            boot_epoch: None,
+            notification_state: if terminal {
+                "delivered".to_owned()
+            } else {
+                "pending".to_owned()
+            },
+            notification_attempts: 0,
+            notification_at_ms: None,
+            notification_error: None,
+            acknowledged_at_ms: None,
+            created_at_ms: now.saturating_sub(age_ms),
+            updated_at_ms: now.saturating_sub(age_ms),
+        }
+    }
+
+    /// user parent | Given one target/parent lane of durable tasks in the
+    /// six-hour window | When the inbox is read | Then four dispatches yield
+    /// one deterministic consult_advisor signal, three yield none, and tasks
+    /// older than the window never count.
+    #[test]
+    fn escalation_reports_repair_budget_exhausted_at_four_dispatches() {
+        let (db_path, registry) = escalation_registry("budget");
+        for (index, age_ms) in [3_000_u64, 2_000, 1_000].into_iter().enumerate() {
+            let task = escalation_task(
+                &format!("dispatch:prompt:budget-{index}"),
+                "child",
+                PromptTaskLifecycle::Completed,
+                age_ms,
+            );
+            registry.save_task(&task, None).unwrap();
+        }
+
+        let three = registry.task_inbox(None, Some("parent"), None, false, false, 10);
+        assert_eq!(three["escalation"]["advisory_only"], true);
+        assert_eq!(three["escalation"]["redispatch"], "never_automatic");
+        assert!(
+            three["escalation"]["signals"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let fourth = escalation_task(
+            "dispatch:prompt:budget-3",
+            "child",
+            PromptTaskLifecycle::Completed,
+            500,
+        );
+        registry.save_task(&fourth, None).unwrap();
+        // An old attempt must stay out of the live escalation window.
+        let old = escalation_task(
+            "dispatch:prompt:budget-old",
+            "child",
+            PromptTaskLifecycle::Completed,
+            7 * 60 * 60_000,
+        );
+        registry.save_task(&old, None).unwrap();
+
+        let inbox = registry.task_inbox(None, Some("parent"), None, false, false, 10);
+        let signals = inbox["escalation"]["signals"].as_array().unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0]["kind"], "repair_budget_exhausted");
+        assert_eq!(signals[0]["recommended_action"], "consult_advisor");
+        assert_eq!(signals[0]["target"], "child");
+        assert_eq!(signals[0]["parent_session_ref_present"], false);
+        assert_eq!(signals[0]["dispatch_count"], 4);
+        assert_eq!(signals[0]["task_ids"][0], "dispatch:prompt:budget-3");
+        assert_eq!(signals[0]["task_ids"].as_array().unwrap().len(), 4);
+
+        // Signals stay ordered by (kind, then target) across lanes.
+        for (index, age_ms) in [200_u64, 100].into_iter().enumerate() {
+            let other = escalation_task(
+                &format!("dispatch:prompt:other-{index}"),
+                "other",
+                PromptTaskLifecycle::Failed,
+                age_ms,
+            );
+            registry.save_task(&other, None).unwrap();
+        }
+        let ordered = registry.task_inbox(None, Some("parent"), None, false, false, 10);
+        let signals = ordered["escalation"]["signals"].as_array().unwrap();
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0]["kind"], "repair_budget_exhausted");
+        assert_eq!(signals[0]["target"], "child");
+        assert_eq!(signals[1]["kind"], "unsuccessful_streak");
+        assert_eq!(signals[1]["target"], "other");
+        assert_eq!(signals[1]["streak_length"], 2);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user parent | Given a lane whose newest terminal tasks are failed and
+    /// blocked | When the inbox is read | Then one consult_advisor streak
+    /// signal appears without exposing the raw parent session reference.
+    #[test]
+    fn escalation_reports_unsuccessful_streak_without_exposing_session_refs() {
+        let (db_path, registry) = escalation_registry("streak");
+        for (task_id, lifecycle, age_ms) in [
+            ("streak-failed", PromptTaskLifecycle::Failed, 1_000_u64),
+            ("streak-blocked", PromptTaskLifecycle::Blocked, 2_000),
+        ] {
+            let mut task = escalation_task(
+                &format!("dispatch:prompt:{task_id}"),
+                "child",
+                lifecycle,
+                age_ms,
+            );
+            task.parent_session_ref = Some("session:private-owner".to_owned());
+            registry.save_task(&task, None).unwrap();
+        }
+
+        let inbox = registry.task_inbox(None, Some("parent"), None, false, false, 10);
+        let signals = inbox["escalation"]["signals"].as_array().unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0]["kind"], "unsuccessful_streak");
+        assert_eq!(signals[0]["recommended_action"], "consult_advisor");
+        assert_eq!(signals[0]["parent_session_ref_present"], true);
+        assert_eq!(signals[0]["streak_length"], 2);
+        assert_eq!(
+            signals[0]["task_ids"],
+            json!([
+                "dispatch:prompt:streak-failed",
+                "dispatch:prompt:streak-blocked"
+            ])
+        );
+        assert!(signals[0].get("parent_session_ref").is_none());
+        // The escalation object never echoes the raw reference; the sibling
+        // `tasks` array keeps its pre-existing caller-scoped field.
+        assert!(
+            !inbox["escalation"]
+                .to_string()
+                .contains("session:private-owner")
+        );
+
+        // Same facts through the MCP-facing method router a caller really uses.
+        let routed = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_target": "parent", "limit": 10}),
+            Some("session:private-owner"),
+        );
+        assert_eq!(routed["escalation"]["redispatch"], "never_automatic");
+        assert_eq!(
+            routed["escalation"]["signals"][0]["kind"],
+            "unsuccessful_streak"
+        );
+        assert_eq!(routed["escalation"]["signals"][0]["streak_length"], 2);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user parent | Given a delivery-uncertain task newer than failed work
+    /// | When the inbox is read | Then uncertainty neither breaks a streak
+    /// into a failure nor ever produces a consult_advisor hint.
+    #[test]
+    fn escalation_never_counts_delivery_uncertainty_as_failure() {
+        let (db_path, registry) = escalation_registry("uncertain");
+        for (task_id, lifecycle, age_ms) in [
+            (
+                "uncertain-newest",
+                PromptTaskLifecycle::DeliveryUncertain,
+                500_u64,
+            ),
+            ("uncertain-failed", PromptTaskLifecycle::Failed, 1_000),
+            ("uncertain-blocked", PromptTaskLifecycle::Blocked, 2_000),
+        ] {
+            let task = escalation_task(
+                &format!("dispatch:prompt:{task_id}"),
+                "child",
+                lifecycle,
+                age_ms,
+            );
+            registry.save_task(&task, None).unwrap();
+        }
+
+        let inbox = registry.task_inbox(None, Some("parent"), None, false, false, 10);
+        let signals = inbox["escalation"]["signals"].as_array().unwrap();
+        assert!(
+            signals
+                .iter()
+                .all(|signal| signal["kind"] != "unsuccessful_streak")
+        );
+        assert!(
+            signals
+                .iter()
+                .all(|signal| signal["recommended_action"] != "consult_advisor")
+        );
+        assert!(!inbox["escalation"].to_string().contains("uncertain-newest"));
+        assert_eq!(inbox["escalation"]["redispatch"], "never_automatic");
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user parent | Given a running task with no observed activity | When
+    /// the inbox is read | Then only the 25-minute-old task yields one
+    /// verify_progress stall signal while a 10-minute-old task yields none.
+    #[test]
+    fn escalation_reports_stall_only_after_twenty_idle_minutes() {
+        let (db_path, registry) = escalation_registry("stall");
+        let fresh = escalation_task(
+            "dispatch:prompt:stall-fresh",
+            "child",
+            PromptTaskLifecycle::Running,
+            10 * 60_000,
+        );
+        registry.save_task(&fresh, None).unwrap();
+        let quiet = registry.task_inbox(None, Some("parent"), None, false, false, 10);
+        assert!(
+            quiet["escalation"]["signals"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let stale = escalation_task(
+            "dispatch:prompt:stall-stale",
+            "child",
+            PromptTaskLifecycle::Running,
+            25 * 60_000,
+        );
+        registry.save_task(&stale, None).unwrap();
+
+        let inbox = registry.task_inbox(None, Some("parent"), None, false, false, 10);
+        let signals = inbox["escalation"]["signals"].as_array().unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0]["kind"], "stall_suspected");
+        assert_eq!(signals[0]["recommended_action"], "verify_progress");
+        assert_eq!(signals[0]["task_id"], "dispatch:prompt:stall-stale");
+        assert_eq!(signals[0]["lifecycle"], "running");
+        assert!(
+            signals[0]["idle_ms"].as_u64().unwrap() >= 20 * 60_000,
+            "idle_ms must report the observed idle window"
+        );
+
+        drop(registry);
+        remove_escalation_db(&db_path);
     }
 }
