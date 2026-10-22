@@ -8675,6 +8675,11 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "browser_page_navigation_owned_only",
   "browser_page_navigation_unchanged",
   "browser_page_navigation_unavailable",
+  "browser_page_navigation_history_unavailable",
+  "browser_page_navigation_history_ambiguous",
+  "browser_page_navigation_history_out_of_scope",
+  "browser_page_navigation_history_mismatch",
+  "browser_page_navigation_view_changed",
   "hover_only_target",
   "hover_target_offscreen",
   "hover_target_obscured",
@@ -8868,6 +8873,108 @@ async function settleBrowserPageNavigation(outcome, page, destination, { reload 
     : { ok: true, navigated: true, navigated_url: destination };
 }
 
+// History entries are not origin-scoped in Chrome: a task-owned tab can carry
+// a cross-origin entry immediately behind or ahead of the current document.
+// chrome.tabs.goBack/goForward would commit that entry before any postcondition
+// check, so history traversal is preflighted over CDP instead: prove the live
+// current entry is the recorded same-origin document and that the exact
+// adjacent entry equals the caller-supplied same-origin expected URL, then
+// navigate to that validated entry id only. Anything unavailable, ambiguous or
+// different fails closed before a navigation is committed.
+async function browserPageNavigateHistory(page, tab, action, destination) {
+  if (!chrome.debugger?.attach || !chrome.debugger?.sendCommand || !chrome.debugger?.detach) {
+    return { ok: false, error: "browser_page_navigation_history_unavailable", dispatched: false };
+  }
+  const exactTab = async () => {
+    try {
+      const live = await chrome.tabs.get(tab.id);
+      return live?.windowId === tab.windowId
+        && live?.url === page.canonical_url
+        && live?.status === "complete";
+    } catch (_) {
+      return false;
+    }
+  };
+  const target = { tabId: tab.id };
+  let attached = false;
+  let dispatched = false;
+  let failure = null;
+  try {
+    if (!await exactTab()) {
+      failure = { error: "browser_page_navigation_view_changed", dispatched: false };
+      return failure;
+    }
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    // Read-only: the raw entry list never leaves this function, and no entry
+    // URL/title is echoed in a result or diagnostic.
+    const history = await chrome.debugger.sendCommand(target, "Page.getNavigationHistory");
+    const entries = Array.isArray(history?.entries) ? history.entries : [];
+    const currentIndex = Number(history?.currentIndex);
+    const adjacentIndex = action === "back" ? currentIndex - 1 : currentIndex + 1;
+    if (!Number.isInteger(currentIndex)
+        || currentIndex < 0
+        || currentIndex >= entries.length
+        || !Number.isInteger(adjacentIndex)
+        || adjacentIndex < 0
+        || adjacentIndex >= entries.length) {
+      failure = { error: "browser_page_navigation_history_ambiguous", dispatched: false };
+    } else {
+      const currentUrl = browserPageNavigationUrl(entries[currentIndex]?.url, page);
+      const adjacentUrl = browserPageNavigationUrl(entries[adjacentIndex]?.url, page);
+      const adjacentId = Number(entries[adjacentIndex]?.id);
+      if (currentUrl !== page.canonical_url) {
+        failure = {
+          error: currentUrl
+            ? "browser_page_navigation_history_mismatch"
+            : "browser_page_navigation_history_out_of_scope",
+          dispatched: false,
+        };
+      } else if (adjacentUrl !== destination) {
+        failure = {
+          error: adjacentUrl
+            ? "browser_page_navigation_history_mismatch"
+            : "browser_page_navigation_history_out_of_scope",
+          dispatched: false,
+        };
+      } else if (!Number.isSafeInteger(adjacentId)) {
+        failure = { error: "browser_page_navigation_history_ambiguous", dispatched: false };
+      } else if (!await exactTab()) {
+        // Re-read after the history snapshot: a tab or document race in the
+        // preflight window must fail closed, never commit the stale entry.
+        failure = { error: "browser_page_navigation_view_changed", dispatched: false };
+      } else {
+        dispatched = true;
+        await chrome.debugger.sendCommand(target, "Page.navigateToHistoryEntry", {
+          entryId: adjacentId,
+        });
+      }
+    }
+  } catch (_) {
+    failure = dispatched
+      ? { error: "browser_page_navigation_history_unconfirmed", dispatched: true }
+      : { error: "browser_page_navigation_history_unavailable", dispatched: false };
+  } finally {
+    if (attached) {
+      let detachVerified = false;
+      for (let attempt = 0; attempt < 2 && !detachVerified; attempt += 1) {
+        try {
+          await chrome.debugger.detach(target);
+          detachVerified = true;
+        } catch (_) {}
+      }
+      if (!detachVerified) {
+        return {
+          ok: false,
+          error: "browser_page_navigation_debugger_detach_unverified",
+          dispatched,
+        };
+      }
+    }
+  }
+  return failure ? { ok: false, ...failure } : { ok: true };
+}
+
 async function performBrowserPageNavigation(page, tab, action, msg) {
   const pageGeneration = Number(msg?.pageGeneration);
   if (!Number.isSafeInteger(pageGeneration) || pageGeneration !== page.page_generation) {
@@ -8907,33 +9014,33 @@ async function performBrowserPageNavigation(page, tab, action, msg) {
       error: "browser_page_navigation_unavailable",
     }, page, false);
   }
-  if ((action === "back" && typeof chrome.tabs.goBack !== "function")
-      || (action === "forward" && typeof chrome.tabs.goForward !== "function")) {
-    return browserPageMutationEnvelope({
-      ok: false,
-      error: "browser_page_navigation_unavailable",
-    }, page, false);
-  }
-
   const tracked = await trackBrowserPageNavigation(tab.id, page, { reload: action === "reload" });
-  try {
-    if (action === "navigate") {
-      await chrome.tabs.update(tab.id, { url: destination });
-    } else if (action === "reload") {
-      await chrome.tabs.reload(tab.id);
-    } else if (action === "back") {
-      await chrome.tabs.goBack(tab.id);
-    } else {
-      await chrome.tabs.goForward(tab.id);
+  if (action === "back" || action === "forward") {
+    const traversal = await browserPageNavigateHistory(page, tab, action, destination);
+    if (!traversal.ok) {
+      tracked.stop();
+      if (traversal.dispatched) await markBrowserPageNavigationStale(page);
+      return browserPageMutationEnvelope({
+        ok: false,
+        error: traversal.error,
+      }, page, traversal.dispatched);
     }
-  } catch (error) {
-    tracked.stop();
-    await markBrowserPageNavigationStale(page);
-    return browserPageMutationEnvelope({
-      ok: false,
-      error: "browser_page_navigation_transport_failed",
-      detail: String(error?.message || error || ""),
-    }, page, true);
+  } else {
+    try {
+      if (action === "navigate") {
+        await chrome.tabs.update(tab.id, { url: destination });
+      } else {
+        await chrome.tabs.reload(tab.id);
+      }
+    } catch (error) {
+      tracked.stop();
+      await markBrowserPageNavigationStale(page);
+      return browserPageMutationEnvelope({
+        ok: false,
+        error: "browser_page_navigation_transport_failed",
+        detail: String(error?.message || error || ""),
+      }, page, true);
+    }
   }
 
   const settled = await settleBrowserPageNavigation(await tracked.wait(), page, destination, {

@@ -61,6 +61,7 @@ function browserPageLifecycleHarness({
   fetchResponder = null,
   scriptResponder = null,
   hoverResponder = null,
+  historyResponder = null,
   navigationResponder = null,
   deferredCreate = false,
   windowFocused = true,
@@ -94,13 +95,58 @@ function browserPageLifecycleHarness({
     async get(key) { return { [key]: structuredClone(sessionStorage[key] || []) }; },
     async set(value) { Object.assign(sessionStorage, structuredClone(value)); },
   };
+  let navigationHistorySnapshot = null;
+  const debuggerResponder = historyResponder || hoverResponder;
+  const debuggerApi = debuggerResponder ? {
+    attach: (target, version) => debuggerResponder("attach", target, version),
+    async sendCommand(target, method, params) {
+      if (historyResponder) {
+        const custom = await historyResponder("command", target, { method, params });
+        if (custom !== undefined) {
+          if (method === "Page.getNavigationHistory" && Array.isArray(custom?.entries)) {
+            navigationHistorySnapshot = custom.entries;
+          }
+          return custom;
+        }
+      }
+      if (method === "Page.getNavigationHistory") {
+        const tab = tabs.get(target?.tabId);
+        if (!tab) throw new Error("tab missing");
+        if (!Array.isArray(tab.history)) tab.history = [tab.url];
+        if (!Number.isInteger(tab.historyIndex)) tab.historyIndex = tab.history.length - 1;
+        const entries = tab.history.map((url, index) => ({
+          id: 5000 + index, url, transitionType: "link", title: "",
+        }));
+        navigationHistorySnapshot = entries;
+        return { currentIndex: tab.historyIndex, entries };
+      }
+      if (method === "Page.navigateToHistoryEntry") {
+        const tab = tabs.get(target?.tabId);
+        if (!tab) throw new Error("tab missing");
+        const index = (navigationHistorySnapshot || [])
+          .findIndex((entry) => entry.id === params?.entryId);
+        if (index < 0 || tab.history?.[index] !== navigationHistorySnapshot[index].url) {
+          throw new Error("history entry unavailable");
+        }
+        tab.historyIndex = index;
+        tab.url = tab.history[index];
+        tab.status = "loading";
+        for (const listener of updatedListeners) listener(tab.id, { status: "loading" });
+        tab.status = "complete";
+        for (const listener of updatedListeners) listener(tab.id, { url: tab.url, status: "complete" });
+        return {};
+      }
+      if (hoverResponder) {
+        const custom = await hoverResponder("command", target, { method, params });
+        if (custom !== undefined) return custom;
+      }
+      return {};
+    },
+    detach: (target) => debuggerResponder("detach", target),
+  } : undefined;
   const chrome = {
     storage: { session: storageArea },
-    debugger: hoverResponder ? {
-      attach: (target, version) => hoverResponder("attach", target, version),
-      sendCommand: (target, method, params) => hoverResponder("command", target, { method, params }),
-      detach: (target) => hoverResponder("detach", target),
-    } : undefined,
+    debugger: debuggerApi,
     tabs: {
       async get(tabId) {
         const tab = tabs.get(tabId);
@@ -5972,9 +6018,22 @@ test("user refuses a redirected reload | Given an owned page reload that lands o
   assert.equal(h.browserPagesByRef.get(opened.page_ref)?.stale, true);
 });
 
-test("user moves through task-owned history | Given an owned page with three same-origin history entries | When back and forward name the exact expected URL | Then each verified move is adopted and fenced by the advanced page generation", async () => {
+test("user moves through task-owned history | Given an owned page with three same-origin history entries | When back and forward name the exact expected URL | Then the validated adjacent entry is traversed by CDP and the advanced generation is adopted", async () => {
   const tabs = new Map();
-  const h = browserPageLifecycleHarness({ tabs });
+  let attaches = 0;
+  let detaches = 0;
+  const traversed = [];
+  const h = browserPageLifecycleHarness({
+    tabs,
+    historyResponder(kind, _target, payload) {
+      if (kind === "attach") attaches += 1;
+      if (kind === "detach") detaches += 1;
+      if (kind === "command" && payload.method === "Page.navigateToHistoryEntry") {
+        traversed.push(payload.params.entryId);
+      }
+      return undefined;
+    },
+  });
   const opened = await h.performBrowserPageLifecycleRequest({
     action: "open",
     targetOrigin: "https://example.com",
@@ -6017,6 +6076,9 @@ test("user moves through task-owned history | Given an owned page with three sam
   assert.equal(back.navigated_url, "https://example.com/second");
   assert.equal(back.page_generation, third.page_generation + 1);
   assert.equal([...tabs.values()][0].url, "https://example.com/second");
+  assert.deepEqual(traversed, [5001], "back must traverse the validated previous entry id");
+  assert.equal(attaches, 1);
+  assert.equal(detaches, 1);
 
   const staleBack = await h.performBrowserPageActionRequest({
     action: "back",
@@ -6039,6 +6101,9 @@ test("user moves through task-owned history | Given an owned page with three sam
   assert.equal(forward.navigated_url, "https://example.com/third");
   assert.equal(forward.page_generation, back.page_generation + 1);
   assert.equal([...tabs.values()][0].url, "https://example.com/third");
+  assert.deepEqual(traversed, [5001, 5002], "forward must traverse the validated next entry id");
+  assert.equal(attaches, 2);
+  assert.equal(detaches, 2);
 
   const claimedTabs = new Map([[95, { id: 95, url: "https://example.com/third", status: "complete", active: true }]]);
   const claimedHarness = browserPageLifecycleHarness({ tabs: claimedTabs });
@@ -6058,34 +6123,253 @@ test("user moves through task-owned history | Given an owned page with three sam
   assert.equal(claimedBack.delivery_state, "not_applied");
 });
 
-test("user refuses history that lands outside the named entry | Given task-owned history whose previous entry differs from the expected URL | When back settles on the other same-origin entry | Then delivery stays unknown and the page handle is stale", async () => {
+test("user blocks an off-origin adjacent history entry | Given an owned page whose previous history entry is outside the origin | When back requests a same-origin expected URL | Then no history traversal is dispatched and the rejection is not_applied and retry-safe", async () => {
+  const tabs = new Map();
+  let traversals = 0;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    historyResponder(kind, _target, payload) {
+      if (kind === "command" && payload.method === "Page.getNavigationHistory") {
+        return {
+          currentIndex: 1,
+          entries: [
+            { id: 71, url: "https://other.example/exit" },
+            { id: 72, url: "https://example.com/second" },
+          ],
+        };
+      }
+      if (kind === "command" && payload.method === "Page.navigateToHistoryEntry") traversals += 1;
+      return undefined;
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/second",
+    idempotencyKey: "open-history-cross-origin-1",
+  });
+  const result = await h.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://example.com/first",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "browser_page_navigation_history_out_of_scope");
+  assert.equal(result.delivery_state, "not_applied");
+  assert.equal(result.retry_safe, true);
+  assert.equal(result.mutation_submitted, false);
+  assert.equal([...tabs.values()][0].url, "https://example.com/second");
+  assert.equal(traversals, 0);
+  assert.equal(h.browserPagesByRef.get(opened.page_ref)?.stale, false);
+});
+
+test("user blocks a history destination that differs from the expected URL | Given an owned page whose previous entry is another same-origin URL | When back names a different expected URL | Then the preflight rejects it before any traversal", async () => {
+  const tabs = new Map();
+  let traversals = 0;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    historyResponder(kind, _target, payload) {
+      if (kind === "command" && payload.method === "Page.getNavigationHistory") {
+        return {
+          currentIndex: 1,
+          entries: [
+            { id: 73, url: "https://example.com/landing" },
+            { id: 74, url: "https://example.com/second" },
+          ],
+        };
+      }
+      if (kind === "command" && payload.method === "Page.navigateToHistoryEntry") traversals += 1;
+      return undefined;
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/second",
+    idempotencyKey: "open-history-mismatch-1",
+  });
+  const result = await h.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://example.com/first",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "browser_page_navigation_history_mismatch");
+  assert.equal(result.delivery_state, "not_applied");
+  assert.equal(result.retry_safe, true);
+  assert.equal(result.mutation_submitted, false);
+  assert.equal([...tabs.values()][0].url, "https://example.com/second");
+  assert.equal(traversals, 0);
+});
+
+test("user blocks history without the debugger | Given an owned page and no debugger capability | When back is requested | Then nothing is dispatched and the rejection is not_applied and retry-safe", async () => {
   const tabs = new Map();
   const h = browserPageLifecycleHarness({ tabs });
   const opened = await h.performBrowserPageLifecycleRequest({
     action: "open",
     targetOrigin: "https://example.com",
-    url: "https://example.com/first",
-    idempotencyKey: "open-history-mismatch-1",
+    url: "https://example.com/second",
+    idempotencyKey: "open-history-no-debugger-1",
   });
-  const next = await h.performBrowserPageActionRequest({
+  const result = await h.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://example.com/first",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "browser_page_navigation_history_unavailable");
+  assert.equal(result.delivery_state, "not_applied");
+  assert.equal(result.retry_safe, true);
+  assert.equal(result.mutation_submitted, false);
+  assert.equal([...tabs.values()][0].url, "https://example.com/second");
+});
+
+test("user blocks history when the live tab moved during preflight | Given the tab URL changes after resolution | When back reads the history snapshot | Then the view-change fence rejects the move before traversal", async () => {
+  const tabs = new Map();
+  let traversals = 0;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    historyResponder(kind, _target, payload) {
+      if (kind === "command" && payload.method === "Page.getNavigationHistory") {
+        const tab = [...tabs.values()][0];
+        tab.url = "https://example.com/elsewhere";
+        return {
+          currentIndex: 1,
+          entries: [
+            { id: 81, url: "https://example.com/first" },
+            { id: 82, url: "https://example.com/second" },
+          ],
+        };
+      }
+      if (kind === "command" && payload.method === "Page.navigateToHistoryEntry") traversals += 1;
+      return undefined;
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/second",
+    idempotencyKey: "open-history-race-1",
+  });
+  const result = await h.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://example.com/first",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "browser_page_navigation_view_changed");
+  assert.equal(result.delivery_state, "not_applied");
+  assert.equal(result.retry_safe, true);
+  assert.equal(result.mutation_submitted, false);
+  assert.equal([...tabs.values()][0].url, "https://example.com/elsewhere");
+  assert.equal(traversals, 0);
+});
+
+test("user blocks history without an adjacent entry | Given an owned page at the oldest history entry | When back is requested | Then the ambiguous history is rejected before traversal", async () => {
+  const tabs = new Map();
+  let traversals = 0;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    historyResponder(kind, _target, payload) {
+      if (kind === "command" && payload.method === "Page.navigateToHistoryEntry") traversals += 1;
+      return undefined;
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/first",
+    idempotencyKey: "open-history-ambiguous-1",
+  });
+  const result = await h.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://example.com/start",
+    pageGeneration: opened.page_generation,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "browser_page_navigation_history_ambiguous");
+  assert.equal(result.delivery_state, "not_applied");
+  assert.equal(result.retry_safe, true);
+  assert.equal(result.mutation_submitted, false);
+  assert.equal([...tabs.values()][0].url, "https://example.com/first");
+  assert.equal(traversals, 0);
+});
+
+test("user never leaves a debugger attached after history traversal | Given a verified history move whose detach fails | When back dispatches the validated entry | Then the result is delivery unknown and the page handle is stale", async () => {
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({
+    tabs,
+    historyResponder(kind) {
+      if (kind === "detach") throw new Error("detach failed");
+      return undefined;
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/first",
+    idempotencyKey: "open-history-detach-1",
+  });
+  const second = await h.performBrowserPageActionRequest({
     action: "navigate",
     pageRef: opened.page_ref,
     url: "https://example.com/second",
     pageGeneration: opened.page_generation,
   });
-  const live = [...tabs.values()][0];
-  live.history[live.historyIndex - 1] = "https://example.com/landing";
   const result = await h.performBrowserPageActionRequest({
     action: "back",
     pageRef: opened.page_ref,
     expectedUrl: "https://example.com/first",
-    pageGeneration: next.page_generation,
+    pageGeneration: second.page_generation,
   });
   assert.equal(result.ok, false);
-  assert.equal(result.error, "browser_page_navigation_mismatch");
+  assert.equal(result.error, "browser_page_navigation_debugger_detach_unverified");
   assert.equal(result.delivery_state, "delivery_unknown");
   assert.equal(result.retry_safe, false);
   assert.equal(result.mutation_submitted, true);
-  assert.equal(live.url, "https://example.com/landing");
+  assert.equal([...tabs.values()][0].url, "https://example.com/first");
+  assert.equal(h.browserPagesByRef.get(opened.page_ref)?.stale, true);
+});
+
+test("user never replays an unconfirmed history command | Given the history command channel fails after preflight | When back dispatches | Then delivery is unknown and the handle is stale", async () => {
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({
+    tabs,
+    historyResponder(kind, _target, payload) {
+      if (kind === "command" && payload.method === "Page.navigateToHistoryEntry") {
+        throw new Error("cdp channel lost");
+      }
+      return undefined;
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/first",
+    idempotencyKey: "open-history-unconfirmed-1",
+  });
+  const second = await h.performBrowserPageActionRequest({
+    action: "navigate",
+    pageRef: opened.page_ref,
+    url: "https://example.com/second",
+    pageGeneration: opened.page_generation,
+  });
+  const result = await h.performBrowserPageActionRequest({
+    action: "back",
+    pageRef: opened.page_ref,
+    expectedUrl: "https://example.com/first",
+    pageGeneration: second.page_generation,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "browser_page_navigation_history_unconfirmed");
+  assert.equal(result.delivery_state, "delivery_unknown");
+  assert.equal(result.retry_safe, false);
+  assert.equal(result.mutation_submitted, true);
+  assert.equal([...tabs.values()][0].url, "https://example.com/second");
   assert.equal(h.browserPagesByRef.get(opened.page_ref)?.stale, true);
 });

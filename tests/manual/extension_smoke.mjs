@@ -1307,6 +1307,11 @@ const pageAssistReturn = wakeContentListener?.(
 );
 ok(pageAssistReturn === false && !pageAssistSwallowed,
   "WebChat content listener leaves h2w_page_assist responses to the Generic Web listener");
+ok(!backgroundSource.includes("chrome.tabs.goBack(")
+    && !backgroundSource.includes("chrome.tabs.goForward(")
+    && backgroundSource.includes("Page.getNavigationHistory")
+    && backgroundSource.includes("Page.navigateToHistoryEntry"),
+  "history navigation preflights the exact adjacent CDP entry instead of blind tab history APIs");
 // Exercise the actual BrowserPage read handler with a Chrome-compatible
 // unresolved initial response. The absence of a Page Assist listener must
 // invoke its existing one-shot kernel injection and settle with a DOM read.
