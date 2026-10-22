@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.232";
+const H2W_CONTENT_VERSION = "0.1.233";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3671,7 +3671,7 @@ function normalizeHerdrMentionAlias(value) {
             "native_id_conflict_matching_email",
             "native_id_conflict_different_email",
             "native_id_conflict_unverified_email",
-            "email_conflict",
+            "email_conflict", "authenticated_rate_limited",
           ].includes(observed?.reason) ? observed.reason : null,
           idRelation: [
             "me_matches_session_account_id",
@@ -3704,6 +3704,7 @@ function normalizeHerdrMentionAlias(value) {
       native_id_conflict_different_email: "id_conflict_different_email",
       native_id_conflict_unverified_email: "id_conflict_unverified_email",
       email_conflict: "email_conflict",
+      authenticated_rate_limited: "identity_rate_limited",
     };
     lastBrowserRegistrationStatus = accountNativeIdentity ? "identity_observed"
       : conflictStatuses[accountObservation?.reason] || "identity_unavailable";

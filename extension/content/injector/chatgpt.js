@@ -65,7 +65,22 @@ class ChatGPTAdapter extends BaseAdapter {
     return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null;
   }
 
+  noteAccountIdentity429(response) {
+    const retryAfter = Number.parseInt(response?.headers?.get?.("retry-after") || "", 10);
+    const boundedRetryAfterMs = Number.isSafeInteger(retryAfter)
+      && retryAfter >= 0 && retryAfter <= 86_400 ? retryAfter * 1000 : 0;
+    this._accountIdentity429Count = Math.min(8, (this._accountIdentity429Count || 0) + 1);
+    const policyMs = Math.min(120_000, 30_000 * (2 ** Math.min(2, this._accountIdentity429Count - 1)));
+    this._accountIdentity429Until = Math.max(
+      this._accountIdentity429Until || 0,
+      Date.now() + Math.max(30_000, policyMs, boundedRetryAfterMs),
+    );
+  }
+
   async getAccountObservation(timeoutMs = 1500) {
+    if (Date.now() < (this._accountIdentity429Until || 0)) {
+      return { nativeIdentity: null, email: null, reason: "authenticated_rate_limited" };
+    }
     let nativeIdentity = null;
     let email = null;
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
@@ -79,6 +94,10 @@ class ChatGPTAdapter extends BaseAdapter {
           headers: { accept: "application/json" },
           signal: controller.signal,
         });
+        if (response.status === 429) {
+          this.noteAccountIdentity429(response);
+          return { nativeIdentity: null, email: null, reason: "authenticated_rate_limited" };
+        }
         if (!response.ok) continue;
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
@@ -134,6 +153,7 @@ class ChatGPTAdapter extends BaseAdapter {
                   signal: bearerController.signal,
                 });
                 if (!verified.ok) {
+                  if (verified.status === 429) this.noteAccountIdentity429(verified);
                   bearerRelation = verified.status === 401 || verified.status === 403
                     ? "bearer_not_authorized" : verified.status === 429
                       ? "bearer_rate_limited" : "bearer_response_unavailable";
@@ -168,6 +188,7 @@ class ChatGPTAdapter extends BaseAdapter {
           // All other conflicts continue to fail closed.
           if (bearerRelation === "bearer_matches_session_user"
               && observedEmail && (!email || email === observedEmail)) {
+            this._accountIdentity429Count = 0;
             return {
               nativeIdentity: observedIdentity,
               email: observedEmail,
@@ -187,6 +208,7 @@ class ChatGPTAdapter extends BaseAdapter {
         clearTimeout(timer);
       }
     }
+    if (nativeIdentity) this._accountIdentity429Count = 0;
     return nativeIdentity
       ? { nativeIdentity, email }
       : { nativeIdentity: null, email: null, reason: "authenticated_identity_unavailable" };

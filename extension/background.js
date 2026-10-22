@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.232";
+const H2W_SCRIPT_VERSION = "0.1.233";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -3896,7 +3896,7 @@ async function handleBrowserActuation(command) {
               "not_observed", "identity_observed", "identity_unavailable",
               "id_conflict_matching_email", "id_conflict_different_email",
               "id_conflict_unverified_email", "email_conflict",
-              "provider_readback_unavailable",
+              "identity_rate_limited", "provider_readback_unavailable",
               "background_unavailable", "registry_observed", "registry_unobserved",
             ].includes(status)) probeRegistrationStatus = status;
             const relation = response?.identityRelation;

@@ -264,6 +264,35 @@ test("user rejects inconsistent ChatGPT account identity | Given authenticated e
   assert.equal(consistent.email, "prior@example.com");
 });
 
+test("user backs off authenticated identity probes | Given either cookie identity endpoint returns HTTP 429 | When the same account is observed again | Then no additional authenticated request is issued until cooldown expires", async () => {
+  for (const rateLimitedRoute of ["/backend-api/me", "/api/auth/session"]) {
+    const requests = [];
+    let rateLimited = true;
+    const fetch = async (url) => {
+      requests.push(url);
+      if (url === rateLimitedRoute && rateLimited) {
+        return { ok: false, status: 429, headers: { get: () => "1" } };
+      }
+      return { ok: true, status: 200, json: async () => url === "/backend-api/me"
+        ? { id: "same-id", email: "same@example.com" }
+        : { user: { id: "same-id", email: "same@example.com" } } };
+    };
+    const adapter = loadAdapterWithDocument({}, fetch);
+    const first = await adapter.getAccountObservation();
+    assert.equal(first.nativeIdentity, null);
+    assert.equal(first.reason, "authenticated_rate_limited");
+    const callsAt429 = requests.length;
+    const second = await adapter.getAccountObservation();
+    assert.equal(second.reason, "authenticated_rate_limited");
+    assert.equal(requests.length, callsAt429, "retry during cooldown must not hit either authenticated endpoint");
+    rateLimited = false;
+    adapter._accountIdentity429Until = 0;
+    const recovered = await adapter.getAccountObservation();
+    assert.equal(recovered.nativeIdentity, "same-id");
+    assert.equal(recovered.email, "same@example.com");
+  }
+});
+
 test("user safely adopts a bearer-verified session identity | Given conflicting cookie and session IDs | When the active bearer proves the session user | Then the canonical account identity is bounded and cache-safe", async () => {
   let bearerCalls = 0;
   const payloads = {
@@ -332,6 +361,7 @@ test("user refuses unproven bearer login identity | Given a mismatched cookie us
 
   payloads["/backend-api/me"].email = "different@example.com";
   bearerStatus = 200;
+  adapter._accountIdentity429Until = 0; // simulated expiry; no unbounded wait in test
   payloads["/api/auth/session"].user.id = "live-session-user";
   const disagree = await adapter.getAccountObservation();
   assert.equal(disagree.nativeIdentity, null, "different authenticated emails must reject even a valid session bearer");

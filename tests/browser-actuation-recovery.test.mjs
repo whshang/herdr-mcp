@@ -4253,6 +4253,8 @@ test("user learns safe registration failures | Given a create scope handshake af
   assert.match(registrationStatus, /lastBrowserRegistrationStatus\s*=\s*accountNativeIdentity/);
   assert.match(registrationStatus, /"id_conflict_matching_email"/);
   assert.match(registrationStatus, /"id_conflict_different_email"/);
+  assert.match(wakeSource, /authenticated_rate_limited: "identity_rate_limited"/);
+  assert.match(backgroundSource, /"identity_rate_limited", "provider_readback_unavailable"/);
   const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
   const end = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")', start);
   assert.ok(start >= 0 && end > start);
