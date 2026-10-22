@@ -38,6 +38,7 @@ struct RegisterTaskInput<'a> {
     task_id: &'a str,
     target: &'a str,
     fingerprint: &'a str,
+    idempotency_key: Option<&'a str>,
     before: Option<&'a AgentState>,
     after: Option<&'a AgentState>,
     submitted: Option<bool>,
@@ -85,6 +86,8 @@ struct PromptTaskRecord {
     task_id: String,
     dispatch_id: String,
     target: String,
+    #[serde(default)]
+    idempotency_key_digest: Option<String>,
     pane_id: Option<String>,
     workspace_id: Option<String>,
     baseline_status: Option<String>,
@@ -411,6 +414,7 @@ impl PromptRegistry {
             task_id,
             target,
             fingerprint,
+            idempotency_key,
             before,
             after,
             submitted,
@@ -467,6 +471,8 @@ impl PromptRegistry {
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
             target: target.to_owned(),
+            idempotency_key_digest: idempotency_key
+                .map(|key| stable_digest(&[b"herdr_prompt/task_key", key.as_bytes()])),
             pane_id,
             workspace_id,
             baseline_status,
@@ -517,6 +523,53 @@ impl PromptRegistry {
                 "code": "agent_task_store_unavailable",
                 "message": error,
                 "task_id": task_id,
+            }),
+        }
+    }
+
+    pub fn task_status_by_idempotency(
+        &self,
+        idempotency_key: &str,
+        target: &str,
+        parent_session_ref: Option<&str>,
+    ) -> Value {
+        let digest = stable_digest(&[b"herdr_prompt/task_key", idempotency_key.as_bytes()]);
+        let Some(store) = self.inner.store.as_ref() else {
+            return json!({"ok": false, "code": "agent_task_store_unavailable"});
+        };
+        let ids = match store.lock() {
+            Ok(store) => store.task_operation_ids_by_key_digest(
+                PROMPT_TASK_OPERATION_KIND,
+                &digest,
+                i64::try_from(now_ms()).unwrap_or(i64::MAX),
+            ),
+            Err(_) => Err("agent task store lock unavailable".to_owned()),
+        };
+        let ids = match ids {
+            Ok(ids) => ids,
+            Err(error) => {
+                return json!({
+                    "ok": false, "code": "agent_task_store_unavailable", "message": error,
+                });
+            }
+        };
+        if ids.len() > 1 {
+            return json!({"ok": false, "code": "agent_task_lookup_ambiguous"});
+        }
+        let Some(task_id) = ids.first() else {
+            return json!({"ok": false, "code": "agent_task_not_found"});
+        };
+        match self.reconcile_task(task_id) {
+            Ok(Some(task))
+                if task.idempotency_key_digest.as_deref() == Some(digest.as_str())
+                    && task.target == target
+                    && task.parent_session_ref.as_deref() == parent_session_ref =>
+            {
+                json!({"ok": true, "task": task.public_json()})
+            }
+            Ok(_) => json!({"ok": false, "code": "agent_task_not_found"}),
+            Err(error) => json!({
+                "ok": false, "code": "agent_task_store_unavailable", "message": error,
             }),
         }
     }
@@ -1499,6 +1552,21 @@ pub fn task_call_with_parent_session(
 ) -> Value {
     match method {
         AGENT_TASK_STATUS_METHOD => {
+            if let Some(key_value) = params.get("idempotency_key") {
+                let Some(key) = key_value.as_str() else {
+                    return invalid("idempotency_key must be a string");
+                };
+                let Some(target) = params.get("target").and_then(Value::as_str) else {
+                    return invalid("target is required for idempotency lookup");
+                };
+                if key.is_empty() || key.len() > 256 || target.is_empty() || target.len() > 256 {
+                    return invalid("invalid idempotency_key or target length");
+                }
+                if params.get("task_id").is_some() {
+                    return invalid("choose task_id or idempotency_key, not both");
+                }
+                return registry.task_status_by_idempotency(key, target, caller_parent_session_ref);
+            }
             let Some(task_id) = params.get("task_id").and_then(Value::as_str) else {
                 return invalid("task_id is required");
             };
@@ -1679,6 +1747,7 @@ pub fn run_with_parent_session(
         task_id,
         target,
         fingerprint: &fingerprint,
+        idempotency_key,
         before: before.as_ref(),
         after: after.as_ref(),
         submitted,
@@ -2953,6 +3022,7 @@ mod tests {
                 task_id,
                 target: "child",
                 fingerprint: "fingerprint",
+                idempotency_key: Some("review-project-19-sha"),
                 before: Some(&before),
                 after: Some(&after),
                 submitted: Some(true),
@@ -2999,6 +3069,23 @@ mod tests {
         assert_eq!(status["task"]["lifecycle"], "completed");
         assert_eq!(status["task"]["parent_target"], "parent");
         assert_eq!(status["task"]["turn_correlation"], "runtime_activity_gate");
+        let found = task_call_with_parent_session(
+            &reopened,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"idempotency_key": "review-project-19-sha", "target": "child"}),
+            None,
+        );
+        assert_eq!(found["task"]["task_id"], task_id);
+        assert_eq!(found["task"]["lifecycle"], "completed");
+        assert!(found["task"].get("idempotency_key_digest").is_none());
+        assert_eq!(
+            reopened.task_status_by_idempotency("review-project-19-sha", "wrong-target", None)["code"],
+            "agent_task_not_found"
+        );
+        assert_eq!(
+            reopened.task_status_by_idempotency("review-project-19-sha", "child", Some("wrong"))["code"],
+            "agent_task_not_found"
+        );
 
         let inbox = reopened.task_inbox(None, Some("parent"), None, false, true, 10);
         assert_eq!(inbox["summary"]["completed"], 1);
@@ -3025,6 +3112,48 @@ mod tests {
         assert_eq!(after_ack["summary"]["completed"], 0);
         assert!(after_ack["tasks"].as_array().unwrap().is_empty());
         assert_eq!(after_ack["attention"]["reason"], "no_pending_terminal");
+
+        // Recover even when the original task is older than the bounded inbox.
+        for index in 0..520 {
+            let mut filler = task.clone();
+            filler.task_id = format!("dispatch:prompt:filler-{index}");
+            filler.dispatch_id = filler.task_id.clone();
+            filler.idempotency_key_digest = None;
+            reopened.save_task(&filler, None).unwrap();
+        }
+        let recovered = reopened.task_status_by_idempotency("review-project-19-sha", "child", None);
+        assert_eq!(recovered["task"]["task_id"], task_id);
+
+        let mut duplicate = task.clone();
+        duplicate.task_id = "dispatch:prompt:duplicate".to_owned();
+        duplicate.dispatch_id = duplicate.task_id.clone();
+        reopened.save_task(&duplicate, None).unwrap();
+        assert_eq!(
+            reopened.task_status_by_idempotency("review-project-19-sha", "child", None)["code"],
+            "agent_task_lookup_ambiguous"
+        );
+
+        let mut session_bound = task.clone();
+        session_bound.task_id = "dispatch:prompt:session-bound".to_owned();
+        session_bound.dispatch_id = session_bound.task_id.clone();
+        session_bound.parent_session_ref = Some("session:owner".to_owned());
+        session_bound.idempotency_key_digest = Some(stable_digest(&[
+            b"herdr_prompt/task_key",
+            b"separate-session-key",
+        ]));
+        reopened.save_task(&session_bound, None).unwrap();
+        assert_eq!(
+            reopened.task_status_by_idempotency("separate-session-key", "child", None)["code"],
+            "agent_task_not_found"
+        );
+        assert_eq!(
+            reopened.task_status_by_idempotency(
+                "separate-session-key",
+                "child",
+                Some("session:owner")
+            )["task"]["task_id"],
+            session_bound.task_id
+        );
 
         drop(reopened);
         fs::remove_file(&db_path).ok();
@@ -3059,6 +3188,7 @@ mod tests {
                 task_id,
                 target: "child",
                 fingerprint: "fingerprint",
+                idempotency_key: None,
                 before: Some(&idle),
                 after: Some(&idle),
                 submitted: Some(true),
@@ -3190,6 +3320,7 @@ mod tests {
                 task_id: "dispatch:prompt:boot-fence",
                 target: "child",
                 fingerprint: "fp",
+                idempotency_key: None,
                 before: Some(&before),
                 after: Some(&after),
                 submitted: Some(true),
