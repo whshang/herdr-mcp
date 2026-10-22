@@ -57,6 +57,10 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 "properties": {
                     "ids": {"type": "array", "items": {"type": "string"}},
                     "expected_digests": {"type": "object"},
+                    "omit_unchanged": {
+                        "type": "boolean",
+                        "description": "with a matching expected digest, return the entry with unchanged=true instead of content",
+                    },
                     "project_root": {"type": "string"},
                 },
                 "required": ["ids"],
