@@ -5682,6 +5682,7 @@ mod tests {
 
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[
                 json!({
@@ -5697,7 +5698,8 @@ mod tests {
                     "pane": {"pane_id": "w1:p1", "agent_status": "done"}
                 }),
             ],
-        );
+        )
+        .unwrap();
 
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
