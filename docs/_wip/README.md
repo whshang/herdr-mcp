@@ -25,5 +25,6 @@ Current active WIP is limited to unresolved work: the 1.1 Browser Adapter Platfo
 - Archived 1.1 consolidation plan: [`../history/architecture/v1.1-consolidation-plan-20261011.md`](../history/architecture/v1.1-consolidation-plan-20261011.md).
 - Archived caller-grant-missing diagnosis (#626 background): [`../history/architecture/caller-grant-missing-20261013.md`](../history/architecture/caller-grant-missing-20261013.md).
 - Active browser control-plane work: [`browser-control-plane.md`](browser-control-plane.md).
+- Active WebChat provider-adapter diagnosis (ChatGPT/Claude/Grok decoupling): [`webchat-provider-adapters.md`](webchat-provider-adapters.md).
 - Active progressive-skills work: [`modular-progressive-skills.md`](modular-progressive-skills.md).
 - Active browser-extension package/Store work: [`browser-extension-development-and-store-release.md`](browser-extension-development-and-store-release.md). Historical pre-1.0 Store rollout detail lives under [`../history/architecture/browser-extension-development-and-store-release-20260829.md`](../history/architecture/browser-extension-development-and-store-release-20260829.md).
