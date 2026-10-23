@@ -2000,7 +2000,8 @@ const FINAL_EXCERPT_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
 /// completed while its children still run non-terminal, and — exactly once at
 /// an eligible terminal transition — captures the bounded final excerpt of the
 /// child's recent output. A failed capture only leaves `final_excerpt` unset;
-/// lifecycle, notification, and ack state are untouched.
+/// lifecycle, notification, and ack state are untouched, including the
+/// fail-closed case where the terminal event carries no producer sequence.
 ///
 /// `registry` is `Some` when the caller owns the durable task ledger and can
 /// count this task's still-running children. `None` applies events only, for
@@ -2076,12 +2077,13 @@ fn hold_settled_task_for_children(task: &mut PromptTaskRecord, awaiting_children
 }
 
 /// Returns true when this same event batch already proves the pane moved past
-/// the task's terminal cursor, i.e. the pane may be serving a later task. Live
-/// Herdr events carry no `state_change_seq`, so a later same-pane status change
-/// or pane closure is by itself enough to fail the capture closed before any
-/// native read; a differing sequence does the same when events carry one. A
-/// `pane_updated` snapshot of the same terminal status is the companion of
-/// `pane.agent_status_changed` and does not prove a later task.
+/// the task's terminal cursor, i.e. the pane may be serving a later task. A
+/// later same-pane status change or pane closure is by itself enough to fail the
+/// capture closed before any native read; a differing sequence does the same when
+/// events carry one. A `pane_updated` snapshot of the same terminal status is the
+/// companion of `pane.agent_status_changed` and does not prove a later task; it
+/// only matters once the terminal event carries a sequence, because an
+/// unsequenced terminal event never reaches the read at all.
 fn batch_proves_pane_advanced(
     task: &PromptTaskRecord,
     events: &[Value],
@@ -2153,9 +2155,10 @@ fn final_excerpt_eligible(task: &PromptTaskRecord) -> bool {
 ///
 /// A pane may be reused between terminal-event observation and this read, so the
 /// capture is fenced on a `state_change_seq` observed both before and after the
-/// read. Live Herdr terminal events carry no sequence, in which case the pre-read
-/// `agent.get` supplies it (and must prove the pane moved past the dispatch
-/// baseline).
+/// read. That sequence must come from the terminal event itself: Herdr 0.8.2 and
+/// 0.9.5 emit no sequence, and a probe-only sequence cannot tell this task's
+/// settle from a later same-status task on the reused pane, so such a transition
+/// is never read and simply keeps `final_excerpt` unset.
 fn read_final_excerpt(
     client: Option<&HerdrClient>,
     task: &PromptTaskRecord,
@@ -2199,15 +2202,22 @@ fn read_final_excerpt(
 }
 
 /// Returns the pane state sequence this capture is fenced on, after proving the
-/// pane still reports this task's terminal status. An event that carries a
-/// sequence pins it directly; a live event without one is pinned by the
-/// pre-read `agent.get`, which must also have advanced past the baseline.
+/// pane still reports this task's terminal status.
+///
+/// The fence fails closed without the producer's own terminal identity. Herdr
+/// 0.8.2 and 0.9.5 emit `pane.agent_status_changed` without `state_change_seq`,
+/// so a deferred `agent.get` only reports "whatever the pane serves now": a
+/// later task that settled to the same status on the same pane is
+/// indistinguishable from this task's own settle, and the pre/post probes agree
+/// on the impostor. Capturing there would store the wrong child's output, so an
+/// event without a sequence omits the excerpt until the producer stamps one.
 fn final_excerpt_capture_seq(
     client: &HerdrClient,
     task: &PromptTaskRecord,
     target: &str,
     expected_state_change_seq: Option<u64>,
 ) -> Option<u64> {
+    let expected_seq = expected_state_change_seq?;
     let pre = final_excerpt_agent_state(client, target)?;
     if pre.pane_id.as_deref() != Some(target)
         || pre.agent_status.as_deref() != task.terminal_status.as_deref()
@@ -2215,7 +2225,7 @@ fn final_excerpt_capture_seq(
         return None;
     }
     let pre_seq = pre.state_change_seq?;
-    if expected_state_change_seq.is_some_and(|expected_seq| expected_seq != pre_seq) {
+    if expected_seq != pre_seq {
         return None;
     }
     // Terminal task state is monotonic: a sequence that did not move past the
@@ -5490,16 +5500,18 @@ mod tests {
         );
     }
 
-    /// user owner | Given live Herdr events that carry no `state_change_seq` |
-    /// When the pre-read and post-read `agent.get` agree on the pane state |
-    /// Then the excerpt is captured from the pane state observed before the read.
+    /// user owner | Given a live `pane.agent_status_changed` done event with no
+    /// `state_change_seq`, while `agent.get` returns a stable done state | When
+    /// the terminal transition is reconciled | Then the excerpt is omitted
+    /// because no producer identity can pin the pane to this task, and the task
+    /// stays terminal with the same lifecycle and cursor.
     #[test]
-    fn final_excerpt_captures_live_event_without_state_change_seq_when_pre_and_post_agent_get_match()
+    fn final_excerpt_omits_live_event_without_state_change_seq_even_when_pre_and_post_agent_get_match()
      {
         let socket = temp_socket();
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
-        let server = scripted_read_server(
+        let _server = scripted_read_server(
             listener,
             vec![
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
@@ -5528,19 +5540,17 @@ mod tests {
 
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(task.terminal_status.as_deref(), Some("done"));
         assert_eq!(task.terminal_cursor, Some(101));
-        assert_eq!(
-            task.final_excerpt.as_deref(),
-            Some("LIVE EXCERPT OK\n"),
-            "the live event shape must still capture a fenced excerpt"
+        assert_eq!(task.notification_state, "pending");
+        assert!(
+            task.final_excerpt.is_none(),
+            "an unsequenced terminal event cannot be pinned to this task"
         );
-        let recorded = requests.lock().unwrap();
-        assert_eq!(recorded.len(), 3);
-        assert_eq!(recorded[0].0, "agent.get");
-        assert_eq!(recorded[1].0, "agent.read");
-        assert_eq!(recorded[2].0, "agent.get");
-        drop(recorded);
-        server.join().unwrap();
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a transition without producer identity must not probe or read the pane"
+        );
     }
 
     /// user owner | Given live events without `state_change_seq` where the pane
@@ -5601,11 +5611,11 @@ mod tests {
         );
     }
 
-    /// user owner | Given a live event without `state_change_seq` | When the
-    /// pane advances between the pre-read and post-read `agent.get` | Then the
-    /// read output is dropped and no excerpt is stored.
+    /// user owner | Given a sequenced terminal event | When the pane advances
+    /// between the pre-read and post-read `agent.get` | Then the read output is
+    /// dropped and no excerpt is stored.
     #[test]
-    fn final_excerpt_omits_live_event_without_seq_when_seq_advances_between_pre_and_post_read() {
+    fn final_excerpt_omits_sequenced_event_when_seq_advances_between_pre_and_post_read() {
         let socket = temp_socket();
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
@@ -5628,10 +5638,7 @@ mod tests {
             &mut task,
             &[json!({
                 "cursor": 101,
-                "pane_id": "w1:p1",
-                "agent": "codex",
-                "agent_status": "done",
-                "type": "pane.agent_status_changed"
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
         )
         .unwrap();
@@ -5702,16 +5709,17 @@ mod tests {
         );
     }
 
-    /// user owner | Given a live `pane.agent_status_changed` done event followed
-    /// in the same batch by a `pane_updated` snapshot of that same status and
-    /// no sequence | When the terminal transition is reconciled | Then the
-    /// snapshot is not a later task and the fenced excerpt is captured.
+    /// user owner | Given a live `pane.agent_status_changed` done event with no
+    /// `state_change_seq`, followed in the same batch by a `pane_updated`
+    /// snapshot of that same status and no sequence | When the terminal
+    /// transition is reconciled | Then no excerpt is captured: the snapshot
+    /// carries no identity either, so it cannot prove this task owns the pane.
     #[test]
-    fn final_excerpt_captures_live_done_when_same_status_pane_updated_follows_without_seq() {
+    fn final_excerpt_omits_live_done_without_seq_when_same_status_pane_updated_follows() {
         let socket = temp_socket();
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
-        let server = scripted_read_server(
+        let _server = scripted_read_server(
             listener,
             vec![
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
@@ -5748,26 +5756,190 @@ mod tests {
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
         assert_eq!(task.terminal_cursor, Some(101));
-        assert_eq!(
-            task.final_excerpt.as_deref(),
-            Some("RC3_EXCERPT_UAT_PASS\n"),
-            "a same-status pane_updated snapshot must not hide this task's excerpt"
+        assert!(
+            task.final_excerpt.is_none(),
+            "an unsequenced snapshot must not unlock this task's excerpt"
         );
-        let recorded = requests.lock().unwrap();
-        assert_eq!(recorded.len(), 3);
-        assert_eq!(recorded[0].0, "agent.get");
-        assert_eq!(recorded[1].0, "agent.read");
-        assert_eq!(recorded[2].0, "agent.get");
-        drop(recorded);
-        server.join().unwrap();
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the snapshot pair carries no identity, so the pane must not be read"
+        );
     }
 
-    /// user owner | Given a live event without `state_change_seq` whose pane
-    /// state has not moved past the dispatch baseline | When the terminal
-    /// transition is reconciled | Then no excerpt is captured and the pane is
-    /// never read.
+    /// user owner | Given task A's live `done` event without
+    /// `state_change_seq`, a pane whose next task B already settled to the
+    /// same `done` status with B's `working` event lost, and no reuse event
+    /// in A's batch | When A's terminal transition is reconciled | Then A
+    /// must keep no excerpt and the reused pane must never be read.
     #[test]
-    fn final_excerpt_omits_live_event_without_seq_when_pre_read_seq_did_not_pass_baseline() {
+    fn final_excerpt_omits_live_event_without_seq_when_pane_already_settled_to_a_later_same_status_task()
+     {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        // Every response below belongs to the next task B: the capture must
+        // never ask, or A adopts these values.
+        let _server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 4}}}),
+                json!({"result": {"read": {"content": "OUTPUT FROM THE NEXT TASK B"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 4}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-lost-working");
+        // A was dispatched while the pane was still idle at sequence 1.
+        task.baseline_seq = Some(1);
+
+        // A's batch holds only A's live `done`: B's `working` was lost and
+        // B's `done` has not reached this window, so no in-batch event can
+        // prove the pane advanced.
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane_id": "w1:p1",
+                "agent": "codex",
+                "agent_status": "done",
+                "type": "pane.agent_status_changed"
+            })],
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(task.terminal_cursor, Some(101));
+        assert!(
+            task.final_excerpt.is_none(),
+            "A must not adopt a later same-status task's output; got {:?}",
+            task.final_excerpt
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a pane that already settled to a later task must never be read"
+        );
+    }
+
+    /// user owner | Given A's live `done` event followed by a same-status
+    /// `pane_updated` snapshot, while the pane has actually already settled
+    /// to a later task B | When A's terminal transition is reconciled | Then
+    /// A must keep no excerpt, because the snapshot is not an identity anchor.
+    #[test]
+    fn final_excerpt_omits_live_event_without_seq_when_same_status_snapshot_belongs_to_the_next_task()
+     {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        // Every response below belongs to the next task B: the capture must
+        // never ask, or A adopts these values.
+        let _server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 4}}}),
+                json!({"result": {"read": {"content": "OUTPUT FROM THE NEXT TASK B"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 4}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-lost-working-snapshot");
+        task.baseline_seq = Some(1);
+
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[
+                json!({
+                    "cursor": 101,
+                    "pane_id": "w1:p1",
+                    "agent": "codex",
+                    "agent_status": "done",
+                    "type": "pane.agent_status_changed"
+                }),
+                json!({
+                    "cursor": 104,
+                    "type": "pane_updated",
+                    "pane": {"pane_id": "w1:p1", "agent_status": "done"}
+                }),
+            ],
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert!(
+            task.final_excerpt.is_none(),
+            "an unanchored same-status snapshot must not let A adopt B's output; got {:?}",
+            task.final_excerpt
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the reused pane must never be read on this shape"
+        );
+    }
+
+    /// Contract check for the fix the RED cases above require: if the
+    /// producer put the terminal transition's own sequence on the event, the
+    /// existing consumer already rejects a pane that settled to a later task.
+    ///
+    /// user owner | Given a terminal event that carries its own
+    /// `state_change_seq` and a pane already settled to a later task with a
+    /// different sequence | When the transition is reconciled | Then the
+    /// excerpt is omitted and the pane is never read.
+    #[test]
+    fn final_excerpt_omits_sequenced_terminal_event_when_the_pane_advanced_to_another_sequence() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let _server = scripted_read_server(
+            listener,
+            vec![
+                // The pane already reports the next task's settle.
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 4}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-sequenced-advanced");
+        task.baseline_seq = Some(1);
+
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane": {
+                    "pane_id": "w1:p1",
+                    "agent_status": "done",
+                    "state_change_seq": 2
+                }
+            })],
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert!(
+            task.final_excerpt.is_none(),
+            "a terminal event pinned to sequence 2 must not adopt sequence 4 output"
+        );
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "only the pre-read probe may run");
+        assert_eq!(recorded[0].0, "agent.get");
+        drop(recorded);
+    }
+
+    /// user owner | Given a sequenced terminal event whose pane state has not
+    /// moved past the dispatch baseline | When the terminal transition is
+    /// reconciled | Then no excerpt is captured and the pane is never read.
+    #[test]
+    fn final_excerpt_omits_sequenced_event_when_pre_read_seq_did_not_pass_baseline() {
         let socket = temp_socket();
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
@@ -5790,10 +5962,7 @@ mod tests {
             &mut task,
             &[json!({
                 "cursor": 101,
-                "pane_id": "w1:p1",
-                "agent": "codex",
-                "agent_status": "done",
-                "type": "pane.agent_status_changed"
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
         )
         .unwrap();
