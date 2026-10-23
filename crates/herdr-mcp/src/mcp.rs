@@ -865,10 +865,69 @@ fn chatgpt_conversation_url_ref(raw: &str) -> Option<(String, Option<String>)> {
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct BrowserConversationUrlRef {
     provider: &'static str,
+    /// The unified WebChat adapter that claims this conversation URL. Same
+    /// value as `provider` for the three registered adapters today; carried
+    /// separately so grants/URL identity can move to adapter ids without
+    /// touching the compatibility field.
+    adapter_id: &'static str,
     conversation_id: String,
     project_id: Option<String>,
+}
+
+/// One row of the WebChat adapter registry: the single place a provider's
+/// conversation-URL identity contract lives in the Runtime (#692 phase 0
+/// seam). Adding a provider means adding a row here, not a match arm in
+/// `browser_conversation_url_ref`; phases 1-3 move more per-provider facts
+/// (DOM selectors, capabilities) into this manifest.
+struct WebChatAdapterRow {
+    /// Adapter identity used by the unified Browser Adapter architecture.
+    adapter_id: &'static str,
+    /// Compatibility provider name (grants, session rows, error codes).
+    provider: &'static str,
+    /// Hosts the adapter claims, lowercase.
+    hosts: &'static [&'static str],
+    /// Path segments of a plain conversation URL, e.g. `["c"]` for
+    /// grok.com/c/<uuid>. Empty for adapters whose richer dedicated parser
+    /// owns the shape until phase 1 (chatgpt).
+    conversation_path: &'static [&'static str],
+    /// Optional project URL shape: path segments plus the query parameter
+    /// carrying the conversation id (grok.com/project/<uuid>?chat=<uuid>).
+    project: Option<(&'static [&'static str], &'static str)>,
+}
+
+const WEBCHAT_ADAPTER_REGISTRY: &[WebChatAdapterRow] = &[
+    WebChatAdapterRow {
+        adapter_id: "chatgpt",
+        provider: "chatgpt",
+        hosts: &["chatgpt.com", "www.chatgpt.com"],
+        // Shape parsing stays with the dedicated ChatGPT parser (vanity
+        // project suffixes) until phase 1 moves it into the manifest.
+        conversation_path: &[],
+        project: None,
+    },
+    WebChatAdapterRow {
+        adapter_id: "claude",
+        provider: "claude",
+        hosts: &["claude.ai"],
+        conversation_path: &["chat"],
+        project: None,
+    },
+    WebChatAdapterRow {
+        adapter_id: "grok",
+        provider: "grok",
+        hosts: &["grok.com"],
+        conversation_path: &["c"],
+        project: Some((&["project"], "chat")),
+    },
+];
+
+fn webchat_adapter_for_host(host: &str) -> Option<&'static WebChatAdapterRow> {
+    WEBCHAT_ADAPTER_REGISTRY
+        .iter()
+        .find(|row| row.hosts.contains(&host))
 }
 
 fn browser_uuid(value: &str) -> bool {
@@ -881,54 +940,92 @@ fn browser_uuid(value: &str) -> bool {
             .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
 }
 
-fn browser_conversation_url_ref(raw: &str) -> Option<BrowserConversationUrlRef> {
-    if let Some((conversation_id, project_id)) = chatgpt_conversation_url_ref(raw) {
-        return Some(BrowserConversationUrlRef {
-            provider: "chatgpt",
+/// Resolve a WebChat conversation URL to its adapter-owned identity.
+///
+/// * `Ok(Some(ref))` — a registered adapter claims the URL and its shape
+///   matched: `adapter_id` names the claiming adapter.
+/// * `Ok(None)` — the URL belongs to a registered adapter host but is not a
+///   conversation URL (or is not a usable URL at all).
+/// * `Err("adapter_unsupported")` — a well-formed `https` URL on a host no
+///   registered adapter claims.
+///
+/// Consumers that only need "resolvable or not" treat `Err` and `Ok(None)`
+/// identically via `.ok()`, so their fail-closed codes are unchanged.
+fn browser_conversation_url_ref(
+    raw: &str,
+) -> Result<Option<BrowserConversationUrlRef>, &'static str> {
+    let parsed = match url::Url::parse(raw.trim()) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    if parsed.scheme() != "https" {
+        return Ok(None);
+    }
+    let host = match parsed.host_str() {
+        Some(value) => value.to_ascii_lowercase(),
+        None => return Ok(None),
+    };
+    let Some(row) = webchat_adapter_for_host(&host) else {
+        // A well-formed https URL on a host no registered adapter claims is a
+        // typed refusal, distinguishable from a non-conversation URL on a
+        // known host.
+        return Err("adapter_unsupported");
+    };
+    let segments: Vec<&str> = match parsed.path_segments() {
+        Some(value) => value.filter(|segment| !segment.is_empty()).collect(),
+        None => return Ok(None),
+    };
+    let identity =
+        |conversation_id: String, project_id: Option<String>| BrowserConversationUrlRef {
+            provider: row.provider,
+            adapter_id: row.adapter_id,
             conversation_id,
             project_id,
-        });
+        };
+    // ChatGPT keeps its dedicated shape parser until phase 1 moves the
+    // vanity-suffix handling into the manifest; the host claim already came
+    // from the registry above.
+    if row.conversation_path.is_empty() {
+        return match chatgpt_conversation_url_ref(raw) {
+            Some((conversation_id, project_id)) => Ok(Some(identity(conversation_id, project_id))),
+            None => Ok(None),
+        };
     }
-
-    let parsed = url::Url::parse(raw.trim()).ok()?;
-    if parsed.scheme() != "https" {
-        return None;
+    // Plain conversation path shape: <conversation_path...>/<uuid>.
+    if segments.len() == row.conversation_path.len() + 1
+        && segments[..row.conversation_path.len()] == *row.conversation_path
+    {
+        let conversation_id = segments[row.conversation_path.len()];
+        if browser_uuid(conversation_id) {
+            return Ok(Some(identity(conversation_id.to_ascii_lowercase(), None)));
+        }
+        return Ok(None);
     }
-    let host = parsed.host_str()?.to_ascii_lowercase();
-    let segments = parsed
-        .path_segments()?
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    match (host.as_str(), segments.as_slice()) {
-        ("claude.ai", ["chat", conversation_id]) if browser_uuid(conversation_id) => {
-            Some(BrowserConversationUrlRef {
-                provider: "claude",
-                conversation_id: conversation_id.to_ascii_lowercase(),
-                project_id: None,
-            })
+    // Optional project shape: <project_path...>/<uuid>?<query>=<uuid>.
+    if let Some((project_path, query_key)) = row.project
+        && segments.len() == project_path.len() + 1
+        && segments[..project_path.len()] == *project_path
+    {
+        let project_id = segments[project_path.len()];
+        if !browser_uuid(project_id) {
+            return Ok(None);
         }
-        ("grok.com", ["c", conversation_id]) if browser_uuid(conversation_id) => {
-            Some(BrowserConversationUrlRef {
-                provider: "grok",
-                conversation_id: conversation_id.to_ascii_lowercase(),
-                project_id: None,
-            })
+        let conversation_id = match parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == query_key).then_some(value.into_owned()))
+        {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        if !browser_uuid(&conversation_id) {
+            return Ok(None);
         }
-        ("grok.com", ["project", project_id]) if browser_uuid(project_id) => {
-            let conversation_id = parsed
-                .query_pairs()
-                .find_map(|(key, value)| (key == "chat").then_some(value.into_owned()))?;
-            if !browser_uuid(&conversation_id) {
-                return None;
-            }
-            Some(BrowserConversationUrlRef {
-                provider: "grok",
-                conversation_id: conversation_id.to_ascii_lowercase(),
-                project_id: Some(project_id.to_ascii_lowercase()),
-            })
-        }
-        _ => None,
+        return Ok(Some(identity(
+            conversation_id.to_ascii_lowercase(),
+            Some(project_id.to_ascii_lowercase()),
+        )));
     }
+    Ok(None)
 }
 
 fn work_pickup_call(
@@ -4792,6 +4889,8 @@ fn browser_source_route(
         return Err("browser_source_url_invalid".to_owned());
     }
     let source = browser_conversation_url_ref(source_url)
+        .ok()
+        .flatten()
         .ok_or_else(|| "browser_source_url_invalid".to_owned())?;
     // ChatGPT renders project-scoped conversation URLs with a display-name
     // suffix (`/g/g-p-<hex>-name/c/<uuid>`) while the registry stores the
@@ -4944,7 +5043,7 @@ fn browser_handoff_prepare(
         Ok(value) => value,
         Err(_) => return json!({"ok": false, "code": "browser_handoff_source_url_invalid"}),
     };
-    let source = match browser_conversation_url_ref(source_url) {
+    let source = match browser_conversation_url_ref(source_url).ok().flatten() {
         Some(reference) => reference,
         None => return json!({"ok": false, "code": "browser_handoff_source_url_invalid"}),
     };
@@ -17867,6 +17966,89 @@ mod tests {
                 .continuity_resume("hc:missing", 1)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    const TEST_CONVERSATION_UUID: &str = "5d2a9c3e-1f4b-4a6d-8e2f-0b7c9d1e3a5b";
+
+    /// user resolves a Grok conversation through an adapter | Given a grok.com
+    /// conversation URL | When the URL identity is resolved | Then the result
+    /// names the claiming adapter via the adapter registry (not a provider
+    /// match arm) while the compatibility provider field stays "grok".
+    #[test]
+    fn conversation_url_ref_for_grok_returns_adapter_id() {
+        let url = format!("https://grok.com/c/{}", TEST_CONVERSATION_UUID);
+        let resolved = browser_conversation_url_ref(&url)
+            .expect("registered grok URL must not error")
+            .expect("grok conversation URL must resolve");
+        assert_eq!(resolved.adapter_id, "grok");
+        assert_eq!(resolved.provider, "grok");
+        assert_eq!(
+            resolved.conversation_id.to_ascii_lowercase(),
+            TEST_CONVERSATION_UUID
+        );
+        assert_eq!(resolved.project_id, None);
+    }
+
+    /// user gets a typed refusal for unsupported hosts | Given a well-formed
+    /// https URL on a host no registered adapter claims | When the URL
+    /// identity is resolved | Then the result is a typed adapter_unsupported
+    /// error, distinguishable from a non-conversation URL on a known host.
+    #[test]
+    fn conversation_url_ref_for_unknown_host() {
+        let url = format!("https://example.com/c/{}", TEST_CONVERSATION_UUID);
+        assert_eq!(
+            browser_conversation_url_ref(&url),
+            Err("adapter_unsupported")
+        );
+        // A known-host URL that is not a conversation URL stays Ok(None),
+        // not the typed unsupported error.
+        assert_eq!(
+            browser_conversation_url_ref("https://grok.com/about"),
+            Ok(None)
+        );
+    }
+
+    /// user keeps provider compatibility while adapters claim URLs | Given
+    /// chatgpt and claude conversation URLs | When resolved | Then provider,
+    /// adapter_id, and identity fields match the pre-registry behaviour.
+    #[test]
+    fn conversation_url_ref_provider_compat_across_registry() {
+        let chatgpt = browser_conversation_url_ref(&format!(
+            "https://chatgpt.com/c/{}",
+            TEST_CONVERSATION_UUID
+        ))
+        .expect("chatgpt must resolve")
+        .expect("chatgpt conversation URL must resolve");
+        assert_eq!(chatgpt.adapter_id, "chatgpt");
+        assert_eq!(chatgpt.provider, "chatgpt");
+
+        let claude = browser_conversation_url_ref(&format!(
+            "https://claude.ai/chat/{}",
+            TEST_CONVERSATION_UUID
+        ))
+        .expect("claude must resolve")
+        .expect("claude conversation URL must resolve");
+        assert_eq!(claude.adapter_id, "claude");
+        assert_eq!(claude.provider, "claude");
+
+        let grok_project = browser_conversation_url_ref(&format!(
+            "https://grok.com/project/{}?chat={}",
+            TEST_CONVERSATION_UUID, TEST_CONVERSATION_UUID
+        ))
+        .expect("grok project must resolve")
+        .expect("grok project URL must resolve");
+        assert_eq!(grok_project.adapter_id, "grok");
+        assert_eq!(
+            grok_project.project_id,
+            Some(TEST_CONVERSATION_UUID.to_owned())
+        );
+
+        // Malformed and non-https inputs stay Ok(None), never the typed error.
+        assert_eq!(browser_conversation_url_ref("not a url"), Ok(None));
+        assert_eq!(
+            browser_conversation_url_ref("http://grok.com/c/x"),
+            Ok(None)
         );
     }
 
