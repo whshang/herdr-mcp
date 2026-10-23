@@ -1,8 +1,10 @@
 # Browser extension development and Store release
 
-> Status: **active 1.0 release plan**
->
-> Updated: 2026-09-23.
+> Status: **active 1.0 release plan** — still authoritative for the 1.1 Store
+> gate: a published Store/Standalone build matching the 1.1 GO SHA remains a
+> must-have gate in
+> [`../releases/1.1-feature-list.md`](../releases/1.1-feature-list.md).
+> Updated: 2026-10-23 (1.1 note); original 2026-09-23.
 >
 > This file contains only the current DEV / STANDALONE / STORE release boundary. Historical rollout notes for the 0.1.7x/0.1.9x candidate series were moved intact to [the historical Store rollout record](../history/architecture/browser-extension-development-and-store-release-20260829.md).
 
