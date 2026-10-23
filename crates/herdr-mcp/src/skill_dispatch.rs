@@ -11,6 +11,12 @@ pub struct TaskProfile {
     pub minimum_reasoning_tier: Option<u8>,
     pub destructive_production_mutation: bool,
     pub delegates_other_workers: bool,
+    /// Planner-designated supervisor for this task. A supervisor is the one
+    /// target allowed to re-dispatch workers (`agent dispatch --parent-target
+    /// <own pane>`); `delegates_other_workers` alone still describes an
+    /// unscoped middle-manager chain and stays blocked. Only an explicit
+    /// planner value sets this; the semantic layer never designates one.
+    pub supervisor: bool,
     pub independent_units: Option<usize>,
     pub ownership_isolated: bool,
     pub shared_runtime_state: bool,
@@ -79,7 +85,9 @@ pub fn advise_dispatch(task: &TaskProfile, snapshot: &CapabilitySnapshot) -> Dis
             "destructive_production_mutation_not_auto_delegated",
         );
     }
-    if task.delegates_other_workers {
+    // One planner-designated supervisor per task may re-dispatch workers; the
+    // delegation depth and self-loop limits are enforced by the dispatch guards.
+    if task.delegates_other_workers && !task.supervisor {
         return blocked_advice(task, snapshot, "middle_manager_delegation_forbidden");
     }
 
@@ -526,6 +534,20 @@ mod tests {
         let manager_advice = advise_dispatch(&manager, &snapshot(vec![worker("a", "idle")]));
         assert!(!manager_advice.delegation_allowed);
         assert_eq!(manager_advice.reason, "middle_manager_delegation_forbidden");
+        // A planner-designated supervisor is the one target allowed to
+        // re-dispatch: the same task profile is advisory-allowed for it.
+        let supervisor = TaskProfile {
+            delegates_other_workers: true,
+            supervisor: true,
+            ..TaskProfile::default()
+        };
+        let supervisor_advice = advise_dispatch(&supervisor, &snapshot(vec![worker("a", "idle")]));
+        assert!(supervisor_advice.delegation_allowed);
+        assert_eq!(
+            supervisor_advice.reason,
+            "compatible_workers_available_planner_decides"
+        );
+        assert_eq!(supervisor_advice.candidates[0].agent_id, "a");
     }
 
     #[test]

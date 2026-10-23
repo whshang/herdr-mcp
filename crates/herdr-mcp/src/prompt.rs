@@ -123,6 +123,13 @@ struct PromptTaskRecord {
     /// skipped on the wire so older runtimes keep loading stored records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_excerpt: Option<String>,
+    /// Supervisor hold fact: how many non-terminal child tasks still named this
+    /// task as their `parent_target` when its own turn settled. Present only
+    /// while the hold is active; the task turns terminal on its next settle
+    /// after those children are terminal. Absent on every other record, so
+    /// older runtimes keep loading stored records unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    awaiting_children: Option<u32>,
     parent_target: Option<String>,
     #[serde(default)]
     parent_session_ref: Option<String>,
@@ -185,10 +192,13 @@ impl PromptTaskRecord {
             "created_at_ms": self.created_at_ms,
             "updated_at_ms": self.updated_at_ms,
         });
-        if let Some(excerpt) = &self.final_excerpt
-            && let Some(object) = public.as_object_mut()
-        {
-            object.insert("final_excerpt".to_owned(), json!(excerpt));
+        if let Some(object) = public.as_object_mut() {
+            if let Some(excerpt) = &self.final_excerpt {
+                object.insert("final_excerpt".to_owned(), json!(excerpt));
+            }
+            if let Some(awaiting_children) = self.awaiting_children {
+                object.insert("awaiting_children".to_owned(), json!(awaiting_children));
+            }
         }
         public
     }
@@ -515,6 +525,7 @@ impl PromptRegistry {
             terminal_cursor: None,
             terminal_at_ms: None,
             final_excerpt: None,
+            awaiting_children: None,
             parent_target: parent_target.map(str::to_owned),
             parent_session_ref: parent_session_ref.map(str::to_owned),
             boot_epoch: self
@@ -651,6 +662,54 @@ impl PromptRegistry {
                 "message": error,
             }),
         }
+    }
+
+    /// Extension/planner inbox read that may also project the session's
+    /// unfinished tasks.
+    ///
+    /// The default inbox lists terminal tasks only: a conversation is not woken
+    /// by unfinished work. A conversation binding, however, has to survive a
+    /// long-running supervisor task, so the extension may opt in to one compact
+    /// row per non-terminal task of its own session. Those rows carry no
+    /// excerpt, are never acked, and share the caller's `limit` with the
+    /// terminal rows, which keep their wake priority.
+    pub fn task_inbox_with_running(
+        &self,
+        workspace_id: Option<&str>,
+        parent_session_ref: &str,
+        limit: usize,
+    ) -> Value {
+        let mut payload = self.task_inbox(
+            workspace_id,
+            None,
+            Some(parent_session_ref),
+            false,
+            true,
+            limit,
+        );
+        if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+            return payload;
+        }
+        let Ok(tasks) = self.list_tasks(512) else {
+            return payload;
+        };
+        let mut running = tasks
+            .into_iter()
+            .filter(|task| {
+                !task.is_terminal()
+                    && task.parent_session_ref.as_deref() == Some(parent_session_ref)
+                    && workspace_id.is_none_or(|workspace_id| {
+                        task.workspace_id.as_deref() == Some(workspace_id)
+                    })
+            })
+            .collect::<Vec<_>>();
+        running.sort_by_key(|task| std::cmp::Reverse(task.updated_at_ms));
+        let Some(rows) = payload.get_mut("tasks").and_then(Value::as_array_mut) else {
+            return payload;
+        };
+        let room = limit.saturating_sub(rows.len());
+        rows.extend(running.into_iter().take(room).map(running_task_row));
+        payload
     }
 
     /// Bounded inbox long-poll: returns immediately when an unacknowledged
@@ -1205,19 +1264,7 @@ impl PromptRegistry {
             return Ok(Some(task));
         }
         let digest = cache.digest_since(task.last_cursor);
-        if digest.cursor.saturating_sub(task.last_cursor) > 2048 {
-            changed |= mark_delivery_uncertain(&mut task, now_ms(), "event_history_gap");
-        } else {
-            changed |= apply_events_with_final_excerpt(
-                self.inner.client.as_ref(),
-                &mut task,
-                &digest.events,
-            );
-        }
-        if digest.cursor > task.last_cursor {
-            task.last_cursor = digest.cursor;
-            changed = true;
-        }
+        changed |= self.apply_task_window(&mut task, digest.cursor, &digest.events)?;
         if changed {
             self.save_task(&task, None)?;
             if task.is_terminal() {
@@ -1228,6 +1275,51 @@ impl PromptRegistry {
             }
         }
         Ok(Some(task))
+    }
+
+    /// Applies one ordered cache window to a task record that is neither
+    /// terminal nor fenced: event history gap detection, the supervisor settle
+    /// hold, and cursor bookkeeping in the one place `reconcile_task` uses.
+    ///
+    /// A held settle still advances `last_cursor` past its own event, so the
+    /// supervisor's later settle arrives as a strictly newer cursor and is
+    /// applied normally once its children are terminal.
+    fn apply_task_window(
+        &self,
+        task: &mut PromptTaskRecord,
+        cursor: u64,
+        events: &[Value],
+    ) -> Result<bool, String> {
+        let mut changed = if cursor.saturating_sub(task.last_cursor) > 2048 {
+            mark_delivery_uncertain(task, now_ms(), "event_history_gap")
+        } else {
+            apply_events_with_final_excerpt(self.inner.client.as_ref(), Some(self), task, events)?
+        };
+        if cursor > task.last_cursor {
+            task.last_cursor = cursor;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// Number of non-terminal tasks that still name this task as their parent.
+    ///
+    /// Dispatch records `parent_target` exactly as its dispatcher wrote it, so a
+    /// child may name either the supervisor's target or its pane id; both are
+    /// compared through `task_matches_target` just like the dispatch guards.
+    fn nonterminal_children(&self, task: &PromptTaskRecord) -> Result<u32, String> {
+        let children =
+            self.list_tasks(512)?
+                .into_iter()
+                .filter(|child| {
+                    child.task_id != task.task_id
+                        && !child.is_terminal()
+                        && child.parent_target.as_deref().is_some_and(|parent_target| {
+                            task_matches_target(task, parent_target, None)
+                        })
+                })
+                .count();
+        Ok(u32::try_from(children).unwrap_or(u32::MAX))
     }
 
     fn workspace_for_pane(&self, pane_id: &str) -> Option<String> {
@@ -1353,8 +1445,9 @@ enum InboxView {
 /// Fields kept by `view: compact`. Attention facts are only carried when the
 /// task object already exposes them; the raw `parent_session_ref` never is.
 /// `final_excerpt` is present only when captured and spares the planner an
-/// `agent.read` round trip.
-const COMPACT_TASK_FIELDS: [&str; 9] = [
+/// `agent.read` round trip; `awaiting_children` is present only while a
+/// supervisor is held for its own children.
+const COMPACT_TASK_FIELDS: [&str; 10] = [
     "task_id",
     "target",
     "pane_id",
@@ -1364,6 +1457,7 @@ const COMPACT_TASK_FIELDS: [&str; 9] = [
     "terminal_at_ms",
     "updated_at_ms",
     "final_excerpt",
+    "awaiting_children",
 ];
 
 fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
@@ -1372,6 +1466,22 @@ fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
             COMPACT_TASK_FIELDS.contains(&key.as_str()) || key.starts_with("attention")
         })
         .collect()
+}
+
+/// One non-terminal row for the opt-in extension inbox view: identity, lane
+/// lifecycle, and the supervisor hold fact only. Deliberately no excerpt (the
+/// task has no outcome yet) and no acknowledged state (it cannot be acked).
+fn running_task_row(task: PromptTaskRecord) -> Value {
+    let mut row = json!({
+        "task_id": task.task_id,
+        "workspace_id": task.workspace_id,
+        "lifecycle": task.lifecycle.as_str(),
+        "terminal": false,
+    });
+    if let (Some(awaiting_children), Some(object)) = (task.awaiting_children, row.as_object_mut()) {
+        object.insert("awaiting_children".to_owned(), json!(awaiting_children));
+    }
+    row
 }
 
 fn apply_inbox_view(payload: Value, view: InboxView) -> Value {
@@ -1450,6 +1560,16 @@ fn task_matches_scope(
         && parent_session_ref.is_none_or(|parent_session_ref| {
             task.parent_session_ref.as_deref() == Some(parent_session_ref)
         })
+}
+
+/// Resolves a dispatch target to the durable task it addresses: the same agent
+/// may be named by its target string, by that exact pane id, or by a pane the
+/// caller had to probe. Dispatch accepts all three forms, so every parent/child
+/// comparison goes through this normalization instead of raw string equality.
+fn task_matches_target(task: &PromptTaskRecord, target: &str, resolved_pane: Option<&str>) -> bool {
+    task.target == target
+        || task.pane_id.as_deref() == Some(target)
+        || resolved_pane.is_some_and(|pane| task.pane_id.as_deref() == Some(pane))
 }
 
 fn task_notification_priority(task: &PromptTaskRecord) -> u32 {
@@ -1832,15 +1952,23 @@ const FINAL_EXCERPT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// If the pane's state cannot be revalidated promptly, omit the excerpt.
 const FINAL_EXCERPT_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Applies cache events to a durable task record and, exactly once at an
-/// eligible terminal transition, captures the bounded final excerpt of the
-/// child's recent output. A failed capture only leaves `final_excerpt`
-/// unset; lifecycle, notification, and ack state are untouched.
+/// Applies cache events to a durable task record, keeps a supervisor that
+/// completed while its children still run non-terminal, and — exactly once at
+/// an eligible terminal transition — captures the bounded final excerpt of the
+/// child's recent output. A failed capture only leaves `final_excerpt` unset;
+/// lifecycle, notification, and ack state are untouched.
+///
+/// `registry` is `Some` when the caller owns the durable task ledger and can
+/// count this task's still-running children. `None` applies events only, for
+/// callers with no ledger to consult. A failed child lookup returns an error
+/// before anything is persisted, so the caller retries the same window instead
+/// of settling a supervisor early.
 fn apply_events_with_final_excerpt(
     client: Option<&HerdrClient>,
+    registry: Option<&PromptRegistry>,
     task: &mut PromptTaskRecord,
     events: &[Value],
-) -> bool {
+) -> Result<bool, String> {
     let mut changed = false;
     let mut terminal_state_change_seq = None;
     for event in events {
@@ -1852,6 +1980,31 @@ fn apply_events_with_final_excerpt(
             }
         }
     }
+    if changed {
+        // Any newer activity supersedes the recorded hold fact.
+        task.awaiting_children = None;
+        if let Some(registry) = registry
+            && matches!(
+                task.lifecycle,
+                PromptTaskLifecycle::Completed | PromptTaskLifecycle::Blocked
+            )
+        {
+            let awaiting_children = registry.nonterminal_children(task)?;
+            if awaiting_children > 0 {
+                if task.lifecycle == PromptTaskLifecycle::Completed {
+                    hold_settled_task_for_children(task, awaiting_children);
+                } else {
+                    // A blocked supervisor waits on a human or permission
+                    // boundary. Holding it would hide that boundary and nothing
+                    // would wake the parent again, so it surfaces immediately and
+                    // keeps the outstanding child count only as a fact.
+                    task.awaiting_children = Some(awaiting_children);
+                }
+            }
+        }
+    }
+    // A held settle is no longer terminal, so it never reaches this qualified
+    // capture: the excerpt fence and the supervisor hold cannot both apply.
     if changed
         && task.is_terminal()
         && task.final_excerpt.is_none()
@@ -1860,7 +2013,22 @@ fn apply_events_with_final_excerpt(
     {
         task.final_excerpt = read_final_excerpt(client, task, terminal_state_change_seq);
     }
-    changed
+    Ok(changed)
+}
+
+/// Keeps a supervisor that completed while its own children still run
+/// non-terminal. The settle event itself is already consumed, so the task stays
+/// `running` with an explicit `awaiting_children` fact and turns terminal on its
+/// next settle after the children are terminal. `blocked`, `delivery_uncertain`,
+/// `failed`, and pane-closed terminals never reach this path: a blocked
+/// supervisor must surface at once because nothing would wake it again.
+fn hold_settled_task_for_children(task: &mut PromptTaskRecord, awaiting_children: u32) {
+    task.lifecycle = PromptTaskLifecycle::Running;
+    task.awaiting_children = Some(awaiting_children);
+    task.terminal_status = None;
+    task.terminal_cursor = None;
+    task.terminal_at_ms = None;
+    task.final_excerpt = None;
 }
 
 /// Returns true when this same event batch already proves the pane moved past
@@ -2452,6 +2620,87 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
     run_with_parent_session(client, registry, args, None)
 }
 
+/// Rejections for a dispatch that would make the delegation chain unsafe. Both
+/// guards run before the idempotency reservation and before the native prompt,
+/// so a rejected dispatch writes no ledger row and prompts no agent.
+fn delegation_rejection(code: &str, message: &str) -> Value {
+    json!({
+        "ok": false,
+        "code": code,
+        "message": message,
+        "retryable": false,
+    })
+}
+
+/// Refuses self-parenting and a third delegation level below the top-level
+/// parent.
+///
+/// The Web planner may dispatch a supervisor, and that supervisor may dispatch
+/// workers (`parent_target` naming the supervisor). A worker dispatching its own
+/// sub-worker is refused: `parent_target` then names an active task that is
+/// itself the child of another active task.
+fn delegation_guard(
+    client: &HerdrClient,
+    registry: &PromptRegistry,
+    target: &str,
+    target_state: Option<&AgentState>,
+    parent_target: &str,
+) -> Option<Value> {
+    let target_pane = target_state.and_then(|state| state.pane_id.as_deref());
+    let parent_pane = agent_state_of(client, parent_target).and_then(|state| state.pane_id);
+    let same_target = parent_target == target
+        || parent_pane
+            .as_deref()
+            .zip(target_pane)
+            .is_some_and(|(parent_pane, target_pane)| parent_pane == target_pane);
+    if same_target {
+        return Some(delegation_rejection(
+            "parent_target_is_target",
+            "parent_target resolves to the same agent or pane as target; a task cannot be its own parent",
+        ));
+    }
+    match delegation_depth_exceeded(registry, parent_target, parent_pane.as_deref()) {
+        Ok(false) => None,
+        Ok(true) => Some(delegation_rejection(
+            "delegation_depth_exceeded",
+            "parent_target is already the child of another active task; at most two delegation levels below the top-level parent are allowed",
+        )),
+        // The chain lives in the durable task ledger: without it the depth cap
+        // cannot be proven, so fail closed instead of allowing the dispatch.
+        Err(error) => Some(json!({
+            "ok": false,
+            "code": "agent_task_store_unavailable",
+            "message": error,
+            "retryable": true,
+        })),
+    }
+}
+
+/// True when `parent_target` names an active task whose own `parent_target`
+/// names another active task. Only the durable ledger is consulted: every
+/// recorded `parent_target` is stored exactly as its dispatcher wrote it, so the
+/// aliases stay comparable without a live probe.
+fn delegation_depth_exceeded(
+    registry: &PromptRegistry,
+    parent_target: &str,
+    parent_pane: Option<&str>,
+) -> Result<bool, String> {
+    let tasks = registry.list_tasks(512)?;
+    let active = |task: &PromptTaskRecord| !task.is_terminal();
+    let Some(parent_task) = tasks
+        .iter()
+        .find(|task| active(task) && task_matches_target(task, parent_target, parent_pane))
+    else {
+        return Ok(false);
+    };
+    let Some(grandparent_target) = parent_task.parent_target.as_deref() else {
+        return Ok(false);
+    };
+    Ok(tasks
+        .iter()
+        .any(|task| active(task) && task_matches_target(task, grandparent_target, None)))
+}
+
 pub fn run_with_parent_session(
     client: &HerdrClient,
     registry: &PromptRegistry,
@@ -2489,6 +2738,23 @@ pub fn run_with_parent_session(
     let task_id = dispatch_id.as_str();
     let mut operation_id = None;
 
+    // A parented dispatch probes the caller's own agent once for the delegation
+    // guards and reuses that observation as the pre-submit baseline below.
+    let guard_observation = parent_target.and_then(|_| agent_state_of(client, target));
+    if let Some(parent_target) = parent_target
+        && let Some(mut rejection) = delegation_guard(
+            client,
+            registry,
+            target,
+            guard_observation.as_ref(),
+            parent_target,
+        )
+    {
+        insert_dispatch_id(&mut rejection, task_id);
+        insert_task_id(&mut rejection, task_id);
+        return rejection;
+    }
+
     if let Some(key) = idempotency_key {
         match registry.begin(key, &fingerprint) {
             Ok(BeginPrompt::Reserved(op_id)) => operation_id = op_id,
@@ -2510,7 +2776,7 @@ pub fn run_with_parent_session(
     }
 
     let start_cursor = registry.current_task_cursor();
-    let before = agent_state_of(client, target);
+    let before = guard_observation.or_else(|| agent_state_of(client, target));
     let pane_id = before
         .as_ref()
         .and_then(|state| state.pane_id.as_deref())
@@ -4277,6 +4543,7 @@ mod tests {
             terminal_cursor: None,
             terminal_at_ms: terminal.then(|| now.saturating_sub(age_ms)),
             final_excerpt: None,
+            awaiting_children: None,
             parent_target: Some("parent".to_owned()),
             parent_session_ref: None,
             boot_epoch: None,
@@ -5051,6 +5318,7 @@ mod tests {
             terminal_cursor: None,
             terminal_at_ms: None,
             final_excerpt: None,
+            awaiting_children: None,
             parent_target: None,
             parent_session_ref: None,
             boot_epoch: Some("boot-excerpt-test".to_owned()),
@@ -5086,12 +5354,14 @@ mod tests {
         let mut task = excerpt_test_task("dispatch:prompt:excerpt-once");
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[json!({
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
-        );
+        )
+        .unwrap();
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
         let excerpt = task
@@ -5118,12 +5388,14 @@ mod tests {
         // A terminal task is immutable and must never trigger another read.
         let changed_again = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[json!({
                 "cursor": 102,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
-        );
+        )
+        .unwrap();
         assert!(!changed_again);
         assert_eq!(task.final_excerpt.as_deref(), Some(excerpt.as_str()));
         assert_eq!(requests.lock().unwrap().len(), 3);
@@ -5149,6 +5421,7 @@ mod tests {
 
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[
                 json!({
@@ -5160,7 +5433,8 @@ mod tests {
                     "pane": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 3}
                 }),
             ],
-        );
+        )
+        .unwrap();
 
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
@@ -5196,6 +5470,7 @@ mod tests {
 
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[json!({
                 "cursor": 101,
@@ -5204,7 +5479,8 @@ mod tests {
                 "agent_status": "done",
                 "type": "pane.agent_status_changed"
             })],
-        );
+        )
+        .unwrap();
 
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
@@ -5243,6 +5519,7 @@ mod tests {
 
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[
                 json!({
@@ -5267,7 +5544,8 @@ mod tests {
                     "type": "pane.agent_status_changed"
                 }),
             ],
-        );
+        )
+        .unwrap();
 
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
@@ -5302,6 +5580,7 @@ mod tests {
 
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[json!({
                 "cursor": 101,
@@ -5310,7 +5589,8 @@ mod tests {
                 "agent_status": "done",
                 "type": "pane.agent_status_changed"
             })],
-        );
+        )
+        .unwrap();
 
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
@@ -5344,6 +5624,7 @@ mod tests {
 
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[
                 json!({
@@ -5361,7 +5642,8 @@ mod tests {
                     "type": "pane.agent_status_changed"
                 }),
             ],
-        );
+        )
+        .unwrap();
 
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
@@ -5458,6 +5740,7 @@ mod tests {
 
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[json!({
                 "cursor": 101,
@@ -5466,7 +5749,8 @@ mod tests {
                 "agent_status": "done",
                 "type": "pane.agent_status_changed"
             })],
-        );
+        )
+        .unwrap();
 
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
@@ -5500,6 +5784,7 @@ mod tests {
 
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[
                 json!({
@@ -5511,7 +5796,8 @@ mod tests {
                     "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
                 }),
             ],
-        );
+        )
+        .unwrap();
 
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
@@ -5553,9 +5839,11 @@ mod tests {
         let mut task = excerpt_test_task("dispatch:prompt:excerpt-pane-closed");
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[json!({"cursor": 101, "pane_id": "w1:p1", "type": "pane.closed"})],
-        );
+        )
+        .unwrap();
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Failed);
         assert_eq!(task.final_excerpt, None);
@@ -5636,12 +5924,14 @@ mod tests {
         let mut task = excerpt_test_task("dispatch:prompt:excerpt-read-fails");
         let changed = apply_events_with_final_excerpt(
             Some(&client),
+            None,
             &mut task,
             &[json!({
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
-        );
+        )
+        .unwrap();
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
         assert_eq!(task.terminal_status.as_deref(), Some("done"));
@@ -5782,5 +6072,567 @@ mod tests {
         assert!(line.ends_with("terminal_seq 101)"));
         assert!(!text.contains("working notes"));
         assert!(!text.contains("xxxx"));
+    }
+
+    fn task_agent_state(pane_id: &str, status: &str, seq: u64) -> AgentState {
+        AgentState {
+            pane_id: Some(pane_id.to_owned()),
+            agent_status: Some(status.to_owned()),
+            state_change_seq: Some(seq),
+        }
+    }
+
+    /// Registers one running task through the real task path.
+    fn register_running_task(
+        registry: &PromptRegistry,
+        task_id: &str,
+        target: &str,
+        pane_id: &str,
+        parent_target: Option<&str>,
+        parent_session_ref: Option<&str>,
+        start_cursor: u64,
+    ) -> PromptTaskRecord {
+        let before = task_agent_state(pane_id, "idle", 1);
+        let after = task_agent_state(pane_id, "working", 2);
+        let task = registry
+            .register_task(RegisterTaskInput {
+                task_id,
+                target,
+                fingerprint: task_id,
+                idempotency_key: None,
+                before: Some(&before),
+                after: Some(&after),
+                submitted: Some(true),
+                start_cursor,
+                parent_target,
+                parent_session_ref,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Running);
+        task
+    }
+
+    /// user planner | Given a session-scoped supervisor task that settles while
+    /// its child still runs | When the child finishes before the supervisor
+    /// settles again | Then the supervisor stays non-terminal with
+    /// `awaiting_children` 1, the browser-session inbox never lists the child,
+    /// and the supervisor's later, newer settle completes it.
+    #[test]
+    fn supervisor_task_holds_until_its_children_are_terminal() {
+        let (db_path, registry) = task_registry("supervisor-hold");
+        let supervisor_id = "dispatch:prompt:supervisor-hold";
+        let child_id = "dispatch:prompt:supervisor-child";
+        register_running_task(
+            &registry,
+            supervisor_id,
+            "supervisor",
+            "w1:p1",
+            Some("web-planner"),
+            Some("session:web"),
+            100,
+        );
+        register_running_task(
+            &registry,
+            child_id,
+            "worker-1",
+            "w1:p2",
+            Some("supervisor"),
+            None,
+            200,
+        );
+
+        // The supervisor's own turn settles while its child is still running.
+        let mut settled = registry.load_task(supervisor_id).unwrap().unwrap();
+        let held = registry
+            .apply_task_window(
+                &mut settled,
+                101,
+                &[json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})],
+            )
+            .unwrap();
+        assert!(held);
+        assert_eq!(
+            settled.last_cursor, 101,
+            "a held settle still consumes its own event cursor"
+        );
+        assert_eq!(settled.lifecycle, PromptTaskLifecycle::Running);
+        assert!(!settled.is_terminal());
+        assert_eq!(settled.awaiting_children, Some(1));
+        assert_eq!(settled.terminal_status, None);
+        assert_eq!(settled.terminal_cursor, None);
+        assert_eq!(settled.terminal_at_ms, None);
+        assert!(
+            settled.final_excerpt.is_none(),
+            "a held settle must not capture an outcome excerpt"
+        );
+        registry.save_task(&settled, None).unwrap();
+
+        let status = registry.task_status(supervisor_id);
+        assert_eq!(status["task"]["lifecycle"], "running");
+        assert_eq!(status["task"]["terminal"], false);
+        assert_eq!(status["task"]["awaiting_children"], 1);
+        assert!(status["task"]["terminal_cursor"].is_null());
+
+        // The child finishes on its own lane. That alone must not settle the
+        // supervisor: the hold is released by its own next settle.
+        let mut child = registry.load_task(child_id).unwrap().unwrap();
+        assert!(
+            registry
+                .apply_task_window(
+                    &mut child,
+                    201,
+                    &[json!({"cursor": 201, "pane_id": "w1:p2", "agent_status": "done"})],
+                )
+                .unwrap()
+        );
+        assert_eq!(child.lifecycle, PromptTaskLifecycle::Completed);
+        registry.save_task(&child, None).unwrap();
+        assert_eq!(
+            registry.task_status(supervisor_id)["task"]["awaiting_children"],
+            1
+        );
+
+        // The browser session that dispatched the supervisor still sees no
+        // terminal task, and never the supervisor's own child.
+        let browser_held = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({}),
+            Some("session:web"),
+        );
+        assert!(
+            browser_held["tasks"].as_array().unwrap().is_empty(),
+            "a held supervisor must not reach the browser-session inbox"
+        );
+        assert!(!browser_held.to_string().contains(child_id));
+        // The supervisor's own inbox owns the finished child.
+        let supervisor_inbox = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_target": "supervisor"}),
+            None,
+        );
+        assert_eq!(supervisor_inbox["tasks"][0]["task_id"], child_id);
+
+        // The supervisor settles again after its children are terminal: the
+        // strictly newer cursor is still applied and the hold clears.
+        let mut resettled = registry.load_task(supervisor_id).unwrap().unwrap();
+        assert_eq!(resettled.last_cursor, 101);
+        assert!(
+            registry
+                .apply_task_window(
+                    &mut resettled,
+                    301,
+                    &[json!({"cursor": 301, "pane_id": "w1:p1", "agent_status": "done"})],
+                )
+                .unwrap()
+        );
+        assert_eq!(resettled.lifecycle, PromptTaskLifecycle::Completed);
+        assert!(resettled.is_terminal());
+        assert_eq!(resettled.awaiting_children, None);
+        assert_eq!(resettled.last_cursor, 301);
+        registry.save_task(&resettled, None).unwrap();
+
+        let done = registry.task_status(supervisor_id);
+        assert_eq!(done["task"]["lifecycle"], "completed");
+        assert_eq!(done["task"]["terminal"], true);
+        assert!(done["task"].get("awaiting_children").is_none());
+
+        let browser_done = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"view": "compact"}),
+            Some("session:web"),
+        );
+        let listed = browser_done["tasks"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["task_id"], supervisor_id);
+        assert_eq!(browser_done["summary"]["completed"], 1);
+        assert!(
+            !browser_done.to_string().contains(child_id),
+            "the supervisor's child is never session scoped"
+        );
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user planner | Given a held supervisor task | When the compact inbox
+    /// projection is applied | Then the `awaiting_children` fact survives the
+    /// projection that session-scoped planners read.
+    #[test]
+    fn compact_projection_keeps_the_awaiting_children_fact() {
+        let mut task = excerpt_test_task("dispatch:prompt:compact-hold");
+        task.awaiting_children = Some(2);
+        let projected = compact_task(task.public_json().as_object().unwrap().clone());
+        assert_eq!(projected["awaiting_children"], 2);
+        assert_eq!(projected["lifecycle"], "running");
+    }
+
+    /// user operator | Given a task record written before the hold fact existed
+    /// | When the runtime decodes it | Then it loads with no hold and its
+    /// public projection omits the field.
+    #[test]
+    fn legacy_task_records_load_without_the_awaiting_children_field() {
+        let task = excerpt_test_task("dispatch:prompt:legacy-hold");
+        let mut encoded = serde_json::to_value(&task).unwrap();
+        assert!(
+            encoded.get("awaiting_children").is_none(),
+            "records without a hold must not carry the field on the wire"
+        );
+        encoded.as_object_mut().unwrap().remove("awaiting_children");
+        let decoded: PromptTaskRecord = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.awaiting_children, None);
+        assert!(decoded.public_json().get("awaiting_children").is_none());
+
+        let mut held = task;
+        held.awaiting_children = Some(3);
+        let round_tripped: PromptTaskRecord =
+            serde_json::from_value(serde_json::to_value(&held).unwrap()).unwrap();
+        assert_eq!(round_tripped.awaiting_children, Some(3));
+    }
+
+    /// user planner | Given a dispatch whose parent_target resolves to the
+    /// dispatcher's own pane | When it is submitted | Then it is rejected as
+    /// `parent_target_is_target` before any prompt or ledger write.
+    #[test]
+    fn dispatch_rejects_a_parent_target_that_resolves_to_the_target_pane() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let prompt_texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let idle = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}});
+        let server = scripted_dispatch_server(
+            listener,
+            vec![idle.clone(), idle],
+            Arc::clone(&prompt_texts),
+        );
+        let client = HerdrClient::new(&socket);
+        let (db_path, registry) = task_registry("guard-self");
+
+        let rejected = run_with_parent_session(
+            &client,
+            &registry,
+            &json!({
+                "target": "pi",
+                "text": "delegate to myself",
+                "parent_target": "w1:p1",
+                "idempotency_key": "guard-self-1",
+            }),
+            None,
+        );
+        server.join().unwrap();
+
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["code"], "parent_target_is_target");
+        assert_eq!(rejected["retryable"], false);
+        assert_eq!(rejected["task_id"], rejected["dispatch_id"]);
+        assert!(
+            prompt_texts.lock().unwrap().is_empty(),
+            "a rejected dispatch must never prompt the agent"
+        );
+        assert!(
+            registry.list_tasks(10).unwrap().is_empty(),
+            "a rejected dispatch must not write a task row"
+        );
+        assert!(
+            registry.inner.records.lock().unwrap().is_empty(),
+            "a rejected dispatch must not reserve idempotency state"
+        );
+
+        drop(registry);
+        remove_task_db(&db_path);
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given a worker task whose own parent is another active
+    /// supervisor task | When the worker dispatches a sub-worker | Then it is
+    /// rejected as `delegation_depth_exceeded` with nothing persisted, while the
+    /// planner→supervisor→worker chain stays allowed.
+    #[test]
+    fn dispatch_rejects_delegation_below_a_worker() {
+        let (db_path, registry) = task_registry("guard-depth");
+        register_running_task(
+            &registry,
+            "dispatch:prompt:depth-supervisor",
+            "supervisor",
+            "w1:p1",
+            Some("web-planner"),
+            Some("session:web"),
+            100,
+        );
+        register_running_task(
+            &registry,
+            "dispatch:prompt:depth-worker",
+            "worker-1",
+            "w1:p2",
+            Some("supervisor"),
+            None,
+            200,
+        );
+        assert_eq!(registry.list_tasks(10).unwrap().len(), 2);
+
+        let unreachable = HerdrClient::new(temp_socket());
+        let rejected = run_with_parent_session(
+            &unreachable,
+            &registry,
+            &json!({
+                "target": "sub-worker",
+                "text": "delegate deeper",
+                "parent_target": "worker-1",
+                "idempotency_key": "guard-depth-1",
+            }),
+            None,
+        );
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["code"], "delegation_depth_exceeded");
+        assert_eq!(rejected["retryable"], false);
+        assert_eq!(
+            registry.list_tasks(10).unwrap().len(),
+            2,
+            "a rejected dispatch must not write a task row"
+        );
+        assert!(registry.inner.records.lock().unwrap().is_empty());
+
+        // Web planner → supervisor → worker is the allowed depth: the planner is
+        // a browser session, not another active task in the ledger.
+        assert!(!delegation_depth_exceeded(&registry, "supervisor", Some("w1:p1")).unwrap());
+        assert!(delegation_depth_exceeded(&registry, "worker-1", Some("w1:p2")).unwrap());
+
+        // The allowed dispatch really runs end to end: the supervisor's own
+        // parent link names no active task, so only the target and parent are
+        // probed once each before the prompt.
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let prompt_texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let worker = json!({"result": {"agent": {"pane_id": "w1:p3", "agent_status": "idle", "state_change_seq": 1}}});
+        let supervisor = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 3}}});
+        let submitted = json!({"result": {"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p3", "agent_status": "working", "state_change_seq": 2}}}});
+        let server = scripted_dispatch_server(
+            listener,
+            vec![worker, supervisor, submitted],
+            Arc::clone(&prompt_texts),
+        );
+        let client = HerdrClient::new(&socket);
+        let allowed = run_with_parent_session(
+            &client,
+            &registry,
+            &json!({
+                "target": "worker-2",
+                "text": "integrate the child output",
+                "parent_target": "supervisor",
+                "idempotency_key": "guard-depth-2",
+            }),
+            None,
+        );
+        server.join().unwrap();
+        assert_eq!(allowed["ok"], true);
+        assert_eq!(allowed["task"]["parent_target"], "supervisor");
+        assert_eq!(allowed["task"]["lifecycle"], "running");
+        assert_eq!(prompt_texts.lock().unwrap().len(), 1);
+        assert_eq!(registry.list_tasks(10).unwrap().len(), 3);
+
+        drop(registry);
+        remove_task_db(&db_path);
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given a session-scoped supervisor task that blocks while
+    /// its child still runs | When the block window is applied | Then it
+    /// surfaces as terminal `blocked` immediately and keeps the outstanding
+    /// child count as a fact, so the parent is woken instead of deadlocking.
+    #[test]
+    fn blocked_supervisor_surfaces_immediately_with_awaiting_children() {
+        let (db_path, registry) = task_registry("supervisor-blocked");
+        let supervisor_id = "dispatch:prompt:supervisor-blocked";
+        let child_id = "dispatch:prompt:supervisor-blocked-child";
+        register_running_task(
+            &registry,
+            supervisor_id,
+            "supervisor",
+            "w1:p1",
+            Some("web-planner"),
+            Some("session:web"),
+            100,
+        );
+        register_running_task(
+            &registry,
+            child_id,
+            "worker-1",
+            "w1:p2",
+            Some("supervisor"),
+            None,
+            200,
+        );
+
+        let mut blocked = registry.load_task(supervisor_id).unwrap().unwrap();
+        assert!(
+            registry
+                .apply_task_window(
+                    &mut blocked,
+                    101,
+                    &[json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "blocked"})],
+                )
+                .unwrap()
+        );
+        assert_eq!(blocked.lifecycle, PromptTaskLifecycle::Blocked);
+        assert!(blocked.is_terminal());
+        assert_eq!(blocked.terminal_status.as_deref(), Some("blocked"));
+        assert_eq!(blocked.terminal_cursor, Some(101));
+        assert_eq!(blocked.awaiting_children, Some(1));
+        registry.save_task(&blocked, None).unwrap();
+
+        let status = registry.task_status(supervisor_id);
+        assert_eq!(status["task"]["lifecycle"], "blocked");
+        assert_eq!(status["task"]["terminal"], true);
+        assert_eq!(status["task"]["awaiting_children"], 1);
+
+        // A blocked supervisor is never held: the browser inbox is woken at
+        // once, while the running child stays out of it.
+        let browser = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({}),
+            Some("session:web"),
+        );
+        let listed = browser["tasks"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["task_id"], supervisor_id);
+        assert_eq!(listed[0]["lifecycle"], "blocked");
+        assert_eq!(listed[0]["awaiting_children"], 1);
+        assert!(!browser.to_string().contains(child_id));
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user extension | Given a session whose supervisor task is still running |
+    /// When the extension inbox is read with the opt-in running view | Then it
+    /// gets one bounded compact row for that session only, with no excerpt and
+    /// no ack, and the default inbox keeps listing terminal tasks only.
+    #[test]
+    fn extension_inbox_can_include_running_task_rows() {
+        let _guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let semantic_config_dir = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-extension-semantic-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &semantic_config_dir);
+        }
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-extension-running-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        let cache = Arc::new(EventCache::from_snapshot_for_test(json!({
+            "panes": [
+                {"pane_id": "w1:p1", "workspace_id": "w1"},
+                {"pane_id": "w1:p3", "workspace_id": "w1"},
+                {"pane_id": "w2:p9", "workspace_id": "w2"},
+            ],
+            "agents": [],
+            "workspaces": [{"workspace_id": "w1"}, {"workspace_id": "w2"}],
+        })));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(store),
+                cache: Some(cache),
+                client: None,
+            }),
+        };
+        let supervisor_id = "dispatch:prompt:extension-running";
+        let other_id = "dispatch:prompt:extension-running-other";
+        register_running_task(
+            &registry,
+            supervisor_id,
+            "supervisor",
+            "w1:p1",
+            None,
+            Some("session:web"),
+            100,
+        );
+        register_running_task(
+            &registry,
+            "dispatch:prompt:extension-running-child",
+            "worker-1",
+            "w1:p3",
+            Some("supervisor"),
+            None,
+            100,
+        );
+        register_running_task(
+            &registry,
+            other_id,
+            "supervisor",
+            "w2:p9",
+            None,
+            Some("session:other"),
+            100,
+        );
+
+        // Default projection is unchanged: no terminal task, no rows.
+        let default_view = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"limit": 8}),
+            Some("session:web"),
+        );
+        assert!(default_view["tasks"].as_array().unwrap().is_empty());
+
+        let included = registry.task_inbox_with_running(None, "session:web", 8);
+        let rows = included["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["task_id"], supervisor_id);
+        assert_eq!(rows[0]["workspace_id"], "w1");
+        assert_eq!(rows[0]["lifecycle"], "running");
+        assert_eq!(rows[0]["terminal"], false);
+        assert!(rows[0].get("final_excerpt").is_none());
+        assert!(rows[0].get("acknowledged").is_none());
+        assert!(rows[0].get("awaiting_children").is_none());
+        assert_eq!(included["summary"]["running"], 1);
+        assert!(
+            !included.to_string().contains(other_id),
+            "another session's running task stays out of scope"
+        );
+
+        // The caller's own workspace and limit still bound the projection.
+        let other_workspace = registry.task_inbox_with_running(Some("w2"), "session:web", 8);
+        assert!(other_workspace["tasks"].as_array().unwrap().is_empty());
+        let bounded = registry.task_inbox_with_running(None, "session:web", 1);
+        assert_eq!(bounded["tasks"].as_array().unwrap().len(), 1);
+
+        // A held supervisor keeps exposing its hold fact in the same row.
+        let mut held = registry.load_task(supervisor_id).unwrap().unwrap();
+        assert!(
+            registry
+                .apply_task_window(
+                    &mut held,
+                    101,
+                    &[json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})],
+                )
+                .unwrap()
+        );
+        registry.save_task(&held, None).unwrap();
+        let held_view = registry.task_inbox_with_running(None, "session:web", 8);
+        let held_rows = held_view["tasks"].as_array().unwrap();
+        assert_eq!(held_rows.len(), 1);
+        assert_eq!(held_rows[0]["lifecycle"], "running");
+        assert_eq!(held_rows[0]["awaiting_children"], 1);
+
+        drop(registry);
+        remove_task_db(&db_path);
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+        fs::remove_dir_all(&semantic_config_dir).ok();
     }
 }
