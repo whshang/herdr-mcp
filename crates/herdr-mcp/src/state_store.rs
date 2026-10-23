@@ -3407,6 +3407,82 @@ impl StateStore {
             .map_err(|error| format!("cannot inspect browser resource locator: {error}"))
     }
 
+    /// Adapter-scoped canonical URL -> session lookup (#692 slice 2).
+    ///
+    /// Same fail-closed ambiguity contract as the ChatGPT-scoped variant
+    /// below, but admits every provider named by the caller-supplied
+    /// adapter set (the Runtime passes the WebChat adapter registry's
+    /// providers, so the registry stays the single authority). An empty
+    /// provider set resolves nothing.
+    pub fn browser_session_ref_for_canonical_url_for_adapters(
+        &self,
+        canonical_url: &str,
+        providers: &[&str],
+    ) -> Result<Option<String>, String> {
+        if canonical_url.is_empty()
+            || canonical_url.len() > 2048
+            || canonical_url != canonical_url.trim()
+            || canonical_url.chars().any(char::is_control)
+            || !canonical_url.starts_with("https://")
+        {
+            return Err("browser_canonical_url_invalid".to_owned());
+        }
+        // Provider names come from the Runtime's adapter registry. They are
+        // bound into the query as parameters (never interpolated), and any
+        // malformed name fails closed instead of being silently dropped.
+        if providers.is_empty() {
+            return Ok(None);
+        }
+        for provider in providers {
+            if provider.is_empty()
+                || provider.len() > 32
+                || provider.chars().any(|ch| {
+                    !(ch.is_ascii_lowercase()
+                        || ch.is_ascii_digit()
+                        || matches!(ch, '.' | '_' | '-'))
+                })
+            {
+                return Err("browser_adapter_provider_invalid".to_owned());
+            }
+        }
+        // Same fail-closed ambiguity contract as the ChatGPT-scoped variant:
+        // an exact canonical URL must map to exactly one session across the
+        // admitted adapter providers; any second distinct session is
+        // ambiguous regardless of recency.
+        let placeholders = std::iter::repeat_n("?", providers.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT r.resource_ref
+             FROM browser_resource_locators l
+             JOIN browser_resources r ON r.resource_ref = l.resource_ref
+             WHERE l.canonical_url = ?1
+               AND r.kind = 'session'
+               AND r.provider IN ({placeholders})
+             GROUP BY r.resource_ref
+             LIMIT 2"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|error| format!("cannot prepare browser session URL lookup: {error}"))?;
+        let mut params: Vec<&str> = Vec::with_capacity(providers.len() + 1);
+        params.push(canonical_url);
+        params.extend(providers.iter().copied());
+        let mut refs = stmt
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("cannot query browser session URL lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser session URL lookup: {error}"))?;
+        match refs.len() {
+            0 => Ok(None),
+            1 => Ok(Some(refs.remove(0))),
+            _ => Err("browser_canonical_url_ambiguous".to_owned()),
+        }
+    }
+
     pub fn browser_session_ref_for_canonical_url(
         &self,
         canonical_url: &str,
@@ -12587,6 +12663,149 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn browser_session_url_lookup_is_adapter_scoped() {
+        use crate::state_store::{
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput,
+        };
+        const CLAUDE_URL: &str = "https://claude.ai/chat/5d2a9c3e-1f4b-4a6d-8e2f-0b7c9d1e3a5b";
+        const ADAPTERS: &[&str] = &["chatgpt", "claude", "grok"];
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+        let observe_provider_session = |store: &mut StateStore,
+                                        seed: &str,
+                                        provider: &str,
+                                        identity: &str,
+                                        url: &str,
+                                        observed_at: i64|
+         -> String {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: DEVICE,
+                    profile_seed: seed,
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider,
+                    adapter_protocol_version: 1,
+                    observation_generation: observed_at,
+                    capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                    observed_at,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider,
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: &format!("{identity}-account"),
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider,
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: identity,
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    url,
+                    observed_at,
+                    observed_at,
+                )
+                .unwrap();
+            session.resource_ref
+        };
+
+        // A registered claude conversation URL resolves its session through the
+        // adapter-scoped lookup.
+        let mut store = StateStore::open(":memory:").unwrap();
+        let claude_session = observe_provider_session(
+            &mut store,
+            "seed-claude-endpoint",
+            "claude",
+            "claude-current",
+            CLAUDE_URL,
+            100,
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url_for_adapters(CLAUDE_URL, ADAPTERS)
+                .unwrap()
+                .as_deref(),
+            Some(claude_session.as_str()),
+            "a registered claude conversation URL must resolve through the adapter set"
+        );
+
+        // A chatgpt session sharing the same canonical URL with the claude
+        // session stays ambiguous across providers: never newest-wins.
+        observe_provider_session(
+            &mut store,
+            "seed-cross-provider-endpoint",
+            "chatgpt",
+            "chatgpt-cross",
+            CLAUDE_URL,
+            200,
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url_for_adapters(CLAUDE_URL, ADAPTERS)
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous",
+            "cross-provider duplicate URLs must stay fail-closed"
+        );
+
+        // An unregistered provider's session never resolves through the
+        // adapter set, and an empty adapter set resolves nothing.
+        let mut other = StateStore::open(":memory:").unwrap();
+        let zai_session = observe_provider_session(
+            &mut other,
+            "seed-zai-endpoint",
+            "z.ai",
+            "zai-current",
+            "https://z.ai/chat/some-conversation",
+            100,
+        );
+        assert_eq!(
+            other
+                .browser_session_ref_for_canonical_url_for_adapters(
+                    "https://z.ai/chat/some-conversation",
+                    ADAPTERS,
+                )
+                .unwrap(),
+            None,
+            "unregistered provider sessions never resolve"
+        );
+        assert_eq!(
+            other
+                .browser_session_ref_for_canonical_url_for_adapters(
+                    "https://z.ai/chat/some-conversation",
+                    &[],
+                )
+                .unwrap(),
+            None,
+            "an empty adapter set resolves nothing"
+        );
+        assert!(!zai_session.is_empty());
     }
 
     #[test]
