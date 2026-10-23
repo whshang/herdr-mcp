@@ -75,10 +75,10 @@ Remaining registry/background branches on provider name:
 | provider → origin pattern switch | `extension/background.js:321-325` |
 | Site derivation special-cases ChatGPT | `extension/background.js:450-452` |
 | Project/launch URL builders branch per site | `extension/background.js:776-786`, `:790-823` |
-| Conversation-URL parsers duplicated per provider | `extension/background.js:1896-1918` (`claudeConversationInfo`, `grokConversationInfo`), `:1947-1950` |
-| ChatGPT-only dispatch path | `extension/background.js:3010-3011` (`if (site === "chatgpt") return sendChatGptTabMessage(...)`) |
+| Conversation-URL parsers duplicated per provider | `extension/background.js:1894-1912` (`claudeConversationInfo`, `grokConversationInfo`), `:1947-1950` |
+| ChatGPT-only dispatch path | `extension/background.js:3011` (`if (site === "chatgpt") return sendChatGptTabMessage(...)`) |
 | Continuity/handoff limited to ChatGPT | `extension/background.js:7896-7902`, `:11009` |
-| ChatGPT-only artifacts/perf/migration machinery | `extension/content/chatgpt-artifact-core.js:157` (`/backend-api/estuary/content`), `extension/content/chatgpt-perf-main.js`, `extension/background.js:64`, `:989-1040`, `:2392`, `extension/continuity-core.js:14` |
+| ChatGPT-only artifacts/perf/migration machinery | `extension/content/chatgpt-artifact-core.js:161` (`/backend-api/estuary/content`), `extension/content/chatgpt-perf-main.js`, `extension/background.js:64`, `:989-1040`, `:2392`, `extension/continuity-core.js:14` |
 
 ### 1.2 Rust runtime
 
@@ -113,7 +113,7 @@ transport.
 | Per-host conversation URL parsing (chatgpt.com / claude.ai / grok.com) — a second copy of the extension parsers | `mcp.rs:884-928` |
 | Continuity resume only for `chatgpt` | `mcp.rs:1216` |
 | Claude-only diagnostic counters | `mcp.rs:2723` |
-| Session-URL lookup pinned to `r.provider = 'chatgpt'` | `crates/herdr-mcp/src/state_store.rs:3422` |
+| Session-URL lookup pinned to `r.provider = 'chatgpt'` | `crates/herdr-mcp/src/state_store.rs:3437` |
 | Session ops assert `kind`/`provider` constants | `state_store.rs:3740` |
 | Alpha-4 support matrix requires provider `chatgpt` for create | `mcp.rs:5800-5821` |
 | `session.open` / `session.archive` / `archive_status` chatgpt-only gates | `mcp.rs:5967-5974`, `:6089`, `:6710-6713` |
@@ -169,7 +169,7 @@ Rules:
    `applied|uncertain|not_applied` delivery, generation fence and human-boundary policy
    (`v1.1-browser-adapter-platform.md:173`, `:819`, `:887-889`).
 3. **Canonicalization lives with the adapter, once.** Today the same URL parsing exists in
-   both `extension/background.js:1896-1918` and `crates/herdr-mcp/src/mcp.rs:884-928`;
+   both `extension/background.js:1894-1912` and `crates/herdr-mcp/src/mcp.rs:884-928`;
    the adapter manifest should be the single declaration, with the runtime validating
    rather than re-deriving.
 4. **Thin control plane stays in Runtime**: grants, idempotency, delivery states, archive
