@@ -1881,6 +1881,12 @@ fn batch_proves_pane_advanced(
     })
 }
 
+/// Only an identical re-observation of the same transition — the same status
+/// with a `state_change_seq` present on both sides and equal — is allowed past
+/// the fence. Everything else after the terminal cursor proves the pane moved
+/// on: live events carry no sequence, so a repeated `done` is a second task that
+/// already finished, and a snapshot `pane_updated` for the same status is only
+/// emitted after the pane actually changed.
 fn event_proves_pane_advanced(
     task: &PromptTaskRecord,
     event: &Value,
@@ -1892,18 +1898,10 @@ fn event_proves_pane_advanced(
     ) {
         return true;
     }
-    if let Some(status) = task_event_status(event)
-        && Some(status) != task.terminal_status.as_deref()
-    {
-        return true;
-    }
-    matches!(
-        (
-            task_event_state_change_seq(event),
-            terminal_state_change_seq
-        ),
-        (Some(seq), Some(terminal_seq)) if seq != terminal_seq
-    )
+    let event_seq = task_event_state_change_seq(event);
+    !(event_seq.is_some()
+        && event_seq == terminal_state_change_seq
+        && task_event_status(event) == task.terminal_status.as_deref())
 }
 
 fn task_event_state_change_seq(event: &Value) -> Option<u64> {
@@ -5315,6 +5313,148 @@ mod tests {
             "output read while the pane advanced must never be attributed to this task"
         );
         assert_eq!(requests.lock().unwrap().len(), 3);
+        server.join().unwrap();
+    }
+
+    /// user owner | Given live events without `state_change_seq` where a second
+    /// same-status `done` event follows the terminal one in the same batch |
+    /// When the terminal transition is reconciled | Then the batch fence keeps
+    /// the task terminal with no excerpt and issues no native read, because the
+    /// later `done` can only be a second task that already finished.
+    #[test]
+    fn final_excerpt_omits_live_event_without_seq_when_second_same_status_event_follows_in_batch() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let _server = scripted_read_server(
+            listener,
+            vec![json!({"result": {"read": {"content": "SECOND TASK FINAL OUTPUT"}}})],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-live-repeat-done");
+        task.baseline_seq = Some(1);
+
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            &mut task,
+            &[
+                json!({
+                    "cursor": 101,
+                    "pane_id": "w1:p1",
+                    "agent": "codex",
+                    "agent_status": "done",
+                    "type": "pane.agent_status_changed"
+                }),
+                json!({
+                    "cursor": 102,
+                    "pane_id": "w1:p1",
+                    "agent": "codex",
+                    "agent_status": "done",
+                    "type": "pane.agent_status_changed"
+                }),
+            ],
+        );
+
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(task.terminal_cursor, Some(101));
+        assert!(
+            task.final_excerpt.is_none(),
+            "a repeated live done event must not attribute the next task's output"
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a batch that already shows a second completion must not read the pane"
+        );
+    }
+
+    /// user owner | Given a live event without `state_change_seq` whose pane
+    /// state has not moved past the dispatch baseline | When the terminal
+    /// transition is reconciled | Then no excerpt is captured and the pane is
+    /// never read.
+    #[test]
+    fn final_excerpt_omits_live_event_without_seq_when_pre_read_seq_did_not_pass_baseline() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let _server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-live-stale-baseline");
+        // The pane has not advanced since dispatch, so this sequence cannot
+        // belong to this task's terminal transition.
+        task.baseline_seq = Some(2);
+
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane_id": "w1:p1",
+                "agent": "codex",
+                "agent_status": "done",
+                "type": "pane.agent_status_changed"
+            })],
+        );
+
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert!(task.final_excerpt.is_none());
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "a stale pre-read sequence stops capture");
+        assert_eq!(recorded[0].0, "agent.get");
+        drop(recorded);
+    }
+
+    /// user owner | Given the same terminal transition observed twice with the
+    /// same status and the same `state_change_seq` | When the batch is
+    /// reconciled | Then the fence accepts it and still captures the excerpt.
+    #[test]
+    fn final_excerpt_captures_when_only_the_identical_transition_repeats_in_batch() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": "COMPANION EVENT EXCERPT\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-companion");
+        task.baseline_seq = Some(1);
+
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            &mut task,
+            &[
+                json!({
+                    "cursor": 101,
+                    "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+                }),
+                json!({
+                    "cursor": 102,
+                    "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+                }),
+            ],
+        );
+
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(
+            task.final_excerpt.as_deref(),
+            Some("COMPANION EVENT EXCERPT\n"),
+            "an identical transition re-observation is not pane reuse"
+        );
         server.join().unwrap();
     }
 
