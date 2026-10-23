@@ -20,7 +20,9 @@ shared files or shared runtime/state   -> single mutation lane
 
 Optimize for correct ownership and dependencies, not maximum parallelism.
 
-The Web planner is the main brain: it decomposes, owns branches/worktrees/panes, merges, integrates, verifies, and cleans up, and delegates non-trivial implementation (more than roughly one file or ~30 changed lines, or work needing iterative test/fix rounds) to a compatible local coder agent in its own worktree. Small deterministic edits, reads, git/branch management, and final verification may stay direct; this is a scheduling heuristic, not a gate. Multiple independent lanes are worth it only when decomposition is clean and the expected latency/quality gain exceeds orchestration overhead — never because the task is large or a worker is idle.
+Delegation depth is two: planner -> supervisor -> workers. A worker never re-dispatches.
+
+The Web planner is the main brain: it decomposes, owns branches/worktrees/panes, merges, integrates, verifies, and cleans up, and delegates non-trivial implementation (more than roughly one file or ~30 changed lines, or work needing iterative test/fix rounds) to a compatible local coder agent in its own worktree. Small deterministic edits, reads, git/branch management, and final verification may stay direct; this is a scheduling heuristic, not a gate. Multiple independent lanes are worth it only when decomposition is clean and the expected latency/quality gain exceeds orchestration overhead — never because the task is large or a worker is idle. For multi-lane or long work the planner may appoint one local supervisor per task: it re-dispatches to workers (`herdr-mcp agent dispatch <target> <text> --parent <its own pane> --idempotency-key <key>`), owns that task's progress checks, review, and integration, and reports once — the supervisor's children wake it, not the planner. The planner still owns lane decomposition, branches/worktrees, merge decisions, cross-lane reconciliation, and final review of what comes back.
 
 For multiple lines, reason with a lightweight lane: `objective`, `project_root`, optional branch/worktree, owner, `file_scope`, dependencies, and validation. Keep overall orchestration and cross-lane reconciliation with the Web planner.
 
@@ -49,7 +51,7 @@ Create/reuse a worktree only for independent mutation, isolation from unrelated 
 
 Treat workspaces and panes as bounded reusable resources. Reuse an existing compatible workspace/pane before creating another; one canonical `herdr-mcp:utility` pane per workspace is normally sufficient. Duplicate utility panes or finished temporary lanes are resource-pressure evidence for the planner, not a reason to run an autonomous cleanup daemon.
 
-Parallel mutations require non-overlapping file/runtime ownership. Shared files serialize unless ownership is deliberately transferred. Delegated workers receive one bounded objective and do not dispatch other workers.
+Parallel mutations require non-overlapping file/runtime ownership. Shared files serialize unless ownership is deliberately transferred. Delegated workers receive one bounded objective and do not dispatch other workers; only a task's designated supervisor dispatches, and only to its own workers.
 
 ## Validation and reclamation
 

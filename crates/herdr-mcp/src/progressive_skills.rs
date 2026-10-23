@@ -72,6 +72,8 @@ pub const DOUBAO_IMAGE_STATUS_METHOD: &str = "herdr_mcp.doubao.image.status";
 /// Task requirements the semantic layer may fill only when the planner left
 /// them unspecified. Semantic inference can add an advisory requirement, but
 /// cannot override an explicit planner value or become execution authority.
+/// `supervisor` is deliberately absent: designating the one supervisor allowed
+/// to re-dispatch workers is a planner decision, never an inference.
 const SEMANTIC_INFERABLE_KEYS: &[&str] = &[
     "requires_code_edit",
     "requires_shell",
@@ -712,6 +714,7 @@ impl ProgressiveSkillService {
                     "minimum_reasoning_tier": "optional integer 0..255",
                     "destructive_production_mutation": "optional boolean",
                     "delegates_other_workers": "optional boolean",
+                    "supervisor": "optional boolean; true only when the planner designates this task's agent as the one supervisor allowed to re-dispatch workers (workers never re-dispatch; dispatch depth and self-loop limits are enforced by the runtime guards)",
                     "independent_units": "optional integer 1..64; omitted means task independence is unknown",
                     "ownership_isolated": "optional boolean",
                     "shared_runtime_state": "optional boolean"
@@ -830,6 +833,7 @@ impl ProgressiveSkillService {
             "minimum_reasoning_tier",
             "destructive_production_mutation",
             "delegates_other_workers",
+            "supervisor",
             "independent_units",
             "ownership_isolated",
             "shared_runtime_state",
@@ -2532,6 +2536,7 @@ fn task_profile_from_params(params: &Value) -> Result<TaskProfile, Value> {
         minimum_reasoning_tier: optional_u8(params, "minimum_reasoning_tier")?,
         destructive_production_mutation: optional_bool(params, "destructive_production_mutation")?,
         delegates_other_workers: optional_bool(params, "delegates_other_workers")?,
+        supervisor: optional_bool(params, "supervisor")?,
         independent_units: optional_independent_units(params)?,
         ownership_isolated: optional_bool(params, "ownership_isolated")?,
         shared_runtime_state: optional_bool(params, "shared_runtime_state")?,
@@ -2930,7 +2935,7 @@ fn inactive_candidate_reject_reason(
     if task.destructive_production_mutation {
         return Some("destructive_production_mutation_not_auto_delegated");
     }
-    if task.delegates_other_workers {
+    if task.delegates_other_workers && !task.supervisor {
         return Some("middle_manager_delegation_forbidden");
     }
     if let Some(target) = task.explicit_target.as_deref()

@@ -16,7 +16,7 @@ Delegate non-trivial implementation per `development-orchestration`'s main-brain
 1. Delegation stays a planner choice, not a side effect of idle workers or candidate availability.
 2. Filter live candidates by auto-dispatch policy, project/cwd, status, lane ownership, mutation conflict, and capabilities the task actually requires.
 3. Expose compatible candidates with known quality/cost/latency evidence to the Web planner. Unknown capability fields stay unknown; candidate availability never requires dispatch.
-4. Submit one bounded task card: objective, role declaration (executor — implement and report; do not dispatch other agents, merge, or push unless the card says so), worktree/branch, file scope, validation commands, report boundary. Give the executor only the context the card needs — not the chat transcript, not planner-only dispatch rules — and keep the card well under 12 KB. Then verify delivery through prompt evidence plus live state.
+4. Submit one bounded task card: objective, role declaration (executor — implement and report, no dispatch/merge/push unless the card says so; or supervisor — the task's single designated dispatcher, re-dispatching with `--parent` = its own pane, supervising, reviewing, integrating, and reporting once, still merging/pushing only if the card says so), worktree/branch, file scope, validation commands, report boundary. Give the executor only the context the card needs — not the chat transcript, not planner-only dispatch rules — and keep the card well under 12 KB. Then verify delivery through prompt evidence plus live state.
 5. Record a progress checkpoint for delegated work. On the next relevant planner turn and before integration, use `herdr_since` plus the lane's Git/output evidence to confirm progress; when evidence shows drift or a stall, tighten the prompt, stop the lane, or reassign it before starting another worker.
 
 A user-specified agent/model/pane target has priority and is never silently replaced. A busy preferred worker may fall back only to a reliably equivalent compatible worker; do not silently lower capability or quality.
@@ -27,7 +27,7 @@ Generic same-project reasoning may consider an idle allowed worker even when opt
 
 ## Boundaries and evidence
 
-Reject blocked workers, project mismatch, conflicting mutation ownership, destructive production/runtime mutation, and middle-manager delegation. Do not invent work because a worker is idle.
+Reject blocked workers, project mismatch, conflicting mutation ownership, destructive production/runtime mutation, and unscoped middle-manager chains. A worker that would plan or manage other workers is admissible only when the Web planner designates it as that task's single supervisor; its own workers never re-dispatch. Do not invent work because a worker is idle.
 
 Keep bounded `DispatchAdvice` evidence: task profile, direct deterministic option, compatible candidates, relevant rejection reasons, optional parallelism opportunity, ownership scope, and validation boundary. A selected target exists only after the Web planner chooses one. Uncertain submission is observed before any retry.
 
