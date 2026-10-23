@@ -446,10 +446,13 @@ mod tests {
             Duration::from_secs(6 * 60 * 60),
         )
         .unwrap();
+        // `subscribe` only writes the request to the socket, so joining here cannot
+        // deadlock. It guarantees the peer already wrote the ack and closed the
+        // stream, which makes the EOF below deterministic instead of racy on load.
+        server.join().unwrap();
         let error = stream.poll_event(Duration::from_millis(50)).unwrap_err();
         assert_eq!(error.code, "event_stream_closed");
 
-        server.join().unwrap();
         std::fs::remove_file(socket).unwrap();
     }
 
