@@ -935,7 +935,9 @@ fn webchat_adapter_for_host(host: &str) -> Option<&'static WebChatAdapterRow> {
 /// unregistered provider name stays refused. Until the registry is wired in
 /// this keeps the historical ChatGPT-only behavior.
 fn webchat_adapter_binds_parent_session(provider: &str) -> bool {
-    provider == "chatgpt"
+    WEBCHAT_ADAPTER_REGISTRY
+        .iter()
+        .any(|row| row.provider == provider)
 }
 
 fn browser_uuid(value: &str) -> bool {
