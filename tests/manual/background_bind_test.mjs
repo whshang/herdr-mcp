@@ -181,6 +181,7 @@ function emitPushEvent(event, data) {
 const mcpRequestBodies = [];
 const nativeBatchRequests = [];
 let failNextBrowserEndpointRegistration = true;
+let pendingSourceTurnObserveFailures = [];
 const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
@@ -532,6 +533,17 @@ globalThis.chrome = {
             status: 503,
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ ok: false, code: "browser_registry_test_unavailable" }),
+          });
+          return;
+        }
+        if (body.operation === "source_turn.observe" && pendingSourceTurnObserveFailures.length > 0) {
+          const code = pendingSourceTurnObserveFailures.shift();
+          callback({
+            ok: true,
+            transport: "ipc",
+            status: 200,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ok: false, code }),
           });
           return;
         }
@@ -4378,6 +4390,76 @@ console.log("\n[owned child task auto binding]");
   mockStateWorkspaces = [];
   testClockOffsetMs -= 5000;
 }
+console.log("\n[Source-turn observe retry covers the fresh-conversation registration race]");
+{
+  const observesFor = (conv) => browserRegistryRequests.filter(
+    (request) => request.operation === "source_turn.observe" && request.canonical_url === conv,
+  );
+  const retryConv = "https://chatgpt.com/c/source-turn-retry-race";
+  const startedAt = Date.now() - 10;
+  pendingSourceTurnObserveFailures = [
+    "browser_source_session_not_found",
+    "browser_source_session_not_found",
+  ];
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: retryConv,
+    userText: "  确认当前用户回合  ",
+    startedAt,
+  });
+  ok(await waitForTest(() => observesFor(retryConv).length >= 3, 12000),
+    "user retries a fresh-conversation source turn | Given the first source_turn.observe fails with browser_source_session_not_found | When the turn-started handler runs the bounded retry schedule | Then all attempts replay the exact trimmed turn evidence",
+    JSON.stringify(observesFor(retryConv)));
+  const attempts = observesFor(retryConv);
+  ok(attempts.length === 3,
+    "the retry schedule makes exactly one initial attempt plus two bounded retries");
+  ok(attempts.every((attempt) => attempt.user_text === "确认当前用户回合"
+      && attempt.observed_at === startedAt),
+    "every retry replays the same trimmed text and original submit time");
+  await new Promise((resolve) => setTimeout(resolve, 3500));
+  ok(observesFor(retryConv).length === 3,
+    "the retry stops after the bounded schedule instead of polling",
+    JSON.stringify(observesFor(retryConv)));
+
+  const settledConv = "https://chatgpt.com/c/source-turn-retry-settled";
+  const settledAt = Date.now();
+  pendingSourceTurnObserveFailures = ["browser_source_session_not_found"];
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: settledConv,
+    userText: "第二个回合",
+    startedAt: settledAt,
+  });
+  ok(await waitForTest(() => observesFor(settledConv).length >= 2, 8000),
+    "user recovers a turn whose session registered late | Given the first observe fails once | When the first retry succeeds | Then the observe stops at two attempts",
+    JSON.stringify(observesFor(settledConv)));
+  ok(observesFor(settledConv).length === 2
+      && observesFor(settledConv).every((attempt) => attempt.observed_at === settledAt),
+    "the recovered retry replays the original turn evidence exactly");
+
+  // A registration miss followed by a different failure must not issue the
+  // third attempt: only the registration code may continue the schedule.
+  const failClosedConv = "https://chatgpt.com/c/source-turn-retry-fail-closed";
+  const failClosedAt = Date.now();
+  pendingSourceTurnObserveFailures = [
+    "browser_source_session_not_found",
+    "browser_canonical_url_ambiguous",
+  ];
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: failClosedConv,
+    userText: "歧义后停止",
+    startedAt: failClosedAt,
+  });
+  ok(await waitForTest(() => observesFor(failClosedConv).length >= 2, 8000),
+    "user keeps an ambiguous observe fail-closed | Given the first observe misses registration and the retry reports an ambiguous canonical URL | When the retry schedule inspects the failure code | Then exactly two attempts are made",
+    JSON.stringify(observesFor(failClosedConv)));
+  await new Promise((resolve) => setTimeout(resolve, 4000));
+  ok(observesFor(failClosedConv).length === 2,
+    "a non-registration failure stops the retry schedule instead of issuing the third attempt",
+    JSON.stringify(observesFor(failClosedConv)));
+}
+
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);
 process.exit(failures === 0 ? 0 : 1);

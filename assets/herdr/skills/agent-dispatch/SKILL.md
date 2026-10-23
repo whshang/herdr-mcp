@@ -7,7 +7,7 @@ description: Advise, submit, and verify useful independent coding-agent work fro
 
 Own: `herdr_prompt`. Combine this policy with live facts from `herdr_inspect`/`herdr_since`; never encode a permanent agent/model ranking or infer a worker's role from its name/kind.
 
-Call shape: target one explicit live Agent name or pane identity and use one stable `idempotency_key` for the intended prompt submission. Normal orchestration is asynchronous; retain the returned task/dispatch identity instead of blocking on a global Agent state. After timeout or transport failure, retry only when delivery evidence says `not_delivered` or live state proves the prompt did not apply.
+Call shape: target one explicit live Agent name or pane identity and use one stable `idempotency_key` for the intended prompt submission. A WebChat caller also passes the exact current user turn as `current_user_message` so the runtime can bind the task to that conversation's browser session (`parent_session_ref`); binding is evidence-based and a `parent_session: {bound:false}` fact never fails the dispatch. Normal orchestration is asynchronous; retain the returned task/dispatch identity instead of blocking on a global Agent state. After timeout or transport failure, retry only when delivery evidence says `not_delivered` or live state proves the prompt did not apply.
 
 Delegate non-trivial implementation per `development-orchestration`'s main-brain rule; delegation never removes the planner's own fs/exec capability.
 
