@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -2198,16 +2200,79 @@ fn read_final_excerpt(
     {
         return None;
     }
-    // A pane narrower than the readable floor can only yield hard-wrapped
-    // viewport fragments: a TUI agent wraps its own layout, so `recent_unwrapped`
-    // has no soft-wrap to rejoin. Fail closed instead of publishing wrapping
-    // noise the parent would have to re-read anyway (#684).
-    if let Some(cols) = final_excerpt_pane_columns(client, target)
-        && !crate::pane_width::excerpt_is_readable(cols)
-    {
+    // A pane narrower than the readable floor stores hard-wrapped viewport
+    // fragments (a TUI agent wraps its own layout, so `recent_unwrapped` has no
+    // soft-wrap to rejoin). Its logical lines still exist in the agent's own
+    // session transcript, so read those instead of publishing wrapping noise
+    // (#684). Unknown geometry fails closed: never publish rows that cannot be
+    // qualified as the agent's own output.
+    match final_excerpt_pane_columns(client, target) {
+        Some(cols) if crate::pane_width::excerpt_is_readable(cols) => Some(excerpt),
+        Some(_) => logical_excerpt_from_agent_session(client, target),
+        None => None,
+    }
+}
+
+/// Bytes of the agent transcript tail inspected for the last assistant message.
+const FINAL_EXCERPT_SESSION_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Recovers the child's last assistant message from its own session file.
+///
+/// This is the logical-line path for panes too narrow to read: it returns the
+/// text the agent produced, not the column-wrapped rows it painted. Anything
+/// unreadable or unparsable leaves the excerpt absent rather than guessing.
+fn logical_excerpt_from_agent_session(client: &HerdrClient, target: &str) -> Option<String> {
+    let response = client
+        .call_with_timeout(
+            "agent.get",
+            json!({"target": target}),
+            FINAL_EXCERPT_VERIFY_TIMEOUT,
+        )
+        .ok()?;
+    let agent = response.get("agent").unwrap_or(&response);
+    let session = agent.get("agent_session")?;
+    if session.get("kind").and_then(Value::as_str) != Some("path") {
         return None;
     }
-    Some(excerpt)
+    let path = session.get("value").and_then(Value::as_str)?;
+    let text = read_session_tail_text(Path::new(path))?;
+    let excerpt = shape_final_excerpt(&text);
+    (!excerpt.trim().is_empty()).then_some(excerpt)
+}
+
+/// Last assistant message text from the tail of a JSONL agent transcript.
+fn read_session_tail_text(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(FINAL_EXCERPT_SESSION_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = String::new();
+    file.take(FINAL_EXCERPT_SESSION_TAIL_BYTES)
+        .read_to_string(&mut tail)
+        .ok()?;
+    tail.lines()
+        .rev()
+        .find_map(assistant_text_from_session_line)
+}
+
+fn assistant_text_from_session_line(line: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let message = value.get("message").unwrap_or(&value);
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    match message.get("content") {
+        Some(Value::String(text)) => (!text.trim().is_empty()).then(|| text.clone()),
+        Some(Value::Array(blocks)) => {
+            let text: Vec<&str> = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect();
+            (!text.is_empty()).then(|| text.join("\n"))
+        }
+        _ => None,
+    }
 }
 
 /// Column width of the pane the excerpt was read from. A missing or failed
@@ -5504,10 +5569,21 @@ mod tests {
     /// `final_excerpt`, because column fragments are not an outcome the parent
     /// can close out on (#684).
     #[test]
-    fn final_excerpt_is_omitted_for_a_pane_below_the_readable_width() {
+    fn final_excerpt_recovers_logical_lines_from_a_narrow_pane() {
         let socket = temp_socket();
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let transcript = temp_socket().with_extension("jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"older turn\"}]}}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"go\"}}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"cb604c6f\"},{\"type\":\"text\",\"text\":\"T259-DONE\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        let session_path = transcript.to_string_lossy().into_owned();
         let server = scripted_read_server(
             listener,
             vec![
@@ -5515,6 +5591,9 @@ mod tests {
                 json!({"result": {"read": {"content": " cb\n 60\n 4c\n 6f\n\n T2\n 59\n -D\n ON\n E\n"}}}),
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
                 layout_response(4),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done",
+                    "state_change_seq": 2,
+                    "agent_session": {"agent": "pi", "kind": "path", "value": session_path}}}}),
             ],
             Arc::clone(&requests),
         );
@@ -5534,21 +5613,110 @@ mod tests {
 
         assert!(changed);
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
-        assert_eq!(
-            task.final_excerpt, None,
-            "a four-column pane can only yield wrapped fragments, so the excerpt must fail closed"
+        let excerpt = task.final_excerpt.clone().expect(
+            "a four-column pane must still publish the agent's logical lines, not wrapping noise",
         );
-        assert_eq!(task.notification_state, "pending");
+        assert!(excerpt.contains("cb604c6f"), "excerpt: {excerpt:?}");
+        assert!(excerpt.contains("T259-DONE"), "excerpt: {excerpt:?}");
+        assert!(
+            !excerpt.contains(" cb") && !excerpt.contains(" 60") && !excerpt.contains(" 4c"),
+            "column fragments must never reach the parent: {excerpt:?}"
+        );
 
         let recorded = requests.lock().unwrap();
         assert_eq!(
             recorded.len(),
-            4,
-            "the capture reads once, then probes the pane width"
+            5,
+            "read, verify, probe the width, then read the session transcript"
         );
         assert_eq!(recorded[3].0, "pane.layout");
-        assert_eq!(recorded[3].1["pane_id"], "w1:p1");
+        assert_eq!(recorded[4].0, "agent.get");
         drop(recorded);
+        server.join().unwrap();
+        fs::remove_file(&socket).ok();
+        fs::remove_file(&transcript).ok();
+    }
+
+    /// user parent | Given a narrow pane whose agent transcript cannot be read |
+    /// When the terminal transition is reconciled | Then the excerpt stays absent
+    /// rather than falling back to wrapped viewport fragments.
+    #[test]
+    fn final_excerpt_stays_absent_for_a_narrow_pane_without_a_transcript() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": " cb\n 60\n 4c\n 6f\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                layout_response(4),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done",
+                    "agent_session": {"agent": "pi", "kind": "path",
+                                      "value": "/nonexistent/herdr-mcp/session.jsonl"}}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-narrow-no-transcript");
+
+        apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(
+            task.final_excerpt, None,
+            "without a readable transcript a narrow pane must fail closed, never ship fragments"
+        );
+        server.join().unwrap();
+        fs::remove_file(&socket).ok();
+    }
+
+    /// user parent | Given the pane width probe fails | When the terminal
+    /// transition is reconciled | Then no excerpt is published, because unwrapped
+    /// rows that cannot be qualified may be wrapping garbage.
+    #[test]
+    fn final_excerpt_stays_absent_when_the_width_probe_fails() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": " cb\n 60\n 4c\n 6f\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"error": {"code": "internal_error", "message": "layout unavailable"}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-width-probe-failed");
+
+        apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(
+            task.final_excerpt, None,
+            "an unverifiable pane width must fail closed instead of publishing unqualified rows"
+        );
         server.join().unwrap();
         fs::remove_file(&socket).ok();
     }
@@ -5656,6 +5824,7 @@ mod tests {
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
                 json!({"result": {"read": {"content": "LIVE EXCERPT OK\n"}}}),
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                wide_layout_response(),
             ],
             Arc::clone(&requests),
         );
@@ -5864,6 +6033,7 @@ mod tests {
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
                 json!({"result": {"read": {"content": "RC3_EXCERPT_UAT_PASS\n"}}}),
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                wide_layout_response(),
             ],
             Arc::clone(&requests),
         );
@@ -6129,6 +6299,7 @@ mod tests {
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
                 json!({"result": {"read": {"content": "COMPANION EVENT EXCERPT\n"}}}),
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                wide_layout_response(),
             ],
             Arc::clone(&requests),
         );
