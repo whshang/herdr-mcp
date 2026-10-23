@@ -3407,6 +3407,23 @@ impl StateStore {
             .map_err(|error| format!("cannot inspect browser resource locator: {error}"))
     }
 
+    /// Adapter-scoped canonical URL -> session lookup (#692 slice 2).
+    ///
+    /// Same fail-closed ambiguity contract as the ChatGPT-scoped variant
+    /// below, but admits every provider named by the caller-supplied
+    /// adapter set (the Runtime passes the WebChat adapter registry's
+    /// providers, so the registry stays the single authority). An empty
+    /// provider set resolves nothing.
+    pub fn browser_session_ref_for_canonical_url_for_adapters(
+        &self,
+        canonical_url: &str,
+        _providers: &[&str],
+    ) -> Result<Option<String>, String> {
+        // RED scaffold: provider set not honored yet — delegates to the
+        // historical ChatGPT-pinned query so behavior is unchanged today.
+        self.browser_session_ref_for_canonical_url(canonical_url)
+    }
+
     pub fn browser_session_ref_for_canonical_url(
         &self,
         canonical_url: &str,
@@ -12587,6 +12604,144 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn browser_session_url_lookup_is_adapter_scoped() {
+        use crate::state_store::{
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput,
+        };
+        const CLAUDE_URL: &str = "https://claude.ai/chat/5d2a9c3e-1f4b-4a6d-8e2f-0b7c9d1e3a5b";
+        const ADAPTERS: &[&str] = &["chatgpt", "claude", "grok"];
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+        let observe_provider_session = |store: &mut StateStore,
+                                        seed: &str,
+                                        provider: &str,
+                                        identity: &str,
+                                        url: &str,
+                                        observed_at: i64|
+         -> String {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: DEVICE,
+                    profile_seed: seed,
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider,
+                    adapter_protocol_version: 1,
+                    observation_generation: observed_at,
+                    capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                    observed_at,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider,
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: &format!("{identity}-account"),
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider,
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: identity,
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(&session.resource_ref, url, observed_at, observed_at)
+                .unwrap();
+            session.resource_ref
+        };
+
+        // A registered claude conversation URL resolves its session through the
+        // adapter-scoped lookup.
+        let mut store = StateStore::open(":memory:").unwrap();
+        let claude_session = observe_provider_session(
+            &mut store,
+            "seed-claude-endpoint",
+            "claude",
+            "claude-current",
+            CLAUDE_URL,
+            100,
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url_for_adapters(CLAUDE_URL, ADAPTERS)
+                .unwrap()
+                .as_deref(),
+            Some(claude_session.as_str()),
+            "a registered claude conversation URL must resolve through the adapter set"
+        );
+
+        // A chatgpt session sharing the same canonical URL with the claude
+        // session stays ambiguous across providers: never newest-wins.
+        observe_provider_session(
+            &mut store,
+            "seed-cross-provider-endpoint",
+            "chatgpt",
+            "chatgpt-cross",
+            CLAUDE_URL,
+            200,
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url_for_adapters(CLAUDE_URL, ADAPTERS)
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous",
+            "cross-provider duplicate URLs must stay fail-closed"
+        );
+
+        // An unregistered provider's session never resolves through the
+        // adapter set, and an empty adapter set resolves nothing.
+        let mut other = StateStore::open(":memory:").unwrap();
+        let zai_session = observe_provider_session(
+            &mut other,
+            "seed-zai-endpoint",
+            "z.ai",
+            "zai-current",
+            "https://z.ai/chat/some-conversation",
+            100,
+        );
+        assert_eq!(
+            other
+                .browser_session_ref_for_canonical_url_for_adapters(
+                    "https://z.ai/chat/some-conversation",
+                    ADAPTERS,
+                )
+                .unwrap(),
+            None,
+            "unregistered provider sessions never resolve"
+        );
+        assert_eq!(
+            other
+                .browser_session_ref_for_canonical_url_for_adapters(
+                    "https://z.ai/chat/some-conversation",
+                    &[],
+                )
+                .unwrap(),
+            None,
+            "an empty adapter set resolves nothing"
+        );
+        assert!(!zai_session.is_empty());
     }
 
     #[test]
