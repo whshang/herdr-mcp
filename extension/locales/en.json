@@ -357,6 +357,8 @@
   "cc_workspaces_binding_hint": "Live state · current-page binding",
   "cc_workspace_bind": "Bind",
   "cc_workspace_bound": "Bound",
+  "cc_workspace_bound_auto": "Bound · auto",
+  "cc_workspace_bound_auto_hint": "Bound automatically for this conversation's own Herdr task. Unbind it from {workspace} like any other binding.",
   "cc_workspace_binding_updating": "…",
   "cc_workspace_binding_busy_reason": "A page binding update is already in progress.",
   "cc_workspace_binding_disabled": "Open a supported Project or conversation to manage page binding.",
