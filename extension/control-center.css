@@ -96,6 +96,7 @@ button.danger { border-color: color-mix(in srgb, var(--danger) 62%, var(--border
 .workspace-binding-toggle { align-self: center; flex: 0 0 auto; margin-right: 6px; min-width: 44px; padding: 3px 5px; color: var(--text); font-size: 10px; white-space: nowrap; }
 .workspace-binding-toggle[aria-pressed="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--panel-2)); color: var(--accent); }
 .workspace-binding-toggle.binding-busy { opacity: .7; }
+.workspace-binding-toggle.context-auto-bound { border-style: dashed; }
 .panes { border-top: 1px solid var(--border); }
 .pane { position: relative; padding: 8px 9px 8px 13px; border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent); cursor: pointer; }
 .pane:last-child { border-bottom: 0; }

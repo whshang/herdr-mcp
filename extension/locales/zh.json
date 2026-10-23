@@ -357,6 +357,8 @@
   "cc_workspaces_binding_hint": "实时状态 · 当前页面绑定",
   "cc_workspace_bind": "绑定",
   "cc_workspace_bound": "已绑定",
+  "cc_workspace_bound_auto": "已绑定 · 自动",
+  "cc_workspace_bound_auto_hint": "由当前会话自己派出的 Herdr 任务自动绑定；可像其他绑定一样解除与 {workspace} 的绑定。",
   "cc_workspace_binding_updating": "…",
   "cc_workspace_binding_busy_reason": "当前页面的绑定正在更新，请等这次操作完成。",
   "cc_workspace_binding_disabled": "先打开受支持的 Project 或会话，才能管理当前页面绑定。",

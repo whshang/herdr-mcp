@@ -288,6 +288,16 @@ ChatGPT が `herdr_prompt` で長時間のローカル Agent task を dispatch �
 
 inbox に未 acknowledge の terminal work がある場合、Runtime は scope 内の child summary を最大 16 件 freeze し、active sibling も含めて一度だけ `agent.attention.advise` を評価できます。結果は Parent 向け guidance として inbox に添付され、`verify_completion` は deterministic validation へ、`continue_unobserved` は独立して running 中の sibling をそのままにし、human/blocker/drift state は次の観測方向だけを決めます。terminal fact はそのまま Parent を wake し、Browser は二重の semantic grace 待ちや独自 probability threshold を持ちません。Jev が未設定、遅延、malformed、error の場合も同じ deterministic terminal wake を続行します。
 
+この会話自身が dispatch した task はその会話の durable work であり、Auto による自動継続ではありません。したがって terminal wake は Auto 設定に依存せず、Auto が off でも配送されます。バイパスされるのは Auto の on/off だけです。runtime gate、handoff 中の block、ブラウザ identity / generation の検証、配送成功後のみ acknowledge する規律はそのまま適用され、pane 単位の settle / progress / rollover wake は引き続き Auto を要求します。所有判定は Runtime が行い、拡張は自分自身の `browser_session_ref` の session-scoped inbox を読むだけです。
+
+### 自分の task に対する自動 binding
+
+wake は通常の workspace binding を通るため、task を dispatch したのにまだ binding を持たない会話は、task が terminal になる前に binding を得る必要があります。アカウント identity 付きの登録が未 binding で、Runtime が session ref を発行した場合、拡張はその観測事実（conversation key、tab、Runtime 発行の `browser_session_ref`、account ref、observation generation）を記憶し、登録時と既存の push wake シグナルの両方でこの session の inbox を Runtime に問い合わせます。この読み取りは Runtime の未完了タスクビュー（`include_running=1`）を明示的に有効にするため、最初の terminal 行を待たずに、タスクがまだ running のうちに binding が作られます。inbox の task の `workspace_id` が本機の live catalog に属する場合、拡張は Side Panel の手動 binding と同じ binding レコードで実際の binding を作成し、`persistence: "auto"` を付けます。
+
+wake と acknowledge の経路は意図的に別です。未完了タスクビューを要求せず、Runtime が `terminal: false` の行を返してもそれを無視するため、未完了のタスクが会話を wake したり acknowledge されたりすることはありません。このフラグより前の Runtime は terminal 行だけを返し続け、その場合は最初の terminal タスクで binding が作られます。
+
+自動 binding は通常の binding です。Side Panel に小さな auto マーカー付きで表示され、他の binding と同様に解除でき、pane progress / settle wake は引き続き Auto を要求します。解除時は session 単位で抑制を記録し、同じブラウザ session が再作成しないようにします。その session のより新しい observation generation では抑制が解除されます。tab の会話が変わった場合、tab が閉じた場合、またはその workspace が本機の live catalog にない場合は何も binding しません。拡張は session ref を自作せず、他の device の workspace を binding せず、アカウント identity なしで binding することもありません。
+
 ## turn 終了時の意味判定
 
 ChatGPT の返信は、構文的には終わっていても意味的には未完了であることがあります。たとえば、まだテストを実行する必要がある、次の手順は Git を inspect することだ、といった内容です。
