@@ -84,6 +84,10 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "minimum_reasoning_tier": {"type": "integer", "minimum": 0, "maximum": 255},
                     "destructive_production_mutation": {"type": "boolean"},
                     "delegates_other_workers": {"type": "boolean"},
+                    "supervisor": {
+                        "type": "boolean",
+                        "description": "true only when the planner designates this task's agent as the one supervisor allowed to re-dispatch workers; workers never re-dispatch",
+                    },
                     "independent_units": {"type": "integer", "minimum": 1, "maximum": 64},
                     "ownership_isolated": {"type": "boolean"},
                     "shared_runtime_state": {"type": "boolean"},
@@ -180,7 +184,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "view": {
                         "type": "string",
                         "enum": ["full", "compact"],
-                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps and the bounded final_excerpt when captured."
+                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured."
                     },
                 },
                 "required": [],

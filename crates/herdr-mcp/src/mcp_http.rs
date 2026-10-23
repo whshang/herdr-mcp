@@ -423,14 +423,24 @@ async fn get_extension_agent_tasks(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(50)
         .clamp(1, 512);
-    let value = state.prompt.task_inbox(
-        workspace_id,
-        None,
-        Some(parent_session_ref),
-        false,
-        true,
-        limit,
-    );
+    // Opt-in only, and only for a session-scoped read: a conversation binding
+    // must survive a long-running supervisor task before its first terminal
+    // task exists. Every other caller keeps the terminal-only inbox.
+    let include_running = query.get("include_running").map(String::as_str) == Some("1");
+    let value = if include_running {
+        state
+            .prompt
+            .task_inbox_with_running(workspace_id, parent_session_ref, limit)
+    } else {
+        state.prompt.task_inbox(
+            workspace_id,
+            None,
+            Some(parent_session_ref),
+            false,
+            true,
+            limit,
+        )
+    };
     json_response(StatusCode::OK, &value)
 }
 
