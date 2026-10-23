@@ -8,6 +8,7 @@ use crate::fs_tools;
 use crate::git_tools;
 use crate::herdr::HerdrClient;
 use crate::native_tools;
+use crate::pane_width;
 use crate::progressive_skills::{
     BILIBILI_VIDEO_TRANSCRIPT_METHOD, BROWSER_COMPOSER_SET_APPS_METHOD,
     BROWSER_COMPOSER_SET_REASONING_METHOD, BROWSER_DISPATCH_STATUS_METHOD,
@@ -688,6 +689,19 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &params,
                     parent_session_ref.as_deref(),
                 )
+            } else if method == pane_width::SPLIT_METHOD {
+                // A horizontal split must not create a pane whose agent output
+                // can only be captured as wrapping noise (#684).
+                match pane_width::guard_split(&context.cache.snapshot(), &params) {
+                    pane_width::SplitPlan::Forward(params) => native_tools::call_with_local(
+                        context.client,
+                        context.skill,
+                        &context.cache.snapshot(),
+                        method,
+                        params,
+                    ),
+                    pane_width::SplitPlan::Refuse(result) => result,
+                }
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
             } else {

@@ -57,6 +57,7 @@ mod native_host_install;
 #[cfg(any(unix, test))]
 mod native_host_origin_check;
 mod native_tools;
+mod pane_width;
 mod patch;
 mod paths;
 mod product_lifecycle;

@@ -189,7 +189,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "view": {
                         "type": "string",
                         "enum": ["full", "compact"],
-                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured."
+                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured. final_excerpt is omitted, not degraded, when the child pane is narrower than 40 columns: a TUI agent hard-wraps its own layout there, so the only readable options are reading the pane or giving the agent a wider pane (a new tab, a reused wide pane, or a down split)."
                     },
                 },
                 "required": [],

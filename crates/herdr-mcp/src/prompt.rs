@@ -2198,7 +2198,30 @@ fn read_final_excerpt(
     {
         return None;
     }
+    // A pane narrower than the readable floor can only yield hard-wrapped
+    // viewport fragments: a TUI agent wraps its own layout, so `recent_unwrapped`
+    // has no soft-wrap to rejoin. Fail closed instead of publishing wrapping
+    // noise the parent would have to re-read anyway (#684).
+    if let Some(cols) = final_excerpt_pane_columns(client, target)
+        && !crate::pane_width::excerpt_is_readable(cols)
+    {
+        return None;
+    }
     Some(excerpt)
+}
+
+/// Column width of the pane the excerpt was read from. A missing or failed
+/// `pane.layout` read leaves the capture ungated rather than discarding a
+/// usable excerpt.
+fn final_excerpt_pane_columns(client: &HerdrClient, target: &str) -> Option<u16> {
+    let response = client
+        .call_with_timeout(
+            "pane.layout",
+            json!({"pane_id": target}),
+            FINAL_EXCERPT_VERIFY_TIMEOUT,
+        )
+        .ok()?;
+    crate::pane_width::pane_columns_from_layout_response(&response, target)
 }
 
 /// Returns the pane state sequence this capture is fenced on, after proving the
@@ -5350,6 +5373,18 @@ mod tests {
         })
     }
 
+    fn layout_response(width: u16) -> Value {
+        json!({"result": {"layout": {
+            "panes": [{"pane_id": "w1:p1", "focused": true,
+                       "rect": {"x": 0, "y": 0, "width": width, "height": 30}}],
+            "area": {"x": 0, "y": 0, "width": 200, "height": 30},
+        }}})
+    }
+
+    fn wide_layout_response() -> Value {
+        layout_response(crate::pane_width::MIN_READABLE_PANE_COLS + 60)
+    }
+
     fn excerpt_test_task(task_id: &str) -> PromptTaskRecord {
         PromptTaskRecord {
             schema_version: 1,
@@ -5400,6 +5435,7 @@ mod tests {
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
                 json!({"result": {"read": {"content": "analyzing module\n\u{1b}[32mprogress: 50%\u{1b}[0m\nDONE: report at /tmp/report.md\n\n\n"}}}),
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                wide_layout_response(),
             ],
             Arc::clone(&requests),
         );
@@ -5427,7 +5463,11 @@ mod tests {
         assert!(excerpt.ends_with("DONE: report at /tmp/report.md\n"));
 
         let recorded = requests.lock().unwrap();
-        assert_eq!(recorded.len(), 3, "capture must verify, read and re-verify");
+        assert_eq!(
+            recorded.len(),
+            4,
+            "capture must verify, read, re-verify and probe the pane width"
+        );
         assert_eq!(recorded[0].0, "agent.get");
         assert_eq!(recorded[0].1["target"], "w1:p1");
         assert_eq!(recorded[1].0, "agent.read");
@@ -5437,6 +5477,8 @@ mod tests {
         assert_eq!(recorded[1].1["strip_ansi"], true);
         assert_eq!(recorded[2].0, "agent.get");
         assert_eq!(recorded[2].1["target"], "w1:p1");
+        assert_eq!(recorded[3].0, "pane.layout");
+        assert_eq!(recorded[3].1["pane_id"], "w1:p1");
         drop(recorded);
 
         // A terminal task is immutable and must never trigger another read.
@@ -5452,8 +5494,105 @@ mod tests {
         .unwrap();
         assert!(!changed_again);
         assert_eq!(task.final_excerpt.as_deref(), Some(excerpt.as_str()));
-        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert_eq!(requests.lock().unwrap().len(), 4);
         server.join().unwrap();
+    }
+
+    /// user parent | Given a child pane only four columns wide whose TUI agent
+    /// hard-wrapped its report | When the terminal transition is reconciled |
+    /// Then the task stays terminal and notifiable but publishes no
+    /// `final_excerpt`, because column fragments are not an outcome the parent
+    /// can close out on (#684).
+    #[test]
+    fn final_excerpt_is_omitted_for_a_pane_below_the_readable_width() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": " cb\n 60\n 4c\n 6f\n\n T2\n 59\n -D\n ON\n E\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                layout_response(4),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-narrow-pane");
+
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(
+            task.final_excerpt, None,
+            "a four-column pane can only yield wrapped fragments, so the excerpt must fail closed"
+        );
+        assert_eq!(task.notification_state, "pending");
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            4,
+            "the capture reads once, then probes the pane width"
+        );
+        assert_eq!(recorded[3].0, "pane.layout");
+        assert_eq!(recorded[3].1["pane_id"], "w1:p1");
+        drop(recorded);
+        server.join().unwrap();
+        fs::remove_file(&socket).ok();
+    }
+
+    /// user parent | Given a child pane at the readable-width floor | When the
+    /// terminal transition is reconciled | Then the excerpt is captured, so the
+    /// narrow-pane guard never suppresses a usable outcome.
+    #[test]
+    fn final_excerpt_is_captured_at_the_readable_width_floor() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": "cb604c6f\nT259-DONE\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                layout_response(crate::pane_width::MIN_READABLE_PANE_COLS),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-floor-pane");
+
+        apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
+        )
+        .unwrap();
+
+        let excerpt = task
+            .final_excerpt
+            .clone()
+            .expect("a pane at the readable floor still publishes an excerpt");
+        assert!(excerpt.contains("cb604c6f"));
+        assert!(excerpt.contains("T259-DONE"));
+        server.join().unwrap();
+        fs::remove_file(&socket).ok();
     }
 
     /// user owner | Given a pane is reused before an old task is reconciled |
