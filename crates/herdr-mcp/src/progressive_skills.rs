@@ -4600,6 +4600,23 @@ mod tests {
             !name.contains("consent") && !name.contains("observe") && !name.contains("register")
         }));
 
+        let methods = local_method_schemas("agent.task.dispatch");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0]["method"], "herdr_mcp.agent.task.dispatch");
+        assert_eq!(methods[0]["access"], "mutation");
+        assert_eq!(
+            methods[0]["params"]["properties"]["current_user_message"]["maxLength"],
+            262144
+        );
+        assert!(
+            !methods[0]["params"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "current_user_message"),
+            "current_user_message stays optional evidence"
+        );
+
         let methods = local_method_schemas("bilibili");
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0]["method"], BILIBILI_VIDEO_TRANSCRIPT_METHOD);

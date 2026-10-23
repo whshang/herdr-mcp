@@ -613,6 +613,50 @@ impl PromptRegistry {
         }
     }
 
+    /// Read-only head check for one dispatch idempotency key.
+    ///
+    /// True when this call cannot produce a new submission because the runtime
+    /// already knows the key: a completed replay payload, an in-flight
+    /// reservation, a conflicting reuse, or a durable task that still owns the
+    /// key (the same conditions `begin` resolves without reserving). Callers
+    /// use it to keep a replayed dispatch a pure replay. It never reserves,
+    /// writes, or prunes anything.
+    pub fn dispatch_key_already_known(&self, idempotency_key: &str) -> bool {
+        let now = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+        let key_hash = stable_digest(&[b"herdr_prompt/idempotency", idempotency_key.as_bytes()]);
+        let op_id = format!("op:prompt:{}", &key_hash[..32]);
+        let Some(store) = self.inner.store.as_ref() else {
+            return self
+                .inner
+                .records
+                .lock()
+                .map(|records| records.contains_key(idempotency_key))
+                .unwrap_or(false);
+        };
+        let Ok(store) = store.lock() else {
+            return false;
+        };
+        let live_operation = store
+            .operation_ledger(&op_id)
+            .ok()
+            .flatten()
+            .is_some_and(|record| {
+                record.kind == PROMPT_OPERATION_KIND
+                    && record.idempotency_key.as_deref() == Some(key_hash.as_str())
+                    && record.expires_at.is_none_or(|expires_at| expires_at > now)
+            });
+        if live_operation {
+            return true;
+        }
+        // The short replay reservation expires before the durable task does;
+        // `begin` still refuses a new submission while a task owns the key.
+        let digest = stable_digest(&[b"herdr_prompt/task_key", idempotency_key.as_bytes()]);
+        store
+            .task_operation_ids_by_key_digest(PROMPT_TASK_OPERATION_KIND, &digest, now)
+            .map(|ids| !ids.is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn task_status_for_parent_session(&self, task_id: &str, parent_session_ref: &str) -> Value {
         match self.reconcile_task(task_id) {
             Ok(Some(task)) if task.parent_session_ref.as_deref() == Some(parent_session_ref) => {

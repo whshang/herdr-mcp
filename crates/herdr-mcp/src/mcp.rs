@@ -212,6 +212,68 @@ pub struct RuntimeContext<'a> {
     pub trusted_local_ipc: bool,
 }
 
+/// The parent-session binding decision for one WebChat `agent.task.dispatch`
+/// carrying `current_user_message`.
+///
+/// The message resolves the caller's browser session through the same durable
+/// source-turn evidence model as the archive path: the exact trimmed user text
+/// observed for one registered session, never recency, tab, or URL guesses.
+/// Binding is best-effort and fail-closed — any missing, stale, ambiguous, or
+/// conflicting evidence leaves the dispatch unstamped and reports only a
+/// compact non-secret reason. The opaque session id, the user text, and its
+/// hash are never echoed.
+enum AgentTaskParentSession {
+    /// Nothing was attempted: the caller passed no `current_user_message`
+    /// (or has no WebChat identity to bind), so dispatch behaves as before.
+    NotAttempted,
+    /// The source-turn evidence resolved and the caller mapping was bound.
+    Bound(String),
+    /// Binding was attempted but must not stamp; the fact reports the reason.
+    Unbound(&'static str),
+    /// The idempotency key is already known, so this call is a pure replay:
+    /// no evidence is resolved, no mapping is written, and the fact describes
+    /// the stored task instead of this call.
+    Replay,
+}
+
+/// The compact, non-secret `parent_session` fact for one dispatch result.
+///
+/// A replay reports the stored task's actual stamp; it never claims the binding
+/// this call would have resolved.
+fn agent_task_parent_session_fact(
+    binding: &AgentTaskParentSession,
+    result: &Value,
+) -> Option<Value> {
+    match binding {
+        AgentTaskParentSession::NotAttempted => None,
+        AgentTaskParentSession::Bound(_) => Some(json!({"bound": true})),
+        AgentTaskParentSession::Unbound(reason) => Some(json!({"bound": false, "reason": reason})),
+        AgentTaskParentSession::Replay => result.get("task").map(|task| {
+            if task
+                .get("parent_session_ref")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                json!({"bound": true})
+            } else {
+                json!({"bound": false, "reason": "idempotent_replay"})
+            }
+        }),
+    }
+}
+
+/// Map one fail-closed store error from the source-turn evidence path onto the
+/// compact dispatch fact reason. Unknown diagnostic strings stay generic.
+fn source_turn_unbound_reason(error: &str) -> &'static str {
+    match error {
+        "browser_current_turn_not_found" => "source_turn_not_found",
+        "browser_current_turn_ambiguous" => "source_turn_ambiguous",
+        "browser_current_turn_stale" => "source_turn_stale",
+        "browser_caller_session_conflict" => "caller_session_conflict",
+        _ => "binding_failed",
+    }
+}
+
 fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
     let authorization = context.caller_webchat_authorization?;
     let caller_session = context.caller_browser_session?;
@@ -226,6 +288,106 @@ fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
         )
         .ok()
         .flatten()
+}
+
+/// Resolve the `parent_session_ref` for one WebChat task dispatch.
+///
+/// `current_user_message` is optional evidence: without it the dispatch keeps
+/// today's behavior (the durable caller-session mapping alone). With it the
+/// binding must be proven by the exact source turn, exactly like the archive
+/// path. A durable mapping to a different session is a conflict: dispatch
+/// never retargets it silently, so the mapping stays unchanged and the task is
+/// dispatched unstamped.
+fn agent_task_dispatch_parent_session(
+    context: &RuntimeContext<'_>,
+    params: &Value,
+) -> AgentTaskParentSession {
+    let current_user_message = match current_user_message_param(params) {
+        Ok(Some(message)) => message,
+        Ok(None) => return AgentTaskParentSession::NotAttempted,
+        Err(()) => return AgentTaskParentSession::Unbound("current_user_message_invalid"),
+    };
+    // A local/trusted IPC caller has no WebChat identity to bind, so the
+    // parameter changes nothing for it.
+    let Some(authorization) = context.caller_webchat_authorization else {
+        return AgentTaskParentSession::NotAttempted;
+    };
+    let Some(caller_session) = context.caller_browser_session else {
+        return AgentTaskParentSession::Unbound("caller_session_absent");
+    };
+    if caller_session.provider != "chatgpt" {
+        return AgentTaskParentSession::Unbound("caller_session_absent");
+    }
+    let Ok(mut store) = context.state_store.lock() else {
+        return AgentTaskParentSession::Unbound("state_store_unavailable");
+    };
+    let source_user_text_sha256 = browser_sha256(current_user_message);
+    let observed_at = browser_epoch_ms();
+    let (session_ref, expected_generation) = match store
+        .resolve_browser_source_turn(&source_user_text_sha256, observed_at)
+    {
+        Ok(value) => value,
+        Err(error) => return AgentTaskParentSession::Unbound(source_turn_unbound_reason(&error)),
+    };
+    let session = match store.browser_resource(&session_ref) {
+        Ok(Some(value)) => value,
+        Ok(None) => return AgentTaskParentSession::Unbound("source_turn_not_found"),
+        Err(_) => return AgentTaskParentSession::Unbound("binding_failed"),
+    };
+    if session.kind != "session" || session.provider != "chatgpt" {
+        return AgentTaskParentSession::Unbound("source_turn_not_found");
+    }
+    if session.observation_generation != expected_generation {
+        return AgentTaskParentSession::Unbound("source_turn_stale");
+    }
+    // The archive reservation additionally fences on the current provider
+    // generation. A still-registered session row and its source turn can lag
+    // the provider after an extension reload, so the session-only comparison
+    // above cannot prove the evidence is current.
+    let provider_generation =
+        match store.browser_provider_state(&session.endpoint_ref, &session.provider) {
+            Ok(Some(state)) => state.observation_generation,
+            Ok(None) => return AgentTaskParentSession::Unbound("provider_generation_unknown"),
+            Err(_) => return AgentTaskParentSession::Unbound("binding_failed"),
+        };
+    if provider_generation != expected_generation {
+        return AgentTaskParentSession::Unbound("source_turn_stale");
+    }
+    // The grant is provider-scoped (endpoint + provider), so any observed
+    // account matches — the same fence the archive path applies.
+    let granted = context
+        .caller_webchat_control_grants
+        .iter()
+        .any(|grant| webchat_control_grant_covers(grant, &session.endpoint_ref, &session.provider));
+    if !granted {
+        return AgentTaskParentSession::Unbound("grant_missing");
+    }
+    if browser_resource_account_ref(&store, &session).is_err() {
+        return AgentTaskParentSession::Unbound("session_account_unavailable");
+    }
+    match store.resolve_browser_caller_session(
+        &authorization.principal_ref,
+        &caller_session.provider,
+        &caller_session.opaque_session_id,
+    ) {
+        Ok(Some(existing)) if existing != session_ref => {
+            return AgentTaskParentSession::Unbound("caller_session_conflict");
+        }
+        Ok(_) => {}
+        Err(_) => return AgentTaskParentSession::Unbound("binding_failed"),
+    }
+    match store.rebind_browser_caller_session_from_source_turn(
+        &authorization.principal_ref,
+        &caller_session.provider,
+        &caller_session.opaque_session_id,
+        &session_ref,
+        &source_user_text_sha256,
+        expected_generation,
+        observed_at,
+    ) {
+        Ok(()) => AgentTaskParentSession::Bound(session_ref),
+        Err(error) => AgentTaskParentSession::Unbound(source_turn_unbound_reason(&error)),
+    }
 }
 
 pub trait BrowserActuator: Send + Sync {
@@ -535,13 +697,42 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     })
                 })
             } else if method == prompt::AGENT_TASK_DISPATCH_METHOD {
-                let parent_session_ref = prompt_parent_session_ref(context);
-                prompt::run_with_parent_session(
+                // A key the runtime already knows (replay payload, in-flight
+                // reservation, conflict, or durable task ownership) cannot
+                // produce a new dispatch. That call must stay a pure replay:
+                // resolve no evidence and write no caller-session mapping.
+                let replayed = params
+                    .get("idempotency_key")
+                    .and_then(Value::as_str)
+                    .is_some_and(|key| context.prompt.dispatch_key_already_known(key));
+                let binding = if replayed {
+                    AgentTaskParentSession::Replay
+                } else {
+                    agent_task_dispatch_parent_session(context, &params)
+                };
+                let parent_session_ref = match &binding {
+                    AgentTaskParentSession::Bound(session_ref) => Some(session_ref.clone()),
+                    AgentTaskParentSession::Unbound(_) | AgentTaskParentSession::Replay => None,
+                    AgentTaskParentSession::NotAttempted => prompt_parent_session_ref(context),
+                };
+                // The turn text is binding evidence only; it must never travel
+                // into the prompt path that retains or traces the arguments.
+                let mut prompt_params = params.clone();
+                if let Some(object) = prompt_params.as_object_mut() {
+                    object.remove("current_user_message");
+                }
+                let mut result = prompt::run_with_parent_session(
                     context.client,
                     context.prompt,
-                    &params,
+                    &prompt_params,
                     parent_session_ref.as_deref(),
-                )
+                );
+                if let Some(fact) = agent_task_parent_session_fact(&binding, &result)
+                    && let Some(object) = result.as_object_mut()
+                {
+                    object.insert("parent_session".to_owned(), fact);
+                }
+                result
             } else if method.starts_with("herdr_mcp.agent.task.") {
                 let parent_session_ref = prompt_parent_session_ref(context);
                 prompt::task_call_with_parent_session(
@@ -5060,6 +5251,27 @@ fn browser_handoff_prepare(
     })
 }
 
+/// Shared `current_user_message` validation: an optional trimmed, non-empty
+/// string of at most 262144 bytes. `Ok(None)` means the parameter is absent.
+/// The archive current-turn path and the WebChat task dispatch path must accept
+/// exactly the same evidence shape.
+fn current_user_message_param(params: &Value) -> Result<Option<&str>, ()> {
+    let Some(value) = params.get("current_user_message") else {
+        return Ok(None);
+    };
+    let Some(message) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    else {
+        return Err(());
+    };
+    if message.len() > 262_144 {
+        return Err(());
+    }
+    Ok(Some(message))
+}
+
 fn browser_session_archive_params_from_current_turn(
     store: &mut StateStore,
     params: &Value,
@@ -5067,8 +5279,10 @@ fn browser_session_archive_params_from_current_turn(
     caller_authorization: Option<&BrowserCallerAuthorization>,
     caller_browser_session: Option<&BrowserCallerSessionIdentity>,
 ) -> Result<Option<Value>, Value> {
-    let Some(current_user_message) = params.get("current_user_message") else {
-        return Ok(None);
+    let current_user_message = match current_user_message_param(params) {
+        Ok(Some(message)) => message,
+        Ok(None) => return Ok(None),
+        Err(()) => return Err(json!({"ok": false, "code": "browser_current_turn_invalid"})),
     };
     let Some(object) = params.as_object() else {
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
@@ -5076,16 +5290,6 @@ fn browser_session_archive_params_from_current_turn(
     const ALLOWED: &[&str] = &["current_user_message", "idempotency_key"];
     if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
-    }
-    let Some(current_user_message) = current_user_message
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Err(json!({"ok": false, "code": "browser_current_turn_invalid"}));
-    };
-    if current_user_message.len() > 262_144 {
-        return Err(json!({"ok": false, "code": "browser_current_turn_invalid"}));
     }
     let idempotency_key = browser_required_idempotency_key(params)?;
     let source_user_text_sha256 = browser_sha256(current_user_message);
