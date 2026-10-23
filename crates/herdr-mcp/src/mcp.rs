@@ -930,6 +930,15 @@ fn webchat_adapter_for_host(host: &str) -> Option<&'static WebChatAdapterRow> {
         .find(|row| row.hosts.contains(&host))
 }
 
+/// The WebChat adapter providers from the registry, for state-store
+/// adapter-scoped lookups. The registry stays the single provider authority.
+fn webchat_adapter_providers() -> Vec<&'static str> {
+    WEBCHAT_ADAPTER_REGISTRY
+        .iter()
+        .map(|row| row.provider)
+        .collect()
+}
+
 /// Whether a provider's sessions may bind WebChat dispatch parent sessions.
 /// Registry-driven (slice 1): any registered WebChat adapter qualifies, an
 /// unregistered provider name stays refused. Until the registry is wired in
@@ -1317,12 +1326,28 @@ fn continuity_call(
                     Ok(Some(value)) => Ok(Some(value)),
                     Ok(None) => {
                         if let Some(conversation_url) = conversation_url
-                            && let Some(session_ref) =
-                                store.browser_session_ref_for_canonical_url(conversation_url)?
-                            && let Some(value) =
-                                store.continuity_for_provider_session("chatgpt", &session_ref)?
+                            && let Some(session_ref) = store
+                                .browser_session_ref_for_canonical_url_for_adapters(
+                                    conversation_url,
+                                    &webchat_adapter_providers(),
+                                )?
                         {
-                            return Ok(Some(value));
+                            // Resolve the session's ACTUAL provider from the
+                            // resource row: claude/grok URLs must not be read
+                            // through a ChatGPT continuity binding. A resource
+                            // row that cannot be read or has no provider keeps
+                            // the historical no-match path.
+                            let provider = store
+                                .browser_resource(&session_ref)
+                                .ok()
+                                .flatten()
+                                .map(|resource| resource.provider);
+                            if let Some(provider) = provider
+                                && let Some(value) = store
+                                    .continuity_for_provider_session(&provider, &session_ref)?
+                            {
+                                return Ok(Some(value));
+                            }
                         }
                         let Some(project_id) = project_id else {
                             return Ok(None);
@@ -1351,9 +1376,12 @@ fn continuity_call(
             let continuity_id = if let Some(value) = explicit_id {
                 value.to_owned()
             } else if let Some(raw_url) = conversation_url {
-                let Some((conversation_id, project_id)) = chatgpt_conversation_url_ref(raw_url)
+                let Some((conversation_id, project_id)) = browser_conversation_url_ref(raw_url)
+                    .ok()
+                    .flatten()
+                    .map(|reference| (reference.conversation_id, reference.project_id))
                 else {
-                    return json!({"ok": false, "code": "continuity_resume_params_invalid", "message": "conversation_url must be a ChatGPT conversation URL"});
+                    return json!({"ok": false, "code": "continuity_resume_params_invalid", "message": "conversation_url must be a registered WebChat conversation URL"});
                 };
                 match resolve_identity(&conversation_id, project_id.as_deref(), Some(raw_url)) {
                     Ok(Some(value)) => value,
@@ -1477,13 +1505,13 @@ fn continuity_call(
                 Err(error) => return error,
             };
             let (url_conversation_id, url_project_id) = match conversation_url {
-                Some(raw) => match chatgpt_conversation_url_ref(raw) {
-                    Some((conversation_id, project_id)) => (Some(conversation_id), project_id),
+                Some(raw) => match browser_conversation_url_ref(raw).ok().flatten() {
+                    Some(reference) => (Some(reference.conversation_id), reference.project_id),
                     None => {
                         return json!({
                             "ok": false,
                             "code": "continuity_search_params_invalid",
-                            "message": "conversation_url must be a ChatGPT conversation URL",
+                            "message": "conversation_url must be a registered WebChat conversation URL",
                         });
                     }
                 },
@@ -4937,7 +4965,10 @@ fn browser_source_route(
         selected.to_owned()
     } else {
         store
-            .browser_session_ref_for_canonical_url(&canonical_url)?
+            .browser_session_ref_for_canonical_url_for_adapters(
+                &canonical_url,
+                &webchat_adapter_providers(),
+            )?
             .ok_or_else(|| "browser_source_session_not_found".to_owned())?
     };
     let session = store
@@ -12864,6 +12895,7 @@ mod tests {
                 })
                 .unwrap();
         }
+
         let ambiguous =
             continuity_call(&store, "continuity.search", &json!({"workspace_id": "w19"}));
         assert_eq!(ambiguous["resolution"], "confirmation_required");
@@ -19217,7 +19249,10 @@ mod tests {
         let source_session_ref = store
             .lock()
             .unwrap()
-            .browser_session_ref_for_canonical_url(&source_url)
+            .browser_session_ref_for_canonical_url_for_adapters(
+                &source_url,
+                &webchat_adapter_providers(),
+            )
             .unwrap()
             .unwrap();
         let current_turn_now = browser_epoch_ms();
@@ -23483,6 +23518,110 @@ mod tests {
         assert_ne!(result["delivery_state"], "delivery_unknown", "{result}");
         assert_eq!(result["retry_safe"], true, "{result}");
         assert_eq!(result["retryable"], true, "{result}");
+    }
+
+    #[test]
+    fn continuity_resume_by_url_uses_the_sessions_real_provider() {
+        use crate::state_store::{
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput, ContinuityTurnInput, WorkMemoryBindingInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        // A claude conversation URL with a claude provider binding must
+        // resume; the same session must NOT be readable through a chatgpt
+        // continuity binding (the historical bug), and a chatgpt binding on a
+        // different session keeps working.
+        let claude_url = "https://claude.ai/chat/5d2a9c3e-1f4b-4a6d-8e2f-0b7c9d1e3a5b";
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "claude-continuity-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at: 100,
+                })
+                .unwrap();
+            for provider in ["claude", "chatgpt"] {
+                guard
+                    .observe_browser_provider(BrowserProviderObservationInput {
+                        endpoint_ref: &endpoint.endpoint_ref,
+                        provider,
+                        adapter_protocol_version: 1,
+                        observation_generation: 100,
+                        capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                        observed_at: 100,
+                    })
+                    .unwrap();
+            }
+            let claude_account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "claude",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "claude-continuity-account",
+                    display_label: None,
+                    observation_generation: 100,
+                    observed_at: 100,
+                })
+                .unwrap()
+                .resource_ref;
+            let claude_session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "claude",
+                    kind: "session",
+                    parent_ref: Some(&claude_account),
+                    native_identity: "claude-continuity-session",
+                    display_label: None,
+                    observation_generation: 100,
+                    observed_at: 100,
+                })
+                .unwrap()
+                .resource_ref;
+            guard
+                .upsert_browser_resource_locator(&claude_session, claude_url, 100, 100)
+                .unwrap();
+            guard
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:claude",
+                    conversation_id: "claude-conv",
+                    workspace_id: Some("w-claude"),
+                    project_id: None,
+                    title: Some("Claude continuity"),
+                    message_id: "msg-c",
+                    role: "user",
+                    text: "continue claude work",
+                    fingerprint: None,
+                    observed_at: 110,
+                })
+                .unwrap();
+            guard
+                .bind_work_memory(WorkMemoryBindingInput {
+                    continuity_id: "hc:claude",
+                    project_ref: "project:herdr-mcp",
+                    repo_id: "github.com/whshang/herdr-mcp",
+                    work_chain_id: "wc_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    provider: "claude",
+                    account_ref: None,
+                    space_ref: None,
+                    session_ref: &claude_session,
+                    bound_at: 120,
+                })
+                .unwrap();
+        }
+
+        let resumed = continuity_call(
+            &store,
+            "continuity.resume",
+            &json!({"conversation_url": claude_url}),
+        );
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert_eq!(resumed["continuity_id"], "hc:claude");
     }
 }
 
