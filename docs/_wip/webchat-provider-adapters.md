@@ -75,7 +75,7 @@ Remaining registry/background branches on provider name:
 | provider → origin pattern switch | `extension/background.js:321-325` |
 | Site derivation special-cases ChatGPT | `extension/background.js:450-452` |
 | Project/launch URL builders branch per site | `extension/background.js:776-786`, `:790-823` |
-| Conversation-URL parsers duplicated per provider | `extension/background.js:1894-1912` (`claudeConversationInfo`, `grokConversationInfo`), `:1947-1950` |
+| Conversation-URL parsers duplicated per provider | `extension/background.js:1894-1943` (`claudeConversationInfo`, `grokConversationInfo`), `:1947-1950` |
 | ChatGPT-only dispatch path | `extension/background.js:3011` (`if (site === "chatgpt") return sendChatGptTabMessage(...)`) |
 | Continuity/handoff limited to ChatGPT | `extension/background.js:7896-7902`, `:11009` |
 | ChatGPT-only artifacts/perf/migration machinery | `extension/content/chatgpt-artifact-core.js:161` (`/backend-api/estuary/content`), `extension/content/chatgpt-perf-main.js`, `extension/background.js:64`, `:989-1040`, `:2392`, `extension/continuity-core.js:14` |
@@ -110,7 +110,7 @@ transport.
 | Opaque connector session only for `chatgpt` | `mcp_http.rs:3031`, `crates/herdr-mcp/src/link/local_mcp.rs:480` |
 | Task parent binding only for `chatgpt` sessions | `crates/herdr-mcp/src/mcp.rs:265`, `:284` |
 | ChatGPT composer rewrites conversation URLs to ids | `mcp.rs:826-848` |
-| Per-host conversation URL parsing (chatgpt.com / claude.ai / grok.com) — a second copy of the extension parsers | `mcp.rs:884-928` |
+| Per-host conversation URL parsing — **resolved by #693** (`bc27cd9b`): `browser_conversation_url_ref` resolves through `WEBCHAT_ADAPTER_REGISTRY`; unclaimed hosts fail with typed `adapter_unsupported` | `mcp.rs:901` (registry), `:954` (fn) |
 | Continuity resume only for `chatgpt` | `mcp.rs:1216` |
 | Claude-only diagnostic counters | `mcp.rs:2723` |
 | Session-URL lookup pinned to `r.provider = 'chatgpt'` | `crates/herdr-mcp/src/state_store.rs:3437` |
@@ -169,7 +169,7 @@ Rules:
    `applied|uncertain|not_applied` delivery, generation fence and human-boundary policy
    (`v1.1-browser-adapter-platform.md:173`, `:819`, `:887-889`).
 3. **Canonicalization lives with the adapter, once.** Today the same URL parsing exists in
-   both `extension/background.js:1894-1912` and `crates/herdr-mcp/src/mcp.rs:884-928`;
+   both `extension/background.js:1894-1943` and the Runtime registry that replaced the old `mcp.rs` host arms (#693; now `mcp.rs:901`);
    the adapter manifest should be the single declaration, with the runtime validating
    rather than re-deriving.
 4. **Thin control plane stays in Runtime**: grants, idempotency, delivery states, archive
@@ -229,7 +229,7 @@ extension release and no behaviour change:
 
 **Slice: conversation-URL identity resolved by the adapter registry.**
 
-- Move the per-host match in `crates/herdr-mcp/src/mcp.rs:884-928`
+- Move the per-host match that lived at `crates/herdr-mcp/src/mcp.rs:884-928` (landed as the #693 registry)
   (`chatgpt.com` / `claude.ai` / `grok.com`) behind one adapter lookup that returns
   `(adapter_id, conversation_id, project_id)`.
 - RED: `conversation_url_ref_for_grok_returns_adapter_id` fails today because the
