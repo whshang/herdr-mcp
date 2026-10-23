@@ -181,6 +181,7 @@ function emitPushEvent(event, data) {
 const mcpRequestBodies = [];
 const nativeBatchRequests = [];
 let failNextBrowserEndpointRegistration = true;
+let failNextSourceTurnObserveCount = 0;
 const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
@@ -532,6 +533,17 @@ globalThis.chrome = {
             status: 503,
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ ok: false, code: "browser_registry_test_unavailable" }),
+          });
+          return;
+        }
+        if (body.operation === "source_turn.observe" && failNextSourceTurnObserveCount > 0) {
+          failNextSourceTurnObserveCount -= 1;
+          callback({
+            ok: true,
+            transport: "ipc",
+            status: 200,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ok: false, code: "browser_source_session_not_found" }),
           });
           return;
         }
@@ -4378,6 +4390,51 @@ console.log("\n[owned child task auto binding]");
   mockStateWorkspaces = [];
   testClockOffsetMs -= 5000;
 }
+console.log("\n[Source-turn observe retry covers the fresh-conversation registration race]");
+{
+  const observesFor = (conv) => browserRegistryRequests.filter(
+    (request) => request.operation === "source_turn.observe" && request.canonical_url === conv,
+  );
+  const retryConv = "https://chatgpt.com/c/source-turn-retry-race";
+  const startedAt = Date.now() - 10;
+  failNextSourceTurnObserveCount = 2;
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: retryConv,
+    userText: "  确认当前用户回合  ",
+    startedAt,
+  });
+  ok(await waitForTest(() => observesFor(retryConv).length >= 3, 12000),
+    "user retries a fresh-conversation source turn | Given the first source_turn.observe fails with browser_source_session_not_found | When the turn-started handler runs the bounded retry schedule | Then all attempts replay the exact trimmed turn evidence",
+    JSON.stringify(observesFor(retryConv)));
+  const attempts = observesFor(retryConv);
+  ok(attempts.length === 3,
+    "the retry schedule makes exactly one initial attempt plus two bounded retries");
+  ok(attempts.every((attempt) => attempt.user_text === "确认当前用户回合"
+      && attempt.observed_at === startedAt),
+    "every retry replays the same trimmed text and original submit time");
+  await new Promise((resolve) => setTimeout(resolve, 3500));
+  ok(observesFor(retryConv).length === 3,
+    "the retry stops after the bounded schedule instead of polling",
+    JSON.stringify(observesFor(retryConv)));
+
+  const settledConv = "https://chatgpt.com/c/source-turn-retry-settled";
+  const settledAt = Date.now();
+  failNextSourceTurnObserveCount = 1;
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: settledConv,
+    userText: "第二个回合",
+    startedAt: settledAt,
+  });
+  ok(await waitForTest(() => observesFor(settledConv).length >= 2, 8000),
+    "user recovers a turn whose session registered late | Given the first observe fails once | When the first retry succeeds | Then the observe stops at two attempts",
+    JSON.stringify(observesFor(settledConv)));
+  ok(observesFor(settledConv).length === 2
+      && observesFor(settledConv).every((attempt) => attempt.observed_at === settledAt),
+    "the recovered retry replays the original turn evidence exactly");
+}
+
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);
 process.exit(failures === 0 ? 0 : 1);

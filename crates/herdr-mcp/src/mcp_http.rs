@@ -5730,4 +5730,611 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
     }
+
+    /// Minimal scripted Herdr socket: one JSON-RPC request per connection,
+    /// each answered with the next scripted response (id mirrored). Same wire
+    /// contract as the prompt.rs dispatch tests.
+    fn spawn_scripted_herdr_socket(responses: Vec<Value>) -> PathBuf {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        static SOCKET_SEQ: AtomicU64 = AtomicU64::new(0);
+        let unique = SOCKET_SEQ.fetch_add(1, Ordering::SeqCst);
+        // Keep the socket path short: unix domain socket paths are bounded by
+        // SUN_LEN on some platforms.
+        let socket = env::temp_dir().join(format!(
+            "herdr-mcp-h2w-{}-{unique}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({"id": request["id"], "result": response})
+                )
+                .unwrap();
+            }
+        });
+        socket
+    }
+
+    /// Production-shaped AppState for dispatch tests: the durable task
+    /// ledger shares the browser registry's StateStore, exactly like the
+    /// managed runtime wires `PromptRegistry::with_runtime`.
+    fn dispatch_test_state(root: &std::path::Path, socket: &std::path::Path) -> AppState {
+        let mut state = test_state(root);
+        state.client = HerdrClient::new(socket.to_owned());
+        let cache = Arc::new(EventCache::from_snapshot_for_test(json!({
+            "panes": [],
+            "agents": [],
+            "workspaces": []
+        })));
+        state.cache = cache.clone();
+        state.prompt =
+            PromptRegistry::with_runtime(state.state_store.clone(), cache, state.client.clone());
+        state
+    }
+
+    fn registry_request(payload: Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/extension/browser/registry")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    }
+
+    /// Registers one ChatGPT endpoint (endpoint + provider + account) through
+    /// the trusted extension registry route.
+    async fn register_chatgpt_endpoint(
+        app: axum::Router,
+        label: &str,
+        observed_at: i64,
+    ) -> (axum::Router, String, String, String) {
+        let profile_seed = format!("extension-profile-seed-{label}");
+        let register = json!({
+            "operation": "endpoint.register",
+            "profile_seed": profile_seed,
+            "browser_family": "chrome",
+            "extension_version": "0.1.236",
+            "observed_at": observed_at
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(register))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        let endpoint_ref = result["endpoint"]["endpoint_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let provider = json!({
+            "operation": "provider.observe",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "adapter_protocol_version": 1,
+            "observation_generation": 1,
+            "capabilities": {"operations": ["identity.inspect", "space.list"]},
+            "observed_at": observed_at
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(provider))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let account = json!({
+            "operation": "resource.observe",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "account",
+            "native_identity": format!("native-account-{label}"),
+            "display_label": "Work",
+            "observation_generation": 1,
+            "observed_at": observed_at
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(account))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        let account_ref = result["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        (app, profile_seed, endpoint_ref, account_ref)
+    }
+
+    /// Observes one ChatGPT session with its exact source turn on an already
+    /// registered endpoint/account, so a webchat_control grant on that
+    /// endpoint covers every session registered here.
+    async fn observe_chatgpt_session_source_turn(
+        app: axum::Router,
+        profile_seed: &str,
+        endpoint_ref: &str,
+        account_ref: &str,
+        label: &str,
+        user_text: &str,
+        observed_at: i64,
+    ) -> (axum::Router, String) {
+        let canonical_url = format!("https://chatgpt.com/c/dispatch-{label}");
+        let session = json!({
+            "operation": "resource.observe",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "session",
+            "parent_ref": account_ref,
+            "native_identity": format!("dispatch-session-{label}"),
+            "display_label": null,
+            "canonical_url": canonical_url,
+            "observation_generation": 1,
+            "observed_at": observed_at
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        let session_ref = result["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let source_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": canonical_url,
+            "user_text": user_text,
+            "observed_at": observed_at
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(source_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["session_ref"], session_ref);
+        (app, session_ref)
+    }
+
+    async fn webchat_tool_call(
+        app: axum::Router,
+        headers: &[(&str, String)],
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(AUTHORIZATION, "Bearer test-token")
+            .header(CONTENT_TYPE, "application/json")
+            .header("user-agent", "openai-mcp/1.0.0");
+        for (name, value) in headers {
+            builder = builder.header(*name, value.as_str());
+        }
+        let request = builder
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {"name": "herdr_call", "arguments": {
+                        "method": method,
+                        "params": params.to_string(),
+                    }}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let envelope: Value = serde_json::from_slice(&body).unwrap();
+        let text = envelope["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn webchat_dispatch_binds_parent_session_from_current_user_message() {
+        let root = test_root("webchat-dispatch-bind");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let socket = spawn_scripted_herdr_socket(vec![
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
+            json!({"prompt": {
+                "status": "submitted",
+                "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5},
+            }}),
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}),
+            json!({"prompt": {
+                "status": "submitted",
+                "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 6},
+            }}),
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 6}}),
+            json!({"prompt": {
+                "status": "submitted",
+                "agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 7},
+            }}),
+        ]);
+        let mut state = dispatch_test_state(&root, &socket);
+        state.trusted_extension_ipc = true;
+        let store = state.state_store.clone();
+        let local_state = {
+            let mut local_state = state.clone();
+            local_state.trusted_extension_ipc = false;
+            local_state
+        };
+        let app = candidate_router(state);
+        let (app, profile_seed, endpoint_ref, account_ref) =
+            register_chatgpt_endpoint(app, "bind", now).await;
+        let user_text = "把 L14 任务派给 pi";
+        let (app, session_ref) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "bind",
+            user_text,
+            now,
+        )
+        .await;
+        let local_app = candidate_router(local_state);
+
+        let edge_headers = |opaque_session_id: &str| {
+            vec![
+                (
+                    "x-herdr-edge-expected-runtime-generation",
+                    "rust-caller-grant-proof".to_owned(),
+                ),
+                (
+                    "x-herdr-edge-webchat-authorization",
+                    json!({
+                        "principal_ref": "connector:conn_DispatchBind1",
+                        "connector_id": "conn_DispatchBind1",
+                        "grant_generation": 1
+                    })
+                    .to_string(),
+                ),
+                (
+                    "x-herdr-edge-browser-caller-session",
+                    json!({"provider": "chatgpt", "opaque_session_id": opaque_session_id})
+                        .to_string(),
+                ),
+                (
+                    "x-herdr-edge-webchat-control-grants",
+                    json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+                ),
+            ]
+        };
+        let opaque = "opaque-dispatch-bind-1";
+
+        // Main acceptance: the exact current user message binds the task to
+        // the session whose source turn observed it.
+        let result = webchat_tool_call(
+            app.clone(),
+            &edge_headers(opaque),
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "run the L14 lane",
+                "idempotency_key": "dispatch-bind-1",
+                "current_user_message": format!("  {user_text}  "),
+            }),
+        )
+        .await;
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["submitted"], true);
+        assert_eq!(result["task"]["parent_session_ref"], session_ref);
+        assert_eq!(result["parent_session"], json!({"bound": true}));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_caller_session("connector:conn_DispatchBind1", "chatgpt", opaque)
+                .unwrap(),
+            Some(session_ref.clone())
+        );
+        let task_id = result["task"]["task_id"].as_str().unwrap().to_owned();
+
+        // A local/trusted IPC caller without WebChat identity keeps today's
+        // behavior: the parameter is inert and no binding fact is reported.
+        let local = webchat_tool_call(
+            local_app,
+            &[],
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "local dispatch keeps working",
+                "idempotency_key": "dispatch-bind-local",
+                "current_user_message": user_text,
+            }),
+        )
+        .await;
+        assert_eq!(local["ok"], true);
+        assert!(local.get("parent_session").is_none());
+        assert!(local["task"]["parent_session_ref"].is_null());
+
+        // The session-scoped inbox sees the running bound task and excludes
+        // the local caller's unstamped task, which proves the scoping is the
+        // session mapping itself (an unmapped caller would fall back to the
+        // unscoped inbox by existing design).
+        let inbox = webchat_tool_call(
+            app.clone(),
+            &edge_headers(opaque),
+            "herdr_mcp.agent.task.inbox",
+            json!({}),
+        )
+        .await;
+        assert_eq!(inbox["ok"], true);
+        assert_eq!(inbox["summary"]["running"], 1);
+        let status = webchat_tool_call(
+            app.clone(),
+            &edge_headers(opaque),
+            "herdr_mcp.agent.task.status",
+            json!({"task_id": task_id}),
+        )
+        .await;
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["task"]["parent_session_ref"], session_ref);
+
+        // An already-bound caller session keeps stamping without the message,
+        // and the result stays identical to the pre-binding surface.
+        let second = webchat_tool_call(
+            app.clone(),
+            &edge_headers(opaque),
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "run the L14 follow-up",
+                "idempotency_key": "dispatch-bind-2",
+            }),
+        )
+        .await;
+        assert_eq!(second["ok"], true);
+        assert_eq!(second["task"]["parent_session_ref"], session_ref);
+        assert!(second.get("parent_session").is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn webchat_dispatch_current_user_message_evidence_misses_stay_unstamped() {
+        let root = test_root("webchat-dispatch-bind-miss");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let socket = spawn_scripted_herdr_socket(vec![
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 7}}}),
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 8}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 9}}}),
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 10}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 11}}}),
+        ]);
+        let mut state = dispatch_test_state(&root, &socket);
+        state.trusted_extension_ipc = true;
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let (app, profile_seed, endpoint_ref, account_ref) =
+            register_chatgpt_endpoint(app, "conflict", now).await;
+        let (app, first_session) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "conflict-a",
+            "第一条消息",
+            now,
+        )
+        .await;
+        let (app, second_session) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "conflict-b",
+            "第二条消息",
+            now,
+        )
+        .await;
+
+        let opaque = "opaque-dispatch-conflict-1";
+        store
+            .lock()
+            .unwrap()
+            .bind_browser_caller_session(
+                "connector:conn_DispatchConflict1",
+                "chatgpt",
+                opaque,
+                &second_session,
+                now,
+            )
+            .unwrap();
+        let edge_headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-authorization",
+                json!({
+                    "principal_ref": "connector:conn_DispatchConflict1",
+                    "connector_id": "conn_DispatchConflict1",
+                    "grant_generation": 1
+                })
+                .to_string(),
+            ),
+            (
+                "x-herdr-edge-browser-caller-session",
+                json!({"provider": "chatgpt", "opaque_session_id": opaque}).to_string(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+            ),
+        ];
+
+        // A message hash matching no observed source turn dispatches fine but
+        // stays unstamped and writes no mapping.
+        let miss = webchat_tool_call(
+            app.clone(),
+            &edge_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "unobserved turn still dispatches",
+                "idempotency_key": "dispatch-miss-1",
+                "current_user_message": "不存在的消息",
+            }),
+        )
+        .await;
+        assert_eq!(miss["ok"], true);
+        assert!(miss["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            miss["parent_session"],
+            json!({"bound": false, "reason": "source_turn_not_found"})
+        );
+
+        // A conflicting durable mapping wins: dispatch stays unstamped and the
+        // mapping is never retargeted silently.
+        let conflict = webchat_tool_call(
+            app.clone(),
+            &edge_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "conflicting evidence stays unstamped",
+                "idempotency_key": "dispatch-miss-2",
+                "current_user_message": "第一条消息",
+            }),
+        )
+        .await;
+        assert_eq!(conflict["ok"], true);
+        assert!(conflict["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            conflict["parent_session"],
+            json!({"bound": false, "reason": "caller_session_conflict"})
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_caller_session(
+                    "connector:conn_DispatchConflict1",
+                    "chatgpt",
+                    opaque
+                )
+                .unwrap(),
+            Some(second_session.clone())
+        );
+        assert_ne!(first_session, second_session);
+
+        // An invalid message reports a compact reason and never fails the
+        // dispatch.
+        let invalid = webchat_tool_call(
+            app.clone(),
+            &edge_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "invalid evidence still dispatches",
+                "idempotency_key": "dispatch-miss-3",
+                "current_user_message": "   ",
+            }),
+        )
+        .await;
+        assert_eq!(invalid["ok"], true);
+        assert!(invalid["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            invalid["parent_session"],
+            json!({"bound": false, "reason": "current_user_message_invalid"})
+        );
+
+        // A miss on a caller session that was never bound writes no mapping
+        // at all, so a later dispatch cannot inherit guessed evidence.
+        let fresh_opaque = "opaque-dispatch-never-bound";
+        let fresh_headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-authorization",
+                json!({
+                    "principal_ref": "connector:conn_DispatchConflict1",
+                    "connector_id": "conn_DispatchConflict1",
+                    "grant_generation": 1
+                })
+                .to_string(),
+            ),
+            (
+                "x-herdr-edge-browser-caller-session",
+                json!({"provider": "chatgpt", "opaque_session_id": fresh_opaque}).to_string(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+            ),
+        ];
+        let unbound_miss = webchat_tool_call(
+            app,
+            &fresh_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "unbound caller miss",
+                "idempotency_key": "dispatch-miss-4",
+                "current_user_message": "不存在的消息",
+            }),
+        )
+        .await;
+        assert_eq!(unbound_miss["ok"], true);
+        assert_eq!(
+            unbound_miss["parent_session"],
+            json!({"bound": false, "reason": "source_turn_not_found"})
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_caller_session(
+                    "connector:conn_DispatchConflict1",
+                    "chatgpt",
+                    fresh_opaque
+                )
+                .unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

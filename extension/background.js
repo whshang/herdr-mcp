@@ -12013,15 +12013,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "continuity-fields-incomplete" });
         return;
       }
+      const observeSourceTurn = () => postBrowserRegistry({
+        operation: "source_turn.observe",
+        canonical_url: convKey,
+        user_text: userText,
+        observed_at: msg?.startedAt || Date.now(),
+      });
       try {
-        await postBrowserRegistry({
-          operation: "source_turn.observe",
-          canonical_url: convKey,
-          user_text: userText,
-          observed_at: msg?.startedAt || Date.now(),
-        });
+        await observeSourceTurn();
       } catch (error) {
         callLog("current source turn observe failed:", error?.message || String(error));
+        if (error?.message === "browser_source_session_not_found") {
+          // The first turn of a brand-new conversation can mount before the
+          // 1s route poll registers the session for its canonical URL, so the
+          // exact-turn evidence is dropped exactly when a fresh WebChat
+          // dispatch needs it most. The observe is an idempotent per-session
+          // upsert gated on the same confirmed submit, so retry the
+          // registration race a bounded number of times instead of dropping
+          // the turn. Any other failure stays dropped and fail-closed.
+          void (async () => {
+            for (const delayMs of [1500, 3000]) {
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+              try {
+                await observeSourceTurn();
+                return;
+              } catch (retryError) {
+                callLog(
+                  "current source turn observe retry failed:",
+                  retryError?.message || String(retryError),
+                );
+              }
+            }
+          })();
+        }
       }
       let session = [];
       try {
