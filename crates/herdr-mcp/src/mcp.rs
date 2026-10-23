@@ -22052,7 +22052,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn browser_page_observe_paging_forwards_a_bounded_read_only_offset_without_a_mutation() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
@@ -22148,7 +22147,10 @@ mod tests {
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
         {
             let seen = actuator.seen.lock().unwrap();
-            assert_eq!(seen[0]["element_offset"], 128, "the cursor must reach the extension");
+            assert_eq!(
+                seen[0]["element_offset"], 128,
+                "the cursor must reach the extension"
+            );
             assert!(
                 seen[1].get("element_offset").is_none(),
                 "an offset-free observe must not invent a cursor"
@@ -22172,7 +22174,14 @@ mod tests {
                 "element_offset {invalid_offset} must fail closed"
             );
         }
-        for action in ["click", "screenshot", "expect", "extract", "scroll", "press"] {
+        for action in [
+            "click",
+            "screenshot",
+            "expect",
+            "extract",
+            "scroll",
+            "press",
+        ] {
             let mut request = json!({
                 "endpoint_ref": "bep_test",
                 "page_ref": page_ref,

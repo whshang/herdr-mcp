@@ -35,13 +35,14 @@ test("user scrolls a browser page | Given a typed Rust actuation payload | When 
   assert.match(bridge, /amount:\s*params\.amount/);
 });
 
-test("user pages a long observation | Given a typed Rust actuation payload | When the extension bridge forwards observe paging | Then the offset and limit reach the Page Assist action path", () => {
+test("user pages past the observed ref cap | Given a typed Rust actuation payload | When the extension bridge forwards observe paging | Then the read-only offset reaches both the native actuation and Page Assist paths", () => {
   const start = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
   const end = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', start);
   assert.ok(start > 0 && end > start);
   const bridge = backgroundSource.slice(start, end);
   assert.match(bridge, /elementOffset:\s*params\.element_offset/);
-  assert.match(bridge, /elementLimit:\s*params\.element_limit/);
+  assert.doesNotMatch(bridge, /elementLimit/, "observe paging keeps the fixed 128-ref page size");
+  assert.match(backgroundSource, /elementOffset:\s*msg\?\.elementOffset/);
 });
 
 const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
@@ -257,7 +258,7 @@ test("user opens a loading generic page | Given Chrome returns only pendingUrl f
   assert.equal(sessionStorage.herdrBrowserPagesV1.length, 1);
 });
 
-test("user observes the next page of a long page | Given a claimed page and a bounded paging request | When observe passes the offset and limit | Then the Page Assist payload carries the window and truncation metadata reaches the caller", async () => {
+test("user observes the next page of a long page | Given a claimed page and a bounded paging request | When observe passes the read-only offset | Then the Page Assist payload carries the cursor and next_element_offset reaches the caller", async () => {
   const tabs = new Map([
     [121, { id: 121, url: "https://example.com/long", status: "complete", active: true }],
   ]);
@@ -270,9 +271,7 @@ test("user observes the next page of a long page | Given a claimed page and a bo
         ok: true,
         generation: "pa_gen_page_2",
         element_offset: 128,
-        element_limit: 64,
-        elements_truncated: false,
-        next_element_offset: null,
+        next_element_offset: 256,
         elements: [{ text: "Action 128" }],
       };
     },
@@ -288,16 +287,13 @@ test("user observes the next page of a long page | Given a claimed page and a bo
     action: "observe",
     pageRef: page.page_ref,
     elementOffset: 128,
-    elementLimit: 64,
   });
   assert.equal(result.ok, true);
   assert.equal(forwarded.action, "observe");
   assert.equal(forwarded.elementOffset, 128);
-  assert.equal(forwarded.elementLimit, 64);
+  assert.ok(!Object.hasOwn(forwarded, "elementLimit"), "the 128-ref page size stays fixed");
   assert.equal(result.element_offset, 128);
-  assert.equal(result.element_limit, 64);
-  assert.equal(result.elements_truncated, false);
-  assert.equal(result.next_element_offset, null);
+  assert.equal(result.next_element_offset, 256);
   assert.ok(!Object.hasOwn(result, "delivery_state"), "paged observe stays read-only");
 });
 
