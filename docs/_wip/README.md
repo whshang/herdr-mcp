@@ -19,7 +19,11 @@ Current active WIP is limited to unresolved work: the 1.1 Browser Adapter Platfo
 - Archived beta.2 orchestration design: [`../history/architecture/v1.0-beta2-webchat-orchestration.md`](../history/architecture/v1.0-beta2-webchat-orchestration.md).
 - Archived 1.0 performance/resource plan: [`../history/architecture/v1.0-performance-resource-plan.md`](../history/architecture/v1.0-performance-resource-plan.md).
 - 1.1 core Browser Adapter Platform: [`v1.1-browser-adapter-platform.md`](v1.1-browser-adapter-platform.md).
-- 1.1 Jev/semantic route measurement and fast-path defects (T3): [`v1.1-jev-remeasure-20261011.md`](v1.1-jev-remeasure-20261011.md).
+- 1.1 stable-GO checklist (SSOT): [`../releases/1.1-feature-list.md`](../releases/1.1-feature-list.md).
+- Archived 1.1 OpenCLI-parity audit (#586): [`../history/architecture/browserpage-opencli-parity-audit-586.md`](../history/architecture/browserpage-opencli-parity-audit-586.md).
+- Archived 1.1 Jev re-measurement (T3): [`../history/architecture/v1.1-jev-remeasure-20261011.md`](../history/architecture/v1.1-jev-remeasure-20261011.md).
+- Archived 1.1 consolidation plan: [`../history/architecture/v1.1-consolidation-plan-20261011.md`](../history/architecture/v1.1-consolidation-plan-20261011.md).
+- Archived caller-grant-missing diagnosis (#626 background): [`../history/architecture/caller-grant-missing-20261013.md`](../history/architecture/caller-grant-missing-20261013.md).
 - Active browser control-plane work: [`browser-control-plane.md`](browser-control-plane.md).
 - Active progressive-skills work: [`modular-progressive-skills.md`](modular-progressive-skills.md).
 - Active browser-extension package/Store work: [`browser-extension-development-and-store-release.md`](browser-extension-development-and-store-release.md). Historical pre-1.0 Store rollout detail lives under [`../history/architecture/browser-extension-development-and-store-release-20260829.md`](../history/architecture/browser-extension-development-and-store-release-20260829.md).
