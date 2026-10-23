@@ -1148,11 +1148,14 @@ export function createBoundedSupervisorAdapter({
     if (input.text.length > SUPERVISOR_LIMITS.totalInputChars) return { ok: false, reason: "input_over_budget" };
 
     let last = { ok: false, reason: "no_attempt" };
-    let user = buildSupervisorUserMessage(input);
-    if (correction) {
-      user = `${user}\n\nYour previous answer was rejected by the deterministic guard: ${correction}. Allowed values — ${SUPERVISOR_REPAIR_VOCABULARY}. Return a corrected JSON object.`;
-    }
+    // The projection is immutable: every attempt is rebuilt from it, so at most one
+    // repair block is ever present and the prompt cannot grow across retries.
+    const baseUser = buildSupervisorUserMessage(input);
+    let repair = correction
+      ? `Your previous answer was rejected by the deterministic guard: ${correction}. Allowed values — ${SUPERVISOR_REPAIR_VOCABULARY}. Return a corrected JSON object.`
+      : null;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const user = repair ? `${baseUser}\n\n${repair}` : baseUser;
       const result = await request({ system: SUPERVISOR_SYSTEM_PROMPT, user, timeoutMs });
       if (!result?.ok) {
         last = { ok: false, reason: result?.reason || "provider_error" };
@@ -1162,7 +1165,7 @@ export function createBoundedSupervisorAdapter({
       const parsed = parseSupervisorDecision(result.content);
       if (!parsed.ok) {
         last = { ok: false, reason: `invalid_decision:${parsed.error}` };
-        user = `${user}\n\nYour previous answer was rejected: ${parsed.error}. Allowed values — ${SUPERVISOR_REPAIR_VOCABULARY}. Return only the required JSON object.`;
+        repair = `Your previous answer was rejected: ${parsed.error}. Allowed values — ${SUPERVISOR_REPAIR_VOCABULARY}. Return only the required JSON object.`;
         continue;
       }
       return { ok: true, decision: parsed, attempts: attempt };

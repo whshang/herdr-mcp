@@ -8,10 +8,15 @@ This is a separate contract from `webchat create/send/handoff`. A WebChat sessio
 
 ```sh
 herdr-mcp webchat endpoints --limit 5
+# claim an existing exact user page
 herdr-mcp browser-page lifecycle --params-json '{"endpoint_ref":"ENDPOINT_REF","action":"claim","target_origin":"https://example.com","url":"https://example.com/","idempotency_key":"ONE_STABLE_CLAIM_KEY"}'
+# open an agent-owned, inactive page
+herdr-mcp browser-page lifecycle --params-json '{"endpoint_ref":"ENDPOINT_REF","action":"open","target_origin":"https://example.com","url":"https://example.com/","idempotency_key":"ONE_STABLE_OPEN_KEY"}'
 ```
 
-Choose a returned `endpoint_ref` on the intended device/profile. Use `claim` only for an existing exact user page. Use `open` with the same parameters for an agent-owned, inactive page. Never guess an endpoint, page ref, origin, account, or tab identity. Do not silently move between endpoints if one is unavailable. Record the returned opaque `page_ref` and `ownership`.
+`target_origin` is a **required** parameter for both `claim` and `open`: pass the exact HTTP/HTTPS origin that `url` belongs to (`https://example.com` for any `https://example.com/...` page). It is normalized to an origin and must equal `url`'s origin; omitting it, or passing one that does not match `url`, fails with `invalid_params`. Do not pass `target_origin` (or `url`) for `release` or `finalize`; those two actions take only `endpoint_ref`, `action`, `page_ref` and an optional `idempotency_key`, and reject `target_origin`/`url`.
+
+Choose a returned `endpoint_ref` on the intended device/profile. Use `claim` only for an existing exact user page. Use `open` for an agent-owned, inactive page. Never guess an endpoint, page ref, origin, account, or tab identity. Do not silently move between endpoints if one is unavailable. Record the returned opaque `page_ref` and `ownership`.
 
 ## Observe, act, and verify
 
