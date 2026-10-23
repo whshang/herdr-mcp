@@ -1512,3 +1512,23 @@ test("user observes only bounded choice controls | Given inert tags and unsafe c
   const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
   assert.deepEqual(Array.from(observed.elements, (el) => el.text), ["Cancel"]);
 });
+
+test("user observes only safe body text | Given hidden and sensitive descendants | When inspect runs | Then their text is excluded", () => {
+  const button = createElement({ tag: "button", text: "Save" });
+  const h = harness({ elements: [button], bodyText: "Visible SECRET_ARIA SECRET_HIDDEN SECRET_PASSWORD tail" });
+  const doc = button.ownerDocument;
+  const textNode = (value) => ({ nodeType: 3, nodeValue: value });
+  const child = (options, nodes) => Object.assign(createElement(options), { nodeType: 1, ownerDocument: doc, childNodes: nodes });
+  doc.body.nodeType = 1;
+  doc.body.childNodes = [
+    textNode("Visible "),
+    child({ tag: "span", attrs: { "aria-hidden": "true" } }, [textNode("SECRET_ARIA")]),
+    child({ tag: "span", visible: false }, [textNode("SECRET_HIDDEN")]),
+    child({ tag: "input", type: "password" }, [textNode("SECRET_PASSWORD")]),
+    textNode("tail"),
+  ];
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.text, "Visible tail");
+  assert.doesNotMatch(observed.text, /SECRET_/);
+});
