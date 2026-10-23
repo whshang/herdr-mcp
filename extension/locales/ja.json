@@ -357,6 +357,8 @@
   "cc_workspaces_binding_hint": "ライブ状態 · 現在ページの binding",
   "cc_workspace_bind": "連携",
   "cc_workspace_bound": "連携済",
+  "cc_workspace_bound_auto": "連携済 · 自動",
+  "cc_workspace_bound_auto_hint": "この会話自身の Herdr タスク用に自動で連携されました。{workspace} の他の binding と同様に解除できます。",
   "cc_workspace_binding_updating": "…",
   "cc_workspace_binding_busy_reason": "ページの binding 更新が進行中です。完了するまで待ってください。",
   "cc_workspace_binding_disabled": "対応 Project または会話を開くと現在ページの binding を操作できます。",

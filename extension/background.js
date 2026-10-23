@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.212";
+const H2W_SCRIPT_VERSION = "0.1.213";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -1111,8 +1111,11 @@ function migrateBindingsMap(raw, now = Date.now()) {
     // Workspace bindings are explicit user choices. Older builds imposed a
     // 24-hour expiry, which is hostile to long-running Project conversations.
     // Preserve already-expired rows so pruneExpired can remove them, but promote
-    // every still-live legacy row to explicit persistence.
+    // every still-live legacy row to explicit persistence. An automatic binding
+    // (persistence "auto") is current-format state, not a legacy row: it must
+    // keep its own persistence kind so the Side Panel and removal stay honest.
     if (next.persistence !== "explicit"
+      && next.persistence !== "auto"
       && !(typeof next.expires_at === "number" && next.expires_at <= now)) {
       next.persistence = "explicit";
       delete next.expires_at;
@@ -1208,6 +1211,69 @@ function bindingView(b) {
     workspace_label: b.workspace_label || null,
     working_count: Object.keys(workingPaneMap(b)).length,
   };
+}
+
+/**
+ * Single workspace-binding record constructor. An explicit Side Panel bind and
+ * the automatic binding created for a conversation's own dispatched task share
+ * this one persisted format; only `persistence` records how it came to exist.
+ */
+async function buildWorkspaceBindingRecord({
+  pageInfo,
+  bindingKey,
+  workspaceId,
+  workspaceLabel,
+  pane = null,
+  agent = null,
+  localProjectKey = null,
+  roots = [],
+  deviceId = null,
+  browserScope = null,
+  tabId = null,
+  tabUrl = null,
+  continuityId = null,
+  persistence = "explicit",
+}) {
+  const projectScoped = Boolean(pageInfo?.project_id);
+  const pendingRoot = pageInfo?.site === "chatgpt" && pageInfo?.is_new_chat_root === true;
+  const hasConversationTarget = Boolean(pageInfo?.conversation_id);
+  const deliveryTabId = projectScoped && !hasConversationTarget ? null : tabId;
+  const b = {
+    workspace_id: workspaceId,
+    workspace_label: workspaceLabel,
+    pane,
+    focus_agent: agent,
+    agent: null, // The binding targets a workspace, not an individual agent.
+    workingPanes: {},
+    convKey: bindingKey,
+    site: pageInfo?.site || "unknown",
+    binding_scope: projectScoped ? "project" : (pendingRoot ? "pending" : "conversation"),
+    project_id: pageInfo?.project_id || null,
+    project_name: pageInfo?.project_name || null,
+    project_key: pageInfo?.project_key || null,
+    local_project_key: localProjectKey,
+    project_roots: Array.isArray(roots)
+      ? roots.filter((root) => typeof root === "string" && root.trim()).map((root) => root.trim()).slice(0, 16)
+      : [],
+    browser_account_ref: browserScope?.accountRef || null,
+    browser_space_ref: browserScope?.spaceRef || null,
+    browser_generation: Number.isSafeInteger(browserScope?.observationGeneration)
+      ? browserScope.observationGeneration
+      : null,
+    device_id: deviceId,
+    active_conv_key: projectScoped && hasConversationTarget ? pageInfo.convKey : null,
+    tabId: deliveryTabId,
+    tabUrl: deliveryTabId ? (tabUrl || pageInfo?.url || null) : null,
+    execution_state: deliveryTabId ? await protectBoundTab(deliveryTabId) : null,
+    created_at: Date.now(),
+    last_seen_at: Date.now(),
+    persistence,
+    continuity_id: continuityId,
+    status: "unknown",
+    lastSettle: null,
+  };
+  b.revision = bindingRevision(b);
+  return b;
 }
 
 function workspaceMetaForBinding(b, workspaces = []) {
@@ -4588,6 +4654,12 @@ async function handlePushBlock(block, streamCtrl = null) {
       pendingOutputByPane.set(pendingKey(storeKey, data.pane), data.output || "");
     }
   }
+  // A conversation's own child tasks are the only wake that does not depend on
+  // Auto, so watched (still unbound) sessions are re-checked on the same
+  // low-cost push signals instead of a second timer.
+  if (event === "hello" || event === "agent_settled") {
+    void refreshAutoBindWatches(event).catch((e) => callLog("auto binding refresh failed:", e?.message || String(e)));
+  }
 }
 
 async function onPushHello(storeKey, data) {
@@ -4877,7 +4949,7 @@ function taskInboxWakeText(inbox) {
   return lines.join("\n").slice(0, 12000);
 }
 
-async function fetchAgentTaskInbox(binding, { settleRetry = false } = {}) {
+async function fetchAgentTaskInbox(binding, { settleRetry = false, includeRunning = false } = {}) {
   const parentSessionRef = String(binding?.browser_session_ref || "").trim();
   if (!parentSessionRef) return null;
   const workspaceId = String(normalizeWorkspaceId(binding) || "").trim();
@@ -4887,6 +4959,10 @@ async function fetchAgentTaskInbox(binding, { settleRetry = false } = {}) {
       const url = new URL(semanticRuntimeUrl("/extension/agent/tasks"));
       url.searchParams.set("parent_session_ref", parentSessionRef);
       if (workspaceId) url.searchParams.set("workspace_id", workspaceId);
+      // Opt-in unfinished-task view, used only by the auto-binding watch so a
+      // conversation can bind while its task is still running. The wake/ack path
+      // must never request it, and older runtimes ignore it (terminal rows only).
+      if (includeRunning) url.searchParams.set("include_running", "1");
       url.searchParams.set("limit", "64");
       const response = await localHerdrFetch(url.toString(), { nativeTimeoutMs: 1800 });
       const value = await response.json().catch(() => null);
@@ -4924,11 +5000,19 @@ async function ackAgentTask(binding, taskId) {
 
 async function routeAgentTaskInboxWake(binding, { wakeKind = null, settleRetry = false } = {}) {
   const inbox = await fetchAgentTaskInbox(binding, { settleRetry });
-  const decision = taskInboxDecision(inbox);
+  // Defensive: a row with `terminal: false` is an unfinished task (the compact
+  // include_running row, or a runtime that returns one anyway). It is never a
+  // result, so it can neither wake the conversation nor be acknowledged, and
+  // this path never asks for the unfinished-task view in the first place.
+  const terminalInbox = terminalOnlyInbox(inbox);
+  const decision = taskInboxDecision(terminalInbox);
   if (!decision.matched) return { matched: false, wake: false, inbox };
-  if (!automationEnabledForBinding(binding)) {
-    return { matched: true, wake: false, disabled: true, decision, inbox };
-  }
+  // A task this conversation dispatched is the conversation's own durable work,
+  // so its terminal wake is not an Auto continuation and does not depend on the
+  // Auto preference. Only the Auto on/off check is bypassed here: the runtime
+  // gate, the active-handoff block, identity/generation fencing and
+  // ack-after-delivery stay in place, and every pane-level settle/progress/
+  // rollover wake keeps requiring Auto.
   const routed = await routeWake(
     binding,
     {
@@ -4937,15 +5021,306 @@ async function routeAgentTaskInboxWake(binding, { wakeKind = null, settleRetry =
       task_summary: inbox?.summary || null,
       attention_used: inbox?.attention?.used === true,
     },
-    taskInboxWakeText(inbox),
+    taskInboxWakeText(terminalInbox),
     wakeKind,
+    { ownTask: true },
   );
   if (routed?.ok) {
-    for (const task of Array.isArray(inbox?.tasks) ? inbox.tasks : []) {
+    for (const task of terminalInboxTasks(terminalInbox)) {
       await ackAgentTask(binding, task?.task_id);
     }
   }
-  return { matched: true, wake: Boolean(routed?.ok), decision, inbox, routed };
+  return { matched: true, wake: Boolean(routed?.ok), decision, inbox: terminalInbox, routed };
+}
+
+// ---- Auto binding for a conversation's own child task (Herdr 1.1) ----
+// Owner rule: a WebChat conversation that dispatched a local task owns that
+// task's terminal wake even when Auto is off. The wake still travels through a
+// normal workspace binding, so an unbound conversation has to become one before
+// the task settles. The watch below only remembers what h2w_register already
+// observed (conversation key, tab, Runtime-issued browser session ref, account
+// ref, observation generation) and asks the Runtime for that exact session's
+// inbox; it never builds a session ref, and it never binds a workspace the live
+// catalog does not report for this device.
+const AUTO_BINDING_PERSISTENCE = "auto";
+const AUTO_BIND_STORAGE_KEY = "herdrAutoBindWatchesV1";
+const AUTO_BIND_WATCH_TTL_MS = 30 * 60 * 1000;
+const AUTO_BIND_WATCH_MAX = 8;
+const AUTO_BIND_CHECK_MIN_MS = 4000;
+const AUTO_BIND_SUPPRESSED_MAX = 64;
+const TERMINAL_TASK_LIFECYCLES = new Set(["completed", "blocked", "failed", "delivery_uncertain"]);
+const autoBindWatches = new Map(); // browser_session_ref -> watch
+const autoBindSuppressed = new Map(); // `${sessionRef}::${workspace_id}` -> observed generation
+let autoBindStateLoaded = false;
+
+function isTerminalInboxTask(task) {
+  if (task?.terminal === false) return false;
+  return task?.terminal === true || TERMINAL_TASK_LIFECYCLES.has(String(task?.lifecycle || ""));
+}
+
+/** Terminal rows only: an unfinished row must never wake or be acknowledged. */
+function terminalInboxTasks(inbox) {
+  return (Array.isArray(inbox?.tasks) ? inbox.tasks : []).filter(isTerminalInboxTask);
+}
+
+function terminalOnlyInbox(inbox) {
+  if (inbox?.ok !== true) return inbox;
+  const tasks = Array.isArray(inbox.tasks) ? inbox.tasks : [];
+  const terminal = tasks.filter(isTerminalInboxTask);
+  return terminal.length === tasks.length ? inbox : { ...inbox, tasks: terminal };
+}
+
+function autoBindSuppressionKey(sessionRef, workspaceId) {
+  const session = String(sessionRef || "").trim();
+  const workspace = String(workspaceId || "").trim();
+  return session && workspace ? `${session}::${workspace}` : null;
+}
+
+function noteAutoBindSuppression(sessionRef, workspaceId, generation = null) {
+  const key = autoBindSuppressionKey(sessionRef, workspaceId);
+  if (!key) return;
+  autoBindSuppressed.set(key, Number.isSafeInteger(generation) && generation > 0 ? generation : null);
+  while (autoBindSuppressed.size > AUTO_BIND_SUPPRESSED_MAX) {
+    autoBindSuppressed.delete(autoBindSuppressed.keys().next().value);
+  }
+}
+
+function autoBindSuppressedFor(sessionRef, workspaceId, generation = null) {
+  const key = autoBindSuppressionKey(sessionRef, workspaceId);
+  if (!key || !autoBindSuppressed.has(key)) return false;
+  const suppressedGeneration = autoBindSuppressed.get(key);
+  // A newer observation generation is a new browser epoch for the same session,
+  // so an earlier manual removal no longer describes this conversation state.
+  if (suppressedGeneration && generation && Number(generation) > suppressedGeneration) {
+    autoBindSuppressed.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function pruneAutoBindWatches(now = Date.now()) {
+  for (const [sessionRef, watch] of [...autoBindWatches.entries()]) {
+    if (!watch?.convKey || now - Number(watch.seen_at || 0) > AUTO_BIND_WATCH_TTL_MS) {
+      autoBindWatches.delete(sessionRef);
+    }
+  }
+  while (autoBindWatches.size > AUTO_BIND_WATCH_MAX) {
+    const oldest = [...autoBindWatches.entries()]
+      .sort((left, right) => Number(left[1].seen_at || 0) - Number(right[1].seen_at || 0))[0];
+    if (!oldest) break;
+    autoBindWatches.delete(oldest[0]);
+  }
+}
+
+/**
+ * Restore the session-scoped watch list after a service-worker restart.
+ * chrome.storage.session survives a worker restart but not a browser restart,
+ * so each entry is re-validated against its exact tab and conversation before
+ * it is trusted again.
+ */
+async function ensureAutoBindStateLoaded() {
+  if (autoBindStateLoaded) return;
+  autoBindStateLoaded = true;
+  const area = chrome.storage?.session;
+  if (!area?.get) return;
+  let stored = null;
+  try { stored = (await area.get(AUTO_BIND_STORAGE_KEY))[AUTO_BIND_STORAGE_KEY]; } catch (_) { return; }
+  const now = Date.now();
+  for (const raw of Array.isArray(stored?.watches) ? stored.watches : []) {
+    const sessionRef = String(raw?.browser_session_ref || "").trim();
+    const convKey = String(raw?.convKey || "").trim();
+    const tabId = Number(raw?.tabId);
+    if (!sessionRef || !convKey || !Number.isSafeInteger(tabId) || tabId <= 0) continue;
+    if (now - Number(raw?.seen_at || 0) > AUTO_BIND_WATCH_TTL_MS) continue;
+    let tab = null;
+    try { tab = await chrome.tabs.get(tabId); } catch (_) { tab = null; }
+    if (!tab?.url || browserPageContextInfoFromSupportedUrl(tab.url)?.convKey !== convKey) continue;
+    autoBindWatches.set(sessionRef, { ...raw, convKey, tabId, browser_session_ref: sessionRef });
+  }
+  for (const row of Array.isArray(stored?.suppressed) ? stored.suppressed : []) {
+    const key = String(row?.key || "").trim();
+    if (!key) continue;
+    autoBindSuppressed.set(key, Number.isSafeInteger(row?.generation) ? row.generation : null);
+  }
+  pruneAutoBindWatches(now);
+}
+
+async function persistAutoBindState() {
+  const area = chrome.storage?.session;
+  if (!area?.set) return;
+  pruneAutoBindWatches();
+  const suppressed = [...autoBindSuppressed.entries()].map(([key, generation]) => ({ key, generation }));
+  try {
+    await area.set({
+      [AUTO_BIND_STORAGE_KEY]: {
+        watches: [...autoBindWatches.values()],
+        suppressed,
+      },
+    });
+  } catch (_) {}
+}
+
+/** Remember one unbound conversation the Runtime reported a session ref for. */
+async function noteAutoBindWatch({ sessionRef, convKey, bindingKey, pageInfo, tabId, tabUrl, generation, accountRef, site }) {
+  const key = String(sessionRef || "").trim();
+  const conversationKey = String(convKey || "").trim();
+  const id = Number(tabId);
+  if (!key || !conversationKey || !Number.isSafeInteger(id) || id <= 0) return null;
+  await ensureAutoBindStateLoaded();
+  const previous = autoBindWatches.get(key);
+  const sameObservation = previous
+    && previous.convKey === conversationKey
+    && Number(previous.tabId) === id
+    && Number(previous.generation || 0) === Number(generation || 0);
+  // One tab watches one conversation/account at a time, and one conversation
+  // tab must not accumulate watches across account switches.
+  for (const [otherRef, other] of [...autoBindWatches.entries()]) {
+    if (otherRef === key || Number(other.tabId) !== id) continue;
+    if (other.convKey === conversationKey && other.account_ref === (accountRef || null)) continue;
+    autoBindWatches.delete(otherRef);
+  }
+  const watch = {
+    browser_session_ref: key,
+    convKey: conversationKey,
+    binding_key: String(bindingKey || conversationKey),
+    pageInfo: pageInfo && typeof pageInfo === "object" ? { ...pageInfo } : null,
+    tabId: id,
+    tabUrl: tabUrl || null,
+    generation: Number.isSafeInteger(generation) && generation > 0 ? generation : null,
+    account_ref: accountRef || null,
+    site: site || null,
+    seen_at: Date.now(),
+    last_check_at: sameObservation ? Number(previous.last_check_at || 0) : 0,
+  };
+  autoBindWatches.set(key, watch);
+  await persistAutoBindState();
+  return watch;
+}
+
+async function forgetAutoBindWatch(sessionRef, reason = null) {
+  const key = String(sessionRef || "").trim();
+  if (!key || !autoBindWatches.delete(key)) return false;
+  await persistAutoBindState();
+  if (reason) callLog(`auto binding watch dropped (${reason})`);
+  return true;
+}
+
+/**
+ * Bind the workspaces of this session's inbox tasks and report whether the
+ * session holds terminal work. Fail-closed: no tab identity, no live workspace
+ * row, or another device's workspace means no binding.
+ */
+async function autoBindWatchedSession(watch, reason = "refresh") {
+  const sessionRef = String(watch?.browser_session_ref || "").trim();
+  if (!sessionRef || !watch?.convKey) return null;
+  let tab = null;
+  try { tab = await chrome.tabs.get(watch.tabId); } catch (_) { tab = null; }
+  if (!tab?.url) { await forgetAutoBindWatch(sessionRef, "tab-closed"); return null; }
+  if (browserPageContextInfoFromSupportedUrl(tab.url)?.convKey !== watch.convKey) {
+    await forgetAutoBindWatch(sessionRef, "conversation-changed");
+    return null;
+  }
+  watch.tabUrl = tab.url;
+  watch.seen_at = Date.now();
+  watch.last_check_at = watch.seen_at;
+  const inbox = await fetchAgentTaskInbox({ browser_session_ref: sessionRef }, { includeRunning: true });
+  if (inbox?.ok !== true) return null;
+  const tasks = Array.isArray(inbox.tasks) ? inbox.tasks : [];
+  const terminal = terminalInboxTasks(inbox).length > 0;
+  if (!tasks.length) return { created: [], terminal: false };
+  const state = await fetchStateFresh();
+  const catalog = Array.isArray(state?.workspaces) ? state.workspaces : [];
+  if (!catalog.length) return { created: [], terminal };
+  const endpointDeviceId = typeof browserEndpoint?.device_id === "string" ? browserEndpoint.device_id.trim() : "";
+  const scope = browserTabScopes.get(watch.tabId) || null;
+  const bindings = await loadBindings();
+  const created = [];
+  for (const task of tasks) {
+    const workspaceId = String(task?.workspace_id || "").trim();
+    if (!workspaceId) continue;
+    if (autoBindSuppressedFor(sessionRef, workspaceId, watch.generation)) continue;
+    // The workspace must be live on this runtime, otherwise the binding would
+    // be pruned on the next reconcile and could never deliver a wake.
+    const row = catalog.find((workspace) => String(workspace?.id || "") === workspaceId) || null;
+    if (!row) continue;
+    const rowDeviceId = typeof row.device_id === "string" ? row.device_id.trim() : "";
+    if (rowDeviceId && endpointDeviceId && rowDeviceId !== endpointDeviceId) continue;
+    const storeKey = bindingStoreKey(watch.binding_key || watch.convKey, workspaceId);
+    if (bindings[storeKey]) continue;
+    const sibling = bindingsForPageInfo(bindings, watch.pageInfo, watch.binding_key || watch.convKey);
+    const record = await buildWorkspaceBindingRecord({
+      pageInfo: watch.pageInfo,
+      bindingKey: watch.binding_key || watch.convKey,
+      workspaceId,
+      workspaceLabel: workspaceTitleWithId({ id: workspaceId, label: row.label, roots: row.roots }),
+      pane: null,
+      agent: null,
+      localProjectKey: row.local_project_key || null,
+      roots: row.roots,
+      deviceId: rowDeviceId || endpointDeviceId || null,
+      browserScope: scope,
+      tabId: watch.tabId,
+      tabUrl: watch.tabUrl,
+      continuityId: sibling.map((entry) => entry.continuity_id).find(Boolean) || newContinuityId(),
+      persistence: AUTO_BINDING_PERSISTENCE,
+    });
+    // The Runtime-issued session identity must be on the record from the start:
+    // it scopes the own-task inbox (fetchAgentTaskInbox returns null without it),
+    // so a binding created outside h2w_register would otherwise never wake, and
+    // h2w_unbind could not record a removal for it. The register match loop only
+    // stamps bindings registration itself created, so stamp it here.
+    record.browser_session_ref = sessionRef;
+    if (watch.account_ref) record.browser_account_ref = watch.account_ref;
+    if (watch.generation) record.browser_generation = watch.generation;
+    record.revision = bindingRevision(record);
+    bindings[storeKey] = record;
+    created.push({ storeKey, workspace_id: workspaceId });
+  }
+  if (!created.length) return { created: [], terminal };
+  await saveBindings(bindings);
+  reconcileProgressTimers(bindings);
+  ensurePushStream(bindings);
+  broadcastControlMessage({ type: "herdr_control_binding_changed" });
+  callLog(`auto bound ${created.length} workspace(s) for ${watch.convKey} (${reason})`);
+  return { created, terminal };
+}
+
+/**
+ * Low-cost re-check of watched unbound conversations. Runs on the same push
+ * signals that already drive binding wakes, so it adds no new timer or loop.
+ */
+async function refreshAutoBindWatches(reason = "push", { force = false } = {}) {
+  await ensureAutoBindStateLoaded();
+  pruneAutoBindWatches();
+  if (!autoBindWatches.size) return { checked: 0, created: 0 };
+  const now = Date.now();
+  const result = { checked: 0, created: 0 };
+  for (const watch of [...autoBindWatches.values()]) {
+    if (!force && now - Number(watch.last_check_at || 0) < AUTO_BIND_CHECK_MIN_MS) continue;
+    const sessionRef = watch.browser_session_ref;
+    try {
+      const bound = await autoBindWatchedSession(watch, reason);
+      result.checked += 1;
+      result.created += bound?.created?.length || 0;
+      if (bound?.terminal) {
+        const bindings = await loadBindings();
+        for (const entry of bindingsForPageInfo(bindings, watch.pageInfo, watch.binding_key || watch.convKey)) {
+          if (!entry?.browser_session_ref) continue;
+          const wake = await routeAgentTaskInboxWake(entry, { wakeKind: "round" });
+          if (wake?.wake) callLog(`own task wake: conv=${watch.convKey} ws=${normalizeWorkspaceId(entry)}`);
+        }
+      }
+      if (bound?.created?.length) {
+        // The conversation is bound now; settlement wakes reach it through the
+        // ordinary binding fan-out, so the watch has done its job.
+        await forgetAutoBindWatch(sessionRef, "auto-bound");
+      }
+    } catch (error) {
+      callLog("auto binding refresh failed:", error?.message || String(error));
+    }
+  }
+  await persistAutoBindState();
+  return result;
 }
 
 async function aggregateAgentTaskSummary(bindings = []) {
@@ -6318,8 +6693,8 @@ function reconcileProgressTimers(bindings) {
  * continue, LLM/Jev nudge, supervisor effect) reaches the composer pipeline
  * through here, so one failure line explains every blocked automatic send.
  */
-async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null) {
-  const result = await routeWakeAttempt(b, extra, template, wakeKind);
+async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null, options = {}) {
+  const result = await routeWakeAttempt(b, extra, template, wakeKind, options);
   if (result?.ok !== true) {
     callLog(
       `auto wake blocked reason=${result?.reason || result?.error || result?.blocked || "wake_failed"}`,
@@ -6331,8 +6706,11 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTem
   return result;
 }
 
-async function routeWakeAttempt(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null) {
-  if (!automationEnabledForBinding(b)) return { ok: false, reason: "disabled" };
+async function routeWakeAttempt(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null, { ownTask = false } = {}) {
+  // `ownTask` marks a wake for a task this conversation dispatched itself. That
+  // task is the conversation's own durable work, so only the Auto on/off
+  // preference is bypassed; every other gate below still applies.
+  if (!ownTask && !automationEnabledForBinding(b)) return { ok: false, reason: "disabled" };
   const runtimeGate = await automationRuntimeGate();
   if (!runtimeGate.ok) return runtimeGate;
   const handoffs = await loadHandoffTransfers();
@@ -6435,6 +6813,7 @@ async function routeWakeAttempt(b, extra, template = CFG.wakeTemplate || default
       working_count,
       template: rendered,
       autoAllow: true,
+      own_task: ownTask === true,
       requiredApps: bindingRequiredApps(b),
     },
   };
@@ -10548,7 +10927,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "site-access-disabled" });
         return;
       }
-      const bindings = await loadBindings();
+      let bindings = await loadBindings();
       const rawPageInfo = registeringSite === "chatgpt"
         ? conversationInfoFromSupportedUrl(msg.url || msg.convKey)
         : (browserConversationInfo(registeringSite, msg.url || msg.convKey)
@@ -10646,6 +11025,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           );
           if (migration.migrated) {
             matched = bindingsForPageInfo(bindings, pageInfo, msg.convKey);
+          }
+        }
+      }
+      // A conversation that is not bound yet can still own a local task: the
+      // Runtime tags that task with this conversation's own browser session ref
+      // as parent_session_ref. Watch the exact session the Runtime just reported
+      // so the task's workspace can be bound before the task turns terminal.
+      if (!matched.length && browserObservation?.sessionRef && sender.tab?.id) {
+        const registerBindingKey = bindingKeyForConversationInfo(pageInfo, msg.convKey);
+        const watch = await noteAutoBindWatch({
+          sessionRef: browserObservation.sessionRef,
+          convKey: pageInfo?.convKey || String(msg.convKey || ""),
+          bindingKey: registerBindingKey,
+          pageInfo,
+          tabId: sender.tab.id,
+          tabUrl: msg.url || sender.tab?.url || null,
+          generation: browserObservation.observationGeneration,
+          accountRef: browserObservation.accountRef,
+          site: pageInfo?.site || registeringSite,
+        });
+        if (watch) {
+          const autoBound = await autoBindWatchedSession(watch, "register");
+          if (autoBound?.created?.length) {
+            bindings = await loadBindings();
+            matched = bindingsForPageInfo(bindings, pageInfo, msg.convKey);
+            await forgetAutoBindWatch(watch.browser_session_ref, "auto-bound");
           }
         }
       }
@@ -11389,10 +11794,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const continuity_id = bindingsForPageInfo(bindings, pageInfo, effectiveBindingKey)
         .map((x) => x.continuity_id).find(Boolean)
         || newContinuityId();
-      const projectScoped = Boolean(pageInfo?.project_id);
-      const pendingRoot = pageInfo?.site === "chatgpt" && pageInfo?.is_new_chat_root === true;
-      const hasConversationTarget = Boolean(pageInfo?.conversation_id);
-      const deliveryTabId = projectScoped && !hasConversationTarget ? null : tabId;
       const browserScope = tabId ? browserTabScopes.get(tabId) : null;
       // Device-aware binding: preserve immutable device identity where known.
       // The local workspace catalog may advertise device_id; otherwise use
@@ -11404,41 +11805,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Validate loosely: must look like dev_<ulid>
         if (/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(candidateDeviceId)) bindingDeviceId = candidateDeviceId.toUpperCase();
       }
-      const b = {
-        workspace_id,
-        workspace_label,
+      const b = await buildWorkspaceBindingRecord({
+        pageInfo,
+        bindingKey: effectiveBindingKey,
+        workspaceId: workspace_id,
+        workspaceLabel: workspace_label,
         pane: msg.pane || null,
-        focus_agent: msg.agent || null,
-        agent: null, // The binding targets a workspace, not an individual agent.
-        workingPanes: {},
-        convKey: effectiveBindingKey,
-        site: pageInfo?.site || "unknown",
-        binding_scope: projectScoped ? "project" : (pendingRoot ? "pending" : "conversation"),
-        project_id: pageInfo?.project_id || null,
-        project_name: pageInfo?.project_name || null,
-        project_key: pageInfo?.project_key || null,
-        local_project_key: msg.local_project_key || null,
-        project_roots: Array.isArray(msg.roots)
-          ? msg.roots.filter((root) => typeof root === "string" && root.trim()).map((root) => root.trim()).slice(0, 16)
-          : [],
-        browser_account_ref: browserScope?.accountRef || null,
-        browser_space_ref: browserScope?.spaceRef || null,
-        browser_generation: Number.isSafeInteger(browserScope?.observationGeneration)
-          ? browserScope.observationGeneration
-          : null,
-        device_id: bindingDeviceId,
-        active_conv_key: projectScoped && hasConversationTarget ? pageInfo.convKey : null,
-        tabId: deliveryTabId,
-        tabUrl: deliveryTabId ? (pageInfo?.url || sender.tab?.url || null) : null,
-        execution_state: deliveryTabId ? await protectBoundTab(deliveryTabId) : null,
-        created_at: Date.now(),
-        last_seen_at: Date.now(),
+        agent: msg.agent || null,
+        localProjectKey: msg.local_project_key || null,
+        roots: msg.roots,
+        deviceId: bindingDeviceId,
+        browserScope,
+        tabId,
+        tabUrl: pageInfo?.url || sender.tab?.url || null,
+        continuityId: continuity_id,
         persistence: "explicit",
-        continuity_id,
-        status: "unknown",
-        lastSettle: null,
-      };
-      b.revision = bindingRevision(b);
+      });
       bindings[storeKey] = b;
       await saveBindings(bindings);
       // A binding created after Auto was already enabled must start watching
@@ -11484,14 +11866,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       let tabId = null;
+      const removedAutoBindings = [];
       for (const { storeKey } of targets) {
         const b = bindings[storeKey];
         if (!b) continue;
         tabId = b.tabId || tabId;
+        if (b.persistence === AUTO_BINDING_PERSISTENCE && b.browser_session_ref) {
+          removedAutoBindings.push({ sessionRef: b.browser_session_ref, workspaceId: b.workspace_id || normalizeWorkspaceId(b) });
+        }
         delete bindings[storeKey];
         clearProgressTimer(storeKey);
       }
       await saveBindings(bindings);
+      // Removing an auto binding is an explicit user decision: the same
+      // session must not recreate it just because its task is still in the inbox.
+      for (const removed of removedAutoBindings) {
+        noteAutoBindSuppression(removed.sessionRef, removed.workspaceId);
+      }
+      if (removedAutoBindings.length) await persistAutoBindState();
       broadcastControlMessage({ type: "herdr_control_binding_changed" });
       await restoreTabDiscardabilityIfUnbound(tabId, bindings);
       const remaining = pageInfo

@@ -329,6 +329,16 @@ ChatGPT 通过 `herdr_prompt` 派出本地 Agent 长任务时，当前 WebChat �
 
 当 inbox 出现未 acknowledge 的 terminal work 时，Runtime 可以把当前 scope 内最多 16 个 child summary 连同仍在运行的 sibling 一次冻结，并只做一次 `agent.attention.advise`。结果作为 Parent guidance 附在 inbox 上：`verify_completion` 进入确定性 validation，`continue_unobserved` 让独立运行的 sibling 继续，human/blocker/drift 状态只决定下一步观察方向。terminal fact 本身仍立即触发 Parent wake；Browser 不再增加第二次 semantic grace 等待，也不维护自己的概率阈值。Jev 未配置、超时、返回异常或 provider 失败时，继续走同一条确定性 terminal wake。
 
+本会话自己派出的任务属于它自己的 durable work，不是 Auto 的自动续写，因此它的 terminal wake 不依赖 Auto 开关：即使 Auto 关闭也会送达。被绕过的只有 Auto 开关本身——runtime 门禁、handoff 进行中的阻断、浏览器身份/代际校验，以及「成功送达后才 acknowledge」全部保留；所有 pane 级 settle、progress 与 rollover 唤醒仍然需要 Auto。归属由 Runtime 判定：扩展不自行判断任务归属，只读取自己 `browser_session_ref` 的 session-scoped inbox。
+
+### 自有任务的自动绑定
+
+唤醒仍然走普通的 workspace binding，所以一个派出过任务、但还没有绑定任何 workspace 的会话，必须在任务结算前先拿到绑定。当带账号身份的注册返回未绑定、且 Runtime 给出了 session ref 时，扩展会记住这次观测的精确事实（conversation key、tab、Runtime 签发的 `browser_session_ref`、account ref、observation generation），并在注册时以及已有的 push 唤醒信号上，向 Runtime 查询这个 session 的 inbox。这次读取会显式打开 Runtime 的未完成任务视图（`include_running=1`），因此绑定在任务仍在运行时就能建立，而不是等到第一条 terminal 记录出现。若 inbox 中任务的 `workspace_id` 属于本机实时 catalog，扩展就用与 Side Panel 手动绑定同一份 binding 记录创建真实绑定，标记 `persistence: "auto"`。
+
+唤醒与 acknowledge 路径刻意不同：它从不请求未完成任务视图，并且即使 Runtime 返回了 `terminal: false` 的行也会忽略，因此未完成的任务永远不会唤醒会话，也永远不会被 acknowledge。早于该 flag 的 Runtime 继续只返回 terminal 行，此时绑定会在第一个 terminal 任务出现时建立。
+
+自动绑定就是普通绑定：它在 Side Panel 中带一个小的 auto 标记，可以像其他绑定一样解除，pane progress / settle 唤醒仍然需要 Auto。解除时会按 session 记录抑制，避免同一浏览器 session 再次创建；该 session 出现更新的 observation generation 时抑制失效。tab 的会话变更、tab 关闭、或该 workspace 不在本机实时 catalog 中时都不会绑定——扩展从不自行拼造 session ref，不会绑定其它 device 上报的 workspace，也不会在没有账号身份时绑定。
+
 ## ChatGPT 回复结束后的语义判断
 
 有些回复从页面上看已经“结束”，但语义上其实停在半途，比如：

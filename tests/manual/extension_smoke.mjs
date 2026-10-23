@@ -114,6 +114,38 @@ ok(wakeSource.includes('tasks: hud?.task_summary || null')
     && hudRendererSource.includes('tasks.uncertain'),
   "HUD renders durable task running/completed/blocked/uncertain counters from the Runtime inbox");
 ok(wakeSource.includes(`const H2W_CONTENT_VERSION = "${manifestVersion}"`), "content version matches manifest");
+// Owned child task contract: a task this conversation dispatched wakes its own
+// conversation even with Auto off, while every other wake stays Auto-gated.
+const autoBindSegmentStart = backgroundSource.indexOf("async function autoBindWatchedSession(");
+const autoBindSegmentEnd = backgroundSource.indexOf("async function refreshAutoBindWatches(", autoBindSegmentStart);
+ok(backgroundSource.includes('const AUTO_BINDING_PERSISTENCE = "auto"')
+    && backgroundSource.includes("async function buildWorkspaceBindingRecord(")
+    && autoBindSegmentStart >= 0
+    && autoBindSegmentEnd > autoBindSegmentStart
+    && backgroundSource.slice(autoBindSegmentStart, autoBindSegmentEnd).includes("persistence: AUTO_BINDING_PERSISTENCE")
+    && backgroundSource.includes('if (!ownTask && !automationEnabledForBinding(b)) return { ok: false, reason: "disabled" };')
+    && backgroundSource.includes("own_task: ownTask === true")
+    && wakeSource.includes("msg?.data?.own_task === true && automationRuntimeAvailable"),
+  "an owned child task wakes its own WebChat conversation with Auto off, and its workspace is bound through the ordinary binding record");
+ok(controlCenterSource.includes("pageContextAutoBindingIds")
+    && controlCenterSource.includes("cc_workspace_bound_auto")
+    && ["en", "ja", "zh"].every((locale) => readFileSync(path.join(EXT, "locales", `${locale}.json`), "utf8")
+      .includes('"cc_workspace_bound_auto": ')),
+  "the Side Panel marks automatic bindings with a localized auto label");
+// The unfinished-task inbox view is opt-in for the auto-binding watch only: the
+// wake/ack path must stay terminal-only and must also filter leaked rows.
+const inboxWakeStart = backgroundSource.indexOf("async function routeAgentTaskInboxWake(");
+const inboxWakeEnd = backgroundSource.indexOf("// ---- Auto binding for a conversation's own child task", inboxWakeStart);
+const inboxWakeSegment = backgroundSource.slice(inboxWakeStart, inboxWakeEnd);
+ok(backgroundSource.includes('url.searchParams.set("include_running", "1")')
+    && backgroundSource.includes("{ browser_session_ref: sessionRef }, { includeRunning: true }")
+    && inboxWakeStart >= 0
+    && inboxWakeEnd > inboxWakeStart
+    && !inboxWakeSegment.includes('searchParams.set("include_running"')
+    && !inboxWakeSegment.includes("includeRunning")
+    && inboxWakeSegment.includes("const terminalInbox = terminalOnlyInbox(inbox);")
+    && inboxWakeSegment.includes("terminalInboxTasks(terminalInbox)"),
+  "only the auto-binding watch asks for unfinished task rows while the wake path stays terminal-only and filters leaked unfinished rows");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
 // Conversation attachment contract: extension-generated ChatGPT turns preserve
 // a provider-owned App identity only from explicit input, the learned binding,

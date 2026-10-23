@@ -115,6 +115,69 @@ const mockContinuityByConversation = new Map();
 const continuityTurnRequests = [];
 const continuityResolveRequests = [];
 const browserRegistryRequests = [];
+const mockTaskInboxes = new Map(); // parent_session_ref -> { tasks: [...] }
+const mockTaskAcks = [];
+const mockTaskInboxQueries = []; // { parent_session_ref, workspace_id, include_running }
+// The Runtime inbox is terminal-only unless the caller opts into the compact
+// unfinished-task view. `supportsIncludeRunning = false` models an older runtime
+// that ignores the flag; `leaksRunningRows` models a runtime that returns an
+// unfinished row without the flag (the extension must still never wake/ack it).
+let mockTaskInboxSupportsIncludeRunning = true;
+let mockTaskInboxLeaksRunningRows = false;
+const MOCK_TERMINAL_LIFECYCLES = new Set(["completed", "blocked", "failed", "delivery_uncertain"]);
+let activePushPort = null;
+
+function mockTaskInboxIsTerminal(task) {
+  if (task?.terminal === false) return false;
+  return task?.terminal === true || MOCK_TERMINAL_LIFECYCLES.has(String(task?.lifecycle || ""));
+}
+
+function mockTaskInboxPayload(parentSessionRef, workspaceId, includeRunning = false) {
+  const row = mockTaskInboxes.get(parentSessionRef) || { tasks: [] };
+  const all = Array.isArray(row.tasks) ? row.tasks : [];
+  const acked = new Set(mockTaskAcks
+    .filter((entry) => entry.parent_session_ref === parentSessionRef)
+    .map((entry) => entry.task_id));
+  const scoped = all
+    .filter((task) => !acked.has(task.task_id))
+    .filter((task) => !workspaceId || task.workspace_id === workspaceId);
+  const summary = { running: 0, completed: 0, blocked: 0, failed: 0, uncertain: 0 };
+  for (const task of all) {
+    if (acked.has(task.task_id)) continue;
+    if (["running", "awaiting_activity", "awaiting_prior_settle"].includes(task.lifecycle)) summary.running += 1;
+    else if (task.lifecycle === "completed") summary.completed += 1;
+    else if (task.lifecycle === "blocked") summary.blocked += 1;
+    else if (task.lifecycle === "failed") summary.failed += 1;
+    else if (task.lifecycle === "delivery_uncertain") summary.uncertain += 1;
+  }
+  const terminalRows = scoped.filter(mockTaskInboxIsTerminal);
+  const runningRows = scoped.filter((task) => !mockTaskInboxIsTerminal(task));
+  const withRunning = includeRunning && mockTaskInboxSupportsIncludeRunning;
+  // The Runtime appends one compact row per unfinished task, sharing the limit.
+  const rows = withRunning
+    ? [...terminalRows, ...runningRows.map((task) => ({
+      task_id: task.task_id,
+      workspace_id: task.workspace_id,
+      lifecycle: task.lifecycle,
+      terminal: false,
+      ...(Number.isSafeInteger(task.awaiting_children) ? { awaiting_children: task.awaiting_children } : {}),
+    }))]
+    : mockTaskInboxLeaksRunningRows
+      ? [...terminalRows, ...runningRows]
+      : terminalRows;
+  return {
+    ok: true,
+    summary,
+    tasks: rows,
+    attention: { ok: true, attempted: false, used: false, advisory_only: true, children: [] },
+  };
+}
+
+function emitPushEvent(event, data) {
+  if (!activePushPort) throw new Error("push stream is not open");
+  const text = `event: ${event}\ndata: ${JSON.stringify(data || {})}\n\n`;
+  activePushPort.send({ type: "stream_chunk", chunk_b64: Buffer.from(text, "utf8").toString("base64") });
+}
 const mcpRequestBodies = [];
 const nativeBatchRequests = [];
 let failNextBrowserEndpointRegistration = true;
@@ -363,6 +426,46 @@ globalThis.chrome = {
         });
         return;
       }
+      if (message.path?.startsWith("/extension/agent/tasks/ack")) {
+        const body = JSON.parse(message.body || "{}");
+        mockTaskAcks.push({ task_id: body.task_id, parent_session_ref: body.parent_session_ref });
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: true, task_id: body.task_id }),
+        });
+        return;
+      }
+      if (message.path?.startsWith("/extension/agent/tasks")) {
+        const query = new URL(`http://127.0.0.1${message.path}`).searchParams;
+        const parentSessionRef = String(query.get("parent_session_ref") || "");
+        const includeRunning = query.get("include_running") === "1";
+        mockTaskInboxQueries.push({
+          parent_session_ref: parentSessionRef,
+          workspace_id: query.get("workspace_id"),
+          include_running: query.get("include_running"),
+        });
+        if (!parentSessionRef) {
+          callback({
+            ok: true,
+            transport: "ipc",
+            status: 400,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ok: false, code: "parent_session_ref_required" }),
+          });
+          return;
+        }
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(mockTaskInboxPayload(parentSessionRef, query.get("workspace_id"), includeRunning)),
+        });
+        return;
+      }
       if (message.path === "/extension/semantic/status") {
         callback({
           ok: true,
@@ -478,7 +581,11 @@ globalThis.chrome = {
                       : body.kind === "space"
                         ? "brsp_grok_project"
                         : "brs_grok_session")
-                    : (body.kind === "account" ? "bra_gemini_account" : "brs_gemini_session"),
+                    : body.provider === "chatgpt" && body.kind === "session"
+                      // ChatGPT sessions are per conversation, so an owned-task
+                      // fixture can address exactly one browser session.
+                      ? `brs_chatgpt_${body.native_identity}`
+                      : (body.kind === "account" ? "bra_gemini_account" : "brs_gemini_session"),
                 kind: body.kind,
               },
             }
@@ -602,6 +709,12 @@ globalThis.chrome = {
         postMessage(message) {
           if (message?.type === "stream"
               && message.path?.startsWith("/push/events?browser_endpoint_ref=bep_")) {
+            activePushPort = {
+              send(payload) {
+                if (disconnected) return;
+                for (const fn of messageListeners) fn(payload);
+              },
+            };
             queueMicrotask(() => {
               if (disconnected) return;
               for (const fn of messageListeners) fn({ type: "stream_open", status: 200, transport: "ipc" });
@@ -3866,6 +3979,404 @@ console.log("\n[ChatGPT Project catalog launch locator]");
   ok(space?.canonical_url === `${PROJECT_KEY}/project`,
     "ChatGPT catalog space locator launches /project, not its bare stable resource key",
     JSON.stringify(space));
+}
+
+console.log("\n[owned child task auto binding]");
+{
+  const sleepFor = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const ownedConvId = "owned-task-1";
+  const ownedConv = `https://chatgpt.com/c/${ownedConvId}`;
+  const ownedTabId = 610;
+  const ownedSessionRef = `brs_chatgpt_${ownedConvId}`;
+  const ownedStoreKey = `${ownedConv}::wOwned`;
+  const OWNED_TASK_ID = "task:owned:1";
+  mockStateWorkspaces = [
+    { id: "wOwned", label: "owned-task", roots: ["/tmp/owned-task"] },
+    { id: "wLegacy", label: "legacy-task", roots: ["/tmp/legacy-task"] },
+  ];
+  mockTaskInboxes.set(ownedSessionRef, {
+    tasks: [{
+      task_id: OWNED_TASK_ID,
+      workspace_id: "wOwned",
+      lifecycle: "running",
+      terminal: false,
+      target: "wOwned:p1",
+      parent_session_ref: ownedSessionRef,
+    }],
+  });
+  const ownedWakes = installAutoWakeContentScript(ownedTabId, ownedConv);
+
+  const automationState = await dispatchMessage(
+    { type: "h2w_automation_state", convKey: ownedConv, site: "chatgpt" },
+    { tab: { id: ownedTabId, url: ownedConv } },
+  );
+  ok(automationState?.ok === true && automationState.enabled === false,
+    "the owned-task conversation starts with Auto off",
+    JSON.stringify(automationState));
+
+  const registered = await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: ownedConv,
+    url: ownedConv,
+    accountNativeIdentity: "chatgpt-owned-task-account",
+  }, { tab: { id: ownedTabId, url: ownedConv } });
+  const ownedBinding = storage.herdrWakeBindings?.[ownedStoreKey];
+  ok(registered?.bound === true
+      && registered?.workspace_id === "wOwned"
+      && registered?.browser_session_ref === ownedSessionRef,
+    "user gets a real workspace binding | Given an unbound conversation whose session inbox lists its own running Herdr task | When the conversation registers with account identity | Then the task's workspace is bound and reported bound",
+    JSON.stringify(registered));
+  ok(ownedBinding?.persistence === "auto"
+      && ownedBinding?.workspace_id === "wOwned"
+      && ownedBinding?.browser_session_ref === ownedSessionRef
+      && ownedBinding?.tabId === ownedTabId
+      && ownedBinding?.continuity_id,
+    "user keeps the ordinary binding record | Given an automatically bound workspace | When the binding is persisted | Then it carries persistence auto plus the observed session, tab and continuity",
+    JSON.stringify(ownedBinding));
+  ok(mockTaskInboxQueries.some((query) => query.parent_session_ref === ownedSessionRef
+      && query.include_running === "1"),
+    "user is bound while the task is still running | Given an unfinished task of this session | When the auto-binding watch reads the inbox | Then it asks for the unfinished-task view instead of waiting for a terminal row",
+    JSON.stringify(mockTaskInboxQueries.filter((query) => query.parent_session_ref === ownedSessionRef)));
+
+  const panelState = await dispatchMessage(
+    { type: "h2w_state", tabId: ownedTabId },
+    { tab: { id: ownedTabId, url: ownedConv } },
+  );
+  const panelBinding = (panelState?.sessionBindings || []).find((entry) => entry.workspace_id === "wOwned");
+  ok(panelBinding?.persistence === "auto",
+    "user can tell an automatic binding apart in the Side Panel | Given a conversation with an automatic binding | When the Side Panel reads its page context | Then the binding reports persistence auto",
+    JSON.stringify(panelState?.sessionBindings));
+
+  ok(await waitForTest(() => Boolean(activePushPort)),
+    "the shared push stream is open for the owned-task fixture");
+
+  // The task turns terminal. The workspace push settle is the only trigger and
+  // Auto stays off for this conversation.
+  mockTaskInboxes.set(ownedSessionRef, {
+    tasks: [{
+      task_id: OWNED_TASK_ID,
+      workspace_id: "wOwned",
+      lifecycle: "completed",
+      terminal: true,
+      terminal_seq: 42,
+      target: "wOwned:p1",
+      parent_session_ref: ownedSessionRef,
+    }],
+  });
+  const wakesBeforeTerminal = ownedWakes.length;
+  const queriesBeforeTerminal = mockTaskInboxQueries.length;
+  emitPushEvent("agent_settled", { workspace: "wOwned", pane: "wOwned:p1", agent: "pi", status: "idle" });
+  const terminalWakeDelivered = await waitForTest(() => ownedWakes.length > wakesBeforeTerminal);
+  const terminalWake = ownedWakes[wakesBeforeTerminal];
+  ok(terminalWakeDelivered
+      && terminalWake?.data?.own_task === true
+      && String(terminalWake?.data?.template || "").includes("Herdr child-task terminal update"),
+    "user is woken by its own task's terminal result with Auto off | Given an automatic binding whose own task turned terminal | When its workspace settles with Auto off | Then the terminal wake is delivered",
+    JSON.stringify(terminalWake));
+  ok(await waitForTest(() => mockTaskAcks.some((entry) => entry.task_id === OWNED_TASK_ID
+      && entry.parent_session_ref === ownedSessionRef)),
+    "the terminal task is acknowledged only after its wake was delivered");
+  const wakePathQueries = mockTaskInboxQueries
+    .slice(queriesBeforeTerminal)
+    .filter((query) => query.parent_session_ref === ownedSessionRef);
+  ok(wakePathQueries.length > 0 && wakePathQueries.every((query) => query.include_running !== "1"),
+    "the wake path never asks for unfinished rows | Given a terminal task owned by this conversation | When the wake and ack read the inbox | Then the request stays terminal-only",
+    JSON.stringify(wakePathQueries));
+
+  // A runtime that returns an unfinished row without the flag must still never
+  // wake or acknowledge it.
+  mockTaskInboxLeaksRunningRows = true;
+  mockTaskInboxes.set(ownedSessionRef, {
+    tasks: [{
+      task_id: "task:owned:leaked-running",
+      workspace_id: "wOwned",
+      lifecycle: "running",
+      terminal: false,
+      target: "wOwned:p1",
+      parent_session_ref: ownedSessionRef,
+    }],
+  });
+  const wakesBeforeLeak = ownedWakes.length;
+  const acksBeforeLeak = mockTaskAcks.length;
+  emitPushEvent("agent_settled", { workspace: "wOwned", pane: "wOwned:p1", agent: "pi", status: "idle" });
+  await sleepFor(250);
+  ok(ownedWakes.length === wakesBeforeLeak && mockTaskAcks.length === acksBeforeLeak,
+    "user is never woken or acked by an unfinished row | Given a runtime that returns a running row on the wake path | When the workspace settles | Then no wake is delivered and nothing is acknowledged",
+    JSON.stringify({ wakes: ownedWakes.slice(wakesBeforeLeak), acks: mockTaskAcks.slice(acksBeforeLeak) }));
+  mockTaskInboxLeaksRunningRows = false;
+  mockTaskInboxes.delete(ownedSessionRef);
+
+  // Flag dependence and compatibility: a Runtime that ignores include_running=1
+  // keeps answering terminal-only, so the conversation binds at the first
+  // terminal task instead of while the task is still running.
+  mockTaskInboxSupportsIncludeRunning = false;
+  const legacyConvId = "owned-task-legacy";
+  const legacyConv = `https://chatgpt.com/c/${legacyConvId}`;
+  const legacyTabId = 613;
+  const legacySessionRef = `brs_chatgpt_${legacyConvId}`;
+  const legacyStoreKey = `${legacyConv}::wLegacy`;
+  const legacyWakes = installAutoWakeContentScript(legacyTabId, legacyConv);
+  mockTaskInboxes.set(legacySessionRef, {
+    tasks: [{
+      task_id: "task:owned:legacy",
+      workspace_id: "wLegacy",
+      lifecycle: "running",
+      terminal: false,
+      target: "wLegacy:p1",
+      parent_session_ref: legacySessionRef,
+    }],
+  });
+  const legacyRegistered = await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: legacyConv,
+    url: legacyConv,
+    accountNativeIdentity: "chatgpt-owned-task-account",
+  }, { tab: { id: legacyTabId, url: legacyConv } });
+  ok(legacyRegistered?.bound === false && !storage.herdrWakeBindings?.[legacyStoreKey],
+    "user is not bound early by a runtime without the unfinished-task view | Given a running task and a runtime that ignores include_running | When the conversation registers | Then it stays unbound until the task turns terminal",
+    JSON.stringify(legacyRegistered));
+  mockTaskInboxes.set(legacySessionRef, {
+    tasks: [{
+      task_id: "task:owned:legacy",
+      workspace_id: "wLegacy",
+      lifecycle: "completed",
+      terminal: true,
+      terminal_seq: 61,
+      target: "wLegacy:p1",
+      parent_session_ref: legacySessionRef,
+    }],
+  });
+  testClockOffsetMs += 5000;
+  const legacyWakesBefore = legacyWakes.length;
+  emitPushEvent("agent_settled", { workspace: "wOwned", pane: "wOwned:p1", agent: "pi", status: "idle" });
+  const legacyBoundAtTerminal = await waitForTest(() => Boolean(storage.herdrWakeBindings?.[legacyStoreKey]));
+  const legacyBinding = storage.herdrWakeBindings?.[legacyStoreKey];
+  ok(legacyBoundAtTerminal
+      && legacyBinding?.persistence === "auto"
+      && legacyBinding?.browser_session_ref === legacySessionRef,
+    "user is still bound by a runtime without the unfinished-task view | Given a runtime that only answers terminal rows | When the task turns terminal | Then the binding is created from that terminal row",
+    JSON.stringify(legacyBinding));
+  ok(await waitForTest(() => legacyWakes.length > legacyWakesBefore),
+    "the terminal-row binding still gets its Auto-off own-task wake");
+  mockTaskInboxSupportsIncludeRunning = true;
+
+  // Pane-level wakes keep requiring Auto even on an automatic binding.
+  const wakesBeforePane = ownedWakes.length;
+  emitPushEvent("agent_working", { workspace: "wOwned", pane: "wOwned:p1", agent: "pi" });
+  await sleepFor(60);
+  emitPushEvent("agent_settled", { workspace: "wOwned", pane: "wOwned:p1", agent: "pi", status: "idle" });
+  await sleepFor(200);
+  ok(ownedWakes.length === wakesBeforePane,
+    "user gets no pane-level wake with Auto off | Given an automatic binding and no pending terminal task | When a pane settles with Auto off | Then no wake is delivered",
+    JSON.stringify(ownedWakes.slice(wakesBeforePane)));
+
+  // A task can appear while the conversation is still unbound, so the watch has
+  // to react to a workspace push event even when that event belongs to a
+  // different workspace than the task's own.
+  const pushConvId = "owned-task-push";
+  const pushConv = `https://chatgpt.com/c/${pushConvId}`;
+  const pushTabId = 612;
+  const pushSessionRef = `brs_chatgpt_${pushConvId}`;
+  mockStateWorkspaces = [
+    { id: "wOwned", label: "owned-task", roots: ["/tmp/owned-task"] },
+    { id: "wPush", label: "push-task", roots: ["/tmp/push-task"] },
+  ];
+  const pushWakes = installAutoWakeContentScript(pushTabId, pushConv);
+  const pushRegistered = await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: pushConv,
+    url: pushConv,
+    accountNativeIdentity: "chatgpt-owned-task-account",
+  }, { tab: { id: pushTabId, url: pushConv } });
+  ok(pushRegistered?.bound === false
+      && !storage.herdrWakeBindings?.[`${pushConv}::wPush`],
+    "an unbound conversation with an empty inbox stays unbound",
+    JSON.stringify(pushRegistered));
+  mockTaskInboxes.set(pushSessionRef, {
+    tasks: [{
+      task_id: "task:owned:push",
+      workspace_id: "wPush",
+      lifecycle: "running",
+      terminal: false,
+      target: "wPush:p1",
+      parent_session_ref: pushSessionRef,
+    }],
+  });
+  testClockOffsetMs += 5000;
+  emitPushEvent("agent_settled", { workspace: "wOwned", pane: "wOwned:p1", agent: "pi", status: "idle" });
+  const pushBound = await waitForTest(() => Boolean(storage.herdrWakeBindings?.[`${pushConv}::wPush`]));
+  const pushBinding = storage.herdrWakeBindings?.[`${pushConv}::wPush`];
+  ok(pushBound && pushBinding?.persistence === "auto"
+      && pushBinding?.workspace_id === "wPush",
+    "user gets bound by a push event in another workspace | Given a watched unbound conversation | When its own task appears and any workspace settles | Then the task's workspace is bound automatically",
+    JSON.stringify(pushBinding));
+  // A binding created outside h2w_register must still carry the Runtime-issued
+  // session identity: it scopes the own-task inbox and the removal record.
+  ok(pushBinding?.browser_session_ref === pushSessionRef
+      && Number.isSafeInteger(pushBinding?.browser_generation)
+      && pushBinding.browser_generation > 0
+      && pushBinding?.browser_account_ref === "bra_gemini_account",
+    "user keeps the Runtime session identity on a push-created binding | Given an automatic binding created from a push event | When it is persisted | Then it carries the observed browser session ref, account ref and generation",
+    JSON.stringify(pushBinding));
+
+  // The same push-created binding owns the Auto-off terminal wake and its ack.
+  mockTaskInboxes.set(pushSessionRef, {
+    tasks: [{
+      task_id: "task:owned:push",
+      workspace_id: "wPush",
+      lifecycle: "completed",
+      terminal: true,
+      terminal_seq: 51,
+      target: "wPush:p1",
+      parent_session_ref: pushSessionRef,
+    }],
+  });
+  const pushWakesBefore = pushWakes.length;
+  emitPushEvent("agent_settled", { workspace: "wPush", pane: "wPush:p1", agent: "pi", status: "idle" });
+  const pushWakeDelivered = await waitForTest(() => pushWakes.length > pushWakesBefore);
+  ok(pushWakeDelivered
+      && pushWakes[pushWakesBefore]?.data?.own_task === true
+      && String(pushWakes[pushWakesBefore]?.data?.template || "").includes("Herdr child-task terminal update"),
+    "user is woken by a push-created binding's own terminal task with Auto off | Given an automatic binding created from a push event | When its own task turns terminal | Then the own-task wake is delivered",
+    JSON.stringify(pushWakes[pushWakesBefore]));
+  ok(await waitForTest(() => mockTaskAcks.some((entry) => entry.task_id === "task:owned:push"
+      && entry.parent_session_ref === pushSessionRef)),
+    "the push-created binding's terminal task is acknowledged after delivery");
+
+  // Removing a push-created automatic binding is remembered too.
+  mockTaskInboxes.set(pushSessionRef, {
+    tasks: [{
+      task_id: "task:owned:push:2",
+      workspace_id: "wPush",
+      lifecycle: "blocked",
+      terminal: true,
+      terminal_seq: 52,
+      target: "wPush:p1",
+      parent_session_ref: pushSessionRef,
+    }],
+  });
+  const pushUnbound = await dispatchMessage(
+    { type: "h2w_unbind", binding_key: pushConv, workspace_id: "wPush" },
+    { tab: { id: pushTabId, url: pushConv } },
+  );
+  ok(pushUnbound?.ok === true && !storage.herdrWakeBindings?.[`${pushConv}::wPush`],
+    "the push-created automatic binding is removable like any other binding",
+    JSON.stringify(pushUnbound));
+  const pushReRegistered = await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: pushConv,
+    url: pushConv,
+    accountNativeIdentity: "chatgpt-owned-task-account",
+  }, { tab: { id: pushTabId, url: pushConv } });
+  await sleepFor(50);
+  ok(pushReRegistered?.bound === false && !storage.herdrWakeBindings?.[`${pushConv}::wPush`]
+      && (sessionStorage.herdrAutoBindWatchesV1?.suppressed || [])
+        .some((row) => row.key === `${pushSessionRef}::wPush`),
+    "a removed push-created automatic binding is not recreated | Given a user-removed automatic binding from the push path | When the same session registers again with a pending task | Then no binding returns and the removal is recorded",
+    JSON.stringify({ registered: pushReRegistered, autoState: sessionStorage.herdrAutoBindWatchesV1 }));
+
+  // An active handoff blocks the owned-task wake and must not acknowledge.
+  storage.herdrConversationTransfers = {
+    hh_owned_task: {
+      handoff_id: "hh_owned_task",
+      source_conv_key: ownedConv,
+      status: "summary_requested",
+      project_id: null,
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    },
+  };
+  mockTaskInboxes.set(ownedSessionRef, {
+    tasks: [{
+      task_id: "task:owned:2",
+      workspace_id: "wOwned",
+      lifecycle: "failed",
+      terminal: true,
+      terminal_seq: 43,
+      target: "wOwned:p1",
+      parent_session_ref: ownedSessionRef,
+    }],
+  });
+  const wakesBeforeHandoff = ownedWakes.length;
+  const acksBeforeHandoff = mockTaskAcks.length;
+  emitPushEvent("agent_settled", { workspace: "wOwned", pane: "wOwned:p1", agent: "pi", status: "idle" });
+  await sleepFor(250);
+  ok(ownedWakes.length === wakesBeforeHandoff,
+    "user gets no owned-task wake while a handoff is active | Given an active handoff from this conversation | When its own task turns terminal | Then no wake is delivered",
+    JSON.stringify(ownedWakes.slice(wakesBeforeHandoff)));
+  ok(mockTaskAcks.length === acksBeforeHandoff,
+    "a blocked owned-task wake does not acknowledge the task");
+  delete storage.herdrConversationTransfers;
+
+  // Removing the automatic binding is a user decision and must stick.
+  const unbound = await dispatchMessage(
+    { type: "h2w_unbind", binding_key: ownedConv, workspace_id: "wOwned" },
+    { tab: { id: ownedTabId, url: ownedConv } },
+  );
+  ok(unbound?.ok === true && !storage.herdrWakeBindings?.[ownedStoreKey],
+    "the automatic binding is removable like any other binding",
+    JSON.stringify(unbound));
+  const reRegistered = await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: ownedConv,
+    url: ownedConv,
+    accountNativeIdentity: "chatgpt-owned-task-account",
+  }, { tab: { id: ownedTabId, url: ownedConv } });
+  await sleepFor(50);
+  ok(reRegistered?.bound === false && !storage.herdrWakeBindings?.[ownedStoreKey],
+    "a removed automatic binding is not recreated for the same browser session",
+    JSON.stringify(reRegistered));
+  const storedAutoState = sessionStorage.herdrAutoBindWatchesV1;
+  ok(Array.isArray(storedAutoState?.suppressed)
+      && storedAutoState.suppressed.some((row) => row.key === `${ownedSessionRef}::wOwned`),
+    "the removal is recorded so the same session cannot re-create the binding",
+    JSON.stringify(storedAutoState));
+
+  // Registration without account identity cannot produce a session, a watch or
+  // a binding: the Runtime never issued that identity.
+  const anonConvId = "owned-task-anon";
+  const anonConv = `https://chatgpt.com/c/${anonConvId}`;
+  const anonTabId = 611;
+  mockTaskInboxes.set(`brs_chatgpt_${anonConvId}`, {
+    tasks: [{
+      task_id: "task:owned:anon",
+      workspace_id: "wOwned",
+      lifecycle: "completed",
+      terminal: true,
+      terminal_seq: 44,
+      target: "wOwned:p1",
+      parent_session_ref: `brs_chatgpt_${anonConvId}`,
+    }],
+  });
+  installAutoWakeContentScript(anonTabId, anonConv);
+  const anonRegistered = await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: anonConv,
+    url: anonConv,
+  }, { tab: { id: anonTabId, url: anonConv } });
+  ok(anonRegistered?.bound === false && anonRegistered?.browser_session_ref == null,
+    "user cannot get a binding from an unidentified page | Given a conversation registration without account identity | When the Runtime cannot issue a browser session | Then the registration stays unbound",
+    JSON.stringify(anonRegistered));
+  ok(!storage.herdrWakeBindings?.[`${anonConv}::wOwned`],
+    "no automatic binding is created without a Runtime-issued session ref");
+  const watchedSessions = sessionStorage.herdrAutoBindWatchesV1?.watches || [];
+  ok(!watchedSessions.some((watch) => watch?.convKey === anonConv),
+    "no session watch is remembered without account identity",
+    JSON.stringify(watchedSessions));
+
+  tabs.delete(ownedTabId);
+  tabs.delete(legacyTabId);
+  tabs.delete(pushTabId);
+  tabs.delete(anonTabId);
+  mockTaskInboxes.clear();
+  mockStateWorkspaces = [];
+  testClockOffsetMs -= 5000;
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);
