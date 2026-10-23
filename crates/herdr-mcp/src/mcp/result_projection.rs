@@ -30,14 +30,13 @@ pub(super) fn model_visible_tool_output(name: &str, arguments: &Value, output: V
         .flatten();
     let skill_surface = name == "herdr_skill"
         || method.is_some_and(|method| method.starts_with("herdr_mcp.skill."));
-    let output = neutralize_model_visible_metadata(output, None);
-    let mut output = if skill_surface {
-        suppress_model_visible_skill_text(output)
-    } else {
-        output
-    };
+    let mut output = neutralize_model_visible_metadata(output, None);
+    // Skill surfaces keep the policy bodies the caller explicitly requested
+    // (`content`, including nested per-skill bodies); the generic advisory
+    // neutralization above still applies to them. The marker stays for
+    // consumers, now reporting that the requested text is model-visible.
     if skill_surface && let Some(object) = output.as_object_mut() {
-        object.insert("reference_text_exposed".to_owned(), json!(false));
+        object.insert("reference_text_exposed".to_owned(), json!(true));
     }
     output
 }
@@ -68,26 +67,6 @@ fn neutralize_model_visible_metadata(value: Value, parent_key: Option<&str>) -> 
             }
             Value::Object(visible)
         }
-        other => other,
-    }
-}
-
-fn suppress_model_visible_skill_text(value: Value) -> Value {
-    match value {
-        Value::Array(values) => Value::Array(
-            values
-                .into_iter()
-                .map(suppress_model_visible_skill_text)
-                .collect(),
-        ),
-        Value::Object(object) => Value::Object(
-            object
-                .into_iter()
-                .filter_map(|(key, value)| {
-                    (key != "content").then(|| (key, suppress_model_visible_skill_text(value)))
-                })
-                .collect(),
-        ),
         other => other,
     }
 }
@@ -146,18 +125,66 @@ mod tests {
             visible["structured_output"],
             json!({"hint": "user-owned-json", "value": 7})
         );
+    }
 
+    #[test]
+    fn skill_surfaces_keep_requested_policy_bodies_and_still_drop_advisory_prose() {
         let skill = model_visible_tool_output(
             "herdr_skill",
             &json!({}),
             json!({
                 "ok": true,
                 "content": "planner policy text",
-                "project_skill": {"origin": "bundled"}
+                "hint": "load more policy",
+                "instructions": "use another tool",
+                "project_skill": {"origin": "bundled", "retry_hint": "retry this way"}
             }),
         );
-        assert!(skill.get("content").is_none());
+        assert_eq!(skill["content"], "planner policy text");
+        assert!(skill.get("hint").is_none());
+        assert!(skill.get("instructions").is_none());
         assert_eq!(skill["project_skill"]["origin"], "bundled");
-        assert_eq!(skill["reference_text_exposed"], false);
+        assert!(skill["project_skill"].get("retry_hint").is_none());
+        assert_eq!(skill["reference_text_exposed"], true);
+
+        // Nested per-skill bodies in progressive load results are policy
+        // documents the planner explicitly requested, so they stay verbatim.
+        let loaded = model_visible_tool_output(
+            "herdr_call",
+            &json!({
+                "method": "herdr_mcp.skill.load",
+                "params": {"ids": ["git-repository", "files-search"]}
+            }),
+            json!({
+                "ok": true,
+                "method": "herdr_mcp.skill.load",
+                "skills": [
+                    {
+                        "id": "git-repository",
+                        "content": "## Git policy\ncommit by theme",
+                        "next_action": "load more"
+                    },
+                    {"id": "files-search", "content": "## Search policy", "stream_hint": "x"}
+                ],
+                "recovery": {"action": "reload"}
+            }),
+        );
+        assert_eq!(
+            loaded["skills"][0]["content"],
+            "## Git policy\ncommit by theme"
+        );
+        assert!(loaded["skills"][0].get("next_action").is_none());
+        assert_eq!(loaded["skills"][1]["content"], "## Search policy");
+        assert!(loaded["skills"][1].get("stream_hint").is_none());
+        assert!(loaded.get("recovery").is_none());
+        assert_eq!(loaded["reference_text_exposed"], true);
+
+        // Non-skill callers never gain the skill marker.
+        let exec = model_visible_tool_output(
+            "herdr_exec",
+            &json!({"workspace": "w1"}),
+            json!({"ok": true, "hint": "do something next"}),
+        );
+        assert!(exec.get("reference_text_exposed").is_none());
     }
 }

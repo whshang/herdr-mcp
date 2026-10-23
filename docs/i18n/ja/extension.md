@@ -93,6 +93,33 @@ herdr-mcp Rust runtime
 
 ブラウザは操作と可視化を所有し、Native Host は信頼されたローカルブリッジであり、ツール schema、managed-root チェック、権限、mutation 境界は引き続き runtime が所有します。公開 OAuth/MCP とローカル Native Messaging は別々の信頼境界です。
 
+## Linux と Google Chrome
+
+macOS と Linux は同じ Native Messaging 契約を使います。管理 runtime は mode-`0600` の `~/.config/herdr-mcp/extension.sock` で拡張 IPC を提供します。ブラウザ manifest はちょうど一つの `chrome-extension://<id>/` origin だけを許可し、安定 wrapper `~/.config/herdr-mcp/native/herdr-extension-host` を指します。wrapper は同じディレクトリの runtime コピーを `herdr-mcp extension-host` として起動します。Host は loopback bearer を受け付けず、`127.0.0.1:8772` への匿名 TCP は拒否されたままです。
+
+`herdr-mcp native-host install` は常に Google Chrome を登録します。Chromium、Chrome for Testing、Chrome Beta、Chrome Dev（`google-chrome-unstable`）、Brave、Microsoft Edge は、そのブラウザの設定ディレクトリが既にあるときだけ登録します。既定のパス:
+
+| ブラウザ | Manifest ディレクトリ |
+| --- | --- |
+| Google Chrome | `~/.config/google-chrome/NativeMessagingHosts/dev.herdr.mcp.json` |
+| Chromium | `~/.config/chromium/NativeMessagingHosts/dev.herdr.mcp.json` |
+| Chrome for Testing | `~/.config/google-chrome-for-testing/NativeMessagingHosts/dev.herdr.mcp.json` |
+
+プロセスの home で `XDG_CONFIG_HOME` が絶対パスのとき、これらのディレクトリは `$XDG_CONFIG_HOME` の下に作られます。管理 wrapper を指さない手書き manifest は外部ファイルです。`native-host install` は所有していない host ファイルを奪わないので、先に削除してください。
+
+`--user-data-dir` 付きで起動した Chrome は、既定の設定ディレクトリではなく `<user-data-dir>/NativeMessagingHosts/` から native host を読みます。`native-host install` または `native-host use` に `--user-data-dir` を繰り返して渡せます。`native-host status` はそれらのディレクトリを表示し、`native-host rollback` は前の集合を戻します。プロファイルディレクトリは既に存在し、symlink であってはなりません。
+
+socket を作るのは `native-host install` ではなく管理 runtime です。`herdr-mcp service install`（更新と `herdr-mcp dev sync` もこれを実行します）は user systemd unit または切り離されたプロセス環境を書き直し、`HERDR_EXTENSION_IPC_SOCKET` を付けて runtime を再起動します。古い unit に対する `service restart` だけではこの変数は追加されません。新しい runtime が起動したあと channel を登録し、Chrome を再起動して host を起動させます。
+
+```bash
+herdr-mcp service install
+herdr-mcp native-host use standalone
+# または: herdr-mcp native-host install
+herdr-mcp native-host status
+```
+
+その後、拡張を再読み込みする（または Chrome を再起動する）と、`herdr-mcp webchat endpoints` にブラウザ endpoint が出ます。`extension.sock` は自分のユーザーが所有する mode-`0600` の socket です。
+
 ## 初回利用
 
 1. Runtime と ChatGPT Connector がすでに動作していることを確認します。

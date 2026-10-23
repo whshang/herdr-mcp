@@ -160,7 +160,7 @@ fn detect_parent_browser_family() -> String {
     classify_browser_family(&command).to_owned()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn owner_is_active(expected_origin: &str, registered_origin: Option<&str>) -> bool {
     registered_origin == Some(expected_origin)
 }
@@ -171,16 +171,9 @@ fn require_active_owner(config: &HostConfig) -> Result<(), String> {
     if !config.enforce_owner_fence {
         return Ok(());
     }
-    #[cfg(target_os = "macos")]
-    {
-        let registered = crate::native_host_install::current_registered_extension_origin()?;
-        if !owner_is_active(&config.expected_origin, registered.as_deref()) {
-            return Err("extension_origin_not_active".to_owned());
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = config;
+    let registered = crate::native_host_install::current_registered_extension_origin()?;
+    if !owner_is_active(&config.expected_origin, registered.as_deref()) {
+        return Err("extension_origin_not_active".to_owned());
     }
     Ok(())
 }
@@ -318,7 +311,7 @@ fn expected_extension_origin() -> Result<String, String> {
     Ok(crate::browser_extension_identity::official_store_identity()?.origin)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(crate) fn extension_path_for_install() -> Result<PathBuf, String> {
     extension_path_for_install_optional()?.ok_or_else(|| {
         "extension directory not found: set HERDR_EXTENSION_PATH to an unpacked development extension directory when using an unpacked build"
@@ -348,7 +341,7 @@ fn is_extension_dir(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn require_extension_dir(path: &Path, context: &str) -> Result<PathBuf, String> {
+pub(crate) fn require_extension_dir(path: &Path, context: &str) -> Result<PathBuf, String> {
     if is_extension_dir(path) {
         Ok(path.to_path_buf())
     } else {
@@ -360,7 +353,7 @@ fn require_extension_dir(path: &Path, context: &str) -> Result<PathBuf, String> 
 }
 
 #[cfg(unix)]
-fn validate_extension_origin(origin: &str) -> Result<&str, String> {
+pub(crate) fn validate_extension_origin(origin: &str) -> Result<&str, String> {
     let Some(id) = origin
         .strip_prefix("chrome-extension://")
         .and_then(|value| value.strip_suffix('/'))
@@ -374,7 +367,7 @@ fn validate_extension_origin(origin: &str) -> Result<&str, String> {
 }
 
 #[cfg(unix)]
-fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1002,7 +995,6 @@ mod tests {
         assert!(validate_extension_origin("https://example.com/").is_err());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn active_owner_fence_requires_the_exact_current_origin() {
         let expected = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/";

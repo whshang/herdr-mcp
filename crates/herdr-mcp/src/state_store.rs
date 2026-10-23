@@ -24,6 +24,8 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 mod schema;
+pub(crate) mod work_journal;
+use work_journal::ensure_work_journal_auxiliary_schema;
 
 use schema::{
     META_SCHEMA_VERSION, db_file_name, ensure_browser_archive_auxiliary_schema,
@@ -682,6 +684,7 @@ impl StateStore {
             migrate(&mut conn)?;
             ensure_browser_archive_auxiliary_schema(&conn)?;
             ensure_browser_dispatch_auxiliary_schema(&conn)?;
+            ensure_work_journal_auxiliary_schema(&conn)?;
             return Ok(Self { path: None, conn });
         }
 
@@ -693,6 +696,7 @@ impl StateStore {
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
+        ensure_work_journal_auxiliary_schema(&conn)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
             conn,
@@ -718,6 +722,7 @@ impl StateStore {
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
+        ensure_work_journal_auxiliary_schema(&conn)?;
         Ok(Self {
             path: Some(path),
             conn,
@@ -1072,6 +1077,31 @@ impl StateStore {
             )
             .optional()
             .map_err(|error| format!("cannot read operation ledger: {error}"))
+    }
+
+    pub fn task_operation_ids_by_key_digest(
+        &self,
+        kind: &str,
+        digest: &str,
+        now_ms: i64,
+    ) -> Result<Vec<String>, String> {
+        // Search all live task records. Two matches already make ownership
+        // ambiguous, regardless of which targets or sessions they contain.
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT op_id FROM operations
+             WHERE kind = ?1
+               AND idempotency_key = ?2
+               AND (expires_at IS NULL OR expires_at > ?3)
+             LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare task lookup: {error}"))?;
+        statement
+            .query_map(params![kind, digest, now_ms], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query task lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read task lookup: {error}"))
     }
 
     pub fn operation_ledgers(
@@ -9463,7 +9493,9 @@ mod tests {
                 "browser_resource_locators",
                 "browser_session_archive_intents",
                 "browser_session_reservations",
-                "browser_source_turns"
+                "browser_source_turns",
+                "work_events",
+                "work_state"
             ]
         );
         assert!(!tables_after.contains(&"browser_delivery_events".to_owned()));

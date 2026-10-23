@@ -43,17 +43,6 @@ function neutralizeModelVisibleMetadata(value: unknown, parentKey?: string): unk
   return out;
 }
 
-function suppressSkillPolicyText(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(suppressSkillPolicyText);
-  if (!isRecord(value)) return value;
-  const out: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value)) {
-    if (key === "content") continue;
-    out[key] = suppressSkillPolicyText(child);
-  }
-  return out;
-}
-
 function isSkillSurface(toolName?: string, args?: Record<string, unknown>): boolean {
   const method = toolName === "herdr_call" && typeof args?.method === "string" ? args.method : null;
   return toolName === "herdr_skill" || method?.startsWith("herdr_mcp.skill.") === true;
@@ -64,11 +53,12 @@ function modelVisibleStructured(
   toolName?: string,
   args?: Record<string, unknown>,
 ): Record<string, unknown> {
-  const skillSurface = isSkillSurface(toolName, args);
-  const neutralized = neutralizeModelVisibleMetadata(structured);
-  const visible = skillSurface ? suppressSkillPolicyText(neutralized) : neutralized;
-  const out = structuredObject(visible);
-  if (skillSurface) out.reference_text_exposed = false;
+  // Skill surfaces keep the policy bodies the caller explicitly requested
+  // (`content`, including nested per-skill bodies); the generic advisory
+  // neutralization still applies to them. The marker stays for consumers, now
+  // reporting that the requested text is model-visible.
+  const out = structuredObject(neutralizeModelVisibleMetadata(structured));
+  if (isSkillSurface(toolName, args)) out.reference_text_exposed = true;
   return out;
 }
 
@@ -95,7 +85,6 @@ export function normalizeSuccessfulToolResult(
     return callToolResult(modelVisibleStructured(structuredObject(value), toolName, args));
   }
 
-  const skillSurface = isSkillSurface(toolName, args);
   const result: Record<string, unknown> = { ...value };
   if (isRecord(value.structuredContent)) {
     result.structuredContent = modelVisibleStructured(value.structuredContent, toolName, args);
@@ -108,9 +97,9 @@ export function normalizeSuccessfulToolResult(
       const visible = modelVisibleStructured(parsed, toolName, args);
       return { ...item, text: JSON.stringify(visible) };
     } catch {
-      return skillSurface
-        ? { ...item, text: JSON.stringify({ reference_text_exposed: false }) }
-        : item;
+      // Non-JSON text is caller-facing text the Edge cannot inspect, so it
+      // passes through verbatim on every surface.
+      return item;
     }
   });
   return result;

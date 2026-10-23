@@ -312,6 +312,14 @@ Agent 应按这个顺序做：
 - **写操作按账号范围串行化**，不要试图并行执行互相冲突的修改。
 - **不要创建第二套状态权威。** 页面、Project、会话都不能替代 Continuity/Work Memory。
 
+### 浏览器 endpoint 在线判定与 Runtime 切换
+
+参见 [#632](https://github.com/whshang/herdr-mcp/issues/632)。
+
+- **在线规则。** 只有在**当前 Runtime generation** 的注册表中已注册（本次 Runtime 启动后注册或重新观察过），并且扩展正在轮询 `/push/events` 的 browser endpoint 才算在线。只轮询但未注册、或只有上一个 generation 遗留的陈旧注册的 endpoint 一律视为离线：浏览器变更会立刻返回可重试的 `not_delivered`（例如 `browser_page_unavailable`），而不是等到超时。push 的 `hello` 帧会报告 `endpoint_registered`。
+- **超时结果。** actuation 超时时，如果命令仍在队列中、从未被任何扩展取走，Runtime 会把它移出队列（之后不可能再被投递），并返回带 `retry_safe: true` 的 `not_delivered`，可以安全地重试原意图。只有已经交给扩展的命令才保留 `delivery_unknown`：先重新观察，不要盲目重试。
+- **升级顺序。** 切换 Runtime **之前**，先把浏览器扩展升级到 `0.1.203` 或更高版本。扩展 `0.1.203` 在 Runtime 的 `boot_id` 变化、或 `hello` 携带 `endpoint_registered: false` 时会自动重新注册 endpoint。旧扩展在 Runtime 切换后会显示离线，直到其 service worker 重启；临时办法：在 `chrome://extensions` 中只重载扩展的 service worker（无需重启 Chrome）。
+
 ## 9. Continuity / Work Memory / Browser session 的区别
 
 | 概念 | 负责什么 | 不要混淆成 |
@@ -336,7 +344,7 @@ Agent 应按这个顺序做：
 | 同一个会话被两个 browser endpoint 观测过 | canonical URL 必须唯一解析到一个已登记的 session。两个不同 session 共享同一 URL 即为歧义，直接返回 `browser_canonical_url_ambiguous`，不会按最新观测选择，source-anchored create 与 handoff 都不会改投到其他 profile/account 的 session。重新观测不会移除另一个 session 的记录，该 URL 对 source-anchored create 与 handoff 仍然有歧义；请改用显式指定 endpoint、provider、account 与 generation 的 direct create |
 | dispatch 超时 | 先读 `herdr-mcp webchat dispatch-status DISPATCH_ID`，再观测会话，然后才决策 |
 | 写操作 delivery 不确定 | 先重新观测。不要换新 idempotency key 重发 |
-| `code: "caller_grant_missing"` | 你不在受信任本地路径上（例如裸 TCP MCP 客户端）。请使用 `herdr-mcp` CLI，它自己附带本地 grant；grant 无法通过 TCP 自证 |
+| `code: "caller_grant_missing"` | 两种原因之一。(1) 你不在受信任本地路径上（例如裸 TCP MCP 客户端）：请改用 `herdr-mcp` CLI，它自己附带本地 grant——grant 无法通过 TCP 自证。(2) 调用方是远程 connector，其 Page Assist grant 缺失或已失效：Page Assist grant 绑定 `{connector_id, grant_generation, device_id, endpoint_ref}`，ChatGPT 重新授权（产生新 `connector_id`）或扩展 ID 变化（产生新 `endpoint_ref`）都会使旧 grant 静默失效。由 workstation 所有者按顺序恢复：`herdr-mcp connector list` → `browser_endpoint.list`（CLI：`herdr-mcp webchat endpoints`；选在线且版本最新的端点）→ `herdr-mcp connector page-assist allow CONNECTOR_ID DEVICE_ID ENDPOINT_REF --confirm` |
 | `code: "unsupported"` | 该操作不在当前支持矩阵内（见“能力发现”），请如实报告而不是模拟实现 |
 | 能找到 continuity，但 browser session 已不在 | 先解析持久状态（`continuity resume`），再创建/打开目标会话；不要把页面消失当成历史丢失 |
 | session 存在但 `work_memory` 为 `null` | 停在 Continuity 层。没有可用的 `project_ref`/`repo_id`/`work_chain_id`，也不允许合成 |

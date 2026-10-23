@@ -22,7 +22,7 @@ import {
   newContinuityId, newTransferId, shouldDiscardRetiredSourceTab,
 } from "./continuity-core.js";
 import {
-  CONTINUITY_JOURNAL_STORAGE_KEY, turnFingerprint,
+  CONTINUITY_JOURNAL_STORAGE_KEY, continuityJournalEntry, turnFingerprint,
 } from "./continuity-journal.js";
 import {
   classifyCheckpointPutError, createBoundedSupervisorAdapter, deriveGoalLedger,
@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.202";
+const H2W_SCRIPT_VERSION = "0.1.212";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -2301,7 +2301,7 @@ function browserEndpointView(endpoint) {
 }
 
 async function setLocalBrowserWebchatControlConsent() {
-  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const endpoint = await currentBrowserEndpoint();
   const current = browserEndpointView(endpoint);
   if (!endpoint?.endpoint_ref || !current) throw new Error("browser-endpoint-unavailable");
   const profileSeed = await getOrCreateBrowserProfileSeed();
@@ -2348,7 +2348,98 @@ async function recoverOpenChatGptBrowserRegistry() {
   return { observed };
 }
 
-async function registerLocalBrowserEndpoint() {
+// ---- #632 browser endpoint runtime reconciliation (begin) ----
+// One owner for endpoint registration: every caller (push hello, keepalive
+// runtime check, stream reconnect, rebuild, consent) goes through the
+// single-flight registerLocalBrowserEndpoint(), so concurrent triggers share one
+// endpoint.register. A runtime generation switch (new boot_id) or a hello that
+// reports endpoint_registered:false clears the cached endpoint and re-registers
+// at most once per boot_id, without needing a service-worker restart.
+let browserEndpointRegistration = null;
+let browserEndpointHelloBootId = null;
+let browserEndpointReregisteredBootId = null;
+// #632: the runtime evaluates endpoint registration when the push stream opens,
+// so a stream it opened while reporting endpoint_registered:false keeps refusing
+// actuation even after the same derived endpoint_ref is re-registered. This
+// demand survives a failed registration attempt and is cleared once one actually
+// succeeded, so the refresh is claimed at most once per boot_id.
+let browserEndpointStreamRefreshPending = false;
+
+function registerLocalBrowserEndpoint() {
+  if (!browserEndpointRegistration) {
+    browserEndpointRegistration = registerLocalBrowserEndpointOnce().finally(() => {
+      browserEndpointRegistration = null;
+    });
+  }
+  return browserEndpointRegistration;
+}
+
+/** Cached endpoint, or the in-flight / a fresh single-flight registration. */
+async function currentBrowserEndpoint() {
+  if (browserEndpointRegistration) return browserEndpointRegistration;
+  return browserEndpoint || registerLocalBrowserEndpoint();
+}
+
+/**
+ * Drop the cached endpoint and re-register (single-flight). Returns null when a
+ * re-register was already triggered for this boot_id, so a runtime that keeps
+ * reporting endpoint_registered:false cannot cause a registration loop.
+ */
+function invalidateBrowserEndpointForRuntime(bootId, reason) {
+  const id = String(bootId || "").trim();
+  if (id && browserEndpointReregisteredBootId === id) return null;
+  if (id) browserEndpointReregisteredBootId = id;
+  callLog(`browser endpoint re-register (${reason}) boot=${id || "-"}`);
+  browserEndpointStreamRefreshPending = true;
+  browserEndpoint = null;
+  return registerLocalBrowserEndpoint();
+}
+
+/**
+ * #632: the runtime only re-evaluates registration when the push stream opens,
+ * so a stream opened before the endpoint's registration became visible must be
+ * replaced. A failed registration attempt leaves the demand pending for the next
+ * trigger (keepalive, control center) instead of dropping the recovery, and the
+ * demand is cleared only once the replacement is actually scheduled.
+ */
+async function refreshPushStreamAfterEndpointRegistration() {
+  if (!browserEndpointStreamRefreshPending) return false;
+  if (!pushStream) {
+    // No stream was opened as unregistered, so nothing has to be replaced.
+    browserEndpointStreamRefreshPending = false;
+    return false;
+  }
+  const bindings = await loadBindings();
+  browserEndpointStreamRefreshPending = false;
+  callLog("push stream refreshed after browser endpoint re-register");
+  stopPushStream();
+  ensurePushStream(bindings);
+  return true;
+}
+
+/** Push hello: detect a runtime switch or a missing registration and self-heal. */
+async function reconcileBrowserEndpointForHello(data, streamCtrl) {
+  const bootId = String(data?.boot_id || "").trim() || null;
+  const previousBootId = browserEndpointHelloBootId;
+  if (bootId) browserEndpointHelloBootId = bootId;
+  let reason = null;
+  if (data?.endpoint_registered === false) reason = "endpoint_registered=false";
+  else if (previousBootId && bootId && previousBootId !== bootId) reason = `boot_id ${previousBootId} -> ${bootId}`;
+  if (!reason) return null;
+  const registration = invalidateBrowserEndpointForRuntime(bootId, reason);
+  if (!registration) return null;
+  const endpoint = await registration;
+  // The runtime evaluates registration when the stream opens, so reconnect
+  // this stream with the freshly registered endpoint_ref.
+  if (endpoint && pushStream?.ctrl === streamCtrl) {
+    stopPushStream();
+    ensurePushStream(await loadBindings());
+  }
+  return endpoint;
+}
+// ---- #632 browser endpoint runtime reconciliation (end) ----
+
+async function registerLocalBrowserEndpointOnce() {
   await configReady;
   try {
     const profileSeed = await getOrCreateBrowserProfileSeed();
@@ -2368,6 +2459,14 @@ async function registerLocalBrowserEndpoint() {
       browserEndpoint = parsed.endpoint;
       await getBrowserObservationGeneration();
       await recoverOpenChatGptBrowserRegistry();
+      await refreshPushStreamAfterEndpointRegistration().catch((error) => {
+        // The endpoint is registered; a failed stream replacement must keep the
+        // pending demand for the next trigger, not fail the registration.
+        callLog(
+          "push stream refresh after browser endpoint re-register failed:",
+          error?.message || String(error),
+        );
+      });
       return browserEndpoint;
     }
     callLog(
@@ -2447,7 +2546,14 @@ async function journalAppendContinuityTurn(payload) {
     const rows = Array.isArray(pending[continuityId]) ? pending[continuityId] : [];
     const now = Date.now();
     if (!rows.some((r) => r.message_id === messageId)) {
-      rows.push({ message_id: messageId, role, createdAt: now });
+      rows.push(continuityJournalEntry({
+        message_id: messageId,
+        role,
+        createdAt: now,
+        provider: payload?.provider,
+        account: payload?.account,
+        project: payload?.project,
+      }));
       if (rows.length > CONTINUITY_TURN_MAX_CACHED) rows.splice(0, rows.length - CONTINUITY_TURN_MAX_CACHED);
     }
     await saveContinuityCache({ ...cache, pending: { ...pending, [continuityId]: rows } });
@@ -2458,6 +2564,9 @@ async function journalAppendContinuityTurn(payload) {
     conversation_id: payload?.conversation_id || convKey,
     workspace_id: payload?.workspace_id || null,
     project_id: payload?.project_id || null,
+    provider: payload?.provider || null,
+    account: payload?.account || null,
+    project: payload?.project || null,
     title: payload?.title || null,
     message_id: messageId,
     role,
@@ -2958,6 +3067,8 @@ function reconcilePushStreamRuntime(state) {
   const streamBootId = String(pushStream?.bootId || "").trim();
   if (!pushStream || !currentBootId || !streamBootId || currentBootId === streamBootId) return false;
   callLog(`push stream runtime changed ${streamBootId} -> ${currentBootId}; forcing reconnect`);
+  // #632: a new runtime generation has its own registry; never reuse the cache.
+  void invalidateBrowserEndpointForRuntime(currentBootId, "runtime boot changed");
   stopPushStream();
   return true;
 }
@@ -2981,7 +3092,16 @@ async function runPushStream(ctrl) {
     let stallTimer = null;
     let relayAbort = null;
     try {
-      const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+      const endpoint = await currentBrowserEndpoint();
+      // #633: a stream replacement can abort this controller while the lookup
+      // above is still awaiting a (re-)registration that then succeeds:
+      // refreshPushStreamAfterEndpointRegistration() calls stopPushStream(),
+      // which aborts ctrl, and then schedules the replacement stream. Resuming
+      // here would open a second live push transport beside that replacement,
+      // so the loop must stop before opening a stream. The controller is
+      // re-checked after the await because the abort listener can only be
+      // attached once a stream exists.
+      if (ctrl.signal.aborted) break;
       const browserEndpointRef = String(endpoint?.endpoint_ref || "").trim();
       if (!browserEndpointRef) throw new Error("browser-endpoint-unavailable");
       const decoder = new TextDecoder();
@@ -3464,6 +3584,7 @@ async function handleBrowserActuation(command) {
         amount: params.amount,
         key: params.key,
         maxRows: params.max_rows,
+        expectedUrl: params.expected_url,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -4410,6 +4531,9 @@ async function handlePushBlock(block, streamCtrl = null) {
   if (event === "hello") {
     if (pushStream?.ctrl === streamCtrl) {
       pushStream.bootId = String(data.boot_id || "").trim() || null;
+      // #632: off the dispatch chain so registration never blocks push events.
+      void reconcileBrowserEndpointForHello(data, streamCtrl)
+        .catch((e) => callLog("browser endpoint reconcile failed:", e?.message || String(e)));
     }
     // A reconnect is the reconciliation boundary for the Control Center.
     // Fetch exactly one authoritative snapshot; steady-state changes remain
@@ -8161,6 +8285,9 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "scroll_unavailable",
   "press_params_invalid",
   "press_unavailable",
+  "hover_only_target",
+  "hover_target_offscreen",
+  "hover_target_obscured",
 ]);
 
 function browserPageMutationEnvelope(result, page, sendAttempted) {
@@ -8251,6 +8378,84 @@ function browserImageArtifactMetadata(response) {
   };
 }
 
+async function captureOwnedBackgroundScreenshot(page, tab) {
+  const target = { tabId: tab.id };
+  const exactTab = async () => {
+    try {
+      const live = await chrome.tabs.get(tab.id);
+      return live?.windowId === tab.windowId
+        && live?.url === page.canonical_url
+        && live?.status === "complete"
+        && page.ownership === "owned";
+    } catch (_) {
+      return false;
+    }
+  };
+  if (!chrome.tabs?.onUpdated?.addListener || !chrome.tabs?.onUpdated?.removeListener
+      || !await exactTab()) {
+    return { ok: false, error: "browser_page_screenshot_view_changed", retryable: true };
+  }
+  let navigationSeen = false;
+  const onTabUpdated = (updatedTabId, changeInfo) => {
+    if (updatedTabId === tab.id
+        && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+      navigationSeen = true;
+    }
+  };
+  chrome.tabs.onUpdated.addListener(onTabUpdated);
+
+  let attached = false;
+  let detachVerified = true;
+  let imageData = "";
+  let error = null;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    const frameIdentity = async () => {
+      const tree = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+      const frame = tree?.frameTree?.frame;
+      if (!frame?.id || !frame?.loaderId
+          || browserPageCanonicalUrl(frame.url, page.origin) !== page.canonical_url) return null;
+      return `${frame.id}:${frame.loaderId}`;
+    };
+    const before = await frameIdentity();
+    if (!before || navigationSeen) {
+      error = "browser_page_screenshot_view_changed";
+    } else {
+      const captured = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+        format: "jpeg", quality: 80, fromSurface: true, captureBeyondViewport: false,
+      });
+      imageData = captured?.data;
+      const after = await frameIdentity();
+      if (navigationSeen || !after || after !== before || !await exactTab()) {
+        error = "browser_page_screenshot_view_changed";
+      }
+    }
+  } catch (_) {
+    error = "browser_page_screenshot_failed";
+  } finally {
+    try { chrome.tabs.onUpdated.removeListener(onTabUpdated); } catch (_) {}
+    if (attached) {
+      detachVerified = false;
+      for (let attempt = 0; attempt < 2 && !detachVerified; attempt += 1) {
+        try {
+          await chrome.debugger.detach(target);
+          detachVerified = true;
+        } catch (_) {}
+      }
+    }
+  }
+  if (!detachVerified) {
+    return { ok: false, error: "browser_page_screenshot_debugger_detach_unverified", retryable: false };
+  }
+  if (error) return { ok: false, error, retryable: true };
+  if (typeof imageData !== "string" || imageData.length > 12000000 || imageData.length < 16
+      || !/^[A-Za-z0-9+/]+={0,2}$/.test(imageData)) {
+    return { ok: false, error: "browser_page_screenshot_invalid", retryable: false };
+  }
+  return { ok: true, dataUrl: `data:image/jpeg;base64,${imageData}` };
+}
+
 async function captureBrowserPageScreenshot(page, tab) {
   if (!page || !tab?.id || !Number.isInteger(tab.windowId)
       || !chrome.tabs?.onActivated?.addListener
@@ -8291,50 +8496,103 @@ async function captureBrowserPageScreenshot(page, tab) {
     }
   };
 
-  if (!await exactTargetIsVisible()) {
-    return withBrowserPageIdentity({
-      ok: false,
-      error: "browser_page_screenshot_not_visible",
-      retryable: true,
-      capture_scope: "visible_tab",
-    }, page);
-  }
-
-  let viewChanged = false;
-  const onActivated = (activeInfo) => {
-    if (activeInfo?.windowId === tab.windowId) viewChanged = true;
-  };
-  const onFocusChanged = (windowId) => {
-    if (windowId !== tab.windowId) viewChanged = true;
-  };
-  chrome.tabs.onActivated.addListener(onActivated);
-  chrome.windows.onFocusChanged.addListener(onFocusChanged);
-
+  const visible = await exactTargetIsVisible();
   let dataUrl = "";
-  try {
-    dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: "jpeg",
-      quality: 80,
-    });
-    if (viewChanged || !await exactTargetIsVisible()) {
+  let captureScope = "visible_tab";
+  if (!visible) {
+    if (page.ownership !== "owned" || !chrome.debugger?.attach
+        || !chrome.debugger?.sendCommand || !chrome.debugger?.detach) {
       return withBrowserPageIdentity({
-        ok: false,
-        error: "browser_page_screenshot_view_changed",
-        retryable: true,
-        capture_scope: "visible_tab",
+        ok: false, error: "browser_page_screenshot_not_visible",
+        retryable: true, capture_scope: "visible_tab",
       }, page);
     }
-  } catch (error) {
-    return withBrowserPageIdentity({
-      ok: false,
-      error: "browser_page_screenshot_failed",
-      retryable: true,
-      detail: String(error?.message || error || ""),
-      capture_scope: "visible_tab",
-    }, page);
-  } finally {
-    chrome.tabs.onActivated.removeListener(onActivated);
-    chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+    const result = await captureOwnedBackgroundScreenshot(page, tab);
+    if (!result.ok) {
+      return withBrowserPageIdentity({
+        ok: false, error: result.error,
+        retryable: result.retryable, capture_scope: "owned_background",
+      }, page);
+    }
+    dataUrl = result.dataUrl;
+    captureScope = "owned_background";
+  } else {
+    let viewChanged = false;
+    const onActivated = (activeInfo) => {
+      if (activeInfo?.windowId === tab.windowId) viewChanged = true;
+    };
+    const onFocusChanged = (windowId) => {
+      if (windowId !== tab.windowId) viewChanged = true;
+    };
+    const onUpdated = (tabId, changeInfo) => {
+      if (tabId === tab.id
+          && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+        viewChanged = true;
+      }
+    };
+    const exactDocument = async () => {
+      try {
+        const result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: "ISOLATED",
+          func: () => ({
+            href: location.href, origin: location.origin, timeOrigin: performance.timeOrigin,
+          }),
+        });
+        const info = result?.[0]?.result;
+        if (info?.href !== page.canonical_url || info?.origin !== page.origin
+            || !Number.isFinite(info?.timeOrigin)) return null;
+        return info.timeOrigin;
+      } catch (_) {
+        return null;
+      }
+    };
+    if (!chrome.tabs.onUpdated?.addListener || !chrome.tabs.onUpdated?.removeListener) {
+      return withBrowserPageIdentity({
+        ok: false, error: "browser_page_screenshot_view_changed",
+        retryable: true, capture_scope: "visible_tab",
+      }, page);
+    }
+    chrome.tabs.onActivated.addListener(onActivated);
+    chrome.windows.onFocusChanged.addListener(onFocusChanged);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+
+    try {
+      const documentTimeOrigin = await exactDocument();
+      if (!documentTimeOrigin || viewChanged) {
+        return withBrowserPageIdentity({
+          ok: false, error: "browser_page_screenshot_view_changed",
+          retryable: true, capture_scope: "visible_tab",
+        }, page);
+      }
+      dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+        format: "jpeg",
+        quality: 80,
+      });
+      const afterDocument = await exactDocument();
+      const liveTab = await chrome.tabs.get(tab.id);
+      if (viewChanged || afterDocument !== documentTimeOrigin
+          || liveTab.windowId !== tab.windowId || liveTab.url !== page.canonical_url
+          || !await exactTargetIsVisible()) {
+        return withBrowserPageIdentity({
+          ok: false,
+          error: "browser_page_screenshot_view_changed",
+          retryable: true,
+          capture_scope: "visible_tab",
+        }, page);
+      }
+    } catch (error) {
+      return withBrowserPageIdentity({
+        ok: false,
+        error: "browser_page_screenshot_failed",
+        retryable: true,
+        detail: String(error?.message || error || ""),
+        capture_scope: "visible_tab",
+      }, page);
+    } finally {
+      chrome.tabs.onActivated.removeListener(onActivated);
+      chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+    }
   }
 
   const match = /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ""));
@@ -8343,7 +8601,7 @@ async function captureBrowserPageScreenshot(page, tab) {
       ok: false,
       error: "browser_page_screenshot_invalid",
       retryable: false,
-      capture_scope: "visible_tab",
+      capture_scope: captureScope,
     }, page);
   }
 
@@ -8362,12 +8620,12 @@ async function captureBrowserPageScreenshot(page, tab) {
       ok: false,
       error: String(response?.error || "browser_page_screenshot_artifact_failed"),
       retryable: true,
-      capture_scope: "visible_tab",
+      capture_scope: captureScope,
     }, page);
   }
   return withBrowserPageIdentity({
     ok: true,
-    capture_scope: "visible_tab",
+    capture_scope: captureScope,
     origin: page.origin,
     canonical_url: page.canonical_url,
     artifact,
@@ -8377,7 +8635,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table"].includes(action)) {
+  if (!["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -8387,7 +8645,7 @@ async function performBrowserPageActionRequest(msg) {
 
   const pageRef = String(msg?.pageRef || "");
   if (!validBrowserPageRef(pageRef)) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
       : { ok: false, error: "browser_page_ref_invalid" };
   }
@@ -8395,12 +8653,12 @@ async function performBrowserPageActionRequest(msg) {
   await loadBrowserPages();
   const record = browserPagesByRef.get(pageRef);
   if (!record) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
       : { ok: false, error: "browser_page_not_found" };
   }
   if (record.endpoint_ref !== endpointRef) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
       : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
   }
@@ -8413,14 +8671,14 @@ async function performBrowserPageActionRequest(msg) {
       reason: "host_permission_missing",
       origin: record.origin,
     };
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope(denied, record, false)
       : withBrowserPageIdentity(denied, record);
   }
 
   const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
   if (!resolved.ok) {
-    return action === "click" || action === "fill" || action === "scroll" || action === "press"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope(resolved, record, false)
       : withBrowserPageIdentity(resolved, record);
   }
@@ -8429,6 +8687,18 @@ async function performBrowserPageActionRequest(msg) {
     return captureBrowserPageScreenshot(page, resolved.tab);
   }
   const tabId = resolved.tab.id;
+  if (action === "hover" && (page.ownership !== "owned" || !chrome.debugger)) {
+    return browserPageMutationEnvelope({ ok: false, error: "browser_page_hover_unavailable" }, page, false);
+  }
+  const rawExpectedUrl = msg?.expectedUrl;
+  const expectedUrl = rawExpectedUrl == null
+    ? null
+    : browserPageCanonicalUrl(rawExpectedUrl, page.origin);
+  if (rawExpectedUrl != null && (action !== "click" || !expectedUrl || expectedUrl === page.canonical_url)) {
+    return browserPageMutationEnvelope(
+      { ok: false, error: "navigation_expectation_invalid" }, page, false,
+    );
+  }
   const payload = {
     type: "h2w_page_assist",
     action,
@@ -8446,7 +8716,7 @@ async function performBrowserPageActionRequest(msg) {
     ...(action === "fill" ? { mainWorldFill: true } : {}),
   };
 
-  const mutation = action === "click" || action === "fill" || action === "scroll" || action === "press";
+  const mutation = action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press";
   let sendAttempted = false;
   const send = async () => {
     sendAttempted = true;
@@ -8454,16 +8724,46 @@ async function performBrowserPageActionRequest(msg) {
   };
 
   try {
+    // Anchor the document the hover coordinates will be validated against:
+    // href/origin/timeOrigin read from the live page right before the
+    // content-script round that computes the point. The post-attach fence in
+    // browserPageTrustedHover compares against this observation.
+    const observedDocument = action === "hover"
+      ? await browserPageHoverDocumentProbe(tabId)
+      : null;
     const response = await send();
     if (mutation) {
+      if (action === "hover") {
+        if (response?.ok !== true) return browserPageMutationEnvelope(response, page, false);
+        const hover = await browserPageTrustedHover(tabId, response.hover_point, {
+          page, tab: resolved.tab, observedDocument,
+        });
+        return browserPageMutationEnvelope(hover.result, page, hover.dispatched);
+      }
       let mutationResponse = response;
       if (action === "fill" && response?.ok === true && typeof response?.main_world_fill_token === "string") {
         mutationResponse = await browserPageMainWorldFill(tabId, response, { page, tab: resolved.tab });
       }
-      if (action === "click" && response?.ok === true && typeof response?.navigation_url === "string") {
-        await adoptAppliedBrowserPageNavigation(page, tabId, response.navigation_url);
-        mutationResponse = { ...response };
-        delete mutationResponse.navigation_url;
+      if (action === "click" && response?.ok === true) {
+        const observedNavigationUrl = typeof response.navigation_url === "string"
+          ? browserPageCanonicalUrl(response.navigation_url, page.origin)
+          : null;
+        if (expectedUrl && observedNavigationUrl && expectedUrl !== observedNavigationUrl) {
+          return browserPageMutationEnvelope(
+            { ok: false, error: "navigation_expectation_mismatch" }, page, true,
+          );
+        }
+        const navigationUrl = expectedUrl || observedNavigationUrl;
+        if (navigationUrl) {
+          const confirmed = await adoptAppliedBrowserPageNavigation(page, tabId, navigationUrl);
+          if (expectedUrl && !confirmed) {
+            return browserPageMutationEnvelope(
+              { ok: false, error: "navigation_postcondition_unverified" }, page, true,
+            );
+          }
+          mutationResponse = { ...response };
+          delete mutationResponse.navigation_url;
+        }
       }
       return browserPageMutationEnvelope(mutationResponse, page, true);
     }
@@ -8593,6 +8893,130 @@ function h2wFillTargetProbe(selector, mode) {
 
 function browserPageFillNormalize(value) {
   return String(value || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+async function browserPageTrustedHover(tabId, point, ctx) {
+  const x = Number(point?.x);
+  const y = Number(point?.y);
+  if (!Number.isInteger(x) || !Number.isInteger(y)
+      || x < 0 || y < 0 || x > 10000 || y > 10000) {
+    return { result: { ok: false, error: "hover_target_invalid" }, dispatched: false };
+  }
+  const page = ctx?.page;
+  const tab = ctx?.tab;
+  // P1 hover navigation race (review on 08ee0348): the hover point was
+  // validated by the content script against the document it observed, before
+  // the async debugger attach. Fence the dispatch with the same document and
+  // navigation evidence the owned-tab screenshot uses: after attach, the frame
+  // identity (id + loaderId + canonical url), the live tab (window, exact url,
+  // settled loader) and the tab-update stream must all still match that
+  // observation. Any drift fails closed BEFORE a mouse event is dispatched.
+  if (!page?.canonical_url || !tab || !Number.isInteger(tab.windowId)
+      || page.ownership !== "owned"
+      || !chrome.tabs?.onUpdated?.addListener || !chrome.tabs?.onUpdated?.removeListener) {
+    return { result: { ok: false, error: "browser_page_hover_unavailable" }, dispatched: false };
+  }
+  const exactTab = async () => {
+    try {
+      const live = await chrome.tabs.get(tabId);
+      return live?.windowId === tab.windowId
+        && live?.url === page.canonical_url
+        && live?.status === "complete";
+    } catch (_) {
+      return false;
+    }
+  };
+  let navigationSeen = false;
+  const onTabUpdated = (updatedTabId, changeInfo) => {
+    if (updatedTabId === tabId
+        && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+      navigationSeen = true;
+    }
+  };
+  chrome.tabs.onUpdated.addListener(onTabUpdated);
+
+  const target = { tabId };
+  let attached = false;
+  let dispatched = false;
+  let result = { ok: false, error: "browser_page_hover_unavailable" };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    // Anchor the frame/loader identity first, then gather every async leg…
+    const tree = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+    const frameAnchor = tree?.frameTree?.frame;
+    const frameAnchorIdentity = frameAnchor?.id && frameAnchor?.loaderId
+      ? `${frameAnchor.id}:${frameAnchor.loaderId}` : null;
+    // Same-document guarantee: the live MAIN-world document (origin, exact
+    // canonical url, per-load timeOrigin) must still be the one the point was
+    // validated against; a reload or committed navigation fails here.
+    const liveDocument = await browserPageHoverDocumentProbe(tabId);
+    const observed = ctx?.observedDocument;
+    // …and the last await re-reads the frame so a navigation during any
+    // earlier leg (including the tab query) swaps id/loaderId or trips the
+    // tab-update listener before the gate below runs.
+    const tabUnchanged = await exactTab();
+    const treeNow = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+    const frameNow = treeNow?.frameTree?.frame;
+    const frameUnchanged = frameNow?.id && frameNow?.loaderId
+      && `${frameNow.id}:${frameNow.loaderId}` === frameAnchorIdentity;
+    const documentUnchanged = observed && liveDocument
+      && liveDocument.origin.toLowerCase() === observed.origin.toLowerCase()
+      && browserPageCanonicalUrl(liveDocument.href, page.origin) === page.canonical_url
+      && liveDocument.timeOrigin === observed.timeOrigin;
+    // Synchronous fail-closed gate AFTER the last await: navigationSeen is
+    // re-read here, so a navigation during the final awaited query can never
+    // dispatch stale coordinates.
+    if (navigationSeen
+        || !frameAnchorIdentity || !frameUnchanged
+        || browserPageCanonicalUrl(frameAnchor.url, page.origin) !== page.canonical_url
+        || !tabUnchanged
+        || !documentUnchanged) {
+      result = { ok: false, error: "browser_page_hover_view_changed", retryable: true };
+    } else {
+      dispatched = true;
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse",
+      });
+      result = { ok: true, hover_dispatched: true, hover_requires_observe: true };
+    }
+  } catch (_) {
+    result = { ok: false, error: dispatched ? "hover_delivery_unconfirmed" : "browser_page_hover_unavailable" };
+  } finally {
+    try { chrome.tabs.onUpdated.removeListener(onTabUpdated); } catch (_) {}
+    if (attached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_) {
+        try {
+          await chrome.debugger.detach(target);
+        } catch (_) {
+          result = { ok: false, error: "hover_debugger_detach_unverified" };
+        }
+      }
+    }
+  }
+  return { result, dispatched };
+}
+
+function h2wHoverDocumentProbe() {
+  // Runs in the page's MAIN world via verified chrome.scripting: browser-page
+  // globals only (location, performance.timeOrigin — the per-load monotonic
+  // anchor), no Node-isms. This is one leg of the fence, never the sole proof.
+  return {
+    href: String(location?.href || ""),
+    origin: String(location?.origin || ""),
+    timeOrigin: Number(performance?.timeOrigin),
+  };
+}
+
+async function browserPageHoverDocumentProbe(tabId) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId }, world: "MAIN", func: h2wHoverDocumentProbe,
+  });
+  const value = res?.[0]?.result;
+  return value && typeof value.href === "string" && typeof value.origin === "string"
+    && Number.isFinite(value.timeOrigin) ? value : null;
 }
 
 function browserPageTrustedFillAllowed(page) {
@@ -11227,6 +11651,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conversation_id: msg?.conversation_id || convKey,
         workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
         project_id: primary?.project_id || null,
+        provider: primary?.site || browserConversationInfoFromSupportedUrl(convKey)?.site || null,
+        account: primary?.browser_account_ref || null,
+        project: primary?.project_id || primary?.browser_space_ref || null,
         title: primary?.workspace_label || primary?.workspace_id || null,
         role: "user",
         text: userText,
@@ -11266,6 +11693,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conversation_id: msg?.conversation_id || convKey,
         project_id: primary?.project_id || null,
         workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
+        provider: primary?.site || browserConversationInfoFromSupportedUrl(convKey)?.site || null,
+        account: primary?.browser_account_ref || null,
+        project: primary?.project_id || primary?.browser_space_ref || null,
         title: primary?.workspace_label || primary?.workspace_id || null,
         userMessageId: msg?.userMessageId || null,
         userText,
@@ -11355,6 +11785,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conv_key: msg?.convKey || null,
         project_id: msg?.project_id || primaryBinding?.project_id || null,
         workspace_id: msg?.workspace_id || primaryBinding?.workspace_id || normalizeWorkspaceId(primaryBinding) || null,
+        provider: msg?.provider || primaryBinding?.site || browserConversationInfoFromSupportedUrl(msg?.convKey || "")?.site || null,
+        account: msg?.account || primaryBinding?.browser_account_ref || null,
+        project: msg?.project || msg?.project_id || primaryBinding?.project_id || primaryBinding?.browser_space_ref || null,
         title: primaryBinding?.workspace_label || primaryBinding?.workspace_id || null,
         conversation_id: msg?.conversation_id || null,
         userText: msg?.userText || null,
@@ -11472,7 +11905,7 @@ async function rebuildStreams() {
   }
   // Bootstrap Browser Registry before the long-lived Native Messaging push
   // stream so endpoint identity does not depend on opening Control Center later.
-  if (!browserEndpoint) await registerLocalBrowserEndpoint();
+  if (!browserEndpoint) await currentBrowserEndpoint();
   const bindings = await loadBindings();
   callLog(
     `rebuild streams v${H2W_SCRIPT_VERSION}: ${Object.keys(bindings).length} binding(s),`,
@@ -11498,7 +11931,7 @@ async function ensureAlive(preloaded, runtimeState = null) {
   // Endpoint bootstrap can legitimately fail when the extension starts before
   // a runtime that exposes Browser Registry is active. Reuse the existing
   // keepalive instead of introducing another retry timer/state owner.
-  if (!browserEndpoint) await registerLocalBrowserEndpoint();
+  if (!browserEndpoint) await currentBrowserEndpoint();
   const bindings = preloaded || await loadBindings();
   ensurePushStream(bindings);
   // Restore every missing Auto watcher, including settled conversations whose

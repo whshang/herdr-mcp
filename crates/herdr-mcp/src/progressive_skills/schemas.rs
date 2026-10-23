@@ -19,7 +19,7 @@ use super::{
     LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD, TEXT_READ_METHOD, TEXT_WRITE_METHOD,
     VALIDATION_ADVISE_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
     WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
+    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
@@ -57,6 +57,10 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 "properties": {
                     "ids": {"type": "array", "items": {"type": "string"}},
                     "expected_digests": {"type": "object"},
+                    "omit_unchanged": {
+                        "type": "boolean",
+                        "description": "with a matching expected digest, return the entry with unchanged=true instead of content",
+                    },
                     "project_root": {"type": "string"},
                 },
                 "required": ["ids"],
@@ -148,8 +152,10 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "params": {
                 "properties": {
                     "task_id": {"type": "string", "maxLength": 128},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                    "target": {"type": "string", "maxLength": 256},
                 },
-                "required": ["task_id"],
+                "required": [],
                 "empty": false,
             },
         }),
@@ -165,6 +171,17 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "include_acknowledged": {"type": "boolean"},
                     "advisory": {"type": "boolean"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 512},
+                    "wait_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 60000,
+                        "description": "Optional bounded long-poll budget. Returns as soon as an unacknowledged terminal task is in scope; deterministic task facts only, no advisory or semantic work."
+                    },
+                    "view": {
+                        "type": "string",
+                        "enum": ["full", "compact"],
+                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps and the bounded final_excerpt when captured."
+                    },
                 },
                 "required": [],
                 "empty": true,
@@ -177,8 +194,16 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "params": {
                 "properties": {
                     "task_id": {"type": "string", "maxLength": 128},
+                    "task_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 128},
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "uniqueItems": true,
+                        "description": "Optional batch alternative to task_id; out-of-scope or unknown ids are reported as not_found."
+                    },
                 },
-                "required": ["task_id"],
+                "required": [],
                 "empty": false,
             },
         }),
@@ -266,6 +291,22 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 },
                 "required": ["path", "content", "sha256"],
                 "empty": false,
+            },
+        }),
+        json!({
+            "method": WORK_PICKUP_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "worktree": {"type": "string", "maxLength": 4096},
+                    "project_root": {"type": "string", "maxLength": 4096},
+                    "project_ref": {"type": "string", "maxLength": 512},
+                    "cwd": {"type": "string", "maxLength": 4096},
+                    "pane": {"type": "string", "maxLength": 256},
+                },
+                "required": [],
+                "description": "Pass worktree or project_root (or cwd/pane to resolve the caller's project); with no selector, lists projects that have handoffs.",
             },
         }),
         json!({
@@ -540,6 +581,11 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "params": {
                 "properties": {
                     "source_url": {"type": ["string", "null"], "maxLength": 2048},
+                    "source_session_ref": {
+                        "type": "string",
+                        "maxLength": 96,
+                        "description": "Optional exact observed source session for source_url ambiguity across accounts; URL and resource generation must match."
+                    },
                     "endpoint_ref": {"type": "string", "maxLength": 96},
                     "provider": {"type": "string", "maxLength": 32},
                     "account_ref": {"type": "string", "maxLength": 96},
@@ -752,14 +798,19 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 "properties": {
                     "endpoint_ref": {"type": "string", "maxLength": 96},
                     "page_ref": {"type": "string", "maxLength": 67},
-                    "action": {"type": "string", "enum": ["observe", "click", "fill", "expect", "screenshot"]},
+                    "action": {"type": "string",  "enum": ["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "extract", "extract_table", "press"]},
                     "max_chars": {"type": ["integer", "null"], "minimum": 1, "maximum": 100000},
                     "generation": {"type": ["string", "null"], "maxLength": 256},
                     "ref": {"type": ["string", "null"], "maxLength": 256},
                     "value": {"type": ["string", "null"], "maxLength": 10000},
-                    "condition": {"type": ["string", "null"], "enum": ["document_ready", "url_equals", "text_present", "text_absent", null]},
+                    "condition": {"type": ["string", "null"], "enum": ["document_ready", "url_equals", "text_present", "text_absent", "element_present", "element_absent", "input_value_equals", "input_value_contains", "element_checked", "element_selected", "element_class_contains", "element_visible", "element_enabled", null]},
                     "timeout_ms": {"type": ["integer", "null"], "minimum": 0, "maximum": 5000},
                     "idempotency_key": {"type": ["string", "null"], "maxLength": 256},
+                    "direction": {"type": ["string", "null"], "enum": ["up", "down", null]},
+                    "amount": {"type": ["integer", "null"], "minimum": 1, "maximum": 1500},
+                    "max_rows": {"type": ["integer", "null"], "minimum": 1, "maximum": 100},
+                    "expected_url": {"type": "string", "maxLength": 4096, "description": "Click only: explicit absolute same-origin destination to verify after a button-triggered navigation, including history back/forward. Never auto-retry an unverified click."},
+                    "key": {"type": ["string", "null"], "enum": ["Enter", "Escape", "Tab", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Space", null]},
                     "objective": {"type": ["string", "null"], "maxLength": 1024},
                 },
                 "required": ["endpoint_ref", "page_ref", "action"],
@@ -772,15 +823,29 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                         "required": ["generation", "ref", "idempotency_key"],
                     },
                     {
+                        "properties": {"action": {"enum": ["hover"]}},
+                        "required": ["generation", "ref", "idempotency_key"],
+                    },
+                    {
                         "properties": {"action": {"enum": ["fill"]}},
                         "required": ["generation", "ref", "value", "idempotency_key"],
                     },
                     {
                         "properties": {"action": {"enum": ["expect"]}},
                         "required": ["condition"],
+                        "oneOf": [
+                            {"properties": {"condition": {"enum": ["document_ready"]}}},
+                            {"properties": {"condition": {"enum": ["url_equals", "text_present", "text_absent", "element_present", "element_absent"]}}, "required": ["value"]},
+                            {"properties": {"condition": {"enum": ["input_value_equals", "input_value_contains", "element_class_contains"]}}, "required": ["generation", "ref", "value"]},
+                            {"properties": {"condition": {"enum": ["element_checked", "element_selected", "element_visible", "element_enabled"]}}, "required": ["generation", "ref"]}
+                        ],
                     },
                     {
                         "properties": {"action": {"enum": ["screenshot"]}},
+                    },
+                    { "properties": {"action": {"enum": ["scroll"]}}, "required": ["generation", "direction", "idempotency_key"] },
+                    { "properties": {"action": {"enum": ["extract", "extract_table"]}}, "required": ["generation", "ref"] },
+                    { "properties": {"action": {"enum": ["press"]}}, "required": ["generation", "key", "idempotency_key"]
                     },
                 ],
                 "empty": false,

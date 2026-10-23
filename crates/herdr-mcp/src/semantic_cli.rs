@@ -219,6 +219,8 @@ fn run_setup(
         url: Some(url),
         model: Some(model),
         api_key: Some(api_key),
+        max_requests_per_second: None,
+        max_tokens_per_second: None,
     };
     validate_route_shape(&route)?;
 
@@ -642,6 +644,8 @@ mod tests {
             url: Some("https://example.com/v1/decision".to_owned()),
             model: Some("model-a".to_owned()),
             api_key: Some("secret".to_owned()),
+            max_requests_per_second: None,
+            max_tokens_per_second: None,
         };
         upsert_route(&mut config, route.clone());
         assert_eq!(config.semantic.routes, vec![route.clone()]);
