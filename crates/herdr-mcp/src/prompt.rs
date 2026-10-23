@@ -1867,7 +1867,9 @@ fn apply_events_with_final_excerpt(
 /// the task's terminal cursor, i.e. the pane may be serving a later task. Live
 /// Herdr events carry no `state_change_seq`, so a later same-pane status change
 /// or pane closure is by itself enough to fail the capture closed before any
-/// native read; a differing sequence does the same when events carry one.
+/// native read; a differing sequence does the same when events carry one. A
+/// `pane_updated` snapshot of the same terminal status is the companion of
+/// `pane.agent_status_changed` and does not prove a later task.
 fn batch_proves_pane_advanced(
     task: &PromptTaskRecord,
     events: &[Value],
@@ -1881,12 +1883,12 @@ fn batch_proves_pane_advanced(
     })
 }
 
-/// Only an identical re-observation of the same transition — the same status
-/// with a `state_change_seq` present on both sides and equal — is allowed past
-/// the fence. Everything else after the terminal cursor proves the pane moved
-/// on: live events carry no sequence, so a repeated `done` is a second task that
-/// already finished, and a snapshot `pane_updated` for the same status is only
-/// emitted after the pane actually changed.
+/// Only two observations are the same transition and may pass the fence:
+/// the same status with a `state_change_seq` present on both sides and equal,
+/// or a `pane_updated` snapshot of that same status with no sequence. Live
+/// Herdr emits the snapshot immediately after `pane.agent_status_changed`.
+/// A second `pane.agent_status_changed` with the same status and no sequence
+/// is a later task that already finished.
 fn event_proves_pane_advanced(
     task: &PromptTaskRecord,
     event: &Value,
@@ -1898,10 +1900,15 @@ fn event_proves_pane_advanced(
     ) {
         return true;
     }
+    let same_status = task_event_status(event) == task.terminal_status.as_deref();
+    if !same_status {
+        return true;
+    }
     let event_seq = task_event_state_change_seq(event);
-    !(event_seq.is_some()
-        && event_seq == terminal_state_change_seq
-        && task_event_status(event) == task.terminal_status.as_deref())
+    if event_seq.is_some() && event_seq == terminal_state_change_seq {
+        return false;
+    }
+    task_event_type(event) != "pane_updated" || event_seq.is_some()
 }
 
 fn task_event_state_change_seq(event: &Value) -> Option<u64> {
@@ -5367,6 +5374,64 @@ mod tests {
             requests.lock().unwrap().is_empty(),
             "a batch that already shows a second completion must not read the pane"
         );
+    }
+
+    /// user owner | Given a live `pane.agent_status_changed` done event followed
+    /// in the same batch by a `pane_updated` snapshot of that same status and
+    /// no sequence | When the terminal transition is reconciled | Then the
+    /// snapshot is not a later task and the fenced excerpt is captured.
+    #[test]
+    fn final_excerpt_captures_live_done_when_same_status_pane_updated_follows_without_seq() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": "RC3_EXCERPT_UAT_PASS\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-live-snapshot");
+        task.baseline_seq = Some(1);
+
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            &mut task,
+            &[
+                json!({
+                    "cursor": 101,
+                    "pane_id": "w1:p1",
+                    "agent": "pi",
+                    "agent_status": "done",
+                    "type": "pane.agent_status_changed"
+                }),
+                json!({
+                    "cursor": 104,
+                    "type": "pane_updated",
+                    "pane": {"pane_id": "w1:p1", "agent_status": "done"}
+                }),
+            ],
+        );
+
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(task.terminal_cursor, Some(101));
+        assert_eq!(
+            task.final_excerpt.as_deref(),
+            Some("RC3_EXCERPT_UAT_PASS\n"),
+            "a same-status pane_updated snapshot must not hide this task's excerpt"
+        );
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0].0, "agent.get");
+        assert_eq!(recorded[1].0, "agent.read");
+        assert_eq!(recorded[2].0, "agent.get");
+        drop(recorded);
+        server.join().unwrap();
     }
 
     /// user owner | Given a live event without `state_change_seq` whose pane
