@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.213";
+const H2W_SCRIPT_VERSION = "0.1.214";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -3651,6 +3651,7 @@ async function handleBrowserActuation(command) {
         key: params.key,
         maxRows: params.max_rows,
         expectedUrl: params.expected_url,
+        elementOffset: params.element_offset,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -9092,6 +9093,7 @@ async function performBrowserPageActionRequest(msg) {
     amount: msg?.amount,
     key: msg?.key,
     maxRows: msg?.maxRows,
+    elementOffset: msg?.elementOffset,
     ...(action === "fill" ? { mainWorldFill: true } : {}),
   };
 

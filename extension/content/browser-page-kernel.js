@@ -11,6 +11,7 @@
   const MAX_CHARS_CEILING = 100000;
   const MAX_FILL_CHARS = 10000;
   const MAX_ELEMENTS = 128;
+  const MAX_ELEMENT_OFFSET = 4096;
   const MAX_HOVER_TARGETS = 32;
   const DISALLOWED_INPUT_TYPES = new Set(["password", "file", "hidden"]);
   const FORBIDDEN_PARAM_KEYS = new Set([
@@ -251,10 +252,21 @@
     return cleanText(collectVisibleText(el, 121), 120).length > 0;
   }
 
+  // Page cursor over eligible, visible controls only. The 128-element response
+  // cap is retained; the offset lets a caller reach controls past it instead of
+  // seeing the same document-order prefix on every observation.
+  function parseObserveOffset(options = {}) {
+    const offset = options.elementOffset === undefined ? 0 : options.elementOffset;
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > MAX_ELEMENT_OFFSET) return null;
+    return offset;
+  }
+
   function scanDocument(options = {}) {
     if (isCrossOriginFrame()) {
       return { ok: false, error: "cross_origin_iframe_blocked" };
     }
+    const elementOffset = parseObserveOffset(options);
+    if (elementOffset === null) return { ok: false, error: "element_offset_invalid" };
 
     generationSeq += 1;
     currentGenerationToken = `pa_gen_${documentNonce}_${generationSeq}_${Date.now().toString(36)}`;
@@ -270,10 +282,11 @@
 
     const elements = [];
     let elementIndex = 0;
+    let eligibleIndex = 0;
     let hoverTargets = 0;
+    let hasMoreElements = false;
 
     for (const el of candidates) {
-      if (elements.length >= MAX_ELEMENTS) break;
       const tag = (el.tagName || "").toLowerCase();
 
       const clickable = isObservableControlCandidate(el);
@@ -287,12 +300,18 @@
       if (isElementHidden(el)) continue;
       if (isElementDisabled(el)) continue;
 
+      // Only eligible, visible controls advance the cursor, so a skipped
+      // password/hidden/disabled control never consumes a page slot.
+      if (hoverOnly) hoverTargets += 1;
+      if (eligibleIndex++ < elementOffset) continue;
+      if (elements.length >= MAX_ELEMENTS) {
+        hasMoreElements = true;
+        break;
+      }
+
       const ref = `ref_${currentGenerationToken}_${elementIndex++}`;
       elementMap.set(ref, el);
-      if (hoverOnly) {
-        hoverOnlyRefs.add(ref);
-        hoverTargets += 1;
-      }
+      if (hoverOnly) hoverOnlyRefs.add(ref);
 
       const roleAttr = el.getAttribute("role");
       const observedRole = roleAttr || (tag === "a" ? "link" : tag);
@@ -364,6 +383,10 @@
       origin: String(global.location ? global.location.origin : "").slice(0, 512),
       title: String(doc.title || "").slice(0, 512),
       generation: currentGenerationToken,
+      ...(hasMoreElements || options.elementOffset !== undefined ? {
+        element_offset: elementOffset,
+        next_element_offset: hasMoreElements ? elementOffset + elements.length : null,
+      } : {}),
       scroll: {
         y: Math.max(0, Math.round(Number(global.scrollY) || 0)),
         max_y: Math.max(0, Math.round((Number(doc.documentElement?.scrollHeight) || 0) - (Number(global.innerHeight) || 0))),
