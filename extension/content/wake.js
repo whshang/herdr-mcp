@@ -3439,7 +3439,12 @@ function normalizeHerdrMentionAlias(value) {
       if (msg?.type === "h2w_wake") {
         (async () => {
           const automationActive = await refreshAutomationState();
-          if (msg?.data?.manual !== true && !automationActive) {
+          // A task this conversation dispatched itself is its own durable work,
+          // so its terminal wake is not an Auto continuation: only the Auto
+          // on/off preference is bypassed, the runtime must still be available,
+          // and every pane-level wake keeps requiring Auto.
+          const ownTaskAllowed = msg?.data?.own_task === true && automationRuntimeAvailable;
+          if (msg?.data?.manual !== true && !automationActive && !ownTaskAllowed) {
             sendResponse({
               ok: false,
               blocked: automationRuntimeAvailable ? "automation-disabled" : "local-runtime-unavailable",

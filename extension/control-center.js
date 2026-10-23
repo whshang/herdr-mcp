@@ -345,6 +345,14 @@ function pageContextBindingIds() {
   return new Set(pageContextBindings().map((binding) => String(binding?.workspace_id || "")).filter(Boolean));
 }
 
+/** Workspaces bound automatically by the extension on this conversation's behalf. */
+function pageContextAutoBindingIds() {
+  return new Set(pageContextBindings()
+    .filter((binding) => binding?.persistence === "auto")
+    .map((binding) => String(binding?.workspace_id || ""))
+    .filter(Boolean));
+}
+
 function projectInstructionContext(state) {
   const info = pageContextInfo();
   if (info?.site !== "chatgpt") return null;
@@ -539,6 +547,7 @@ function renderWorkspaceTree(state) {
   controlDock.hidden = true;
   workspaceList.replaceChildren();
   const pageBoundIds = pageContextBindingIds();
+  const pageAutoBoundIds = pageContextAutoBindingIds();
   const workspaces = workspaceRowsForPage(state.workspaces || [], pageContextBindings());
   if (!workspaces.length) {
     const empty = document.createElement("div");
@@ -592,19 +601,28 @@ function renderWorkspaceTree(state) {
     header.appendChild(toggle);
     if (pageSupported) {
       const bindingToggle = document.createElement("button");
+      const contextAutoBound = contextBound && pageAutoBoundIds.has(workspaceId);
       bindingToggle.type = "button";
-      bindingToggle.className = `workspace-binding-toggle${bindingMutationWorkspaceId === workspaceId ? " binding-busy" : ""}`;
+      bindingToggle.className = [
+        "workspace-binding-toggle",
+        bindingMutationWorkspaceId === workspaceId ? "binding-busy" : "",
+        contextAutoBound ? "context-auto-bound" : "",
+      ].filter(Boolean).join(" ");
       bindingToggle.dataset.workspaceBindingAction = workspaceId;
       bindingToggle.setAttribute("aria-pressed", String(contextBound));
       bindingToggle.disabled = bindingBusy;
       bindingToggle.textContent = bindingMutationWorkspaceId === workspaceId
         ? t("cc_workspace_binding_updating")
-        : (contextBound ? t("cc_workspace_bound") : t("cc_workspace_bind"));
+        : contextBound
+          ? (contextAutoBound ? t("cc_workspace_bound_auto") : t("cc_workspace_bound"))
+          : t("cc_workspace_bind");
       bindingToggle.title = bindingBusy
         ? t("cc_workspace_binding_busy_reason")
-        : contextBound
-          ? t("cc_workspace_unbind_hint", { workspace: workspaceName })
-          : t("cc_workspace_bind_hint", { workspace: workspaceName });
+        : contextAutoBound
+          ? t("cc_workspace_bound_auto_hint", { workspace: workspaceName })
+          : contextBound
+            ? t("cc_workspace_unbind_hint", { workspace: workspaceName })
+            : t("cc_workspace_bind_hint", { workspace: workspaceName });
       bindingToggle.setAttribute("aria-label", contextBound
         ? t("cc_workspace_unbind_aria", { workspace: workspaceName })
         : t("cc_workspace_bind_aria", { workspace: workspaceName }));
