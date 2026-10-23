@@ -29,6 +29,9 @@ import {
   supervise,
 } from "../extension/goal-supervisor-core.js";
 
+/** The stable repair-block marker every retry prompt carries at most once. */
+const REPAIR_MARKER = "Allowed values —";
+
 test("user keeps Goal evidence authoritative | Given a Jev semantic prior | When bounded supervisor input is built | Then the probabilities are advisory and visible to the LLM supervisor", () => {
   const input = buildSupervisorInput({
     ledger: deriveGoalLedger({
@@ -549,6 +552,32 @@ test("user never receives an action from a malformed model answer | Given prose,
   assert.equal(result.status, "provider_failed");
   assert.equal(result.effects, null);
   assert.ok(calls.length <= DEFAULT_SUPERVISOR_POLICY.maxDecisionAttempts);
+});
+
+test("user retry prompt stays bounded across repeated rejections | Given a bounded adapter allowed three attempts | When all three replies are rejected with different parse errors | Then each retry prompt carries only the latest repair block and never accumulates earlier ones", async () => {
+  const replies = [
+    { decision: "CONTINUE", reason: "x", todo_updates: [{ id: "t1", status: "in_progress" }], message_to_send: "go" },
+    { decision: "CONTINUE", reason: "x", retry_class: "wild", message_to_send: "go" },
+    { decision: "PROCEED", reason: "x" },
+  ];
+  const calls = [];
+  const adapter = createBoundedSupervisorAdapter({
+    maxAttempts: 3,
+    request: async (payload) => {
+      calls.push(payload);
+      return { ok: true, content: JSON.stringify(replies.shift()) };
+    },
+  });
+  const result = await adapter.run(buildSupervisorInput({ ledger: ledger(), runtime: healthyRuntime, now: 10_000 }));
+  assert.equal(result.ok, false);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].user.includes(REPAIR_MARKER), false);
+  for (const call of [calls[1], calls[2]]) assert.equal(call.user.split(REPAIR_MARKER).length - 1, 1);
+  assert.equal(calls[1].user.includes("todo_update_status_required"), true);
+  assert.equal(calls[2].user.includes("unknown_retry_class"), true);
+  assert.equal(calls[2].user.includes("todo_update_status_required"), false);
+  assert.equal(calls[2].user.split("BOUNDED SUPERVISOR INPUT").length - 1, 1);
+  assert.ok(calls[2].user.length <= calls[1].user.length, `${calls[2].user.length} <= ${calls[1].user.length}`);
 });
 
 test("user gets a repairable rejection | Given a supervisor reply rejected for an out-of-vocabulary todo status | When the bounded adapter retries the decision | Then the repair message names the exact allowed status values so the model can correct it", async () => {

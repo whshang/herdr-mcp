@@ -10986,7 +10986,7 @@ fn browser_page_lifecycle_call(
                 return json!({
                     "ok": false,
                     "code": "invalid_params",
-                    "message": "target_origin is required for open or claim",
+                    "message": "target_origin is required for open or claim (e.g. \"target_origin\":\"https://example.com\" matching url)",
                 });
             }
         };
@@ -22906,6 +22906,32 @@ mod tests {
             1,
             "no actuation on grant miss"
         );
+    }
+
+    #[test]
+    fn browser_page_lifecycle_missing_target_origin_states_the_required_parameter() {
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        for action in ["open", "claim"] {
+            let result = browser_page_lifecycle_call(
+                &json!({
+                    "endpoint_ref": "bep_test",
+                    "action": action,
+                    "url": "https://example.com/app",
+                    "idempotency_key": "page-open-1"
+                }),
+                &grants,
+                None,
+            );
+            assert_eq!(result["ok"], false, "{action}");
+            assert_eq!(result["code"], "invalid_params", "{action}");
+            assert_eq!(
+                result["message"],
+                "target_origin is required for open or claim (e.g. \"target_origin\":\"https://example.com\" matching url)",
+                "{action}"
+            );
+        }
     }
 
     #[test]

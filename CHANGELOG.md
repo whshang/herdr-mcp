@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **MCP Skill 正文恢复对模型可见：** 经 `herdr_skill` 或 `herdr_call(method="herdr_mcp.skill.*")` 显式请求的 Skill 正文（含 `skill.load` 结果里逐个 Skill 的 `content`）在 Runtime 与 Edge 边界重新逐字节可见，`reference_text_exposed` 现在报告 `true`；Edge 不会再把这个字段当作替换非 JSON Skill 文本的理由。通用 advisory 净化（`hint` / `*_hint` / `next_action` / `next_surface` / `recovery` / `instructions`）对包括 Skill 表面在内的所有工具保持不变，public tool schema、contract epoch 与 contract 哈希不变。
 - **relay/HANDOFF 压缩器去重与任务收尾：** 规则/错题/任务写入时按规范化文本（大小写、空白、尾随省略号与标点）去重：文本完全相等，或较短一方以 `…`/`...` 结尾（截断副本）时合并到原条目（保留较早 id 与更完整文本），`test` 不会吞掉 `test deployment`；预算不再句中截断条目文本（只丢滚动日志、多余来源与已完成任务，必要时以完整条目超预算写出）；压缩提示词严格不超过语义接口 65,536 字节上限（超限时先省略 recent/current_state/workspace，再丢 legacy 上下文，最后从提示词中省略最旧的完整条目——内存中保留，只有事件尾部会被截断）；任务按 `origin/main` 中真正的合并证据（subject 末尾 `(#N)` 或 `Merge pull request #N`，并按 token 边界匹配已合并分支）或 30 天无更新自动关闭，`done` 任务不再渲染，且每个 tick 都会对每个已存 work_state 执行（不依赖新事件）；命令中按顺序求值每个 `cd`（相对路径接续当前 cwd、`~/` 展开、词法规范化 `.`/`..`），任一步落到 scope 根目录之外即不记入当前项目。
 
 ## v1.1.0-rc.3 — 2026-10-18
