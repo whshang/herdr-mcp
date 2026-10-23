@@ -164,6 +164,10 @@ Interactive Connectors are approved/revoked from an enrolled-device/operator con
 herdr-mcp connector approve <approval-request-id>
 herdr-mcp connector list
 herdr-mcp connector revoke <connector-id> --confirm
+herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> --clear
+herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
+herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm
 ```
 
 The approval command reads the six-digit code interactively; do not put that code on argv or in shell history. Any enrolled device is an equivalent Worker administration channel; there is no owner/member device hierarchy.

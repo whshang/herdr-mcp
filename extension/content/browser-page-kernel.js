@@ -11,6 +11,7 @@
   const MAX_CHARS_CEILING = 100000;
   const MAX_FILL_CHARS = 10000;
   const MAX_ELEMENTS = 128;
+  const MAX_ELEMENT_OFFSET = 4096;
   const MAX_HOVER_TARGETS = 32;
   const DISALLOWED_INPUT_TYPES = new Set(["password", "file", "hidden"]);
   const FORBIDDEN_PARAM_KEYS = new Set([
@@ -256,6 +257,11 @@
       return { ok: false, error: "cross_origin_iframe_blocked" };
     }
 
+    const elementOffset = options.elementOffset === undefined ? 0 : options.elementOffset;
+    if (!Number.isSafeInteger(elementOffset) || elementOffset < 0 || elementOffset > MAX_ELEMENT_OFFSET) {
+      return { ok: false, error: "element_offset_invalid" };
+    }
+
     generationSeq += 1;
     currentGenerationToken = `pa_gen_${documentNonce}_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
@@ -267,13 +273,23 @@
     if (!doc) return { ok: false, error: "document_unavailable" };
 
     const candidates = doc.querySelectorAll(OBSERVABLE_CONTROL_SELECTOR);
+    // Expose table refs even when a long navigation consumes the normal limit.
+    function* tableFirstCandidates() {
+      for (const el of candidates) {
+        if (el.tagName?.toLowerCase() === "table") yield el;
+      }
+      for (const el of candidates) {
+        if (el.tagName?.toLowerCase() !== "table") yield el;
+      }
+    }
 
     const elements = [];
     let elementIndex = 0;
+    let eligibleIndex = 0;
     let hoverTargets = 0;
+    let hasMoreElements = false;
 
-    for (const el of candidates) {
-      if (elements.length >= MAX_ELEMENTS) break;
+    for (const el of tableFirstCandidates()) {
       const tag = (el.tagName || "").toLowerCase();
 
       const clickable = isObservableControlCandidate(el);
@@ -287,11 +303,17 @@
       if (isElementHidden(el)) continue;
       if (isElementDisabled(el)) continue;
 
+      if (hoverOnly) hoverTargets += 1;
+      if (eligibleIndex++ < elementOffset) continue;
+      if (elements.length >= MAX_ELEMENTS) {
+        hasMoreElements = true;
+        break;
+      }
+
       const ref = `ref_${currentGenerationToken}_${elementIndex++}`;
       elementMap.set(ref, el);
       if (hoverOnly) {
         hoverOnlyRefs.add(ref);
-        hoverTargets += 1;
       }
 
       const roleAttr = el.getAttribute("role");
@@ -355,8 +377,9 @@
       });
     }
 
-    const rawBody = doc.body ? (doc.body.innerText || doc.body.textContent || "") : "";
-    const text = cleanText(rawBody, options.maxChars);
+    const maxTextChars = Math.max(1, Math.min(Number(options.maxChars) || DEFAULT_MAX_CHARS, MAX_CHARS_CEILING));
+    const rawBody = doc.body ? collectVisibleText(doc.body, maxTextChars + 1) : "";
+    const text = cleanText(rawBody, maxTextChars);
 
     return {
       ok: true,
@@ -370,6 +393,10 @@
       },
       text,
       elements,
+      ...(hasMoreElements || options.elementOffset !== undefined ? {
+        element_offset: elementOffset,
+        next_element_offset: hasMoreElements ? elementOffset + elements.length : null,
+      } : {}),
     };
   }
 

@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.213";
+const H2W_CONTENT_VERSION = "0.1.236";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2428,6 +2428,21 @@ function normalizeHerdrMentionAlias(value) {
     return evidence;
   }
 
+  function chatGptDispatchBaselineRejectionReason(snapshot) {
+    // The returned error is a fixed enum: never forward URLs, status bodies,
+    // user messages, or raw Provider errors. This remains a pre-send refusal.
+    if (snapshot?.ok && !snapshot.userMessageId) return "browser_dispatch_baseline_user_id_missing";
+    const reason = String(snapshot?.reason || "");
+    if (reason === "http-429") return "browser_dispatch_baseline_http429";
+    if (reason === "auth" || reason === "http-401") return "browser_dispatch_baseline_auth";
+    if (reason === "http-403") return "browser_dispatch_baseline_forbidden";
+    if (reason === "http-404") return "browser_dispatch_baseline_not_found";
+    if (reason === "timeout") return "browser_dispatch_baseline_timeout";
+    if (reason === "fetch-failed") return "browser_dispatch_baseline_network";
+    if (/^http-5[0-9][0-9]$/.test(reason)) return "browser_dispatch_baseline_server";
+    return "browser_dispatch_baseline_unavailable";
+  }
+
   async function performBrowserActuationCommand(command) {
     const dispatchId = typeof command?.dispatch_id === "string" ? command.dispatch_id : "";
     const expectedGeneration = Number(command?.expected_generation || 0);
@@ -2628,12 +2643,19 @@ function normalizeHerdrMentionAlias(value) {
     const boundedChatGptSubmit = exactChatGptDispatchIdentity || (
       ADAPTER.name === "chatgpt" && creatingSession
     );
-    const snapshotTimeoutMs = exactChatGptDispatchIdentity || creatingSession ? 1200 : 6000;
+    let snapshotTimeoutMs = 6000;
+    if (creatingSession) snapshotTimeoutMs = 1200;
+    if (exactChatGptDispatchIdentity) snapshotTimeoutMs = 3000;
     const beforeServer = ADAPTER.name === "chatgpt"
       ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
       : { ok: false };
     const beforeDom = providerMessageSnapshot("user");
     const beforeAssistant = providerMessageSnapshot("assistant");
+    // Dispatch needs a provider-owned pre-submit user ID to prove advancement.
+    // Refuse before touching the composer when that baseline is unavailable.
+    if (exactChatGptDispatchIdentity && (!beforeServer?.ok || !beforeServer.userMessageId)) {
+      return browserRejectedEvidence(evidence, chatGptDispatchBaselineRejectionReason(beforeServer));
+    }
     const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
     const result = await performWake({
       template: message,
@@ -2643,13 +2665,18 @@ function normalizeHerdrMentionAlias(value) {
       expectedConvKey: command?.expectedConvKey ?? null,
       requiredApps,
     });
-    if (!result?.ok) {
-      if (boundedChatGptSubmit && result?.uncertain === true) {
-        evidence.command_accepted = true;
-        evidence.resource_available = true;
-        evidence.canonical_url_observed = providerCanonicalConversationObserved();
-        return evidence;
-      }
+    // A previously latched uncertain submit cannot be attributed to this
+    // dispatch. Preserve uncertainty without attempting another provider send.
+    if (boundedChatGptSubmit && result?.blocked === "submit-uncertain") {
+      evidence.command_accepted = true;
+      evidence.resource_available = true;
+      evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      return evidence;
+    }
+    // A one-shot send may succeed after its immediate UI acknowledgement
+    // expires. Use existing bounded exact-message readback without resubmitting.
+    const submitUnconfirmed = boundedChatGptSubmit && result?.uncertain === true;
+    if (!result?.ok && !submitUnconfirmed) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
@@ -2798,9 +2825,16 @@ function normalizeHerdrMentionAlias(value) {
         afterAssistant.text
         && afterAssistant.text !== beforeAssistant.text,
       );
+      const providerAssistantAdvanced = Boolean(
+        conversationStillExpected && serverAdvanced
+        && typeof beforeServer?.messageId === "string" && beforeServer.messageId
+        && typeof afterServer?.messageId === "string" && afterServer.messageId
+        && afterServer.messageId !== beforeServer.messageId,
+      );
       evidence.generation_status_observed = Boolean(
         isTurnInProgress()
-        || assistantAdvanced,
+        || assistantAdvanced
+        || providerAssistantAdvanced,
       );
       if (evidence.accepted_message_observed
           && (creatingSession || evidence.generation_status_observed)
@@ -3199,6 +3233,10 @@ function normalizeHerdrMentionAlias(value) {
             browserProjectName: project?.name || null,
             browserSessionRef: identityMatchesRoute ? registeredBrowserSessionRef : null,
             browserGeneration: identityMatchesRoute ? registeredBrowserGeneration : null,
+            registrationStatus: lastBrowserRegistrationStatus,
+            identityRelation: lastBrowserIdentityRelation,
+            contactProof: lastBrowserContactProof,
+            bearerRelation: lastBrowserBearerRelation,
           });
         })();
         return true;
@@ -3617,9 +3655,71 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   const registrationInFlight = new Map();
+  // Privacy-preserving registration diagnostics: finite states only, never IDs.
+  let lastBrowserRegistrationStatus = "not_observed";
+  let lastBrowserIdentityRelation = "not_observed";
+  let lastBrowserContactProof = "not_observed";
+  let lastBrowserBearerRelation = "not_observed";
+
+  async function browserAccountObservation() {
+    try {
+      if (typeof ADAPTER.getAccountObservation === "function") {
+        const observed = await ADAPTER.getAccountObservation();
+        const nativeIdentity = typeof observed?.nativeIdentity === "string" && observed.nativeIdentity.trim()
+          ? observed.nativeIdentity.trim()
+          : null;
+        const email = typeof observed?.email === "string" ? observed.email.trim().toLowerCase() : "";
+        return {
+          nativeIdentity,
+          email: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null,
+          reason: [
+            "native_id_conflict_matching_email",
+            "native_id_conflict_different_email",
+            "native_id_conflict_unverified_email",
+            "email_conflict", "authenticated_rate_limited",
+          ].includes(observed?.reason) ? observed.reason : null,
+          idRelation: [
+            "me_matches_session_account_id",
+            "me_differs_session_user_and_account_id",
+            "me_differs_session_user_without_account_id",
+            "unclassified",
+          ].includes(observed?.idRelation) ? observed.idRelation : null,
+          emailProof: [
+            "emails_match", "emails_differ", "session_email_missing",
+            "me_email_missing", "both_emails_missing",
+          ].includes(observed?.emailProof) ? observed.emailProof : null,
+          bearerRelation: [
+            "bearer_token_unavailable", "bearer_not_authorized",
+            "bearer_rate_limited", "bearer_response_unavailable",
+            "bearer_identity_missing", "bearer_matches_session_user",
+            "bearer_matches_session_account", "bearer_matches_cookie_me",
+            "bearer_differs_from_session", "bearer_network_unavailable",
+          ].includes(observed?.bearerRelation) ? observed.bearerRelation : null,
+        };
+      }
+    } catch (_) {}
+    return { nativeIdentity: await browserAccountNativeIdentity(), email: null };
+  }
 
   async function runConversationRegistration(reason, convKey, registrationAttempt) {
-    const accountNativeIdentity = await browserAccountNativeIdentity();
+    const accountObservation = await browserAccountObservation();
+    const accountNativeIdentity = accountObservation.nativeIdentity;
+    const conflictStatuses = {
+      native_id_conflict_matching_email: "id_conflict_matching_email",
+      native_id_conflict_different_email: "id_conflict_different_email",
+      native_id_conflict_unverified_email: "id_conflict_unverified_email",
+      email_conflict: "email_conflict",
+      authenticated_rate_limited: "identity_rate_limited",
+    };
+    lastBrowserRegistrationStatus = accountNativeIdentity ? "identity_observed"
+      : conflictStatuses[accountObservation?.reason] || "identity_unavailable";
+    lastBrowserIdentityRelation = accountObservation?.idRelation || "not_observed";
+    lastBrowserContactProof = accountObservation?.emailProof || "not_observed";
+    lastBrowserBearerRelation = accountObservation?.bearerRelation || "not_observed";
+    // Never attempt to associate a ChatGPT route when no authenticated
+    // identity is available. A fresh tab can have conflicting login endpoints
+    // during an account switch; report only a bounded diagnostic state.
+    if (ADAPTER.name === "chatgpt" && !accountNativeIdentity) return null;
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
       try {
@@ -3662,18 +3762,52 @@ function normalizeHerdrMentionAlias(value) {
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
       ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
       : [];
+    // A previous account's tab can retain its old DOM after account switching.
+    // Verify this exact conversation is readable in the current signed-in
+    // provider session before publishing any account/session association.
+    if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
+      const proof = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+      if (!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim()) {
+        lastBrowserRegistrationStatus = "provider_readback_unavailable";
+        if (registeredConvKey === convKey) {
+          registeredConvKey = null;
+          registeredBrowserSessionRef = null;
+          registeredBrowserGeneration = null;
+          registeredHerdrAppKeyword = null;
+          registeredConversationBound = false;
+        }
+        return null;
+      }
+    }
+    // Async project discovery can outlive an account or project switch.
+    // Fence the registration against the current page before publishing it.
+    const currentAccount = await browserAccountObservation();
+    const currentProject = typeof ADAPTER.getProjectIdentity === "function"
+      ? ADAPTER.getProjectIdentity()
+      : adapterProject;
+    if (registrationAttempt !== browserRegistrationAttempt
+        || ADAPTER.getConversationKey() !== convKey
+        || currentAccount.nativeIdentity !== accountNativeIdentity
+        || (currentProject?.id || null) !== (adapterProject?.id || null)) {
+      return null;
+    }
     const response = await sendBg({
       type: "h2w_register",
       convKey,
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
+      accountDisplayEmail: currentAccount.email,
       browserProjects,
       browserAppKeywords,
       browserCurrentProjectId: browserCurrentProject?.id || null,
       browserCurrentProjectName: browserCurrentProject?.name || null,
       browserSessionReservationRef,
     });
+    lastBrowserRegistrationStatus = response === null ? "background_unavailable"
+      : Number.isSafeInteger(response?.browser_generation) && response.browser_generation > 0
+        && typeof response?.browser_account_ref === "string" && response.browser_account_ref
+        ? "registry_observed" : "registry_unobserved";
     if (response !== null) {
       if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
         if (registeredConvKey === convKey) {
@@ -4173,11 +4307,41 @@ function normalizeHerdrMentionAlias(value) {
   // /backend-api/conversations/<id> endpoint with a Bearer header. Any
   // 401/404/timeout fails closed and returns an error payload only; the token
   // never leaves this function scope and is never logged/stored.
+  // A provider 429 must stop all authenticated conversation reads, including
+  // the extra /api/auth/session preflight. Keep the cooldown local to this tab.
+  let chatGptReadRateLimitUntil = 0;
+  let chatGptReadRateLimitCount = 0;
+
+  function chatGptReadRateLimit() {
+    const remaining = chatGptReadRateLimitUntil - Date.now();
+    return remaining > 0
+      ? { ok: false, error: "conversation-http", reason: "http-429", status: 429,
+          retryAfterS: Math.ceil(remaining / 1000) }
+      : null;
+  }
+
+  function noteChatGptRead429(response) {
+    const rawSeconds = Number.parseInt(response.headers?.get?.("retry-after") || "", 10);
+    const retryAfterMs = Number.isSafeInteger(rawSeconds) && rawSeconds >= 0 && rawSeconds <= 86400
+      ? rawSeconds * 1000 : 0;
+    chatGptReadRateLimitCount = Math.min(8, chatGptReadRateLimitCount + 1);
+    const policyMs = BROWSER_PERFORMANCE?.rateLimitBackoffMs?.(chatGptReadRateLimitCount) || 30000;
+    chatGptReadRateLimitUntil = Math.max(
+      chatGptReadRateLimitUntil,
+      Date.now() + Math.max(30000, policyMs, retryAfterMs),
+    );
+    noteChatGptRateLimit(Date.now(), "authenticated_conversation");
+  }
+
   async function fetchChatGptConversationDetail({ conversationId, timeoutMs = 6000 } = {}) {
     if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, error: "not-chatgpt-conversation" };
+    const cooldown = chatGptReadRateLimit();
+    if (cooldown) return cooldown;
     const accessToken = await readChatGptAccessToken(4000);
     const sessionToken = String(accessToken || "");
-    if (!sessionToken || sessionToken.length > 4096) return { ok: false, reason: "auth" };
+    if (!sessionToken || sessionToken.length > 4096) {
+      return chatGptReadRateLimit() || { ok: false, reason: "auth" };
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -4188,7 +4352,11 @@ function normalizeHerdrMentionAlias(value) {
         headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
         signal: controller.signal,
       });
-      if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+      if (!response.ok) {
+        if (response.status === 429) noteChatGptRead429(response);
+        return { ok: false, reason: `http-${response.status}` };
+      }
+      chatGptReadRateLimitCount = 0;
       return { ok: true, body: await response.json() };
     } catch (error) {
       return { ok: false, reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
@@ -4205,8 +4373,13 @@ function normalizeHerdrMentionAlias(value) {
     if (!conversationId || ADAPTER.name !== "chatgpt") {
       return { ok: false, error: "not-chatgpt-conversation" };
     }
+    const cooldown = chatGptReadRateLimit();
+    if (cooldown) return cooldown;
     const accessToken = await readChatGptAccessToken(authTimeoutMs);
-    if (!accessToken) return { ok: false, error: "session-missing", reason: "auth", status: 401 };
+    if (!accessToken) {
+      return chatGptReadRateLimit()
+        || { ok: false, error: "session-missing", reason: "auth", status: 401 };
+    }
     const sessionToken = String(accessToken);
     if (sessionToken.length === 0 || sessionToken.length > 4096) {
       return { ok: false, error: "session-missing", reason: "auth" };
@@ -4223,6 +4396,7 @@ function normalizeHerdrMentionAlias(value) {
         signal: controller.signal,
       });
       if (!response.ok) {
+        if (response.status === 429) noteChatGptRead429(response);
         const retryAfter = Number.parseInt(response.headers?.get?.("retry-after") || "", 10);
         return {
           ok: false, error: "conversation-http", reason: `http-${response.status}`, status: response.status,
@@ -4230,6 +4404,7 @@ function normalizeHerdrMentionAlias(value) {
         };
       }
       const body = await response.json();
+      chatGptReadRateLimitCount = 0;
       return { ok: true, body };
     } catch (error) {
       return { ok: false, error: "conversation-failed", reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
@@ -4316,6 +4491,7 @@ function normalizeHerdrMentionAlias(value) {
         authTimeoutMs: remainingTimeout(800),
       });
       if (observed?.ok && observed.body?.title === title) return verified(true);
+      if (observed?.status === 429) break;
       if (Date.now() < deadline) await wait(150);
     }
     return failed("title_projection_readback_unverified");
@@ -4379,6 +4555,7 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function readChatGptAccessToken(timeoutMs = 4000) {
+    if (chatGptReadRateLimit()) return null;
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -4390,7 +4567,10 @@ function normalizeHerdrMentionAlias(value) {
           headers: { accept: "application/json" },
           signal: controller.signal,
         });
-        if (!response.ok) return null;
+        if (!response.ok) {
+          if (response.status === 429) noteChatGptRead429(response);
+          return null;
+        }
         const body = await response.json();
         return String(body?.accessToken || "") || null;
       } finally {
@@ -5211,12 +5391,51 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
-  async function maybeSendRecoveryProbe() {
+  // Recovery probe authorization evidence. A probe is a new user turn, so the
+  // policy only escalates on a proven terminal provider fact. A busy page, an
+  // unreadable provider snapshot, and a still-open turn all fail closed here.
+  async function observeRecoveryEvidence(record = conversationHealth) {
+    if (typeof RECOVERY_CONTROLLER?.recoveryProbeAllowed !== "function") return null;
+    // Gate the authenticated provider fetch before it happens. The 5s health
+    // watch and the post-load reconcile both land here, and last_user_submit_at
+    // survives markTurnEnded(), so a settled conversation used to keep fetching
+    // the provider snapshot indefinitely. Only a pending, evidence-due reply is
+    // fetched; an ended, Auto-off, or not-yet-due conversation stops here.
+    if (typeof RECOVERY_CONTROLLER.shouldObserveRecoveryEvidence !== "function"
+      || !RECOVERY_CONTROLLER.shouldObserveRecoveryEvidence(record, { automationEnabled, now: Date.now() })) {
+      return null;
+    }
+    const safety = recoverySafetySnapshot();
+    const dom = {
+      streaming: safety.streaming,
+      toolRunning: safety.toolRunning,
+      composerBusy: safety.composerBusy,
+      permissionCardActive: safety.permissionCardActive,
+      assistantText: lastMessageByRole("assistant"),
+    };
+    if (safety.streaming || safety.toolRunning || safety.composerBusy || safety.permissionCardActive) {
+      return { dom };
+    }
+    const server = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+    return { dom, server };
+  }
+
+  async function maybeSendRecoveryProbe(evidence = null) {
     if (!conversationHealth || !RECOVERY_CONTROLLER) return false;
     if (!automationEnabled) return false;
-    if (!RECOVERY_CONTROLLER.shouldSendRecovery(conversationHealth)) return false;
+    if (!RECOVERY_CONTROLLER.shouldSendRecovery(
+      conversationHealth,
+      RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY,
+      Date.now(),
+      evidence,
+    )) return false;
     const safety = recoverySafetySnapshot();
     if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return false;
+    // Re-verify immediately before submitting. Other watchers (stale-view
+    // refresh, explicit-error handling) run between the polling tick and this
+    // point, and a probe is a new user turn that must never race live work.
+    const live = await observeRecoveryEvidence(conversationHealth);
+    if (!RECOVERY_CONTROLLER.recoveryProbeAllowed(live, conversationHealth.last_user_submit_at)) return false;
     const result = await performWake({
       template: hudLabels.recovery_probe_template,
       autoAllow: false,
@@ -5362,7 +5581,13 @@ function normalizeHerdrMentionAlias(value) {
     if (ADAPTER.name === "chatgpt" && !chatGptConversationId()) return;
     const record = await ensureConversationHealth();
     if (!record || !RECOVERY_CONTROLLER) return;
-    const suspect = RECOVERY_CONTROLLER.classifyReplyTimeout(record);
+    const evidence = await observeRecoveryEvidence(record);
+    const suspect = RECOVERY_CONTROLLER.classifyReplyTimeout(
+      record,
+      Date.now(),
+      RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs,
+      evidence,
+    );
     if (suspect !== record) markConversationState(suspect);
     await maybeEscalateRecoveryRollover();
   }
@@ -5382,10 +5607,16 @@ function normalizeHerdrMentionAlias(value) {
         if (await maybeRecoverPageHealth()) return;
         if (await maybeRecoverExplicitChatGptFailure()) return;
         if (await maybeRecoverExplicitThreadError()) return;
-        const next = RECOVERY_CONTROLLER.classifyReplyTimeout(conversationHealth);
+        const evidence = await observeRecoveryEvidence();
+        const next = RECOVERY_CONTROLLER.classifyReplyTimeout(
+          conversationHealth,
+          Date.now(),
+          RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs,
+          evidence,
+        );
         if (next !== conversationHealth) markConversationState(next);
         if (await maybeRefreshStaleView()) return;
-        if (await maybeSendRecoveryProbe()) return;
+        if (await maybeSendRecoveryProbe(evidence)) return;
         if (await maybeReloadForRecovery()) return;
         if (await maybeEscalateContextRollover()) return;
         await maybeEscalateRecoveryRollover();

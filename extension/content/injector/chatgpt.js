@@ -59,7 +59,33 @@ class ChatGPTAdapter extends BaseAdapter {
     return { ok: false, error: "chat_mode_switch_timeout" };
   }
 
-  async getAccountNativeIdentity(timeoutMs = 1500) {
+  displayEmailFromPayload(payload) {
+    const raw = payload?.email || payload?.user?.email || payload?.account?.email || payload?.email_address || null;
+    const email = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+    return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null;
+  }
+
+  noteAccountIdentity429(response) {
+    const retryAfter = Number.parseInt(response?.headers?.get?.("retry-after") || "", 10);
+    const boundedRetryAfterMs = Number.isSafeInteger(retryAfter)
+      && retryAfter >= 0 && retryAfter <= 86_400 ? retryAfter * 1000 : 0;
+    this._accountIdentity429Count = Math.min(8, (this._accountIdentity429Count || 0) + 1);
+    const policyMs = Math.min(120_000, 30_000 * (2 ** Math.min(2, this._accountIdentity429Count - 1)));
+    this._accountIdentity429Until = Math.max(
+      this._accountIdentity429Until || 0,
+      Date.now() + Math.max(30_000, policyMs, boundedRetryAfterMs),
+    );
+  }
+
+  async getAccountObservation(timeoutMs = 1500) {
+    if (Date.now() < (this._accountIdentity429Until || 0)) {
+      return { nativeIdentity: null, email: null, reason: "authenticated_rate_limited" };
+    }
+    let nativeIdentity = null;
+    let email = null;
+if (Date.now() < (this._accountIdentity429Until || 0)) {
+      return { nativeIdentity: null, email: null, reason: "authenticated_rate_limited" };
+    }
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -71,16 +97,129 @@ class ChatGPTAdapter extends BaseAdapter {
           headers: { accept: "application/json" },
           signal: controller.signal,
         });
+        if (response.status === 429) {
+          this.noteAccountIdentity429(response);
+          return { nativeIdentity: null, email: null, reason: "authenticated_rate_limited" };
+        }
         if (!response.ok) continue;
+        this._accountIdentity429Count = 0;
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-        if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+        const observedIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+        if (!observedIdentity) continue;
+        const observedEmail = this.displayEmailFromPayload(payload);
+        // An old tab can retain the former account's authenticated /me response
+        // after a ChatGPT account switch. Reject conflicting provider identities.
+        if (nativeIdentity && observedIdentity !== nativeIdentity) {
+          const reason = email && observedEmail
+            ? (email === observedEmail
+              ? "native_id_conflict_matching_email" : "native_id_conflict_different_email")
+            : "native_id_conflict_unverified_email";
+          // Only compare identity equality and source shape. Never return the
+          // raw identifiers or session/account payload to the extension host.
+          const sessionAccountId = typeof payload?.account?.id === "string"
+            ? payload.account.id.trim() : "";
+          const idRelation = url === "/api/auth/session"
+            ? (sessionAccountId
+              ? (nativeIdentity === sessionAccountId
+                ? "me_matches_session_account_id" : "me_differs_session_user_and_account_id")
+              : "me_differs_session_user_without_account_id")
+            : "unclassified";
+          const emailProof = email && observedEmail
+            ? (email === observedEmail ? "emails_match" : "emails_differ")
+            : (email ? "session_email_missing"
+              : (observedEmail ? "me_email_missing" : "both_emails_missing"));
+          let bearerRelation = "bearer_token_unavailable";
+          // Probe only after conflicting cookie-authenticated responses. The
+          // bearer token remains in this page's memory and never enters a
+          // background message, log, Registry record or diagnostic payload.
+          if (url === "/api/auth/session" && typeof payload?.accessToken === "string"
+              && payload.accessToken.trim()) {
+            const now = Date.now();
+            const cached = this._bearerIdentityProbe;
+            if (cached && cached.meId === nativeIdentity
+                && cached.sessionUserId === observedIdentity
+                && cached.sessionAccountId === sessionAccountId
+                && now - cached.checkedAt < 30_000) {
+              bearerRelation = cached.relation;
+            } else {
+              const bearerController = new AbortController();
+              const bearerTimer = setTimeout(() => bearerController.abort(), timeoutMs);
+              try {
+                const verified = await fetch("/backend-api/me", {
+                  method: "GET",
+                  credentials: "include",
+                  cache: "no-store",
+                  headers: {
+                    accept: "application/json",
+                    authorization: `Bearer ${payload.accessToken}`,
+                  },
+                  signal: bearerController.signal,
+                });
+                if (!verified.ok) {
+                  if (verified.status === 429) this.noteAccountIdentity429(verified);
+                  bearerRelation = verified.status === 401 || verified.status === 403
+                    ? "bearer_not_authorized" : verified.status === 429
+                      ? "bearer_rate_limited" : "bearer_response_unavailable";
+                } else {
+                  const identity = await verified.json();
+                  const candidateId = identity?.id || identity?.user?.id || identity?.account?.id;
+                  const bearerId = typeof candidateId === "string" ? candidateId.trim() : "";
+                  bearerRelation = !bearerId ? "bearer_identity_missing"
+                    : bearerId === observedIdentity ? "bearer_matches_session_user"
+                    : bearerId === sessionAccountId ? "bearer_matches_session_account"
+                    : bearerId === nativeIdentity ? "bearer_matches_cookie_me"
+                    : "bearer_differs_from_session";
+                }
+              } catch (_) {
+                bearerRelation = "bearer_network_unavailable";
+              } finally {
+                clearTimeout(bearerTimer);
+              }
+              this._bearerIdentityProbe = {
+                meId: nativeIdentity,
+                sessionUserId: observedIdentity,
+                sessionAccountId,
+                relation: bearerRelation,
+                checkedAt: now,
+              };
+            }
+          }
+          // The cookie-backed /me ID may come from a stale account or a
+          // different ID namespace. Accept only a current-session user ID
+          // independently confirmed by /me using that session's bearer token,
+          // with a valid current email and no contradictory email evidence.
+          // All other conflicts continue to fail closed.
+          if (bearerRelation === "bearer_matches_session_user"
+              && observedEmail && (!email || email === observedEmail)) {
+            this._accountIdentity429Count = 0;
+            return {
+              nativeIdentity: observedIdentity,
+              email: observedEmail,
+              identityVerification: "bearer_verified_session_user",
+              idRelation, emailProof, bearerRelation,
+            };
+          }
+          return { nativeIdentity: null, email: null, reason, idRelation, emailProof, bearerRelation };
+        }
+        if (email && observedEmail && email !== observedEmail) {
+          return { nativeIdentity: null, email: null, reason: "email_conflict" };
+        }
+        nativeIdentity = observedIdentity;
+        email ||= observedEmail;
       } catch (_) {
       } finally {
         clearTimeout(timer);
       }
     }
-    return null;
+    if (nativeIdentity) this._accountIdentity429Count = 0;
+    return nativeIdentity
+      ? { nativeIdentity, email }
+      : { nativeIdentity: null, email: null, reason: "authenticated_identity_unavailable" };
+  }
+
+  async getAccountNativeIdentity(timeoutMs = 1500) {
+    return (await this.getAccountObservation(timeoutMs)).nativeIdentity;
   }
 
   getConversationKey() {
@@ -401,6 +540,35 @@ class ChatGPTAdapter extends BaseAdapter {
       : 'div.ProseMirror[role="textbox"][contenteditable="true"]';
   }
 
+  // Page-level generation authority. The composer-scoped candidate list can miss
+  // the stop control during thinking/tool phases, while the page-wide control is
+  // still present. Any visible, strictly validated stop control on the
+  // conversation page means a generation is running; the same page-wide scan is
+  // already used by the MAIN-world render-containment script.
+  isGenerationInProgress() {
+    const stopLabel = /^(?:stop|stop generating|stop streaming|stop response|停止|停止生成|停止流式|停止回答)$/i;
+    const selectors = [
+      'button[data-testid*="stop"]',
+      '[role="button"][data-testid*="stop"]',
+      'button[aria-label*="stop" i]',
+      '[role="button"][aria-label*="stop" i]',
+      'button[aria-label*="停止"]',
+      '[role="button"][aria-label*="停止"]',
+    ];
+    for (const selector of selectors) {
+      for (const el of document.querySelectorAll(selector)) {
+        if (!this.elementVisible(el)) continue;
+        const testId = String(el.getAttribute('data-testid') || '').trim().toLowerCase();
+        if (testId.includes('stop')) return true;
+        const values = [el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText, el.textContent]
+          .map((value) => String(value || '').trim().replace(/\s+/g, ' '))
+          .filter(Boolean);
+        if (values.some((value) => stopLabel.test(value))) return true;
+      }
+    }
+    return false;
+  }
+
   getSendButtonCandidates() {
     const selectors = [
       'button[data-testid="send-button"]',
@@ -436,6 +604,7 @@ class ChatGPTAdapter extends BaseAdapter {
       'button[aria-label="Stop streaming" i]',
       'button[aria-label="停止生成"]',
       'button[aria-label="停止流式"]',
+      'button[aria-label="停止"]',
     ];
     const seen = new Set();
     const out = [];

@@ -356,6 +356,32 @@ function tableHarness({ rows, extraElements = [] }) {
   return { h, table };
 }
 
+test("user reads a table after long navigation | Given more than 128 links before a visible table | When inspect assigns bounded refs | Then the table can still be extracted", () => {
+  const navigation = Array.from({ length: 140 }, (_, index) => createElement({
+    tag: "a", text: `Nav ${index}`, attrs: { href: `/nav/${index}` },
+  }));
+  const table = createElement({ tag: "table" });
+  const h = harness({ elements: [...navigation, table] });
+  const doc = table.ownerDocument;
+  attachTableRows(table, [
+    tableDomRow({ doc, cells: [tableDomNode({ doc, tag: "th", text: "Name" })] }),
+    tableDomRow({ doc, cells: [tableDomNode({ doc, text: "Alpha" })] }),
+  ]);
+
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 128);
+  const tableRef = observed.elements.find((element) => element.tag === "table")?.ref;
+  assert.ok(tableRef, "long navigation must not hide the table from observed refs");
+
+  const extracted = h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: tableRef, maxRows: 2,
+  });
+  assert.equal(extracted.ok, true);
+  assert.deepEqual(Array.from(extracted.headers), ["Name"]);
+  assert.deepEqual(Array.from(extracted.rows[0]), ["Alpha"]);
+});
+
 test("user extracts one observed table | Given a page with a visible table ref | When extract_table requests bounded rows | Then headers and cell text return without markup or hidden values", () => {
   const longCell = "v".repeat(400);
   const button = createElement({ tag: "button", text: "Filter" });
@@ -1435,6 +1461,42 @@ test("user clicks a nested custom choice | Given a bounded generic tag in a dial
   assert.equal(h.send({ type: "h2w_page_assist", action: "click", generation: observed.generation, ref: observed.elements[0].ref }).error, "stale_generation");
 });
 
+test("user pages beyond 128 safe controls | Given a long document with sensitive fields | When observe advances an eligible offset | Then each bounded page returns fresh refs without exposing secrets", () => {
+  const buttons = Array.from({ length: 260 }, (_, i) => createElement({ text: "Item " + i }));
+  const password = createElement({ tag: "input", type: "password", value: "private" });
+  const hidden = createElement({ text: "Hidden", visible: false });
+  const h = harness({ elements: [...buttons.slice(0, 130), password, hidden, ...buttons.slice(130)] });
+
+  const first = h.send({ type: "h2w_page_assist", action: "observe" });
+  assert.equal(first.ok, true);
+  assert.equal(first.elements.length, 128);
+  assert.equal(first.elements[0].text, "Item 0");
+  assert.equal(first.elements[127].text, "Item 127");
+  assert.equal(first.next_element_offset, 128);
+
+  const second = h.send({ type: "h2w_page_assist", action: "observe", elementOffset: first.next_element_offset });
+  assert.equal(second.ok, true);
+  assert.equal(second.elements.length, 128);
+  assert.equal(second.elements[0].text, "Item 128");
+  assert.equal(second.elements[127].text, "Item 255");
+  assert.equal(second.next_element_offset, 256);
+  assert.notEqual(second.generation, first.generation);
+  const stale = h.send({ type: "h2w_page_assist", action: "click", generation: first.generation, ref: first.elements[0].ref });
+  assert.equal(stale.error, "stale_generation");
+
+  const last = h.send({ type: "h2w_page_assist", action: "observe", elementOffset: second.next_element_offset });
+  assert.equal(last.ok, true);
+  assert.deepEqual(Array.from(last.elements, (item) => item.text), ["Item 256", "Item 257", "Item 258", "Item 259"]);
+  assert.equal(last.element_offset, 256);
+  assert.equal(last.next_element_offset, null);
+  for (const offset of [-1, 1.5, 4097, "128"]) {
+    const rejected = h.send({ type: "h2w_page_assist", action: "observe", elementOffset: offset });
+    assert.equal(rejected.error, "element_offset_invalid");
+  }
+  assert.equal(h.send({ type: "h2w_page_assist", action: "click", generation: last.generation, ref: last.elements[0].ref }).ok, true);
+  assert.equal(buttons[256].clicked, 1);
+});
+
 test("user observes only bounded choice controls | Given inert tags and unsafe custom containers | When inspect scans them before Cancel | Then they receive no refs and do not consume the control budget", () => {
   const inert = Array.from({ length: 128 }, () => createElement({ tag: "span", text: "Decorative", attrs: { class: "tag" } }));
   const inertDiv = createElement({ tag: "div", text: "Inert", attrs: { class: "layout-container" } });
@@ -1449,4 +1511,24 @@ test("user observes only bounded choice controls | Given inert tags and unsafe c
   const h = harness({ elements: [...inert, inertDiv, broad, sensitive, createElement({ text: "Cancel" })] });
   const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
   assert.deepEqual(Array.from(observed.elements, (el) => el.text), ["Cancel"]);
+});
+
+test("user observes only safe body text | Given hidden and sensitive descendants | When inspect runs | Then their text is excluded", () => {
+  const button = createElement({ tag: "button", text: "Save" });
+  const h = harness({ elements: [button], bodyText: "Visible SECRET_ARIA SECRET_HIDDEN SECRET_PASSWORD tail" });
+  const doc = button.ownerDocument;
+  const textNode = (value) => ({ nodeType: 3, nodeValue: value });
+  const child = (options, nodes) => Object.assign(createElement(options), { nodeType: 1, ownerDocument: doc, childNodes: nodes });
+  doc.body.nodeType = 1;
+  doc.body.childNodes = [
+    textNode("Visible "),
+    child({ tag: "span", attrs: { "aria-hidden": "true" } }, [textNode("SECRET_ARIA")]),
+    child({ tag: "span", visible: false }, [textNode("SECRET_HIDDEN")]),
+    child({ tag: "input", type: "password" }, [textNode("SECRET_PASSWORD")]),
+    textNode("tail"),
+  ];
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.text, "Visible tail");
+  assert.doesNotMatch(observed.text, /SECRET_/);
 });

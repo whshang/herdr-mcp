@@ -81,6 +81,59 @@ pub struct BrowserCallerAuthorization {
     pub principal_ref: String,
     pub connector_id: String,
     pub grant_generation: i64,
+    // Display-only platform_account labels live Edge-side; they never ride
+    // the authorization wire and are not part of the runtime struct.
+}
+
+/// `<platform>-<email>` display label. The first `-` separates the platform
+/// from the account, so the email may itself contain `-`.
+pub(crate) fn normalize_platform_account(value: &str) -> Option<String> {
+    let text = value.trim().to_ascii_lowercase();
+    if text.len() < 6 || text.len() > 128 {
+        return None;
+    }
+    let (platform, account) = text.split_once('-')?;
+    if !is_platform_account_token(platform) || !is_platform_account_email(account) {
+        return None;
+    }
+    Some(text)
+}
+
+fn is_platform_account_token(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_lowercase()
+        && value.len() <= 32
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+}
+
+fn is_platform_account_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || !local.chars().all(|ch| {
+            ch.is_ascii_lowercase()
+                || ch.is_ascii_digit()
+                || matches!(ch, '.' | '_' | '%' | '+' | '-')
+        })
+    {
+        return false;
+    }
+    let Some((host, tld)) = domain.rsplit_once('.') else {
+        return false;
+    };
+    !host.is_empty()
+        && !host.starts_with(['.', '-'])
+        && !host.ends_with(['.', '-'])
+        && !host.contains("..")
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-'))
+        && (2..=24).contains(&tld.len())
+        && tld.chars().all(|ch| ch.is_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4671,6 +4724,27 @@ fn browser_session_create_reconcile_uncertain_inner(
             Err(error) => return browser_store_error(error),
         }
     }
+    let (app_refusal_reason, app_selection_probe) =
+        browser_session_create_app_refusal_fields(delivery_state, &evidence);
+    let mut value = json!({
+        "ok": false,
+        "code": delivery_state.as_str(),
+        "reservation_ref": settled.reservation_ref,
+        "reservation_state": settled.state,
+        "delivery_state": settled.delivery_state,
+        "app_refusal_reason": app_refusal_reason,
+        "app_selection_probe": app_selection_probe,
+        "replayed": replayed,
+        "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
+    });
+    browser_session_apply_classification_reason(&mut value, classification_reason);
+    value
+}
+
+fn browser_session_create_app_refusal_fields(
+    delivery_state: BrowserDeliveryState,
+    evidence: &BrowserPostconditionEvidence,
+) -> (Option<String>, Option<Value>) {
     // The provider can return arbitrary strings. Surface only a fixed set of
     // non-sensitive App-selection failures rather than echoing DOM text.
     let app_refusal_reason = if delivery_state == BrowserDeliveryState::Rejected {
@@ -4732,19 +4806,125 @@ fn browser_session_create_reconcile_uncertain_inner(
         }
         (!out.is_empty()).then_some(Value::Object(out))
     });
-    let mut value = json!({
-        "ok": false,
-        "code": delivery_state.as_str(),
-        "reservation_ref": settled.reservation_ref,
-        "reservation_state": settled.state,
-        "delivery_state": settled.delivery_state,
-        "app_refusal_reason": app_refusal_reason,
-        "app_selection_probe": app_selection_probe,
-        "replayed": replayed,
-        "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
-    });
-    browser_session_apply_classification_reason(&mut value, classification_reason);
-    value
+    (app_refusal_reason.map(str::to_owned), app_selection_probe)
+}
+
+fn browser_session_create_public_delivery_evidence(
+    result: Option<&Value>,
+    app_refusal_reason: Option<&str>,
+    app_selection_probe: Option<&Value>,
+) -> Value {
+    // The extension observes untrusted provider content. Never echo arbitrary
+    // objects, page text, account profile JSON, cookies or token-shaped data.
+    let mut public = serde_json::Map::new();
+    if let Some(result) = result {
+        const SAFE_BOOLEANS: &[&str] = &[
+            "message_submitted",
+            "retry_safe",
+            "tab_opened",
+            "tab_closed",
+            "tab_cleanup_verified",
+            "session_materialized",
+            "canonical_url_observed",
+        ];
+        for key in SAFE_BOOLEANS {
+            if let Some(value) = result.get(*key).and_then(Value::as_bool) {
+                public.insert((*key).to_owned(), Value::Bool(value));
+            }
+        }
+        if result
+            .get("accepted_user_message_ref")
+            .is_some_and(Value::is_null)
+        {
+            public.insert("accepted_user_message_ref".to_owned(), Value::Null);
+        }
+
+        // Operational diagnostics consist exclusively of fixed vocabularies.
+        // Future provider strings require an explicit contract change.
+        const SAFE_CODES: &[(&str, &[&str])] = &[
+            (
+                "registration_status",
+                &[
+                    "not_observed",
+                    "identity_observed",
+                    "identity_unavailable",
+                    "registry_observed",
+                    "registry_unobserved",
+                    "background_unavailable",
+                    "provider_readback_unavailable",
+                    "probe_not_completed",
+                    "identity_conflict",
+                    "id_conflict_matching_email",
+                    "id_conflict_different_email",
+                    "id_conflict_unverified_email",
+                    "email_conflict",
+                ],
+            ),
+            (
+                "identity_relation",
+                &[
+                    "me_matches_session_account_id",
+                    "me_differs_session_user_and_account_id",
+                    "me_differs_session_user_without_account_id",
+                    "unclassified",
+                    "not_observed",
+                ],
+            ),
+            (
+                "contact_proof",
+                &[
+                    "emails_match",
+                    "emails_differ",
+                    "session_email_missing",
+                    "me_email_missing",
+                    "both_emails_missing",
+                    "not_observed",
+                ],
+            ),
+            (
+                "bearer_relation",
+                &[
+                    "bearer_token_unavailable",
+                    "bearer_not_authorized",
+                    "bearer_rate_limited",
+                    "bearer_response_unavailable",
+                    "bearer_identity_missing",
+                    "bearer_matches_session_user",
+                    "bearer_matches_session_account",
+                    "bearer_matches_cookie_me",
+                    "bearer_differs_from_session",
+                    "bearer_network_unavailable",
+                    "not_observed",
+                ],
+            ),
+            (
+                "scope_failure",
+                &[
+                    "scope_missing",
+                    "provider_mismatch",
+                    "account_mismatch",
+                    "space_mismatch",
+                    "generation_mismatch",
+                    "registry_handshake_delay",
+                    "content_script_unavailable",
+                ],
+            ),
+        ];
+        for (key, known) in SAFE_CODES {
+            if let Some(value) = result.get(*key).and_then(Value::as_str)
+                && known.contains(&value)
+            {
+                public.insert((*key).to_owned(), Value::String(value.to_owned()));
+            }
+        }
+    }
+    if let Some(reason) = app_refusal_reason {
+        public.insert("error".to_owned(), Value::String(reason.to_owned()));
+    }
+    if let Some(probe) = app_selection_probe {
+        public.insert("app_selection_probe".to_owned(), probe.clone());
+    }
+    Value::Object(public)
 }
 
 fn browser_session_create_params_from_source(
@@ -5684,6 +5864,13 @@ fn browser_session_create(
             classification_reason,
         );
     }
+    let (app_refusal_reason, app_selection_probe) =
+        browser_session_create_app_refusal_fields(delivery_state, &evidence);
+    let delivery_evidence = browser_session_create_public_delivery_evidence(
+        evidence.result.as_ref(),
+        app_refusal_reason.as_deref(),
+        app_selection_probe.as_ref(),
+    );
     json!({
         "ok": false,
         "code": unavailable_reason.as_deref().unwrap_or_else(|| observed_delivery_state.as_str()),
@@ -5694,7 +5881,9 @@ fn browser_session_create(
         "delivery_state": updated.delivery_state,
         "replayed": replayed,
         "reconciled": false,
-        "delivery_evidence": evidence.result,
+        "app_refusal_reason": app_refusal_reason,
+        "app_selection_probe": app_selection_probe,
+        "delivery_evidence": delivery_evidence,
     })
 }
 
@@ -6999,7 +7188,8 @@ fn browser_operation_resource(
     Ok(resource)
 }
 
-/// WebChat control grants are provider-scoped: exact endpoint + provider.
+/// WebChat control grants are provider-scoped: exact endpoint + provider,
+/// unless the grant is device-wide (`endpoint_ref` `*`).
 /// `account_ref` (legacy per-account grants, or the `*` provider-scope marker)
 /// is accepted for backward compatibility and does not narrow the match.
 pub(crate) const WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT: &str = "*";
@@ -7009,14 +7199,30 @@ fn webchat_control_grant_covers(
     endpoint_ref: &str,
     provider: &str,
 ) -> bool {
-    grant.endpoint_ref == endpoint_ref
+    (grant.endpoint_ref == endpoint_ref
+        || (grant.endpoint_ref == WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
+            && grant.provider == WEBCHAT_CONTROL_ANY_PROVIDER
+            && grant.account_ref == WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT))
         && (grant.provider == provider || grant.provider == WEBCHAT_CONTROL_ANY_PROVIDER)
 }
 
 /// Provider wildcard: a grant with provider `*` covers every WebChat provider
-/// on its exact endpoint (issued explicitly, or derived by Edge from a Page
-/// Assist endpoint grant).
+/// on its exact endpoint (issued explicitly, or derived by Edge from Page
+/// Assist). The separately issued complete `*/*/*` tuple covers a device's
+/// endpoints after the trusted Edge device-route filter. Partial wildcards
+/// (endpoint `*` with a specific provider or account) are always rejected.
 pub(crate) const WEBCHAT_CONTROL_ANY_PROVIDER: &str = "*";
+/// Device-wide WebChat control is issued only by the enrolled owner's
+/// allow-device command. Edge binds it to a verified connector and routes
+/// it only to the same device; Page Assist is never inherited.
+pub(crate) const WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT: &str = "*";
+
+/// Device-wide wildcard. Edge forwards only grants whose `device_id` matches
+/// the routed device, so `*` covers every endpoint on that device and no other.
+/// Kept for test references; the strict grant_covers path uses the
+/// DEVICE_SCOPE_ENDPOINT triplet check instead.
+#[cfg(test)]
+pub(crate) const WEBCHAT_CONTROL_ANY_ENDPOINT: &str = "*";
 
 fn browser_resource_actuation_decision(
     store: &StateStore,
@@ -9082,6 +9288,22 @@ fn browser_fast_path_call_with_semantic(
     unreachable!("bounded browser fast path loop always returns")
 }
 
+fn browser_page_action_http_url(value: Option<&Value>) -> Option<url::Url> {
+    let raw = value?.as_str()?;
+    if raw.len() > 4096 || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let url = url::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+    {
+        return None;
+    }
+    Some(url)
+}
+
 fn browser_page_action_call(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -9096,6 +9318,7 @@ fn browser_page_action_call(
         "page_ref",
         "action",
         "max_chars",
+        "element_offset",
         "generation",
         "ref",
         "value",
@@ -9108,6 +9331,8 @@ fn browser_page_action_call(
         "key",
         "max_rows",
         "expected_url",
+        "url",
+        "page_generation",
     ];
     if let Some(key) = object
         .keys()
@@ -9172,13 +9397,14 @@ fn browser_page_action_call(
     let action = match object.get("action").and_then(Value::as_str) {
         Some(
             value @ ("observe" | "click" | "hover" | "fill" | "expect" | "screenshot" | "scroll"
-            | "extract" | "extract_table" | "press"),
+            | "extract" | "extract_table" | "press" | "navigate" | "reload" | "back"
+            | "forward"),
         ) => value,
         _ => {
             return json!({
                 "ok": false,
                 "code": "invalid_params",
-                "message": "action must be observe, click, hover, fill, expect, screenshot, scroll, extract, extract_table, or press",
+                "message": "action must be observe, click, hover, fill, expect, screenshot, scroll, extract, extract_table, press, navigate, reload, back, or forward",
             });
         }
     };
@@ -9191,21 +9417,41 @@ fn browser_page_action_call(
         });
     }
 
-    if action != "click" && object.contains_key("expected_url") {
-        return json!({"ok": false, "code": "invalid_params", "message": "expected_url is accepted only for click"});
+    if action != "navigate" && object.contains_key("url") {
+        return json!({"ok": false, "code": "invalid_params", "message": "url is accepted only for navigate"});
+    }
+
+    if !matches!(action, "click" | "back" | "forward") && object.contains_key("expected_url") {
+        return json!({"ok": false, "code": "invalid_params", "message": "expected_url is accepted only for click, back, or forward"});
+    }
+
+    if !matches!(action, "navigate" | "reload" | "back" | "forward")
+        && object.contains_key("page_generation")
+    {
+        return json!({"ok": false, "code": "invalid_params", "message": "page_generation is accepted only for navigation actions"});
     }
 
     let mut bridge_params = json!({
         "page_ref": page_ref,
         "action": action,
     });
-    let mutation = matches!(action, "click" | "hover" | "fill" | "scroll" | "press");
+    if action != "observe" && object.contains_key("element_offset") {
+        return json!({"ok": false, "code": "invalid_params", "message": "element_offset is accepted only for observe"});
+    }
+    let mutation = matches!(
+        action,
+        "click"
+            | "hover"
+            | "fill"
+            | "scroll"
+            | "press"
+            | "navigate"
+            | "reload"
+            | "back"
+            | "forward"
+    );
     let mut mutation_key: Option<&str> = None;
     let mut semantic_objective: Option<&str> = None;
-
-    if action != "scroll" && (object.contains_key("direction") || object.contains_key("amount")) {
-        return json!({"ok": false, "code": "invalid_params", "message": "direction/amount are accepted only for scroll"});
-    }
 
     match action {
         "observe" | "screenshot" => {
@@ -9255,6 +9501,17 @@ fn browser_page_action_call(
                     });
                 }
                 semantic_objective = Some(objective);
+            }
+            if action == "observe"
+                && let Some(element_offset) = object.get("element_offset")
+            {
+                let Some(offset) = element_offset.as_u64() else {
+                    return json!({"ok": false, "code": "invalid_params", "message": "element_offset must be an integer"});
+                };
+                if offset > 4096 {
+                    return json!({"ok": false, "code": "invalid_params", "message": "element_offset must be between 0 and 4096"});
+                }
+                bridge_params["element_offset"] = json!(offset);
             }
             if action == "observe"
                 && let Some(max_chars) = object.get("max_chars")
@@ -9486,6 +9743,86 @@ fn browser_page_action_call(
             bridge_params["ref"] = json!(element_ref);
             bridge_params["max_rows"] = json!(max_rows);
         }
+        "navigate" | "reload" | "back" | "forward" => {
+            for disallowed in [
+                "max_chars",
+                "generation",
+                "ref",
+                "value",
+                "condition",
+                "timeout_ms",
+                "objective",
+                "direction",
+                "amount",
+                "key",
+                "max_rows",
+            ] {
+                if object.contains_key(disallowed) {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": format!("{disallowed} is not accepted for {action}"),
+                    });
+                }
+            }
+            let page_generation = match object.get("page_generation").and_then(Value::as_u64) {
+                Some(value) if value > 0 && value <= i64::MAX as u64 => value,
+                _ => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "page_generation must be a positive integer",
+                    });
+                }
+            };
+            let idempotency_key = match object
+                .get("idempotency_key")
+                .and_then(Value::as_str)
+                .map(str::trim)
+            {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 256
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "idempotency_key is required for a browser page mutation",
+                    });
+                }
+            };
+            match action {
+                "navigate" => {
+                    let Some(url) = browser_page_action_http_url(object.get("url")) else {
+                        return json!({
+                            "ok": false,
+                            "code": "invalid_params",
+                            "message": "url must be a bounded absolute http(s) URL for navigate",
+                        });
+                    };
+                    bridge_params["url"] = json!(url.to_string());
+                }
+                "back" | "forward" => {
+                    let Some(expected) = browser_page_action_http_url(object.get("expected_url"))
+                    else {
+                        return json!({
+                            "ok": false,
+                            "code": "invalid_params",
+                            "message": "expected_url must be a bounded absolute http(s) URL for back/forward",
+                        });
+                    };
+                    bridge_params["expected_url"] = json!(expected.to_string());
+                }
+                "reload" => {}
+                _ => unreachable!(),
+            }
+            bridge_params["page_generation"] = json!(page_generation);
+            mutation_key = Some(idempotency_key);
+        }
         "click" | "hover" | "fill" | "scroll" | "press" => {
             for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
                 if object.contains_key(disallowed) {
@@ -9579,22 +9916,7 @@ fn browser_page_action_call(
             if action == "click"
                 && let Some(raw_expected) = object.get("expected_url")
             {
-                let valid_expected_url = || -> Option<url::Url> {
-                    let raw = raw_expected.as_str()?;
-                    if raw.len() > 4096 || raw.chars().any(char::is_control) {
-                        return None;
-                    }
-                    let url = url::Url::parse(raw).ok()?;
-                    if !matches!(url.scheme(), "http" | "https")
-                        || !url.username().is_empty()
-                        || url.password().is_some()
-                        || url.host_str().is_none()
-                    {
-                        return None;
-                    }
-                    Some(url)
-                };
-                let Some(expected) = valid_expected_url() else {
+                let Some(expected) = browser_page_action_http_url(Some(raw_expected)) else {
                     return json!({"ok": false, "code": "invalid_params", "message": "expected_url must be a bounded absolute http(s) URL"});
                 };
                 bridge_params["expected_url"] = json!(expected.to_string());
@@ -9761,6 +10083,16 @@ fn browser_page_action_call(
             "generation": bridge_params["generation"],
             "ref": bridge_params.get("ref"),
             "key": bridge_params["key"],
+        })
+    } else if matches!(action, "navigate" | "reload" | "back" | "forward") {
+        json!({
+            "operation": BROWSER_PAGE_ACTION_METHOD,
+            "endpoint_ref": endpoint_ref,
+            "page_ref": page_ref,
+            "action": action,
+            "page_generation": bridge_params["page_generation"],
+            "url": bridge_params.get("url"),
+            "expected_url": bridge_params.get("expected_url"),
         })
     } else {
         // Keep preexisting click/fill hashes identical when expected_url is absent.
@@ -14619,7 +14951,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "gap found by this task's Gap 1 work, not fixed here (product change out of scope): the first-attempt create rejection echoes the extension's whole raw `result` object as `delivery_evidence`, so the fixed App-probe allowlist and `app_refusal_reason` projection that the reconcile path applies are not enforced on the path that actually reports the refusal. The runtime comment at the reconcile projection states provider strings are never echoed; an extension key such as `page_text` therefore crosses to the caller. Needs a product decision: project `delivery_evidence` (and surface `app_refusal_reason`) on the first attempt too."]
     fn browser_create_rejection_should_project_only_allowlisted_app_probe_keys() {
         use std::sync::atomic::AtomicUsize;
 
@@ -22071,6 +22402,250 @@ mod tests {
     }
 
     #[test]
+    fn browser_page_navigation_actions_are_same_origin_generation_fenced_and_idempotent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct NavigationActuator {
+            calls: AtomicUsize,
+            seen: Mutex<Vec<Value>>,
+        }
+        impl BrowserActuator for NavigationActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("navigation must use the exact browser endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert!(dispatch_id.is_some());
+                assert!(params.get("endpoint_ref").is_none());
+                assert!(params.get("generation").is_none());
+                let action = params["action"].as_str().unwrap();
+                let mut result = json!({
+                    "ok": true,
+                    "delivery_state": "applied",
+                    "retry_safe": false,
+                    "mutation_submitted": true,
+                    "postcondition_observed": false,
+                });
+                match action {
+                    "navigate" => {
+                        result["navigated"] = json!(true);
+                        result["navigated_url"] = params["url"].clone();
+                        assert!(params.get("expected_url").is_none());
+                    }
+                    "reload" => {
+                        result["reloaded"] = json!(true);
+                        result["reloaded_url"] = json!("https://example.com/start");
+                        assert!(params.get("url").is_none());
+                        assert!(params.get("expected_url").is_none());
+                    }
+                    "back" | "forward" => {
+                        result["navigated"] = json!(true);
+                        result["navigated_url"] = params["expected_url"].clone();
+                        assert!(params.get("url").is_none());
+                    }
+                    other => panic!("unexpected navigation action {other}"),
+                }
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.seen.lock().unwrap().push(params.clone());
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(result);
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = NavigationActuator {
+            calls: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+        };
+        let page_ref = format!("bp_{}", "b".repeat(64));
+        let navigate = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "navigate",
+            "page_generation": 3,
+            "url": "https://example.com/next",
+            "idempotency_key": "navigate-once-1",
+        });
+
+        let applied = browser_page_action_call(&store, &navigate, &grants, Some(&actuator));
+        assert_eq!(applied["ok"], true, "{applied}");
+        assert_eq!(applied["delivery_state"], "applied");
+        assert_eq!(applied["navigated_url"], "https://example.com/next");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        {
+            let seen = actuator.seen.lock().unwrap();
+            assert_eq!(seen[0]["action"], "navigate");
+            assert_eq!(seen[0]["page_generation"], 3);
+            assert_eq!(seen[0]["url"], "https://example.com/next");
+        }
+
+        let replay = browser_page_action_call(&store, &navigate, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["navigated_url"], "https://example.com/next");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        for (field, value) in [
+            ("url", json!("https://example.com/other")),
+            ("page_generation", json!(4)),
+        ] {
+            let mut conflict = navigate.clone();
+            conflict[field] = value;
+            let result = browser_page_action_call(&store, &conflict, &grants, Some(&actuator));
+            assert_eq!(result["code"], "idempotency_key_conflict", "{result}");
+        }
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        for (field, value) in [
+            ("url", json!("javascript:alert(1)")),
+            ("url", json!("https://user:secret@example.com/next")),
+            ("url", json!("/relative")),
+            ("page_generation", json!(0)),
+            ("generation", json!("pa_gen_nav")),
+            ("expected_url", json!("https://example.com/next")),
+            ("ref", json!("ref_pa_gen_nav_0")),
+        ] {
+            let mut invalid = navigate.clone();
+            invalid[field] = value;
+            invalid["idempotency_key"] = json!(format!("navigate-invalid-{field}"));
+            assert_eq!(
+                browser_page_action_call(&store, &invalid, &grants, Some(&actuator))["code"],
+                "invalid_params",
+                "field {field}"
+            );
+        }
+        let mut missing_key = navigate.clone();
+        missing_key["idempotency_key"] = json!("");
+        assert_eq!(
+            browser_page_action_call(&store, &missing_key, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        let mut missing_generation = navigate.clone();
+        missing_generation
+            .as_object_mut()
+            .unwrap()
+            .remove("page_generation");
+        missing_generation["idempotency_key"] = json!("navigate-missing-generation");
+        assert_eq!(
+            browser_page_action_call(&store, &missing_generation, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        let reload = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "reload",
+            "page_generation": 4,
+            "idempotency_key": "reload-once-1",
+        });
+        let reloaded = browser_page_action_call(&store, &reload, &grants, Some(&actuator));
+        assert_eq!(reloaded["ok"], true, "{reloaded}");
+        assert_eq!(reloaded["reloaded_url"], "https://example.com/start");
+        let reload_replay = browser_page_action_call(&store, &reload, &grants, Some(&actuator));
+        assert_eq!(reload_replay["idempotent_replay"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+        {
+            let seen = actuator.seen.lock().unwrap();
+            assert_eq!(seen[1]["action"], "reload");
+            assert_eq!(seen[1]["page_generation"], 4);
+        }
+        let mut reload_with_url = reload.clone();
+        reload_with_url["url"] = json!("https://example.com/start");
+        reload_with_url["idempotency_key"] = json!("reload-invalid-url");
+        assert_eq!(
+            browser_page_action_call(&store, &reload_with_url, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+
+        for action in ["back", "forward"] {
+            let request = json!({
+                "endpoint_ref": "bep_test",
+                "page_ref": page_ref,
+                "action": action,
+                "page_generation": 5,
+                "expected_url": "https://example.com/start",
+                "idempotency_key": format!("{action}-once-1"),
+            });
+            let applied = browser_page_action_call(&store, &request, &grants, Some(&actuator));
+            assert_eq!(applied["ok"], true, "{applied}");
+            assert_eq!(applied["navigated_url"], "https://example.com/start");
+            let replay = browser_page_action_call(&store, &request, &grants, Some(&actuator));
+            assert_eq!(replay["idempotent_replay"], true);
+            let mut changed = request.clone();
+            changed["expected_url"] = json!("https://example.com/other");
+            assert_eq!(
+                browser_page_action_call(&store, &changed, &grants, Some(&actuator))["code"],
+                "idempotency_key_conflict"
+            );
+        }
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 4);
+        {
+            let seen = actuator.seen.lock().unwrap();
+            assert_eq!(seen[2]["action"], "back");
+            assert_eq!(seen[2]["expected_url"], "https://example.com/start");
+            assert_eq!(seen[3]["action"], "forward");
+            assert_eq!(seen[3]["expected_url"], "https://example.com/start");
+        }
+
+        let mut back_with_url = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "back",
+            "page_generation": 6,
+            "url": "https://example.com/start",
+            "idempotency_key": "back-url-invalid",
+        });
+        assert_eq!(
+            browser_page_action_call(&store, &back_with_url, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        back_with_url["expected_url"] = json!("https://example.com/start");
+        assert_eq!(
+            browser_page_action_call(&store, &back_with_url, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+
+        let click_with_generation = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "click",
+            "generation": "pa_gen_nav",
+            "ref": "ref_pa_gen_nav_0",
+            "page_generation": 6,
+            "idempotency_key": "click-page-generation-invalid",
+        });
+        assert_eq!(
+            browser_page_action_call(&store, &click_with_generation, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
     fn browser_page_element_wait_conditions_use_existing_read_only_actuator() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
@@ -24230,11 +24805,72 @@ mod webchat_control_provider_scope_tests {
         );
     }
 
+    /// Device-wide scope inherits across endpoints/providers, but only with
+    /// the exact owner-issued triple; partial wildcard records fail closed.
+    #[test]
+    fn user_owner_device_scope_covers_all_webchat_endpoints_only_when_complete() {
+        let wide = grant("*", "*", "*");
+        for endpoint in ["bep_a", "bep_b"] {
+            for provider in ["chatgpt", "grok", "claude"] {
+                assert!(webchat_control_grant_covers(&wide, endpoint, provider));
+            }
+        }
+        assert!(!webchat_control_grant_covers(
+            &grant("*", "grok", "*"),
+            "bep_b",
+            "grok"
+        ));
+        assert!(!webchat_control_grant_covers(
+            &grant("*", "*", "br_legacy"),
+            "bep_a",
+            "chatgpt"
+        ));
+        assert!(!webchat_control_grant_covers(
+            &grant("bep_a", "*", "*"),
+            "bep_b",
+            "chatgpt"
+        ));
+    }
+
     /// user owner | Given a legacy grant carrying an explicit account_ref | When that provider on that endpoint is controlled | Then it still works (account_ref is ignored)
     #[test]
     fn user_owner_given_legacy_account_grant_when_same_endpoint_provider_then_authorized() {
         let g = grant("bep_a", "chatgpt", "br_legacy_account");
         assert!(webchat_control_grant_covers(&g, "bep_a", "chatgpt"));
+    }
+
+    /// user owner | Given a device-wide grant (`*` endpoint and provider) | When any provider on another endpoint of that device is controlled | Then it is authorized
+    #[test]
+    fn user_owner_given_device_wide_grant_when_any_endpoint_then_authorized() {
+        let g = grant(
+            WEBCHAT_CONTROL_ANY_ENDPOINT,
+            WEBCHAT_CONTROL_ANY_PROVIDER,
+            WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+        );
+        for (endpoint, provider) in [("bep_a", "grok"), ("bep_b", "claude"), ("bep_c", "chatgpt")] {
+            assert!(
+                webchat_control_grant_covers(&g, endpoint, provider),
+                "{endpoint}/{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_account_label_accepts_platform_email_and_rejects_client_name() {
+        assert_eq!(
+            normalize_platform_account("  Grokbot-Whshang@gmail.com "),
+            Some("grokbot-whshang@gmail.com".to_owned())
+        );
+        assert_eq!(
+            normalize_platform_account("chatgpt-user.name+tag@example.com"),
+            Some("chatgpt-user.name+tag@example.com".to_owned())
+        );
+        assert_eq!(normalize_platform_account("Cursor"), None);
+        assert_eq!(normalize_platform_account("grokbot-not-an-email"), None);
+        assert_eq!(
+            normalize_platform_account("grok_bot-owner@example.com"),
+            None
+        );
     }
 }
 
