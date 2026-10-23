@@ -3417,11 +3417,70 @@ impl StateStore {
     pub fn browser_session_ref_for_canonical_url_for_adapters(
         &self,
         canonical_url: &str,
-        _providers: &[&str],
+        providers: &[&str],
     ) -> Result<Option<String>, String> {
-        // RED scaffold: provider set not honored yet — delegates to the
-        // historical ChatGPT-pinned query so behavior is unchanged today.
-        self.browser_session_ref_for_canonical_url(canonical_url)
+        if canonical_url.is_empty()
+            || canonical_url.len() > 2048
+            || canonical_url != canonical_url.trim()
+            || canonical_url.chars().any(char::is_control)
+            || !canonical_url.starts_with("https://")
+        {
+            return Err("browser_canonical_url_invalid".to_owned());
+        }
+        // Provider names come from the Runtime's adapter registry. They are
+        // bound into the query as parameters (never interpolated), and any
+        // malformed name fails closed instead of being silently dropped.
+        if providers.is_empty() {
+            return Ok(None);
+        }
+        for provider in providers {
+            if provider.is_empty()
+                || provider.len() > 32
+                || provider.chars().any(|ch| {
+                    !(ch.is_ascii_lowercase()
+                        || ch.is_ascii_digit()
+                        || matches!(ch, '.' | '_' | '-'))
+                })
+            {
+                return Err("browser_adapter_provider_invalid".to_owned());
+            }
+        }
+        // Same fail-closed ambiguity contract as the ChatGPT-scoped variant:
+        // an exact canonical URL must map to exactly one session across the
+        // admitted adapter providers; any second distinct session is
+        // ambiguous regardless of recency.
+        let placeholders = std::iter::repeat_n("?", providers.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT r.resource_ref
+             FROM browser_resource_locators l
+             JOIN browser_resources r ON r.resource_ref = l.resource_ref
+             WHERE l.canonical_url = ?1
+               AND r.kind = 'session'
+               AND r.provider IN ({placeholders})
+             GROUP BY r.resource_ref
+             LIMIT 2"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|error| format!("cannot prepare browser session URL lookup: {error}"))?;
+        let mut params: Vec<&str> = Vec::with_capacity(providers.len() + 1);
+        params.push(canonical_url);
+        params.extend(providers.iter().copied());
+        let mut refs = stmt
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("cannot query browser session URL lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser session URL lookup: {error}"))?;
+        match refs.len() {
+            0 => Ok(None),
+            1 => Ok(Some(refs.remove(0))),
+            _ => Err("browser_canonical_url_ambiguous".to_owned()),
+        }
     }
 
     pub fn browser_session_ref_for_canonical_url(
@@ -12667,7 +12726,12 @@ mod tests {
                 })
                 .unwrap();
             store
-                .upsert_browser_resource_locator(&session.resource_ref, url, observed_at, observed_at)
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    url,
+                    observed_at,
+                    observed_at,
+                )
                 .unwrap();
             session.resource_ref
         };

@@ -930,6 +930,15 @@ fn webchat_adapter_for_host(host: &str) -> Option<&'static WebChatAdapterRow> {
         .find(|row| row.hosts.contains(&host))
 }
 
+/// The WebChat adapter providers from the registry, for state-store
+/// adapter-scoped lookups. The registry stays the single provider authority.
+fn webchat_adapter_providers() -> Vec<&'static str> {
+    WEBCHAT_ADAPTER_REGISTRY
+        .iter()
+        .map(|row| row.provider)
+        .collect()
+}
+
 /// Whether a provider's sessions may bind WebChat dispatch parent sessions.
 /// Registry-driven (slice 1): any registered WebChat adapter qualifies, an
 /// unregistered provider name stays refused. Until the registry is wired in
@@ -1317,8 +1326,11 @@ fn continuity_call(
                     Ok(Some(value)) => Ok(Some(value)),
                     Ok(None) => {
                         if let Some(conversation_url) = conversation_url
-                            && let Some(session_ref) =
-                                store.browser_session_ref_for_canonical_url(conversation_url)?
+                            && let Some(session_ref) = store
+                                .browser_session_ref_for_canonical_url_for_adapters(
+                                    conversation_url,
+                                    &webchat_adapter_providers(),
+                                )?
                             && let Some(value) =
                                 store.continuity_for_provider_session("chatgpt", &session_ref)?
                         {
@@ -4937,7 +4949,10 @@ fn browser_source_route(
         selected.to_owned()
     } else {
         store
-            .browser_session_ref_for_canonical_url(&canonical_url)?
+            .browser_session_ref_for_canonical_url_for_adapters(
+                &canonical_url,
+                &webchat_adapter_providers(),
+            )?
             .ok_or_else(|| "browser_source_session_not_found".to_owned())?
     };
     let session = store
@@ -19217,7 +19232,10 @@ mod tests {
         let source_session_ref = store
             .lock()
             .unwrap()
-            .browser_session_ref_for_canonical_url(&source_url)
+            .browser_session_ref_for_canonical_url_for_adapters(
+                &source_url,
+                &webchat_adapter_providers(),
+            )
             .unwrap()
             .unwrap();
         let current_turn_now = browser_epoch_ms();
