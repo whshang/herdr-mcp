@@ -262,7 +262,7 @@ fn agent_task_dispatch_parent_session(
     let Some(caller_session) = context.caller_browser_session else {
         return AgentTaskParentSession::Unbound("caller_session_absent");
     };
-    if caller_session.provider != "chatgpt" {
+    if !webchat_adapter_binds_parent_session(&caller_session.provider) {
         return AgentTaskParentSession::Unbound("caller_session_absent");
     }
     let Ok(mut store) = context.state_store.lock() else {
@@ -281,7 +281,7 @@ fn agent_task_dispatch_parent_session(
         Ok(None) => return AgentTaskParentSession::Unbound("source_turn_not_found"),
         Err(_) => return AgentTaskParentSession::Unbound("binding_failed"),
     };
-    if session.kind != "session" || session.provider != "chatgpt" {
+    if session.kind != "session" || !webchat_adapter_binds_parent_session(&session.provider) {
         return AgentTaskParentSession::Unbound("source_turn_not_found");
     }
     if session.observation_generation != expected_generation {
@@ -928,6 +928,14 @@ fn webchat_adapter_for_host(host: &str) -> Option<&'static WebChatAdapterRow> {
     WEBCHAT_ADAPTER_REGISTRY
         .iter()
         .find(|row| row.hosts.contains(&host))
+}
+
+/// Whether a provider's sessions may bind WebChat dispatch parent sessions.
+/// Registry-driven (slice 1): any registered WebChat adapter qualifies, an
+/// unregistered provider name stays refused. Until the registry is wired in
+/// this keeps the historical ChatGPT-only behavior.
+fn webchat_adapter_binds_parent_session(provider: &str) -> bool {
+    provider == "chatgpt"
 }
 
 fn browser_uuid(value: &str) -> bool {
@@ -17970,6 +17978,19 @@ mod tests {
     }
 
     const TEST_CONVERSATION_UUID: &str = "5d2a9c3e-1f4b-4a6d-8e2f-0b7c9d1e3a5b";
+
+    /// user binds dispatch parents for every registered adapter | Given the
+    /// WebChat adapter registry | When parent-session provider qualification
+    /// is checked | Then chatgpt, claude, and grok all qualify while
+    /// unregistered provider names stay refused.
+    #[test]
+    fn parent_session_provider_qualification_follows_adapter_registry() {
+        assert!(webchat_adapter_binds_parent_session("chatgpt"));
+        assert!(webchat_adapter_binds_parent_session("claude"));
+        assert!(webchat_adapter_binds_parent_session("grok"));
+        assert!(!webchat_adapter_binds_parent_session("z.ai"));
+        assert!(!webchat_adapter_binds_parent_session(""));
+    }
 
     /// user resolves a Grok conversation through an adapter | Given a grok.com
     /// conversation URL | When the URL identity is resolved | Then the result
