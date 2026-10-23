@@ -5733,8 +5733,9 @@ mod tests {
 
     /// Minimal scripted Herdr socket: one JSON-RPC request per connection,
     /// each answered with the next scripted response (id mirrored). Same wire
-    /// contract as the prompt.rs dispatch tests.
-    fn spawn_scripted_herdr_socket(responses: Vec<Value>) -> PathBuf {
+    /// contract as the prompt.rs dispatch tests. Every received request is
+    /// recorded so tests can assert what actually reached the Herdr socket.
+    fn spawn_scripted_herdr_socket(responses: Vec<Value>) -> (PathBuf, Arc<Mutex<Vec<Value>>>) {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
 
@@ -5748,6 +5749,8 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
         std::thread::spawn(move || {
             for response in responses {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -5756,6 +5759,7 @@ mod tests {
                     .read_line(&mut line)
                     .unwrap();
                 let request: Value = serde_json::from_str(&line).unwrap();
+                recorded.lock().unwrap().push(request.clone());
                 writeln!(
                     stream,
                     "{}",
@@ -5764,7 +5768,7 @@ mod tests {
                 .unwrap();
             }
         });
-        socket
+        (socket, requests)
     }
 
     /// Production-shaped AppState for dispatch tests: the durable task
@@ -5966,7 +5970,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let socket = spawn_scripted_herdr_socket(vec![
+        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {
                 "status": "submitted",
@@ -6053,6 +6057,27 @@ mod tests {
         assert_eq!(result["submitted"], true);
         assert_eq!(result["task"]["parent_session_ref"], session_ref);
         assert_eq!(result["parent_session"], json!({"bound": true}));
+        // The turn text is binding evidence only: neither the prompt path nor
+        // the Herdr socket ever receives the key or the text.
+        assert!(!result.to_string().contains(user_text.trim()));
+        let recorded = herdr_requests.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .all(|call| !call.to_string().contains("current_user_message")),
+            "prompt params must not carry current_user_message: {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .all(|call| !call.to_string().contains(user_text.trim())),
+            "the user turn text must never reach the Herdr socket: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|call| call["method"] == "agent.prompt"
+                && call["params"]["text"] == "run the L14 lane"),
+            "the dispatch text itself still reaches agent.prompt"
+        );
         assert_eq!(
             store
                 .lock()
@@ -6131,7 +6156,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let socket = spawn_scripted_herdr_socket(vec![
+        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
@@ -6140,6 +6165,12 @@ mod tests {
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 9}}}),
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 10}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 11}}}),
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 12}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 13}}}),
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 14}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 15}}}),
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 16}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 17}}}),
         ]);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
@@ -6167,6 +6198,29 @@ mod tests {
             now,
         )
         .await;
+        // Two distinct sessions observing the same user text make that digest
+        // ambiguous for every later dispatch.
+        let (app, duplicate_a) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "conflict-dup-a",
+            "重复消息",
+            now,
+        )
+        .await;
+        let (app, duplicate_b) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "conflict-dup-b",
+            "重复消息",
+            now,
+        )
+        .await;
+        assert_ne!(duplicate_a, duplicate_b);
 
         let opaque = "opaque-dispatch-conflict-1";
         store
@@ -6280,8 +6334,11 @@ mod tests {
             json!({"bound": false, "reason": "current_user_message_invalid"})
         );
 
-        // A miss on a caller session that was never bound writes no mapping
-        // at all, so a later dispatch cannot inherit guessed evidence.
+        // A valid message for a turn that is not observed yet leaves the task
+        // unstamped and writes no mapping; once the turn is observed, a replay
+        // of the same idempotency key must stay a pure replay: no evidence is
+        // resolved, no mapping is written, and the fact follows the stored
+        // task.
         let fresh_opaque = "opaque-dispatch-never-bound";
         let fresh_headers = vec![
             (
@@ -6307,14 +6364,14 @@ mod tests {
             ),
         ];
         let unbound_miss = webchat_tool_call(
-            app,
+            app.clone(),
             &fresh_headers,
             "herdr_mcp.agent.task.dispatch",
             json!({
                 "target": "w1:p1",
                 "text": "unbound caller miss",
-                "idempotency_key": "dispatch-miss-4",
-                "current_user_message": "不存在的消息",
+                "idempotency_key": "dispatch-replay-1",
+                "current_user_message": "稍后观察的消息",
             }),
         )
         .await;
@@ -6335,6 +6392,237 @@ mod tests {
                 .unwrap(),
             None
         );
+
+        // The late session registers the turn after the task was created.
+        let (app, _late_session) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "conflict-late",
+            "稍后观察的消息",
+            now,
+        )
+        .await;
+        let prompts_before_replay = herdr_requests.lock().unwrap().len();
+        let replay = webchat_tool_call(
+            app.clone(),
+            &fresh_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "unbound caller miss",
+                "idempotency_key": "dispatch-replay-1",
+                "current_user_message": "稍后观察的消息",
+            }),
+        )
+        .await;
+        assert_eq!(replay["idempotent_replay"], true);
+        assert!(replay["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            replay["parent_session"],
+            json!({"bound": false, "reason": "idempotent_replay"})
+        );
+        assert_eq!(
+            herdr_requests.lock().unwrap().len(),
+            prompts_before_replay,
+            "a replayed dispatch must not submit anything"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_caller_session(
+                    "connector:conn_DispatchConflict1",
+                    "chatgpt",
+                    fresh_opaque
+                )
+                .unwrap(),
+            None,
+            "a replayed dispatch must not write the caller-session mapping"
+        );
+
+        // A WebChat caller without a covering webchat_control grant cannot
+        // bind even with exact evidence.
+        let ungranted_headers = vec![
+            edge_headers[0].clone(),
+            edge_headers[1].clone(),
+            edge_headers[2].clone(),
+            ("x-herdr-edge-webchat-control-grants", "[]".to_owned()),
+        ];
+        let ungranted = webchat_tool_call(
+            app.clone(),
+            &ungranted_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "ungranted dispatch",
+                "idempotency_key": "dispatch-miss-5",
+                "current_user_message": "第二条消息",
+            }),
+        )
+        .await;
+        assert_eq!(ungranted["ok"], true);
+        assert!(ungranted["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            ungranted["parent_session"],
+            json!({"bound": false, "reason": "grant_missing"})
+        );
+
+        // WebChat authorization without the ChatGPT caller session cannot
+        // resolve any caller identity.
+        let no_session_headers = vec![edge_headers[0].clone(), edge_headers[1].clone()];
+        let no_session = webchat_tool_call(
+            app.clone(),
+            &no_session_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "caller session absent",
+                "idempotency_key": "dispatch-miss-6",
+                "current_user_message": "第二条消息",
+            }),
+        )
+        .await;
+        assert_eq!(no_session["ok"], true);
+        assert!(no_session["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            no_session["parent_session"],
+            json!({"bound": false, "reason": "caller_session_absent"})
+        );
+
+        // Two sessions observing the same user text stay ambiguous.
+        let ambiguous = webchat_tool_call(
+            app,
+            &edge_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "ambiguous evidence",
+                "idempotency_key": "dispatch-miss-7",
+                "current_user_message": "重复消息",
+            }),
+        )
+        .await;
+        assert_eq!(ambiguous["ok"], true);
+        assert!(ambiguous["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            ambiguous["parent_session"],
+            json!({"bound": false, "reason": "source_turn_ambiguous"})
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn webchat_dispatch_stale_provider_generation_stays_unstamped() {
+        let root = test_root("webchat-dispatch-bind-stale");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let (socket, _requests) = spawn_scripted_herdr_socket(vec![
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
+        ]);
+        let mut state = dispatch_test_state(&root, &socket);
+        state.trusted_extension_ipc = true;
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let (app, profile_seed, endpoint_ref, account_ref) =
+            register_chatgpt_endpoint(app, "stale", now).await;
+        let (app, session_ref) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "stale-a",
+            "过期前观察的消息",
+            now,
+        )
+        .await;
+
+        // The provider moves to a newer generation while the session row and
+        // its source turn keep the old one (extension reload).
+        let registry_request = |payload: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/extension/browser/registry")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+        let newer_provider = json!({
+            "operation": "provider.observe",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "adapter_protocol_version": 1,
+            "observation_generation": 2,
+            "capabilities": {"operations": ["identity.inspect", "space.list"]},
+            "observed_at": now + 1
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(newer_provider))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let edge_headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-authorization",
+                json!({
+                    "principal_ref": "connector:conn_DispatchStale1",
+                    "connector_id": "conn_DispatchStale1",
+                    "grant_generation": 1
+                })
+                .to_string(),
+            ),
+            (
+                "x-herdr-edge-browser-caller-session",
+                json!({"provider": "chatgpt", "opaque_session_id": "opaque-dispatch-stale-1"})
+                    .to_string(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+            ),
+        ];
+        let stale = webchat_tool_call(
+            app,
+            &edge_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "stale provider generation",
+                "idempotency_key": "dispatch-stale-1",
+                "current_user_message": "过期前观察的消息",
+            }),
+        )
+        .await;
+        assert_eq!(stale["ok"], true);
+        assert!(stale["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            stale["parent_session"],
+            json!({"bound": false, "reason": "source_turn_stale"})
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_caller_session(
+                    "connector:conn_DispatchStale1",
+                    "chatgpt",
+                    "opaque-dispatch-stale-1"
+                )
+                .unwrap(),
+            None
+        );
+        let _ = session_ref;
         let _ = std::fs::remove_dir_all(root);
     }
 }

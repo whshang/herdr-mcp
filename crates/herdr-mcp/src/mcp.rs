@@ -177,15 +177,35 @@ enum AgentTaskParentSession {
     Bound(String),
     /// Binding was attempted but must not stamp; the fact reports the reason.
     Unbound(&'static str),
+    /// The idempotency key is already known, so this call is a pure replay:
+    /// no evidence is resolved, no mapping is written, and the fact describes
+    /// the stored task instead of this call.
+    Replay,
 }
 
-impl AgentTaskParentSession {
-    fn model_visible_fact(&self) -> Option<Value> {
-        match self {
-            Self::NotAttempted => None,
-            Self::Bound(_) => Some(json!({"bound": true})),
-            Self::Unbound(reason) => Some(json!({"bound": false, "reason": reason})),
-        }
+/// The compact, non-secret `parent_session` fact for one dispatch result.
+///
+/// A replay reports the stored task's actual stamp; it never claims the binding
+/// this call would have resolved.
+fn agent_task_parent_session_fact(
+    binding: &AgentTaskParentSession,
+    result: &Value,
+) -> Option<Value> {
+    match binding {
+        AgentTaskParentSession::NotAttempted => None,
+        AgentTaskParentSession::Bound(_) => Some(json!({"bound": true})),
+        AgentTaskParentSession::Unbound(reason) => Some(json!({"bound": false, "reason": reason})),
+        AgentTaskParentSession::Replay => result.get("task").map(|task| {
+            if task
+                .get("parent_session_ref")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                json!({"bound": true})
+            } else {
+                json!({"bound": false, "reason": "idempotent_replay"})
+            }
+        }),
     }
 }
 
@@ -265,6 +285,19 @@ fn agent_task_dispatch_parent_session(
         return AgentTaskParentSession::Unbound("source_turn_not_found");
     }
     if session.observation_generation != expected_generation {
+        return AgentTaskParentSession::Unbound("source_turn_stale");
+    }
+    // The archive reservation additionally fences on the current provider
+    // generation. A still-registered session row and its source turn can lag
+    // the provider after an extension reload, so the session-only comparison
+    // above cannot prove the evidence is current.
+    let provider_generation =
+        match store.browser_provider_state(&session.endpoint_ref, &session.provider) {
+            Ok(Some(state)) => state.observation_generation,
+            Ok(None) => return AgentTaskParentSession::Unbound("provider_generation_unknown"),
+            Err(_) => return AgentTaskParentSession::Unbound("binding_failed"),
+        };
+    if provider_generation != expected_generation {
         return AgentTaskParentSession::Unbound("source_turn_stale");
     }
     // The grant is provider-scoped (endpoint + provider), so any observed
@@ -611,19 +644,37 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     })
                 })
             } else if method == prompt::AGENT_TASK_DISPATCH_METHOD {
-                let binding = agent_task_dispatch_parent_session(context, &params);
+                // A key the runtime already knows (replay payload, in-flight
+                // reservation, conflict, or durable task ownership) cannot
+                // produce a new dispatch. That call must stay a pure replay:
+                // resolve no evidence and write no caller-session mapping.
+                let replayed = params
+                    .get("idempotency_key")
+                    .and_then(Value::as_str)
+                    .is_some_and(|key| context.prompt.dispatch_key_already_known(key));
+                let binding = if replayed {
+                    AgentTaskParentSession::Replay
+                } else {
+                    agent_task_dispatch_parent_session(context, &params)
+                };
                 let parent_session_ref = match &binding {
                     AgentTaskParentSession::Bound(session_ref) => Some(session_ref.clone()),
-                    AgentTaskParentSession::Unbound(_) => None,
+                    AgentTaskParentSession::Unbound(_) | AgentTaskParentSession::Replay => None,
                     AgentTaskParentSession::NotAttempted => prompt_parent_session_ref(context),
                 };
+                // The turn text is binding evidence only; it must never travel
+                // into the prompt path that retains or traces the arguments.
+                let mut prompt_params = params.clone();
+                if let Some(object) = prompt_params.as_object_mut() {
+                    object.remove("current_user_message");
+                }
                 let mut result = prompt::run_with_parent_session(
                     context.client,
                     context.prompt,
-                    &params,
+                    &prompt_params,
                     parent_session_ref.as_deref(),
                 );
-                if let Some(fact) = binding.model_visible_fact()
+                if let Some(fact) = agent_task_parent_session_fact(&binding, &result)
                     && let Some(object) = result.as_object_mut()
                 {
                     object.insert("parent_session".to_owned(), fact);

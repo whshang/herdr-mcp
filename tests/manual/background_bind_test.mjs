@@ -181,7 +181,7 @@ function emitPushEvent(event, data) {
 const mcpRequestBodies = [];
 const nativeBatchRequests = [];
 let failNextBrowserEndpointRegistration = true;
-let failNextSourceTurnObserveCount = 0;
+let pendingSourceTurnObserveFailures = [];
 const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
@@ -536,14 +536,14 @@ globalThis.chrome = {
           });
           return;
         }
-        if (body.operation === "source_turn.observe" && failNextSourceTurnObserveCount > 0) {
-          failNextSourceTurnObserveCount -= 1;
+        if (body.operation === "source_turn.observe" && pendingSourceTurnObserveFailures.length > 0) {
+          const code = pendingSourceTurnObserveFailures.shift();
           callback({
             ok: true,
             transport: "ipc",
             status: 200,
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ ok: false, code: "browser_source_session_not_found" }),
+            body: JSON.stringify({ ok: false, code }),
           });
           return;
         }
@@ -4397,7 +4397,10 @@ console.log("\n[Source-turn observe retry covers the fresh-conversation registra
   );
   const retryConv = "https://chatgpt.com/c/source-turn-retry-race";
   const startedAt = Date.now() - 10;
-  failNextSourceTurnObserveCount = 2;
+  pendingSourceTurnObserveFailures = [
+    "browser_source_session_not_found",
+    "browser_source_session_not_found",
+  ];
   await dispatchMessage({
     type: "h2w_turn_started",
     convKey: retryConv,
@@ -4420,7 +4423,7 @@ console.log("\n[Source-turn observe retry covers the fresh-conversation registra
 
   const settledConv = "https://chatgpt.com/c/source-turn-retry-settled";
   const settledAt = Date.now();
-  failNextSourceTurnObserveCount = 1;
+  pendingSourceTurnObserveFailures = ["browser_source_session_not_found"];
   await dispatchMessage({
     type: "h2w_turn_started",
     convKey: settledConv,
@@ -4433,6 +4436,28 @@ console.log("\n[Source-turn observe retry covers the fresh-conversation registra
   ok(observesFor(settledConv).length === 2
       && observesFor(settledConv).every((attempt) => attempt.observed_at === settledAt),
     "the recovered retry replays the original turn evidence exactly");
+
+  // A registration miss followed by a different failure must not issue the
+  // third attempt: only the registration code may continue the schedule.
+  const failClosedConv = "https://chatgpt.com/c/source-turn-retry-fail-closed";
+  const failClosedAt = Date.now();
+  pendingSourceTurnObserveFailures = [
+    "browser_source_session_not_found",
+    "browser_canonical_url_ambiguous",
+  ];
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: failClosedConv,
+    userText: "歧义后停止",
+    startedAt: failClosedAt,
+  });
+  ok(await waitForTest(() => observesFor(failClosedConv).length >= 2, 8000),
+    "user keeps an ambiguous observe fail-closed | Given the first observe misses registration and the retry reports an ambiguous canonical URL | When the retry schedule inspects the failure code | Then exactly two attempts are made",
+    JSON.stringify(observesFor(failClosedConv)));
+  await new Promise((resolve) => setTimeout(resolve, 4000));
+  ok(observesFor(failClosedConv).length === 2,
+    "a non-registration failure stops the retry schedule instead of issuing the third attempt",
+    JSON.stringify(observesFor(failClosedConv)));
 }
 
 

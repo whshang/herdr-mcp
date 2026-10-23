@@ -12030,7 +12030,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // dispatch needs it most. The observe is an idempotent per-session
           // upsert gated on the same confirmed submit, so retry the
           // registration race a bounded number of times instead of dropping
-          // the turn. Any other failure stays dropped and fail-closed.
+          // the turn. Only that registration code may continue the schedule:
+          // any other failure (ambiguous URL, store error, transport) stops
+          // immediately and stays fail-closed.
           void (async () => {
             for (const delayMs of [1500, 3000]) {
               await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -12038,10 +12040,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 await observeSourceTurn();
                 return;
               } catch (retryError) {
-                callLog(
-                  "current source turn observe retry failed:",
-                  retryError?.message || String(retryError),
-                );
+                const code = retryError?.message || String(retryError);
+                callLog("current source turn observe retry failed:", code);
+                if (retryError?.message !== "browser_source_session_not_found") return;
               }
             }
           })();
