@@ -21,10 +21,13 @@
 
 ChatGPT, Claude and Grok are implemented **twice**: once as `*Adapter` classes inside the
 extension, and again as provider-string branches in the Rust runtime. The browser-side
-adapter seam already exists (`BaseAdapter` + `registerH2WAdapter`, §1.1), but the control
-paths around it still key on the provider name and on hardcoded hosts, so the three
-providers cannot be treated as ordinary adapters over the same BrowserPage surface that
-Bilibili / X / Doubao already use.
+adapter seam exists but is narrower than it looks: the page installs **one** adapter
+singleton (`window.__H2W_ADAPTER__`, `extension/content/wake.js:58`) and the shared engine
+is ChatGPT-shaped — dozens of `ADAPTER.name === "chatgpt"` branches in `wake.js` for
+submit, settlement, queueing, artifacts, archive, HUD and recovery. On the other side,
+Bilibili / X / Doubao are **not** registered adapters either: they are bespoke
+`if (operation === "herdr_mcp.…")` handlers in `extension/background.js:3693`, `:3716`,
+`:3750`, `:3784` that happen to operate on BrowserPage records.
 
 The decoupling is therefore mostly **deletion and re-pointing**, not new machinery: the
 runtime's reservation/idempotency/delivery/grant authority is already provider-neutral
@@ -41,15 +44,29 @@ runtime's reservation/idempotency/delivery/grant authority is already provider-n
 
 ### 1.1 Extension (browser side)
 
-Adapter-shaped already — this is the seam to build on:
+Adapter-shaped, but a single-adapter singleton rather than a registry:
 
 | Surface | Evidence |
 | --- | --- |
 | Adapter base contract (capabilities + policy + per-site declarations) | `extension/content/base.js:1-50` (`BaseAdapter`, `supportsCapability`, `getConversationKey`, `getInputEl`) |
 | Registration | `extension/content/injector/chatgpt.js:470`, `claude.js:367`, `grok.js:332` (`registerH2WAdapter(new …Adapter())`) |
+| One adapter per page | `extension/content/wake.js:58` (`const ADAPTER = window.__H2W_ADAPTER__`) |
 | Declared capabilities | `chatgpt.js:5-19` (`browserActuation`, `stopGeneration`, `sessionCreate`, `sessionOpen`, `titleProjection`, `chatModeGuard`), `claude.js:4`, `grok.js:4` |
+| Shared engine is ChatGPT-shaped | `extension/content/wake.js:488`, `:1041-1065`, `:1172`, `:1196`, `:1333-1392`, `:2533-2637`, `:2625-2720`, `:2962`, `:3191`, `:3624-3661`, `:5411`, `:6375` (dozens of `ADAPTER.name === "chatgpt"` branches) |
 
-But the registry/background layer still branches on provider name:
+Bilibili / X / Doubao are **not** adapters; they are bespoke handlers over BrowserPage
+records in the background worker:
+
+| Site | Evidence |
+| --- | --- |
+| Bilibili transcript | `extension/background.js:3693`, `:10437-10613` (`bilibili_*` error vocabulary, `/x/player/wbi/v2`, subtitle host checks) |
+| Doubao image generate/status | `extension/background.js:3716`, `:3750`, `:9515-10055` (`doubao_*` delivery/artifact vocabulary) |
+| X search/thread read | `extension/background.js:3784` |
+
+So today there are two extension-side patterns and neither is the target: provider
+injectors (single adapter, ChatGPT-biased engine) and bespoke site RPC handlers.
+
+Remaining registry/background branches on provider name:
 
 | Coupling | Evidence |
 | --- | --- |
@@ -72,6 +89,18 @@ The MCP method catalog is already provider-neutral — the coupling is in the ha
 `browser_message.append`, `browser_dispatch.submit|status|stop`,
 `browser_composer.set_reasoning|set_apps`, `browser_page.lifecycle|action|fast_path`).
 
+Two facts keep the Rust side cheap to decouple:
+
+- there is **no provider enum, selector table or per-provider config**: `provider` is an
+  opaque bounded string (`state_store.rs:3093`, `:5569`), and the literal `"chatgpt"` is
+  the only hardcoded provider, used as a fail-closed gate in roughly ten places;
+- webchat operations already ride **one generic adapter-command surface** —
+  `BrowserActuator` → `BrowserActuationBroker` → SSE envelope `herdr-browser-actuation/v1`
+  → extension `handleBrowserActuation` — with provider-specific work in the extension.
+
+So the Rust-side work is to delete the `"chatgpt"` gates, not to introduce an adapter
+transport.
+
 | Coupling | Evidence |
 | --- | --- |
 | Provisional session identity rule only for `chatgpt` | `crates/herdr-mcp/src/mcp_http.rs:954-960` |
@@ -86,6 +115,9 @@ The MCP method catalog is already provider-neutral — the coupling is in the ha
 | Claude-only diagnostic counters | `mcp.rs:2723` |
 | Session-URL lookup pinned to `r.provider = 'chatgpt'` | `crates/herdr-mcp/src/state_store.rs:3422` |
 | Session ops assert `kind`/`provider` constants | `state_store.rs:3740` |
+| Alpha-4 support matrix requires provider `chatgpt` for create | `mcp.rs:5800-5821` |
+| `session.open` / `session.archive` / `archive_status` chatgpt-only gates | `mcp.rs:5967-5974`, `:6089`, `:6710-6713` |
+| Archive idempotency asymmetry: `session.open` uses the generic `operations` ledger, direct `session.archive` rides only the actuation envelope; the durable `browser_session_archive_intents` ledger covers deferred self-archive only | `state_store.rs:882/954`, `mcp.rs:5172` |
 | Grant check keyed on `(endpoint_ref, provider)` — neutral shape, provider string is the join key | `mcp.rs:306-308`, `:5148-5150`, `:6863-6865` |
 
 ### 1.3 Edge / link grants
