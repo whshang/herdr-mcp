@@ -17,9 +17,12 @@ Choose a returned `endpoint_ref` on the intended device/profile. Use `claim` onl
 
 ```sh
 herdr-mcp browser-page action --params-json '{"endpoint_ref":"ENDPOINT_REF","page_ref":"PAGE_REF","action":"observe","max_chars":4000}'
+
 herdr-mcp browser-page action --params-json '{"endpoint_ref":"ENDPOINT_REF","page_ref":"PAGE_REF","action":"click","generation":"GENERATION_FROM_OBSERVE","ref":"ELEMENT_REF_FROM_OBSERVE","idempotency_key":"ONE_STABLE_ACTION_KEY"}'
 herdr-mcp browser-page action --params-json '{"endpoint_ref":"ENDPOINT_REF","page_ref":"PAGE_REF","action":"expect","condition":"text_present","value":"Expected result"}'
 ```
+
+For long pages, Extension 0.1.235+ with matching Runtime supports optional integer element_offset (0..4096) on read-only observe. Each response still includes at most 128 visible, eligible controls; a non-null next_element_offset tells the caller where to continue. For example, pass element_offset=128 after an initial response that returned next_element_offset=128. Only eligible visible controls count toward the offset; password, file, hidden, disabled and sensitive fields never receive refs or consume a page slot. Each observation creates a fresh generation and invalidates refs from the previous page. The offset is a live-document position, not a stable cursor: if the page mutates between reads, re-observe and reconcile before acting. Other actions reject element_offset; no arbitrary CSS selectors, raw HTML, scripts, or credentials are exposed.
 
 Use only refs from the latest observation. Read the installed CLI/runtime error if it rejects a parameter; never emulate unsupported selectors, raw scripts, or arbitrary network calls. `fill` also requires a current generation, an observed nonsensitive ref, an explicit user-provided value, and a stable idempotency key. Prefer `expect` or a fresh `observe` to verify the actual result; a successful click alone is not task completion. Check the exact installed Runtime contract for supported `expect` condition fields before constructing one.
 

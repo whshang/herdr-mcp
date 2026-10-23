@@ -8944,6 +8944,7 @@ fn browser_page_action_call(
         "page_ref",
         "action",
         "max_chars",
+        "element_offset",
         "generation",
         "ref",
         "value",
@@ -9060,6 +9061,9 @@ fn browser_page_action_call(
         "page_ref": page_ref,
         "action": action,
     });
+    if action != "observe" && object.contains_key("element_offset") {
+        return json!({"ok": false, "code": "invalid_params", "message": "element_offset is accepted only for observe"});
+    }
     let mutation = matches!(
         action,
         "click"
@@ -9123,6 +9127,17 @@ fn browser_page_action_call(
                     });
                 }
                 semantic_objective = Some(objective);
+            }
+            if action == "observe"
+                && let Some(element_offset) = object.get("element_offset")
+            {
+                let Some(offset) = element_offset.as_u64() else {
+                    return json!({"ok": false, "code": "invalid_params", "message": "element_offset must be an integer"});
+                };
+                if offset > 4096 {
+                    return json!({"ok": false, "code": "invalid_params", "message": "element_offset must be between 0 and 4096"});
+                }
+                bridge_params["element_offset"] = json!(offset);
             }
             if action == "observe"
                 && let Some(max_chars) = object.get("max_chars")

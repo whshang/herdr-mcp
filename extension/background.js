@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.234";
+const H2W_SCRIPT_VERSION = "0.1.235";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -3584,6 +3584,7 @@ async function handleBrowserActuation(command) {
         pageRef: params.page_ref,
         action: params.action,
         maxChars: params.max_chars,
+        elementOffset: params.element_offset,
         generation: params.generation,
         ref: params.ref,
         value: params.value,
@@ -9076,6 +9077,7 @@ async function performBrowserPageActionRequest(msg) {
     action,
     expectedOrigin: page.origin,
     maxChars: msg?.maxChars,
+    elementOffset: msg?.elementOffset,
     generation: msg?.generation,
     ref: msg?.ref,
     value: msg?.value,

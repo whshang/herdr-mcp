@@ -11,6 +11,7 @@
   const MAX_CHARS_CEILING = 100000;
   const MAX_FILL_CHARS = 10000;
   const MAX_ELEMENTS = 128;
+  const MAX_ELEMENT_OFFSET = 4096;
   const MAX_HOVER_TARGETS = 32;
   const DISALLOWED_INPUT_TYPES = new Set(["password", "file", "hidden"]);
   const FORBIDDEN_PARAM_KEYS = new Set([
@@ -256,6 +257,11 @@
       return { ok: false, error: "cross_origin_iframe_blocked" };
     }
 
+    const elementOffset = options.elementOffset === undefined ? 0 : options.elementOffset;
+    if (!Number.isSafeInteger(elementOffset) || elementOffset < 0 || elementOffset > MAX_ELEMENT_OFFSET) {
+      return { ok: false, error: "element_offset_invalid" };
+    }
+
     generationSeq += 1;
     currentGenerationToken = `pa_gen_${documentNonce}_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
@@ -279,10 +285,11 @@
 
     const elements = [];
     let elementIndex = 0;
+    let eligibleIndex = 0;
     let hoverTargets = 0;
+    let hasMoreElements = false;
 
     for (const el of tableFirstCandidates()) {
-      if (elements.length >= MAX_ELEMENTS) break;
       const tag = (el.tagName || "").toLowerCase();
 
       const clickable = isObservableControlCandidate(el);
@@ -296,11 +303,17 @@
       if (isElementHidden(el)) continue;
       if (isElementDisabled(el)) continue;
 
+      if (hoverOnly) hoverTargets += 1;
+      if (eligibleIndex++ < elementOffset) continue;
+      if (elements.length >= MAX_ELEMENTS) {
+        hasMoreElements = true;
+        break;
+      }
+
       const ref = `ref_${currentGenerationToken}_${elementIndex++}`;
       elementMap.set(ref, el);
       if (hoverOnly) {
         hoverOnlyRefs.add(ref);
-        hoverTargets += 1;
       }
 
       const roleAttr = el.getAttribute("role");
@@ -379,6 +392,10 @@
       },
       text,
       elements,
+      ...(hasMoreElements || options.elementOffset !== undefined ? {
+        element_offset: elementOffset,
+        next_element_offset: hasMoreElements ? elementOffset + elements.length : null,
+      } : {}),
     };
   }
 

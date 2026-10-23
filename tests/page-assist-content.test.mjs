@@ -1461,6 +1461,42 @@ test("user clicks a nested custom choice | Given a bounded generic tag in a dial
   assert.equal(h.send({ type: "h2w_page_assist", action: "click", generation: observed.generation, ref: observed.elements[0].ref }).error, "stale_generation");
 });
 
+test("user pages beyond 128 safe controls | Given a long document with sensitive fields | When observe advances an eligible offset | Then each bounded page returns fresh refs without exposing secrets", () => {
+  const buttons = Array.from({ length: 260 }, (_, i) => createElement({ text: "Item " + i }));
+  const password = createElement({ tag: "input", type: "password", value: "private" });
+  const hidden = createElement({ text: "Hidden", visible: false });
+  const h = harness({ elements: [...buttons.slice(0, 130), password, hidden, ...buttons.slice(130)] });
+
+  const first = h.send({ type: "h2w_page_assist", action: "observe" });
+  assert.equal(first.ok, true);
+  assert.equal(first.elements.length, 128);
+  assert.equal(first.elements[0].text, "Item 0");
+  assert.equal(first.elements[127].text, "Item 127");
+  assert.equal(first.next_element_offset, 128);
+
+  const second = h.send({ type: "h2w_page_assist", action: "observe", elementOffset: first.next_element_offset });
+  assert.equal(second.ok, true);
+  assert.equal(second.elements.length, 128);
+  assert.equal(second.elements[0].text, "Item 128");
+  assert.equal(second.elements[127].text, "Item 255");
+  assert.equal(second.next_element_offset, 256);
+  assert.notEqual(second.generation, first.generation);
+  const stale = h.send({ type: "h2w_page_assist", action: "click", generation: first.generation, ref: first.elements[0].ref });
+  assert.equal(stale.error, "stale_generation");
+
+  const last = h.send({ type: "h2w_page_assist", action: "observe", elementOffset: second.next_element_offset });
+  assert.equal(last.ok, true);
+  assert.deepEqual(Array.from(last.elements, (item) => item.text), ["Item 256", "Item 257", "Item 258", "Item 259"]);
+  assert.equal(last.element_offset, 256);
+  assert.equal(last.next_element_offset, null);
+  for (const offset of [-1, 1.5, 4097, "128"]) {
+    const rejected = h.send({ type: "h2w_page_assist", action: "observe", elementOffset: offset });
+    assert.equal(rejected.error, "element_offset_invalid");
+  }
+  assert.equal(h.send({ type: "h2w_page_assist", action: "click", generation: last.generation, ref: last.elements[0].ref }).ok, true);
+  assert.equal(buttons[256].clicked, 1);
+});
+
 test("user observes only bounded choice controls | Given inert tags and unsafe custom containers | When inspect scans them before Cancel | Then they receive no refs and do not consume the control budget", () => {
   const inert = Array.from({ length: 128 }, () => createElement({ tag: "span", text: "Decorative", attrs: { class: "tag" } }));
   const inertDiv = createElement({ tag: "div", text: "Inert", attrs: { class: "layout-container" } });
