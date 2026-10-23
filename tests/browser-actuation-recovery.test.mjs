@@ -35,6 +35,16 @@ test("user scrolls a browser page | Given a typed Rust actuation payload | When 
   assert.match(bridge, /amount:\s*params\.amount/);
 });
 
+test("user pages past the observed ref cap | Given a typed Rust actuation payload | When the extension bridge forwards observe paging | Then the read-only offset reaches both the native actuation and Page Assist paths", () => {
+  const start = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
+  const end = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', start);
+  assert.ok(start > 0 && end > start);
+  const bridge = backgroundSource.slice(start, end);
+  assert.match(bridge, /elementOffset:\s*params\.element_offset/);
+  assert.doesNotMatch(bridge, /elementLimit/, "observe paging keeps the fixed 128-ref page size");
+  assert.match(backgroundSource, /elementOffset:\s*msg\?\.elementOffset/);
+});
+
 const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
 const browserPageLifecycleEnd = backgroundSource.indexOf("\nasync function performPageAssistRequest", browserPageLifecycleStart);
 assert.ok(browserPageLifecycleStart >= 0 && browserPageLifecycleEnd > browserPageLifecycleStart,
@@ -246,6 +256,45 @@ test("user opens a loading generic page | Given Chrome returns only pendingUrl f
   assert.equal(tabs.size, 1);
   assert.equal([...tabs.values()][0].url, "https://example.com/app");
   assert.equal(sessionStorage.herdrBrowserPagesV1.length, 1);
+});
+
+test("user observes the next page of a long page | Given a claimed page and a bounded paging request | When observe passes the read-only offset | Then the Page Assist payload carries the cursor and next_element_offset reaches the caller", async () => {
+  const tabs = new Map([
+    [121, { id: 121, url: "https://example.com/long", status: "complete", active: true }],
+  ]);
+  let forwarded = null;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      forwarded = payload;
+      return {
+        ok: true,
+        generation: "pa_gen_page_2",
+        element_offset: 128,
+        next_element_offset: 256,
+        elements: [{ text: "Action 128" }],
+      };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/long",
+    idempotencyKey: "claim-observe-paging-1",
+  });
+  assert.equal(page.ok, true);
+  const result = await h.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: page.page_ref,
+    elementOffset: 128,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(forwarded.action, "observe");
+  assert.equal(forwarded.elementOffset, 128);
+  assert.ok(!Object.hasOwn(forwarded, "elementLimit"), "the 128-ref page size stays fixed");
+  assert.equal(result.element_offset, 128);
+  assert.equal(result.next_element_offset, 256);
+  assert.ok(!Object.hasOwn(result, "delivery_state"), "paged observe stays read-only");
 });
 
 test("user finalizes one owned generic page | Given open is retried across a service-worker restart | When the same idempotency key and then page_ref are used | Then one tab is reused and the exact owned tab is closed", async () => {
