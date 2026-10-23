@@ -83,6 +83,33 @@ test("agent-dispatch skill keeps host policy external to worker selection", () =
   assert.doesNotMatch(content, /fallback chain stops/);
 });
 
+test("user gets a bounded supervisor tier | Given the served planner policy | When delegation and completion-wake rules are read | Then one designated supervisor may re-dispatch, workers never re-dispatch, and the planner reads one compact inbox per wake", () => {
+  const globalAgents = readFileSync(new URL("../assets/herdr/AGENTS.md", import.meta.url), "utf8");
+  const dispatchSkill = readFileSync(
+    new URL("../assets/herdr/skills/agent-dispatch/SKILL.md", import.meta.url),
+    "utf8",
+  );
+  const orchestration = readFileSync(
+    new URL("../assets/herdr/skills/development-orchestration/SKILL.md", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(globalAgents, /designate one local supervisor per task/);
+  assert.match(globalAgents, /Workers never re-dispatch/);
+  assert.match(globalAgents, /one compact `agent\.task\.inbox`/);
+  assert.match(globalAgents, /`final_excerpt` before `agent\.read`/);
+  assert.match(globalAgents, /ack in one `task_ids` batch/);
+  assert.match(globalAgents, /bounded `wait_ms` \(max 60000\)/);
+  assert.match(globalAgents, /"continue" resumes/);
+  assert.match(dispatchSkill, /single designated dispatcher/);
+  assert.match(dispatchSkill, /that task's single supervisor/);
+  assert.doesNotMatch(dispatchSkill, /and middle-manager delegation\./);
+  assert.match(orchestration, /Delegation depth is two: planner -> supervisor -> workers/);
+  assert.match(orchestration, /appoint one local supervisor per task/);
+  assert.match(orchestration, /final review of what comes back/);
+  assert.match(orchestration, /only a task's designated supervisor dispatches/);
+});
+
 test("user gets explicit connected-tool shapes | Given progressive Herdr Skills | When domain contracts are read | Then device, params, execution, confirmation, and idempotency rules are explicit", () => {
   const workstation = readFileSync(
     new URL("../assets/herdr/skills/workstation-control/SKILL.md", import.meta.url),
