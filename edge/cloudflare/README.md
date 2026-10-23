@@ -3,10 +3,11 @@
 This subtree implements the Cloudflare Worker + Durable Object edge used between
 ChatGPT and the workstation `herdr-link`. Relay v1, the first-party DEV/PROD
 public contract **epoch 7 / 19 actions** (workstation Runtime Execution Contract
-**epoch 4 / 18 tools**), MCP transport and OAuth compatibility are implemented
+**epoch 5 / 18 tools**), MCP transport and OAuth compatibility are implemented
 and exercised by the Edge Gate. The public Edge epoch-3 identity remains the
-conservative non-DEV/PROD fallback, and runtime epochs 2/3 remain bounded
-rollback/old-session compatibility identities.
+conservative non-DEV/PROD fallback; the immediately previous frozen epoch-4
+contract and the frozen epoch-2 catalog remain the bounded rollback/old-session
+compatibility identities, and epoch 3 is historical only.
 
 Routing is deliberately independent from Worker deployment. `workers.dev` is a
 fully supported default and requires no user-owned domain. A Cloudflare Custom
@@ -71,10 +72,10 @@ edge/cloudflare/
   hibernation-compatible handling (`webSocketMessage/Close/Error/Hibernation` + `alarm`).
 - **hello validation interface** — first message must be `hello` with canonical
   numeric `protocol_version === 1`, non-empty bounded workstation/boot/link identity,
-  and `workstationId` must equal the route key. The current runtime epoch-4
-  identity is accepted, together with the bounded rollback baselines: the frozen
-  epoch-3 (native-default metadata) and epoch-2 catalog pairs. Other contract
-  pairs fail closed.
+  and `workstationId` must equal the route key. The current runtime epoch-5
+  identity is accepted, together with the bounded rollback baselines: the
+  immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog
+  pairs. Other contract pairs fail closed.
 - **heartbeat / last_seen** — persisted into DO storage (throttled re-writes); staleness
   (`LINK_STALE_AFTER_MS`) drives online/offline in `/status/:workstationId`.
   Rely on Cloudflare WS auto-response for protocol pings so routine pongs never wake the DO.
@@ -202,11 +203,12 @@ explicitly as above so root `package.json` stays untouched.
 
 - **No implicit contract drift.** The current first-party DEV/PROD public ABI is
   **epoch 7 / 19 actions**; the workstation Runtime Execution Contract is
-  **epoch 4 / 18 tools**, including `herdr_skill`. Any later public tool/metadata
+  **epoch 5 / 18 tools**, including `herdr_skill`. Any later public tool/metadata
   change requires another frozen contract epoch and a supervised migration;
-  routine workstation runtime upgrades stay inside runtime epoch 4, and the
-  public Edge epoch-3 identity plus runtime epochs 2/3 remain only as bounded
-  fallback/rollback compatibility identities.
+  routine workstation runtime upgrades stay inside runtime epoch 5, and the
+  public Edge epoch-3 identity remains a bounded non-DEV/PROD fallback while the
+  immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog
+  remain only as bounded rollback compatibility identities.
 - **No public inbound path to the workstation.** The Edge terminates public MCP;
   the workstation still connects outward through `herdr-link` only.
 - **No mandatory custom domain.** `workers.dev` remains a supported installation

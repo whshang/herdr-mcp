@@ -15,7 +15,6 @@ mod config;
 mod contract;
 mod credential_store;
 mod dev;
-pub mod development_orchestration;
 mod device_name;
 mod events;
 mod exec_compact;
@@ -29,6 +28,7 @@ mod fs_security;
 mod fs_tools;
 mod git_tools;
 mod github_status;
+mod grant_migration;
 mod herdr;
 mod herdr_dependency;
 mod herdr_native;
@@ -52,6 +52,10 @@ mod mcp_http;
 mod mutation;
 mod native_host;
 mod native_host_install;
+// Origin-check diagnostics serve native-host status on macOS and Linux, plus
+// the cross-platform unit tests. Windows has no native-host installer.
+#[cfg(any(unix, test))]
+mod native_host_origin_check;
 mod native_tools;
 mod patch;
 mod paths;
@@ -67,6 +71,7 @@ mod runtime_meta;
 mod schema;
 mod semantic;
 mod semantic_cli;
+mod semantic_thresholds;
 mod service_lifecycle;
 mod service_manager;
 mod skill;
@@ -85,6 +90,7 @@ mod updater;
 mod updater_store;
 #[cfg(target_os = "windows")]
 mod windows_service_manager;
+mod work_tailers;
 mod workstation_profile;
 // The stable PATH link is a Unix ownership primitive shared by launchd and
 // systemd-user installations; on Windows it is a stable `%USERPROFILE%` user
@@ -93,6 +99,8 @@ mod workstation_profile;
 mod user_cli;
 mod utility_exec;
 mod web_artifact_cache;
+mod work_capture;
+mod work_compactor;
 mod worker;
 mod worker_bootstrap;
 mod workstation;
@@ -166,6 +174,7 @@ fn run() -> Result<ExitCode, String> {
                 contract.epoch, contract.tool_count
             );
             println!("state schema {}", state_store::SCHEMA_VERSION);
+            println!("contract hash {}", contract.hash);
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Status { verbose } => {

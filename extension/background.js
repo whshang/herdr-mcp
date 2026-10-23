@@ -22,7 +22,7 @@ import {
   newContinuityId, newTransferId, shouldDiscardRetiredSourceTab,
 } from "./continuity-core.js";
 import {
-  CONTINUITY_JOURNAL_STORAGE_KEY, turnFingerprint,
+  CONTINUITY_JOURNAL_STORAGE_KEY, continuityJournalEntry, turnFingerprint,
 } from "./continuity-journal.js";
 import {
   classifyCheckpointPutError, createBoundedSupervisorAdapter, deriveGoalLedger,
@@ -56,8 +56,9 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.133";
+const H2W_SCRIPT_VERSION = "0.1.212";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
+const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -868,14 +869,17 @@ function enrichConversationInfoWithBrowserScope(tabId, info) {
     project_id: projectId,
     project_name: projectName || null,
     project_key: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
-    project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
+    project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`,
   };
 }
 
-async function conversationInfoForTab(tabId) {
+async function conversationInfoForTab(tabId, { refreshObservation = false } = {}) {
   if (!tabId) return null;
+  const handshake = refreshObservation
+    ? { type: "h2w_get_convkey", refreshObservation: true }
+    : { type: "h2w_get_convkey" };
   try {
-    const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
+    const live = await chrome.tabs.sendMessage(tabId, handshake);
     if (live?.convKey) {
       const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
       const info = parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
@@ -902,7 +906,7 @@ async function conversationInfoForTab(tabId) {
       }
       for (let attempt = 0; attempt < 20; attempt += 1) {
         try {
-          const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
+          const live = await chrome.tabs.sendMessage(tabId, handshake);
           if (live?.convKey) {
             const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
             const info = parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
@@ -942,7 +946,7 @@ async function probeChatGptPerfTab(tabId) {
           if (typeof input.value === "string" && input.tagName !== "DIV") composerText = input.value;
           else {
             const clone = input.cloneNode(true);
-            for (const node of clone.querySelectorAll?.('[data-inline-selection-pill],[contenteditable="false"]') || []) node.remove();
+            for (const node of clone.querySelectorAll?.('[data-inline-selection-pill],[contenteditable="false"],span[data-appearance="inline-mention"][app-mention-name]') || []) node.remove();
             composerText = clone.textContent || "";
           }
         }
@@ -2105,7 +2109,7 @@ async function drainDurableSelfArchive(convKey, tabId, trigger = "turn-ended") {
 
 function browserProviderCapabilities(provider) {
   const operations = provider === "chatgpt"
-    ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create"]
+    ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create", "session.title_projection"]
     : ["composer.submit", "generation.status", "generation.stop", "session.inspect"];
   return {
     schema_version: 1,
@@ -2179,7 +2183,7 @@ async function observeBrowserConversation({
         parent_ref: parentRef,
         native_identity: projectId,
         display_label: projectName,
-        canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
+        canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`,
         observation_generation: observationGeneration,
         observed_at: Date.now(),
       });
@@ -2287,7 +2291,7 @@ function browserEndpointView(endpoint) {
     browser_family: endpoint.browser_family || null,
     extension_version: endpoint.extension_version || null,
     consent: {
-      webchat_control: consent.webchat_control === true,
+      webchat_control: true,
       tool_bridge: consent.tool_bridge === true,
       tool_bridge_workstation_mutation: consent.tool_bridge_workstation_mutation === true,
       revision: consentRevision,
@@ -2296,8 +2300,8 @@ function browserEndpointView(endpoint) {
   };
 }
 
-async function setLocalBrowserWebchatControlConsent(allowed) {
-  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+async function setLocalBrowserWebchatControlConsent() {
+  const endpoint = await currentBrowserEndpoint();
   const current = browserEndpointView(endpoint);
   if (!endpoint?.endpoint_ref || !current) throw new Error("browser-endpoint-unavailable");
   const profileSeed = await getOrCreateBrowserProfileSeed();
@@ -2306,7 +2310,7 @@ async function setLocalBrowserWebchatControlConsent(allowed) {
     profile_seed: profileSeed,
     endpoint_ref: endpoint.endpoint_ref,
     expected_consent_revision: current.consent_revision,
-    webchat_control_allowed: allowed,
+    webchat_control_allowed: true,
     tool_bridge_allowed: current.consent.tool_bridge,
     tool_bridge_mutation_allowed: current.consent.tool_bridge_workstation_mutation,
     observed_at: Date.now(),
@@ -2316,7 +2320,126 @@ async function setLocalBrowserWebchatControlConsent(allowed) {
   return browserEndpointView(browserEndpoint);
 }
 
-async function registerLocalBrowserEndpoint() {
+async function recoverOpenChatGptBrowserRegistry() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: "*://chatgpt.com/*" });
+  } catch (_) {
+    return { observed: 0 };
+  }
+  let observed = 0;
+  for (const tab of tabs) {
+    if (!tab?.id) continue;
+    try {
+      // The opaque page-identity handshake is the only recovery trigger here,
+      // with an explicit refresh so an already-registered tab that still holds
+      // a previous generation's opaque refs re-runs the content-side
+      // registerCurrentConversation("identity-recovery"). That ordinary content
+      // registration is the single identity source and publishes
+      // provider/account/space/session facts through h2w_register. Background
+      // never receives raw account identity on this handshake and does not
+      // implement a second identity source.
+      const pageInfo = await conversationInfoForTab(tab.id, { refreshObservation: true });
+      if (pageInfo?.site === "chatgpt" && pageInfo?.convKey) observed += 1;
+    } catch (error) {
+      callLog("browser registry recovery failed:", error?.message || String(error));
+    }
+  }
+  return { observed };
+}
+
+// ---- #632 browser endpoint runtime reconciliation (begin) ----
+// One owner for endpoint registration: every caller (push hello, keepalive
+// runtime check, stream reconnect, rebuild, consent) goes through the
+// single-flight registerLocalBrowserEndpoint(), so concurrent triggers share one
+// endpoint.register. A runtime generation switch (new boot_id) or a hello that
+// reports endpoint_registered:false clears the cached endpoint and re-registers
+// at most once per boot_id, without needing a service-worker restart.
+let browserEndpointRegistration = null;
+let browserEndpointHelloBootId = null;
+let browserEndpointReregisteredBootId = null;
+// #632: the runtime evaluates endpoint registration when the push stream opens,
+// so a stream it opened while reporting endpoint_registered:false keeps refusing
+// actuation even after the same derived endpoint_ref is re-registered. This
+// demand survives a failed registration attempt and is cleared once one actually
+// succeeded, so the refresh is claimed at most once per boot_id.
+let browserEndpointStreamRefreshPending = false;
+
+function registerLocalBrowserEndpoint() {
+  if (!browserEndpointRegistration) {
+    browserEndpointRegistration = registerLocalBrowserEndpointOnce().finally(() => {
+      browserEndpointRegistration = null;
+    });
+  }
+  return browserEndpointRegistration;
+}
+
+/** Cached endpoint, or the in-flight / a fresh single-flight registration. */
+async function currentBrowserEndpoint() {
+  if (browserEndpointRegistration) return browserEndpointRegistration;
+  return browserEndpoint || registerLocalBrowserEndpoint();
+}
+
+/**
+ * Drop the cached endpoint and re-register (single-flight). Returns null when a
+ * re-register was already triggered for this boot_id, so a runtime that keeps
+ * reporting endpoint_registered:false cannot cause a registration loop.
+ */
+function invalidateBrowserEndpointForRuntime(bootId, reason) {
+  const id = String(bootId || "").trim();
+  if (id && browserEndpointReregisteredBootId === id) return null;
+  if (id) browserEndpointReregisteredBootId = id;
+  callLog(`browser endpoint re-register (${reason}) boot=${id || "-"}`);
+  browserEndpointStreamRefreshPending = true;
+  browserEndpoint = null;
+  return registerLocalBrowserEndpoint();
+}
+
+/**
+ * #632: the runtime only re-evaluates registration when the push stream opens,
+ * so a stream opened before the endpoint's registration became visible must be
+ * replaced. A failed registration attempt leaves the demand pending for the next
+ * trigger (keepalive, control center) instead of dropping the recovery, and the
+ * demand is cleared only once the replacement is actually scheduled.
+ */
+async function refreshPushStreamAfterEndpointRegistration() {
+  if (!browserEndpointStreamRefreshPending) return false;
+  if (!pushStream) {
+    // No stream was opened as unregistered, so nothing has to be replaced.
+    browserEndpointStreamRefreshPending = false;
+    return false;
+  }
+  const bindings = await loadBindings();
+  browserEndpointStreamRefreshPending = false;
+  callLog("push stream refreshed after browser endpoint re-register");
+  stopPushStream();
+  ensurePushStream(bindings);
+  return true;
+}
+
+/** Push hello: detect a runtime switch or a missing registration and self-heal. */
+async function reconcileBrowserEndpointForHello(data, streamCtrl) {
+  const bootId = String(data?.boot_id || "").trim() || null;
+  const previousBootId = browserEndpointHelloBootId;
+  if (bootId) browserEndpointHelloBootId = bootId;
+  let reason = null;
+  if (data?.endpoint_registered === false) reason = "endpoint_registered=false";
+  else if (previousBootId && bootId && previousBootId !== bootId) reason = `boot_id ${previousBootId} -> ${bootId}`;
+  if (!reason) return null;
+  const registration = invalidateBrowserEndpointForRuntime(bootId, reason);
+  if (!registration) return null;
+  const endpoint = await registration;
+  // The runtime evaluates registration when the stream opens, so reconnect
+  // this stream with the freshly registered endpoint_ref.
+  if (endpoint && pushStream?.ctrl === streamCtrl) {
+    stopPushStream();
+    ensurePushStream(await loadBindings());
+  }
+  return endpoint;
+}
+// ---- #632 browser endpoint runtime reconciliation (end) ----
+
+async function registerLocalBrowserEndpointOnce() {
   await configReady;
   try {
     const profileSeed = await getOrCreateBrowserProfileSeed();
@@ -2335,6 +2458,15 @@ async function registerLocalBrowserEndpoint() {
     if (response.ok && parsed?.ok === true && parsed.endpoint) {
       browserEndpoint = parsed.endpoint;
       await getBrowserObservationGeneration();
+      await recoverOpenChatGptBrowserRegistry();
+      await refreshPushStreamAfterEndpointRegistration().catch((error) => {
+        // The endpoint is registered; a failed stream replacement must keep the
+        // pending demand for the next trigger, not fail the registration.
+        callLog(
+          "push stream refresh after browser endpoint re-register failed:",
+          error?.message || String(error),
+        );
+      });
       return browserEndpoint;
     }
     callLog(
@@ -2414,7 +2546,14 @@ async function journalAppendContinuityTurn(payload) {
     const rows = Array.isArray(pending[continuityId]) ? pending[continuityId] : [];
     const now = Date.now();
     if (!rows.some((r) => r.message_id === messageId)) {
-      rows.push({ message_id: messageId, role, createdAt: now });
+      rows.push(continuityJournalEntry({
+        message_id: messageId,
+        role,
+        createdAt: now,
+        provider: payload?.provider,
+        account: payload?.account,
+        project: payload?.project,
+      }));
       if (rows.length > CONTINUITY_TURN_MAX_CACHED) rows.splice(0, rows.length - CONTINUITY_TURN_MAX_CACHED);
     }
     await saveContinuityCache({ ...cache, pending: { ...pending, [continuityId]: rows } });
@@ -2425,6 +2564,9 @@ async function journalAppendContinuityTurn(payload) {
     conversation_id: payload?.conversation_id || convKey,
     workspace_id: payload?.workspace_id || null,
     project_id: payload?.project_id || null,
+    provider: payload?.provider || null,
+    account: payload?.account || null,
+    project: payload?.project || null,
     title: payload?.title || null,
     message_id: messageId,
     role,
@@ -2925,6 +3067,8 @@ function reconcilePushStreamRuntime(state) {
   const streamBootId = String(pushStream?.bootId || "").trim();
   if (!pushStream || !currentBootId || !streamBootId || currentBootId === streamBootId) return false;
   callLog(`push stream runtime changed ${streamBootId} -> ${currentBootId}; forcing reconnect`);
+  // #632: a new runtime generation has its own registry; never reuse the cache.
+  void invalidateBrowserEndpointForRuntime(currentBootId, "runtime boot changed");
   stopPushStream();
   return true;
 }
@@ -2948,7 +3092,16 @@ async function runPushStream(ctrl) {
     let stallTimer = null;
     let relayAbort = null;
     try {
-      const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+      const endpoint = await currentBrowserEndpoint();
+      // #633: a stream replacement can abort this controller while the lookup
+      // above is still awaiting a (re-)registration that then succeeds:
+      // refreshPushStreamAfterEndpointRegistration() calls stopPushStream(),
+      // which aborts ctrl, and then schedules the replacement stream. Resuming
+      // here would open a second live push transport beside that replacement,
+      // so the loop must stop before opening a stream. The controller is
+      // re-checked after the await because the abort listener can only be
+      // attached once a stream exists.
+      if (ctrl.signal.aborted) break;
       const browserEndpointRef = String(endpoint?.endpoint_ref || "").trim();
       if (!browserEndpointRef) throw new Error("browser-endpoint-unavailable");
       const decoder = new TextDecoder();
@@ -3427,6 +3580,11 @@ async function handleBrowserActuation(command) {
         value: params.value,
         condition: params.condition,
         timeoutMs: params.timeout_ms,
+        direction: params.direction,
+        amount: params.amount,
+        key: params.key,
+        maxRows: params.max_rows,
+        expectedUrl: params.expected_url,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -3690,7 +3848,7 @@ async function handleBrowserActuation(command) {
     let lastObservedScope = null;
     let identityProbeResponded = false;
     let identityProbeFailed = false;
-    const scopeDeadline = Date.now() + 8000;
+    const scopeDeadline = Date.now() + BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS;
     let nextProbeAt = 0;
     let probeInFlight = false;
     do {
@@ -3707,7 +3865,7 @@ async function handleBrowserActuation(command) {
       // A freshly-created ChatGPT tab publishes its Browser Registry scope only
       // after its content script registers the current conversation. The first
       // identity probe can legitimately race content-script injection, so retry
-      // this read-only handshake on a bounded cadence until the existing 8s
+      // this read-only handshake on a bounded cadence until the 30s
       // scope deadline. Never overlap probes and never retry the create/message
       // mutation itself. The create command remains gated on the exact
       // account/space/generation equality checks above.
@@ -4023,7 +4181,29 @@ async function handleBrowserActuation(command) {
     }
     let tabOpen = null;
     try { tabOpen = await chrome.tabs.get(targetOpen.tabId); } catch (_) {}
-    const liveOpen = browserConversationInfo(providerOpen, tabOpen?.url || "");
+    let liveOpen = browserConversationInfo(providerOpen, tabOpen?.url || "");
+    if (!tabOpen || liveOpen?.conversation_id !== targetOpen.conversationId) {
+      // Stale target (the tab navigated away or closed). Drop it and re-resolve
+      // once through the existing exact recovery; only an exact live match on
+      // the same generation proceeds, anything else stays unavailable.
+      browserSessionTargets.delete(sessionRefOpen);
+      const repaired = await recoverBrowserSessionTarget(sessionRefOpen, expectedGeneration, providerOpen)
+        .catch(() => ({ target: null }));
+      const repairedTarget = repaired?.target;
+      let repairedTab = null;
+      if (repairedTarget?.tabId) {
+        try { repairedTab = await chrome.tabs.get(repairedTarget.tabId); } catch (_) {}
+      }
+      const repairedLive = browserConversationInfo(providerOpen, repairedTab?.url || "");
+      if (repairedTab
+          && repairedTarget.observationGeneration === expectedGeneration
+          && repairedTarget.provider === providerOpen
+          && repairedLive?.conversation_id === repairedTarget.conversationId) {
+        targetOpen = repairedTarget;
+        tabOpen = repairedTab;
+        liveOpen = repairedLive;
+      }
+    }
     if (!tabOpen || liveOpen?.conversation_id !== targetOpen.conversationId) {
       browserSessionTargets.delete(sessionRefOpen);
       await postBrowserActuationEvidence(
@@ -4305,6 +4485,17 @@ async function handleBrowserActuation(command) {
           expectedGeneration,
           projectId: archiveProjectId,
         });
+        // A WebChat create leaves its own tab on the conversation; a later
+        // owned page re-binds the session target, so only that newer tab was
+        // closed. Close every other tab still showing the archived conversation.
+        try {
+          const others = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+          for (const other of others) {
+            if (!other?.id || other.id === target.tabId) continue;
+            if (chatGptConversationInfo(other.url || "")?.conversation_id !== target.conversationId) continue;
+            try { await chrome.tabs.remove(other.id); } catch (_) {}
+          }
+        } catch (_) {}
       } catch (error) {
         // Archive authority has already been persisted above. Cleanup must not
         // downgrade a proven provider archive into an uncertain mutation.
@@ -4340,6 +4531,9 @@ async function handlePushBlock(block, streamCtrl = null) {
   if (event === "hello") {
     if (pushStream?.ctrl === streamCtrl) {
       pushStream.bootId = String(data.boot_id || "").trim() || null;
+      // #632: off the dispatch chain so registration never blocks push events.
+      void reconcileBrowserEndpointForHello(data, streamCtrl)
+        .catch((e) => callLog("browser endpoint reconcile failed:", e?.message || String(e)));
     }
     // A reconnect is the reconciliation boundary for the Control Center.
     // Fetch exactly one authoritative snapshot; steady-state changes remain
@@ -7571,6 +7765,7 @@ function normalizeBrowserPageRecord(raw) {
     origin: origin.toLowerCase(),
     canonical_url: canonicalUrl,
     ownership,
+    stale: raw.stale === true,
     observation_generation: observationGeneration,
     page_generation: pageGeneration,
     created_by_operation: createdByOperation,
@@ -7590,7 +7785,7 @@ async function loadBrowserPages() {
     }
     try {
       const stored = (await storageArea.get(BROWSER_PAGE_SESSION_STORAGE_KEY))[BROWSER_PAGE_SESSION_STORAGE_KEY];
-      const records = Array.isArray(stored) ? stored : [];
+      const records = Array.isArray(stored) ? stored : await restoreBrowserPagesAfterReload();
       for (const raw of records.slice(-BROWSER_PAGE_MAX_RECORDS)) {
         const record = normalizeBrowserPageRecord(raw);
         if (record) browserPagesByRef.set(record.page_ref, record);
@@ -7603,6 +7798,38 @@ async function loadBrowserPages() {
   } finally {
     browserPagesLoadPromise = null;
   }
+}
+
+// chrome.storage.session is wiped when the extension reloads, which dropped
+// every page_ref (claimed and owned) mid-task. Mirror the records to local
+// storage and, only when the session copy is absent, rebind a record if its
+// exact tab still exists on the same origin and (for claims) the same
+// conversation identity. Browser restart clears the mirror (tab ids reset).
+const BROWSER_PAGE_RELOAD_MIRROR_KEY = `${BROWSER_PAGE_SESSION_STORAGE_KEY}_reload_mirror`;
+
+async function restoreBrowserPagesAfterReload() {
+  const local = chrome.storage?.local;
+  if (!local?.get) return [];
+  let mirror = [];
+  try {
+    const value = (await local.get(BROWSER_PAGE_RELOAD_MIRROR_KEY))[BROWSER_PAGE_RELOAD_MIRROR_KEY];
+    mirror = Array.isArray(value) ? value : [];
+  } catch (_) {
+    return [];
+  }
+  const restored = [];
+  for (const raw of mirror.slice(-BROWSER_PAGE_MAX_RECORDS)) {
+    const record = normalizeBrowserPageRecord(raw);
+    if (!record) continue;
+    let tab = null;
+    try { tab = await chrome.tabs.get(record.tab_id); } catch (_) {}
+    if (!tab?.url || browserPageOrigin(tab.url) !== record.origin) continue;
+    const liveKey = browserPageClaimKey(tab.url);
+    if (record.ownership === "claimed"
+        && (!liveKey || liveKey !== browserPageClaimKey(record.canonical_url))) continue;
+    restored.push(raw);
+  }
+  return restored;
 }
 
 async function persistBrowserPages() {
@@ -7625,6 +7852,7 @@ async function persistBrowserPages() {
   } catch (_) {
     return false;
   }
+  try { await chrome.storage?.local?.set?.({ [BROWSER_PAGE_RELOAD_MIRROR_KEY]: records }); } catch (_) {}
   const retained = new Set(records.map((record) => record.page_ref));
   for (const record of allRecords) {
     if (record.ownership === "claimed" && !retained.has(record.page_ref)) {
@@ -7653,6 +7881,35 @@ function browserPageCanonicalUrl(rawUrl, targetOrigin = null) {
   } catch (_) {
     return null;
   }
+}
+
+// Claim-only URL equivalence. ChatGPT serves one Project conversation under
+// both /g/g-p-<id>/c/<uuid> (the session canonical URL) and
+// /g/g-p-<id>-<slug>/c/<uuid> (what the worker tab shows). The conversation
+// uuid is the identity; the cosmetic slug is dropped only for that shape.
+function browserPageClaimKey(rawUrl, targetOrigin = null) {
+  const canonical = browserPageCanonicalUrl(rawUrl, targetOrigin);
+  if (!canonical) return null;
+  const parsed = new URL(canonical);
+  if (parsed.hostname === "chatgpt.com") {
+    parsed.pathname = parsed.pathname.replace(/^\/g\/(g-p-[0-9a-f]{32})-[^/]+\/c\//, "/g/$1/c/");
+  }
+  parsed.hash = "";
+  return parsed.href;
+}
+
+// Cleanup is verified against live chrome.tabs state by id AND URL: another
+// tab still showing the same page (e.g. the tab a WebChat create opened) means
+// the URL is not actually gone even when the recorded tab id is.
+async function browserPageSameUrlTabIds(page) {
+  const key = browserPageClaimKey(page?.canonical_url, page?.origin);
+  if (!key) return [];
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({}); } catch (_) { return []; }
+  return tabs
+    .filter((tab) => tab?.id && tab.id !== page.tab_id
+      && browserPageClaimKey(tab.url || tab.pendingUrl, page.origin) === key)
+    .map((tab) => tab.id);
 }
 
 function browserPageView(page, extra = {}) {
@@ -7707,6 +7964,7 @@ async function rememberBrowserPage(
     origin,
     canonical_url: canonicalUrl,
     ownership,
+    stale: false,
     observation_generation: observationGeneration,
     page_generation: 1,
     created_by_operation: createdByOperation,
@@ -7751,15 +8009,20 @@ async function resolveBrowserPage(pageRef, endpointRef, targetOrigin) {
   }
   const liveOrigin = browserPageOrigin(tab.url);
   if (liveOrigin !== record.origin) {
-    browserPagesByRef.delete(pageRef);
+    if (record.ownership === "claimed") browserPagesByRef.delete(pageRef);
+    else record.stale = true;
     await persistBrowserPages();
     return { ok: false, error: "browser_page_origin_mismatch" };
   }
   if (liveOrigin !== targetOrigin) {
     return { ok: false, error: "browser_page_origin_mismatch" };
   }
+  if (record.stale === true) {
+    return { ok: false, error: "browser_page_stale" };
+  }
   if (String(tab.url) !== record.canonical_url) {
-    browserPagesByRef.delete(pageRef);
+    if (record.ownership === "claimed") browserPagesByRef.delete(pageRef);
+    else record.stale = true;
     await persistBrowserPages();
     return { ok: false, error: "browser_page_stale" };
   }
@@ -7824,7 +8087,7 @@ async function performBrowserPageLifecycleRequest(msg) {
         await removeBrowserPageRecord(prior.page_ref);
       } else {
         const liveUrl = browserPageCanonicalUrl(priorTab.url, targetOrigin);
-        if (liveUrl === canonicalUrl && prior.canonical_url === canonicalUrl) {
+        if (liveUrl === canonicalUrl && prior.canonical_url === canonicalUrl && prior.stale !== true) {
           prior.last_seen_at = Date.now();
           if (!await persistBrowserPages()) {
             return { ok: false, error: "browser_page_storage_unavailable" };
@@ -7843,8 +8106,9 @@ async function performBrowserPageLifecycleRequest(msg) {
     if (action === "claim") {
       let tabs = [];
       try { tabs = await chrome.tabs.query({ url: pattern }); } catch (_) {}
+      const claimKey = browserPageClaimKey(canonicalUrl, targetOrigin);
       const matches = tabs.filter((tab) =>
-        tab?.id && browserPageCanonicalUrl(tab.url, targetOrigin) === canonicalUrl);
+        tab?.id && claimKey && browserPageClaimKey(tab.url, targetOrigin) === claimKey);
       if (matches.length === 0) return { ok: false, error: "target_tab_not_found" };
       if (matches.length !== 1) return { ok: false, error: "target_tab_ambiguous" };
       const page = await rememberBrowserPage(
@@ -7941,11 +8205,13 @@ async function performBrowserPageLifecycleRequest(msg) {
     if (!await removeBrowserPageRecord(pageRef)) {
       return { ok: false, error: "browser_page_storage_unavailable" };
     }
+    const sameUrlTabs = await browserPageSameUrlTabIds(page);
     return browserPageView(page, {
       finalized: true,
       tab_closed: true,
-      tab_cleanup_verified: true,
+      tab_cleanup_verified: sameUrlTabs.length === 0,
       already_closed: true,
+      same_url_tabs_open: sameUrlTabs.length,
     });
   }
 
@@ -7976,10 +8242,12 @@ async function performBrowserPageLifecycleRequest(msg) {
       tab_cleanup_verified: true,
     });
   }
+  const sameUrlTabs = await browserPageSameUrlTabIds(page);
   return browserPageView(page, {
     finalized: true,
     tab_closed: true,
-    tab_cleanup_verified: true,
+    tab_cleanup_verified: sameUrlTabs.length === 0,
+    same_url_tabs_open: sameUrlTabs.length,
   });
 }
 
@@ -8005,6 +8273,21 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "sensitive_field_prohibited",
   "element_not_fillable",
   "value_required",
+  "multiple_select_unsupported",
+  "select_option_unavailable",
+  "select_option_not_observed",
+  "select_option_ambiguous",
+  "select_option_stale",
+  "checkable_state_required",
+  "radio_uncheck_unsupported",
+  "control_already_in_state",
+  "scroll_params_invalid",
+  "scroll_unavailable",
+  "press_params_invalid",
+  "press_unavailable",
+  "hover_only_target",
+  "hover_target_offscreen",
+  "hover_target_obscured",
 ]);
 
 function browserPageMutationEnvelope(result, page, sendAttempted) {
@@ -8095,6 +8378,84 @@ function browserImageArtifactMetadata(response) {
   };
 }
 
+async function captureOwnedBackgroundScreenshot(page, tab) {
+  const target = { tabId: tab.id };
+  const exactTab = async () => {
+    try {
+      const live = await chrome.tabs.get(tab.id);
+      return live?.windowId === tab.windowId
+        && live?.url === page.canonical_url
+        && live?.status === "complete"
+        && page.ownership === "owned";
+    } catch (_) {
+      return false;
+    }
+  };
+  if (!chrome.tabs?.onUpdated?.addListener || !chrome.tabs?.onUpdated?.removeListener
+      || !await exactTab()) {
+    return { ok: false, error: "browser_page_screenshot_view_changed", retryable: true };
+  }
+  let navigationSeen = false;
+  const onTabUpdated = (updatedTabId, changeInfo) => {
+    if (updatedTabId === tab.id
+        && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+      navigationSeen = true;
+    }
+  };
+  chrome.tabs.onUpdated.addListener(onTabUpdated);
+
+  let attached = false;
+  let detachVerified = true;
+  let imageData = "";
+  let error = null;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    const frameIdentity = async () => {
+      const tree = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+      const frame = tree?.frameTree?.frame;
+      if (!frame?.id || !frame?.loaderId
+          || browserPageCanonicalUrl(frame.url, page.origin) !== page.canonical_url) return null;
+      return `${frame.id}:${frame.loaderId}`;
+    };
+    const before = await frameIdentity();
+    if (!before || navigationSeen) {
+      error = "browser_page_screenshot_view_changed";
+    } else {
+      const captured = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+        format: "jpeg", quality: 80, fromSurface: true, captureBeyondViewport: false,
+      });
+      imageData = captured?.data;
+      const after = await frameIdentity();
+      if (navigationSeen || !after || after !== before || !await exactTab()) {
+        error = "browser_page_screenshot_view_changed";
+      }
+    }
+  } catch (_) {
+    error = "browser_page_screenshot_failed";
+  } finally {
+    try { chrome.tabs.onUpdated.removeListener(onTabUpdated); } catch (_) {}
+    if (attached) {
+      detachVerified = false;
+      for (let attempt = 0; attempt < 2 && !detachVerified; attempt += 1) {
+        try {
+          await chrome.debugger.detach(target);
+          detachVerified = true;
+        } catch (_) {}
+      }
+    }
+  }
+  if (!detachVerified) {
+    return { ok: false, error: "browser_page_screenshot_debugger_detach_unverified", retryable: false };
+  }
+  if (error) return { ok: false, error, retryable: true };
+  if (typeof imageData !== "string" || imageData.length > 12000000 || imageData.length < 16
+      || !/^[A-Za-z0-9+/]+={0,2}$/.test(imageData)) {
+    return { ok: false, error: "browser_page_screenshot_invalid", retryable: false };
+  }
+  return { ok: true, dataUrl: `data:image/jpeg;base64,${imageData}` };
+}
+
 async function captureBrowserPageScreenshot(page, tab) {
   if (!page || !tab?.id || !Number.isInteger(tab.windowId)
       || !chrome.tabs?.onActivated?.addListener
@@ -8135,50 +8496,103 @@ async function captureBrowserPageScreenshot(page, tab) {
     }
   };
 
-  if (!await exactTargetIsVisible()) {
-    return withBrowserPageIdentity({
-      ok: false,
-      error: "browser_page_screenshot_not_visible",
-      retryable: true,
-      capture_scope: "visible_tab",
-    }, page);
-  }
-
-  let viewChanged = false;
-  const onActivated = (activeInfo) => {
-    if (activeInfo?.windowId === tab.windowId) viewChanged = true;
-  };
-  const onFocusChanged = (windowId) => {
-    if (windowId !== tab.windowId) viewChanged = true;
-  };
-  chrome.tabs.onActivated.addListener(onActivated);
-  chrome.windows.onFocusChanged.addListener(onFocusChanged);
-
+  const visible = await exactTargetIsVisible();
   let dataUrl = "";
-  try {
-    dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: "jpeg",
-      quality: 80,
-    });
-    if (viewChanged || !await exactTargetIsVisible()) {
+  let captureScope = "visible_tab";
+  if (!visible) {
+    if (page.ownership !== "owned" || !chrome.debugger?.attach
+        || !chrome.debugger?.sendCommand || !chrome.debugger?.detach) {
       return withBrowserPageIdentity({
-        ok: false,
-        error: "browser_page_screenshot_view_changed",
-        retryable: true,
-        capture_scope: "visible_tab",
+        ok: false, error: "browser_page_screenshot_not_visible",
+        retryable: true, capture_scope: "visible_tab",
       }, page);
     }
-  } catch (error) {
-    return withBrowserPageIdentity({
-      ok: false,
-      error: "browser_page_screenshot_failed",
-      retryable: true,
-      detail: String(error?.message || error || ""),
-      capture_scope: "visible_tab",
-    }, page);
-  } finally {
-    chrome.tabs.onActivated.removeListener(onActivated);
-    chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+    const result = await captureOwnedBackgroundScreenshot(page, tab);
+    if (!result.ok) {
+      return withBrowserPageIdentity({
+        ok: false, error: result.error,
+        retryable: result.retryable, capture_scope: "owned_background",
+      }, page);
+    }
+    dataUrl = result.dataUrl;
+    captureScope = "owned_background";
+  } else {
+    let viewChanged = false;
+    const onActivated = (activeInfo) => {
+      if (activeInfo?.windowId === tab.windowId) viewChanged = true;
+    };
+    const onFocusChanged = (windowId) => {
+      if (windowId !== tab.windowId) viewChanged = true;
+    };
+    const onUpdated = (tabId, changeInfo) => {
+      if (tabId === tab.id
+          && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+        viewChanged = true;
+      }
+    };
+    const exactDocument = async () => {
+      try {
+        const result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: "ISOLATED",
+          func: () => ({
+            href: location.href, origin: location.origin, timeOrigin: performance.timeOrigin,
+          }),
+        });
+        const info = result?.[0]?.result;
+        if (info?.href !== page.canonical_url || info?.origin !== page.origin
+            || !Number.isFinite(info?.timeOrigin)) return null;
+        return info.timeOrigin;
+      } catch (_) {
+        return null;
+      }
+    };
+    if (!chrome.tabs.onUpdated?.addListener || !chrome.tabs.onUpdated?.removeListener) {
+      return withBrowserPageIdentity({
+        ok: false, error: "browser_page_screenshot_view_changed",
+        retryable: true, capture_scope: "visible_tab",
+      }, page);
+    }
+    chrome.tabs.onActivated.addListener(onActivated);
+    chrome.windows.onFocusChanged.addListener(onFocusChanged);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+
+    try {
+      const documentTimeOrigin = await exactDocument();
+      if (!documentTimeOrigin || viewChanged) {
+        return withBrowserPageIdentity({
+          ok: false, error: "browser_page_screenshot_view_changed",
+          retryable: true, capture_scope: "visible_tab",
+        }, page);
+      }
+      dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+        format: "jpeg",
+        quality: 80,
+      });
+      const afterDocument = await exactDocument();
+      const liveTab = await chrome.tabs.get(tab.id);
+      if (viewChanged || afterDocument !== documentTimeOrigin
+          || liveTab.windowId !== tab.windowId || liveTab.url !== page.canonical_url
+          || !await exactTargetIsVisible()) {
+        return withBrowserPageIdentity({
+          ok: false,
+          error: "browser_page_screenshot_view_changed",
+          retryable: true,
+          capture_scope: "visible_tab",
+        }, page);
+      }
+    } catch (error) {
+      return withBrowserPageIdentity({
+        ok: false,
+        error: "browser_page_screenshot_failed",
+        retryable: true,
+        detail: String(error?.message || error || ""),
+        capture_scope: "visible_tab",
+      }, page);
+    } finally {
+      chrome.tabs.onActivated.removeListener(onActivated);
+      chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+    }
   }
 
   const match = /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ""));
@@ -8187,7 +8601,7 @@ async function captureBrowserPageScreenshot(page, tab) {
       ok: false,
       error: "browser_page_screenshot_invalid",
       retryable: false,
-      capture_scope: "visible_tab",
+      capture_scope: captureScope,
     }, page);
   }
 
@@ -8206,12 +8620,12 @@ async function captureBrowserPageScreenshot(page, tab) {
       ok: false,
       error: String(response?.error || "browser_page_screenshot_artifact_failed"),
       retryable: true,
-      capture_scope: "visible_tab",
+      capture_scope: captureScope,
     }, page);
   }
   return withBrowserPageIdentity({
     ok: true,
-    capture_scope: "visible_tab",
+    capture_scope: captureScope,
     origin: page.origin,
     canonical_url: page.canonical_url,
     artifact,
@@ -8221,7 +8635,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "fill", "expect", "screenshot"].includes(action)) {
+  if (!["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -8231,7 +8645,7 @@ async function performBrowserPageActionRequest(msg) {
 
   const pageRef = String(msg?.pageRef || "");
   if (!validBrowserPageRef(pageRef)) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
       : { ok: false, error: "browser_page_ref_invalid" };
   }
@@ -8239,12 +8653,12 @@ async function performBrowserPageActionRequest(msg) {
   await loadBrowserPages();
   const record = browserPagesByRef.get(pageRef);
   if (!record) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
       : { ok: false, error: "browser_page_not_found" };
   }
   if (record.endpoint_ref !== endpointRef) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
       : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
   }
@@ -8257,14 +8671,14 @@ async function performBrowserPageActionRequest(msg) {
       reason: "host_permission_missing",
       origin: record.origin,
     };
-    return action === "click" || action === "fill"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope(denied, record, false)
       : withBrowserPageIdentity(denied, record);
   }
 
   const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
   if (!resolved.ok) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
       ? browserPageMutationEnvelope(resolved, record, false)
       : withBrowserPageIdentity(resolved, record);
   }
@@ -8273,6 +8687,18 @@ async function performBrowserPageActionRequest(msg) {
     return captureBrowserPageScreenshot(page, resolved.tab);
   }
   const tabId = resolved.tab.id;
+  if (action === "hover" && (page.ownership !== "owned" || !chrome.debugger)) {
+    return browserPageMutationEnvelope({ ok: false, error: "browser_page_hover_unavailable" }, page, false);
+  }
+  const rawExpectedUrl = msg?.expectedUrl;
+  const expectedUrl = rawExpectedUrl == null
+    ? null
+    : browserPageCanonicalUrl(rawExpectedUrl, page.origin);
+  if (rawExpectedUrl != null && (action !== "click" || !expectedUrl || expectedUrl === page.canonical_url)) {
+    return browserPageMutationEnvelope(
+      { ok: false, error: "navigation_expectation_invalid" }, page, false,
+    );
+  }
   const payload = {
     type: "h2w_page_assist",
     action,
@@ -8283,9 +8709,14 @@ async function performBrowserPageActionRequest(msg) {
     value: msg?.value,
     condition: msg?.condition,
     timeoutMs: msg?.timeoutMs,
+    direction: msg?.direction,
+    amount: msg?.amount,
+    key: msg?.key,
+    maxRows: msg?.maxRows,
+    ...(action === "fill" ? { mainWorldFill: true } : {}),
   };
 
-  const mutation = action === "click" || action === "fill";
+  const mutation = action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press";
   let sendAttempted = false;
   const send = async () => {
     sendAttempted = true;
@@ -8293,20 +8724,56 @@ async function performBrowserPageActionRequest(msg) {
   };
 
   try {
+    // Anchor the document the hover coordinates will be validated against:
+    // href/origin/timeOrigin read from the live page right before the
+    // content-script round that computes the point. The post-attach fence in
+    // browserPageTrustedHover compares against this observation.
+    const observedDocument = action === "hover"
+      ? await browserPageHoverDocumentProbe(tabId)
+      : null;
     const response = await send();
     if (mutation) {
+      if (action === "hover") {
+        if (response?.ok !== true) return browserPageMutationEnvelope(response, page, false);
+        const hover = await browserPageTrustedHover(tabId, response.hover_point, {
+          page, tab: resolved.tab, observedDocument,
+        });
+        return browserPageMutationEnvelope(hover.result, page, hover.dispatched);
+      }
       let mutationResponse = response;
-      if (action === "click" && response?.ok === true && typeof response?.navigation_url === "string") {
-        await adoptAppliedBrowserPageNavigation(page, tabId, response.navigation_url);
-        mutationResponse = { ...response };
-        delete mutationResponse.navigation_url;
+      if (action === "fill" && response?.ok === true && typeof response?.main_world_fill_token === "string") {
+        mutationResponse = await browserPageMainWorldFill(tabId, response, { page, tab: resolved.tab });
+      }
+      if (action === "click" && response?.ok === true) {
+        const observedNavigationUrl = typeof response.navigation_url === "string"
+          ? browserPageCanonicalUrl(response.navigation_url, page.origin)
+          : null;
+        if (expectedUrl && observedNavigationUrl && expectedUrl !== observedNavigationUrl) {
+          return browserPageMutationEnvelope(
+            { ok: false, error: "navigation_expectation_mismatch" }, page, true,
+          );
+        }
+        const navigationUrl = expectedUrl || observedNavigationUrl;
+        if (navigationUrl) {
+          const confirmed = await adoptAppliedBrowserPageNavigation(page, tabId, navigationUrl);
+          if (expectedUrl && !confirmed) {
+            return browserPageMutationEnvelope(
+              { ok: false, error: "navigation_postcondition_unverified" }, page, true,
+            );
+          }
+          mutationResponse = { ...response };
+          delete mutationResponse.navigation_url;
+        }
       }
       return browserPageMutationEnvelope(mutationResponse, page, true);
     }
-    return withBrowserPageIdentity(
-      response || { ok: false, error: "empty_content_response" },
-      page,
-    );
+    // A WebChat listener can yield with no response before Page Assist has
+    // been injected. For read-only operations, treat an empty/non-envelope
+    // response as an absent listener and use the existing bounded injector.
+    if (response && typeof response === "object" && !Array.isArray(response)
+        && typeof response.ok === "boolean") {
+      return withBrowserPageIdentity(response, page);
+    }
   } catch (error) {
     if (mutation) {
       return browserPageMutationEnvelope(
@@ -8321,7 +8788,7 @@ async function performBrowserPageActionRequest(msg) {
     }
   }
 
-  if (!["observe", "expect"].includes(action)) {
+  if (!["observe", "expect", "extract", "extract_table"].includes(action)) {
     return withBrowserPageIdentity({ ok: false, error: "browser_page_action_unavailable" }, page);
   }
 
@@ -8358,6 +8825,290 @@ async function performBrowserPageActionRequest(msg) {
       page,
     );
   }
+}
+
+// MAIN-world rich-editor insertion shared by WebChat composer insert and
+// browser_page fill. Must stay self-contained (runs via executeScript).
+function h2wMainWorldInsertText(text, selector, append) {
+  try {
+    const all = [...document.querySelectorAll(selector)];
+    const el = all.reverse().find((e) => e.offsetParent !== null) || all[0] || null;
+    if (!el) return { ok: false, error: "no-input" };
+    el.focus();
+    const sel = window.getSelection();
+    const range = document.createRange();
+    if (append) {
+      // Preserve provider-owned composer nodes such as app mention pills.
+      // Do not select the editor contents after a pill was inserted. Some
+      // provider editors rebuild the whole composer from that selection
+      // and drop the app reference. Place the caret after the current
+      // editor tree instead.
+      const tail = el.lastChild;
+      if (tail) {
+        range.selectNodeContents(tail);
+        range.collapse(false);
+      } else {
+        range.selectNodeContents(el);
+        range.collapse(false);
+      }
+    } else {
+      // Normal insertion replaces the current composer content.
+      range.selectNodeContents(el);
+    }
+    sel.removeAllRanges();
+    sel.addRange(range);
+    const ok = document.execCommand("insertText", false, text);
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+    const got = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+    const want = String(text || "").replace(/\s+/g, " ").trim();
+    return { ok: !!ok, committed: got.includes(want), text: got.slice(0, 40) };
+  } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+// Commit a contenteditable fill and report applied only on a real
+// before/after transition. Rich editors (Claude tiptap/ProseMirror) can show
+// restored draft text in the DOM while the model is empty, and isolated or
+// MAIN-world execCommand may not enable Send. On an automation-owned tab in an
+// unpacked DEV build the fill uses trusted input via chrome.debugger (same
+// path as h2w_type_trusted_mention): focus own tab, select-all + Backspace,
+// verify the editor is empty, Input.insertText, detach immediately.
+function h2wFillTargetProbe(selector, mode) {
+  const el = document.querySelector(selector);
+  if (!el) return { ok: false, error: "no-input" };
+  if (mode === "focus") {
+    el.focus();
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  return {
+    ok: true,
+    text: String(el.innerText || el.textContent || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim(),
+    focused: document.activeElement === el || el.contains(document.activeElement),
+    visible: document.visibilityState === "visible",
+  };
+}
+
+function browserPageFillNormalize(value) {
+  return String(value || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+async function browserPageTrustedHover(tabId, point, ctx) {
+  const x = Number(point?.x);
+  const y = Number(point?.y);
+  if (!Number.isInteger(x) || !Number.isInteger(y)
+      || x < 0 || y < 0 || x > 10000 || y > 10000) {
+    return { result: { ok: false, error: "hover_target_invalid" }, dispatched: false };
+  }
+  const page = ctx?.page;
+  const tab = ctx?.tab;
+  // P1 hover navigation race (review on 08ee0348): the hover point was
+  // validated by the content script against the document it observed, before
+  // the async debugger attach. Fence the dispatch with the same document and
+  // navigation evidence the owned-tab screenshot uses: after attach, the frame
+  // identity (id + loaderId + canonical url), the live tab (window, exact url,
+  // settled loader) and the tab-update stream must all still match that
+  // observation. Any drift fails closed BEFORE a mouse event is dispatched.
+  if (!page?.canonical_url || !tab || !Number.isInteger(tab.windowId)
+      || page.ownership !== "owned"
+      || !chrome.tabs?.onUpdated?.addListener || !chrome.tabs?.onUpdated?.removeListener) {
+    return { result: { ok: false, error: "browser_page_hover_unavailable" }, dispatched: false };
+  }
+  const exactTab = async () => {
+    try {
+      const live = await chrome.tabs.get(tabId);
+      return live?.windowId === tab.windowId
+        && live?.url === page.canonical_url
+        && live?.status === "complete";
+    } catch (_) {
+      return false;
+    }
+  };
+  let navigationSeen = false;
+  const onTabUpdated = (updatedTabId, changeInfo) => {
+    if (updatedTabId === tabId
+        && (typeof changeInfo?.url === "string" || changeInfo?.status === "loading")) {
+      navigationSeen = true;
+    }
+  };
+  chrome.tabs.onUpdated.addListener(onTabUpdated);
+
+  const target = { tabId };
+  let attached = false;
+  let dispatched = false;
+  let result = { ok: false, error: "browser_page_hover_unavailable" };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    // Anchor the frame/loader identity first, then gather every async leg…
+    const tree = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+    const frameAnchor = tree?.frameTree?.frame;
+    const frameAnchorIdentity = frameAnchor?.id && frameAnchor?.loaderId
+      ? `${frameAnchor.id}:${frameAnchor.loaderId}` : null;
+    // Same-document guarantee: the live MAIN-world document (origin, exact
+    // canonical url, per-load timeOrigin) must still be the one the point was
+    // validated against; a reload or committed navigation fails here.
+    const liveDocument = await browserPageHoverDocumentProbe(tabId);
+    const observed = ctx?.observedDocument;
+    // …and the last await re-reads the frame so a navigation during any
+    // earlier leg (including the tab query) swaps id/loaderId or trips the
+    // tab-update listener before the gate below runs.
+    const tabUnchanged = await exactTab();
+    const treeNow = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
+    const frameNow = treeNow?.frameTree?.frame;
+    const frameUnchanged = frameNow?.id && frameNow?.loaderId
+      && `${frameNow.id}:${frameNow.loaderId}` === frameAnchorIdentity;
+    const documentUnchanged = observed && liveDocument
+      && liveDocument.origin.toLowerCase() === observed.origin.toLowerCase()
+      && browserPageCanonicalUrl(liveDocument.href, page.origin) === page.canonical_url
+      && liveDocument.timeOrigin === observed.timeOrigin;
+    // Synchronous fail-closed gate AFTER the last await: navigationSeen is
+    // re-read here, so a navigation during the final awaited query can never
+    // dispatch stale coordinates.
+    if (navigationSeen
+        || !frameAnchorIdentity || !frameUnchanged
+        || browserPageCanonicalUrl(frameAnchor.url, page.origin) !== page.canonical_url
+        || !tabUnchanged
+        || !documentUnchanged) {
+      result = { ok: false, error: "browser_page_hover_view_changed", retryable: true };
+    } else {
+      dispatched = true;
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse",
+      });
+      result = { ok: true, hover_dispatched: true, hover_requires_observe: true };
+    }
+  } catch (_) {
+    result = { ok: false, error: dispatched ? "hover_delivery_unconfirmed" : "browser_page_hover_unavailable" };
+  } finally {
+    try { chrome.tabs.onUpdated.removeListener(onTabUpdated); } catch (_) {}
+    if (attached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_) {
+        try {
+          await chrome.debugger.detach(target);
+        } catch (_) {
+          result = { ok: false, error: "hover_debugger_detach_unverified" };
+        }
+      }
+    }
+  }
+  return { result, dispatched };
+}
+
+function h2wHoverDocumentProbe() {
+  // Runs in the page's MAIN world via verified chrome.scripting: browser-page
+  // globals only (location, performance.timeOrigin — the per-load monotonic
+  // anchor), no Node-isms. This is one leg of the fence, never the sole proof.
+  return {
+    href: String(location?.href || ""),
+    origin: String(location?.origin || ""),
+    timeOrigin: Number(performance?.timeOrigin),
+  };
+}
+
+async function browserPageHoverDocumentProbe(tabId) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId }, world: "MAIN", func: h2wHoverDocumentProbe,
+  });
+  const value = res?.[0]?.result;
+  return value && typeof value.href === "string" && typeof value.origin === "string"
+    && Number.isFinite(value.timeOrigin) ? value : null;
+}
+
+function browserPageTrustedFillAllowed(page) {
+  return Boolean(chrome.debugger) && !chrome.runtime.getManifest().update_url && page?.ownership === "owned";
+}
+
+async function browserPageFillProbe(tabId, selector, mode) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId }, world: "MAIN", func: h2wFillTargetProbe, args: [selector, mode],
+  });
+  return res?.[0]?.result || { ok: false, error: "no-result" };
+}
+
+async function browserPageTrustedFill(tabId, selector, text) {
+  const target = { tabId };
+  const send = (method, params) => chrome.debugger.sendCommand(target, method, params);
+  let attached = false;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    const focus = await browserPageFillProbe(tabId, selector, "focus");
+    if (!focus.ok || !focus.focused) return { ok: false, error: "fill_focus_failed" };
+    const mod = { modifiers: 4, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 };
+    await send("Input.dispatchKeyEvent", { type: "keyDown", commands: ["selectAll"], ...mod });
+    await send("Input.dispatchKeyEvent", { type: "keyUp", ...mod });
+    const del = { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 };
+    await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...del });
+    await send("Input.dispatchKeyEvent", { type: "keyUp", ...del });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const cleared = await browserPageFillProbe(tabId, selector, "read");
+    if (!cleared.ok || cleared.text !== "") return { ok: false, error: "fill_clear_not_applied" };
+    if (text) await send("Input.insertText", { text });
+    return { ok: true, cleared: true };
+  } catch (error) {
+    return { ok: false, error: `trusted_fill_failed:${String(error?.message || error).slice(0, 80)}` };
+  } finally {
+    if (attached) { try { await chrome.debugger.detach(target); } catch (_) {} }
+  }
+}
+
+async function browserPageMainWorldFill(tabId, response, context = {}) {
+  const token = response.main_world_fill_token;
+  const selector = `[data-h2w-fill-token="${token.replace(/[^a-z0-9]/gi, "")}"]`;
+  const want = browserPageFillNormalize(response.value);
+  const base = { ...response };
+  delete base.main_world_fill_token;
+  delete base.value;
+  let method = "main_world_insert_text";
+  let result = null;
+  let before = null;
+  try {
+    before = await browserPageFillProbe(tabId, selector, "read");
+    if (browserPageTrustedFillAllowed(context.page)) {
+      method = "trusted_input";
+      if (context.tab?.windowId != null) {
+        try { await chrome.windows.update(context.tab.windowId, { focused: true }); } catch (_) {}
+      }
+      try { await chrome.tabs.update(tabId, { active: true }); } catch (_) {}
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      result = await browserPageTrustedFill(tabId, selector, String(response.value || ""));
+    } else {
+      const res = await chrome.scripting.executeScript({
+        target: { tabId }, world: "MAIN", func: h2wMainWorldInsertText, args: [response.value, selector, false],
+      });
+      result = res?.[0]?.result || null;
+    }
+  } catch (error) {
+    result = { ok: false, error: String(error?.message || error || "") };
+  }
+  let after = null;
+  try { after = await browserPageFillProbe(tabId, selector, "read"); } catch (_) {}
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId }, world: "ISOLATED",
+      func: (sel) => { for (const el of document.querySelectorAll(sel)) el.removeAttribute("data-h2w-fill-token"); },
+      args: [selector],
+    });
+  } catch (_) {}
+  const verdict = browserPageFillVerdict({ before, after, want, result });
+  if (verdict.applied) return { ...base, method, before_matched: verdict.beforeMatched };
+  return { ok: false, error: verdict.error, applied: false, method };
+}
+
+// Applied only when the insert step succeeded and the after-text equals the
+// request; if the before-text already matched (restored draft), the step must
+// have proven a clear first, otherwise success is unverifiable.
+function browserPageFillVerdict({ before, after, want, result }) {
+  const beforeMatched = Boolean(before?.ok && before.text === want);
+  if (!result?.ok) return { applied: false, error: result?.error || "fill_not_applied", beforeMatched };
+  if (beforeMatched && result.cleared !== true) return { applied: false, error: "fill_unverifiable_same_text", beforeMatched };
+  if (!after?.ok || after.text !== want) return { applied: false, error: "fill_not_applied", beforeMatched };
+  return { applied: true, beforeMatched };
 }
 
 function withBrowserPageIdentity(result, page) {
@@ -9825,21 +10576,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           project_id: currentProjectId,
           project_name: currentProjectName || pageInfo.project_name || null,
           ...(registeringSite === "chatgpt"
-            ? { project_key: projectKey, project_launch_url: projectKey }
+            ? { project_key: projectKey, project_launch_url: `${projectKey}/project` }
             : { pageKey: projectKey }),
         };
       }
       const browserPageInfo = ["chatgpt", "gemini", "claude", "grok"].includes(registeringSite)
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
+      const accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
+      if (registeringSite === "chatgpt" && sender.tab?.id && !accountNativeIdentity) {
+        browserTabScopes.delete(sender.tab.id);
+        for (const [sessionRef, target] of browserSessionTargets) {
+          if (target?.tabId === sender.tab.id) browserSessionTargets.delete(sessionRef);
+        }
+      }
       let browserObservation = null;
-      if (browserPageInfo && sender.tab?.id && String(msg.accountNativeIdentity || "").trim()) {
+      if (browserPageInfo && sender.tab?.id && accountNativeIdentity) {
         const observationInput = {
           provider: browserPageInfo.site,
           tabId: sender.tab.id,
           convKey: String(msg.convKey || ""),
           pageInfo: browserPageInfo,
-          accountNativeIdentity: String(msg.accountNativeIdentity || "").trim(),
+          accountNativeIdentity,
           projects: Array.isArray(msg.browserProjects) ? msg.browserProjects : [],
           reservationRef: String(msg.browserSessionReservationRef || "").trim() || null,
         };
@@ -9953,6 +10711,72 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true;
   }
+  if (msg?.type === "h2w_type_trusted_mention") {
+    // DEV-only trusted keystrokes for the native App mention picker. Live
+    // evidence: ChatGPT ignores execCommand/synthetic input for `@` mentions.
+    // Scope: the sender's own tab only, a fixed `@<keyword>` text of
+    // [a-z0-9_-]{1,64}, attach just for typing and always detach.
+    const tabId = sender.tab?.id;
+    const keyword = String(msg.keyword || "");
+    if (!tabId) { sendResponse({ ok: false, error: "no-tab" }); return; }
+    if (chrome.runtime.getManifest().update_url || !chrome.debugger) {
+      sendResponse({ ok: false, error: "trusted-input-unavailable" });
+      return;
+    }
+    if (!/^[a-z0-9_-]{1,64}$/.test(keyword)) { sendResponse({ ok: false, error: "bad-keyword" }); return; }
+    const target = { tabId };
+    const send = (method, params) => chrome.debugger.sendCommand(target, method, params);
+    const typeChar = async (ch) => {
+      const at = ch === "@";
+      const base = {
+        key: ch,
+        code: at ? "Digit2" : (/[a-z]/.test(ch) ? `Key${ch.toUpperCase()}` : ""),
+        modifiers: at ? 8 : 0,
+      };
+      await send("Input.dispatchKeyEvent", { type: "keyDown", text: ch, unmodifiedText: at ? "2" : ch, ...base });
+      await send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+    };
+    (async () => {
+      let attached = false;
+      try {
+        await chrome.debugger.attach(target, "1.3");
+        attached = true;
+        if (msg.mode === "clear") {
+          // Remove only the automation-typed search text: select all, delete.
+          const selectAll = { key: "a", code: "KeyA", modifiers: 4 };
+          await send("Input.dispatchKeyEvent", { type: "keyDown", commands: ["selectAll"], ...selectAll });
+          await send("Input.dispatchKeyEvent", { type: "keyUp", ...selectAll });
+          const del = { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 };
+          await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...del });
+          await send("Input.dispatchKeyEvent", { type: "keyUp", ...del });
+          return { ok: true };
+        }
+        for (const ch of `@${keyword}`) {
+          await typeChar(ch);
+          await sleep(40);
+        }
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: `trusted-input-failed:${String(e?.message || e).slice(0, 80)}` };
+      } finally {
+        if (attached) { try { await chrome.debugger.detach(target); } catch (_) {} }
+      }
+    })().then(sendResponse);
+    return true;
+  }
+  if (msg?.type === "h2w_focus_own_tab") {
+    // Focus only the sender's own tab and window (native App mention needs a
+    // focused document). No tab id is accepted from the message.
+    const tabId = sender.tab?.id;
+    const windowId = sender.tab?.windowId;
+    if (!tabId || windowId == null) { sendResponse({ ok: false, error: "no-tab" }); return; }
+    Promise.resolve()
+      .then(() => chrome.windows.update(windowId, { focused: true }))
+      .then(() => chrome.tabs.update(tabId, { active: true }))
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    return true;
+  }
   if (msg?.type === "h2w_insert_main") {
     // MAIN-world text insertion: isolated-world execCommand changes the DOM
     // without committing the editor model. Select the last visible match because
@@ -9961,41 +10785,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.scripting.executeScript({
       target: { tabId: sender.tab.id },
       world: "MAIN",
-      func: (text, selector, append) => {
-        try {
-          const all = [...document.querySelectorAll(selector)];
-          const el = all.reverse().find((e) => e.offsetParent !== null) || all[0] || null;
-          if (!el) return { ok: false, error: "no-input" };
-          el.focus();
-          const sel = window.getSelection();
-          const range = document.createRange();
-          if (append) {
-            // Preserve provider-owned composer nodes such as app mention pills.
-            // Do not select the editor contents after a pill was inserted. Some
-            // provider editors rebuild the whole composer from that selection
-            // and drop the app reference. Place the caret after the current
-            // editor tree instead.
-            const tail = el.lastChild;
-            if (tail) {
-              range.selectNodeContents(tail);
-              range.collapse(false);
-            } else {
-              range.selectNodeContents(el);
-              range.collapse(false);
-            }
-          } else {
-            // Normal insertion replaces the current composer content.
-            range.selectNodeContents(el);
-          }
-          sel.removeAllRanges();
-          sel.addRange(range);
-          const ok = document.execCommand("insertText", false, text);
-          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
-          const got = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-          const want = String(text || "").replace(/\s+/g, " ").trim();
-          return { ok: !!ok, committed: got.includes(want), text: got.slice(0, 40) };
-        } catch (e) { return { ok: false, error: String(e) }; }
-      },
+      func: h2wMainWorldInsertText,
       args: [msg.text, msg.selector, Boolean(msg.append)],
     }).then((res) => {
       const r = res && res[0] && res[0].result;
@@ -10861,6 +11651,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conversation_id: msg?.conversation_id || convKey,
         workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
         project_id: primary?.project_id || null,
+        provider: primary?.site || browserConversationInfoFromSupportedUrl(convKey)?.site || null,
+        account: primary?.browser_account_ref || null,
+        project: primary?.project_id || primary?.browser_space_ref || null,
         title: primary?.workspace_label || primary?.workspace_id || null,
         role: "user",
         text: userText,
@@ -10900,6 +11693,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conversation_id: msg?.conversation_id || convKey,
         project_id: primary?.project_id || null,
         workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
+        provider: primary?.site || browserConversationInfoFromSupportedUrl(convKey)?.site || null,
+        account: primary?.browser_account_ref || null,
+        project: primary?.project_id || primary?.browser_space_ref || null,
         title: primary?.workspace_label || primary?.workspace_id || null,
         userMessageId: msg?.userMessageId || null,
         userText,
@@ -10989,6 +11785,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         conv_key: msg?.convKey || null,
         project_id: msg?.project_id || primaryBinding?.project_id || null,
         workspace_id: msg?.workspace_id || primaryBinding?.workspace_id || normalizeWorkspaceId(primaryBinding) || null,
+        provider: msg?.provider || primaryBinding?.site || browserConversationInfoFromSupportedUrl(msg?.convKey || "")?.site || null,
+        account: msg?.account || primaryBinding?.browser_account_ref || null,
+        project: msg?.project || msg?.project_id || primaryBinding?.project_id || primaryBinding?.browser_space_ref || null,
         title: primaryBinding?.workspace_label || primaryBinding?.workspace_id || null,
         conversation_id: msg?.conversation_id || null,
         userText: msg?.userText || null,
@@ -11106,7 +11905,7 @@ async function rebuildStreams() {
   }
   // Bootstrap Browser Registry before the long-lived Native Messaging push
   // stream so endpoint identity does not depend on opening Control Center later.
-  if (!browserEndpoint) await registerLocalBrowserEndpoint();
+  if (!browserEndpoint) await currentBrowserEndpoint();
   const bindings = await loadBindings();
   callLog(
     `rebuild streams v${H2W_SCRIPT_VERSION}: ${Object.keys(bindings).length} binding(s),`,
@@ -11132,7 +11931,7 @@ async function ensureAlive(preloaded, runtimeState = null) {
   // Endpoint bootstrap can legitimately fail when the extension starts before
   // a runtime that exposes Browser Registry is active. Reuse the existing
   // keepalive instead of introducing another retry timer/state owner.
-  if (!browserEndpoint) await registerLocalBrowserEndpoint();
+  if (!browserEndpoint) await currentBrowserEndpoint();
   const bindings = preloaded || await loadBindings();
   ensurePushStream(bindings);
   // Restore every missing Auto watcher, including settled conversations whose
@@ -11142,7 +11941,11 @@ async function ensureAlive(preloaded, runtimeState = null) {
 
 // ---- Install, browser startup, and every service-worker startup ----
 // MV3 can restart the worker without onInstalled/onStartup, so rebuild at module scope.
-chrome.runtime.onStartup.addListener(() => { void rebuildStreams(); });
+chrome.runtime.onStartup.addListener(() => {
+  // Browser restart resets tab ids; drop the reload-only page mirror.
+  try { void chrome.storage?.local?.remove?.(BROWSER_PAGE_RELOAD_MIRROR_KEY); } catch (_) {}
+  void rebuildStreams();
+});
 chrome.runtime.onInstalled.addListener((details) => {
   void rebuildStreams();
   // Chrome treats a Developer Mode Reload of an unpacked extension as an
@@ -11183,12 +11986,38 @@ try {
 void rebuildStreams();
 void registerLocalBrowserEndpoint();
 
+// DEV-only source reload. Unpacked (developer-mode) extensions have no
+// update_url, and fetching the packaged manifest reads the source directory
+// live. When a developer bumps the on-disk manifest version, reload once so
+// the new build is active without a manual chrome://extensions click.
+// Store/standalone packages (update_url present) never take this path, and no
+// external caller can trigger it: only a local write to the loaded extension
+// directory changes the observed version.
+async function reloadIfDevSourceVersionChanged() {
+  try {
+    const loaded = chrome.runtime.getManifest();
+    if (loaded.update_url) return false;
+    const resp = await fetch(chrome.runtime.getURL("manifest.json"), { cache: "no-store" });
+    if (!resp.ok) return false;
+    const onDisk = await resp.json();
+    const next = String(onDisk?.version || "");
+    if (!/^\d+(\.\d+){0,3}$/.test(next) || next === loaded.version) return false;
+    callLog(`dev source version ${loaded.version} -> ${next}; reloading extension`);
+    chrome.runtime.reload();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Wake the service worker each minute to restore missing SSE streams and timers.
 try {
   chrome.alarms.create("h2w-keepalive", { periodInMinutes: 1 });
   chrome.alarms.onAlarm.addListener((a) => {
     if (a.name === "h2w-keepalive") {
-      void ensureAlive();
+      void reloadIfDevSourceVersionChanged().then((reloading) => {
+        if (!reloading) void ensureAlive();
+      });
       return;
     }
     if (a.name === CHATGPT_PERF_MIGRATION_ALARM) {

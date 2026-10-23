@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **MCP Skill 正文恢复对模型可见：** 经 `herdr_skill` 或 `herdr_call(method="herdr_mcp.skill.*")` 显式请求的 Skill 正文（含 `skill.load` 结果里逐个 Skill 的 `content`）在 Runtime 与 Edge 边界重新逐字节可见，`reference_text_exposed` 现在报告 `true`；Edge 不会再把这个字段当作替换非 JSON Skill 文本的理由。通用 advisory 净化（`hint` / `*_hint` / `next_action` / `next_surface` / `recovery` / `instructions`）对包括 Skill 表面在内的所有工具保持不变，public tool schema、contract epoch 与 contract 哈希不变。
+- **relay/HANDOFF 压缩器去重与任务收尾：** 规则/错题/任务写入时按规范化文本（大小写、空白、尾随省略号与标点）去重：文本完全相等，或较短一方以 `…`/`...` 结尾（截断副本）时合并到原条目（保留较早 id 与更完整文本），`test` 不会吞掉 `test deployment`；预算不再句中截断条目文本（只丢滚动日志、多余来源与已完成任务，必要时以完整条目超预算写出）；压缩提示词严格不超过语义接口 65,536 字节上限（超限时先省略 recent/current_state/workspace，再丢 legacy 上下文，最后从提示词中省略最旧的完整条目——内存中保留，只有事件尾部会被截断）；任务按 `origin/main` 中真正的合并证据（subject 末尾 `(#N)` 或 `Merge pull request #N`，并按 token 边界匹配已合并分支）或 30 天无更新自动关闭，`done` 任务不再渲染，且每个 tick 都会对每个已存 work_state 执行（不依赖新事件）；命令中按顺序求值每个 `cd`（相对路径接续当前 cwd、`~/` 展开、词法规范化 `.`/`..`），任一步落到 scope 根目录之外即不记入当前项目。
+
+## v1.1.0-rc.3 — 2026-10-18
+
+- **1.1 第三个预发布（仅 preview 通道）：** Phase 2 浏览器/prompt 修复、endpoint 在线判定与 generation 切换恢复、Generic Browser Page、relay cursor 同事务、Linux native host / DEV sync 加固、Semantic background tier、Page Assist grant migration。stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.3.md](docs/releases/v1.1.0-rc.3.md)。 [PR #655](https://github.com/whshang/herdr-mcp/pull/655) [PR #636](https://github.com/whshang/herdr-mcp/pull/636) [PR #628](https://github.com/whshang/herdr-mcp/pull/628) [PR #642](https://github.com/whshang/herdr-mcp/pull/642) [PR #641](https://github.com/whshang/herdr-mcp/pull/641) [PR #639](https://github.com/whshang/herdr-mcp/pull/639) [PR #633](https://github.com/whshang/herdr-mcp/pull/633) [PR #632](https://github.com/whshang/herdr-mcp/issues/632) [PR #643](https://github.com/whshang/herdr-mcp/pull/643) [PR #647](https://github.com/whshang/herdr-mcp/pull/647) [PR #645](https://github.com/whshang/herdr-mcp/pull/645) [PR #630](https://github.com/whshang/herdr-mcp/pull/630)
+- **#632 浏览器端点在线判定（先升级扩展）：** Runtime 不再把「只轮询 `/push/events`、但未在本 Runtime generation 注册」的 browser endpoint 判为在线；SSE hello 新增 `endpoint_registered`。22s 超时时若命令仍在队列中、从未被扩展取走，则原子移出队列并返回可重试的 `not_delivered`，只有已交给扩展的命令才保留 `delivery_unknown`。**升级顺序：先升级浏览器扩展，再切换 Runtime。** 旧扩展在 Runtime generation 切换后会显示离线，直到其 service worker 重启（chrome://extensions 中重载扩展 service worker，无需重启 Chrome）。 [#632](https://github.com/whshang/herdr-mcp/issues/632)
+
+## v1.1.0-rc.2 — 2026-10-12
+
+- **1.1 第二个预发布（仅 preview 通道）：** 包含 N → N+1 跨 epoch updater 和迁移文档。跨 epoch 接纳要求签名发布清单中的 `contract_migration` 精确匹配来源 contract identity，且两侧 state schema 相同；v1.0.x 升级路径为先到 v1.0.4 epoch-4 bridge，再进入本 RC（epoch 5），bridge 与 RC 发布后该路径才可用，v1.0.x 无法直接更新到本 RC。stable 用户继续留在 1.0.x；成功升级后的 `herdr-mcp rollback` 仅限 macOS，重新激活已安装的上一 generation，不恢复数据库。重新注册保留 WebChat 显式拒绝授权。 [PR #605](https://github.com/whshang/herdr-mcp/pull/605) [PR #607](https://github.com/whshang/herdr-mcp/pull/607)
+
+## v1.1.0-rc.1 — 2026-10-12
+
+- **1.1 预发布（仅 preview 通道）：** Browser Adapter Platform——通用 BrowserPage 控制内核（open/claim/observe/typed mutation/expect/finalize，Runtime 统一幂等与投递）、Bilibili/X/豆包参考 Adapter、项目 Skill Adapter 模型；WebChat 控制授权按 endpoint + provider 并支持由 Page Assist 推导的 `*`；ChatGPT 全路径只提交一次、App 激活与精确候选匹配；Grok/Claude stop 定位目标会话；relay 重放缓存按 Connector 限定。Runtime contract epoch 5、Edge epoch 8、state schema 15。stable 通道不受影响；本版本 manifest 未声明 `contract_migration`，且 v1.0.x updater 拒绝不同 contract epoch，因此 v1.0.x 无法通过普通 `herdr-mcp update` 到达本预发布（计划路径为尚未发布的 v1.0.4 bridge：其 `version` 还会打印包含 `contract epoch 2 / 18 tools` 的兼容行，因此已发布的 v1.0.0–v1.0.3 可经前台 `herdr-mcp update` 与 macOS 后台 stable scheduler（`update auto`）正常更新到该 bridge，无需手工安装；再由声明 `contract_migration` 的首个 v1.1 发布跨到 epoch 5。`contract_migration` 接纳规则尚未在已发布 updater 中实现）。正式 v1.1.0 在 PROD 升级/回滚 UAT 后发布。 [PR #570](https://github.com/whshang/herdr-mcp/pull/570) [PR #588](https://github.com/whshang/herdr-mcp/pull/588) [PR #595](https://github.com/whshang/herdr-mcp/pull/595) [PR #601](https://github.com/whshang/herdr-mcp/pull/601)
+
 ## v1.0.3 — 2026-09-24
 
 - 修复早期 v0.4.x 安装无法经 v0.4.9 migration bridge 升级到 1.x：`worker update` 现在可以原地更新 wrangler 模板部署的旧 Worker；通用 `herdr-edge` 身份在 workers.dev 下由主机名证明脚本名，在自定义域名下则必须通过 Cloudflare Custom Domains API 精确证明 `hostname → service(script)` 后才允许 mutation；未登记 device id 时还要求本机 Link 与 Worker 的 `DEFAULT_WORKSTATION_ID` 一致并原值保留。并修复 Worker 地址只存在于 Link plist 时的静默跳过。1.x 不再改名 0.4.x 的 `config.toml`，大版本回滚会恢复被 v1.0.0–v1.0.2 改名的配置；若配置恢复不完整则保留 rollback material 并报告失败。major-apply 失败原因完整写入 `~/.config/herdr-mcp/major-upgrade-last-failure.log`。同时包含 major migration 已提交后 sidecar 失败改为可恢复警告的修复。 [PR #566](https://github.com/whshang/herdr-mcp/pull/566) [PR #561](https://github.com/whshang/herdr-mcp/pull/561)

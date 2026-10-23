@@ -14,7 +14,7 @@ herdr-mcp webchat resources [--endpoint-ref REF] [--provider chatgpt] [--kind ac
 herdr-mcp webchat inspect RESOURCE_REF
 ```
 
-- `endpoint_ref` must report `consent.webchat_control: true`, otherwise the browser is not drivable.
+- Registered endpoints report `consent.webchat_control: true`; there is no local WebChat Control toggle. Actual mutation availability still intersects the exact caller grant, account binding, provider capability, and current observation generation.
 - Hierarchy is account → `space` (ChatGPT Project) → `session` (conversation); `parent_ref` gives the edge.
 - `resource_ref`, `endpoint_ref`, and `observation_generation` are the only valid identities. Never synthesize, transform, or guess a ref, and never reuse one from another machine or Project.
 - Pass the observed generation as `--expected-generation`.
@@ -38,6 +38,30 @@ herdr-mcp webchat create \
   --space-ref SPACE_REF --display-label LABEL --message MESSAGE \
   --expected-generation N --idempotency-key KEY [--work-chain-id WORK_CHAIN_ID]
 ```
+
+To make a WebChat child actually eligible to use the **provider-owned** Herdr App,
+pass `--required-app herdr` to `webchat create` or `webchat send`.
+The value is a provider App keyword, not Markdown text or a fabricated App pill.
+The Extension resolves candidates only inside the popup its own composer owns
+(`aria-controls` / `aria-owns`), requires an exact provider `data-keyword`
+identity, and stops delivery when that popup or a unique candidate is missing.
+The Runtime must not classify a required-App message as `applied` unless
+`required_apps_readback` matches exactly, and that readback now comes from the
+**accepted provider user message itself** (the same message as
+`accepted_user_message_ref` and its text digest), not from the pre-submit
+composer. A plain-text `@herdr` is never an App identity: only a provider-owned
+inline mention with a non-empty `app-mention-path` counts, and late create
+acceptance re-checks that identity from the same provider message. Expect `uncertain`
+when the accepted message cannot prove the requested App. This is **App identity
+evidence only**: confirm a real tool call and result inside the child before
+claiming execution.
+With `uncertain`, read back first; never resend with a new idempotency key.
+
+ChatGPT submission is **single-shot per wake**: one dispatch primitive is
+attempted, and an unconfirmed acknowledgement stays `uncertain` for every path
+(handoff, queue, recovery, generic wake, and the MCP `dispatch.submit` /
+`session.create` actuation). It is never re-sent, because a second Send click or
+Enter can create a duplicate provider user message.
 
 Dispatch and observe:
 
@@ -111,8 +135,46 @@ continuity_id
 ## Current boundaries (do not document or emulate past these)
 
 - Not supported today (runtime returns `code: "unsupported"`): `browser_space.create`, `browser_space.open`, `browser_message.append`, `browser_composer.set_reasoning`, `browser_composer.set_apps`, and `dispatch.submit` with `reasoning_effort` or `required_apps`.
-- Supported private methods with **no CLI wrapper**: `browser_dispatch.stop`, `browser_endpoint.inspect`, `browser_space.inspect`, and the trusted-local read-only source resolver used internally by the CLI. `browser_session.open` is available through `herdr-mcp webchat open`; `browser_handoff.prepare` is reached through `herdr-mcp webchat handoff`. `webchat create --source-url URL` is available for exact source-window affinity and requires only the canonical source URL plus the normal message/idempotency inputs; the trusted local CLI resolves the latest exact endpoint/account route and attaches that grant internally, while Runtime resolves and validates the same canonical route again before mutation.
-- `code: "caller_grant_missing"` means you are not on the trusted local path (for example a raw TCP MCP client); grants cannot be asserted over TCP. Use the CLI.
+- Supported private methods with **no CLI wrapper**: `browser_dispatch.stop`, `browser_endpoint.inspect`, `browser_space.inspect`, and the trusted-local read-only source resolver used internally by the CLI. `browser_session.open` is available through `herdr-mcp webchat open`; `browser_handoff.prepare` is reached through `herdr-mcp webchat handoff`. `webchat create --source-url URL` is available for exact source-window affinity and requires only the canonical source URL plus the normal message/idempotency inputs; the trusted local CLI resolves the exact endpoint/account route and attaches that grant internally, while Runtime resolves and validates the same canonical route again before mutation. An exact canonical URL observed by more than one browser session is ambiguous and fails closed as `browser_canonical_url_ambiguous`, so source-anchored create and handoff never retarget another profile/account's session.
+- `code: "caller_grant_missing"` has one of two causes. You may be off the trusted local path (for example a raw TCP MCP client; grants cannot be asserted over TCP — use the CLI), or the caller is a remote connector whose Page Assist grant is missing or stale (see the grant-binding note below).
 - `ego-browser` is development/UAT infrastructure, never a user dependency.
 
 Always re-check the installed runtime before relying on a capability.
+
+## Remote connector WebChat control grants (provider-scoped)
+
+Remote MCP connectors (Edge OAuth) need an owner-issued WebChat control grant before
+`webchat send` / `dispatch-status` / `browser_dispatch.stop` work through them. Local CLI
+callers get a synthetic grant automatically. Grants are **provider-scoped**: exact device +
+endpoint + provider; they cover every account of that provider on that endpoint.
+
+```sh
+herdr-mcp connector webchat-control allow CONNECTOR_ID DEVICE_ID ENDPOINT_REF PROVIDER --confirm
+herdr-mcp connector webchat-control deny  CONNECTOR_ID DEVICE_ID ENDPOINT_REF PROVIDER --confirm
+```
+
+A trailing `ACCOUNT_REF` before `--confirm` is still accepted (legacy form) but no longer
+narrows the match; `deny` removes every grant for that endpoint + provider. Caller grant,
+exact device/endpoint, tab ownership, origin and sensitive-field checks are unchanged.
+
+**Provider wildcard and Page Assist implication (2026-10-11 23:03).** A grant may use
+provider `*` (exact endpoint, any provider). Edge derives a `*` WebChat control grant at
+forward time from every Page Assist endpoint grant for the routed device, so
+`connector page-assist allow` also authorizes WebChat send/status/stop for all providers on
+that endpoint, existing Page Assist grants work without migration, and `page-assist deny`
+removes the derived grant. Explicit per-provider grants remain until denied.
+
+**Page Assist grant binding.** A Page Assist grant is not a label; it binds
+`{connector_id, grant_generation, device_id, endpoint_ref}`. Re-authorizing ChatGPT issues a
+new `connector_id`, and a changed extension identity registers a new `endpoint_ref`; in either
+case the previous grant silently stops matching and connector callers get
+`caller_grant_missing` (fail-closed, `retryable=false`). Do not widen permissions in response.
+Re-allow the exact current combination as the workstation owner, in order:
+
+```sh
+herdr-mcp connector list                                        # current connector_id
+herdr-mcp webchat endpoints                                     # browser_endpoint.list: pick an
+                                                                # online endpoint (status "live")
+                                                                # with the newest version
+herdr-mcp connector page-assist allow CONNECTOR_ID DEVICE_ID ENDPOINT_REF --confirm
+```

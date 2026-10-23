@@ -160,6 +160,10 @@ herdr-mcp には複数の境界があります。
 - busy / dirty の確認は偶発的な同時 edit を防ぐ;
 - `herdr_exec` はより強い shell 境界であり、サンドボックスではない。
 
+`herdr_exec` は任意で `intent`（`read_only` / `idempotent_write` / `non_idempotent_write`）と `idempotency_key` を受け付けます。key 付きのリクエストは配信前にローカルの operations ledger に記録されます。同じ key を繰り返すと最初の同期結果を `idempotent_replay=true` で返し、再実行しません。同じ key で別のコマンドを指定すると `idempotency_key_conflict` で拒否され、何も配信されません。予約が存在しても結果が未確定の場合は fail-closed となり、自動的に再実行されることはありません。write intent には key が必要で、`read_only` は intent のみでも構いません。どちらのフィールドも省略した場合は従来とまったく同じ動作です。
+
+特定の Agent prompt が確認・適用されたか、あるいは後続の prompt に置き換えられたかを判定することは現在できません。Herdr 0.9.1 には正確な native prompt-turn の identity がなく、ランタイムは 1 回の prompt をそのターンの確認/適用結果に結び付けられません。`herdr_prompt` の `idempotency_key` は 1 回の送信の重複配信を防ぐだけで、ターン単位の判定は提供しません。
+
 1 つのパスの問題を解決するためだけに、すべての権限を弱めないでください。まず、実際にどの gate が操作をブロックしているかを判断します。
 
 ## 11. デプロイプレーンを分離する

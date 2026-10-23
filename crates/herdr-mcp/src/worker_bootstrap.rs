@@ -3868,7 +3868,7 @@ mod tests {
             "edgeVersion": "0.4.6-dev",
             "contractEpoch": 7,
             "contractHash": "sha256:public-v7",
-            "runtimeContractEpoch": 4,
+            "runtimeContractEpoch": 5,
             "runtimeContractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
         });
         assert!(validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev")).is_ok());
@@ -3884,7 +3884,7 @@ mod tests {
             "contractHash": "sha256:public-v7",
             "runtimeContractEpoch": 2,
             "runtimeContractHash": crate::link::daemon::LEGACY_EPOCH2_CONTRACT_HASH,
-            "currentRuntimeContractEpoch": 4,
+            "currentRuntimeContractEpoch": 5,
             "currentRuntimeContractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
         });
         assert!(validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev")).is_ok());
@@ -3904,7 +3904,7 @@ mod tests {
             "contractHash": "sha256:public-v7",
             "runtimeContractEpoch": 2,
             "runtimeContractHash": crate::link::daemon::LEGACY_EPOCH2_CONTRACT_HASH,
-            "currentRuntimeContractEpoch": 3,
+            "currentRuntimeContractEpoch": 4,
             "currentRuntimeContractHash": crate::link::daemon::PREVIOUS_PUBLIC_CONTRACT_HASH,
         });
         assert!(validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev")).is_ok());
@@ -3954,7 +3954,7 @@ mod tests {
         let payload = json!({
             "ok": true,
             "service": "herdr-edge-mac",
-            "contractEpoch": 4,
+            "contractEpoch": 5,
             "contractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
         });
         assert!(

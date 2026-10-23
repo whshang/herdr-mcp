@@ -11,16 +11,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::thread;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::{Duration, Instant};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const DEV_ACTIVATION_HEALTH_BUDGET: Duration = Duration::from_secs(10);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const DEV_ACTIVATION_HEALTH_POLL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,6 +236,29 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
             write_state(&paths.state, state)?;
             recovered_from_stale_dev = true;
         }
+    }
+
+    // A DEV sync whose activation committed but whose post-activation gate or
+    // compensation failed (e.g. Linux before a real gate/rollback existed)
+    // leaves channel=prod while the failed transaction's DEV generation is
+    // still runtime/current. The pinned PROD snapshot remains the PROD source:
+    // treat the state as DEV so this sync re-pins nothing from DEV bytes.
+    if let Some(state) = existing.as_mut()
+        && failed_transaction_left_dev_active(
+            state,
+            &active_before,
+            is_dev_runtime_version(&binary_version(
+                &runtime.config_dir.join("runtime/current/herdr-mcp"),
+            )?),
+        )
+    {
+        if !verify_snapshot(state)? {
+            return Err(
+                "refusing to resume after a failed DEV sync because the pinned PROD snapshot failed SHA-256 validation"
+                    .to_owned(),
+            );
+        }
+        state.channel = "dev".to_owned();
     }
 
     let prod_generation = match existing.as_ref() {
@@ -829,6 +852,10 @@ fn rollback() -> Result<ExitCode, String> {
     }
 
     unsafe { std::env::set_var("HERDR_MCP_GENERATION_TRIGGER", "dev_rollback") };
+    #[cfg(target_os = "linux")]
+    let install_code =
+        crate::linux_service_manager::install_from_payload(Path::new(&state.prod_snapshot_binary))?;
+    #[cfg(not(target_os = "linux"))]
     let install_code = crate::service_lifecycle::run_install_from_payload(
         false,
         Path::new(&state.prod_snapshot_binary),
@@ -1355,9 +1382,17 @@ fn verify_runtime_activation(runtime: &RuntimePaths, generation: &str) -> Result
     validate_dev_activation_evidence(generation, &service, &link, Some(&native_host))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn service_activation_ready(generation: &str, service: &Value) -> Result<bool, String> {
-    if service.get("implementation").and_then(Value::as_str) != Some("rust") {
+    // macOS reports "rust"; Linux reports its backend ("rust-systemd-user" or
+    // "rust-process-user"). Anything else is not the Rust runtime.
+    if !service
+        .get("implementation")
+        .and_then(Value::as_str)
+        .is_some_and(|implementation| {
+            implementation == "rust" || implementation.starts_with("rust-")
+        })
+    {
         return Err("service implementation is not Rust after DEV activation".to_owned());
     }
     let observed_generation = service
@@ -1373,7 +1408,7 @@ fn service_activation_ready(generation: &str, service: &Value) -> Result<bool, S
         && service.get("healthy").and_then(Value::as_bool) == Some(true))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn wait_for_dev_service_activation_with<Probe, CanRetry, Pause>(
     generation: &str,
     mut probe: Probe,
@@ -1399,12 +1434,88 @@ where
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn verify_runtime_activation(runtime: &RuntimePaths, generation: &str) -> Result<Value, String> {
+    // Linux has no launchd ownership evidence: verify the same facts through
+    // the Linux service manager (systemd user unit or detached processes) and
+    // the Linux Link status report, within the same convergence budget.
+    let deadline = Instant::now() + DEV_ACTIVATION_HEALTH_BUDGET;
+    let service = wait_for_dev_service_activation_with(
+        generation,
+        crate::service_manager::doctor_status,
+        || Instant::now() < deadline,
+        || thread::sleep(DEV_ACTIVATION_HEALTH_POLL),
+    )?;
+    let enrolled = crate::config::Config::load(&runtime.config_file)?
+        .edge_device_id
+        .is_some();
+    loop {
+        let link = crate::linux_service_manager::link_status_report()?;
+        match validate_linux_activation_evidence(generation, &service, &link, enrolled) {
+            Ok(evidence) => return Ok(evidence),
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => thread::sleep(DEV_ACTIVATION_HEALTH_POLL),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn verify_runtime_activation(_runtime: &RuntimePaths, _generation: &str) -> Result<Value, String> {
     Err(
-        "DEV sync activation verification currently depends on macOS launchd ownership evidence; production Linux install/update uses the Linux service/Link health path"
+        "DEV sync activation verification is supported on macOS (launchd) and Linux (systemd user unit or detached processes)"
             .to_owned(),
     )
+}
+
+/// Linux post-activation gate: the Rust service is healthy on the expected
+/// generation and, for an enrolled device, the managed Link is running and
+/// both runtime/current and the Link's active generation are that generation.
+#[cfg(any(target_os = "linux", test))]
+fn validate_linux_activation_evidence(
+    generation: &str,
+    service: &Value,
+    link: &Value,
+    enrolled: bool,
+) -> Result<Value, String> {
+    if !service_activation_ready(generation, service)? {
+        return Err("service status is not healthy after DEV activation".to_owned());
+    }
+    let alignment = link
+        .get("production_runtime_alignment")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Linux Link status is missing generation alignment evidence".to_owned())?;
+    let current = alignment
+        .get("current_generation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if current != generation {
+        return Err(format!(
+            "runtime/current mismatch after DEV activation: expected={generation} current={current}"
+        ));
+    }
+    let link_loaded = link.get("link_loaded").and_then(Value::as_bool) == Some(true);
+    if enrolled {
+        let active = alignment
+            .get("active_generation")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !link_loaded {
+            return Err("Linux Link is not running after DEV activation".to_owned());
+        }
+        if active != generation {
+            return Err(format!(
+                "Linux Link generation mismatch after DEV activation: expected={generation} active={active}"
+            ));
+        }
+    }
+    Ok(json!({
+        "platform": "linux",
+        "implementation": service.get("implementation").cloned().unwrap_or(Value::Null),
+        "generation": generation,
+        "service_healthy": true,
+        "enrolled": enrolled,
+        "link_loaded": link_loaded,
+    }))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1570,6 +1681,20 @@ fn ensure_prod_snapshot(
     }
     secure_dir(&paths.prod_dir)?;
     atomic_copy_executable(&current_binary, &paths.prod_binary)
+}
+
+fn failed_transaction_left_dev_active(
+    state: &DevRuntimeState,
+    active_generation: &str,
+    active_is_dev: bool,
+) -> bool {
+    active_is_dev
+        && state.channel == "prod"
+        && state.prod_generation != active_generation
+        && state.last_transaction.as_ref().is_some_and(|transaction| {
+            transaction.phase == DevSyncPhase::Failed
+                && transaction.generation.as_deref() == Some(active_generation)
+        })
 }
 
 fn verify_snapshot(state: &DevRuntimeState) -> Result<bool, String> {
@@ -2719,5 +2844,112 @@ mod tests {
             state.dev_generation.as_deref(),
             Some("rust-3979663c8cc7e4f7")
         );
+    }
+
+    #[test]
+    fn linux_activation_gate_accepts_healthy_enrolled_runtime() {
+        let service = json!({"ok": true, "healthy": true, "implementation": "rust-process-user", "generation": "rust-new"});
+        let link = json!({"link_loaded": true, "production_runtime_alignment": {"current_generation": "rust-new", "active_generation": "rust-new"}});
+        let evidence =
+            validate_linux_activation_evidence("rust-new", &service, &link, true).unwrap();
+        assert_eq!(evidence["platform"], json!("linux"));
+        assert_eq!(evidence["link_loaded"], json!(true));
+        let systemd = json!({"ok": true, "healthy": true, "implementation": "rust-systemd-user", "generation": "rust-new"});
+        assert!(validate_linux_activation_evidence("rust-new", &systemd, &link, true).is_ok());
+    }
+
+    #[test]
+    fn linux_activation_gate_fails_closed_on_wrong_or_missing_evidence() {
+        let healthy = json!({"ok": true, "healthy": true, "implementation": "rust-process-user", "generation": "rust-new"});
+        let aligned = json!({"link_loaded": true, "production_runtime_alignment": {"current_generation": "rust-new", "active_generation": "rust-new"}});
+        let node = json!({"ok": true, "healthy": true, "implementation": "node", "generation": "rust-new"});
+        assert!(validate_linux_activation_evidence("rust-new", &node, &aligned, true).is_err());
+        let wrong_gen = json!({"ok": true, "healthy": true, "implementation": "rust-process-user", "generation": "rust-old"});
+        assert!(
+            validate_linux_activation_evidence("rust-new", &wrong_gen, &aligned, true).is_err()
+        );
+        let unhealthy = json!({"ok": false, "healthy": false, "implementation": "rust-process-user", "generation": "rust-new"});
+        assert!(
+            validate_linux_activation_evidence("rust-new", &unhealthy, &aligned, true).is_err()
+        );
+        let link_down = json!({"link_loaded": false, "production_runtime_alignment": {"current_generation": "rust-new", "active_generation": "rust-new"}});
+        assert!(
+            validate_linux_activation_evidence("rust-new", &healthy, &link_down, true).is_err()
+        );
+        let stale_link = json!({"link_loaded": true, "production_runtime_alignment": {"current_generation": "rust-new", "active_generation": "rust-old"}});
+        assert!(
+            validate_linux_activation_evidence("rust-new", &healthy, &stale_link, true).is_err()
+        );
+        assert!(
+            validate_linux_activation_evidence("rust-new", &healthy, &json!({}), true).is_err()
+        );
+        // An unenrolled workstation has no Link to verify, but runtime/current must still match.
+        assert!(
+            validate_linux_activation_evidence("rust-new", &healthy, &link_down, false).is_ok()
+        );
+        let wrong_current = json!({"link_loaded": false, "production_runtime_alignment": {"current_generation": "rust-old"}});
+        assert!(
+            validate_linux_activation_evidence("rust-new", &healthy, &wrong_current, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_linux_dev_sync_with_dev_still_active_resumes_from_pinned_prod() {
+        let transaction = DevSyncTransaction {
+            transaction_id: "dstx-1".to_owned(),
+            phase: DevSyncPhase::Failed,
+            target_version: "1.0.0-dev".to_owned(),
+            source_repo: "/src".to_owned(),
+            source_branch: Some("main".to_owned()),
+            source_commit: "abc".to_owned(),
+            source_dirty: false,
+            active_generation_before: "rust-prod".to_owned(),
+            expected_generation: Some("rust-dev".to_owned()),
+            generation: Some("rust-dev".to_owned()),
+            started_at_ms: 1,
+            updated_at_ms: 2,
+            completed_at_ms: Some(2),
+            error: Some("gate failed".to_owned()),
+            activation_evidence: None,
+        };
+        let state = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "prod".to_owned(),
+            target_version: "1.0.0-dev".to_owned(),
+            source_repo: None,
+            source_branch: None,
+            source_commit: None,
+            source_dirty: false,
+            dev_generation: None,
+            prod_generation: "rust-prod".to_owned(),
+            prod_version: "1.0.0".to_owned(),
+            prod_snapshot_binary: "/prod".to_owned(),
+            prod_snapshot_sha256: "00".to_owned(),
+            updated_at_ms: 2,
+            last_transaction: Some(transaction.clone()),
+        };
+        assert!(failed_transaction_left_dev_active(&state, "rust-dev", true));
+        assert!(!failed_transaction_left_dev_active(
+            &state, "rust-dev", false
+        ));
+        assert!(!failed_transaction_left_dev_active(
+            &state,
+            "rust-other",
+            true
+        ));
+        assert!(!failed_transaction_left_dev_active(
+            &state,
+            "rust-prod",
+            true
+        ));
+        let mut succeeded = state.clone();
+        succeeded.last_transaction = Some(DevSyncTransaction {
+            phase: DevSyncPhase::Succeeded,
+            ..transaction
+        });
+        assert!(!failed_transaction_left_dev_active(
+            &succeeded, "rust-dev", true
+        ));
     }
 }

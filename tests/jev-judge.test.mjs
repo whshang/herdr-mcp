@@ -53,6 +53,48 @@ test("user gets the fixed Jev tri-state boundary | Given positive negative and m
   assert.equal(interpretJevPendingWorkAnswer(answer(0.55)).handoffBoundaryStable, null);
 });
 
+test("user never gets a stop decision from malformed provider output | Given a Jev pending-work reply whose probability is null empty non-numeric or a string | When the pending-work answer is interpreted | Then every non-number fails closed to bad_response instead of a done signal", () => {
+  const answer = (noul) => ({ model: "jev-latest", answers: { has_unfinished_work: { type: "noul", noul } } });
+  for (const malformed of [null, "", false, true, [], {}, "0.9", "1", Number.NaN, Number.POSITIVE_INFINITY, -0.1, 1.1]) {
+    const parsed = interpretJevPendingWorkAnswer(answer(malformed));
+    assert.equal(parsed.ok, false, `noul=${JSON.stringify(malformed)} must not be accepted`);
+    assert.equal(parsed.reason, "bad_response");
+    assert.equal(parsed.signal, "unknown");
+    assert.equal(parsed.probability, null);
+    assert.deepEqual(decideJevAutoPolicy(parsed), { action: "fallback", reason: "jev_unavailable" });
+  }
+  // A valid number still behaves exactly as before, including the 0.20 false boundary.
+  assert.equal(interpretJevPendingWorkAnswer(answer(0.2)).signal, "done");
+  assert.equal(interpretJevPendingWorkAnswer(answer(0)).signal, "done");
+});
+
+test("user never gets an all-false Goal prior from malformed provider output | Given a Jev Goal reply whose five signals are null or strings | When the Goal prior is interpreted | Then it fails closed to bad_response instead of reporting every signal as false", () => {
+  const answers = (noul) => Object.fromEntries(JEV_GOAL_SIGNAL_KEYS.map((key) => [key, { type: "noul", noul }]));
+  for (const malformed of [null, "", "0.9", false, []]) {
+    const parsed = interpretJevGoalSemanticAnswer({ answers: answers(malformed) });
+    assert.equal(parsed.ok, false, `noul=${JSON.stringify(malformed)} must not be accepted`);
+    assert.equal(parsed.reason, "bad_response");
+    assert.equal(parsed.probabilities, null);
+  }
+  // One malformed optional head is not a probability hint, but it never becomes a decision.
+  const mixed = interpretJevPendingWorkAnswer({
+    answers: {
+      has_unfinished_work: { type: "noul", noul: 0.55 },
+      handoff_boundary_stable: { type: "noul", noul: null },
+      useful_work_remaining: { type: "noul", noul: "0.64" },
+    },
+  });
+  assert.equal(mixed.ok, true);
+  assert.equal(mixed.handoffBoundaryStable, null);
+  assert.equal(mixed.usefulWorkRemaining, null);
+
+  const goal = interpretJevGoalSemanticAnswer({
+    answers: { ...answers(0.05), waiting_external: { type: "noul", noul: 0.92 } },
+  });
+  assert.equal(goal.ok, true);
+  assert.deepEqual(goal.strong, ["waiting_external"]);
+});
+
 test("user gets Jev first and fallback only on uncertainty or outage | Given explicit Jev outcomes | When Auto selects the semantic stage | Then continue and done are final while uncertain or unavailable fall through", () => {
   assert.deepEqual(
     decideJevAutoPolicy({ ok: true, signal: "continue", probability: 0.91 }),

@@ -41,7 +41,7 @@ pub const LOCAL_MCP_DEFAULT_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const LOCAL_MCP_DEFAULT_TIMEOUT_MS: u64 = 10_000;
 pub const LOCAL_MCP_MAX_TIMEOUT_MS: u64 = 120_000;
 /// Runtime execution contract epoch implemented by the local managed runtime.
-pub const LOCAL_MCP_CONTRACT_EPOCH: u64 = 4;
+pub const LOCAL_MCP_CONTRACT_EPOCH: u64 = 5;
 
 const LOCAL_MCP_RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
@@ -367,8 +367,10 @@ impl LocalMcpTransport {
                 .get("account_ref")
                 .and_then(Value::as_str)
                 .ok_or(())?;
+            // Provider `*` is the WebChat control wildcard (exact endpoint, any
+            // provider); this runtime advertises `webchat_control.any_provider`.
             if !valid_grant_ref(endpoint_ref, 96)
-                || !valid_grant_provider(provider)
+                || !(valid_grant_provider(provider) || provider == "*")
                 || !valid_grant_ref(account_ref, 96)
             {
                 return Err(());
@@ -1929,5 +1931,32 @@ mod tests {
         let transport = transport_for(endpoint);
         assert!(transport.get_health().await.healthy);
         assert_eq!(transport.runtime_info().runtime_version, "0.4.0-test");
+    }
+}
+
+#[cfg(test)]
+mod webchat_any_provider_link_tests {
+    use super::*;
+
+    /// user remote connector | Given Edge forwards a provider `*` WebChat control grant | When the link builds the trusted grant header | Then the grant is accepted instead of failing the whole request
+    #[test]
+    fn user_connector_given_star_grant_when_link_builds_header_then_accepted() {
+        let trace = json!({"webchat_control_grants": [
+            {"endpoint_ref": "bep_a", "provider": "*", "account_ref": "*"},
+            {"endpoint_ref": "bep_a", "provider": "chatgpt", "account_ref": "br_x"}
+        ]});
+        let header = LocalMcpTransport::webchat_control_grants_header(trace.as_object())
+            .expect("star grant accepted");
+        let text = header.expect("header present");
+        assert!(text.contains("\"provider\":\"*\""), "{text}");
+    }
+
+    /// user remote connector | Given a grant with an invalid provider | When the link builds the trusted grant header | Then it still fails closed
+    #[test]
+    fn user_connector_given_invalid_provider_when_link_builds_header_then_rejected() {
+        let trace = json!({"webchat_control_grants": [
+            {"endpoint_ref": "bep_a", "provider": "Bad*", "account_ref": "*"}
+        ]});
+        assert!(LocalMcpTransport::webchat_control_grants_header(trace.as_object()).is_err());
     }
 }

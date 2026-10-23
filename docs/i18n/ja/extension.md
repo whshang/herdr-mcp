@@ -93,6 +93,33 @@ herdr-mcp Rust runtime
 
 ブラウザは操作と可視化を所有し、Native Host は信頼されたローカルブリッジであり、ツール schema、managed-root チェック、権限、mutation 境界は引き続き runtime が所有します。公開 OAuth/MCP とローカル Native Messaging は別々の信頼境界です。
 
+## Linux と Google Chrome
+
+macOS と Linux は同じ Native Messaging 契約を使います。管理 runtime は mode-`0600` の `~/.config/herdr-mcp/extension.sock` で拡張 IPC を提供します。ブラウザ manifest はちょうど一つの `chrome-extension://<id>/` origin だけを許可し、安定 wrapper `~/.config/herdr-mcp/native/herdr-extension-host` を指します。wrapper は同じディレクトリの runtime コピーを `herdr-mcp extension-host` として起動します。Host は loopback bearer を受け付けず、`127.0.0.1:8772` への匿名 TCP は拒否されたままです。
+
+`herdr-mcp native-host install` は常に Google Chrome を登録します。Chromium、Chrome for Testing、Chrome Beta、Chrome Dev（`google-chrome-unstable`）、Brave、Microsoft Edge は、そのブラウザの設定ディレクトリが既にあるときだけ登録します。既定のパス:
+
+| ブラウザ | Manifest ディレクトリ |
+| --- | --- |
+| Google Chrome | `~/.config/google-chrome/NativeMessagingHosts/dev.herdr.mcp.json` |
+| Chromium | `~/.config/chromium/NativeMessagingHosts/dev.herdr.mcp.json` |
+| Chrome for Testing | `~/.config/google-chrome-for-testing/NativeMessagingHosts/dev.herdr.mcp.json` |
+
+プロセスの home で `XDG_CONFIG_HOME` が絶対パスのとき、これらのディレクトリは `$XDG_CONFIG_HOME` の下に作られます。管理 wrapper を指さない手書き manifest は外部ファイルです。`native-host install` は所有していない host ファイルを奪わないので、先に削除してください。
+
+`--user-data-dir` 付きで起動した Chrome は、既定の設定ディレクトリではなく `<user-data-dir>/NativeMessagingHosts/` から native host を読みます。`native-host install` または `native-host use` に `--user-data-dir` を繰り返して渡せます。`native-host status` はそれらのディレクトリを表示し、`native-host rollback` は前の集合を戻します。プロファイルディレクトリは既に存在し、symlink であってはなりません。
+
+socket を作るのは `native-host install` ではなく管理 runtime です。`herdr-mcp service install`（更新と `herdr-mcp dev sync` もこれを実行します）は user systemd unit または切り離されたプロセス環境を書き直し、`HERDR_EXTENSION_IPC_SOCKET` を付けて runtime を再起動します。古い unit に対する `service restart` だけではこの変数は追加されません。新しい runtime が起動したあと channel を登録し、Chrome を再起動して host を起動させます。
+
+```bash
+herdr-mcp service install
+herdr-mcp native-host use standalone
+# または: herdr-mcp native-host install
+herdr-mcp native-host status
+```
+
+その後、拡張を再読み込みする（または Chrome を再起動する）と、`herdr-mcp webchat endpoints` にブラウザ endpoint が出ます。`extension.sock` は自分のユーザーが所有する mode-`0600` の socket です。
+
 ## 初回利用
 
 1. Runtime と ChatGPT Connector がすでに動作していることを確認します。
@@ -102,11 +129,11 @@ herdr-mcp Rust runtime
 5. 状態、Pinned Target、手動操作を確認している間は Auto をオフのままにします。
 6. 無人で長時間動く作業が本当に必要なときにだけ、スコープ付きの Continuity 自動化を有効にします。
 
-設定画面では、言語、ChatGPT Project Auto の capability gate、対応 WebChat のサイトアクセスだけを常時表示します。実験サイト、Page Assist、ローカル接続、Continuity テンプレート、時間設定は必要になるまで折りたたみます。workspace binding と WebChat Control は、現在ページの文脈を確認できる Side Panel / HUD に残します。
+設定画面では、言語、ChatGPT Project Auto の capability gate、対応 WebChat のサイトアクセスだけを常時表示します。実験サイト、Page Assist、ローカル接続、Continuity テンプレート、時間設定は必要になるまで折りたたみます。workspace binding は現在ページの文脈を確認できる Side Panel / HUD に残し、登録済み WebChat endpoint は既定で制御可能とし、独立した WebChat Control トグルは表示しません。
 
 semantic Auto の Provider credential / endpoint はブラウザ拡張では設定しません。拡張はローカル Herdr Runtime だけを呼び出します。Runtime の Provider 設定は、単一マシン用の mode-`0600` `config.json` と、登録済みワークステーション全体で共有する認証済み Cloudflare Worker route pool の 2 層だけです。同じ typed/chat capability にローカル route があればローカルを優先します。両方の層で `name / protocol / url / model / api_key` の共通 route JSON object を使い、`decision` と `decision-vercel` は typed evaluation、`openai-chat` は chat として protocol から自動判定します。shell/process environment は Provider 設定には使いません。通常の Auto は typed evaluation route（Jev）-> chat route（LLM）-> bounded script fallback の固定順序で動きます。設定順が route の優先順位で、最初の healthy route が primary、後続 route は failure/cooldown 時の bounded fallback です。route ごとの timeout と pool 全体の deadline は分離されています。旧 `config.toml` は初回読み込み時に JSON へ移行します。semantic provider がなくても script fallback が基本 Auto を維持し、Work Memory/TODO evidence と deterministic safety guard は引き続き authoritative です。
 
-1.0 のブラウザ対応は ChatGPT、Claude、Grok を対象にします。3 つとも Project / Project 内の会話では workspace binding と WebChat Control を表示し、グローバルな新規チャット / ホームでは WebChat Control を残しつつ、Project または conversation scope がない限り workspace binding を表示しません。ChatGPT はさらに会話 `create`、archive、self-handoff に対応し、Claude と Grok はサインイン済みセッションの dispatch、settled result、reload recovery に対応します。Gemini はオプトインの実験的位置づけのままで、1.0 の受け入れ境界には含みません。
+1.0 のブラウザ対応は ChatGPT、Claude、Grok を対象にします。3 つとも登録済み WebChat endpoint は既定で制御可能です。Project / Project 内の会話では workspace binding も表示し、グローバルな新規チャット / ホームでは Project または conversation scope がない限り workspace binding を表示しません。ChatGPT はさらに会話 `create`、archive、self-handoff に対応し、Claude と Grok はサインイン済みセッションの dispatch、settled result、reload recovery に対応します。Gemini はオプトインの実験的位置づけのままで、1.0 の受け入れ境界には含みません。
 
 z.ai / DeepSeek の JSON → MCP 連携は実験的で、既定では無効です。Herdr の実験的設定で明示的に有効にしてください。
 

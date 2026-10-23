@@ -19,6 +19,7 @@ test("user changes only browser extension behavior | Given extension code and ex
       "extension/background.js",
       "extension/content/wake.js",
       "tests/browser-actuation-recovery.test.mjs",
+      "tests/registration-single-flight.test.mjs",
     ]),
     "extension",
   );

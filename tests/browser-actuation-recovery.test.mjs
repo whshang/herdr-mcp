@@ -11,6 +11,30 @@ const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "b
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
+function backgroundConstantNumber(name) {
+  const match = backgroundSource.match(new RegExp(`const\\s+${name}\\s*=\\s*(\\d[\\d_]*)\\s*;`));
+  assert.ok(match, `${name} must remain declared in extension/background.js`);
+  return Number(match[1].replaceAll("_", ""));
+}
+
+const BROWSER_CREATE_CONTENT_TIMEOUT_MS = backgroundConstantNumber("BROWSER_CREATE_CONTENT_TIMEOUT_MS");
+const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = backgroundConstantNumber("BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS");
+// The late-content-script scenario uses a ready delay that must stay inside the
+// production handshake window; the assertions below pin both bounds.
+const LATE_CONTENT_SCRIPT_READY_MS = 12_000;
+
+test("user scrolls a browser page | Given a typed Rust actuation payload | When the extension bridge forwards it | Then direction and amount reach the normal Page Assist action path", () => {
+  const start = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
+  const end = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', start);
+  assert.ok(start > 0 && end > start);
+  const bridge = backgroundSource.slice(start, end);
+  assert.match(bridge, /pageRef:\s*params\.page_ref/);
+  assert.match(bridge, /action:\s*params\.action/);
+  assert.match(bridge, /generation:\s*params\.generation/);
+  assert.match(bridge, /direction:\s*params\.direction/);
+  assert.match(bridge, /amount:\s*params\.amount/);
+});
+
 const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
 const browserPageLifecycleEnd = backgroundSource.indexOf("\nasync function performPageAssistRequest", browserPageLifecycleStart);
 assert.ok(browserPageLifecycleStart >= 0 && browserPageLifecycleEnd > browserPageLifecycleStart,
@@ -26,6 +50,7 @@ function browserPageLifecycleHarness({
   artifactResponder = null,
   fetchResponder = null,
   scriptResponder = null,
+  hoverResponder = null,
   deferredCreate = false,
   windowFocused = true,
   documentFocused = true,
@@ -34,12 +59,18 @@ function browserPageLifecycleHarness({
   let nextTabId = Math.max(100, ...tabs.keys(), 0) + 1;
   const activatedListeners = new Set();
   const focusListeners = new Set();
+  const updatedListeners = new Set();
   const storageArea = {
     async get(key) { return { [key]: structuredClone(sessionStorage[key] || []) }; },
     async set(value) { Object.assign(sessionStorage, structuredClone(value)); },
   };
   const chrome = {
     storage: { session: storageArea },
+    debugger: hoverResponder ? {
+      attach: (target, version) => hoverResponder("attach", target, version),
+      sendCommand: (target, method, params) => hoverResponder("command", target, { method, params }),
+      detach: (target) => hoverResponder("detach", target),
+    } : undefined,
     tabs: {
       async get(tabId) {
         const tab = tabs.get(tabId);
@@ -98,6 +129,10 @@ function browserPageLifecycleHarness({
           },
         });
       },
+      onUpdated: {
+        addListener(listener) { updatedListeners.add(listener); },
+        removeListener(listener) { updatedListeners.delete(listener); },
+      },
       onActivated: {
         addListener(listener) { activatedListeners.add(listener); },
         removeListener(listener) { activatedListeners.delete(listener); },
@@ -126,10 +161,14 @@ function browserPageLifecycleHarness({
       async executeScript(details) {
         if (scriptResponder) return scriptResponder(details);
         if (typeof details?.func !== "function") return undefined;
+        const tab = tabs.get(details.target?.tabId);
         return [{
           result: {
             hasFocus: documentFocused,
             visibilityState: documentVisibilityState,
+            href: tab?.url,
+            origin: tab?.url ? new URL(tab.url).origin : undefined,
+            timeOrigin: tab?.documentTimeOrigin || 123456,
           },
         }];
       },
@@ -183,7 +222,12 @@ function browserPageLifecycleHarness({
       return fetchResponder(...args);
     },
   });
-  return { ...api, sessionStorage, tabs };
+  return {
+    ...api, sessionStorage, tabs,
+    emitTabUpdated(id, changeInfo) {
+      for (const listener of updatedListeners) listener(id, changeInfo);
+    },
+  };
 }
 
 test("user opens a loading generic page | Given Chrome returns only pendingUrl from tabs.create | When BrowserPage waits for navigation completion | Then the owned page is bound to the live URL and retained", async () => {
@@ -275,6 +319,106 @@ test("user finalizes one owned generic page | Given open is retried across a ser
   assert.ok(capacityStorage.herdrBrowserPagesV1.every((record) => record.ownership === "owned"));
 });
 
+test("user finalizes an owned page whose tab is already gone | Given another tab still shows the same URL | When finalize runs | Then cleanup is not reported verified and the remaining tab is counted", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const harness = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const opened = await harness.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-owned-dup",
+  });
+  assert.equal(opened.ok, true);
+  const [ownedId] = [...tabs.keys()];
+  tabs.delete(ownedId);
+  tabs.set(900, { id: 900, url: "https://example.com/app", status: "complete", windowId: 1, active: false });
+  const finalized = await harness.performBrowserPageLifecycleRequest({
+    action: "finalize",
+    pageRef: opened.page_ref,
+    idempotencyKey: "finalize-owned-dup",
+  });
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.already_closed, true);
+  assert.equal(finalized.tab_cleanup_verified, false);
+  assert.equal(finalized.same_url_tabs_open, 1);
+  assert.equal(tabs.has(900), true);
+});
+
+test("user can clean up an owned search page | Given a form navigates to a new URL | When the old ref becomes stale | Then mutations remain fenced and finalize closes exactly that task-owned tab", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/search",
+    idempotencyKey: "form-search-owned-1",
+  });
+  assert.equal(opened.ok, true);
+  const tab = [...tabs.values()][0];
+  tab.url = "https://example.com/results?q=sample";
+
+  const stale = await h.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.error, "browser_page_stale");
+  assert.equal(sessionStorage.herdrBrowserPagesV1[0]?.stale, true);
+  assert.equal(sessionStorage.herdrBrowserPagesV1[0]?.ownership, "owned");
+
+  tab.url = "https://example.com/search";
+  const restarted = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const revived = await restarted.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(revived.error, "browser_page_stale");
+  const replayed = await restarted.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/search",
+    idempotencyKey: "form-search-owned-1",
+  });
+  assert.equal(replayed.error, "browser_page_operation_stale");
+  assert.equal(tabs.size, 1);
+
+  tab.url = "https://example.com/results?q=sample";
+  const resultsPage = await restarted.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/results?q=sample",
+    idempotencyKey: "form-search-results-claim-1",
+  });
+  assert.equal(resultsPage.ok, true);
+  assert.equal(resultsPage.ownership, "claimed");
+  assert.notEqual(resultsPage.page_ref, opened.page_ref);
+  const releasedResults = await restarted.performBrowserPageLifecycleRequest({
+    action: "release",
+    pageRef: resultsPage.page_ref,
+  });
+  assert.equal(releasedResults.ok, true);
+  assert.equal(releasedResults.tab_closed, false);
+  assert.equal(tabs.size, 1);
+
+  tab.url = "https://other.example/redirect";
+  const outsideOrigin = await restarted.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(outsideOrigin.error, "browser_page_origin_mismatch");
+  const finalized = await restarted.performBrowserPageLifecycleRequest({
+    action: "finalize",
+    pageRef: opened.page_ref,
+  });
+  assert.equal(finalized.ok, true);
+  assert.equal(finalized.tab_cleanup_verified, true);
+  assert.equal(finalized.tab_closed, true);
+  assert.equal(tabs.size, 0);
+  assert.deepEqual(sessionStorage.herdrBrowserPagesV1, []);
+});
+
 test("user releases a claimed generic page | Given one exact user tab and another unrelated tab | When claim and release run | Then the user tab survives and ambiguous duplicate claims fail closed", async () => {
   const tabs = new Map([
     [41, { id: 41, url: "https://example.com/app", active: true }],
@@ -346,7 +490,7 @@ const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteW
 assert.ok(registrationStart >= 0 && registrationEnd > registrationStart, "registration helper must remain extractable");
 const registrationSource = wakeSource.slice(registrationStart, registrationEnd);
 const projectIdentityEnd = wakeSource.indexOf(
-  '\n  async function registerCurrentConversation(reason = "startup")',
+  "\n  const registrationInFlight = new Map();",
   projectIdentityStart,
 );
 assert.ok(projectIdentityStart >= 0 && projectIdentityEnd > projectIdentityStart, "provider project identity helper must remain extractable");
@@ -647,6 +791,636 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(uncertain.mutation_submitted, true);
 });
 
+test("user verifies an explicit same-origin history target | Given an observed button with no link URL | When click supplies a bounded expected URL | Then only the confirmed destination can retain page ownership", async () => {
+  const tab = { id: 83, url: "https://example.com/route-two", status: "complete", active: true };
+  const tabs = new Map([[tab.id, tab]]);
+  let clicks = 0;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_history_1", origin: "https://example.com",
+        url: tab.url, elements: [{ ref: "ref_pa_gen_history_1_0", text: "History back" }],
+      };
+      if (payload.action === "click") {
+        clicks++;
+        tab.url = "https://example.com/route-one";
+        return { ok: true, generation: payload.generation, ref: payload.ref };
+      }
+      throw new Error("unexpected action");
+    },
+  });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com",
+    url: tab.url, idempotencyKey: "history-claim-1",
+  });
+  assert.equal(claimed.ok, true);
+
+  const denied = await h.performBrowserPageActionRequest({
+    action: "click", pageRef: claimed.page_ref, generation: "pa_gen_history_1",
+    ref: "ref_pa_gen_history_1_0", expectedUrl: "https://other.example/path",
+  });
+  assert.equal(denied.error, "navigation_expectation_invalid");
+  assert.equal(denied.delivery_state, "not_applied");
+  assert.equal(denied.mutation_submitted, false);
+  assert.equal(clicks, 0);
+
+  const applied = await h.performBrowserPageActionRequest({
+    action: "click", pageRef: claimed.page_ref, generation: "pa_gen_history_1",
+    ref: "ref_pa_gen_history_1_0", expectedUrl: "https://example.com/route-one",
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.delivery_state, "applied");
+  assert.equal(applied.page_generation, 2);
+  assert.equal(h.browserPagesByRef.get(claimed.page_ref).canonical_url, "https://example.com/route-one");
+  assert.equal(clicks, 1);
+  const observed = await h.performBrowserPageActionRequest({ action: "observe", pageRef: claimed.page_ref });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.url, "https://example.com/route-one");
+
+  const unmatchedTab = { id: 84, url: "https://example.com/route-two", status: "complete", active: true };
+  const failing = browserPageLifecycleHarness({
+    tabs: new Map([[unmatchedTab.id, unmatchedTab]]),
+    contentResponder: (_tabId, payload) => {
+      unmatchedTab.url = "https://example.com/route-unexpected";
+      return { ok: true, generation: payload.generation, ref: payload.ref };
+    },
+  });
+  const initial = await failing.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com",
+    url: unmatchedTab.url, idempotencyKey: "history-claim-2",
+  });
+  const uncertain = await failing.performBrowserPageActionRequest({
+    action: "click", pageRef: initial.page_ref, generation: "pa_gen_history_1",
+    ref: "ref_pa_gen_history_1_0", expectedUrl: "https://example.com/route-one",
+  });
+  assert.equal(uncertain.ok, false);
+  assert.equal(uncertain.error, "navigation_postcondition_unverified");
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  assert.equal(uncertain.mutation_submitted, true);
+  assert.equal(unmatchedTab.url, "https://example.com/route-unexpected");
+  assert.equal(failing.browserPagesByRef.get(initial.page_ref).canonical_url, "https://example.com/route-two");
+});
+
+test("user reveals controls with a trusted hover | Given one owned generic page with a scoped card ref | When the debugger moves the virtual mouse | Then observe sees the edit button, focus stays unchanged, and debugger detaches", async () => {
+  let revealed = false;
+  let failAttach = false;
+  let failCommand = false;
+  const events = [];
+  const h = browserPageLifecycleHarness({
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_hover_1", origin: "https://example.com",
+        url: "https://example.com/card",
+        elements: revealed
+          ? [{ ref: "ref_pa_gen_hover_1_1", text: "Edit", tag: "button" }]
+          : [{ ref: "ref_pa_gen_hover_1_0", text: "Existing evaluation", hover_only: true }],
+      };
+      if (payload.action === "hover") return {
+        ok: true, generation: payload.generation, ref: payload.ref,
+        hover_point: { x: 94, y: 71 },
+      };
+      throw new Error("unexpected action");
+    },
+    hoverResponder(phase, target, data) {
+      events.push(phase);
+      if (phase === "attach" && failAttach) throw new Error("debugger in use");
+      if (phase === "command") {
+        if (data.method === "Page.getFrameTree") {
+          return { frameTree: { frame: {
+            id: "frame-hover-1", loaderId: "loader-hover-1", url: "https://example.com/card",
+          } } };
+        }
+        if (failCommand) throw new Error("mouse dispatch uncertain");
+        assert.equal(data.method, "Input.dispatchMouseEvent");
+        assert.equal(data.params.type, "mouseMoved");
+        assert.equal(data.params.x, 94);
+        assert.equal(data.params.y, 71);
+        revealed = true;
+      }
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/card", idempotencyKey: "hover-owned-1",
+  });
+  assert.equal(opened.ok, true);
+  const before = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  assert.equal(before.elements[0].hover_only, true);
+  const applied = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: before.generation,
+    ref: before.elements[0].ref,
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.delivery_state, "applied");
+  assert.equal(applied.postcondition_observed, false);
+  assert.equal(applied.hover_requires_observe, true);
+  assert.equal(Object.hasOwn(applied, "hover_point"), false);
+  assert.deepEqual(events, ["attach", "command", "command", "command", "detach"]);
+  const after = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  assert.equal(after.elements[0].text, "Edit");
+
+  failAttach = true;
+  const unavailable = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: after.generation,
+    ref: after.elements[0].ref,
+  });
+  assert.equal(unavailable.error, "browser_page_hover_unavailable");
+  assert.equal(unavailable.delivery_state, "not_applied");
+  assert.equal(unavailable.mutation_submitted, false);
+  assert.deepEqual(events.slice(-1), ["attach"]);
+
+  failAttach = false;
+  failCommand = true;
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: after.generation,
+    ref: after.elements[0].ref,
+  });
+  assert.equal(uncertain.error, "hover_delivery_unconfirmed");
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  assert.equal(uncertain.mutation_submitted, true);
+  assert.deepEqual(events.slice(-5), ["attach", "command", "command", "command", "detach"]);
+});
+
+test("user hovers with a fenced dispatch | Given the document navigates between hover-point preparation and the debugger dispatch | When the post-attach fence sees a different live document | Then no mouse event is dispatched and the hover fails closed retryably", async () => {
+  let mouseDispatches = 0;
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_hovrace_1", origin: "https://example.com",
+        url: "https://example.com/feed",
+        elements: [{ ref: "ref_pa_gen_hovrace_1_0", text: "Card", hover_only: true }],
+      };
+      if (payload.action === "hover") return {
+        ok: true, generation: payload.generation, ref: payload.ref,
+        hover_point: { x: 51, y: 49 },
+      };
+      throw new Error("unexpected action");
+    },
+    scriptResponder() {
+      // Document probe: report document A until the second in-hover probe,
+      // then report the navigated document (same URL, new timeOrigin) — the
+      // navigation commits between point preparation and the dispatch fence.
+      probeCalls += 1;
+      const navigated = probeCalls - hoverProbeBaseline >= 2;
+      return [{ result: {
+        href: "https://example.com/feed",
+        origin: "https://example.com",
+        timeOrigin: navigated ? 987654 : 123456,
+      } }];
+    },
+    hoverResponder(phase, _target, data) {
+      if (phase === "command" && data.method === "Input.dispatchMouseEvent") mouseDispatches += 1;
+      if (phase === "command" && data.method === "Page.getFrameTree") {
+        return { frameTree: { frame: {
+          id: "frame-race-1", loaderId: "loader-race-1", url: "https://example.com/feed",
+        } } };
+      }
+    },
+  });
+  let probeCalls = 0;
+  let hoverProbeBaseline = 0;
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/feed", idempotencyKey: "hover-race-1",
+  });
+  assert.equal(opened.ok, true);
+  const observed = await h.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  // From here the next two probes belong to the hover request: the first is
+  // the pre-send anchor (document A), the second is the post-attach fence —
+  // which must already observe the navigated document B.
+  hoverProbeBaseline = probeCalls;
+  const fenced = await h.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: observed.generation,
+    ref: observed.elements[0].ref,
+  });
+  assert.equal(fenced.ok, false);
+  assert.equal(fenced.error, "browser_page_hover_view_changed");
+  assert.equal(fenced.retryable, true);
+  assert.equal(fenced.delivery_state, "not_applied");
+  assert.equal(fenced.mutation_submitted, false);
+  assert.equal(mouseDispatches, 0, "no mouse event may be dispatched after a navigation");
+});
+
+test("user hovers with a fenced dispatch | Given a navigation fires while the final awaited fence leg is in flight | When the post-await gate re-reads the navigation flag | Then no mouse event is dispatched", async () => {
+  let mouseDispatches = 0;
+  let frameReads = 0;
+  const harness = browserPageLifecycleHarness({
+    contentResponder(_tabId, payload) {
+      if (payload.action === "observe") return {
+        ok: true, generation: "pa_gen_hovgate_1", origin: "https://example.com",
+        url: "https://example.com/list",
+        elements: [{ ref: "ref_pa_gen_hovgate_1_0", text: "Row", hover_only: true }],
+      };
+      if (payload.action === "hover") return {
+        ok: true, generation: payload.generation, ref: payload.ref,
+        hover_point: { x: 40, y: 40 },
+      };
+      throw new Error("unexpected action");
+    },
+    hoverResponder(phase, target, data) {
+      if (phase === "command" && data.method === "Page.getFrameTree") {
+        frameReads += 1;
+        // Navigation commits during the final awaited leg: the tab-update
+        // listener fires after the tab query resolves but before the gate.
+        if (frameReads === 2) harness.emitTabUpdated(target.tabId, { status: "loading" });
+        return { frameTree: { frame: {
+          id: "frame-gate-1", loaderId: "loader-gate-1", url: "https://example.com/list",
+        } } };
+      }
+      if (phase === "command" && data.method === "Input.dispatchMouseEvent") mouseDispatches += 1;
+    },
+  });
+  const opened = await harness.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/list", idempotencyKey: "hover-gate-1",
+  });
+  assert.equal(opened.ok, true);
+  const observed = await harness.performBrowserPageActionRequest({ action: "observe", pageRef: opened.page_ref });
+  const fenced = await harness.performBrowserPageActionRequest({
+    action: "hover", pageRef: opened.page_ref, generation: observed.generation,
+    ref: observed.elements[0].ref,
+  });
+  assert.equal(fenced.ok, false);
+  assert.equal(fenced.error, "browser_page_hover_view_changed");
+  assert.equal(fenced.mutation_submitted, false);
+  assert.equal(mouseDispatches, 0, "navigation during the final await must yield zero mouse events");
+});
+
+test("user probes the hover document anchor | Given the real injected probe source | When it runs in a page-like world | Then it reads location and performance.timeOrigin, not Node globals", async () => {
+  const match = backgroundSource.match(/function h2wHoverDocumentProbe\(\) \{[\s\S]*?\n\}/);
+  assert.ok(match, "h2wHoverDocumentProbe source must stay extractable");
+  const probe = new Function("location", "performance", "globalThis",
+    `${match[0]}\nreturn h2wHoverDocumentProbe();`)(
+    { href: "https://example.com/feed", origin: "https://example.com" },
+    { timeOrigin: 123456.5 },
+    { document: { timeOrigin: 999999 } },
+  );
+  assert.deepEqual(probe, {
+    href: "https://example.com/feed",
+    origin: "https://example.com",
+    timeOrigin: 123456.5,
+  });
+});
+
+test("user rejects invalid native form states | Given unavailable dropdown or unsupported checkable state | When fill checks the observed control | Then delivery is not_applied and retry-safe", async () => {
+  const tabs = new Map([[71, { id: 71, url: "https://example.com/form", active: true }]]);
+  let rejection = "select_option_unavailable";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action !== "fill") throw new Error("unexpected test action");
+      return { ok: false, error: rejection };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/form",
+    idempotencyKey: "claim-native-select-reject-1",
+  });
+  assert.equal(page.ok, true);
+
+  for (const error of [
+    "select_option_unavailable",
+    "select_option_not_observed",
+    "select_option_ambiguous",
+    "select_option_stale",
+    "multiple_select_unsupported",
+    "checkable_state_required",
+    "radio_uncheck_unsupported",
+    "control_already_in_state",
+  ]) {
+    rejection = error;
+    const result = await h.performBrowserPageActionRequest({
+      action: "fill",
+      pageRef: page.page_ref,
+      generation: "pa_gen_select_test",
+      ref: "ref_pa_gen_select_test_0",
+      value: "Disabled or changed option",
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, error);
+    assert.equal(result.delivery_state, "not_applied");
+    assert.equal(result.retry_safe, true);
+    assert.equal(result.mutation_submitted, false);
+  }
+  rejection = "select_not_applied";
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "fill",
+    pageRef: page.page_ref,
+    generation: "pa_gen_select_test",
+    ref: "ref_pa_gen_select_test_0",
+    value: "Unknown setter outcome",
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  rejection = "control_state_not_applied";
+  const controlOutcome = await h.performBrowserPageActionRequest({
+    action: "fill",
+    pageRef: page.page_ref,
+    generation: "pa_gen_select_test",
+    ref: "ref_pa_gen_select_test_0",
+    value: "true",
+  });
+  assert.equal(controlOutcome.delivery_state, "delivery_unknown");
+  assert.equal(controlOutcome.retry_safe, false);
+});
+
+test("user receives safe scroll mutation errors | Given an owned page and invalid scroll inputs | When the content kernel rejects before scrolling | Then delivery stays not_applied", async () => {
+  const tabs = new Map([[72, { id: 72, url: "https://example.com/list", active: true }]]);
+  let rejection = "scroll_params_invalid";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      assert.equal(payload.action, "scroll");
+      assert.equal(payload.direction, "down");
+      assert.equal(payload.amount, 500);
+      return { ok: false, error: rejection };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/list",
+    idempotencyKey: "claim-scroll-reject",
+  });
+  assert.equal(page.ok, true);
+  for (const error of ["scroll_params_invalid", "scroll_unavailable"]) {
+    rejection = error;
+    const result = await h.performBrowserPageActionRequest({
+      action: "scroll", pageRef: page.page_ref, generation: "pa_scroll_1", direction: "down", amount: 500,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, error);
+    assert.equal(result.delivery_state, "not_applied");
+    assert.equal(result.retry_safe, true);
+    assert.equal(result.mutation_submitted, false);
+  }
+  rejection = "scroll_delivery_unknown";
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "scroll", pageRef: page.page_ref, generation: "pa_scroll_1", direction: "down", amount: 500,
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+});
+
+test("user receives safe press mutation errors | Given an owned page and out-of-vocabulary keys | When the content kernel rejects before dispatch | Then delivery stays not_applied", async () => {
+  const tabs = new Map([[74, { id: 74, url: "https://example.com/feed", active: true }]]);
+  let rejection = "press_params_invalid";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      assert.equal(payload.action, "press");
+      assert.equal(payload.key, "Enter");
+      assert.equal(payload.ref, undefined);
+      return { ok: false, error: rejection };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/feed",
+    idempotencyKey: "claim-press-reject",
+  });
+  assert.equal(page.ok, true);
+  for (const error of ["press_params_invalid", "press_unavailable", "stale_generation", "unsupported_element", "element_detached"]) {
+    rejection = error;
+    const result = await h.performBrowserPageActionRequest({
+      action: "press", pageRef: page.page_ref, generation: "pa_press_1", key: "Enter",
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, error);
+    assert.equal(result.delivery_state, "not_applied");
+    assert.equal(result.retry_safe, true);
+    assert.equal(result.mutation_submitted, false);
+  }
+  rejection = "press_delivery_unknown";
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "press", pageRef: page.page_ref, generation: "pa_press_1", key: "Enter",
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+
+  let applied = false;
+  const forwarder = browserPageLifecycleHarness({
+    sessionStorage: h.sessionStorage,
+    tabs,
+    contentResponder(_tabId, payload) {
+      assert.equal(payload.action, "press");
+      assert.equal(payload.key, "Tab");
+      assert.equal(payload.ref, "ref_pa_press_2_0");
+      applied = true;
+      return { ok: true, key: "Tab" };
+    },
+  });
+  const delivered = await forwarder.performBrowserPageActionRequest({
+    action: "press", pageRef: page.page_ref, generation: "pa_press_2", key: "Tab", ref: "ref_pa_press_2_0",
+  });
+  assert.equal(applied, true);
+  assert.equal(delivered.ok, true);
+  assert.equal(delivered.delivery_state, "applied");
+  assert.equal(delivered.mutation_submitted, true);
+});
+
+test("user extracts table rows from an observed page | Given a claimed page with an observed table ref | When extract_table requests bounded rows | Then the bridge forwards max_rows without a mutation envelope", async () => {
+  const tabs = new Map([[76, { id: 76, url: "https://example.com/report", active: true }]]);
+  let forwarded = null;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      forwarded = payload;
+      return { ok: true, headers: ["Name", "Qty"], rows: [["Widget", "3"]], rows_truncated: false };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/report",
+    idempotencyKey: "claim-table-extract",
+  });
+  assert.equal(page.ok, true);
+  const result = await h.performBrowserPageActionRequest({
+    action: "extract_table", pageRef: page.page_ref, generation: "pa_table_1",
+    ref: "ref_pa_table_1_0", maxRows: 10,
+  });
+  assert.equal(forwarded.action, "extract_table");
+  assert.equal(forwarded.maxRows, 10);
+  assert.equal(forwarded.ref, "ref_pa_table_1_0");
+  assert.equal(forwarded.generation, "pa_table_1");
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.headers, ["Name", "Qty"]);
+  assert.deepEqual(result.rows, [["Widget", "3"]]);
+  assert.equal(result.page_ref, page.page_ref);
+  assert.ok(!Object.hasOwn(result, "delivery_state"), "read-only extract_table carries no mutation envelope");
+  assert.ok(!Object.hasOwn(result, "tab_id"));
+});
+
+test("user reads a table without claiming a mutation | Given a claimed page and an observed table ref | When extract_table omits max_rows and the kernel rejects a stale generation | Then the read stays read-only and the rejection is returned verbatim", async () => {
+  const tabs = new Map([[77, { id: 77, url: "https://example.com/report", active: true }]]);
+  let forwarded = null;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      forwarded = payload;
+      return { ok: false, error: "stale_generation" };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/report",
+    idempotencyKey: "claim-table-readonly",
+  });
+  assert.equal(page.ok, true);
+  const result = await h.performBrowserPageActionRequest({
+    action: "extract_table", pageRef: page.page_ref, generation: "pa_table_stale_1",
+    ref: "ref_pa_table_stale_1_0",
+  });
+  assert.equal(forwarded.action, "extract_table");
+  assert.equal(forwarded.maxRows, undefined, "an absent max_rows leaves the kernel default in charge");
+  assert.equal(forwarded.generation, "pa_table_stale_1");
+  assert.equal(forwarded.ref, "ref_pa_table_stale_1_0");
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "stale_generation");
+  assert.equal(result.page_ref, page.page_ref);
+  for (const key of ["delivery_state", "retry_safe", "mutation_submitted", "tab_id"]) {
+    assert.equal(Object.hasOwn(result, key), false, `read-only extract_table must not carry ${key}`);
+  }
+});
+
+// ---- Native actuation entry path ----
+//
+// The Page Assist tests above call performBrowserPageActionRequest directly
+// with camelCase arguments, which skips the snake_case native entry hop the
+// Rust runtime actually drives. These tests extract the real
+// handleBrowserActuation handler (the same function the push stream invokes
+// for protocol "herdr-browser-actuation/v1" commands) together with the real
+// evidence helpers, wire it to the real lifecycle bridge, and fake only the
+// localhost evidence boundary so the exact posted evidence stays observable.
+
+const nativeActuationEntrySources = (() => {
+  const postEvidenceStart = backgroundSource.indexOf("async function postBrowserActuationEvidence(");
+  const postEvidenceEnd = backgroundSource.indexOf("\nfunction contentActuationEvidenceWithReason", postEvidenceStart);
+  const unavailableStart = backgroundSource.indexOf("function unavailableBrowserActuationEvidence(");
+  const unavailableEnd = backgroundSource.indexOf("\nfunction shouldCloseArchivedChatGptTab", unavailableStart);
+  const handlerStart = backgroundSource.indexOf("async function handleBrowserActuation(");
+  const handlerEnd = backgroundSource.indexOf("\nasync function handlePushBlock", handlerStart);
+  assert.ok(postEvidenceStart >= 0 && postEvidenceEnd > postEvidenceStart,
+    "actuation evidence poster must remain extractable");
+  assert.ok(unavailableStart >= 0 && unavailableEnd > unavailableStart,
+    "unavailable evidence helper must remain extractable");
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart,
+    "native actuation entry handler must remain extractable");
+  return {
+    postEvidenceSource: backgroundSource.slice(postEvidenceStart, postEvidenceEnd),
+    unavailableEvidenceSource: backgroundSource.slice(unavailableStart, unavailableEnd),
+    handlerSource: backgroundSource.slice(handlerStart, handlerEnd),
+  };
+})();
+
+function nativeActuationEntryHarness({ lifecycle } = {}) {
+  const postedEvidence = [];
+  const handleBrowserActuation = new Function(
+    "performBrowserPageActionRequest",
+    "performBrowserPageLifecycleRequest",
+    "localHerdrFetch",
+    "browserActuationUrl",
+    "STATE_FETCH_MS",
+    [
+      nativeActuationEntrySources.postEvidenceSource,
+      nativeActuationEntrySources.unavailableEvidenceSource,
+      nativeActuationEntrySources.handlerSource,
+      "return handleBrowserActuation;",
+    ].join("\n"),
+  )(
+    lifecycle.performBrowserPageActionRequest,
+    lifecycle.performBrowserPageLifecycleRequest,
+    async (_url, init = {}) => {
+      postedEvidence.push(JSON.parse(init.body));
+      return { ok: true, json: async () => ({}) };
+    },
+    () => "http://127.0.0.1:1/browser-actuation",
+    2000,
+  );
+  return { handleBrowserActuation, postedEvidence };
+}
+
+test("user presses a bound key through the native entry | Given a claimed BrowserPage and a herdr-browser-actuation/v1 press command with snake_case params | When the native entry handler forwards it | Then the content kernel receives key Escape", async () => {
+  const tabs = new Map([[78, { id: 78, url: "https://example.com/panel", active: true }]]);
+  const delivered = [];
+  const lifecycle = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      delivered.push(payload);
+      // Mirror the real content kernel: a press without a key is invalid.
+      if (payload.action === "press" && typeof payload.key !== "string") {
+        return { ok: false, error: "press_params_invalid" };
+      }
+      return { ok: true, key: payload.key };
+    },
+  });
+  const page = await lifecycle.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/panel",
+    idempotencyKey: "claim-native-entry-press",
+  });
+  assert.equal(page.ok, true);
+  const native = nativeActuationEntryHarness({ lifecycle });
+  await native.handleBrowserActuation({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: `ba_${"ab".repeat(8)}`,
+    dispatch_id: `bd_${"cd".repeat(8)}`,
+    operation: "herdr_mcp.browser_page.action",
+    expected_generation: 17,
+    params: {
+      page_ref: page.page_ref,
+      action: "press",
+      generation: "pa_native_entry_1",
+      ref: "ref_pa_native_entry_1_0",
+      key: "Escape",
+    },
+  });
+  assert.equal(native.postedEvidence.length, 1, "the native entry must post exactly one actuation evidence");
+  assert.equal(native.postedEvidence[0].command_accepted, true);
+  const press = delivered.find((payload) => payload.action === "press");
+  assert.ok(press, "press must reach chrome.tabs.sendMessage");
+  assert.equal(press.key, "Escape");
+  assert.equal(native.postedEvidence[0].result.ok, true);
+});
+
+test("user bounds a native table extraction | Given a claimed BrowserPage and a herdr-browser-actuation/v1 extract_table command with max_rows 1 | When the native entry handler forwards it | Then the content kernel receives maxRows 1", async () => {
+  const tabs = new Map([[79, { id: 79, url: "https://example.com/report", active: true }]]);
+  const delivered = [];
+  const lifecycle = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      delivered.push(payload);
+      return { ok: true, headers: ["Name"], rows: [["Widget"]], rows_truncated: payload.maxRows === 1 };
+    },
+  });
+  const page = await lifecycle.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/report",
+    idempotencyKey: "claim-native-entry-table",
+  });
+  assert.equal(page.ok, true);
+  const native = nativeActuationEntryHarness({ lifecycle });
+  await native.handleBrowserActuation({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: `ba_${"ef".repeat(8)}`,
+    dispatch_id: `bd_${"ab".repeat(8)}`,
+    operation: "herdr_mcp.browser_page.action",
+    expected_generation: 17,
+    params: {
+      page_ref: page.page_ref,
+      action: "extract_table",
+      generation: "pa_native_entry_table_1",
+      ref: "ref_pa_native_entry_table_1_0",
+      max_rows: 1,
+    },
+  });
+  assert.equal(native.postedEvidence.length, 1, "the native entry must post exactly one actuation evidence");
+  assert.equal(native.postedEvidence[0].command_accepted, true);
+  const table = delivered.find((payload) => payload.action === "extract_table");
+  assert.ok(table, "extract_table must reach chrome.tabs.sendMessage");
+  assert.equal(table.maxRows, 1);
+});
+
 test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {
   const sessionStorage = {};
   const tabs = new Map([
@@ -772,6 +1546,130 @@ test("user captures bounded visual evidence | Given one visible claimed BrowserP
   assert.equal(racedResult.error, "browser_page_screenshot_view_changed");
   assert.equal(racedResult.retryable, true);
   assert.equal(artifactCalls, 1);
+
+  const urlRaced = browserPageLifecycleHarness({
+    sessionStorage, tabs,
+    screenshotResponder() {
+      tabs.get(61).url = "https://other.example/private";
+      urlRaced.emitTabUpdated(61, { url: "https://other.example/private", status: "loading" });
+      tabs.get(61).url = "https://example.com/app";
+      urlRaced.emitTabUpdated(61, { url: "https://example.com/app", status: "complete" });
+      return "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    },
+    artifactResponder() {
+      throw new Error("a visible screenshot with A-B-A navigation must never be stored");
+    },
+  });
+  const urlRaceResult = await urlRaced.performBrowserPageActionRequest({
+    action: "screenshot", pageRef: claimed.page_ref,
+  });
+  assert.equal(urlRaceResult.ok, false);
+  assert.equal(urlRaceResult.error, "browser_page_screenshot_view_changed");
+
+  const reloadRace = browserPageLifecycleHarness({
+    sessionStorage, tabs,
+    screenshotResponder() {
+      tabs.get(61).documentTimeOrigin = 234567;
+      return "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    },
+    artifactResponder() {
+      throw new Error("a visible screenshot of a replaced document must never be stored");
+    },
+  });
+  const reloadResult = await reloadRace.performBrowserPageActionRequest({
+    action: "screenshot", pageRef: claimed.page_ref,
+  });
+  assert.equal(reloadResult.ok, false);
+  assert.equal(reloadResult.error, "browser_page_screenshot_view_changed");
+});
+
+test("user screenshots an owned background tab without stealing focus | Given an inactive owned page | When capture uses trusted Chrome debugger | Then only bounded artifact metadata is returned and debugger detaches", async () => {
+  const userTab = { id: 91, windowId: 1, url: "https://example.com/user", active: true, status: "complete" };
+  const tabs = new Map([[91, userTab]]);
+  const calls = [];
+  let uploaded = 0;
+  let navigationMode = "none";
+  let loaderId = "load-1";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    windowFocused: true,
+    screenshotResponder() {
+      throw new Error("background screenshot must not capture the user's visible tab");
+    },
+    hoverResponder(phase, target, arg) {
+      calls.push(phase);
+      if (phase === "attach") {
+        assert.equal(arg, "1.3");
+        assert.notEqual(target.tabId, userTab.id);
+      }
+      if (phase === "command") {
+        if (arg.method === "Page.getFrameTree") {
+          return { frameTree: { frame: {
+            id: "frame-1", loaderId, url: "https://example.com/app",
+          } } };
+        }
+        assert.equal(arg.method, "Page.captureScreenshot");
+        assert.equal(arg.params.format, "jpeg");
+        assert.equal(arg.params.captureBeyondViewport, false);
+        if (navigationMode === "document_aba") {
+          tabs.get(target.tabId).url = "https://other.example/secret";
+          tabs.get(target.tabId).url = "https://example.com/app";
+          loaderId = "load-2";
+        }
+        if (navigationMode === "history_aba") {
+          h.emitTabUpdated(target.tabId, { url: "https://example.com/other" });
+          h.emitTabUpdated(target.tabId, { url: "https://example.com/app" });
+        }
+        return { data: "/9j/4AAQSkZJRg==" };
+      }
+    },
+    artifactResponder(image) {
+      uploaded++;
+      assert.match(image.source_id, /^bp_[a-f0-9]{64}$/);
+      assert.equal(image.mime, "image/jpeg");
+      assert.equal(image.bytes_b64, "/9j/4AAQSkZJRg==");
+      return {
+        ok: true,
+        artifact: {
+          artifact_id: "0123456789abcdef0123456789abcdef",
+          conversation_id: image.source_id,
+          file_id: image.artifact_key,
+          mime: "image/jpeg", bytes: 42, sha256: "b".repeat(64),
+          captured_at: 100, expires_at: 200,
+        },
+      };
+    },
+  });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open", targetOrigin: "https://example.com",
+    url: "https://example.com/app", idempotencyKey: "owned-background-capture-1",
+  });
+  assert.equal(opened.ok, true);
+  const ownedTab = [...tabs.values()].find(t => t.id !== 91);
+  assert.equal(ownedTab.active, false);
+  const captured = await h.performBrowserPageActionRequest({
+    action: "screenshot", pageRef: opened.page_ref,
+  });
+  assert.equal(captured.ok, true, JSON.stringify(captured));
+  assert.equal(captured.capture_scope, "owned_background");
+  assert.equal(captured.artifact.mime, "image/jpeg");
+  assert.equal(Object.hasOwn(captured, "bytes_b64"), false);
+  assert.deepEqual(calls, ["attach", "command", "command", "command", "detach"]);
+  assert.equal(tabs.get(91).active, true);
+  assert.equal(ownedTab.active, false);
+  assert.equal(uploaded, 1);
+
+  for (const mode of ["document_aba", "history_aba"]) {
+    navigationMode = mode;
+    const stale = await h.performBrowserPageActionRequest({
+      action: "screenshot", pageRef: opened.page_ref,
+    });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.error, "browser_page_screenshot_view_changed", mode);
+    assert.equal(stale.capture_scope, "owned_background");
+    assert.deepEqual(calls.slice(-5), ["attach", "command", "command", "command", "detach"]);
+    assert.equal(uploaded, 1, `${mode} must not upload a mismatched image`);
+  }
 });
 
 test("user reads a reviewed Bilibili transcript | Given one exact Bilibili BrowserPage | When the builtin read runs | Then bounded transcript data is returned and logged-out access fails closed", async () => {
@@ -1752,7 +2650,7 @@ test("page identity handshake lazily recovers only opaque Browser Registry ident
     wakeSource.indexOf('if (msg?.type === "h2w_get_convkey")'),
     wakeSource.indexOf('if (msg?.type === "h2w_snapshot_turn")'),
   );
-  assert.match(identitySegment, /registerCurrentConversation\("identity-recovery"\)/);
+  assert.match(identitySegment, /registerCurrentConversation\("identity-recovery", \{ refreshObservation \}\)/);
   assert.match(identitySegment, /return true;/);
   assert.match(identitySegment, /const identityMatchesRoute = Boolean\(convKey && registeredConvKey === convKey\)/);
   assert.match(identitySegment, /browserSessionRef:\s*identityMatchesRoute \? registeredBrowserSessionRef : null/);
@@ -1787,7 +2685,11 @@ test("user keeps the ordinary ChatGPT submit path bounded | Given a ready compos
   const ackSegment = wakeSource.slice(ackStart, ackEnd);
   assert.match(ackSegment, /ADAPTER\.name !== "chatgpt"\) return !ADAPTER\.inputHasContent\(\)/);
   assert.doesNotMatch(ackSegment, /if \(!ADAPTER\.inputHasContent\(\)\) return true/);
-  assert.match(ackSegment, /location\.href !== baseline\.href/);
+  // A URL change is no longer acceptance on its own, and the 120-character
+  // prefix overlap is gone: only exact canonical text equality counts.
+  assert.doesNotMatch(ackSegment, /location\.href !== baseline\.href/);
+  assert.match(ackSegment, /providerUserTextMatchesSubmitted\(latestText, baseline\)/);
+  assert.doesNotMatch(ackSegment, /slice\(0, 120\)/);
   assert.doesNotMatch(ackSegment, /baseline\?\.generating|isComposerGenerating\(\)/);
   assert.doesNotMatch(ackSegment, /sendButton\.isConnected|isSendButton\(baseline\.sendButton\)/);
 });
@@ -1828,27 +2730,23 @@ test("conversation registration fences route changes before and after async back
   assert.ok(fences[1] > send, "stale registration response must not overwrite the current route identity");
 });
 
-test("newer same-route browser registration wins when responses arrive out of order", async () => {
+test("user shares one in-flight registration per conversation | Given concurrent same-route registration callers | When both callers await | Then exactly one h2w_register is sent and both receive the same result", async () => {
   const harness = registrationHarness();
   const first = harness.register("first");
-  await flushRegistrationToSend(harness);
   const second = harness.register("second");
-  for (let i = 0; i < 4; i += 1) await Promise.resolve();
-  assert.equal(harness.pending.length, 2);
+  await flushRegistrationToSend(harness);
+  assert.equal(harness.pending.length, 1, "concurrent same-route callers must not start a second attempt");
 
-  harness.pending[1].resolve({ browser_session_ref: "br_new", browser_generation: 9, bound: false });
-  await second;
+  harness.pending[0].resolve({ browser_session_ref: "br_one", browser_generation: 9, bound: false });
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(firstResult, secondResult, "both callers share the same registration result");
+  assert.equal(firstResult?.browser_session_ref, "br_one");
   assert.deepEqual(harness.state(), {
     convKey: "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-    sessionRef: "br_new",
+    sessionRef: "br_one",
     generation: 9,
-    attempt: 2,
+    attempt: 1,
   });
-
-  harness.pending[0].resolve({ browser_session_ref: "br_old_late", browser_generation: 8, bound: false });
-  await first;
-  assert.equal(harness.state().sessionRef, "br_new");
-  assert.equal(harness.state().generation, 9);
 });
 
 test("A to B to A registration cannot resurrect an older A response", async () => {
@@ -1884,6 +2782,8 @@ test("ChatGPT session.open is the only supported existing-view open", () => {
   assert.match(backgroundSource, /provider_message_chars:\s*\{\s*status:\s*"unknown"/);
   assert.match(backgroundSource, /provider_model_reasoning_combinations:\s*\{\s*status:\s*"unknown"/);
   assert.match(backgroundSource, /"session\.open"/);
+  assert.match(backgroundSource, /"session\.title_projection"/);
+  assert.match(chatGptAdapterSource, /titleProjection:\s*true/);
   assert.match(wakeSource, /herdr_mcp\.browser_session\.open/);
 });
 
@@ -2052,7 +2952,7 @@ test("user can stop a live answer | Given an explicit visible stop control while
 });
 
 test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then one Enter submit is attempted and uncertain delivery never falls through to another submit", async () => {
-  const start = wakeSource.indexOf("  async function submitBrowserActuationOnce()");
+  const start = wakeSource.indexOf("  async function submitBrowserActuationOnce(");
   const end = wakeSource.indexOf("  // ---- Submission ----", start);
   assert.ok(start >= 0 && end > start, "bounded Browser Actuation submit helper must remain extractable");
   const helperSource = wakeSource.slice(start, end);
@@ -2647,10 +3547,21 @@ function selfArchiveHarness(overrides = {}) {
   const end = wakeSource.indexOf("async function performBrowserActuationCommand", start);
   assert.ok(start >= 0 && end > start, "deferred self-archive helper must remain extractable");
   const segment = wakeSource.slice(start, end);
+  // The acceptance trim/canonical helpers live earlier in the file than the
+  // deferred-self-archive block, so inject the real ones for the late readback.
+  const acceptanceStart = wakeSource.indexOf("  // The exact Unicode White_Space set Rust");
+  const acceptanceEnd = wakeSource.indexOf("\n  // Exact submit acceptance.", acceptanceStart);
+  assert.ok(acceptanceStart >= 0 && acceptanceEnd > acceptanceStart,
+    "acceptance canonicalization helpers must remain extractable");
+  const acceptanceSource = wakeSource.slice(acceptanceStart, acceptanceEnd);
   const api = new Function("ctx", "sessionStorage", "setTimeout", "Date", `
-    const ADAPTER = { name: "chatgpt" };
+    const ADAPTER = { name: "chatgpt", ...(ctx.adapter || {}) };
     const chatGptConversationId = () => ctx.conversationId;
     const isTurnInProgress = () => ctx.turnInProgress;
+    const fetch = ctx.fetch || (() => { throw new Error("unexpected fetch"); });
+    // The archive API fallback is opt-in: existing fixtures keep the historical
+    // "no provider token" behaviour unless a test supplies one.
+    const readChatGptAccessToken = async () => (ctx.accessToken === undefined ? null : ctx.accessToken);
     const openChatGptArchiveMenu = async () => {
       if (ctx.menuGate) await ctx.menuGate;
       return ctx.archiveAvailable
@@ -2664,10 +3575,14 @@ function selfArchiveHarness(overrides = {}) {
     };
     const fetchChatGptConversation = async () => {
       if (ctx.verifyGate && ctx.clicks.length > 0) await ctx.verifyGate;
+      if (ctx.readbackStatus) {
+        return { ok: false, status: ctx.readbackStatus, error: "conversation-http", reason: "http-" + ctx.readbackStatus };
+      }
       return ctx.archiveVerifies
         ? { ok: true, body: { is_archived: ctx.providerArchived === true } }
         : { ok: false };
     };
+    const fetchChatGptConversationDetail = async () => ctx.detail || { ok: false };
     const fetchChatGptArchivedConversationList = async () => ({
       ok: true,
       items: ctx.archiveListContains
@@ -2682,6 +3597,7 @@ function selfArchiveHarness(overrides = {}) {
     });
     let registeredBrowserSessionRef = ctx.sessionRef;
     let registeredBrowserGeneration = ctx.generation;
+    ${acceptanceSource}
     ${segment}
     return {
       performChatGptSessionArchive,
@@ -3235,6 +4151,9 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   );
   assert.match(createSegment, /registerCurrentConversation\("browser-session-create"\)/);
   assert.match(createSegment, /registeredBrowserSessionRef/);
+  assert.match(createSegment, /adapterSupports\("titleProjection"\)/);
+  assert.match(createSegment, /projectChatGptConversationTitle\(params\.display_label\)/);
+  assert.match(createSegment, /title_projection:\s*titleProjection/);
   const createRegistration = createSegment.indexOf("registerCurrentConversation(\"browser-session-create\")");
   const createSettlementAssignment = createSegment.indexOf("acceptedDispatchAssignments.set(registeredBrowserSessionRef");
   assert.ok(
@@ -3243,10 +4162,14 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   );
   assert.doesNotMatch(createSegment, /reasoning != null \|\| requiredApps\.length > 0/);
   assert.match(createSegment, /ensureRequiredComposerApps\(requiredApps\)/);
-  assert.match(createSegment, /evidence\.required_apps_readback = appSelection\.apps/);
+  // The runtime-visible App readback must come from the accepted provider
+  // message, never from the pre-submit composer selection.
+  assert.match(createSegment, /evidence\.required_apps_readback = acceptedApps\.map\(\(app\) => app\.name\)/);
+  assert.match(createSegment, /getAcceptedUserAppIdentity\(acceptedUserMessageRef\)/);
+  assert.doesNotMatch(createSegment, /evidence\.required_apps_readback = appSelection\.apps/);
   assert.match(createSegment, /requiredApps,/);
 
-  const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
+  const registrationStart = wakeSource.indexOf('async function runConversationRegistration');
   const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch", registrationStart);
   assert.ok(registrationStart >= 0 && registrationEnd > registrationStart);
   const registrationSegment = wakeSource.slice(registrationStart, registrationEnd);
@@ -3257,6 +4180,139 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   const refreshClearStart = wakeSource.indexOf("function clearBrowserPendingDispatchRefresh");
   const refreshClearSegment = wakeSource.slice(refreshClearStart, refreshClearStart + 500);
   assert.match(refreshClearSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
+});
+
+function chatGptTitleProjectionHarness({
+  initialTitle = "Provider title",
+  readbackTitles = [],
+  patchOk = true,
+} = {}) {
+  const start = wakeSource.indexOf("  async function projectChatGptConversationTitle(");
+  const end = wakeSource.indexOf("\n  async function fetchChatGptArchivedConversationList", start);
+  assert.ok(start >= 0 && end > start, "ChatGPT title projection helper must remain extractable");
+  const helperSource = wakeSource.slice(start, end);
+  const ctx = {
+    now: 0,
+    reads: [initialTitle, ...readbackTitles],
+    lastRead: initialTitle,
+    patchCalls: [],
+    patchOk,
+  };
+  const project = new Function("ctx", `
+    const ADAPTER = { name: "chatgpt", capabilities: { titleProjection: true } };
+    const adapterSupports = (capability) => ADAPTER.capabilities?.[capability] === true;
+    const normText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const chatGptConversationId = () => "conv-123";
+    const fetchChatGptConversation = async () => {
+      const title = ctx.reads.length ? ctx.reads.shift() : ctx.lastRead;
+      ctx.lastRead = title;
+      ctx.now += 100;
+      return { ok: true, body: { title } };
+    };
+    const readChatGptAccessToken = async () => {
+      ctx.now += 100;
+      return "short-lived-test-token";
+    };
+    const fetch = async (url, init) => {
+      ctx.patchCalls.push({ url, init });
+      ctx.now += 100;
+      return { ok: ctx.patchOk };
+    };
+    class AbortController {
+      constructor() { this.signal = {}; }
+      abort() {}
+    }
+    const setTimeout = () => 1;
+    const clearTimeout = () => {};
+    const wait = async (ms) => { ctx.now += ms; };
+    const Date = { now: () => ctx.now };
+    ${helperSource}
+    return projectChatGptConversationTitle;
+  `)(ctx);
+  return { ctx, project };
+}
+
+test("user sees the requested ChatGPT worker title | Given a new conversation has a different provider title | When session.create projects its display label | Then one provider PATCH is accepted only after exact title readback", async () => {
+  const { ctx, project } = chatGptTitleProjectionHarness({
+    initialTitle: "Provider title",
+    readbackTitles: ["Worker A"],
+  });
+  const result = await project("  Worker   A  ");
+
+  assert.deepEqual(result, {
+    status: "verified",
+    changed: true,
+    provider: "chatgpt",
+    readback_verified: true,
+    reason: null,
+  });
+  assert.equal(ctx.patchCalls.length, 1);
+  assert.equal(ctx.patchCalls[0].url, "/backend-api/conversation/conv-123");
+  assert.equal(ctx.patchCalls[0].init.method, "PATCH");
+  assert.equal(ctx.patchCalls[0].init.credentials, "include");
+  assert.equal(ctx.patchCalls[0].init.redirect, "error");
+  assert.equal(ctx.patchCalls[0].init.headers["content-type"], "application/json");
+  assert.equal(ctx.patchCalls[0].init.headers.authorization, "Bearer short-lived-test-token");
+  assert.deepEqual(JSON.parse(ctx.patchCalls[0].init.body), { title: "Worker A" });
+  assert.equal(JSON.stringify(result).includes("short-lived-test-token"), false);
+});
+
+test("user keeps a successful create when title projection cannot be verified | Given the provider keeps returning another title | When session.create attempts projection | Then the projection fails after one PATCH without claiming readback success", async () => {
+  const { ctx, project } = chatGptTitleProjectionHarness({
+    initialTitle: "Provider title",
+    readbackTitles: ["Still provider title"],
+  });
+  const projection = await project("Worker B");
+
+  assert.equal(projection.status, "failed");
+  assert.equal(projection.changed, null);
+  assert.equal(projection.provider, "chatgpt");
+  assert.equal(projection.readback_verified, false);
+  assert.equal(projection.reason, "title_projection_readback_unverified");
+  assert.equal(ctx.patchCalls.length, 1);
+
+  const successStart = wakeSource.indexOf("      if (evidence.accepted_message_observed");
+  const successEnd = wakeSource.indexOf("\n      await wait(200);", successStart);
+  assert.ok(successStart >= 0 && successEnd > successStart, "create success gate must remain extractable");
+  const successGate = wakeSource.slice(successStart, successEnd);
+  const settleCreate = new Function("projection", `
+    return async function settleCreate() {
+      const evidence = {
+        command_accepted: true,
+        resource_available: true,
+        rejected: false,
+        stable_resource_ref_observed: true,
+        lifecycle_observed: true,
+        canonical_url_observed: true,
+        accepted_message_observed: true,
+        generation_status_observed: true,
+        generation_owner: null,
+        result: { accepted_user_message_ref: "provider-user-1" },
+      };
+      const exactChatGptDispatchIdentity = false;
+      const acceptedUserMessageRef = "provider-user-1";
+      const creatingSession = true;
+      const expectedGeneration = 17;
+      const params = { display_label: "Worker B" };
+      const ADAPTER = { name: "chatgpt" };
+      const adapterSupports = (capability) => capability === "titleProjection";
+      const projectChatGptConversationTitle = async () => projection;
+      ${successGate}
+      throw new Error("create success gate did not return");
+    };
+  `)(projection);
+  const evidence = await settleCreate();
+  assert.equal(evidence.command_accepted, true);
+  assert.equal(evidence.resource_available, true);
+  assert.equal(evidence.rejected, false);
+  assert.equal(evidence.stable_resource_ref_observed, true);
+  assert.equal(evidence.lifecycle_observed, true);
+  assert.equal(evidence.canonical_url_observed, true);
+  assert.equal(evidence.accepted_message_observed, true);
+  assert.equal(evidence.generation_status_observed, true);
+  assert.equal(evidence.generation_owner, 17);
+  assert.equal(evidence.result.accepted_user_message_ref, "provider-user-1");
+  assert.deepEqual(evidence.result.title_projection, projection);
 });
 
 test("user returns ChatGPT browser actuation to Chat mode | Given Work mode is active | When browser actuation runs | Then the provider adapter switches to Chat mode", () => {
@@ -3280,27 +4336,44 @@ test("user returns ChatGPT browser actuation to Chat mode | Given Work mode is a
 
 test("ChatGPT required_apps selects a real composer app pill and fails closed on ambiguity", () => {
   assert.match(backgroundSource, /"composer\.select_tool"/);
-  assert.match(chatGptAdapterSource, /#composer-plus-btn/);
-  assert.match(chatGptAdapterSource, /data-testid="composer-plus-btn"/);
+  assert.doesNotMatch(wakeSource, /ADAPTER\.openComposerAppsMenu\(\)|ADAPTER\.searchComposerApp\(app\)/);
+  assert.doesNotMatch(chatGptAdapterSource, /openComposerAppsMenu\(\)|searchComposerApp\(keyword\)/);
   assert.match(chatGptAdapterSource, /data-inline-selection-pill/);
   assert.match(chatGptAdapterSource, /data-symbol="ecosystemMention"/);
   assert.match(chatGptAdapterSource, /data-keyword/);
-  // The generalized picker resolves the pill from visible, scored candidates in
-  // the opened menu; ambiguity stays fail-closed via candidates.length !== 1 in
-  // wake.js (asserted below).
-  assert.match(chatGptAdapterSource, /getComposerAppCandidates\(keyword\)/);
-  assert.match(chatGptAdapterSource, /\[data-keyword\], \[data-value\]/);
-  assert.match(chatGptAdapterSource, /keywordMatches\(node\)/);
-  assert.match(chatGptAdapterSource, /visible\(node\)/);
-  assert.match(chatGptAdapterSource, /if \(!menuRoots\.length\) return \[\]/);
-  assert.match(chatGptAdapterSource, /for \(const root of menuRoots\)/);
+  // Direct @ typing triggers the provider suggestion list; a unique visible
+  // candidate and a real selected pill are still mandatory before submit.
+  // Candidates come only from the popup the composer itself owns through its
+  // own association attributes; a document-wide popup/menu scan is never a
+  // fallback and substring text is never a keyword match.
+  assert.match(chatGptAdapterSource, /getComposerOwnedPopup\(input\)/);
+  assert.match(chatGptAdapterSource, /aria-controls/);
+  assert.match(chatGptAdapterSource, /aria-owns/);
+  assert.match(chatGptAdapterSource, /if \(!popup\) return \[\]/);
+  assert.match(chatGptAdapterSource, /for \(const node of popup\.querySelectorAll\(selectors\.join\(','\)\)\)/);
+  assert.match(chatGptAdapterSource, /if \(!keywordMatches\(node\)\) continue/);
+  assert.doesNotMatch(chatGptAdapterSource, /text\.includes\(wanted\)/);
+  assert.doesNotMatch(chatGptAdapterSource, /menuRoots/);
   assert.match(chatGptAdapterSource, /return matches\.sort/);
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
-  assert.match(wakeSource, /!composerModelVisibleText\(\)/);
-  assert.match(wakeSource, /const search = selector \? await insertMainWorld\(app, selector\) : null/);
-  assert.match(wakeSource, /if \(searchInserted\) await clearComposer\(\)/);
+  assert.match(wakeSource, /ADAPTER\.getComposerTextWithoutAppPills\(\) !== ''/);
+  assert.match(wakeSource, /const prefix = selector \? await insertMainWorld\('@', selector,/);
+  assert.match(wakeSource, /const search = await insertMainWorld\(app, selector, true\)/);
+  assert.ok(wakeSource.indexOf("await insertMainWorld('@', selector")
+    < wakeSource.indexOf("await insertMainWorld(app, selector, true)"));
+  assert.match(wakeSource, /required-app-selection-not-observed/);
+  // Rejections carry fixed-shape DOM diagnostics captured before cleanup.
+  assert.match(chatGptAdapterSource, /describeComposerAppSearch\(keyword\)/);
+  assert.match(wakeSource, /app_selection_probe: probe/);
+  assert.doesNotMatch(
+    chatGptAdapterSource.slice(chatGptAdapterSource.indexOf('describeComposerAppSearch(keyword)'),
+      chatGptAdapterSource.indexOf('getWatchMainWorldSelector()')),
+    /outerHTML|innerHTML|innerText/,
+  );
+  assert.match(wakeSource, /!ADAPTER\.getSelectedComposerApps\(\)\.includes\(app\)/);
+  assert.match(wakeSource, /if \(searchInserted\) await clearAutomationSearch\(app\)/);
   assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
   assert.match(wakeSource, /if \(!registeredHerdrAppKeyword\) return \[\]/);
   assert.match(wakeSource, /const observedHerdrApps = ADAPTER\.name === "chatgpt" \? currentHerdrRequiredApps\(\) : \[\]/);
@@ -3352,8 +4425,10 @@ test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conv
   assert.ok(resumeStart >= 0 && resumeEnd > resumeStart);
   const resume = wake.slice(resumeStart, resumeEnd);
   assert.match(resume, /ensureRequiredComposerApps\(requiredApps\)/);
-  assert.ok(resume.indexOf("ensureRequiredComposerApps(requiredApps)") < resume.indexOf("await submit()"),
-    "resume-only submission must restore the required App before submit");
+  assert.ok(resume.indexOf("ensureRequiredComposerApps(requiredApps)") < resume.indexOf("submitWakeText()"),
+    "resume-only submission must restore the required App before the single-shot submit");
+  assert.doesNotMatch(resume, /await submit\(\)/,
+    "resume-only must not fall back to the retrying submit loop");
   const clearBeforeInsert = wake.indexOf("if (clearBeforeInsert) await clearComposer()");
   const mainAppSelection = wake.indexOf("let appSelection = { ok: true, apps: [] }");
   assert.ok(clearBeforeInsert >= 0 && mainAppSelection > clearBeforeInsert,
@@ -3420,9 +4495,11 @@ function createActuationBranchHarness({
   publishOnProbe = true,
   publishOnProbeAttempt = 1,
   contentMode = "success",
+  probeReadyAfterMs = 0,
 } = {}) {
-  // Virtual clock: the old 8s scope-gate deadline must elapse immediately so a
-  // harness that models the no-probe failure returns fast.
+  // Virtual clock: each 200ms handshake-loop tick advances the clock, so the
+  // scope-gate deadline (BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS) elapses
+  // after a bounded number of cheap synchronous iterations.
   const clock = { value: 1_000_000 };
   const dateShim = { now: () => clock.value };
   const setTimeoutShim = (fn) => { clock.value += 200; fn(); return 0; };
@@ -3435,6 +4512,7 @@ function createActuationBranchHarness({
   const removedTabs = [];
   let nextTabId = 100;
   let identityProbeAttempts = 0;
+  let firstIdentityProbeAt = 0;
   const liveScopesByTab = new Map();
 
   const chrome = {
@@ -3460,6 +4538,13 @@ function createActuationBranchHarness({
       async sendMessage(tabId, message) {
         if (message?.type === "h2w_get_convkey") {
           identityProbeAttempts += 1;
+          if (!firstIdentityProbeAt) firstIdentityProbeAt = clock.value;
+          // Content scripts inject at document_idle: on a slow network the
+          // identity handshake rejects until the content script becomes ready.
+          if (probeReadyAfterMs > 0
+              && clock.value - firstIdentityProbeAt < probeReadyAfterMs) {
+            throw new Error("Could not establish connection. Receiving end does not exist.");
+          }
           if (publishOnProbe && identityProbeAttempts >= publishOnProbeAttempt) {
             // The content-script identity handshake drives lazy registration,
             // which publishes the tab's Browser Registry scope on the next poll.
@@ -3541,7 +4626,8 @@ function createActuationBranchHarness({
     "browserConversationInfo", "browserConversationInfoFromSupportedUrl",
     "sendTabMessageWithTimeout",
     "postBrowserActuationEvidence", "protectBoundTab", "sendBrowserActuationTabMessage",
-    "unavailableBrowserActuationEvidence", "BROWSER_CREATE_CONTENT_TIMEOUT_MS", "Date", "setTimeout",
+    "unavailableBrowserActuationEvidence", "BROWSER_CREATE_CONTENT_TIMEOUT_MS",
+    "BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS", "Date", "setTimeout",
     `async function __actuate(command) {\n` +
     `const actuationId = String(command?.actuation_id || "");\n` +
     `const dispatchId = String(command?.dispatch_id || "");\n` +
@@ -3553,7 +4639,7 @@ function createActuationBranchHarness({
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
     sendTabMessageWithTimeout,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
-    unavailable, 43_000, dateShim, setTimeoutShim);
+    unavailable, BROWSER_CREATE_CONTENT_TIMEOUT_MS, BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS, dateShim, setTimeoutShim);
 
   return {
     actuate,
@@ -3660,6 +4746,116 @@ test("user Given a late ChatGPT content script When create retries read-only ide
     harness.postCalls.some((call) => call.evidence?.result?.error === "browser_create_scope_unavailable"),
     false,
   );
+});
+
+test("user keeps the create-scope handshake window ahead of a slow content script | Given the create-scope handshake timeout declared in background.js | When the 12s-ready scenario is compared with the fixed bounds | Then the handshake timeout is at least 25s and the scenario is strictly between 8s and that timeout", () => {
+  assert.ok(
+    BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS >= 25_000,
+    `create-scope handshake timeout must stay >= 25_000ms, got ${BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS}`,
+  );
+  assert.ok(
+    LATE_CONTENT_SCRIPT_READY_MS > 8000
+      && LATE_CONTENT_SCRIPT_READY_MS < BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS,
+    `the 12s-ready scenario (${LATE_CONTENT_SCRIPT_READY_MS}ms) must lie strictly between 8000ms and ${BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS}ms`,
+  );
+});
+
+test("user create still completes after document_idle injection | Given a freshly created tab whose identity probes reject and whose scope is not registered until ~12s after tab creation | When the content script becomes ready and publishes the matching scope | Then the create command is delivered to that tab instead of failing with scope_unavailable", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness({ probeReadyAfterMs: LATE_CONTENT_SCRIPT_READY_MS });
+  const sourceTabId = 71;
+  harness.browserTabScopes.set(sourceTabId, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(sourceTabId, { id: sourceTabId, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+  // The freshly-created tab (id 100) publishes its scope only once its content
+  // script becomes ready ~12s after tab creation, after many rejected probes.
+  harness.liveScopesByTab.set(100, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "c".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "c".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+
+  assert.ok(
+    harness.identityProbeAttempts() >= 20,
+    "the handshake must keep probing on a bounded cadence while the content script is not ready",
+  );
+  assert.deepEqual(
+    harness.actuationMessages.map((message) => message.tabId),
+    [100],
+    "the create command must be delivered to the freshly-created tab once the scope arrives",
+  );
+  assert.equal(
+    harness.actuationMessages[0].message.command.operation,
+    "herdr_mcp.browser_session.create",
+  );
+  const success = harness.postCalls.find((call) => call.evidence?.resource_available === true);
+  assert.ok(success, "a scope published ~12s after tab creation must still complete the create actuation");
+  assert.equal(success.evidence.command_accepted, true);
+  assert.equal(
+    harness.postCalls.some((call) => call.evidence?.result?.error === "browser_create_scope_unavailable"),
+    false,
+  );
+});
+
+test("user create fails closed at the extended handshake deadline | Given the fresh tab's content script never becomes ready and no scope is published before the 30s scope deadline | When the create actuation settles | Then browser_create_scope_unavailable is reported with phase scope_handshake, nothing submitted, and the tab removed", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness({ probeReadyAfterMs: 60_000 });
+  const sourceTabId = 71;
+  harness.browserTabScopes.set(sourceTabId, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(sourceTabId, { id: sourceTabId, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+  harness.liveScopesByTab.set(100, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "d".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "d".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+
+  assert.equal(harness.actuationMessages.length, 0, "no create command may be submitted without a matching scope");
+  const failure = harness.postCalls.find((call) => call.evidence?.resource_available === false);
+  assert.ok(failure, "a scope that never arrives before the deadline must fail closed");
+  assert.equal(failure.evidence.command_accepted, false);
+  assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
+  assert.equal(failure.evidence.result?.phase, "scope_handshake");
+  assert.equal(failure.evidence.result?.scope_failure, "content_script_unavailable");
+  assert.equal(failure.evidence.result?.message_submitted, false);
+  assert.equal(failure.evidence.result?.tab_opened, true);
+  assert.equal(failure.evidence.result?.tab_closed, true);
+  assert.equal(failure.evidence.result?.tab_cleanup_verified, true);
+  assert.deepEqual(harness.removedTabs, [100]);
+  assert.equal(harness.tabs.has(100), false);
+  assert.equal(harness.tabs.has(sourceTabId), true, "scope cleanup must not close the user's anchor tab");
 });
 
 test("user receives a precise boundary reason | Given fresh create content reports unavailable without a reason | When background settles the actuation | Then the missing content reason is classified", async () => {
@@ -3892,4 +5088,406 @@ test("user still fails closed after source recovery | Given source affinity fall
   assert.equal(failure.evidence.command_accepted, false);
   assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
   assert.equal(harness.actuationMessages.length, 0);
+});
+
+test('user mentions an App in ChatGPT | Given an inline-mention App pill | When the composer is inspected | Then the pill is recognised only with provider identity attributes', () => {
+  const adapter = readFileSync(new URL('../extension/content/injector/chatgpt.js', import.meta.url), 'utf8');
+  assert.match(adapter, /span\[data-appearance="inline-mention"\]\[app-mention-name\]\[app-mention-path\]/);
+  assert.match(adapter, /for \(const keyword of this\.getInlineAppMentionKeywords\(input\)\) selected\.add\(keyword\);/);
+  assert.match(adapter, /for \(const node of this\.getInlineAppMentionNodes\(clone\)\) node\.remove\(\);/);
+  assert.match(adapter, /\^\[a-z0-9_-\]\{1,64\}\$/);
+});
+
+// Shared harness for the submit-acceptance rules. It extracts the real
+// evidence + command sources from wake.js so the tests exercise the shipped
+// acceptance logic instead of source text alone.
+function browserSubmitAcceptanceHarness(ctx = {}) {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart, "browser evidence helpers must remain extractable");
+  assert.ok(commandStart >= 0 && commandEnd > commandStart, "browser actuation command must remain extractable");
+  const helperStart = wakeSource.indexOf("  // The exact Unicode White_Space set Rust");
+  const helperEnd = wakeSource.indexOf("\n  function providerCanonicalConversationObserved()", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "exact acceptance helpers must remain extractable");
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const helperSource = wakeSource.slice(helperStart, helperEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  return new Function("ctx", `
+    const crypto = ctx.crypto;
+    const ADAPTER = {
+      name: "chatgpt",
+      capabilities: { browserActuation: true, sessionCreate: true, chatModeGuard: true },
+      prepareBrowserActuation: async () => ({ ok: true, switched: false }),
+      getConversationKey: () => ctx.currentConvKey,
+      getCanonicalConversationUrl: () => ctx.canonicalUrl === "" ? "" : "https://chatgpt.com/c/current",
+      getInputEl: () => ({}),
+      inputHasContent: () => ctx.inputHasContent === true,
+      getAcceptedUserAppIdentity: (messageId) => (typeof ctx.acceptedUserApps === "function"
+        ? ctx.acceptedUserApps(messageId)
+        : []),
+    };
+    const chatGptConversationId = () => {
+      const match = String(ADAPTER.getConversationKey() || "").match(/\\/c\\/([^/?#]+)/);
+      return match ? match[1] : null;
+    };
+    const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    let registeredBrowserSessionRef = ctx.registeredSessionRef || null;
+    let registeredBrowserGeneration = 17;
+    let registeredConvKey = ctx.registeredConvKey || null;
+    const registerCurrentConversation = async () => { ctx.registers = (ctx.registers || 0) + 1; };
+    const currentHerdrRequiredApps = () => ctx.herdrApps || [];
+    const providerCanonicalConversationObserved = () => ctx.canonicalObserved !== false;
+    const document = { hidden: false };
+    const isTurnInProgress = () => ctx.turnInProgress === true;
+    const runtimeAlive = () => true;
+    const BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS = 30000;
+    const acceptedDispatchAssignments = new Map();
+    const Date = { now: () => ctx.now || 0 };
+    const wait = async (ms = 0) => { ctx.now = (ctx.now || 0) + Math.max(1, ms); };
+    const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
+    let snapshotIndex = 0;
+    const fetchChatGptConversationSnapshot = async () => {
+      const snapshots = ctx.snapshots || [];
+      const value = snapshots[Math.min(snapshotIndex, snapshots.length - 1)] || { ok: false };
+      snapshotIndex += 1;
+      return value;
+    };
+    let userSnapshotIndex = 0;
+    const providerMessageSnapshot = (role) => {
+      if (role === "assistant") return ctx.assistantSnapshot || { messageId: null, text: "", count: 0 };
+      const first = userSnapshotIndex === 0;
+      userSnapshotIndex += 1;
+      return first ? ctx.domBefore : ctx.domAfter;
+    };
+    const performWake = async (args) => {
+      ctx.wakeArgs = ctx.wakeArgs || [];
+      ctx.wakeArgs.push(args);
+      if (typeof ctx.afterWake === "function") ctx.afterWake();
+      return ctx.wakeResult || { ok: true };
+    };
+    const projectChatGptConversationTitle = async () => ({
+      status: "unsupported",
+      changed: null,
+      provider: "chatgpt",
+      readback_verified: false,
+      reason: "title_projection_unsupported",
+    });
+    ${evidenceSource}
+    ${helperSource}
+    ${commandSource}
+    return performBrowserActuationCommand;
+  `)({ crypto: webcrypto, ...ctx });
+}
+
+test("user dispatch stays uncertain | Given the before snapshot fails and the latest user id is unchanged | When dispatch.submit acknowledges | Then the previous user message is not recorded", async () => {
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [{ ok: false }, { ok: false }],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: [] },
+  });
+
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.accepted_message_observed, false);
+  assert.equal(result.message_baseline_advanced, false);
+  assert.equal(result.generation_owner, null);
+  assert.equal(result.result, undefined, "no provider identity may be recorded without a before snapshot or an exact new turn");
+});
+
+test("user dispatch does not adopt a short overlapping turn | Given a submitted prompt that contains 'ok' | When a new user turn is only 'ok' | Then delivery stays uncertain and no accepted user message is recorded", async () => {
+  const prompt = "Please reply with ok once the patch is ready and the tests pass.";
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn" },
+      { ok: true, userMessageId: "user-2", userText: "ok" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "ok", count: 2 },
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: prompt, required_apps: [] },
+  });
+
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.accepted_message_observed, false);
+  assert.equal(result.message_baseline_advanced, false);
+  assert.equal(result.generation_owner, null);
+  assert.equal(result.result, undefined, "a short foreign turn inside the prompt must not become the accepted user message");
+});
+
+test("user dispatch ignores an idle prior generation | Given the conversation is idle on an assistant node | When no new generation starts | Then generation_status_observed remains false", async () => {
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn", currentNodeRole: "assistant" },
+      { ok: true, userMessageId: "user-2", userText: "next turn", currentNodeRole: "assistant" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "next turn", count: 2 },
+    assistantSnapshot: { messageId: "assistant-1", text: "previous answer", count: 1 },
+    turnInProgress: false,
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: [] },
+  });
+
+  assert.equal(result.accepted_message_observed, true);
+  assert.equal(result.result.accepted_user_message_ref, "user-2");
+  assert.match(result.result.accepted_user_text_canonical_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(result.generation_status_observed, false, "an idle pre-existing conversation is not an observed generation");
+  assert.equal(result.generation_owner, null, "dispatch must not claim generation ownership without proof");
+});
+
+test("user create does not adopt a foreign conversation | Given a Project-home tab whose URL changes to an existing conversation with different user text | When session.create submits | Then delivery proof is absent and the conversation is not registered", async () => {
+  const ctx = {
+    currentConvKey: "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    canonicalObserved: true,
+    snapshots: [
+      { ok: false },
+      { ok: true, userMessageId: "user-foreign", userText: "someone else's turn" },
+    ],
+    domBefore: { messageId: null, exactMessageId: false, text: "", count: 0 },
+    domAfter: { messageId: "user-foreign", exactMessageId: true, text: "someone else's turn", count: 1 },
+    afterWake: () => { ctx.currentConvKey = "https://chatgpt.com/c/foreign-conversation"; },
+  };
+  const act = browserSubmitAcceptanceHarness(ctx);
+
+  const result = await act({
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      reservation_ref: "bsr_" + "e".repeat(64),
+      message: "ship the patch",
+      required_apps: [],
+    },
+  });
+
+  assert.equal(result.rejected, false);
+  assert.equal(result.accepted_message_observed, false);
+  assert.equal(result.message_baseline_advanced, false);
+  assert.equal(result.stable_resource_ref_observed, false);
+  assert.equal(result.result, undefined, "a foreign conversation's latest turn is not this create's acceptance");
+  assert.equal(ctx.registers || 0, 0, "the landed conversation must not be materialized as the new session");
+});
+
+test("user accepted message must carry the required app | Given the composer selected herdr but the accepted provider message carries no app identity | When acceptance is evaluated | Then the required-app readback is empty and no app is credited", async () => {
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn" },
+      { ok: true, userMessageId: "user-2", userText: "next turn" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "next turn", count: 2 },
+    assistantSnapshot: { messageId: "assistant-1", text: "previous answer", count: 1 },
+    turnInProgress: false,
+    acceptedUserApps: () => [],
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: ["herdr"] },
+  });
+
+  assert.equal(result.accepted_message_observed, true);
+  assert.equal(result.result.accepted_user_message_ref, "user-2");
+  assert.equal(
+    result.required_apps_readback.length,
+    0,
+    "a pre-submit composer pill must never satisfy the required app",
+  );
+  assert.equal(result.result.accepted_user_apps, undefined);
+
+  const credited = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn" },
+      { ok: true, userMessageId: "user-2", userText: "next turn" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "next turn", count: 2 },
+    assistantSnapshot: { messageId: "assistant-1", text: "previous answer", count: 1 },
+    turnInProgress: false,
+    acceptedUserApps: (messageId) => (messageId === "user-2"
+      ? [{ name: "herdr", path: "connectors/herdr" }]
+      : []),
+  });
+  const applied = await credited({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: ["herdr"] },
+  });
+  assert.deepEqual([...applied.required_apps_readback], ["herdr"]);
+  assert.deepEqual([...applied.result.accepted_user_apps].map((app) => ({
+    name: app.name,
+    path: app.path,
+  })), [{ name: "herdr", path: "connectors/herdr" }]);
+});
+
+test("user archive handles a rate-limited preflight | Given the preflight read returns HTTP 429 | When archive is requested | Then rate_limited is returned without any provider mutation", async () => {
+  const fetchCalls = [];
+  const { ctx, api } = selfArchiveHarness({
+    turnInProgress: false,
+    archiveAvailable: false,
+    readbackStatus: 429,
+    fetch: async (url, init = {}) => {
+      fetchCalls.push({ url, method: init.method || "GET" });
+      return { ok: false, status: 429 };
+    },
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      idempotency_key: "archive-preflight-rate-limited",
+    },
+  };
+  const evidence = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(evidence.rejected, true);
+  assert.equal(evidence.result.error, "rate_limited");
+  assert.equal(fetchCalls.length, 0, "nothing may be mutated while the preflight read is throttled");
+});
+
+test("user archive retry never repeats mutation | Given the archive PATCH is throttled with 429 | When the same key is retried | Then it stays unconfirmed and only one PATCH is dispatched", async () => {
+  const patches = [];
+  const { ctx, api } = selfArchiveHarness({
+    turnInProgress: false,
+    archiveAvailable: false,
+    accessToken: "archive-test-token",
+    fetch: async (url, init = {}) => {
+      if ((init.method || "GET") === "PATCH") {
+        patches.push(url);
+        return { ok: false, status: 429 };
+      }
+      return { ok: false, status: 500 };
+    },
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      idempotency_key: "archive-patch-rate-limited",
+    },
+  };
+  const first = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(first.command_accepted, true);
+  assert.equal(first.lifecycle_observed, false, "a throttled PATCH may have been applied: stay unconfirmed");
+  assert.equal(patches.length, 1);
+
+  const second = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(second.command_accepted, true);
+  assert.equal(second.lifecycle_observed, false);
+  assert.equal(patches.length, 1, "an uncertain archive is terminal and must never be re-mutated");
+});
+
+test("user archive treats a definitive provider rejection as not applied | Given the archive PATCH is rejected with HTTP 400 | When archive is requested | Then the provider is reported as rejecting it without a replay", async () => {
+  const patches = [];
+  const { ctx, api } = selfArchiveHarness({
+    turnInProgress: false,
+    archiveAvailable: false,
+    accessToken: "archive-test-token",
+    fetch: async (url, init = {}) => {
+      if ((init.method || "GET") === "PATCH") patches.push(url);
+      return { ok: false, status: 400 };
+    },
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      idempotency_key: "archive-patch-rejected",
+    },
+  };
+  const evidence = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(evidence.rejected, true);
+  assert.equal(evidence.result.error, "browser_archive_control_unavailable");
+  assert.equal(patches.length, 1);
+});
+
+test("user late acceptance verifies app identity | Given a matching message digest without the required App path | When the late readback runs | Then the app readback is empty and only the exact provider message identity is offered", async () => {
+  const detail = {
+    ok: true,
+    body: {
+      mapping: {
+        n1: {
+          message: {
+            id: "m1",
+            author: { role: "user" },
+            content: { content_type: "text", parts: ["late accepted turn"] },
+            metadata: {},
+          },
+        },
+      },
+    },
+  };
+  const commandFor = (ctx) => ({
+    operation: "herdr_mcp.browser_session.archive_status",
+    expected_generation: 7,
+    params: {
+      session_ref: ctx.sessionRef,
+      expected_generation: 7,
+      readback_accepted: true,
+      required_apps: ["herdr"],
+    },
+  });
+
+  const withoutApps = selfArchiveHarness({
+    turnInProgress: false,
+    detail,
+    adapter: { getAcceptedUserAppIdentity: () => [] },
+  });
+  const plain = await withoutApps.api.performChatGptSessionArchiveStatus(
+    commandFor(withoutApps.ctx),
+    { observed_generation: 7 },
+  );
+  assert.equal(plain.result.accepted_user_message_ref, "m1");
+  assert.equal(plain.required_apps_readback.length, 0);
+  assert.equal(plain.result.accepted_user_apps, undefined, "a digest match without app proof stays app-less");
+
+  const withApps = selfArchiveHarness({
+    turnInProgress: false,
+    detail,
+    adapter: {
+      getAcceptedUserAppIdentity: (messageId) => (messageId === "m1"
+        ? [{ name: "herdr", path: "connectors/herdr" }]
+        : []),
+    },
+  });
+  const credited = await withApps.api.performChatGptSessionArchiveStatus(
+    commandFor(withApps.ctx),
+    { observed_generation: 7 },
+  );
+  assert.deepEqual([...credited.required_apps_readback], ["herdr"]);
+  assert.deepEqual([...credited.result.accepted_user_apps].map((app) => ({
+    name: app.name,
+    path: app.path,
+  })), [{ name: "herdr", path: "connectors/herdr" }]);
 });

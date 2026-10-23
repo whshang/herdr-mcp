@@ -250,6 +250,23 @@ test("current workflows pin checkout and setup-node to reviewed v7 commits", asy
   }
 });
 
+test("user Linux CI stays schedulable | Given the CI workflow | When Linux jobs are selected | Then rust and test run on GitHub-hosted ubuntu-latest", async () => {
+  const ci = await readFile(join(ROOT, ".github/workflows/ci.yml"), "utf8");
+  const windows = await readFile(join(ROOT, ".github/workflows/windows-candidate.yml"), "utf8");
+  assert.equal(
+    [...ci.matchAll(/^\s*runs-on:\s*ubuntu-latest\s*$/gm)].length,
+    2,
+    "CI rust and test must both use ubuntu-latest",
+  );
+  assert.doesNotMatch(ci, /self-hosted|herdr-box/);
+  assert.match(ci, /rustup toolchain install 1\.97\.1 --profile minimal --component clippy,rustfmt/);
+  assert.match(ci, /node-version:\s*22/);
+  assert.match(ci, /deno-version:\s*v2\.x/);
+  assert.match(ci, /mozilla-actions\/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba/);
+  assert.match(windows, /runs-on:\s*windows-2025/);
+  assert.doesNotMatch(windows, /ubuntu-latest|herdr-box/);
+});
+
 test("CI Rust gate uses a trusted-main-only shared compiler cache", async () => {
   const ci = await readFile(join(ROOT, ".github/workflows/ci.yml"), "utf8");
   assert.match(ci, /CARGO_INCREMENTAL:\s*["']0["']/);
@@ -427,8 +444,40 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /source_target_mode/);
   assert.match(recovery, /source_manifest_schema/);
   assert.match(recovery, /source_target_matrix/);
-  assert.match(recovery, /contracts\/runtime-exec-v4\.json/);
+  assert.match(recovery, /contracts\/runtime-exec-v5\.json/);
   assert.match(recovery, /contracts\/epoch2\.json/);
+  // The source-contract fallback must select the tagged source descriptor in
+  // exact compatibility order: current v5, then the immediate previous v4
+  // rollback baseline, then the frozen epoch2 base. A v4-only source must
+  // recover its real contract identity instead of silently reporting epoch2.
+  const contractFallback = recovery.slice(
+    recovery.indexOf('if git cat-file -e "${source_digest}:contracts/runtime-exec-v5.json"'),
+    recovery.indexOf("source_contract_epoch="),
+  );
+  assert.match(
+    contractFallback,
+    /if git cat-file -e "\$\{source_digest\}:contracts\/runtime-exec-v5\.json"/,
+    "the v5 descriptor must be the first fallback branch",
+  );
+  assert.match(
+    contractFallback,
+    /elif git cat-file -e "\$\{source_digest\}:contracts\/runtime-exec-v4\.json"/,
+    "the v4 descriptor must be the second fallback branch",
+  );
+  assert.match(
+    contractFallback,
+    /source_contract="\$\(git show "\$\{source_digest\}:contracts\/epoch2\.json"\)"/,
+    "epoch2 must remain the final fallback",
+  );
+  assert.ok(
+    contractFallback.indexOf("runtime-exec-v5.json") <
+      contractFallback.indexOf("runtime-exec-v4.json"),
+    "v5 must be selected before the v4 fallback",
+  );
+  assert.ok(
+    contractFallback.indexOf("runtime-exec-v4.json") < contractFallback.indexOf("epoch2.json"),
+    "v4 must be selected before the epoch2 fallback",
+  );
   assert.match(recovery, /runtime_manifest = root \/ "runtime-manifest\.json"/);
   assert.match(recovery, /legacy_manifest = root \/ "release-manifest\.json"/);
   assert.match(recovery, /manifest_mode = "runtime"/);

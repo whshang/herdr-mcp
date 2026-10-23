@@ -27,9 +27,9 @@ class FakeStorage {
     this._queue = run.then(() => undefined, () => undefined);
     return run;
   }
-  async getAlarm() { return null; }
-  async setAlarm() { throw new Error("pairing flow must not schedule alarms"); }
-  async deleteAlarm() {}
+  async getAlarm() { return this.alarmSetAt ?? null; }
+  async setAlarm(at) { this.alarmSetAt = at; } // #630 migrate confirm first-schedules the idempotency sweep
+  async deleteAlarm() { this.alarmSetAt = undefined; }
 }
 
 function namespace(stub) {
@@ -200,6 +200,7 @@ test("user keeps Worker semantic credentials at Edge | Given an enrolled device 
       name: "edge_fast",
       protocol: "decision",
       model: "jev-edge",
+      pinned: false,
     }],
   });
 
@@ -359,6 +360,7 @@ test("user uses one semantic route schema for chat | Given a Worker-wide openai-
       name: "chat_primary",
       protocol: "openai-chat",
       model: "chat-model",
+      pinned: false,
     }],
   });
 
@@ -398,6 +400,70 @@ test("user uses one semantic route schema for chat | Given a Worker-wide openai-
       content: "continue",
       usage: { total_tokens: 7 },
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("user tunes semantic chat output | Given a Worker-wide openai-chat route | When chat carries max_tokens JSON mode and tier | Then they are validated and forwarded upstream", async () => {
+  const h = makeEnv({
+    HERDR_SEMANTIC_ROUTES: JSON.stringify([{
+      name: "chat_primary",
+      protocol: "openai-chat",
+      url: "https://chat.example/v1/chat/completions",
+      model: "chat-model",
+      api_key: "chat-secret",
+    }]),
+  });
+  const paired = await pair(h.env, "semantic-chat-options");
+  const originalFetch = globalThis.fetch;
+  const upstreamBodies = [];
+  globalThis.fetch = async (_input, init = {}) => {
+    upstreamBodies.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: "{\"ok\":true}" } }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const send = (extra) => worker.fetch(
+    postAsWorkstation(
+      "/semantic/chat",
+      { messages: [{ role: "user", content: "json please" }], ...extra },
+      paired.workstation_id,
+      paired.device_secret,
+    ),
+    h.env,
+  );
+  try {
+    const tuned = await send({ max_tokens: 64, response_format: { type: "json_object" }, tier: "background" });
+    assert.equal(tuned.status, 200);
+    assert.equal(upstreamBodies[0].max_tokens, 64);
+    assert.deepEqual(upstreamBodies[0].response_format, { type: "json_object" });
+    assert.equal("tier" in upstreamBodies[0], false);
+
+    const shorthand = await send({ response_format: "json" });
+    assert.equal(shorthand.status, 200);
+    assert.deepEqual(upstreamBodies[1].response_format, { type: "json_object" });
+    assert.equal("max_tokens" in upstreamBodies[1], false);
+
+    const plain = await send({});
+    assert.equal(plain.status, 200);
+    assert.equal("max_tokens" in upstreamBodies[2], false);
+    assert.equal("response_format" in upstreamBodies[2], false);
+
+    for (const invalid of [
+      { max_tokens: 0 },
+      { max_tokens: 32769 },
+      { max_tokens: 1.5 },
+      { max_tokens: "64" },
+      { response_format: "yaml" },
+      { response_format: { type: "json_schema" } },
+      { tier: "urgent" },
+      { temperature: 1 },
+    ]) {
+      const rejected = await send(invalid);
+      assert.equal(rejected.status, 400, JSON.stringify(invalid));
+    }
+    assert.equal(upstreamBodies.length, 3);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -461,8 +527,8 @@ test("user receives normalized Vercel evaluation | Given a decision-vercel Jev r
 
 test("health and info expose the same explicit first-party public contract identity", async () => {
   for (const [edgeEnv, expectedEpoch] of [
-    ["dev", 7],
-    ["prod", 7],
+    ["dev", 8],
+    ["prod", 8],
     [undefined, 3],
     ["unknown", 3],
   ]) {
@@ -483,16 +549,16 @@ test("health and info expose the same explicit first-party public contract ident
       health.runtimeContractHash,
       "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
     );
-    assert.equal(health.currentRuntimeContractEpoch, 3);
+    assert.equal(health.currentRuntimeContractEpoch, 4);
     assert.equal(
       health.currentRuntimeContractHash,
-      "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5",
+      "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",
     );
-    assert.equal(info.runtimeContract.epoch, 4);
-    assert.equal(info.previousRuntimeContract.epoch, 3);
+    assert.equal(info.runtimeContract.epoch, 5);
+    assert.equal(info.previousRuntimeContract.epoch, 4);
     assert.equal(
       info.previousRuntimeContract.hash,
-      "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5",
+      "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",
     );
   }
 });
@@ -2023,4 +2089,274 @@ test("approved OAuth Connector is ordinary MCP only and cannot administer the fl
   const badKeyBody = await badKey.json();
   assert.equal(badKeyBody.result.isError, true);
   assert.equal(badKeyBody.result.structuredContent.code, "invalid_params");
+});
+
+// #626: the public orphans route is scoped server-side to the authenticated owner device.
+async function orphansHarness() {
+  const h = makeEnv();
+  const oauthStorage = new FakeStorage();
+  const oauth = new OAuthStoreDO({ storage: oauthStorage }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+  const legacyUnregistered = await worker.fetch(postAsWorkstation(
+    "/connectors/page-assist/orphans", { action: "list" }, "prod-real-runtime", "legacy-secret",
+  ), h.env);
+  const connect = await worker.fetch(wsRequest("prod-real-runtime", "legacy-secret"), h.env);
+  assert.equal(connect.status, 200);
+  const list = await h.registry.fetch(new Request("https://registry.internal/internal/devices"));
+  const deviceA = (await list.json()).devices.find((d) => d.workstation_id === "prod-real-runtime").device_id;
+  const deviceB = (await pair(h.env, "orphans-b")).device_id;
+  assert.match(deviceA, /^dev_/);
+  assert.notEqual(deviceA, deviceB);
+  const row = (connector_id, device_id, endpoint_ref) => ({ connector_id, grant_generation: 1, device_id, endpoint_ref });
+  oauthStorage.map.set("grant:c1", {
+    client_id: "c1", status: "active", principal_type: "connector", resource: "https://edge.example/mcp", scope: "mcp",
+    approved_at_ms: 1000, approved_by: "device:owner", connector_id: "conn_new00000001", grant_generation: 1,
+    page_assist: [row("conn_old00000001", deviceA, "epA"), row("conn_old00000001", deviceB, "epB")],
+    webchat_control: [{ ...row("conn_old00000001", deviceB, "epB2"), provider: "chatgpt", account_ref: "*" }],
+  });
+  oauthStorage.writeCount = 0;
+  const call = async (body) => {
+    const resp = await worker.fetch(postAsWorkstation(
+      "/connectors/page-assist/orphans", body, "prod-real-runtime", "legacy-secret",
+    ), h.env);
+    return { status: resp.status, body: await resp.json() };
+  };
+  return { oauthStorage, deviceA, deviceB, call, legacyUnregistered };
+}
+
+test("user Given orphans on owner device A and device B When A lists orphans without device_id Then only A's rows are returned and nothing is written", async () => {
+  const h = await orphansHarness();
+  const res = await h.call({ action: "list" });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.orphans.map((o) => o.endpoint_ref), ["epA"]);
+  assert.ok(res.body.orphans.every((o) => o.device_id === h.deviceA));
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
+
+test("user Given owner device A authenticated When it asks for device B's orphans Then it gets 403 orphans_device_mismatch, none of B's rows, and zero writes", async () => {
+  const h = await orphansHarness();
+  const res = await h.call({ action: "list", device_id: h.deviceB });
+  assert.equal(res.status, 403);
+  assert.deepEqual(res.body, { ok: false, code: "orphans_device_mismatch" });
+  assert.ok(!JSON.stringify(res.body).includes(h.deviceB));
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
+
+test("user Given owner device A authenticated When it lists orphans with its own device_id Then the request succeeds scoped to A", async () => {
+  const h = await orphansHarness();
+  const res = await h.call({ action: "list", device_id: h.deviceA });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.deepEqual(res.body.orphans.map((o) => [o.device_id, o.endpoint_ref]), [[h.deviceA, "epA"]]);
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
+
+test("user Given owner auth When orphans are listed with a malformed device_id, an unknown key, no auth, or no registry device identity Then it fails closed and writes nothing", async () => {
+  const h = await orphansHarness();
+  const bad = await h.call({ action: "list", device_id: "dev_short" });
+  assert.equal(bad.status, 400);
+  assert.deepEqual(bad.body, { ok: false, code: "orphans_invalid_device_id" });
+  const unknown = await h.call({ action: "list", extra: 1 });
+  assert.equal(unknown.status, 400);
+  assert.deepEqual(unknown.body, { ok: false, code: "bad_request" });
+  assert.equal(h.legacyUnregistered.status, 403);
+  assert.deepEqual(await h.legacyUnregistered.json(), { ok: false, code: "orphans_device_unresolved" });
+  const generic = await worker.fetch(post("/connectors/page-assist/orphans", { action: "list" }, "owner-secret"), {
+    ...makeEnv().env,
+  });
+  assert.equal(generic.status, 401);
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
+
+// #630: public dry-run/confirm route for page-assist grant migration.
+const MIG_OLD = "conn_old00000001";
+const MIG_NEW = "conn_new00000001";
+
+async function migrateHarness(sharedRecord = false) {
+  const h = makeEnv();
+  const oauthStorage = new FakeStorage();
+  const oauth = new OAuthStoreDO({ storage: oauthStorage }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+  const legacyUnregistered = await worker.fetch(postAsWorkstation(
+    "/connectors/page-assist/migrate",
+    { from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000001" },
+    "prod-real-runtime", "legacy-secret",
+  ), h.env);
+  const connect = await worker.fetch(wsRequest("prod-real-runtime", "legacy-secret"), h.env);
+  assert.equal(connect.status, 200);
+  const list = await h.registry.fetch(new Request("https://registry.internal/internal/devices"));
+  const deviceA = (await list.json()).devices.find((d) => d.workstation_id === "prod-real-runtime").device_id;
+  const deviceB = (await pair(h.env, "migrate-b")).device_id;
+  const row = (connector_id, device_id, endpoint_ref) => ({ connector_id, grant_generation: 1, device_id, endpoint_ref });
+  oauthStorage.map.set("grant:c1", {
+    client_id: "c1", status: "active", principal_type: "connector", resource: "https://edge.example/mcp", scope: "mcp",
+    approved_at_ms: 1000, approved_by: "device:owner", connector_id: MIG_NEW, grant_generation: 1,
+    page_assist: sharedRecord
+      ? [row(MIG_OLD, deviceA, "epA"), row(MIG_OLD, deviceB, "epB"), row(MIG_NEW, deviceA, "epA2")]
+      : [row(MIG_OLD, deviceA, "epA"), row(MIG_NEW, deviceA, "epA2")],
+    webchat_control: [],
+  });
+  oauthStorage.writeCount = 0;
+  const respond = async (resp) => ({ status: resp.status, body: await resp.json() });
+  const dryRun = (body) => worker.fetch(postAsWorkstation(
+    "/connectors/page-assist/orphans", body, "prod-real-runtime", "legacy-secret",
+  ), h.env).then(respond);
+  const confirm = (body) => worker.fetch(postAsWorkstation(
+    "/connectors/page-assist/migrate", body, "prod-real-runtime", "legacy-secret",
+  ), h.env).then(respond);
+  return { oauthStorage, deviceA, deviceB, dryRun, confirm, legacyUnregistered };
+}
+
+test("user Given owner device A authenticated When it runs a migrate dry run through the public route Then the plan is scoped to A and carries a plan_digest", async () => {
+  const h = await migrateHarness();
+  const res = await h.dryRun({ action: "plan", from: MIG_OLD, to: MIG_NEW });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.dry_run, true);
+  assert.deepEqual(res.body.moves.map((m) => [m.from.device_id, m.from.endpoint_ref]), [[h.deviceA, "epA"]]);
+  assert.match(res.body.plan_digest, /^[0-9a-f]{64}$/);
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
+
+test("user Given a dry-run digest from the public route When the owner confirms through the public route Then only A's rows move with audit and idempotency entries", async () => {
+  const h = await migrateHarness();
+  const plan = await h.dryRun({ action: "plan", from: MIG_OLD, to: MIG_NEW });
+  assert.equal(plan.status, 200);
+  const idem = "route-key-0000000002";
+  const res = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: plan.body.plan_digest, idempotency_key: idem });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.action, "connector_page_assist_migrated");
+  assert.equal(res.body.moved, 1);
+  const stored = h.oauthStorage.map.get("grant:c1");
+  assert.equal(stored.page_assist.find((r) => r.endpoint_ref === "epA").connector_id, MIG_NEW);
+  assert.equal(stored.page_assist.find((r) => r.endpoint_ref === "epA2").connector_id, MIG_NEW);
+  assert.equal(stored.audit.at(-1).by, `device:${h.deviceA}`);
+  assert.ok(h.oauthStorage.map.has(`migrate-idem:v1:${h.deviceA}:${idem}`), "idempotency entry written");
+  // Replay through the public route: same result, zero new writes.
+  const writesAfterFirst = h.oauthStorage.writeCount;
+  const replay = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: plan.body.plan_digest, idempotency_key: idem });
+  assert.equal(replay.status, 200);
+  assert.deepEqual(replay.body, res.body);
+  assert.equal(h.oauthStorage.writeCount, writesAfterFirst, "replay writes nothing");
+});
+
+test("user Given a shared record holding device B rows under the same source When device A dry-runs or confirms through the public route Then both reject the whole plan with migrate_cross_device_rows and no grant or idempotency state changes", async () => {
+  const h = await migrateHarness(true);
+  const dry = await h.dryRun({ action: "plan", from: MIG_OLD, to: MIG_NEW });
+  assert.equal(dry.status, 409);
+  assert.equal(dry.body.code, "migrate_cross_device_rows");
+  const res = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "1".repeat(64), idempotency_key: "route-key-0000000003" });
+  assert.equal(res.status, 409);
+  assert.equal(res.body.code, "migrate_cross_device_rows");
+  // #630 Q4: the rejection writes only the separate per-device reject ring.
+  assert.equal(h.oauthStorage.writeCount, 1, "only the reject ring wrote");
+  assert.deepEqual(
+    h.oauthStorage.map.get(`migrate-reject-audit:v1:${h.deviceA}`).entries.map((entry) => [entry.code, entry.stage, entry.device_id]),
+    [["migrate_cross_device_rows", "device_scope", h.deviceA]],
+  );
+  assert.equal([...h.oauthStorage.map.keys()].some((key) => key.startsWith("migrate-idem:")), false, "no idempotency entry for a reject");
+  assert.equal(h.oauthStorage.map.get("grant:c1").page_assist.find((r) => r.endpoint_ref === "epB").connector_id, MIG_OLD);
+});
+
+test("user Given confirm calls without owner auth, an unresolved legacy device, unknown keys, or malformed fields When the public migrate route is called Then it fails closed with fixed codes, audits every authenticated shape reject, and keeps auth failures log-only", async () => {
+  // #630 §7.6 "Rejected confirm (each stage)" + §7.8 Q4: every authenticated
+  // rejection — including the Edge route's own shape rejects that never reach
+  // the DO confirm transaction — is one slim per-device reject entry plus one
+  // structured log line. Only 401/403 auth failures have no device to key on.
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (line) => logs.push(line);
+  let h;
+  let generic;
+  let bad;
+  let badDigest;
+  let badKey;
+  let tooLarge;
+  try {
+    h = await migrateHarness();
+    generic = await worker.fetch(post("/connectors/page-assist/migrate", {
+      from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000004",
+    }, "owner-secret"), { ...makeEnv().env });
+    bad = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000004", extra: 1 });
+    badDigest = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "nothex", idempotency_key: "route-key-0000000005" });
+    badKey = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "short" });
+    tooLarge = await h.confirm({ from: MIG_OLD, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000007", extra: "x".repeat(9000) });
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(h.legacyUnregistered.status, 403);
+  assert.deepEqual(await h.legacyUnregistered.json(), { ok: false, code: "migrate_device_unresolved" });
+  assert.equal(generic.status, 401);
+  assert.deepEqual(await generic.json(), { ok: false, code: "connector_owner_device_required" });
+  assert.equal(bad.status, 400);
+  assert.deepEqual(bad.body, { ok: false, code: "bad_request" });
+  assert.equal(badDigest.status, 400);
+  assert.deepEqual(badDigest.body, { ok: false, code: "migrate_invalid_plan_digest" });
+  assert.equal(badKey.status, 400);
+  assert.deepEqual(badKey.body, { ok: false, code: "migrate_idempotency_key_invalid" });
+  assert.equal(tooLarge.status, 413);
+  assert.deepEqual(tooLarge.body, { ok: false, code: "payload_too_large" });
+  // Only the reject ring wrote: no grant or idempotency change at all.
+  assert.equal(h.oauthStorage.writeCount, 4, "one reject-ring write per authenticated shape reject");
+  assert.equal([...h.oauthStorage.map.keys()].some((key) => key.startsWith("migrate-idem:")), false, "no idempotency entry for a reject");
+  assert.equal(h.oauthStorage.map.get("grant:c1").page_assist.find((r) => r.endpoint_ref === "epA").connector_id, MIG_OLD, "grant rows untouched");
+  assert.deepEqual(
+    h.oauthStorage.map.get(`migrate-reject-audit:v1:${h.deviceA}`).entries.map((entry) => [entry.code, entry.stage, entry.device_id]),
+    [
+      ["bad_request", "validate", h.deviceA],
+      ["migrate_invalid_plan_digest", "validate", h.deviceA],
+      ["migrate_idempotency_key_invalid", "validate", h.deviceA],
+      ["payload_too_large", "validate", h.deviceA],
+    ],
+  );
+  const rejectLines = logs.map((line) => JSON.parse(line)).filter((entry) => entry.event === "page_assist_migrate_rejected");
+  assert.deepEqual(
+    rejectLines.filter((line) => line.fields.device_id === h.deviceA).map((line) => [line.fields.code, line.fields.stage]),
+    [
+      ["bad_request", "validate"],
+      ["migrate_invalid_plan_digest", "validate"],
+      ["migrate_idempotency_key_invalid", "validate"],
+      ["payload_too_large", "validate"],
+    ],
+  );
+  // Auth failures: log line only, null device/digest/key, and no ring entry.
+  const authLines = rejectLines.filter((line) => line.fields.device_id === null);
+  assert.deepEqual(authLines.map((line) => line.fields.code).sort(), ["connector_owner_device_required", "migrate_device_unresolved"]);
+  assert.deepEqual(authLines.map((line) => [line.fields.plan_digest, line.fields.idempotency_key_sha256_8]), [[null, null], [null, null]]);
+  assert.equal(h.oauthStorage.map.has(`migrate-reject-audit:v1:${h.deviceB}`), false, "no ring for a device that never authenticated");
+});
+
+test("user Given owner device A authenticated When it runs a migrate dry run asserting its own device_id Then the plan is device-scoped and succeeds", async () => {
+  const h = await migrateHarness();
+  const res = await h.dryRun({ action: "plan", from: MIG_OLD, to: MIG_NEW, device_id: h.deviceA });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.dry_run, true);
+  assert.deepEqual(res.body.moves.map((m) => m.from.endpoint_ref), ["epA"]);
+  assert.ok(res.body.moves.every((m) => m.from.device_id === h.deviceA));
+  assert.match(res.body.plan_digest, /^[0-9a-f]{64}$/);
+  // The assertion must match: B's device_id is refused with the fixed mismatch code.
+  const mismatch = await h.dryRun({ action: "plan", from: MIG_OLD, to: MIG_NEW, device_id: h.deviceB });
+  assert.equal(mismatch.status, 403);
+  assert.deepEqual(mismatch.body, { ok: false, code: "orphans_device_mismatch" });
+  assert.equal(h.oauthStorage.writeCount, 0);
+});
+
+test("user Given a migrate request where from equals to When it passes the public route validation Then both layers agree on migrate_source_is_current", async () => {
+  const h = await migrateHarness();
+  const same = await h.confirm({ from: MIG_NEW, to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000006" });
+  assert.equal(same.status, 400);
+  assert.deepEqual(same.body, { ok: false, code: "migrate_source_is_current" }, "public layer returns the DO's code");
+  // Malformed ids keep their own fixed code.
+  const malformed = await h.confirm({ from: "bogus", to: MIG_NEW, plan_digest: "0".repeat(64), idempotency_key: "route-key-0000000007" });
+  assert.equal(malformed.status, 400);
+  assert.deepEqual(malformed.body, { ok: false, code: "migrate_invalid_connector_id" });
+  // #630 Q4: both authenticated shape rejects are audited; nothing else wrote.
+  assert.equal(h.oauthStorage.writeCount, 2, "one reject-ring write per authenticated shape reject");
+  assert.deepEqual(
+    h.oauthStorage.map.get(`migrate-reject-audit:v1:${h.deviceA}`).entries.map((entry) => [entry.code, entry.stage]),
+    [["migrate_source_is_current", "validate"], ["migrate_invalid_connector_id", "validate"]],
+  );
+  assert.equal(h.oauthStorage.map.get("grant:c1").page_assist.find((r) => r.endpoint_ref === "epA").connector_id, MIG_OLD, "grant rows untouched");
 });

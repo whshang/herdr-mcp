@@ -83,10 +83,9 @@ export function chatGptConversationInfo(rawUrl) {
       conversation_id: conversationId,
       project_id: projectId,
       project_key: projectKey,
-      // The resource-id route is deliberately used as the launcher. ChatGPT
-      // currently redirects it to the user-facing `/project` route, including
-      // any cosmetic Project slug.
-      project_launch_url: projectKey,
+      // Keep project_key as the stable resource identity, but launch the
+      // provider's actual Project home so a fresh chat can mount its composer.
+      project_launch_url: `${projectKey}/project`,
       binding_scope: "project",
       is_new_chat_root: false,
       is_project_home: !conversationId,

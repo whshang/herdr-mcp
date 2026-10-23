@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.133";
+const H2W_CONTENT_VERSION = "0.1.212";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -862,6 +862,48 @@ function normalizeHerdrMentionAlias(value) {
     return !isComposerGenerating();
   }
 
+  // Remove only the `@<app>` search text this automation typed, and wait until
+  // the editor model is empty so ChatGPT does not persist it as a Project draft.
+  async function clearAutomationSearch(app) {
+    // The composer was verified empty before typing, so `@<app>` (search) or
+    // `<app>` (a consumed suggestion without a recognised pill) is ours.
+    const ours = () => {
+      const text = ADAPTER.getComposerTextWithoutAppPills().toLowerCase();
+      return text === `@${app}` || text === app;
+    };
+    if (ours()) {
+      await new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: 'h2w_type_trusted_mention', keyword: app, mode: 'clear' }, () => {
+            void chrome.runtime.lastError;
+            resolve();
+          });
+        } catch (_) { resolve(); }
+      });
+    }
+    if (ADAPTER.getComposerTextWithoutAppPills() !== '' && ours()) await clearComposer();
+    const deadline = Date.now() + 1500;
+    while (ADAPTER.getComposerTextWithoutAppPills() !== '' && Date.now() < deadline) await wait(100);
+    // Give the provider a moment to persist the cleared draft before teardown.
+    await wait(300);
+  }
+
+  // After a failed submit, clear the composer only when it still holds exactly
+  // the message this automation inserted (whitespace-canonical, App pills
+  // ignored), so ChatGPT does not persist it as a Project new-chat draft.
+  // A user-authored or different draft is never touched.
+  async function clearAutomationDraft(message) {
+    const canonical = canonicalAcceptanceText;
+    const expected = canonical(message);
+    const ours = () => expected !== "" && canonical(ADAPTER.getComposerTextWithoutAppPills()) === expected;
+    if (!ours()) return ADAPTER.getComposerTextWithoutAppPills() === "" ? "empty" : "not_ours";
+    await clearComposer();
+    const deadline = Date.now() + 1500;
+    while (ADAPTER.getComposerTextWithoutAppPills() !== "" && Date.now() < deadline) await wait(100);
+    await wait(300);
+    return ADAPTER.getComposerTextWithoutAppPills() === "" ? "cleared" : "clear_failed";
+  }
+
   async function ensureRequiredComposerApps(requiredApps) {
     const requested = [...new Set((Array.isArray(requiredApps) ? requiredApps : [])
       .map((app) => String(app || '').trim().toLowerCase())
@@ -869,64 +911,153 @@ function normalizeHerdrMentionAlias(value) {
     if (!requested.length) return { ok: true, apps: [] };
     if (ADAPTER.name !== 'chatgpt'
         || typeof ADAPTER.getSelectedComposerApps !== 'function'
-        || typeof ADAPTER.openComposerAppsMenu !== 'function'
-        || typeof ADAPTER.getComposerAppCandidates !== 'function') {
+        || typeof ADAPTER.getComposerAppCandidates !== 'function'
+        || typeof ADAPTER.getComposerTextWithoutAppPills !== 'function'
+        || typeof ADAPTER.getWatchMainWorldSelector !== 'function'
+        || !ADAPTER.needsMainWorldInsert) {
       return { ok: false, error: 'required-apps-unsupported' };
     }
     for (const app of requested) {
       if (ADAPTER.getSelectedComposerApps().includes(app)) continue;
-      let searchInserted = false;
-      let candidates = ADAPTER.getComposerAppCandidates(app);
-      if (!candidates.length) {
-        if (!ADAPTER.openComposerAppsMenu()) return { ok: false, error: 'required-apps-menu-unavailable' };
-        const deadline = Date.now() + 3000;
-        do {
-          await wait(100);
-          candidates = ADAPTER.getComposerAppCandidates(app);
-          if (candidates.length) break;
-        } while (Date.now() < deadline);
+      // The provider's native @ mention autocomplete is the sole App picker.
+      // Preserve existing pills but never overwrite a real composer draft.
+      if (ADAPTER.getComposerTextWithoutAppPills() !== '') {
+        return { ok: false, error: 'required-app-not-found' };
       }
-      if (!candidates.length
-          && ADAPTER.needsMainWorldInsert
-          && !composerModelVisibleText()
-          && ADAPTER.getSelectedComposerApps().length === 0) {
-        const selector = ADAPTER.getWatchMainWorldSelector();
-        const search = selector ? await insertMainWorld(app, selector) : null;
-        if (search?.ok) {
-          searchInserted = true;
-          const searchDeadline = Date.now() + 3000;
-          do {
-            await wait(100);
-            candidates = ADAPTER.getComposerAppCandidates(app);
-            if (candidates.length) break;
-          } while (Date.now() < searchDeadline);
+      let searchInserted = false;
+      // ChatGPT only opens native mention suggestions for a focused editor in a
+      // focused document. Live 0.1.176 evidence: `@herdr` committed but no
+      // suggestion root of any kind appeared. Bring this task tab's window to
+      // the foreground once before typing; no other tab is touched.
+      if (typeof document.hasFocus === 'function' && !document.hasFocus()) {
+        await new Promise((resolve) => {
+          try {
+            chrome.runtime.sendMessage({ type: 'h2w_focus_own_tab' }, () => {
+              void chrome.runtime.lastError;
+              resolve();
+            });
+          } catch (_) { resolve(); }
+        });
+        const focusDeadline = Date.now() + 1500;
+        while (!document.hasFocus() && Date.now() < focusDeadline) await wait(100);
+      }
+      try { ADAPTER.getInputEl()?.focus(); } catch (_) {}
+      const selector = ADAPTER.getWatchMainWorldSelector();
+      // Insert @ then the keyword as separate editor events so ChatGPT can
+      // activate and filter its native mention suggestions.
+      // Buttons that already match before typing are never suggestion rows.
+      const suggestionBaseline = new Set(typeof ADAPTER.getComposerAppSuggestionButtons === 'function'
+        ? ADAPTER.getComposerAppSuggestionButtons(app)
+        : []);
+      // Prefer trusted keystrokes (DEV only): ChatGPT opens its native mention
+      // picker only for real key input. Fall back to editor insertion when the
+      // trusted path is unavailable (store builds).
+      const trusted = selector && ADAPTER.getSelectedComposerApps().length === 0
+        ? await new Promise((resolve) => {
+          try {
+            chrome.runtime.sendMessage({ type: 'h2w_type_trusted_mention', keyword: app }, (resp) => {
+              if (chrome.runtime.lastError || !resp) resolve({ ok: false, error: 'no-response' });
+              else resolve(resp);
+            });
+          } catch (_) { resolve({ ok: false, error: 'no-response' }); }
+        })
+        : { ok: false, error: 'trusted-input-skipped' };
+      if (trusted.ok) {
+        searchInserted = true;
+      } else {
+        if (ADAPTER.getComposerTextWithoutAppPills() !== '') {
+          // A failed trusted attempt may have typed part of the search text.
+          await clearComposer();
+        }
+        const prefix = selector ? await insertMainWorld('@', selector, ADAPTER.getSelectedComposerApps().length > 0) : null;
+        if (!prefix?.ok) return { ok: false, error: 'required-app-not-found' };
+        searchInserted = true;
+        await wait(100);
+        const search = await insertMainWorld(app, selector, true);
+        if (!search?.ok) {
+          await clearComposer();
+          return { ok: false, error: 'required-app-not-found' };
         }
       }
+      let candidates = [];
+      const searchDeadline = Date.now() + 3000;
+      do {
+        await wait(100);
+        candidates = ADAPTER.getComposerAppCandidates(app);
+        if (!candidates.length && typeof ADAPTER.getComposerAppSuggestionButtons === 'function') {
+          candidates = ADAPTER.getComposerAppSuggestionButtons(app)
+            .filter((button) => !suggestionBaseline.has(button));
+        }
+        if (candidates.length) break;
+      } while (Date.now() < searchDeadline);
+      // Capture fixed-shape DOM diagnostics before any cleanup so a rejection
+      // carries evidence of why the native suggestion was not usable.
+      const probeAppSearch = () => (typeof ADAPTER.describeComposerAppSearch === 'function'
+        ? ADAPTER.describeComposerAppSearch(app)
+        : null);
       if (candidates.length !== 1) {
-        if (searchInserted) await clearComposer();
-        return { ok: false, error: candidates.length ? 'required-app-ambiguous' : 'required-app-not-found' };
+        const probe = probeAppSearch();
+        if (searchInserted) await clearAutomationSearch(app);
+        return {
+          ok: false,
+          error: candidates.length ? 'required-app-ambiguous' : 'required-app-not-found',
+          app_selection_probe: probe ? {
+            ...probe,
+            // Fixed-vocabulary outcome of the trusted key path.
+            trusted_input: trusted.ok ? 'ok' : String(trusted.error || 'unknown').slice(0, 120),
+          } : probe,
+        };
       }
-      candidates[0].click();
-      const selectedDeadline = Date.now() + 2500;
+      {
+        // Suggestion rows may act on mousedown (to keep editor focus), so emit
+        // the full pointer sequence on the single verified candidate.
+        const target = candidates[0];
+        const opts = { bubbles: true, cancelable: true, view: window, button: 0 };
+        try {
+          target.dispatchEvent(new PointerEvent('pointerdown', opts));
+          target.dispatchEvent(new MouseEvent('mousedown', opts));
+          target.dispatchEvent(new PointerEvent('pointerup', opts));
+          target.dispatchEvent(new MouseEvent('mouseup', opts));
+        } catch (_) {}
+        if (target.isConnected) target.click();
+      }
+      const selectedDeadline = Date.now() + 4000;
       while (Date.now() < selectedDeadline) {
         if (ADAPTER.getSelectedComposerApps().includes(app)) break;
         await wait(100);
       }
-      if (!ADAPTER.getSelectedComposerApps().includes(app)) {
-        if (searchInserted) await clearComposer();
-        return { ok: false, error: 'required-app-selection-not-observed' };
+      if (!ADAPTER.getSelectedComposerApps().includes(app)
+          || ADAPTER.getComposerTextWithoutAppPills() !== '') {
+        const probe = probeAppSearch();
+        if (searchInserted) await clearAutomationSearch(app);
+        return { ok: false, error: 'required-app-selection-not-observed', app_selection_probe: probe };
       }
     }
     const selected = ADAPTER.getSelectedComposerApps();
     return { ok: requested.every((app) => selected.includes(app)), apps: selected };
   }
 
-  function captureSubmitAckBaseline(sendButton = null) {
+  function captureSubmitAckBaseline(sendButton = null, options = {}) {
+    const chatGpt = ADAPTER.name === "chatgpt";
+    const composer = composerNorm();
+    const messageText = chatGpt && typeof ADAPTER.getComposerTextWithoutAppPills === "function"
+      ? normText(ADAPTER.getComposerTextWithoutAppPills())
+      : "";
+    const selectedApps = chatGpt && typeof ADAPTER.getSelectedComposerApps === "function"
+      ? ADAPTER.getSelectedComposerApps()
+      : [];
+    const requiredApps = (Array.isArray(options.requiredApps) ? options.requiredApps : [])
+      .map((app) => String(app || "").trim().toLowerCase())
+      .filter(Boolean);
     return {
-      composer: composerNorm(),
+      composer,
+      messageText: messageText || composer,
+      selectedApps: [...new Set([...selectedApps, ...requiredApps])],
       sendButton,
-      href: location.href,
-      userTurn: ADAPTER.name === "chatgpt" ? latestTurnForRole("user") : null,
+      convKey: chatGpt ? ADAPTER.getConversationKey() : null,
+      creatingSession: options.creatingSession === true,
+      expectedConvKey: typeof options.expectedConvKey === "string" ? options.expectedConvKey : null,
+      userTurn: chatGpt ? latestTurnForRole("user") : null,
     };
   }
 
@@ -935,21 +1066,23 @@ function normalizeHerdrMentionAlias(value) {
     // ChatGPT may transiently clear and restore the composer while a submit is
     // still rejected upstream, so empty input alone is not provider acceptance.
     // React may also replace the Send button while the composer is rerendering;
-    // that node transition alone is not provider acceptance. Require a stronger
-    // post-submit signal before stopping retries: navigation to the new ChatGPT
-    // conversation or a matching user turn. A transient busy/generating control
-    // is not sufficient because ChatGPT can show it before provider acceptance.
-    if (baseline?.href && location.href !== baseline.href) return true;
+    // that node transition alone is not provider acceptance, and neither is a
+    // URL change by itself: navigation only counts when the landed conversation
+    // holds exactly the turn this submit inserted.
     const latestUser = latestTurnForRole("user");
-    if (latestUser && latestUser !== baseline?.userTurn) {
-      const latestText = normText(latestUser.innerText || latestUser.textContent || "");
-      const sentText = String(baseline?.composer || "");
-      if (latestText && sentText
-        && (latestText.includes(sentText.slice(0, 120)) || sentText.includes(latestText.slice(0, 120)))) {
-        return true;
-      }
+    if (!latestUser || latestUser === baseline?.userTurn) return false;
+    const latestText = normText(latestUser.innerText || latestUser.textContent || "");
+    if (!providerUserTextMatchesSubmitted(latestText, baseline)) return false;
+    const convKey = ADAPTER.getConversationKey();
+    if (baseline?.expectedConvKey) {
+      // A runtime-targeted dispatch must still be on the conversation it named.
+      return convKey === baseline.expectedConvKey;
     }
-    return false;
+    if (baseline?.creatingSession) {
+      // A create leaves its launcher for a brand-new conversation by design.
+      return Boolean(convKey) && convKey !== baseline.convKey;
+    }
+    return true;
   }
 
   async function waitForSubmitAck(baseline, timeoutMs) {
@@ -961,7 +1094,7 @@ function normalizeHerdrMentionAlias(value) {
     return submitWasAccepted(baseline);
   }
 
-  async function submitBrowserActuationOnce() {
+  async function submitBrowserActuationOnce(options = {}) {
     if (isComposerGenerating()) {
       return { ok: false, attempted: false, error: "composer-busy" };
     }
@@ -980,7 +1113,7 @@ function normalizeHerdrMentionAlias(value) {
     if (!isSendButton(btn)) {
       return { ok: false, attempted: false, error: "submit-unavailable" };
     }
-    const baseline = captureSubmitAckBaseline(btn);
+    const baseline = captureSubmitAckBaseline(btn, options);
     const input = ADAPTER.getInputEl();
     if (!input) {
       return { ok: false, attempted: false, error: "submit-input-unavailable" };
@@ -1001,10 +1134,27 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
+  // ChatGPT must dispatch at most one provider mutation per wake invocation.
+  // `submitBrowserActuationOnce` performs exactly one Enter submit and reports
+  // `attempted`/`uncertain`, so every ChatGPT caller (MCP dispatch, handoff,
+  // queue, recovery, generic wake) can keep an unproven acknowledgement honest
+  // instead of retrying it into a duplicate provider user message. `submit()`, 
+  // `submitTextarea()`, and `submitAfterPermissionClick()` keep their bounded
+  // retry loop only for non-ChatGPT adapters.
+  async function submitChatGptOnce(options = {}) {
+    await waitForComposerIdle(4000);
+    return submitBrowserActuationOnce(options);
+  }
+
   // ---- Submission ----
   // For contenteditable sites, wait for an enabled send button because ProseMirror
   // often consumes synthetic keyboard events. ChatGPT success requires durable
   // conversation navigation or a matching new user turn, not transient composer UI.
+  //
+  // A permission click may already have submitted the turn. The single Send click
+  // below is the only dispatch; there is deliberately no Enter fallback, because a
+  // second submit primitive after an unproven acknowledgement can create a
+  // duplicate provider user message. An unconfirmed click stays unconfirmed.
   async function submitAfterPermissionClick() {
     if (!lastPermClickAt || Date.now() - lastPermClickAt > 6000) return false;
     await wait(1200);
@@ -1015,13 +1165,11 @@ function normalizeHerdrMentionAlias(value) {
       btn.click();
       if (await waitForSubmitAck(baseline, ADAPTER.policy?.submitAckTimeoutMs ?? 4000)) return true;
     }
-    const enterBaseline = captureSubmitAckBaseline(findSendButton());
-    dispatchEnterSubmit(ADAPTER.getInputEl());
-    if (await waitForSubmitAck(enterBaseline, 3000)) return true;
     return false;
   }
 
   async function submitTextarea() {
+    if (ADAPTER.name === "chatgpt") return (await submitChatGptOnce()).ok === true;
     await waitForComposerIdle();
     await wait(420);
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -1044,6 +1192,8 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function submit() {
+    // ChatGPT is single-shot: exactly one dispatch primitive per invocation.
+    if (ADAPTER.name === "chatgpt") return (await submitChatGptOnce()).ok === true;
     if (ADAPTER.needsMainWorldInsert) {
       await waitForComposerIdle();
       const postInsertMs = Math.min(1200, 350 + Math.floor((ADAPTER.getInputEl()?.innerText?.length || 0) / 40) * 50);
@@ -1152,6 +1302,13 @@ function normalizeHerdrMentionAlias(value) {
   let lastWakeNorm = "";
   let lastWakeAt = 0;
   let lastFailedWakeNorm = "";
+  // One ChatGPT submit that provably dispatched a provider mutation but could
+  // not be confirmed may already have created the user turn. Retrying that exact
+  // text would create a duplicate, so the uncertainty is terminal for this
+  // document until the page state is rebuilt (reload/navigation) or the turn is
+  // observed. The latch is the cross-caller guard for handoff, queue, recovery,
+  // and generic wake; an uncertain ack is never re-sent.
+  let uncertainSubmitWakeNorm = "";
   function noteWakeResult(textNorm, sent) {
     if (sent) {
       lastWakeNorm = textNorm;
@@ -1160,6 +1317,12 @@ function normalizeHerdrMentionAlias(value) {
     } else if (textNorm) {
       lastFailedWakeNorm = textNorm;
     }
+  }
+  function noteUncertainSubmit(textNorm) {
+    if (textNorm) uncertainSubmitWakeNorm = textNorm;
+  }
+  function clearUncertainSubmit(textNorm) {
+    if (!textNorm || uncertainSubmitWakeNorm === textNorm) uncertainSubmitWakeNorm = "";
   }
   async function performWake(data) {
     if (!runtimeAlive()) return { ok: false, error: "context-invalidated" };
@@ -1182,6 +1345,19 @@ function normalizeHerdrMentionAlias(value) {
       .map((app) => normalizeHerdrMentionAlias(app).toLowerCase())
       .filter(Boolean))];
     // Short-window deduplication prevents repeated insertion from retries or duplicate timers.
+    if (ADAPTER.name === "chatgpt" && uncertainSubmitWakeNorm && uncertainSubmitWakeNorm === n) {
+      // An earlier submit for this exact text dispatched without confirmation.
+      // Report the same uncertainty instead of sending a second provider turn.
+      return {
+        ok: false,
+        blocked: "submit-uncertain",
+        uncertain: true,
+        attempted: true,
+        committed: true,
+        site: ADAPTER.name,
+        error: "submit-unconfirmed",
+      };
+    }
     if (!data.queueInsert && n && n === lastWakeNorm && Date.now() - lastWakeAt < 8000) {
       return { ok: false, blocked: "dedupe" };
     }
@@ -1206,6 +1382,35 @@ function normalizeHerdrMentionAlias(value) {
       // leave a Herdr tool invocation waiting for a manual Allow click.
       startPermissionWatch();
 
+      // Route every ChatGPT submission through the single-shot path and return its
+      // honest outcome: `attempted` records that a provider mutation was
+      // dispatched and `uncertain` that it could not be confirmed. Non-ChatGPT
+      // adapters keep their bounded retry loop. An uncertain ChatGPT submit is
+      // latched so this exact text is never re-sent; handoff, queue, recovery, and
+      // generic wake all observe the same guard.
+      const submitWakeText = async () => {
+        if (ADAPTER.name === "chatgpt") {
+          const outcome = await submitChatGptOnce({
+            creatingSession: data.browserSessionCreate === true,
+            expectedConvKey: data.expectedConvKey ?? null,
+            requiredApps,
+          });
+          noteWakeResult(n, outcome.ok);
+          if (outcome.ok) {
+            clearUncertainSubmit(n);
+            return { ok: true, committed: true, site: ADAPTER.name };
+          }
+          if (outcome.attempted === true) {
+            noteUncertainSubmit(n);
+            return { ...outcome, uncertain: true, committed: true, site: ADAPTER.name };
+          }
+          return { ...outcome, committed: true, site: ADAPTER.name };
+        }
+        const sent = await submit();
+        noteWakeResult(n, sent);
+        return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+      };
+
       // z.ai/DeepSeek JSON bridge intentionally intercepts normal user submits
       // so it can add the Herdr tool protocol. Handoff prompts and seeds are
       // continuity-control messages, not agent tasks; send them through the
@@ -1229,14 +1434,7 @@ function normalizeHerdrMentionAlias(value) {
             };
           }
         }
-        if (boundedBrowserActuation) {
-          const outcome = await submitBrowserActuationOnce();
-          noteWakeResult(n, outcome.ok);
-          return { ...outcome, committed: true, resumed: true, site: ADAPTER.name };
-        }
-        const sent = await submit();
-        noteWakeResult(n, sent);
-        return { ok: sent, committed: true, resumed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+        return { ...(await submitWakeText()), resumed: true };
       }
 
       if (clearBeforeInsert) await clearComposer();
@@ -1282,14 +1480,7 @@ function normalizeHerdrMentionAlias(value) {
             selectedApps: appSelection.apps || [],
           };
         }
-        if (boundedBrowserActuation) {
-          const outcome = await submitBrowserActuationOnce();
-          noteWakeResult(n, outcome.ok);
-          return { ...outcome, committed: true, site: ADAPTER.name };
-        }
-        const sent = await submit();
-        noteWakeResult(n, sent);
-        return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+        return await submitWakeText();
       }
 
       const el = ADAPTER.getInputEl();
@@ -1298,10 +1489,9 @@ function normalizeHerdrMentionAlias(value) {
       el.style.opacity = "0";
       ADAPTER.fillInput(text);
       await wait(420); // React-controlled inputs commit value asynchronously.
-      const sent = await submit();
+      const submission = await submitWakeText();
       setTimeout(() => { if (el) el.style.opacity = oldOpacity ?? ""; }, 600);
-      noteWakeResult(n, sent);
-      return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+      return submission;
     } finally {
       wakeInFlight = false;
     }
@@ -1580,6 +1770,36 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
+  // Fixed-shape, non-sensitive busy diagnostics: booleans and lengths only,
+  // never composer or page text.
+  function composerBusyProbe() {
+    try {
+      const input = ADAPTER.getInputEl();
+      const raw = input ? String(input.innerText || input.textContent || "").replace(/\u200b/g, "").trim() : "";
+      const placeholder = input
+        ? String(input.querySelector("[data-placeholder]")?.getAttribute("data-placeholder")
+          || input.getAttribute("aria-placeholder") || input.getAttribute("placeholder") || "").trim()
+        : "";
+      return {
+        input_mounted: Boolean(input),
+        input_has_content: Boolean(ADAPTER.inputHasContent()),
+        input_text_length: Math.min(raw.length, 10000),
+        input_text_equals_placeholder: Boolean(placeholder) && raw === placeholder,
+        input_has_placeholder_node: Boolean(input?.querySelector?.(".placeholder, [data-placeholder]")),
+        app_pill_count: Math.min(input ? input.querySelectorAll("[data-inline-selection-pill]").length : 0, 50),
+        stop_control: stopButtons().length > 0,
+        assistant_streaming: Boolean(assistantStreaming()),
+        assistant_tools_in_progress: Boolean(assistantToolsInProgress()),
+        busy_reason: composerBusyReason(),
+        stop_candidate_raw_count: typeof ADAPTER.getStopButtonCandidates === "function"
+          ? Math.min(ADAPTER.getStopButtonCandidates().length, 50) : null,
+        ...(typeof ADAPTER.composerBusyProbeDetail === "function" ? ADAPTER.composerBusyProbeDetail() : {}),
+      };
+    } catch (_) {
+      return { probe_failed: true };
+    }
+  }
+
   function browserRejectedEvidence(evidence, reason) {
     const safeReason = typeof reason === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(reason)
       ? reason
@@ -1609,22 +1829,102 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
-  function exactDomAcceptedUserMessageRef(beforeDom, afterDom, message) {
+  // The exact Unicode White_Space set Rust `str::trim()` / `split_whitespace()`
+  // use. It is written out because JS `String.prototype.trim()` and `\s` differ
+  // from Rust: JS trims U+FEFF but not U+0085 (NEL); Rust does the opposite.
+  // Keeping the two languages on one explicit class is what makes the reported
+  // acceptance digests comparable to the runtime's own hashes.
+  const ACCEPTANCE_WHITESPACE = "\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+  const ACCEPTANCE_WHITESPACE_CLASS = `[${ACCEPTANCE_WHITESPACE}]`;
+  const ACCEPTANCE_TRIM_RE = new RegExp(`^${ACCEPTANCE_WHITESPACE_CLASS}+|${ACCEPTANCE_WHITESPACE_CLASS}+$`, "g");
+  const ACCEPTANCE_SPLIT_RE = new RegExp(`${ACCEPTANCE_WHITESPACE_CLASS}+`, "gu");
+
+  // Acceptance trim. Mirrors Rust `str::trim()` exactly (see above); never use
+  // `String.prototype.trim()` for text whose digest must equal the runtime's.
+  function acceptanceTrim(text) {
+    return String(text ?? "").replace(ACCEPTANCE_TRIM_RE, "");
+  }
+
+  // Whitespace-canonical comparison form for exact submit acceptance. Mirrors
+  // the runtime `browser_readback_text_canonical` (crates/herdr-mcp/src/mcp.rs):
+  // NBSP/BOM become spaces and every Unicode White_Space run collapses to one
+  // space, using the same class Rust `split_whitespace()` uses.
+  function canonicalAcceptanceText(text) {
+    return String(text || "").replace(/[\u00a0\ufeff]/g, " ")
+      .split(ACCEPTANCE_SPLIT_RE).filter(Boolean).join(" ");
+  }
+
+  // Strip only leading `@?<app>` mention tokens the caller named, matching the
+  // normalization the runtime late-acceptance readback applies to the stored
+  // body before hashing.
+  function stripLeadingAppMentionTokens(text, apps) {
+    let body = String(text || "");
+    const names = (Array.isArray(apps) ? apps : [])
+      .map((app) => String(app || "").trim().toLowerCase())
+      .filter((app) => /^[a-z0-9_-]{1,64}$/.test(app));
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const name of names) {
+        const match = body.match(new RegExp(`^@?${name}(?:${ACCEPTANCE_WHITESPACE_CLASS}+|$)`, "i"));
+        if (match) { body = body.slice(match[0].length); changed = true; }
+      }
+    }
+    return body;
+  }
+
+  // Exact submit acceptance. The provider user text must equal what was
+  // submitted on the whitespace-canonical form; a short prefix overlap is never
+  // enough because a foreign turn can occur inside the outgoing prompt.
+  function providerUserTextMatchesSubmitted(observedText, baseline) {
+    if (!baseline) return false;
+    const observed = canonicalAcceptanceText(observedText);
+    if (!observed) return false;
+    const submitted = canonicalAcceptanceText(baseline.messageText);
+    const composer = canonicalAcceptanceText(baseline.composer);
+    if (submitted && observed === submitted) return true;
+    if (composer && observed === composer) return true;
+    if (!submitted) return false;
+    return canonicalAcceptanceText(stripLeadingAppMentionTokens(observedText, baseline.selectedApps)) === submitted;
+  }
+
+  // sha256 digests of the exact accepted provider user text so the runtime can
+  // re-verify acceptance instead of trusting this content script's detection.
+  // Any failure returns no digests, and the runtime then stays uncertain.
+  async function providerAcceptanceDigests(observedText, apps) {
+    try {
+      const hex = async (text) => [...new Uint8Array(await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(text),
+      ))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      const full = acceptanceTrim(observedText);
+      const body = acceptanceTrim(stripLeadingAppMentionTokens(full, apps));
+      if (!full || !body) return {};
+      return {
+        accepted_user_text_sha256: await hex(full),
+        accepted_user_body_sha256: await hex(body),
+        accepted_user_text_canonical_sha256: await hex(canonicalAcceptanceText(full)),
+        accepted_user_body_canonical_sha256: await hex(canonicalAcceptanceText(body)),
+        accepted_user_text_length: full.length,
+        accepted_user_body_length: body.length,
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function exactDomAcceptedUserMessageRef(beforeDom, afterDom, message, requiredApps = []) {
     if (afterDom?.exactMessageId !== true
         || typeof afterDom.messageId !== "string"
         || !afterDom.messageId
         || afterDom.messageId === beforeDom?.messageId) {
       return null;
     }
-    const observed = String(afterDom.text || "").replace(/\s+/g, " ").trim();
-    const expected = String(message || "").replace(/\s+/g, " ").trim();
-    if (!observed || !expected) return null;
-    const expectedPrefix = expected.slice(0, 120);
-    const observedPrefix = observed.slice(0, 120);
-    if (!observed.includes(expectedPrefix) && !expected.includes(observedPrefix)) {
-      return null;
-    }
-    return afterDom.messageId;
+    const matches = providerUserTextMatchesSubmitted(afterDom.text, {
+      messageText: message,
+      composer: "",
+      selectedApps: requiredApps,
+    });
+    return matches ? afterDom.messageId : null;
   }
 
   function providerCanonicalConversationObserved() {
@@ -1644,15 +1944,27 @@ function normalizeHerdrMentionAlias(value) {
     )) || null;
   }
 
+  // Radix dropdown triggers open on pointerdown, not on a bare click() (live
+  // 0.1.177 evidence: header `更多` click() left the menu closed). Send the
+  // pointer sequence a real primary-button press produces, then click.
+  function pressMenuTrigger(button) {
+    const init = { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerType: "mouse", isPrimary: true };
+    try { button.dispatchEvent(new PointerEvent("pointerdown", init)); } catch (_) {}
+    try { button.dispatchEvent(new MouseEvent("mousedown", init)); } catch (_) {}
+    try { button.dispatchEvent(new PointerEvent("pointerup", { ...init, buttons: 0 })); } catch (_) {}
+    try { button.dispatchEvent(new MouseEvent("mouseup", { ...init, buttons: 0 })); } catch (_) {}
+    if (button.getAttribute("aria-expanded") !== "true") button.click();
+  }
+
   async function openChatGptArchiveMenu() {
     const moreLabels = /^(更多|More|その他)$/i;
-    const buttons = [...document.querySelectorAll('button[aria-label]')];
+    const buttons = [...document.querySelectorAll('button[aria-haspopup="menu"], button[aria-label]')];
     const headerMore = buttons.find((button) => (
       ADAPTER.elementVisible(button)
-      && moreLabels.test(normText(button.getAttribute("aria-label") || ""))
+      && moreLabels.test(normText(button.getAttribute("aria-label") || button.textContent || ""))
     ));
     if (headerMore) {
-      headerMore.click();
+      pressMenuTrigger(headerMore);
       const deadline = Date.now() + 1500;
       do {
         const item = visibleChatGptArchiveMenuItem();
@@ -1669,7 +1981,7 @@ function normalizeHerdrMentionAlias(value) {
         && /(?:对话选项|conversation options|chat options|チャット.*オプション)/i.test(label);
     });
     if (!options) return null;
-    options.click();
+    pressMenuTrigger(options);
     const deadline = Date.now() + 1500;
     do {
       const item = visibleChatGptArchiveMenuItem();
@@ -1807,8 +2119,21 @@ function normalizeHerdrMentionAlias(value) {
     if (existing?.ok && existing?.body?.is_archived === true) {
       return { outcome: "applied", delivered: false, alreadyArchived: true };
     }
+    // A rate-limited preflight read is not evidence of current state, so the
+    // archive must not proceed to a mutation it could not verify afterwards.
+    // Reject before the one-shot claim is taken; nothing was mutated.
+    if (existing?.status === 429 || existing?.reason === "http-429") {
+      return { outcome: "rejected", delivered: false, rateLimited: true };
+    }
+    // Some conversations (live: uncertain-create workers J1/K1/A1) never expose
+    // the header options menu. Fall back to ChatGPT's own conversation PATCH
+    // (the same endpoint title projection uses), under the same one-shot claim.
     const archive = await openChatGptArchiveMenu();
-    if (!archive) return { outcome: "rejected", delivered: false };
+    const viaApi = !archive;
+    if (viaApi && (typeof readChatGptAccessToken !== "function"
+        || !(await readChatGptAccessToken(4000).catch(() => null)))) {
+      return { outcome: "rejected", delivered: false };
+    }
     // Converge the one-shot rule here, before the real click: persist and verify
     // the delivery claim first, so a reload or same-key re-entry inside the
     // click/poll window cannot replay it and an unpersistable claim never
@@ -1824,7 +2149,40 @@ function normalizeHerdrMentionAlias(value) {
         : { outcome: "rejected", delivered: false };
     }
     try {
-      archive.click();
+      if (viaApi) {
+        const token = String(await readChatGptAccessToken(4000) || "");
+        if (!token || token.length > 4096) return { outcome: "uncertain", delivered: true };
+        let response = null;
+        try {
+          response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+            method: "PATCH",
+            credentials: "include",
+            cache: "no-store",
+            redirect: "error",
+            headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${token}` },
+            body: JSON.stringify({ is_archived: true }),
+          });
+        } catch (_) {
+          // The request may have reached the provider before the transport
+          // failed; the one-shot claim is already persisted, so stay uncertain
+          // and never re-mutate.
+          return { outcome: "uncertain", delivered: true };
+        }
+        if (response?.ok !== true) {
+          const status = Number(response?.status || 0);
+          // 429 and 5xx mean the provider may have applied the archive before
+          // throttling or failing the response: delivered but unproven. The
+          // one-shot claim keeps this terminal, so it is never re-mutated.
+          if (status === 429 || status >= 500 || status === 0) {
+            return { outcome: "uncertain", delivered: true };
+          }
+          // A definitive non-429 4xx rejection was not applied. The claim is
+          // already persisted, so the same logical archive is not replayed.
+          return { outcome: "rejected", delivered: true, rejectedStatus: status };
+        }
+      } else {
+        archive.click();
+      }
     } catch (_) {
       return { outcome: "uncertain", delivered: true };
     }
@@ -1928,7 +2286,10 @@ function normalizeHerdrMentionAlias(value) {
       generation: registeredBrowserGeneration,
     }, { durableAuthority });
     if (attempt.outcome === "rejected") {
-      return browserRejectedEvidence(evidence, "browser_archive_control_unavailable");
+      return browserRejectedEvidence(
+        evidence,
+        attempt.rateLimited === true ? "rate_limited" : "browser_archive_control_unavailable",
+      );
     }
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
@@ -1958,10 +2319,18 @@ function normalizeHerdrMentionAlias(value) {
     }
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
-    const readback = await fetchChatGptConversation({
-      conversationId,
-      timeoutMs: 2500,
-    }).catch(() => ({ ok: false }));
+    // Late-acceptance readback runs right after a slow create, while the
+    // conversation may still be streaming; give it a longer bounded window
+    // and one retry. Plain archive-status keeps its short budget.
+    const lateReadback = params.readback_accepted === true;
+    let readback = null;
+    for (let attempt = 0; attempt < (lateReadback ? 2 : 1); attempt += 1) {
+      readback = await fetchChatGptConversation({
+        conversationId,
+        timeoutMs: lateReadback ? 10000 : 2500,
+      }).catch(() => ({ ok: false }));
+      if (readback?.ok) break;
+    }
     if (readback?.ok && typeof readback?.body?.is_archived === "boolean") {
       evidence.lifecycle_observed = true;
       evidence.result = {
@@ -1969,6 +2338,68 @@ function normalizeHerdrMentionAlias(value) {
         archive_state: readback.body.is_archived ? "archived" : "active",
         readback_source: "conversation",
       };
+      if (params.readback_accepted === true) {
+        // Late-acceptance readback for an uncertain session.create: report the
+        // conversation's only user message id plus a digest of its text, so
+        // the runtime can match it to the exact create message without resend.
+        // More than one user message means the identity is ambiguous: omit.
+        // Live H1: ChatGPT also stores hidden user-role context nodes (for the
+        // selected App) next to the typed message, so count only visible text
+        // user messages, and hash only their string parts.
+        // The archive readback above is the conversations *list* item (no
+        // mapping). Fetch the conversation detail once for the user turn.
+        const detail = await fetchChatGptConversationDetail({ conversationId, timeoutMs: 10000 })
+          .catch(() => ({ ok: false }));
+        if (!detail?.ok) {
+          const detailError = String(detail?.reason || detail?.error || "");
+          evidence.result.readback_detail_error = /^[a-z0-9_-]{1,48}$/.test(detailError) ? detailError : "unavailable";
+        }
+        const allUsers = Object.values((detail?.ok && detail.body?.mapping) || {})
+          .map((node) => node?.message)
+          .filter((message) => message?.author?.role === "user" && typeof message?.id === "string");
+        const users = allUsers.filter((message) => message?.metadata?.is_visually_hidden_from_conversation !== true
+          && (message?.content?.content_type === "text" || message?.content?.content_type === "multimodal_text")
+          && Array.isArray(message?.content?.parts)
+          && message.content.parts.some((part) => typeof part === "string" && part.trim()));
+        evidence.result.readback_user_counts = { all: allUsers.length, visible: users.length };
+        const parts = users.length === 1 ? users[0].content.parts.filter((part) => typeof part === "string") : null;
+        if (parts && parts.length) {
+          try {
+            const hex = async (text) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))]
+              .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+            // The stored text can carry the selected App mention as a leading
+            // token (live E1: `herdr` pill before the body). Strip only exact
+            // required-App tokens the runtime named, then trim.
+            const apps = (Array.isArray(params.required_apps) ? params.required_apps : [])
+              .filter((app) => typeof app === "string" && /^[a-z0-9_-]{1,64}$/.test(app));
+            const full = acceptanceTrim(parts.join(""));
+            const body = acceptanceTrim(stripLeadingAppMentionTokens(full, apps));
+            evidence.result.accepted_user_message_ref = users[0].id;
+            // App identity for late acceptance must come from the same accepted
+            // provider message as the ref and the digests above, and only from
+            // provider-owned inline mentions with a non-empty path. When it
+            // cannot be proven, the runtime keeps the reservation Uncertain
+            // rather than accepting an unverified App.
+            const acceptedApps = (typeof ADAPTER.getAcceptedUserAppIdentity === "function")
+              ? ADAPTER.getAcceptedUserAppIdentity(users[0].id)
+              : [];
+            evidence.required_apps_readback = Array.isArray(acceptedApps)
+              ? acceptedApps.map((app) => app.name)
+              : [];
+            if (acceptedApps.length) evidence.result.accepted_user_apps = acceptedApps;
+            evidence.result.accepted_user_text_sha256 = await hex(full);
+            evidence.result.accepted_user_body_sha256 = await hex(body);
+            // Whitespace-canonical digests: ChatGPT re-renders composer line
+            // breaks when storing the turn. Mirrors the runtime's
+            // browser_readback_text_canonical through the same shared helpers
+            // used for the submit acceptance digests.
+            evidence.result.accepted_user_text_canonical_sha256 = await hex(canonicalAcceptanceText(full));
+            evidence.result.accepted_user_body_canonical_sha256 = await hex(canonicalAcceptanceText(body));
+            evidence.result.accepted_user_text_length = full.length;
+            evidence.result.accepted_user_body_length = body.length;
+          } catch (_) {}
+        }
+      }
       return evidence;
     }
     const archivedList = await fetchChatGptArchivedConversationList({
@@ -1991,6 +2422,9 @@ function normalizeHerdrMentionAlias(value) {
     }
     evidence.lifecycle_observed = false;
     evidence.result = { error: "browser_archive_status_readback_unavailable" };
+    const readbackError = String(readback?.reason || readback?.error || "");
+    if (/^[a-z0-9_-]{1,48}$/.test(readbackError)) evidence.result.readback_error = readbackError;
+    if (Number.isSafeInteger(readback?.retryAfterS)) evidence.result.readback_retry_after_s = readback.retryAfterS;
     return evidence;
   }
 
@@ -2153,17 +2587,21 @@ function normalizeHerdrMentionAlias(value) {
       }
       if (freshCreateStableIdleSamples < 3) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
-        return browserRejectedEvidence(evidence, "browser_create_composer_busy");
+        const busy = browserRejectedEvidence(evidence, "browser_create_composer_busy");
+        busy.result.composer_busy_probe = composerBusyProbe();
+        return busy;
       }
     }
     if ((!creatingSession && isTurnInProgress()) || ADAPTER.inputHasContent()) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
-      return browserRejectedEvidence(
+      const busy = browserRejectedEvidence(
         evidence,
         creatingSession ? "browser_create_composer_busy" : "browser_dispatch_composer_busy",
       );
+      busy.result.composer_busy_probe = composerBusyProbe();
+      return busy;
     }
 
     if (requiredApps.length > 0) {
@@ -2172,9 +2610,16 @@ function normalizeHerdrMentionAlias(value) {
         if (creatingSession) {
           try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
         }
-        return { ...evidence, rejected: true, result: { error: appSelection.error } };
+        return {
+          ...evidence,
+          rejected: true,
+          result: { error: appSelection.error, app_selection_probe: appSelection.app_selection_probe || null },
+        };
       }
-      evidence.required_apps_readback = appSelection.apps;
+      // The selected-composer readback is intentionally not reported as
+      // delivery evidence: the App identity that satisfies the runtime must come
+      // from the accepted provider user message below, not from a pre-submit
+      // composer pill that may never have landed in the turn.
     }
 
     const exactChatGptDispatchIdentity = ADAPTER.name === "chatgpt"
@@ -2189,10 +2634,13 @@ function normalizeHerdrMentionAlias(value) {
       : { ok: false };
     const beforeDom = providerMessageSnapshot("user");
     const beforeAssistant = providerMessageSnapshot("assistant");
+    const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
     const result = await performWake({
       template: message,
       autoAllow: false,
       browserActuation: boundedChatGptSubmit,
+      browserSessionCreate: creatingSession,
+      expectedConvKey: command?.expectedConvKey ?? null,
       requiredApps,
     });
     if (!result?.ok) {
@@ -2205,51 +2653,110 @@ function normalizeHerdrMentionAlias(value) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
-      return browserRejectedEvidence(
+      let draftCleanup = null;
+      if (ADAPTER.name === "chatgpt") {
+        try { draftCleanup = await clearAutomationDraft(message); } catch (_) { draftCleanup = "clear_failed"; }
+      }
+      const rejectedEvidence = browserRejectedEvidence(
         evidence,
         creatingSession ? "browser_create_submit_failed" : "browser_dispatch_submit_failed",
       );
+      if (draftCleanup) rejectedEvidence.result.automation_draft_cleanup = draftCleanup;
+      return rejectedEvidence;
     }
     evidence.command_accepted = true;
 
-    const deadline = Date.now() + 6000;
+    // session.create waits longer for the exact accepted user-message ref: the
+    // first provider snapshot of a brand-new conversation can lag (live Phase 2
+    // A1 returned uncertain at 6s and was never promoted). The runtime create
+    // actuation timeout (80s) bounds this; a response after the caller's budget
+    // becomes a late completion that a same-key replay reconciles to applied.
+    const deadline = Date.now() + (creatingSession ? 20000 : 6000);
     do {
       const afterServer = ADAPTER.name === "chatgpt"
         ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
         : { ok: false };
       const afterDom = providerMessageSnapshot("user");
       const afterAssistant = providerMessageSnapshot("assistant");
+      const currentConvKey = ADAPTER.getConversationKey();
+      // A dispatch must still be in the conversation the runtime targeted. A
+      // create leaves its launcher for a brand-new conversation by design, so it
+      // instead requires that new canonical conversation to be open.
+      const conversationStillExpected = command?.expectedConvKey
+        ? currentConvKey === command.expectedConvKey
+        : (!creatingSession
+          || (Boolean(currentConvKey)
+            && currentConvKey !== entryConvKey
+            && providerCanonicalConversationObserved()));
+      // Acceptance is exact provider-user-text equality with the submitted
+      // message (whitespace-canonical, named App mention tokens stripped). A URL
+      // change, a newer message id, or a larger message count is never proof on
+      // its own.
+      const acceptanceBaseline = { messageText: message, composer: "", selectedApps: requiredApps };
+      const serverAfterUserMessageId = afterServer?.ok
+        && typeof afterServer.userMessageId === "string" && afterServer.userMessageId
+        ? afterServer.userMessageId : null;
+      const serverBeforeUserMessageId = beforeServer?.ok
+        && typeof beforeServer.userMessageId === "string" && beforeServer.userMessageId
+        ? beforeServer.userMessageId : null;
+      // A missing or failed before-snapshot is missing evidence, not
+      // advancement: a dispatch with no pre-submit provider id has no server
+      // proof of a new turn, and only a create accepts the first user turn of a
+      // conversation that did not exist before the submit.
       const serverAdvanced = Boolean(
-        afterServer?.ok
-        && afterServer.userMessageId
-        && afterServer.userMessageId !== beforeServer?.userMessageId,
+        serverAfterUserMessageId
+        && providerUserTextMatchesSubmitted(afterServer.userText, acceptanceBaseline)
+        && (serverBeforeUserMessageId
+          ? serverAfterUserMessageId !== serverBeforeUserMessageId
+          : creatingSession),
       );
-      const domAdvanced = Boolean(
-        afterDom?.messageId
-        && afterDom.messageId !== beforeDom?.messageId,
-      ) || Boolean(
-        afterDom.count > beforeDom.count,
-      ) || Boolean(
-        afterDom?.text
-        && afterDom.text !== beforeDom?.text
-        && (afterDom.text.includes(message.slice(0, 120)) || message.includes(afterDom.text.slice(0, 120))),
-      );
-      evidence.accepted_message_observed = serverAdvanced || domAdvanced;
-      evidence.message_baseline_advanced = domAdvanced;
-      evidence.canonical_url_observed = providerCanonicalConversationObserved();
-      const exactDomUserMessageRef = exactChatGptDispatchIdentity
-        ? exactDomAcceptedUserMessageRef(beforeDom, afterDom, message)
+      const exactDomUserMessageRef = ADAPTER.name === "chatgpt"
+        ? exactDomAcceptedUserMessageRef(beforeDom, afterDom, message, requiredApps)
         : null;
-      const acceptedUserMessageRef = exactChatGptDispatchIdentity
-        ? (serverAdvanced ? afterServer.userMessageId : exactDomUserMessageRef)
-        : ((afterServer?.ok ? afterServer.userMessageId : null) || afterDom?.messageId || null);
+      const domTurnChanged = Boolean(
+        (afterDom?.messageId && afterDom.messageId !== beforeDom?.messageId)
+        || Number(afterDom?.count || 0) > Number(beforeDom?.count || 0),
+      );
+      const domAdvanced = ADAPTER.name === "chatgpt"
+        ? Boolean(exactDomUserMessageRef)
+        : Boolean(domTurnChanged && providerUserTextMatchesSubmitted(afterDom?.text, acceptanceBaseline));
+      evidence.accepted_message_observed = Boolean(
+        conversationStillExpected && (serverAdvanced || domAdvanced),
+      );
+      evidence.message_baseline_advanced = Boolean(conversationStillExpected && domAdvanced);
+      evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      const acceptedUserMessageRef = !evidence.accepted_message_observed
+        ? null
+        : (serverAdvanced
+          ? afterServer.userMessageId
+          : (exactDomUserMessageRef || afterDom?.messageId || null));
       if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef) {
         // The existing actuation evidence.result object carries the exact
-        // provider user-message identity; no new top-level field is added.
-        evidence.result = { accepted_user_message_ref: acceptedUserMessageRef };
+        // provider user-message identity, the App identity of that same
+        // provider message, and the digests of the accepted provider text, so
+        // the runtime re-verifies acceptance instead of trusting this content
+        // script. No new top-level field is added and no message text leaves the
+        // page.
+        const acceptedApps = (ADAPTER.name === "chatgpt"
+          && typeof ADAPTER.getAcceptedUserAppIdentity === "function")
+          ? ADAPTER.getAcceptedUserAppIdentity(acceptedUserMessageRef)
+          : [];
+        // A requested App is satisfied only by the identity of the accepted
+        // provider message; plain text and unlanded composer pills do not count.
+        evidence.required_apps_readback = acceptedApps.map((app) => app.name);
+        evidence.result = {
+          accepted_user_message_ref: acceptedUserMessageRef,
+          ...(acceptedApps.length ? { accepted_user_apps: acceptedApps } : {}),
+          ...(await providerAcceptanceDigests(
+            serverAdvanced ? afterServer.userText : afterDom.text,
+            requiredApps,
+          )),
+        };
       }
-      if (creatingSession && evidence.canonical_url_observed) {
-        const currentConvKey = ADAPTER.getConversationKey();
+      // Register the new conversation only once the accepted turn is exactly
+      // this create's message; otherwise a create that landed on an unrelated
+      // conversation would materialize it as the new session.
+      if (creatingSession && evidence.canonical_url_observed && evidence.accepted_message_observed) {
         if (currentConvKey && (registeredConvKey !== currentConvKey || !registeredBrowserSessionRef)) {
           await registerCurrentConversation("browser-session-create").catch(() => null);
         }
@@ -2293,14 +2800,30 @@ function normalizeHerdrMentionAlias(value) {
       );
       evidence.generation_status_observed = Boolean(
         isTurnInProgress()
-        || assistantAdvanced
-        || (afterServer?.ok && ["user", "assistant"].includes(afterServer.currentNodeRole)),
+        || assistantAdvanced,
       );
       if (evidence.accepted_message_observed
-          && evidence.generation_status_observed
+          && (creatingSession || evidence.generation_status_observed)
           && (!exactChatGptDispatchIdentity || Boolean(acceptedUserMessageRef))
           && (!creatingSession || (evidence.stable_resource_ref_observed && evidence.canonical_url_observed))) {
         evidence.generation_owner = expectedGeneration;
+        if (creatingSession) {
+          const titleProjection = adapterSupports("titleProjection")
+            ? await projectChatGptConversationTitle(params.display_label)
+            : {
+                status: "unsupported",
+                changed: null,
+                provider: ADAPTER.name,
+                readback_verified: false,
+                reason: "title_projection_unsupported",
+              };
+          evidence.result = {
+            ...(evidence.result && typeof evidence.result === "object" && !Array.isArray(evidence.result)
+              ? evidence.result
+              : {}),
+            title_projection: titleProjection,
+          };
+        }
         return evidence;
       }
       await wait(200);
@@ -2374,6 +2897,15 @@ function normalizeHerdrMentionAlias(value) {
         || pending.generation < 1 || typeof pending.accepted_user_message_ref !== "string"
         || !pending.accepted_user_message_ref) return;
     const current = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+    // session.create records its assignment before the runtime synthesizes the
+    // dispatch, so dispatchId is still null. Adopt the runtime dispatch only
+    // when the accepted user message and generation match exactly.
+    if (current && !current.dispatchId
+        && current.acceptedUserMessageRef === pending.accepted_user_message_ref
+        && current.generation === pending.generation) {
+      acceptedDispatchAssignments.set(registeredBrowserSessionRef, { ...current, dispatchId: pending.dispatch_id });
+      return;
+    }
     if (!current) {
       acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
         dispatchId: pending.dispatch_id,
@@ -2567,7 +3099,9 @@ function normalizeHerdrMentionAlias(value) {
   function maybeRefreshBrowserPendingDispatchAssignment() {
     const refresh = browserPendingDispatchRefresh;
     if (!refresh) return;
-    if (registeredBrowserSessionRef && acceptedDispatchAssignments.has(registeredBrowserSessionRef)) {
+    // Satisfied only once the assignment carries the runtime dispatch identity.
+    if (registeredBrowserSessionRef
+        && /^bd_[0-9a-f]{64}$/.test(String(acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.dispatchId || ""))) {
       clearBrowserPendingDispatchRefresh(true);
       return;
     }
@@ -2575,7 +3109,10 @@ function normalizeHerdrMentionAlias(value) {
       clearBrowserPendingDispatchRefresh(true);
       return;
     }
-    if (document.hidden || refresh.inFlight || Date.now() < refresh.nextAt) return;
+    // Worker tabs created by session.create are background tabs by design, so
+    // this bounded (5 min, backoff to 30s) refresh must not wait for visibility;
+    // otherwise the result observer never learns its dispatch identity.
+    if (refresh.inFlight || Date.now() < refresh.nextAt) return;
     refresh.inFlight = true;
     refresh.nextAt = Date.now() + refresh.retryMs;
     refresh.retryMs = Math.min(refresh.retryMs * 2, 30000);
@@ -2633,9 +3170,21 @@ function normalizeHerdrMentionAlias(value) {
       if (msg?.type === "h2w_get_convkey") {
         void (async () => {
           let convKey = ADAPTER.getConversationKey();
-          if (convKey && (registeredConvKey !== convKey
+          // An explicit refresh re-runs the ordinary content registration even
+          // when this route already holds a registration from an older extension
+          // generation; without it the handshake stays a pure read and returns
+          // the previously registered opaque refs.
+          const refreshObservation = msg?.refreshObservation === true;
+          if (convKey && (refreshObservation
+              || registeredConvKey !== convKey
               || !registeredBrowserSessionRef || !registeredBrowserGeneration)) {
-            await registerCurrentConversation("identity-recovery").catch(() => null);
+            // This read handshake stays opaque: it carries no account identity.
+            // The lazy recovery below runs the ordinary content registration,
+            // which is the single identity source and publishes provider /
+            // account / space / session facts through the existing h2w_register
+            // path. Callers that need those facts trigger this handshake rather
+            // than receiving raw account identity here.
+            await registerCurrentConversation("identity-recovery", { refreshObservation }).catch(() => null);
             convKey = ADAPTER.getConversationKey();
           }
           const identityMatchesRoute = Boolean(convKey && registeredConvKey === convKey);
@@ -2836,7 +3385,10 @@ function normalizeHerdrMentionAlias(value) {
             queueInsert: true,
             requiredApps: queuedSelectedApps.length > 0 ? queuedSelectedApps : currentHerdrRequiredApps(),
           });
-          if (result.ok) {
+          if (result.ok || result.uncertain === true) {
+            // An uncertain single-shot submit is terminal for this batch: the
+            // provider mutation was already dispatched, so remember the batch
+            // instead of letting a redelivery send a duplicate turn.
             rememberQueuedInsertBatch(convKey, batchId);
             if (CONVERSATION_HEALTH) {
               markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
@@ -2881,6 +3433,9 @@ function normalizeHerdrMentionAlias(value) {
         });
         return true;
       }
+      // Generic Web Page Assist owns this message. Do not consume the
+      // asynchronous response before its independent listener handles it.
+      if (msg?.type === "h2w_page_assist") return false;
       sendResponse({});
     });
   } catch (e) { console.warn("[h2w] failed to register onMessage:", e.message); }
@@ -2990,6 +3545,7 @@ function normalizeHerdrMentionAlias(value) {
     const projects = [];
     const seen = new Set();
     let cursor = null;
+    let fetchFailed = false;
     for (let page = 0; page < 5; page += 1) {
       const query = new URLSearchParams({
         owned_only: "true",
@@ -3004,13 +3560,17 @@ function normalizeHerdrMentionAlias(value) {
           cache: "no-store",
           redirect: "error",
           headers: { accept: "application/json", authorization: `Bearer ${accessToken}` },
+          // A hung sidebar response must not stall conversation registration
+          // forever (registry_handshake_delay): give up after 3 seconds.
+          signal: AbortSignal.timeout(3000),
         });
       } catch (_) {
+        fetchFailed = true;
         break;
       }
-      if (!response.ok) break;
+      if (!response.ok) { fetchFailed = true; break; }
       let body;
-      try { body = await response.json(); } catch (_) { break; }
+      try { body = await response.json(); } catch (_) { fetchFailed = true; break; }
       for (const item of Array.isArray(body?.items) ? body.items : []) {
         const project = item?.gizmo?.gizmo;
         const id = typeof project?.id === "string" ? project.id.trim() : "";
@@ -3022,7 +3582,13 @@ function normalizeHerdrMentionAlias(value) {
       cursor = body?.cursor ?? null;
       if (cursor == null || String(cursor) === "") break;
     }
-    chatGptProjectCatalogCache = { accountNativeIdentity, fetchedAt: now, projects };
+    // Only a completed catalog read may refresh the cache: an aborted or
+    // errored sidebar fetch must not poison the catalog with [] for the
+    // next 5 minutes (a slow-but-valid response would otherwise drop the
+    // conversation's Project until a route change or app-identity trigger).
+    if (!fetchFailed) {
+      chatGptProjectCatalogCache = { accountNativeIdentity, fetchedAt: now, projects };
+    }
     return projects;
   }
 
@@ -3045,19 +3611,9 @@ function normalizeHerdrMentionAlias(value) {
     return ADAPTER.resolveProjectIdentity(convKey);
   }
 
-  async function registerCurrentConversation(reason = "startup") {
-    if (!runtimeAlive()) return null;
-    const registrationAttempt = ++browserRegistrationAttempt;
-    const convKey = ADAPTER.getConversationKey();
-    if (!convKey) return null;
-    if (registeredConvKey !== null && registeredConvKey !== convKey) {
-      // Never let a route change advertise the previous conversation's stable
-      // Browser Registry target while the new route is still registering.
-      registeredBrowserSessionRef = null;
-      registeredBrowserGeneration = null;
-      registeredHerdrAppKeyword = null;
-      registeredConversationBound = false;
-    }
+  const registrationInFlight = new Map();
+
+  async function runConversationRegistration(reason, convKey, registrationAttempt) {
     const accountNativeIdentity = await browserAccountNativeIdentity();
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
@@ -3088,6 +3644,14 @@ function normalizeHerdrMentionAlias(value) {
     try {
       const stored = sessionStorage.getItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY);
       browserSessionReservationRef = /^bsr_[0-9a-f]{64}$/.test(String(stored || "")) ? stored : null;
+      // A tab that already materialized a session and then moved (SPA) to a
+      // different conversation must not carry that create reservation onto the
+      // new conversation (live: G1's tab on E1 never rebound to E1).
+      if (browserSessionReservationRef && registeredBrowserSessionRef
+          && registeredConvKey !== null && registeredConvKey !== convKey) {
+        sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY);
+        browserSessionReservationRef = null;
+      }
     } catch (_) {}
     const browserAppKeywords = ADAPTER.name === "chatgpt"
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
@@ -3133,9 +3697,16 @@ function normalizeHerdrMentionAlias(value) {
         : null;
       registeredConversationBound = response?.bound === true;
       restoreBrowserResultAssignment(response?.browser_pending_dispatch);
+      if (changed) {
+        // A route change (SPA navigation away and back, or a reopened tab) starts
+        // a fresh result probe: an earlier backoff or rejection count from the
+        // other route must not keep a still-pending dispatch from settling.
+        browserResultProbeState = null;
+        void observeBrowserResultSettlement().catch(() => {});
+      }
       if (browserSessionReservationRef && registeredBrowserSessionRef) {
         if (response?.browser_pending_dispatch
-            || acceptedDispatchAssignments.has(registeredBrowserSessionRef)) {
+            || /^bd_[0-9a-f]{64}$/.test(String(acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.dispatchId || ""))) {
           clearBrowserPendingDispatchRefresh(true);
         } else {
           armBrowserPendingDispatchRefresh(browserSessionReservationRef);
@@ -3170,13 +3741,77 @@ function normalizeHerdrMentionAlias(value) {
     return response;
   }
 
+  async function registerCurrentConversation(reason = "startup", options = null) {
+    if (!runtimeAlive()) return null;
+    const convKey = ADAPTER.getConversationKey();
+    if (!convKey) return null;
+    if (registeredConvKey !== null && registeredConvKey !== convKey) {
+      // Never let a route change advertise the previous conversation's stable
+      // Browser Registry target while the new route is still registering.
+      registeredBrowserSessionRef = null;
+      registeredBrowserGeneration = null;
+      registeredHerdrAppKeyword = null;
+      registeredConversationBound = false;
+    }
+    // One registration in flight per conversation key: later callers for the
+    // same conversation share it instead of cancelling it, so repeated
+    // h2w_get_convkey handshake probes and the 1s route poll cannot starve
+    // the h2w_register send (registry_handshake_delay).
+    const inFlight = registrationInFlight.get(convKey);
+    if (inFlight && inFlight.attempt === browserRegistrationAttempt) {
+      if (options?.refreshObservation === true) {
+        if (!inFlight.refreshQueued) {
+          // A refreshObservation request chains one fresh run after the
+          // current one; it never cancels the in-flight registration. The
+          // chained run belongs to the conversation that requested it: if
+          // the route moved on while the current run was in flight, skip
+          // the refresh instead of registering a redundant new key.
+          inFlight.refreshQueued = true;
+          const chainedRefresh = () => (ADAPTER.getConversationKey() === convKey
+            ? registerCurrentConversation(reason)
+            : null);
+          inFlight.refreshChain = inFlight.promise.then(chainedRefresh, chainedRefresh);
+        }
+        return inFlight.refreshChain;
+      }
+      return inFlight.promise;
+    }
+    // A registration for a different conversation key still supersedes older
+    // in-flight ones: newest attempt wins across route changes, and the
+    // route-drift fences in runConversationRegistration stay authoritative.
+    const registrationAttempt = ++browserRegistrationAttempt;
+    const entry = { attempt: registrationAttempt, promise: null, refreshQueued: false, refreshChain: null };
+    entry.promise = runConversationRegistration(reason, convKey, registrationAttempt);
+    registrationInFlight.set(convKey, entry);
+    entry.promise.then(
+      () => { if (registrationInFlight.get(convKey) === entry) registrationInFlight.delete(convKey); },
+      () => { if (registrationInFlight.get(convKey) === entry) registrationInFlight.delete(convKey); },
+    );
+    return entry.promise;
+  }
+
   function startConversationRouteWatch() {
+    let hiddenRouteRegistrationInFlight = false;
+    let visibleRouteRegistrationKey = null;
     // One second is fast enough for UI binding while keeping route detection
     // negligible compared with the existing 5s HUD reconciliation interval.
     setInterval(() => {
       void observeBrowserResultSettlement().catch(() => {});
-      if (document.hidden) return;
       maybeRefreshBrowserPendingDispatchAssignment();
+      if (document.hidden) {
+        // A session.create worker is a background tab whose URL moves from the
+        // new-chat route to /c/<id> after submit. Re-register on that route
+        // change even while hidden, or the result observer stays bound to the
+        // stale key and the dispatch never settles. One registration at a time.
+        const hiddenKey = ADAPTER.getConversationKey();
+        if (hiddenKey && hiddenKey !== registeredConvKey && !hiddenRouteRegistrationInFlight) {
+          hiddenRouteRegistrationInFlight = true;
+          void registerCurrentConversation("poll-hidden")
+            .catch(() => {})
+            .finally(() => { hiddenRouteRegistrationInFlight = false; });
+        }
+        return;
+      }
       const convKey = ADAPTER.getConversationKey();
       const observedApps = ADAPTER.name === "chatgpt"
         && registeredConversationBound
@@ -3186,7 +3821,16 @@ function normalizeHerdrMentionAlias(value) {
         : [];
       const shouldLearnAppIdentity = convKey === registeredConvKey && observedApps.length === 1;
       if (convKey && (convKey !== registeredConvKey || shouldLearnAppIdentity)) {
-        void registerCurrentConversation(shouldLearnAppIdentity ? "app-identity" : "poll");
+        // One registration at a time per conversation key: the visible poll
+        // must not stack attempts (and cancel the in-flight one) while the
+        // pre-h2w_register work is still running. A different conversation
+        // key may still register immediately (route-change supersede).
+        if (visibleRouteRegistrationKey !== convKey) {
+          visibleRouteRegistrationKey = convKey;
+          void registerCurrentConversation(shouldLearnAppIdentity ? "app-identity" : "poll")
+            .catch(() => {})
+            .finally(() => { if (visibleRouteRegistrationKey === convKey) visibleRouteRegistrationKey = null; });
+        }
       }
       if (ADAPTER.name === "chatgpt") ensureQueuedInsertButton();
     }, 1000);
@@ -3218,7 +3862,8 @@ function normalizeHerdrMentionAlias(value) {
   function chatGptConversationId() {
     const value = String(ADAPTER.getConversationKey() || location.href || "");
     const match = value.match(/\/c\/([^/?#]+)/);
-    return match ? decodeURIComponent(match[1]) : null;
+    const id = match ? decodeURIComponent(match[1]) : null;
+    return id && !/^local-chatgpt:/i.test(id) ? id : null;
   }
 
   function chatGptCurrentConversationAnchor() {
@@ -3523,11 +4168,39 @@ function normalizeHerdrMentionAlias(value) {
   // /backend-api/conversations/<id> endpoint with a Bearer header. Any
   // 401/404/timeout fails closed and returns an error payload only; the token
   // never leaves this function scope and is never logged/stored.
-  async function fetchChatGptConversation({ conversationId, timeoutMs = 6000 } = {}) {
+  async function fetchChatGptConversationDetail({ conversationId, timeoutMs = 6000 } = {}) {
+    if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, error: "not-chatgpt-conversation" };
+    const accessToken = await readChatGptAccessToken(4000);
+    const sessionToken = String(accessToken || "");
+    if (!sessionToken || sessionToken.length > 4096) return { ok: false, reason: "auth" };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+        credentials: "include",
+        cache: "no-store",
+        redirect: "error",
+        headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
+        signal: controller.signal,
+      });
+      if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+      return { ok: true, body: await response.json() };
+    } catch (error) {
+      return { ok: false, reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function fetchChatGptConversation({
+    conversationId,
+    timeoutMs = 6000,
+    authTimeoutMs = 4000,
+  } = {}) {
     if (!conversationId || ADAPTER.name !== "chatgpt") {
       return { ok: false, error: "not-chatgpt-conversation" };
     }
-    const accessToken = await readChatGptAccessToken();
+    const accessToken = await readChatGptAccessToken(authTimeoutMs);
     if (!accessToken) return { ok: false, error: "session-missing", reason: "auth", status: 401 };
     const sessionToken = String(accessToken);
     if (sessionToken.length === 0 || sessionToken.length > 4096) {
@@ -3544,7 +4217,13 @@ function normalizeHerdrMentionAlias(value) {
         headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
         signal: controller.signal,
       });
-      if (!response.ok) return { ok: false, error: "conversation-http", reason: `http-${response.status}`, status: response.status };
+      if (!response.ok) {
+        const retryAfter = Number.parseInt(response.headers?.get?.("retry-after") || "", 10);
+        return {
+          ok: false, error: "conversation-http", reason: `http-${response.status}`, status: response.status,
+          retryAfterS: Number.isSafeInteger(retryAfter) && retryAfter >= 0 && retryAfter <= 86400 ? retryAfter : null,
+        };
+      }
       const body = await response.json();
       return { ok: true, body };
     } catch (error) {
@@ -3552,6 +4231,89 @@ function normalizeHerdrMentionAlias(value) {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async function projectChatGptConversationTitle(rawTitle) {
+    const provider = "chatgpt";
+    const title = normText(rawTitle);
+    const unsupported = (reason) => ({
+      status: "unsupported",
+      changed: null,
+      provider,
+      readback_verified: false,
+      reason,
+    });
+    const failed = (reason) => ({
+      status: "failed",
+      changed: null,
+      provider,
+      readback_verified: false,
+      reason,
+    });
+    const verified = (changed) => ({
+      status: "verified",
+      changed,
+      provider,
+      readback_verified: true,
+      reason: null,
+    });
+    if (ADAPTER.name !== "chatgpt" || !adapterSupports("titleProjection")) {
+      return unsupported("title_projection_unsupported");
+    }
+    const conversationId = chatGptConversationId();
+    if (!conversationId || !title || title.length > 256) {
+      return failed("title_projection_params_invalid");
+    }
+
+    const deadline = Date.now() + 3000;
+    const remainingTimeout = (ceiling) => Math.max(1, Math.min(ceiling, deadline - Date.now()));
+    const current = await fetchChatGptConversation({
+      conversationId,
+      timeoutMs: remainingTimeout(1000),
+      authTimeoutMs: remainingTimeout(1000),
+    });
+    if (current?.ok && current.body?.title === title) return verified(false);
+    if (Date.now() >= deadline) return failed("title_projection_timeout");
+
+    const accessToken = await readChatGptAccessToken(remainingTimeout(1000));
+    const sessionToken = typeof accessToken === "string" ? accessToken : "";
+    if (!sessionToken || sessionToken.length > 4096) {
+      return failed("title_projection_auth_unavailable");
+    }
+    if (Date.now() >= deadline) return failed("title_projection_timeout");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remainingTimeout(1000));
+    try {
+      const response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+        method: "PATCH",
+        credentials: "include",
+        cache: "no-store",
+        redirect: "error",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({ title }),
+        signal: controller.signal,
+      });
+      if (!response.ok) return failed("title_projection_provider_rejected");
+    } catch (error) {
+      return failed(error?.name === "AbortError" ? "title_projection_timeout" : "title_projection_request_failed");
+    } finally {
+      clearTimeout(timer);
+    }
+
+    while (Date.now() < deadline) {
+      const observed = await fetchChatGptConversation({
+        conversationId,
+        timeoutMs: remainingTimeout(800),
+        authTimeoutMs: remainingTimeout(800),
+      });
+      if (observed?.ok && observed.body?.title === title) return verified(true);
+      if (Date.now() < deadline) await wait(150);
+    }
+    return failed("title_projection_readback_unverified");
   }
 
   async function fetchChatGptArchivedConversationList({ timeoutMs = 3000 } = {}) {
@@ -3611,10 +4373,10 @@ function normalizeHerdrMentionAlias(value) {
     }
   }
 
-  async function readChatGptAccessToken() {
+  async function readChatGptAccessToken(timeoutMs = 4000) {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 4000);
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const response = await fetch("/api/auth/session", {
           credentials: "include",
@@ -3719,7 +4481,7 @@ function normalizeHerdrMentionAlias(value) {
       }
     }
     if (!options) return null;
-    options.click();
+    pressMenuTrigger(options);
     let settings = null;
     const menuDeadline = Date.now() + 1500;
     do {
@@ -4268,7 +5030,7 @@ function normalizeHerdrMentionAlias(value) {
       recovery: true,
       requiredApps: currentHerdrRequiredApps(),
     });
-    if (!result?.ok) {
+    if (!result?.ok && result?.uncertain !== true) {
       markConversationState({ ...conversationHealth, explicit_error_continue_attempt: 0 });
       return true;
     }
@@ -4456,7 +5218,17 @@ function normalizeHerdrMentionAlias(value) {
       recovery: true,
       requiredApps: currentHerdrRequiredApps(),
     });
-    if (!result?.ok) return false;
+    if (!result?.ok) {
+      if (result?.uncertain === true) {
+        // The single submit already dispatched and could not be confirmed. Never
+        // resend the same probe: treat it as sent so the reply/health watcher
+        // decides the next step instead of creating a duplicate provider turn.
+        markConversationState(RECOVERY_CONTROLLER.markRecoverySent(conversationHealth));
+        paintPageHud({});
+        return true;
+      }
+      return false;
+    }
     markConversationState(RECOVERY_CONTROLLER.markRecoverySent(conversationHealth));
     paintPageHud({});
     const confirm = await confirmReplyStarted(RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs);
@@ -4545,7 +5317,7 @@ function normalizeHerdrMentionAlias(value) {
         recovery: true,
         requiredApps: currentHerdrRequiredApps(),
       });
-      if (!result?.ok) return false;
+      if (!result?.ok && result?.uncertain !== true) return false;
       markConversationState(RECOVERY_CONTROLLER.markRecoverySent({
         ...conversationHealth,
         stale_activation_attempt: 1,

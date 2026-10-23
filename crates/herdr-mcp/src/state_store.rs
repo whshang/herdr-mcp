@@ -24,10 +24,13 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 mod schema;
+pub(crate) mod work_journal;
+use work_journal::ensure_work_journal_auxiliary_schema;
 
 use schema::{
-    META_SCHEMA_VERSION, db_file_name, ensure_browser_archive_auxiliary_schema, ensure_parent_dirs,
-    migrate, open_connection, prepare_db_file, reject_symlink,
+    META_SCHEMA_VERSION, db_file_name, ensure_browser_archive_auxiliary_schema,
+    ensure_browser_dispatch_auxiliary_schema, ensure_parent_dirs, migrate, open_connection,
+    prepare_db_file, reject_symlink,
 };
 #[cfg(unix)]
 use schema::{secure_dir, set_mode};
@@ -569,6 +572,11 @@ pub struct BrowserDispatchReserveInput<'a> {
     pub target_session_ref: &'a str,
     pub request_digest: &'a str,
     pub message_digest: &'a str,
+    /// Whitespace-canonical digest of the same message. `Some` for new
+    /// reservations so a later uncertain-dispatch reconcile can compare the
+    /// accepted provider text the same way the live submit path does. Legacy
+    /// callers may pass `None`; their row then reconciles raw-only.
+    pub message_canonical_digest: Option<&'a str>,
     pub reasoning_effort: Option<&'a str>,
     pub required_apps: &'a [&'a str],
     pub expected_generation: i64,
@@ -601,6 +609,7 @@ pub struct BrowserDispatchRecord {
     pub target_session_ref: String,
     pub request_digest: String,
     pub message_digest: String,
+    pub message_canonical_digest: Option<String>,
     pub reasoning_effort: Option<String>,
     pub required_apps: Vec<String>,
     pub expected_generation: i64,
@@ -674,6 +683,8 @@ impl StateStore {
             let mut conn = open_connection(None)?;
             migrate(&mut conn)?;
             ensure_browser_archive_auxiliary_schema(&conn)?;
+            ensure_browser_dispatch_auxiliary_schema(&conn)?;
+            ensure_work_journal_auxiliary_schema(&conn)?;
             return Ok(Self { path: None, conn });
         }
 
@@ -684,6 +695,8 @@ impl StateStore {
         set_mode(path, 0o600)?;
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
+        ensure_browser_dispatch_auxiliary_schema(&conn)?;
+        ensure_work_journal_auxiliary_schema(&conn)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
             conn,
@@ -708,6 +721,8 @@ impl StateStore {
         set_mode(&path, 0o600)?;
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
+        ensure_browser_dispatch_auxiliary_schema(&conn)?;
+        ensure_work_journal_auxiliary_schema(&conn)?;
         Ok(Self {
             path: Some(path),
             conn,
@@ -861,7 +876,9 @@ impl StateStore {
     ///
     /// Expired rows are removed first. `INSERT OR IGNORE` plus the scoped
     /// unique index makes concurrent processes converge on one authoritative
-    /// row without a read-then-write race.
+    /// row without a read-then-write race. `expires_at` is nullable: `None`
+    /// records an ownership claim that time alone can never prune, which is
+    /// required for requests whose outcome may still be uncertain.
     pub fn reserve_operation(
         &mut self,
         kind: &str,
@@ -869,7 +886,7 @@ impl StateStore {
         request_hash: &str,
         op_id: &str,
         now_ms: i64,
-        expires_at: i64,
+        expires_at: Option<i64>,
     ) -> Result<OperationReservation, String> {
         let tx = self
             .conn
@@ -933,6 +950,7 @@ impl StateStore {
 
     /// Mark one reserved operation complete and persist the bounded replay
     /// payload. A missing/mismatched row is an integrity error, not an upsert.
+    /// `expires_at` may stay `None` when the recorded outcome is not terminal.
     pub fn complete_operation(
         &mut self,
         kind: &str,
@@ -940,7 +958,7 @@ impl StateStore {
         request_hash: &str,
         result_json: &str,
         now_ms: i64,
-        expires_at: i64,
+        expires_at: Option<i64>,
     ) -> Result<(), String> {
         let tx = self
             .conn
@@ -1059,6 +1077,31 @@ impl StateStore {
             )
             .optional()
             .map_err(|error| format!("cannot read operation ledger: {error}"))
+    }
+
+    pub fn task_operation_ids_by_key_digest(
+        &self,
+        kind: &str,
+        digest: &str,
+        now_ms: i64,
+    ) -> Result<Vec<String>, String> {
+        // Search all live task records. Two matches already make ownership
+        // ambiguous, regardless of which targets or sessions they contain.
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT op_id FROM operations
+             WHERE kind = ?1
+               AND idempotency_key = ?2
+               AND (expires_at IS NULL OR expires_at > ?3)
+             LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare task lookup: {error}"))?;
+        statement
+            .query_map(params![kind, digest, now_ms], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query task lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read task lookup: {error}"))
     }
 
     pub fn operation_ledgers(
@@ -1973,6 +2016,59 @@ impl StateStore {
         })
     }
 
+    /// Bind a freshly created browser session into the single active Work
+    /// Memory chain that already owns `work_chain_id`, so its later dispatch
+    /// settlement can append the assistant turn. Never creates a chain: an
+    /// unknown chain stays `work_memory_not_found`, and an ambiguous chain
+    /// fails closed.
+    pub fn bind_created_browser_session_work_chain(
+        &mut self,
+        work_chain_id: &str,
+        provider: &str,
+        account_ref: Option<&str>,
+        space_ref: Option<&str>,
+        session_ref: &str,
+        bound_at: i64,
+    ) -> Result<String, String> {
+        if !valid_work_chain_id(work_chain_id) {
+            return Err("work_memory_work_chain_id_invalid".to_owned());
+        }
+        validate_provider_binding(provider, account_ref, space_ref, session_ref)?;
+        let mut ids = self
+            .conn
+            .prepare(
+                "SELECT continuity_id FROM continuity_chains
+                 WHERE work_chain_id = ?1 AND status = 'active'
+                 ORDER BY continuity_id LIMIT 2",
+            )
+            .map_err(|error| format!("cannot resolve work chain: {error}"))?
+            .query_map([work_chain_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query work chain: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read work chain: {error}"))?;
+        let continuity_id = match ids.len() {
+            0 => return Err("work_memory_not_found".to_owned()),
+            1 => ids.remove(0),
+            _ => return Err("work_memory_ambiguous".to_owned()),
+        };
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO continuity_provider_bindings (
+                    continuity_id, provider, account_ref, space_ref, session_ref, bound_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    continuity_id,
+                    provider,
+                    account_ref.unwrap_or(""),
+                    space_ref.unwrap_or(""),
+                    session_ref,
+                    bound_at
+                ],
+            )
+            .map_err(|error| format!("cannot persist work memory provider binding: {error}"))?;
+        Ok(continuity_id)
+    }
+
     pub fn append_browser_dispatch_work_memory_evidence(
         &mut self,
         work_chain_id: &str,
@@ -2865,6 +2961,8 @@ impl StateStore {
             if device_id != input.device_id {
                 return Err("browser_endpoint_identity_conflict".to_owned());
             }
+            // Registration observes identity, never grants legacy WebChat consent.
+            // Preserve both explicit deny and allow for schema-15 epoch-4 rollback.
             tx.execute(
                 "UPDATE browser_endpoints
                  SET browser_family = ?2,
@@ -2880,6 +2978,8 @@ impl StateStore {
             )
             .map_err(|error| format!("cannot update browser endpoint: {error}"))?;
         } else {
+            // Explicit 0 preserves epoch-4 deny regardless of whether the
+            // installed table's historical migration default is 0 or 1.
             tx.execute(
                 "INSERT INTO browser_endpoints(
                     endpoint_ref, device_id, browser_family, extension_version,
@@ -2917,19 +3017,19 @@ impl StateStore {
         if input.observed_at < 0 {
             return Err("browser_observed_at_invalid".to_owned());
         }
+        // The WebChat switch was retired in 1.1. Its compatibility payload field
+        // is not a user grant: Tool Bridge changes must preserve the epoch-4 flag.
         let changed = self
             .conn
             .execute(
                 "UPDATE browser_endpoints
-                 SET webchat_control_allowed = ?2,
-                     tool_bridge_allowed = ?3,
-                     tool_bridge_mutation_allowed = ?4,
+                 SET tool_bridge_allowed = ?2,
+                     tool_bridge_mutation_allowed = ?3,
                      consent_revision = consent_revision + 1,
-                     last_observed_at = MAX(last_observed_at, ?5)
-                 WHERE endpoint_ref = ?1 AND consent_revision = ?6",
+                     last_observed_at = MAX(last_observed_at, ?4)
+                 WHERE endpoint_ref = ?1 AND consent_revision = ?5",
                 params![
                     input.endpoint_ref,
-                    i64::from(input.webchat_control_allowed),
                     i64::from(input.tool_bridge_allowed),
                     i64::from(input.tool_bridge_mutation_allowed),
                     input.observed_at,
@@ -3334,57 +3434,6 @@ impl StateStore {
             0 => Ok(None),
             1 => Ok(Some(refs.remove(0))),
             _ => Err("browser_canonical_url_ambiguous".to_owned()),
-        }
-    }
-
-    pub fn browser_latest_session_ref_for_canonical_url(
-        &self,
-        canonical_url: &str,
-    ) -> Result<Option<String>, String> {
-        if canonical_url.is_empty()
-            || canonical_url.len() > 2048
-            || canonical_url != canonical_url.trim()
-            || canonical_url.chars().any(char::is_control)
-            || !canonical_url.starts_with("https://")
-        {
-            return Err("browser_canonical_url_invalid".to_owned());
-        }
-        // Browser source affinity may follow the newest observation of one
-        // canonical conversation across browser-profile/extension identity
-        // changes. An exact newest timestamp tie remains fail-closed. Continuity
-        // URL resume intentionally keeps using the stricter all-history resolver.
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT r.resource_ref, MAX(l.observed_at) AS observed_at
-                 FROM browser_resource_locators l
-                 JOIN browser_resources r ON r.resource_ref = l.resource_ref
-                 WHERE l.canonical_url = ?1
-                   AND r.kind = 'session'
-                   AND r.provider = 'chatgpt'
-                 GROUP BY r.resource_ref
-                 ORDER BY observed_at DESC, r.resource_ref
-                 LIMIT 2",
-            )
-            .map_err(|error| format!("cannot prepare browser source URL lookup: {error}"))?;
-        let mut refs = stmt
-            .query_map([canonical_url], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(|error| format!("cannot query browser source URL lookup: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("cannot read browser source URL lookup: {error}"))?;
-        match refs.len() {
-            0 => Ok(None),
-            1 => Ok(Some(refs.remove(0).0)),
-            _ => {
-                let (newest_ref, newest_at) = refs.remove(0);
-                let (_, runner_up_at) = refs.remove(0);
-                if runner_up_at == newest_at {
-                    return Err("browser_canonical_url_ambiguous".to_owned());
-                }
-                Ok(Some(newest_ref))
-            }
         }
     }
 
@@ -3861,29 +3910,19 @@ impl StateStore {
             })?;
             return Ok(None);
         };
-        let (kind, resource_generation, webchat_control_allowed) = tx
+        let (kind, resource_generation) = tx
             .query_row(
-                "SELECT r.kind, r.observation_generation, e.webchat_control_allowed
+                "SELECT r.kind, r.observation_generation
                  FROM browser_resources r
-                 JOIN browser_endpoints e ON e.endpoint_ref = r.endpoint_ref
                  WHERE r.resource_ref = ?1 AND r.endpoint_ref = ?2 AND r.provider = ?3",
                 params![session_ref, pending.endpoint_ref, pending.provider],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)? != 0,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()
             .map_err(|error| format!("cannot read browser archive claim resource: {error}"))?
             .ok_or_else(|| "browser_resource_not_found".to_owned())?;
         if kind != "session" {
             return Err("browser_resource_kind_mismatch".to_owned());
-        }
-        if !webchat_control_allowed {
-            return Err("browser_control_not_allowed".to_owned());
         }
         require_current_browser_generation(
             &tx,
@@ -4594,6 +4633,9 @@ impl StateStore {
         validate_browser_resource_ref(input.target_session_ref)?;
         validate_browser_digest(input.request_digest, "request_digest")?;
         validate_browser_digest(input.message_digest, "message_digest")?;
+        if let Some(canonical_digest) = input.message_canonical_digest {
+            validate_browser_digest(canonical_digest, "message_canonical_digest")?;
+        }
         validate_browser_digest(input.idempotency_key_digest, "idempotency_key_digest")?;
         if let Some(parent_dispatch_id) = input.parent_dispatch_id {
             validate_browser_dispatch_id(parent_dispatch_id)?;
@@ -4669,6 +4711,14 @@ impl StateStore {
                 || existing.target_session_ref != input.target_session_ref
                 || existing.request_digest != input.request_digest
                 || existing.message_digest != input.message_digest
+                // A legacy row has no canonical digest. It is not a conflict for
+                // the same request to start supplying one: the legacy row is kept
+                // and reconciles raw-only rather than being treated as a
+                // different request.
+                || existing
+                    .message_canonical_digest
+                    .as_deref()
+                    .is_some_and(|existing| Some(existing) != input.message_canonical_digest)
                 || existing.reasoning_effort.as_deref() != input.reasoning_effort
                 || existing.required_apps_json != required_apps_json
                 || existing.expected_generation != input.expected_generation
@@ -4719,10 +4769,11 @@ impl StateStore {
                     idempotency_key_digest, parent_dispatch_id,
                     authorization_principal_ref, authorization_connector_id,
                     authorization_grant_generation, delivery_state, generation_owner,
-                    work_chain_id, lane_id, created_at, updated_at
+                    work_chain_id, lane_id, created_at, updated_at,
+                    message_canonical_digest
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, 'not_applied', NULL, ?16, ?17, ?18, ?18
+                    ?13, ?14, ?15, 'not_applied', NULL, ?16, ?17, ?18, ?18, ?19
                  )",
             params![
                 dispatch_id,
@@ -4743,6 +4794,7 @@ impl StateStore {
                 input.work_chain_id,
                 input.lane_id,
                 input.created_at,
+                input.message_canonical_digest,
             ],
         )
         .map_err(|error| format!("cannot reserve browser dispatch: {error}"))?;
@@ -4795,6 +4847,37 @@ impl StateStore {
             Some(dispatch_id) => self.browser_dispatch(&dispatch_id),
             None => Ok(None),
         }
+    }
+
+    /// Read-only fanout view: every dispatch already recorded for one work
+    /// chain, oldest first, bounded. Reads the existing dispatch ledger only.
+    pub fn browser_dispatches_for_work_chain(
+        &self,
+        work_chain_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BrowserDispatchRecord>, String> {
+        validate_browser_work_chain_id(work_chain_id)?;
+        let ids = self
+            .conn
+            .prepare(
+                "SELECT dispatch_id FROM browser_dispatches
+                 WHERE work_chain_id = ?1
+                 ORDER BY created_at ASC, dispatch_id ASC LIMIT ?2",
+            )
+            .map_err(|error| format!("cannot prepare fanout read: {error}"))?
+            .query_map(params![work_chain_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("cannot read fanout dispatches: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode fanout dispatches: {error}"))?;
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(record) = self.browser_dispatch(&id)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     pub fn latest_browser_dispatch_for_session(
@@ -5170,6 +5253,7 @@ struct StoredBrowserDispatch {
     target_session_ref: String,
     request_digest: String,
     message_digest: String,
+    message_canonical_digest: Option<String>,
     reasoning_effort: Option<String>,
     required_apps_json: String,
     expected_generation: i64,
@@ -5199,7 +5283,7 @@ const BROWSER_DISPATCH_SELECT: &str = "SELECT dispatch_id, endpoint_ref, provide
             accepted_user_message_ref, result_assistant_message_ref,
             result_turn_message_id, result_evidence_id, result_settled_at,
             authorization_principal_ref, authorization_connector_id,
-            authorization_grant_generation
+            authorization_grant_generation, message_canonical_digest
      FROM browser_dispatches";
 
 fn decode_stored_browser_dispatch(
@@ -5232,6 +5316,7 @@ fn decode_stored_browser_dispatch(
         authorization_principal_ref: row.get(23)?,
         authorization_connector_id: row.get(24)?,
         authorization_grant_generation: row.get(25)?,
+        message_canonical_digest: row.get(26)?,
     })
 }
 
@@ -5385,6 +5470,7 @@ fn decode_browser_dispatch(stored: StoredBrowserDispatch) -> Result<BrowserDispa
         target_session_ref: stored.target_session_ref,
         request_digest: stored.request_digest,
         message_digest: stored.message_digest,
+        message_canonical_digest: stored.message_canonical_digest,
         reasoning_effort: stored.reasoning_effort,
         required_apps,
         expected_generation: stored.expected_generation,
@@ -5413,7 +5499,10 @@ fn decode_browser_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserE
         device_id: row.get(1)?,
         browser_family: row.get(2)?,
         extension_version: row.get(3)?,
-        webchat_control_allowed: row.get::<_, i64>(4)? != 0,
+        // 1.1 removed this switch; derive its enabled projection without writing
+        // a grant. The stored flag remains epoch-4 consent (including 0 for fresh
+        // registrations), since rollback reads i64 != 0 without restoring the DB.
+        webchat_control_allowed: true,
         tool_bridge_allowed: row.get::<_, i64>(5)? != 0,
         tool_bridge_mutation_allowed: row.get::<_, i64>(6)? != 0,
         consent_revision: row.get(7)?,
@@ -5614,6 +5703,7 @@ const ALLOWED_BROWSER_CAPABILITY_OPERATIONS: &[&str] = &[
     "session.list",
     "session.move_to_space",
     "session.open",
+    "session.title_projection",
     "session.remove_from_space",
     "session.rename",
     "space.archive",
@@ -7418,12 +7508,12 @@ mod tests {
         let mut store = StateStore::open(":memory:").unwrap();
         assert_eq!(
             store
-                .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 10, 1_000)
+                .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 10, Some(1_000))
                 .unwrap(),
             OperationReservation::Reserved
         );
         let OperationReservation::Existing(existing) = store
-            .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 11, 1_000)
+            .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 11, Some(1_000))
             .unwrap()
         else {
             panic!("expected existing reservation");
@@ -7434,7 +7524,14 @@ mod tests {
 
         assert_eq!(
             store
-                .reserve_operation("other_mutation", "key-hash", "req-b", "op-b", 12, 1_000)
+                .reserve_operation(
+                    "other_mutation",
+                    "key-hash",
+                    "req-b",
+                    "op-b",
+                    12,
+                    Some(1_000)
+                )
                 .unwrap(),
             OperationReservation::Reserved,
             "the same digest may be reused by a different operation kind"
@@ -7447,11 +7544,11 @@ mod tests {
                 "req-a",
                 r#"{"ok":true}"#,
                 20,
-                2_000,
+                Some(2_000),
             )
             .unwrap();
         let OperationReservation::Existing(completed) = store
-            .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 21, 2_000)
+            .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 21, Some(2_000))
             .unwrap()
         else {
             panic!("expected completed operation");
@@ -7459,6 +7556,31 @@ mod tests {
         assert_eq!(completed.state.as_deref(), Some("complete"));
         assert_eq!(completed.phase.as_deref(), Some("settled"));
         assert_eq!(completed.result_json.as_deref(), Some(r#"{"ok":true}"#));
+
+        // A NULL expiry is an ownership claim that time alone can never prune:
+        // a far-future reservation attempt for the same key still finds the
+        // pending row instead of deleting it and reserving a fresh one. Run
+        // last because the far-future prune legitimately clears bounded rows.
+        assert_eq!(
+            store
+                .reserve_operation("herdr_exec", "unbounded-key", "req-c", "op-c", 30, None)
+                .unwrap(),
+            OperationReservation::Reserved
+        );
+        let OperationReservation::Existing(owned) = store
+            .reserve_operation(
+                "herdr_exec",
+                "unbounded-key",
+                "req-c",
+                "op-c",
+                i64::MAX / 2,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("a NULL-expiry row must survive a far-future prune attempt");
+        };
+        assert_eq!(owned.state.as_deref(), Some("pending"));
     }
 
     #[test]
@@ -7474,7 +7596,7 @@ mod tests {
                         "persisted-request",
                         "persisted-op",
                         100,
-                        10_000,
+                        Some(10_000),
                     )
                     .unwrap(),
                 OperationReservation::Reserved
@@ -7486,7 +7608,7 @@ mod tests {
                     "persisted-request",
                     r#"{"ok":true,"value":7}"#,
                     110,
-                    10_000,
+                    Some(10_000),
                 )
                 .unwrap();
         }
@@ -7499,7 +7621,7 @@ mod tests {
                     "persisted-request",
                     "persisted-op",
                     120,
-                    10_000,
+                    Some(10_000),
                 )
                 .unwrap()
             else {
@@ -9371,7 +9493,9 @@ mod tests {
                 "browser_resource_locators",
                 "browser_session_archive_intents",
                 "browser_session_reservations",
-                "browser_source_turns"
+                "browser_source_turns",
+                "work_events",
+                "work_state"
             ]
         );
         assert!(!tables_after.contains(&"browser_delivery_events".to_owned()));
@@ -10289,6 +10413,7 @@ mod tests {
                 target_session_ref: &session_ref,
                 request_digest: &request_digest,
                 message_digest: &message_digest,
+                message_canonical_digest: None,
                 reasoning_effort: Some("balanced"),
                 required_apps: &required_apps,
                 expected_generation: 7,
@@ -10360,6 +10485,7 @@ mod tests {
                     target_session_ref: &session_ref,
                     request_digest: &request_digest,
                     message_digest: &message_digest,
+                    message_canonical_digest: None,
                     reasoning_effort: Some("balanced"),
                     required_apps: &required_apps,
                     expected_generation: 7,
@@ -10433,6 +10559,136 @@ mod tests {
     }
 
     #[test]
+    fn schema15_epoch4_reader_preserves_epoch5_dispatch_evidence_on_writeback() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, session_ref, _) =
+            browser_dispatch_fixture(&mut store, 7, "epoch-rollback-native");
+        let request_digest = sha256_text("rollback-request");
+        let message_digest = sha256_text("rollback-message");
+        let canonical_digest = sha256_text("rollback canonical message");
+        let key_digest = sha256_text("rollback-key");
+        let BrowserDispatchReservation::Reserved(record) = store
+            .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                operation: "browser_dispatch.submit",
+                target_session_ref: &session_ref,
+                request_digest: &request_digest,
+                message_digest: &message_digest,
+                message_canonical_digest: Some(&canonical_digest),
+                reasoning_effort: None,
+                required_apps: &[],
+                expected_generation: 7,
+                idempotency_key_digest: &key_digest,
+                parent_dispatch_id: None,
+                authorization: None,
+                work_chain_id: None,
+                lane_id: None,
+                created_at: 10,
+            })
+            .unwrap()
+        else {
+            panic!("expected a new browser dispatch");
+        };
+
+        // Frozen v1.0.3/schema-15 read projection: old readers never SELECT *,
+        // and therefore do not interpret the new nullable canonical digest.
+        const EPOCH4_SELECT: &str = "SELECT dispatch_id, endpoint_ref, provider, operation,
+            target_session_ref, request_digest, message_digest,
+            reasoning_effort, required_apps_json, expected_generation,
+            idempotency_key_digest, parent_dispatch_id, delivery_state,
+            generation_owner, work_chain_id, lane_id, created_at, updated_at,
+            accepted_user_message_ref, result_assistant_message_ref,
+            result_turn_message_id, result_evidence_id, result_settled_at,
+            authorization_principal_ref, authorization_connector_id,
+            authorization_grant_generation
+            FROM browser_dispatches WHERE dispatch_id = ?1";
+        let (old_message_digest, old_delivery_state) = store
+            .conn
+            .query_row(EPOCH4_SELECT, [&record.dispatch_id], |row| {
+                Ok((row.get::<_, String>(6)?, row.get::<_, String>(12)?))
+            })
+            .unwrap();
+        assert_eq!(old_message_digest, message_digest);
+        assert_eq!(old_delivery_state, "not_applied");
+
+        // Frozen v1.0.3 update projection leaves newer settlement evidence intact.
+        store
+            .conn
+            .execute(
+                "UPDATE browser_dispatches
+                 SET delivery_state = ?2, generation_owner = ?3,
+                     accepted_user_message_ref = COALESCE(?6, accepted_user_message_ref),
+                     updated_at = MAX(updated_at, ?4)
+                 WHERE dispatch_id = ?1 AND expected_generation = ?5",
+                params![
+                    record.dispatch_id,
+                    "uncertain",
+                    None::<i64>,
+                    9,
+                    7,
+                    None::<String>,
+                ],
+            )
+            .unwrap();
+        let after_rollback = store
+            .browser_dispatch(&record.dispatch_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_rollback.delivery_state,
+            BrowserDeliveryState::Uncertain
+        );
+        assert_eq!(
+            after_rollback.message_canonical_digest.as_deref(),
+            Some(canonical_digest.as_str())
+        );
+        assert_eq!(after_rollback.updated_at, 10);
+        assert_eq!(store.schema_version().unwrap(), 15);
+    }
+
+    #[test]
+    fn schema15_epoch4_pruning_and_readback_preserve_unbounded_epoch5_operations() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        assert_eq!(
+            store
+                .reserve_operation("herdr_exec", "epoch5-key", "request", "epoch5-op", 10, None)
+                .unwrap(),
+            OperationReservation::Reserved
+        );
+        // Frozen v1.0.3 pruning excludes NULL expiries; its decoder already
+        // reads expires_at as Option<i64> and result_json as opaque text.
+        store
+            .conn
+            .execute(
+                "DELETE FROM operations WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                [i64::MAX / 2],
+            )
+            .unwrap();
+        let (op_id, state, expiry) = store
+            .conn
+            .query_row(
+                "SELECT op_id, request_hash, phase, state, result_json,
+                        created_at, updated_at, expires_at
+                 FROM operations
+                 WHERE kind = ?1 AND idempotency_key = ?2",
+                params!["herdr_exec", "epoch5-key"],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(op_id, "epoch5-op");
+        assert_eq!(state, "pending");
+        assert_eq!(expiry, None);
+        assert_eq!(store.schema_version().unwrap(), 15);
+    }
+
+    #[test]
     fn late_dispatch_settlement_is_exact_generation_scoped_and_row_isolated() {
         let mut store = StateStore::open(":memory:").unwrap();
         let (endpoint_ref, session_ref, _) =
@@ -10450,6 +10706,7 @@ mod tests {
                     target_session_ref: &session_ref,
                     request_digest: &request_digest,
                     message_digest: &message_digest,
+                    message_canonical_digest: None,
                     reasoning_effort: None,
                     required_apps: &required_apps,
                     expected_generation: 7,
@@ -10571,6 +10828,7 @@ mod tests {
                 target_session_ref: &session_ref,
                 request_digest: &request_digest,
                 message_digest: &message_digest,
+                message_canonical_digest: None,
                 reasoning_effort: Some("thorough"),
                 required_apps: &required_apps,
                 expected_generation: 7,
@@ -10646,6 +10904,7 @@ mod tests {
                         target_session_ref: &session_ref,
                         request_digest: &request_digest,
                         message_digest: &message_digest,
+                        message_canonical_digest: None,
                         reasoning_effort: Some("thorough"),
                         required_apps: &required_apps,
                         expected_generation: 7,
@@ -10697,6 +10956,7 @@ mod tests {
                 target_session_ref: &session_ref,
                 request_digest: &request_digest,
                 message_digest: &message_digest,
+                message_canonical_digest: None,
                 reasoning_effort: None,
                 required_apps: &required_apps,
                 expected_generation: 7,
@@ -11100,6 +11360,7 @@ mod tests {
                     target_session_ref: &session_ref,
                     request_digest: &request_digest,
                     message_digest: &message_digest,
+                    message_canonical_digest: None,
                     reasoning_effort: None,
                     required_apps: &required_apps,
                     expected_generation: 7,
@@ -11369,6 +11630,7 @@ mod tests {
                     target_session_ref: &session_ref,
                     request_digest: &request_digest,
                     message_digest: &message_digest,
+                    message_canonical_digest: None,
                     reasoning_effort: None,
                     required_apps: &required_apps,
                     expected_generation: 7,
@@ -11409,6 +11671,137 @@ mod tests {
     }
 
     #[test]
+    fn browser_registration_and_tool_bridge_changes_preserve_epoch_4_consent() {
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        for legacy_consent in [None, Some(false), Some(true)] {
+            let path = temp_db_path();
+            let endpoint_ref;
+            {
+                let mut store = StateStore::open(&path).unwrap();
+                let endpoint = store
+                    .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                        device_id: DEVICE,
+                        profile_seed: "rollback-consent-profile-seed",
+                        browser_family: "chrome",
+                        extension_version: "1.1.0",
+                        observed_at: 10,
+                    })
+                    .unwrap();
+                endpoint_ref = endpoint.endpoint_ref;
+                assert!(endpoint.webchat_control_allowed);
+
+                // Frozen v1.0.3 consent writer: only this legacy user action
+                // establishes an explicit WebChat grant or deny.
+                if let Some(allowed) = legacy_consent {
+                    assert_eq!(
+                        store
+                            .conn
+                            .execute(
+                                "UPDATE browser_endpoints
+                                 SET webchat_control_allowed = ?2,
+                                     tool_bridge_allowed = ?3,
+                                     tool_bridge_mutation_allowed = ?4,
+                                     consent_revision = consent_revision + 1,
+                                     last_observed_at = MAX(last_observed_at, ?5)
+                                 WHERE endpoint_ref = ?1 AND consent_revision = ?6",
+                                params![endpoint_ref, i64::from(allowed), 0, 0, 11, 0],
+                            )
+                            .unwrap(),
+                        1
+                    );
+                }
+                let expected_revision = i64::from(legacy_consent.is_some());
+                let registered = store
+                    .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                        device_id: DEVICE,
+                        profile_seed: "rollback-consent-profile-seed",
+                        browser_family: "ego",
+                        extension_version: "1.1.1",
+                        observed_at: 12,
+                    })
+                    .unwrap();
+                assert_eq!(registered.endpoint_ref, endpoint_ref);
+                assert_eq!(registered.browser_family, "ego");
+                assert_eq!(registered.extension_version, "1.1.1");
+                assert_eq!(registered.consent_revision, expected_revision);
+                assert!(registered.webchat_control_allowed);
+                let read_epoch_4 = || {
+                    store
+                        .conn
+                        .query_row(
+                            "SELECT webchat_control_allowed FROM browser_endpoints
+                             WHERE endpoint_ref = ?1",
+                            params![endpoint_ref],
+                            |row| Ok(row.get::<_, i64>(0)? != 0),
+                        )
+                        .unwrap()
+                };
+                assert_eq!(read_epoch_4(), legacy_consent.unwrap_or(false));
+
+                // Both compatibility payload values must leave rollback consent
+                // untouched while the supported 1.1 Tool Bridge switches work.
+                for (offset, compatibility_value) in [true, false].into_iter().enumerate() {
+                    let consent = store
+                        .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                            endpoint_ref: &endpoint_ref,
+                            expected_revision: expected_revision + offset as i64,
+                            webchat_control_allowed: compatibility_value,
+                            tool_bridge_allowed: compatibility_value,
+                            tool_bridge_mutation_allowed: compatibility_value,
+                            observed_at: 13 + offset as i64,
+                        })
+                        .unwrap();
+                    assert!(consent.webchat_control_allowed);
+                    assert_eq!(consent.tool_bridge_allowed, compatibility_value);
+                    assert_eq!(consent.tool_bridge_mutation_allowed, compatibility_value);
+                    assert_eq!(
+                        consent.consent_revision,
+                        expected_revision + offset as i64 + 1
+                    );
+                    assert_eq!(
+                        store
+                            .conn
+                            .query_row(
+                                "SELECT webchat_control_allowed FROM browser_endpoints
+                                 WHERE endpoint_ref = ?1",
+                                params![endpoint_ref],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .unwrap(),
+                        i64::from(legacy_consent.unwrap_or(false))
+                    );
+                }
+            }
+            // A separate SQLite connection represents rollback without a DB
+            // restore. Epoch 4 uses this exact boolean decoding rule.
+            let epoch_4 = Connection::open(&path).unwrap();
+            let allowed = epoch_4
+                .query_row(
+                    "SELECT webchat_control_allowed FROM browser_endpoints
+                     WHERE endpoint_ref = ?1",
+                    params![endpoint_ref],
+                    |row| Ok(row.get::<_, i64>(0)? != 0),
+                )
+                .unwrap();
+            assert_eq!(allowed, legacy_consent.unwrap_or(false));
+            drop(epoch_4);
+            let reopened = StateStore::open(&path).unwrap();
+            assert!(
+                reopened
+                    .browser_endpoint(&endpoint_ref)
+                    .unwrap()
+                    .unwrap()
+                    .webchat_control_allowed
+            );
+            assert!(reopened.browser_endpoints(64).unwrap()[0].webchat_control_allowed);
+            drop(reopened);
+            std::fs::remove_file(&path).ok();
+            std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+            std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+        }
+    }
+
+    #[test]
     fn browser_registry_is_local_opaque_fenced_and_fail_closed() {
         const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
         const PROFILE_SEED: &str = "profile-seed-0123456789abcdef";
@@ -11426,7 +11819,7 @@ mod tests {
         assert!(endpoint.endpoint_ref.starts_with("bep_"));
         assert!(!endpoint.endpoint_ref.contains(PROFILE_SEED));
         assert_eq!(endpoint.device_id, DEVICE);
-        assert!(!endpoint.webchat_control_allowed);
+        assert!(endpoint.webchat_control_allowed);
         assert!(!endpoint.tool_bridge_allowed);
         assert!(!endpoint.tool_bridge_mutation_allowed);
 
@@ -11447,7 +11840,7 @@ mod tests {
             "browser_consent_cas_conflict"
         );
 
-        // Successful consent mutation from revision 0 -> 1.
+        // Tool Bridge consent mutation from revision 0 -> 1 keeps WebChat control enabled.
         let consent = store
             .set_browser_endpoint_consent(BrowserEndpointConsentInput {
                 endpoint_ref: &endpoint.endpoint_ref,
@@ -11463,7 +11856,7 @@ mod tests {
         assert!(consent.tool_bridge_mutation_allowed);
         assert_eq!(consent.consent_revision, 1);
 
-        // Turn OFF WebChat control from revision 1 -> 2.
+        // A legacy false WebChat field leaves the 1.1 enabled projection unchanged.
         let consent_off = store
             .set_browser_endpoint_consent(BrowserEndpointConsentInput {
                 endpoint_ref: &endpoint.endpoint_ref,
@@ -11474,10 +11867,10 @@ mod tests {
                 observed_at: 12,
             })
             .unwrap();
-        assert!(!consent_off.webchat_control_allowed);
+        assert!(consent_off.webchat_control_allowed);
         assert_eq!(consent_off.consent_revision, 2);
 
-        // Stale ON request (with old revision 1 or 0) fails closed and cannot overwrite newer OFF.
+        // A stale revision still fails closed and cannot overwrite the newer Tool Bridge state.
         assert_eq!(
             store
                 .set_browser_endpoint_consent(BrowserEndpointConsentInput {
@@ -11491,12 +11884,12 @@ mod tests {
                 .unwrap_err(),
             "browser_consent_cas_conflict"
         );
-        // Verify still OFF
+        // Verify the current WebChat projection remains enabled.
         let current_ep = store
             .browser_endpoint(&endpoint.endpoint_ref)
             .unwrap()
             .unwrap();
-        assert!(!current_ep.webchat_control_allowed);
+        assert!(current_ep.webchat_control_allowed);
         assert_eq!(current_ep.consent_revision, 2);
 
         // Valid widening with current revision 2 -> 3
@@ -11989,13 +12382,6 @@ mod tests {
                 .unwrap_err(),
             "browser_canonical_url_ambiguous"
         );
-        assert_eq!(
-            store
-                .browser_latest_session_ref_for_canonical_url(URL)
-                .unwrap()
-                .as_deref(),
-            Some(newer.as_str())
-        );
         // Re-observing the same single session under the same URL is not an ambiguity,
         // and a late lower-timestamp locator must not change the single-session answer.
         let mut store = StateStore::open(":memory:").unwrap();
@@ -12011,7 +12397,8 @@ mod tests {
                 .as_deref(),
             Some(singleton.as_str())
         );
-        // Two distinct sessions sharing the newest observation stay fail-closed.
+        // A second distinct session on the same URL stays fail-closed even when it ties
+        // the newest observation.
         observe_session(&mut store, "seed-tied-endpoint", "conversation-tied", 300);
         assert_eq!(
             store
@@ -12021,21 +12408,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .browser_latest_session_ref_for_canonical_url(URL)
-                .unwrap_err(),
-            "browser_canonical_url_ambiguous"
-        );
-        assert_eq!(
-            store
                 .browser_session_ref_for_canonical_url("https://chatgpt.com/c/never-observed")
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            store
-                .browser_latest_session_ref_for_canonical_url(
-                    "https://chatgpt.com/c/never-observed",
-                )
                 .unwrap(),
             None
         );
@@ -12061,7 +12434,7 @@ mod tests {
                 provider: "chatgpt",
                 adapter_protocol_version: 1,
                 observation_generation: 1_789_378_392_882,
-                capabilities_json: r#"{"schema_version":1,"operations":["composer.submit","composer.select_tool","generation.status","generation.stop","session.archive","session.inspect","session.open","session.create"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"}}}"#,
+                capabilities_json: r#"{"schema_version":1,"operations":["composer.submit","composer.select_tool","generation.status","generation.stop","session.archive","session.inspect","session.open","session.create","session.title_projection"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"}}}"#,
                 observed_at: 11,
             })
             .unwrap();
@@ -12071,6 +12444,13 @@ mod tests {
         assert_eq!(
             observed_capabilities["input_modalities"],
             serde_json::json!(["text"])
+        );
+        assert!(
+            observed_capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("session.title_projection"))
         );
         assert_eq!(
             observed_capabilities["limits"]["attachment_count"]["max"],

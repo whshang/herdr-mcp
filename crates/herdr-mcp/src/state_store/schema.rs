@@ -305,7 +305,7 @@ CREATE TABLE IF NOT EXISTS browser_endpoints (
     device_id                       TEXT NOT NULL,
     browser_family                  TEXT NOT NULL,
     extension_version               TEXT NOT NULL,
-    webchat_control_allowed         INTEGER NOT NULL DEFAULT 0,
+    webchat_control_allowed         INTEGER NOT NULL DEFAULT 1,
     tool_bridge_allowed             INTEGER NOT NULL DEFAULT 0,
     tool_bridge_mutation_allowed    INTEGER NOT NULL DEFAULT 0,
     consent_revision                INTEGER NOT NULL DEFAULT 0,
@@ -626,6 +626,33 @@ pub(super) fn ensure_browser_archive_auxiliary_schema(conn: &Connection) -> Resu
     Ok(())
 }
 
+/// Forward-additive browser-dispatch settlement evidence.
+///
+/// `message_canonical_digest` is intentionally **not** a numbered migration: it
+/// is a nullable additive column. A schema-15 PROD binary reads and writes
+/// browser dispatches through explicit column lists, so it ignores the extra
+/// column and can still open the same database. That keeps `herdr-mcp dev
+/// rollback` to the pinned schema-15 PROD binary possible after DEV has written
+/// canonical digests. Legacy rows keep `NULL` and reconcile raw-only, which is
+/// fail-closed rather than a fabricated canonical match.
+pub(super) fn ensure_browser_dispatch_auxiliary_schema(conn: &Connection) -> Result<(), String> {
+    let has_canonical_digest = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('browser_dispatches') WHERE name = 'message_canonical_digest'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("cannot inspect browser dispatch auxiliary schema: {error}"))?;
+    if has_canonical_digest == 0 {
+        conn.execute(
+            "ALTER TABLE browser_dispatches ADD COLUMN message_canonical_digest TEXT",
+            [],
+        )
+        .map_err(|error| format!("cannot extend browser dispatch auxiliary schema: {error}"))?;
+    }
+    Ok(())
+}
+
 pub(super) fn migrate_to(
     conn: &mut Connection,
     target: i64,
@@ -769,4 +796,20 @@ pub(super) fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .map_err(|error| format!("cannot set state store mode on {}: {error}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MIGRATION_V7;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn migration_v7_matches_published_main_bytes() {
+        // Frozen from ac4b3bab226de179ddf5923f43bc7d5beca47de6 (main/rc.1).
+        // Applied migration text must not change, including whitespace/defaults.
+        assert_eq!(
+            format!("{:x}", Sha256::digest(MIGRATION_V7.as_bytes())),
+            "aef49b2c83dede770188725bb323e6767764f3d85cf8ff052a1463965e2882eb"
+        );
+    }
 }

@@ -109,6 +109,8 @@ export interface OAuthConnectorGrantRecord {
   last_rotated_by?: string;
   revoked_at_ms?: number;
   revoked_by?: string;
+  /** #630 migrate success audit ring (bounded 64); preserved verbatim on write-backs. */
+  audit?: Array<Record<string, unknown>>;
 }
 
 export interface OAuthWebChatControlGrant {
@@ -339,7 +341,14 @@ export function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantReco
     ? value.grant_generation as number
     : undefined;
   const revokedAt = finiteEpoch(value.revoked_at_ms) ? value.revoked_at_ms as number : undefined;
-  const revokedBy = typeof value.revoked_by === "string" && value.revoked_by.length <= 4096 ? value.revoked_by : undefined;
+  const revokedBy = boundedString(value.revoked_by, 4096) ? value.revoked_by : undefined;
+  // #630: the migrate success audit ring rides on the raw record. It is
+  // preserved verbatim by unrelated write-backs (allow/deny/revoke) so the
+  // migrate history survives them; bounded to the ring size (64, matching
+  // MIGRATE_AUDIT_RING in grant-migration.ts).
+  const audit = Array.isArray(value.audit)
+    ? value.audit.filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === "object").slice(-64)
+    : undefined;
   const revocationScope = value.revocation_scope === "client" ? "client" as const : undefined;
   return {
     client_id: value.client_id,
@@ -364,6 +373,7 @@ export function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantReco
     ...(lastRotatedBy !== undefined ? { last_rotated_by: lastRotatedBy } : {}),
     ...(revokedAt !== undefined ? { revoked_at_ms: revokedAt } : {}),
     ...(revokedBy !== undefined ? { revoked_by: revokedBy } : {}),
+    ...(audit !== undefined ? { audit } : {}),
   };
 }
 
@@ -385,7 +395,7 @@ export function normalizeWebChatControlGrants(value: unknown): OAuthWebChatContr
     if (!Number.isSafeInteger(item.grant_generation) || (item.grant_generation as number) <= 0) return null;
     if (!boundedString(item.device_id, 64)) return null;
     if (!boundedString(item.endpoint_ref, 96) || !boundedString(item.account_ref, 96)) return null;
-    if (!boundedString(item.provider, 32) || !/^[a-z0-9][a-z0-9._-]*$/.test(item.provider)) return null;
+    if (!boundedString(item.provider, 32) || !(item.provider === "*" || /^[a-z0-9][a-z0-9._-]*$/.test(item.provider))) return null;
     grants.push({
       connector_id: item.connector_id,
       grant_generation: item.grant_generation as number,

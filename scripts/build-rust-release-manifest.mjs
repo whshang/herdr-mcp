@@ -88,9 +88,29 @@ export async function buildRustReleaseManifest({
   }
   const cargo = await readFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), "utf8");
   const stateStore = await readFile(join(root, "crates", "herdr-mcp", "src", "state_store.rs"), "utf8");
-  const contract = JSON.parse(await readFile(join(root, "contracts", "runtime-exec-v4.json"), "utf8"));
+  const contract = JSON.parse(await readFile(join(root, "contracts", "runtime-exec-v5.json"), "utf8"));
   const version = parseCargoPackageVersion(cargo);
   const stateSchema = parseRustStateSchema(stateStore);
+  let contractMigration;
+  if (contract.contract_epoch > 2) {
+    const previousPath = join(root, "contracts", `runtime-exec-v${contract.contract_epoch - 1}.json`);
+    try {
+      const previous = JSON.parse(await readFile(previousPath, "utf8"));
+      if (previous.contract_epoch !== contract.contract_epoch - 1
+        || !/^sha256:[a-f0-9]{64}$/.test(previous.contract_hash)
+        || !Number.isSafeInteger(previous.tool_count) || previous.tool_count <= 0) {
+        throw new Error("invalid previous frozen runtime contract");
+      }
+      if (stateSchema !== 15) throw new Error("previous frozen runtime requires rollback-compatible state schema 15");
+      // This declaration only admits rollback-compatible, unchanged schemas.
+      contractMigration = {
+        from: { epoch: previous.contract_epoch, hash: previous.contract_hash, tool_count: previous.tool_count },
+        state_schema_from: 15,
+      };
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
   const tagVersion = tag.startsWith("v") ? tag.slice(1) : tag;
   if (tagVersion !== version) throw new Error(`tag ${tag} does not match Cargo version ${version}`);
 
@@ -154,6 +174,7 @@ export async function buildRustReleaseManifest({
       hash: contract.contract_hash,
       tool_count: contract.tool_count,
     },
+    ...(contractMigration ? { contract_migration: contractMigration } : {}),
     edge,
     assets,
   };

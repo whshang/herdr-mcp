@@ -26,11 +26,11 @@ herdr-mcp 的理想工作方式是：**Web 模型负责理解目标、做决策�
 优先使用：
 
 - `herdr_fs_read` / `herdr_fs_list` / `herdr_fs_grep`
-- `herdr_fs_patch` / `herdr_fs_edit`
+- 已知局部替换优先 `herdr_fs_edit`；需要上下文补丁时使用 `herdr_fs_patch`，一次 mutation 只承载一个清晰、可审计的改动边界
 - `herdr_git`
 - `herdr_exec`，以及长任务用的 `herdr_exec_start` / `read` / `kill`
 
-这条原则的价值主要是减少等待、减少状态转述，并让 Web planner 直接看到操作结果。Agent 数量应该由任务并行性和推理需要决定。
+这条原则的价值主要是减少等待、减少状态转述，并让 Web planner 直接看到操作结果。Agent 数量应该由任务并行性和推理需要决定。委派给 Agent 的提示词也保持任务化和事实化：写清目标、工作目录、修改范围、验收与停止条件；仓库规则和详细背景由 Agent 在项目内读取，避免把整份安全策略或开发手册重复塞进一次调度参数。
 
 ## 3. 什么时候调度本地 Agent
 
@@ -61,6 +61,10 @@ Agent 怎么选、首选 Agent 不可用时如何切换、长任务如何运行�
 `herdr_prompt` 建议带 `idempotency_key`。任何提交、push、部署、消息发送、创建资源等操作出现不确定结果时，先用 `herdr_since`、`herdr_inspect`、Git 或目标系统状态确认是否已经生效，再决定是否重试。
 
 `herdr_exec` 也遵循同样原则：命令一旦已经投递，就不能因为返回链路失败而假设它没有运行。
+
+`herdr_exec` 现在可选地接受 `intent`（`read_only` / `idempotent_write` / `non_idempotent_write`）与 `idempotency_key`。带 key 的请求会先记入本地 operations ledger 再投递：同一个 key 再次调用时返回首次的同步结果（`idempotent_replay=true`），不会重复执行；同一个 key 换了别的命令会以 `idempotency_key_conflict` 拒绝且不投递；已有保留但未结算的记录一律 fail-closed，不会自动重跑。write intent 必须带 key，`read_only` 可以只带 intent。不传这两个字段时行为与旧版完全一致。
+
+需要精确判断「某个 Agent prompt 是否已被确认、应用或被后续 prompt 取代」时，目前还做不到：Herdr 0.9.1 没有精确的 native prompt-turn 身份，运行时无法把一次 prompt 与它对应回合的确认/应用结果一一绑定。`herdr_prompt` 的 `idempotency_key` 只保证同一次投递不重复，不提供这种回合级判定。
 
 ## 6. Git 是开发结果的事实来源
 

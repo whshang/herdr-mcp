@@ -16,13 +16,14 @@ import type { DeviceRouteResult } from "./device-directory.js";
 import { extractDeviceIdFromArgs } from "./device-refs.js";
 import { normalizeDeviceId } from "./device-model.js";
 import { sha256Hex } from "./device-crypto.js";
-import type { InternalForwardRequest } from "./workstation-do.js";
+import type { InternalForwardRequest, ReplayBinding } from "./workstation-do.js";
 import { discoverFleetControlMethods, invalidFleetControlParam, isFleetControlMethod, type FleetControlMethod } from "./fleet-control.js";
 import {
   isChatgptOAuthClientId,
   isOpenAiMcpUserAgent,
 } from "./mcp-chatgpt-transport.js";
 import { callToolResult, normalizeSuccessfulToolResult } from "./mcp-result.js";
+import { isPageScopedLocalMethod } from "./page-scoped-methods.js";
 
 export const MCP_SERVER_NAME = "herdr-mcp";
 export const MCP_LEGACY_PROTOCOL = "2025-11-25";
@@ -44,6 +45,103 @@ function stableDedupeValue(value: unknown): unknown {
   const source = value as Record<string, unknown>;
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(source).sort()) out[key] = stableDedupeValue(source[key]);
+  return out;
+}
+
+/**
+ * Published `herdr_call` input schema is `{method, params}` plus the Edge
+ * `device` routing selector. `idempotency_key` is a deliberate Edge relay-level
+ * idempotency field: it is consumed by the Edge/WorkstationDO replay ledger
+ * (scoped to the authenticated principal, routed device and connector grant
+ * generation) and is not part of the runtime call schema. Every other
+ * top-level argument is unknown and rejected rather than forwarded blindly.
+ */
+const HERDR_CALL_TOP_LEVEL_ARGS: ReadonlySet<string> = new Set([
+  "method",
+  "params",
+  "device",
+  "idempotency_key",
+]);
+
+/**
+ * Bounded, control-character-free relay idempotency key.
+ *
+ * The 128 bound mirrors `MAX_IDEMPOTENCY_KEY_LEN` in
+ * crates/herdr-mcp/src/relay/validation.rs, which the Link applies to the wire
+ * `tool_request.idempotency_key` field (`1..=128` relay identifier grammar, so
+ * no whitespace or control characters either). A key over that bound, wrapped
+ * in whitespace, or carrying control characters was already forwarded as that
+ * frame field and rejected there as `invalid_id`; the Edge now reports the same
+ * shapes earlier and explicitly. The empty string is the only newly rejected
+ * shape: it used to be omitted from the frame field and forwarded unvalidated
+ * in `arguments`. Keys the Edge still accepts are unchanged.
+ */
+const MAX_RELAY_IDEMPOTENCY_KEY_LEN = 128;
+
+function validRelayIdempotencyKey(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= MAX_RELAY_IDEMPOTENCY_KEY_LEN
+    && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+/** Inner `params` object of a `herdr_call`, whether serialized or already an object. */
+function herdrCallInnerParams(args: Record<string, unknown>): unknown {
+  const raw = args.params;
+  if (typeof raw !== "string") return raw ?? {};
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return {};
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    // Malformed params are rejected by normal validation; keep the raw text so
+    // the binding still distinguishes two different malformed payloads.
+    return { __raw: raw };
+  }
+}
+
+/**
+ * Page Assist endpoint a page-scoped `herdr_call` requires. Returns the empty
+ * string when the method is page-scoped but names no endpoint, which can never
+ * match a real grant and therefore fails the replay gate closed.
+ */
+function pageScopedEndpointRefOf(args: Record<string, unknown>): string | undefined {
+  if (!isPageScopedLocalMethod(args.method)) return undefined;
+  const params = herdrCallInnerParams(args);
+  const ref = isRecord(params) ? params.endpoint_ref : undefined;
+  return typeof ref === "string" ? ref : "";
+}
+
+/**
+ * Canonical payload binding for relay idempotency. The identity (principal,
+ * routed device, grant generation, caller key) is owned by the WorkstationDO;
+ * this hash additionally binds it to the exact inner method, canonical args and
+ * Page Assist endpoint, so a key reused for a different request can never
+ * return the earlier completion.
+ */
+async function replayRequestHash(op: string, runtimeArgs: Record<string, unknown>): Promise<string> {
+  const canonical = op === "herdr_call"
+    ? {
+        op,
+        method: typeof runtimeArgs.method === "string" ? runtimeArgs.method : null,
+        params: stableDedupeValue(herdrCallInnerParams(runtimeArgs)),
+        endpoint_ref: pageScopedEndpointRefOf(runtimeArgs) ?? null,
+      }
+    : {
+        op,
+        args: stableDedupeValue(plainRelayArgs(runtimeArgs)),
+      };
+  return sha256Hex(JSON.stringify(canonical));
+}
+
+/** Top-level args with the relay idempotency key removed. */
+function plainRelayArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(args)) {
+    if (key === "idempotency_key") continue;
+    out[key] = args[key];
+  }
   return out;
 }
 
@@ -1101,13 +1199,39 @@ export async function handleMcp(
       }, true));
     }
 
+    // The generic herdr_call path (page-scoped methods, browser methods, agent
+    // tasks, exec, …) accepts only the published top-level fields plus the
+    // deliberate Edge relay `idempotency_key`. Reject anything else instead of
+    // forwarding an unvalidated envelope to the runtime.
+    if (name === "herdr_call") {
+      for (const key of Object.keys(args)) {
+        if (HERDR_CALL_TOP_LEVEL_ARGS.has(key)) continue;
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "invalid_params",
+          retryable: false,
+          delivery_state: "not_delivered",
+          failure_layer: "edge_routing",
+          message: `unknown top-level argument '${key}'; herdr_call only accepts 'method', 'params', optional 'device' and optional 'idempotency_key'`,
+        }, true));
+      }
+    }
+    if (args.idempotency_key !== undefined && !validRelayIdempotencyKey(args.idempotency_key)) {
+      return rpcResult(id, callToolResult({
+        ok: false,
+        code: "invalid_params",
+        retryable: false,
+        delivery_state: "not_delivered",
+        field: "idempotency_key",
+        message: `idempotency_key must be a non-empty string of at most ${MAX_RELAY_IDEMPOTENCY_KEY_LEN} characters, without leading or trailing whitespace and without control characters (the relay link rejects the same shapes)`,
+      }, true));
+    }
+
     const selectorValue = args.device;
     if (selectorValue !== undefined && typeof selectorValue !== "string") {
       return rpcError(id, -32602, "Invalid params", { reason: "device must be a string" });
     }
-    const isPageAssistPrivateMethod = localMethod === "herdr_mcp.page_assist"
-      || localMethod === "herdr_mcp.browser_page.lifecycle"
-      || localMethod === "herdr_mcp.browser_page.action";
+    const isPageAssistPrivateMethod = isPageScopedLocalMethod(localMethod);
     const isBrowserPrivateMethod = typeof localMethod === "string"
       && localMethod.startsWith("herdr_mcp.browser_")
       && !isPageAssistPrivateMethod;
@@ -1231,19 +1355,31 @@ export async function handleMcp(
     const now = deps.now?.() ?? Date.now();
     const requestId = newRequestId();
     const opClass = classifyRequestOp(name, runtimeArgs);
-    const idempotencyKey =
-      typeof runtimeArgs.idempotency_key === "string" && runtimeArgs.idempotency_key.length > 0
-        ? runtimeArgs.idempotency_key
-        : undefined;
-    const webchatControlGrants = isBrowserPrivateMethod && initialRouteDeviceId
-      ? (deps.client?.webchatControlGrants ?? [])
-        .filter((grant) => grant.device_id === initialRouteDeviceId)
-        .map((grant) => ({
-          endpoint_ref: grant.endpoint_ref,
-          provider: grant.provider,
-          account_ref: grant.account_ref,
-        }))
-      : [];
+    const idempotencyKey = validRelayIdempotencyKey(runtimeArgs.idempotency_key)
+      ? runtimeArgs.idempotency_key
+      : undefined;
+    // A Page Assist endpoint grant implies WebChat control for every provider
+    // on that exact device+endpoint (provider "*"). Derived at forward time, so
+    // existing Page Assist grants work without migration and Page Assist deny
+    // revokes it; explicitly issued per-provider grants are unaffected.
+    const webchatControlGrants: Array<{ endpoint_ref: string; provider: string; account_ref: string }> = [];
+    if (isBrowserPrivateMethod && initialRouteDeviceId) {
+      const seen = new Set<string>();
+      const push = (grant: { endpoint_ref: string; provider: string; account_ref: string }) => {
+        const key = `${grant.endpoint_ref}\u0000${grant.provider}\u0000${grant.account_ref}`;
+        if (seen.has(key) || webchatControlGrants.length >= 32) return;
+        seen.add(key);
+        webchatControlGrants.push(grant);
+      };
+      for (const grant of deps.client?.webchatControlGrants ?? []) {
+        if (grant.device_id !== initialRouteDeviceId) continue;
+        push({ endpoint_ref: grant.endpoint_ref, provider: grant.provider, account_ref: grant.account_ref });
+      }
+      for (const grant of deps.client?.pageAssistGrants ?? []) {
+        if (grant.device_id !== initialRouteDeviceId) continue;
+        push({ endpoint_ref: grant.endpoint_ref, provider: "*", account_ref: "*" });
+      }
+    }
     const pageAssistGrants = isPageAssistPrivateMethod && initialRouteDeviceId
       ? (deps.client?.pageAssistGrants ?? [])
         .filter((grant) => grant.device_id === initialRouteDeviceId)
@@ -1280,6 +1416,23 @@ export async function handleMcp(
       typeof runtimeArgs.timeout_ms === "number" && Number.isFinite(runtimeArgs.timeout_ms)
         ? Math.max(1, runtimeArgs.timeout_ms)
         : undefined;
+
+    // Relay idempotency binding: the WorkstationDO scopes the replay ledger to
+    // the authenticated principal/connector generation and routed device, and
+    // only replays when this canonical request hash matches. Page-scoped
+    // completions additionally require the caller to still hold the endpoint
+    // grant. Built once here so every retry attempt reuses the same binding.
+    const pageScopedEndpointRef = pageScopedEndpointRefOf(runtimeArgs);
+    const grantGeneration = deps.client?.grantGeneration;
+    const replayBinding: ReplayBinding | undefined = idempotencyKey === undefined
+      ? undefined
+      : {
+          requestHash: await replayRequestHash(name, runtimeArgs),
+          ...(pageScopedEndpointRef !== undefined ? { pageScopedEndpointRef } : {}),
+          ...(Number.isSafeInteger(grantGeneration) && Number(grantGeneration) > 0
+            ? { grantGeneration: Number(grantGeneration) }
+            : {}),
+        };
     const browserSessionCreate = name === "herdr_call"
       && runtimeArgs.method === "herdr_mcp.browser_session.create";
     const requestBudgetMs = requestedToolTimeoutMs === undefined
@@ -1299,6 +1452,7 @@ export async function handleMcp(
       contractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
       contractHash: RUNTIME_EXECUTION_CONTRACT.contract_hash,
       idempotencyKey,
+      ...(replayBinding !== undefined ? { replayBinding } : {}),
       readDedupeKey,
       ...(route.device_id ? { routeDeviceId: route.device_id } : {}),
       ...(route.execution_fence ? { executionFence: route.execution_fence } : {}),

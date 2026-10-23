@@ -721,6 +721,22 @@ export function buildSupervisorInput({
 // 4. decision contract (strict) + risk classification
 // ---------------------------------------------------------------------------
 
+/**
+ * The executable vocabulary the strict parser enforces. It is stated to the model
+ * in the same place every other enumerated field is stated: a value outside it is
+ * rejected as no executable decision, so the model must be able to know it.
+ */
+const SUPERVISOR_TODO_STATUS_VOCABULARY = TODO_STATUSES.join(" | ");
+const SUPERVISOR_EVIDENCE_KIND_VOCABULARY = EVIDENCE_KINDS.join(" | ");
+
+/** Repair guidance for a rejected reply: name the allowed values, not just the error. */
+const SUPERVISOR_REPAIR_VOCABULARY = [
+  `decision: ${SUPERVISOR_DECISIONS.join(" | ")}`,
+  `retry_class: ${RETRY_CLASSES.join(" | ")}`,
+  `todo_updates[].status: ${SUPERVISOR_TODO_STATUS_VOCABULARY}`,
+  `todo_updates[].evidence[].kind: ${SUPERVISOR_EVIDENCE_KIND_VOCABULARY}`,
+].join("; ");
+
 export const SUPERVISOR_SYSTEM_PROMPT = [
   "You are a deterministic goal supervisor for one WebChat conversation working on one project.",
   "You do not do the work. You decide exactly one next action.",
@@ -730,6 +746,8 @@ export const SUPERVISOR_SYSTEM_PROMPT = [
   "  reason: short justification, <=300 chars",
   "  retry_class: none | transient | provider | browser | uncertain",
   "  todo_updates: array of {id, status, owner?, evidence?: [{kind, ref, summary?}], superseded_reason?}",
+  `    status: one of ${SUPERVISOR_TODO_STATUS_VOCABULARY} — a TODO update must state one of these; any other value rejects the whole decision`,
+  `    evidence[].kind: one of ${SUPERVISOR_EVIDENCE_KIND_VOCABULARY}`,
   "  message_to_send: the exact text to send to the WebChat conversation, or null",
   "  choice: {question, options: [..], chosen} — required for ANSWER_DECISION",
   "  derived_from: ledger references that justify an ANSWER_DECISION",
@@ -1131,7 +1149,9 @@ export function createBoundedSupervisorAdapter({
 
     let last = { ok: false, reason: "no_attempt" };
     let user = buildSupervisorUserMessage(input);
-    if (correction) user = `${user}\n\nYour previous answer was rejected by the deterministic guard: ${correction}. Return a corrected JSON object.`;
+    if (correction) {
+      user = `${user}\n\nYour previous answer was rejected by the deterministic guard: ${correction}. Allowed values — ${SUPERVISOR_REPAIR_VOCABULARY}. Return a corrected JSON object.`;
+    }
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       const result = await request({ system: SUPERVISOR_SYSTEM_PROMPT, user, timeoutMs });
       if (!result?.ok) {
@@ -1142,7 +1162,7 @@ export function createBoundedSupervisorAdapter({
       const parsed = parseSupervisorDecision(result.content);
       if (!parsed.ok) {
         last = { ok: false, reason: `invalid_decision:${parsed.error}` };
-        user = `${user}\n\nYour previous answer was rejected: ${parsed.error}. Return only the required JSON object.`;
+        user = `${user}\n\nYour previous answer was rejected: ${parsed.error}. Allowed values — ${SUPERVISOR_REPAIR_VOCABULARY}. Return only the required JSON object.`;
         continue;
       }
       return { ok: true, decision: parsed, attempts: attempt };

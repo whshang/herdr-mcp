@@ -61,7 +61,14 @@ jobs:
           fi
           source_state_schema="$(git show "${source_digest}:crates/herdr-mcp/src/state_store.rs" | sed -nE 's/^pub const SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' | head -n1)"
           [[ "$source_state_schema" =~ ^[0-9]+$ ]] || { echo "cannot read source state schema" >&2; exit 1; }
-          if git cat-file -e "${source_digest}:contracts/runtime-exec-v4.json" 2>/dev/null; then
+          # Select the tagged source's Runtime Execution contract descriptor in
+          # exact compatibility order: current v5, then the immediate previous
+          # v4 rollback baseline, then the frozen epoch2 base. A source that
+          # predates v5 but carries v4 must recover v4's real contract identity
+          # rather than silently falling back to epoch2.
+          if git cat-file -e "${source_digest}:contracts/runtime-exec-v5.json" 2>/dev/null; then
+            source_contract="$(git show "${source_digest}:contracts/runtime-exec-v5.json")"
+          elif git cat-file -e "${source_digest}:contracts/runtime-exec-v4.json" 2>/dev/null; then
             source_contract="$(git show "${source_digest}:contracts/runtime-exec-v4.json")"
           else
             source_contract="$(git show "${source_digest}:contracts/epoch2.json")"

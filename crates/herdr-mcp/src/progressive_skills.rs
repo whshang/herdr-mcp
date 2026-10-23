@@ -38,6 +38,7 @@ pub const WORK_MEMORY_APPEND_EVIDENCE_METHOD: &str = "work_memory.append_evidenc
 pub const WORK_MEMORY_CHECKPOINT_PUT_METHOD: &str = "work_memory.checkpoint.put";
 pub const WORK_MEMORY_RESUME_METHOD: &str = "work_memory.resume";
 pub const WORK_MEMORY_SEARCH_METHOD: &str = "work_memory.search";
+pub const WORK_PICKUP_METHOD: &str = "work.pickup";
 pub const BROWSER_ENDPOINT_LIST_METHOD: &str = "herdr_mcp.browser_endpoint.list";
 pub const BROWSER_ENDPOINT_INSPECT_METHOD: &str = "herdr_mcp.browser_endpoint.inspect";
 pub const BROWSER_RESOURCE_LIST_METHOD: &str = "herdr_mcp.browser_resource.list";
@@ -220,7 +221,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 10] = [
     },
     BuiltinSkillSpec {
         id: "files-mutation",
-        description: "File mutation only: herdr_fs_write = CREATE / FULL REWRITE; herdr_fs_edit = exact replacement; herdr_fs_patch = PATCH EXISTING FILES or coherent multi-file changes.",
+        description: "Edit managed project files with exact replacements, full rewrites, or bounded patches. Prefer exact replacement for a known local change and keep each mutation scoped to one coherent change.",
         content: FILES_MUTATION,
         triggers: &["edit", "write", "patch", "modify files"],
         requires_capabilities: &["managed project root", "mutation gate"],
@@ -268,7 +269,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 10] = [
     },
     BuiltinSkillSpec {
         id: "agent-dispatch",
-        description: "Select and submit compatible local-agent work from live capability facts with explicit ownership and verification.",
+        description: "Submit concise local-agent tasks from live capability facts with explicit ownership, idempotency, and result verification.",
         content: AGENT_DISPATCH,
         triggers: &[
             "delegate",
@@ -670,7 +671,7 @@ impl ProgressiveSkillService {
         let global_digest = Digest::from_content(global_content);
         let catalog = self.catalog();
         let content = format!(
-            "{}\n\n## Progressive load contract\n\nUse the compact `catalog` field to select policy modules. Load all required domains in one call:\n\n```text\nherdr_call(method=\"{}\", params={{\"ids\":[\"files-search\",\"git-repository\"]}})\n```\n\nFor non-trivial task planning, `herdr_call(method=\"{}\", ...)` returns evidence-backed direct/delegation/parallelism advice without choosing or starting an Agent. Loaded text is sticky in the current context while source identity and digest are unchanged. A new user turn does not reload it. Refresh live worker/pane/runtime facts through inspect/since.",
+            "{}\n\n## Progressive load contract\n\nUse the compact `catalog` field to select policy modules. Load all required domains in one call:\n\n```text\nherdr_call(method=\"{}\", params={{\"ids\":[\"files-search\",\"git-repository\"]}})\n```\n\nFor non-trivial task planning, `herdr_call(method=\"{}\", ...)` returns evidence-backed direct/delegation/parallelism advice without choosing or starting an Agent. Loaded text is sticky in the current context while source identity and digest are unchanged. A new user turn does not reload it. Revalidate sticky ids with `expected_digests` plus `omit_unchanged: true` so unchanged bodies are not returned again. Refresh live worker/pane/runtime facts through inspect/since.",
             global_content, LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD
         );
         json!({
@@ -690,6 +691,7 @@ impl ProgressiveSkillService {
                 "params": {
                     "ids": "required array<string>, batched, first-request order preserved",
                     "expected_digests": "optional object keyed by skill id; mismatch fails closed",
+                    "omit_unchanged": "optional boolean; default false; a matching expected_digests entry returns unchanged=true without content",
                     "project_root": "optional string; enables deterministic project-local .agents/skills resolution"
                 },
                 "sticky": "conversation/task-context until source identity or digest changes, new capability domain, handoff, or explicit refresh",
@@ -2092,9 +2094,10 @@ impl ProgressiveSkillService {
     }
 
     fn load_method(&self, params: &Value, snapshot: &Value) -> Value {
-        if let Err(error) =
-            validate_object_keys(params, &["ids", "expected_digests", "project_root"])
-        {
+        if let Err(error) = validate_object_keys(
+            params,
+            &["ids", "expected_digests", "project_root", "omit_unchanged"],
+        ) {
             return error;
         }
         let Some(ids) = params.get("ids").and_then(Value::as_array) else {
@@ -2107,6 +2110,11 @@ impl ProgressiveSkillService {
             None | Some(Value::Null) => None,
             Some(Value::Object(value)) => Some(value),
             Some(_) => return invalid_params("expected_digests must be an object when provided"),
+        };
+        let omit_unchanged = match params.get("omit_unchanged") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return invalid_params("omit_unchanged must be a boolean when provided"),
         };
         let project_root = match optional_project_root(params) {
             Ok(value) => value,
@@ -2134,9 +2142,10 @@ impl ProgressiveSkillService {
                 return json!({"ok": false, "code": "unknown_skill", "id": id});
             };
             let descriptor = &entry.descriptor;
-            if let Some(expected_digest) = expected
+            let expected_digest = expected
                 .and_then(|map| map.get(&id))
-                .and_then(Value::as_str)
+                .and_then(Value::as_str);
+            if let Some(expected_digest) = expected_digest
                 && expected_digest != descriptor.identity.digest.as_str()
             {
                 return json!({
@@ -2147,6 +2156,7 @@ impl ProgressiveSkillService {
                     "actual_digest": descriptor.identity.digest.as_str(),
                 });
             }
+            let unchanged = omit_unchanged && expected_digest.is_some();
             let content = entry.content.clone();
             let (content, cache_hit) = match self.load_verified(&descriptor.identity, &content) {
                 Ok(value) => value,
@@ -2167,9 +2177,14 @@ impl ProgressiveSkillService {
                 loaded_at: now_rfc3339(),
             };
             let mut item = load_evidence_json(&evidence);
-            item.as_object_mut()
-                .expect("load evidence must be an object")
-                .insert("content".to_owned(), json!(content.as_ref()));
+            let object = item
+                .as_object_mut()
+                .expect("load evidence must be an object");
+            if unchanged {
+                object.insert("unchanged".to_owned(), json!(true));
+            } else {
+                object.insert("content".to_owned(), json!(content.as_ref()));
+            }
             loaded.push(item);
         }
         json!({
@@ -3597,6 +3612,175 @@ mod tests {
     }
 
     #[test]
+    fn omit_unchanged_skips_content_when_the_expected_digest_matches() {
+        let service = ProgressiveSkillService::new();
+        let _ = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["files-search"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        let baseline = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["files-search"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        let digest = baseline["skills"][0]["digest"].clone();
+        let omitted = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({
+                    "ids": ["files-search"],
+                    "expected_digests": {"files-search": digest},
+                    "omit_unchanged": true
+                }),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(omitted["ok"], true);
+        let entry = &omitted["skills"][0];
+        assert_eq!(entry["unchanged"], true);
+        assert!(entry.get("content").is_none());
+        for key in [
+            "id",
+            "source_identity",
+            "uri",
+            "digest",
+            "version",
+            "bytes",
+            "cache_hit",
+        ] {
+            assert_eq!(
+                entry[key], baseline["skills"][0][key],
+                "{key} must stay identical when content is omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn omit_unchanged_only_omits_ids_with_a_matching_expected_digest() {
+        let service = ProgressiveSkillService::new();
+        let warm = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["files-search", "git-repository"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        let mixed = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({
+                    "ids": ["files-search", "git-repository"],
+                    "expected_digests": {"files-search": warm["skills"][0]["digest"]},
+                    "omit_unchanged": true
+                }),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(mixed["ok"], true);
+        assert_eq!(mixed["skills"][0]["unchanged"], true);
+        assert!(mixed["skills"][0].get("content").is_none());
+        assert_eq!(mixed["skills"][1]["id"], "git-repository");
+        assert!(mixed["skills"][1].get("unchanged").is_none());
+        assert!(mixed["skills"][1]["content"].as_str().is_some());
+    }
+
+    #[test]
+    fn omit_unchanged_keeps_digest_mismatch_fail_closed() {
+        let service = ProgressiveSkillService::new();
+        let baseline = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({
+                    "ids": ["files-search"],
+                    "expected_digests": {"files-search": "sha256:wrong"}
+                }),
+                &snapshot(),
+            )
+            .unwrap();
+        let omitted = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({
+                    "ids": ["files-search"],
+                    "expected_digests": {"files-search": "sha256:wrong"},
+                    "omit_unchanged": true
+                }),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(omitted, baseline);
+        assert_eq!(omitted["code"], "skill_digest_mismatch");
+        assert_eq!(service.cache_len(), 0);
+    }
+
+    #[test]
+    fn omit_unchanged_absent_or_false_keeps_todays_response_shape() {
+        let service = ProgressiveSkillService::new();
+        let absent = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["execution"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        let disabled = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["execution"], "omit_unchanged": false}),
+                &snapshot(),
+            )
+            .unwrap();
+        for response in [&absent, &disabled] {
+            assert_eq!(response["ok"], true);
+            assert_eq!(response["count"], 1);
+            let entry = &response["skills"][0];
+            assert_eq!(entry["id"], "execution");
+            assert!(entry.get("unchanged").is_none());
+            assert!(entry["content"].as_str().is_some());
+        }
+        let keys = absent["skills"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "bytes".to_owned(),
+                "cache_hit".to_owned(),
+                "content".to_owned(),
+                "digest".to_owned(),
+                "id".to_owned(),
+                "loaded_at".to_owned(),
+                "source_identity".to_owned(),
+                "uri".to_owned(),
+                "version".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn omit_unchanged_rejects_non_boolean_values() {
+        let service = ProgressiveSkillService::new();
+        let result = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["execution"], "omit_unchanged": "true"}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "invalid_params");
+        assert_eq!(service.cache_len(), 0);
+    }
+
+    #[test]
     fn same_uri_and_digest_from_different_sources_do_not_collide() {
         let service = ProgressiveSkillService::new();
         let content = "same";
@@ -4248,6 +4432,13 @@ mod tests {
             "same workflow and required gates remain valid; only advisory ordering/classification is absent"
         );
 
+        let pickup = local_method_schemas("work.pickup");
+        assert_eq!(pickup.len(), 1);
+        assert_eq!(pickup[0]["method"], WORK_PICKUP_METHOD);
+        assert_eq!(pickup[0]["access"], "read_only");
+        assert!(pickup[0]["params"]["properties"]["cwd"].is_object());
+        assert!(pickup[0]["params"]["properties"]["pane"].is_object());
+
         let methods = local_method_schemas("work_memory.");
         assert_eq!(methods.len(), 6);
         assert_eq!(methods[0]["method"], WORK_MEMORY_BIND_METHOD);
@@ -4364,13 +4555,24 @@ mod tests {
         );
         assert_eq!(
             methods[20]["params"]["properties"]["action"]["enum"],
-            json!(["observe", "click", "fill", "expect", "screenshot"])
+            json!([
+                "observe",
+                "click",
+                "hover",
+                "fill",
+                "expect",
+                "screenshot",
+                "scroll",
+                "extract",
+                "extract_table",
+                "press"
+            ])
         );
         assert_eq!(
             methods[20]["params"]["properties"]["objective"]["maxLength"],
             1024
         );
-        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 5);
+        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 9);
         assert_eq!(methods[21]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
         assert_eq!(methods[21]["access"], "read_only");
         assert_eq!(
@@ -4445,8 +4647,8 @@ mod tests {
         assert!(search.description.contains("READ ONLY"));
         assert!(search.owned_tools.contains(&"herdr_fs_read".to_owned()));
         assert!(!search.owned_tools.contains(&"herdr_fs_write".to_owned()));
-        assert!(mutation.description.contains("CREATE / FULL REWRITE"));
-        assert!(mutation.description.contains("PATCH EXISTING FILES"));
+        assert!(mutation.description.contains("exact replacements"));
+        assert!(mutation.description.contains("bounded patches"));
         assert!(mutation.owned_tools.contains(&"herdr_fs_write".to_owned()));
         assert!(mutation.owned_tools.contains(&"herdr_fs_patch".to_owned()));
     }

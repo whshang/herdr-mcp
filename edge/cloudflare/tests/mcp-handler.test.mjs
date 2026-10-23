@@ -6,7 +6,7 @@ import { EPOCH3_CONTRACT } from "../dist/contracts/epoch3.js";
 import { EPOCH4_CONTRACT } from "../dist/contracts/epoch4.js";
 import { EPOCH5_CONTRACT } from "../dist/contracts/epoch5.js";
 import { EPOCH6_CONTRACT } from "../dist/contracts/epoch6.js";
-import { EPOCH7_CONTRACT } from "../dist/contracts/epoch7.js";
+import { EPOCH8_CONTRACT } from "../dist/contracts/epoch8.js";
 import { RUNTIME_EXECUTION_CONTRACT } from "../dist/contracts/runtime.js";
 import { encodeDeviceRef } from "../dist/device-refs.js";
 import { makeLimits } from "../dist/limits.js";
@@ -286,10 +286,10 @@ test("tools/list exposes runtime tools plus edge-local herdr_devices", async () 
   assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH3_CONTRACT.contract_hash);
 });
 
-test("public contract selection uses epoch 7 for first-party dev/prod and stays consistent across discovery surfaces", async () => {
+test("user discovers consistent first-party public tools | Given a dev or prod Edge configuration | When initializing and listing tools | Then epoch 8 metadata matches across discovery surfaces", async () => {
   for (const [edgeEnv, expected] of [
-    ["dev", EPOCH7_CONTRACT],
-    ["prod", EPOCH7_CONTRACT],
+    ["dev", EPOCH8_CONTRACT],
+    ["prod", EPOCH8_CONTRACT],
     [undefined, EPOCH3_CONTRACT],
     ["staging", EPOCH3_CONTRACT],
   ]) {
@@ -1135,12 +1135,18 @@ test("user keeps process output while advisory prose is removed | Given Herdr-ge
           content: [{ type: "text", text: JSON.stringify({
             ok: true,
             content: "planner policy text",
-            project_skill: { origin: "bundled" },
+            hint: "load more policy",
+            instructions: "use another tool",
+            skills: [{ id: "git-repository", content: "## Git policy", next_action: "load more" }],
+            project_skill: { origin: "bundled", retry_hint: "retry this way" },
           }) }],
           structuredContent: {
             ok: true,
             content: "planner policy text",
-            project_skill: { origin: "bundled" },
+            hint: "load more policy",
+            instructions: "use another tool",
+            skills: [{ id: "git-repository", content: "## Git policy", next_action: "load more" }],
+            project_skill: { origin: "bundled", retry_hint: "retry this way" },
           },
         },
       },
@@ -1151,12 +1157,20 @@ test("user keeps process output while advisory prose is removed | Given Herdr-ge
     "w1",
     skillDeps.value,
   );
-  assert.equal(skill.body.result.structuredContent.content, undefined);
+  assert.equal(skill.body.result.structuredContent.content, "planner policy text");
+  assert.equal(skill.body.result.structuredContent.hint, undefined);
+  assert.equal(skill.body.result.structuredContent.instructions, undefined);
+  assert.equal(skill.body.result.structuredContent.skills[0].content, "## Git policy");
+  assert.equal(skill.body.result.structuredContent.skills[0].next_action, undefined);
   assert.equal(skill.body.result.structuredContent.project_skill.origin, "bundled");
-  assert.equal(skill.body.result.structuredContent.reference_text_exposed, false);
+  assert.equal(skill.body.result.structuredContent.project_skill.retry_hint, undefined);
+  assert.equal(skill.body.result.structuredContent.reference_text_exposed, true);
   const skillText = JSON.parse(skill.body.result.content[0].text);
-  assert.equal(skillText.content, undefined);
-  assert.equal(skillText.reference_text_exposed, false);
+  assert.equal(skillText.content, "planner policy text");
+  assert.equal(skillText.hint, undefined);
+  assert.equal(skillText.skills[0].content, "## Git policy");
+  assert.equal(skillText.skills[0].next_action, undefined);
+  assert.equal(skillText.reference_text_exposed, true);
 
   const legacySkillDeps = deps({
     forward: async () => new Response(JSON.stringify({
@@ -1175,9 +1189,11 @@ test("user keeps process output while advisory prose is removed | Given Herdr-ge
     "w1",
     legacySkillDeps.value,
   );
-  assert.deepEqual(JSON.parse(legacySkill.body.result.content[0].text), { reference_text_exposed: false });
+  // A non-JSON skill text item is caller-facing text the Edge cannot inspect,
+  // so it passes through byte-for-byte instead of being replaced.
+  assert.equal(legacySkill.body.result.content[0].text, "legacy planner policy text");
   assert.equal(legacySkill.body.result.structuredContent.project_skill.origin, "legacy");
-  assert.equal(legacySkill.body.result.structuredContent.reference_text_exposed, false);
+  assert.equal(legacySkill.body.result.structuredContent.reference_text_exposed, true);
 });
 
 test("herdr_skill is public while unknown tools are rejected before forwarding", async () => {
@@ -1386,6 +1402,10 @@ test("browser and Page Assist private methods require explicit enrolled device s
       endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       provider: "chatgpt",
       account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }, {
+      endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      provider: "*",
+      account_ref: "*",
     }],
     webchat_authorization: {
       principal_ref: "connector:conn_auditconnector123",
@@ -1743,4 +1763,461 @@ test("forwarded requests carry a bounded principal ownership key derived from au
   assert.notEqual(aRef, bRef);
   assert.equal(JSON.stringify(a.calls[0]).includes("conn_principal_a"), false,
     "raw Connector identity must not enter pending ownership metadata");
+});
+
+function pageScopedGrantDeps() {
+  return deps({
+    client: {
+      connectorId: "conn_pagescopedgrant123",
+      grantGeneration: 3,
+      webchatControlGrants: [{
+        device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        provider: "chatgpt",
+        account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }],
+      pageAssistGrants: [
+        { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+        { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW", endpoint_ref: "be_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
+      ],
+    },
+    resolveDevice: async (selector) => selector === "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+      ? { ok: true, device_id: selector, workstation_id: "w-target", routing_reason: "explicit_device_selector" }
+      : { ok: false, code: "device_not_found" },
+  });
+}
+
+test("user runs an X site command | Given Page Assist grants on two devices | When herdr_mcp.x.search.posts is routed to one device | Then only that device's Page Assist grant is forwarded and no WebChat control grant", async () => {
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+  for (const method of ["herdr_mcp.x.search.posts", "herdr_mcp.bilibili.video.transcript", "herdr_mcp.doubao.image.status"]) {
+    assert.ok(PAGE_SCOPED_LOCAL_METHODS.includes(method), `${method} is page-scoped`);
+  }
+  const d = pageScopedGrantDeps();
+  const res = await handleMcp(
+    req(1, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.x.search.posts",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          page_ref: `bp_${"a".repeat(64)}`,
+          query: "from:OpenAI",
+          limit: 1,
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].args.method, "herdr_mcp.x.search.posts");
+  assert.deepEqual(d.calls[0].trace?.page_assist_grants, [{
+    endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  }]);
+  assert.equal(d.calls[0].trace?.webchat_control_grants, undefined, "site method gets no WebChat control grants");
+});
+
+async function dispatchStatusTrace(client) {
+  const d = deps({
+    client: { connectorId: "conn_derivedgrant1234", grantGeneration: 3, ...client },
+    resolveDevice: async (selector) => ({ ok: true, device_id: selector, workstation_id: "w-target", routing_reason: "explicit_device_selector" }),
+  });
+  await handleMcp(
+    req(3, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.browser_dispatch.status",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({ dispatch_ref: `bd_${"a".repeat(64)}` }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(d.calls.length, 1);
+  return d.calls[0].trace?.webchat_control_grants;
+}
+
+const DERIVED_E = `be_${"e".repeat(64)}`;
+
+test("user allows Page Assist | Given a Page Assist grant for device+endpoint and no WebChat grant | When a WebChat dispatch method is forwarded to that device | Then a wildcard provider (*) WebChat control grant for that endpoint is forwarded", async () => {
+  const grants = await dispatchStatusTrace({
+    pageAssistGrants: [
+      { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: DERIVED_E },
+      { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW", endpoint_ref: `be_${"f".repeat(64)}` },
+    ],
+  });
+  assert.deepEqual(grants, [{ endpoint_ref: DERIVED_E, provider: "*", account_ref: "*" }]);
+});
+
+test("user denies Page Assist | Given an explicit grok WebChat grant and no Page Assist grant | When a WebChat dispatch method is forwarded | Then the derived wildcard (*) grant is gone and only the explicit grant remains", async () => {
+  const grants = await dispatchStatusTrace({
+    webchatControlGrants: [{ device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: DERIVED_E, provider: "grok", account_ref: "*" }],
+    pageAssistGrants: [],
+  });
+  assert.deepEqual(grants, [{ endpoint_ref: DERIVED_E, provider: "grok", account_ref: "*" }]);
+});
+
+test("user has no grants | Given no Page Assist and no WebChat control grant | When a WebChat dispatch method is forwarded | Then no WebChat control grant is forwarded", async () => {
+  const grants = await dispatchStatusTrace({ webchatControlGrants: [], pageAssistGrants: [] });
+  assert.equal(grants, undefined);
+});
+
+test("user lists browser endpoints | Given a connector with Page Assist grants | When a non-page method is forwarded | Then no Page Assist grant is attached", async () => {
+  const d = pageScopedGrantDeps();
+  const res = await handleMcp(
+    req(2, "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "herdr_mcp.browser_endpoint.list", device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", params: "{}" },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].trace?.page_assist_grants, undefined);
+});
+
+test("user relies on page-scoped grant forwarding | Given the Edge page-scoped method list | When it is compared with runtime method constants | Then every listed method exists in the runtime", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+  const rust = readFileSync(new URL("../../../crates/herdr-mcp/src/progressive_skills.rs", import.meta.url), "utf8");
+  for (const method of PAGE_SCOPED_LOCAL_METHODS) {
+    if (method === "herdr_mcp.page_assist") continue;
+    assert.ok(rust.includes(`"${method}"`), `${method} is a runtime method constant`);
+  }
+});
+
+test("user stops a WebChat generation remotely | Given WebChat control and Page Assist grants on the routed device | When herdr_mcp.browser_dispatch.stop is called | Then the WebChat control grant is forwarded and no Page Assist grant is", async () => {
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+  assert.equal(PAGE_SCOPED_LOCAL_METHODS.includes("herdr_mcp.browser_dispatch.stop"), false,
+    "dispatch stop authorizes with WebChat control grants, not Page Assist grants");
+  const d = pageScopedGrantDeps();
+  const res = await handleMcp(
+    req(1, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.browser_dispatch.stop",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          dispatch_id: `bd_${"c".repeat(64)}`,
+          expected_generation: 7,
+          idempotency_key: "edge-stop-forwarding-test",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].args.method, "herdr_mcp.browser_dispatch.stop");
+  // The same "stops a WebChat generation remotely" routing also carries the
+  // wildcard WebChat control grant derived from the device's Page Assist grant
+  // (base tip), alongside the explicitly issued per-provider grant.
+  assert.deepEqual(d.calls[0].trace?.webchat_control_grants, [{
+    endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    provider: "chatgpt",
+    account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  }, {
+    endpoint_ref: DERIVED_E,
+    provider: "*",
+    account_ref: "*",
+  }]);
+  assert.equal(d.calls[0].trace?.page_assist_grants, undefined);
+});
+
+test("user sees the runtime refusal relayed unchanged | Given no WebChat control grant and no Page Assist grant for the routed device | When herdr_mcp.browser_dispatch.stop is forwarded | Then the trace carries no grant keys at all and the device-returned caller_grant_missing reaches the caller", async () => {
+  const STOP_TARGET_DEVICE = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const UNGRANTED_DEVICE = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+  const d = deps({
+    client: {
+      connectorId: "conn_stopgrantless123",
+      grantGeneration: 3,
+      webchatControlGrants: [{
+        device_id: UNGRANTED_DEVICE,
+        endpoint_ref: `be_${"b".repeat(64)}`,
+        provider: "grok",
+        account_ref: `br_${"2".repeat(64)}`,
+      }],
+      pageAssistGrants: [
+        { device_id: UNGRANTED_DEVICE, endpoint_ref: `be_${"f".repeat(64)}` },
+      ],
+    },
+    resolveDevice: async (selector) => selector === STOP_TARGET_DEVICE
+      ? { ok: true, device_id: selector, workstation_id: "w-target", routing_reason: "explicit_device_selector" }
+      : { ok: false, code: "device_not_found" },
+    forward: async () => new Response(JSON.stringify({
+      status: "ok",
+      completion: {
+        status: "ok",
+        result: {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ ok: false, code: "caller_grant_missing", actuation_available: false }),
+          }],
+          structuredContent: { ok: false, code: "caller_grant_missing", actuation_available: false },
+        },
+      },
+    }), { headers: { "content-type": "application/json" } }),
+  });
+  const res = await handleMcp(
+    req(1, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.browser_dispatch.stop",
+        device: STOP_TARGET_DEVICE,
+        params: JSON.stringify({
+          dispatch_id: `bd_${"c".repeat(64)}`,
+          expected_generation: 7,
+          idempotency_key: "edge-stop-grantless-test",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.error, undefined);
+  assert.equal(d.calls.length, 1, "a stop with no grant for the routed device must still reach the runtime");
+  assert.equal(d.calls[0].args.method, "herdr_mcp.browser_dispatch.stop");
+  assert.ok(d.calls[0].trace, "the forwarded stop call must carry a trace");
+  assert.equal(
+    d.calls[0].trace?.webchat_control_grants, undefined,
+    "no WebChat control grant may be forwarded for the routed device",
+  );
+  assert.equal(
+    d.calls[0].trace?.page_assist_grants, undefined,
+    "no Page Assist grant may be forwarded or derived for the routed device",
+  );
+  // The refusal is the fake device reply; runtime enforcement is pinned by the Rust test browser_dispatch_stop_fails_closed_without_a_caller_webchat_control_grant.
+  assert.equal(
+    res.body.result.structuredContent.code, "caller_grant_missing",
+    "the runtime refusal must reach the caller unchanged",
+  );
+});
+
+test("user stops a WebChat generation on one of two granted devices | Given WebChat control and Page Assist grants on devices A and B | When herdr_mcp.browser_dispatch.stop is routed to one device | Then only that device's grants are forwarded and the other device's endpoint refs never appear in the trace", async () => {
+  const DEVICE_A = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const DEVICE_B = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+  const WEBCHAT_A = `be_${"a".repeat(64)}`;
+  const WEBCHAT_B = `be_${"b".repeat(64)}`;
+  const ACCOUNT_A = `br_${"1".repeat(64)}`;
+  const ACCOUNT_B = `br_${"2".repeat(64)}`;
+  const PAGE_A = `be_${"e".repeat(64)}`;
+  const PAGE_B = `be_${"f".repeat(64)}`;
+
+  for (const [device, expectedGrants, forbiddenRefs] of [
+    [DEVICE_A, [
+      { endpoint_ref: WEBCHAT_A, provider: "chatgpt", account_ref: ACCOUNT_A },
+      { endpoint_ref: PAGE_A, provider: "*", account_ref: "*" },
+    ], [WEBCHAT_B, PAGE_B]],
+    [DEVICE_B, [
+      { endpoint_ref: WEBCHAT_B, provider: "grok", account_ref: ACCOUNT_B },
+      { endpoint_ref: PAGE_B, provider: "*", account_ref: "*" },
+    ], [WEBCHAT_A, PAGE_A]],
+  ]) {
+    const d = deps({
+      client: {
+        connectorId: "conn_stopdeviceisolation1",
+        grantGeneration: 3,
+        webchatControlGrants: [
+          { device_id: DEVICE_A, endpoint_ref: WEBCHAT_A, provider: "chatgpt", account_ref: ACCOUNT_A },
+          { device_id: DEVICE_B, endpoint_ref: WEBCHAT_B, provider: "grok", account_ref: ACCOUNT_B },
+        ],
+        pageAssistGrants: [
+          { device_id: DEVICE_A, endpoint_ref: PAGE_A },
+          { device_id: DEVICE_B, endpoint_ref: PAGE_B },
+        ],
+      },
+      resolveDevice: async (selector) => [DEVICE_A, DEVICE_B].includes(selector)
+        ? {
+          ok: true,
+          device_id: selector,
+          workstation_id: `ws-${selector.slice(-1).toLowerCase()}`,
+          routing_reason: "explicit_device_selector",
+        }
+        : { ok: false, code: "device_not_found" },
+    });
+    const res = await handleMcp(
+      req(`stop-isolation-${device}`, "tools/call", {
+        name: "herdr_call",
+        arguments: {
+          method: "herdr_mcp.browser_dispatch.stop",
+          device,
+          params: JSON.stringify({
+            dispatch_id: `bd_${"c".repeat(64)}`,
+            expected_generation: 7,
+            idempotency_key: `edge-stop-isolation-${device}`,
+          }),
+        },
+      }),
+      "w1",
+      d.value,
+    );
+    assert.equal(res.body.result.isError, undefined);
+    assert.equal(d.calls.length, 1);
+    assert.equal(d.calls[0].args.method, "herdr_mcp.browser_dispatch.stop");
+    assert.ok(d.calls[0].trace, "the forwarded stop call must carry a trace");
+    assert.deepEqual(d.calls[0].trace?.webchat_control_grants, expectedGrants);
+    assert.equal(d.calls[0].trace?.page_assist_grants, undefined);
+    for (const ref of forbiddenRefs) {
+      assert.equal(
+        JSON.stringify(d.calls[0].trace).includes(ref), false,
+        `the serialized trace of a stop routed to ${device} must not contain the other device's grant ${ref}`,
+      );
+    }
+  }
+});
+
+test("user relies on page-scoped grant forwarding | Given the runtime dispatch that passes caller_page_assist_grants | When its methods are compared with the Edge page-scoped list | Then every runtime Page Assist consumer is forwarded", async () => {
+  const { readFileSync, readdirSync } = await import("node:fs");
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+  const srcDir = new URL("../../../crates/herdr-mcp/src/", import.meta.url);
+  const sources = readdirSync(srcDir).filter((name) => name.endsWith(".rs"))
+    .map((name) => readFileSync(new URL(name, srcDir), "utf8")).join("\n");
+  const constants = new Map([...sources.matchAll(/const ([A-Z0-9_]+_METHOD): &str = "([^"]+)";/g)]
+    .map((m) => [m[1], m[2]]));
+  const mcp = readFileSync(new URL("mcp.rs", srcDir), "utf8");
+  const consumers = [...mcp.matchAll(/method == ([A-Z0-9_]+_METHOD)\s*\{[^}]*?context\.caller_page_assist_grants/g)]
+    .map((m) => constants.get(m[1]) ?? m[1]);
+  assert.ok(consumers.length >= 7, `found runtime Page Assist consumers: ${consumers.join(",")}`);
+  for (const method of consumers) {
+    assert.ok(PAGE_SCOPED_LOCAL_METHODS.includes(method), `${method} must be in PAGE_SCOPED_LOCAL_METHODS`);
+  }
+});
+
+// ---- Page-scoped caller-grant routing matrix -------------------------------
+// Every method in PAGE_SCOPED_LOCAL_METHODS authorizes on the runtime with a
+// Page Assist caller grant that the Edge forwards only for the routed device.
+// These scenarios pin that contract for the whole list, not one method at a
+// time, so a new page-scoped method cannot silently forward another device's
+// grant (or forward grants with no routed device at all).
+
+const PAGE_DEVICE_A = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const PAGE_DEVICE_B = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+const PAGE_DEVICE_C = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAX";
+const PAGE_GRANT_A = `be_${"e".repeat(64)}`;
+const PAGE_GRANT_B = `be_${"f".repeat(64)}`;
+
+function pageScopedRoutingDeps({ withGrants = true } = {}) {
+  return deps({
+    client: {
+      connectorId: "conn_pagescopedrouting123",
+      grantGeneration: 5,
+      pageAssistGrants: withGrants
+        ? [
+          { device_id: PAGE_DEVICE_A, endpoint_ref: PAGE_GRANT_A },
+          { device_id: PAGE_DEVICE_B, endpoint_ref: PAGE_GRANT_B },
+        ]
+        : [{ device_id: PAGE_DEVICE_B, endpoint_ref: PAGE_GRANT_B }],
+    },
+    resolveDevice: async (selector) => [PAGE_DEVICE_A, PAGE_DEVICE_B, PAGE_DEVICE_C].includes(selector)
+      ? {
+        ok: true,
+        device_id: selector,
+        workstation_id: `ws_${selector.slice(-1).toLowerCase()}`,
+        routing_reason: "explicit_device_selector",
+      }
+      : { ok: false, code: "device_not_found" },
+  });
+}
+
+// The Edge forwards runtime params unchanged for these private methods, so the
+// matrix only needs opaque, shape-valid refs to keep the trace comparable. The
+// requested endpoint_ref is deliberately distinct from every caller grant, so a
+// leaked grant can never be mistaken for the caller's own request field.
+function pageScopedMethodParams() {
+  return JSON.stringify({
+    endpoint_ref: `be_${"1".repeat(64)}`,
+    page_ref: `bp_${"a".repeat(64)}`,
+  });
+}
+
+test("user calls every page-scoped method | Given Page Assist grants on two enrolled devices | When the call is routed to one device | Then only that device's grant is forwarded and the other device's endpoint never is", async () => {
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+  assert.ok(PAGE_SCOPED_LOCAL_METHODS.length >= 9, "the page-scoped forwarding list is covered in full");
+
+  for (const method of PAGE_SCOPED_LOCAL_METHODS) {
+    for (const [device, granted, other] of [
+      [PAGE_DEVICE_A, PAGE_GRANT_A, PAGE_GRANT_B],
+      [PAGE_DEVICE_B, PAGE_GRANT_B, PAGE_GRANT_A],
+    ]) {
+      const d = pageScopedRoutingDeps();
+      const res = await handleMcp(
+        req(`matrix-${method}-${device}`, "tools/call", {
+          name: "herdr_call",
+          arguments: { method, device, params: pageScopedMethodParams() },
+        }),
+        "w1",
+        d.value,
+      );
+      assert.equal(res.body.result.isError, undefined, `${method} routed to ${device}`);
+      assert.equal(d.calls.length, 1, `${method} must forward exactly once`);
+      assert.deepEqual(
+        d.calls[0].trace?.page_assist_grants,
+        [{ endpoint_ref: granted }],
+        `${method} must forward only the routed device's Page Assist grant`,
+      );
+      assert.equal(
+        JSON.stringify(d.calls[0].trace ?? {}).includes(other),
+        false,
+        `${method} must never carry another device's grant endpoint in the forwarded trace`,
+      );
+      assert.equal(
+        d.calls[0].trace?.webchat_control_grants,
+        undefined,
+        `${method} must not attach WebChat control grants`,
+      );
+    }
+  }
+});
+
+test("user calls every page-scoped method on an un-granted device | Given the connector holds grants for other devices only | When the call is routed to that device | Then no Page Assist grant is forwarded", async () => {
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+
+  for (const method of PAGE_SCOPED_LOCAL_METHODS) {
+    const d = pageScopedRoutingDeps({ withGrants: false });
+    const res = await handleMcp(
+      req(`ungranted-${method}`, "tools/call", {
+        name: "herdr_call",
+        arguments: { method, device: PAGE_DEVICE_A, params: pageScopedMethodParams() },
+      }),
+      "w1",
+      d.value,
+    );
+    assert.equal(res.body.result.isError, undefined, `${method} still routes to the device it was told to`);
+    assert.equal(d.calls.length, 1, `${method} forwards to the routed device`);
+    assert.equal(
+      d.calls[0].trace?.page_assist_grants,
+      undefined,
+      `${method} must not invent a grant for the routed device`,
+    );
+    assert.equal(
+      JSON.stringify(d.calls[0].trace ?? {}).includes(PAGE_GRANT_B),
+      false,
+      `${method} must not forward an unrelated device's grant as a substitute`,
+    );
+  }
+});
+
+test("user calls every page-scoped method without a device | Given page-scoped forwarding needs an explicit enrolled device | When the selector is missing | Then the call is refused before any grant is forwarded", async () => {
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+
+  for (const method of PAGE_SCOPED_LOCAL_METHODS) {
+    const d = pageScopedRoutingDeps();
+    const res = await handleMcp(
+      req(`no-device-${method}`, "tools/call", {
+        name: "herdr_call",
+        arguments: { method, params: pageScopedMethodParams() },
+      }),
+      "w1",
+      d.value,
+    );
+    assert.equal(res.body.result.isError, true, `${method} must fail closed without a device`);
+    assert.equal(res.body.result.structuredContent.code, "device_required", method);
+    assert.equal(res.body.result.structuredContent.delivery_state, "not_delivered", method);
+    assert.equal(d.calls.length, 0, `${method} must not forward without a routed device`);
+  }
 });

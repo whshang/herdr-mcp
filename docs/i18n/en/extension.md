@@ -93,6 +93,33 @@ herdr-mcp Rust runtime
 
 The browser owns interaction and visualization; Native Host is the trusted local bridge; the runtime still owns tool schemas, managed-root checks, permissions, and mutation boundaries. Public OAuth/MCP and local Native Messaging are separate trust boundaries.
 
+## Linux and Google Chrome
+
+macOS and Linux use the same Native Messaging contract. The managed runtime listens on the mode-`0600` socket `~/.config/herdr-mcp/extension.sock`. The browser manifest allows exactly one `chrome-extension://<id>/` origin and points at the stable wrapper `~/.config/herdr-mcp/native/herdr-extension-host`. That wrapper runs the colocated runtime copy as `herdr-mcp extension-host`. The host does not accept the loopback bearer; anonymous TCP to `127.0.0.1:8772` stays denied.
+
+`herdr-mcp native-host install` always registers Google Chrome. Chromium, Chrome for Testing, Chrome Beta, Chrome Dev (`google-chrome-unstable`), Brave, and Microsoft Edge are registered only when that browser's config directory already exists. Linux manifest directories:
+
+| Browser | Manifest directory |
+| --- | --- |
+| Google Chrome | `~/.config/google-chrome/NativeMessagingHosts/dev.herdr.mcp.json` |
+| Chromium | `~/.config/chromium/NativeMessagingHosts/dev.herdr.mcp.json` |
+| Chrome for Testing | `~/.config/google-chrome-for-testing/NativeMessagingHosts/dev.herdr.mcp.json` |
+
+When `XDG_CONFIG_HOME` is an absolute path and this is the process home, those directories are created under `$XDG_CONFIG_HOME` instead of `~/.config`. A hand-written manifest that does not point at the managed wrapper is foreign; remove it before `native-host install`, which refuses to take over an unowned host file.
+
+Chrome launched with `--user-data-dir` reads native hosts from `<user-data-dir>/NativeMessagingHosts/`, not the default config directory. Repeat `--user-data-dir` on `native-host install` or `native-host use`. `native-host status` lists those directories and `native-host rollback` restores the previous set. The profile directory must already exist and must not be a symlink.
+
+The socket is created by the managed runtime, not by `native-host install`. `herdr-mcp service install` (also what an update and `herdr-mcp dev sync` run) rewrites the user systemd unit or the detached-process environment with `HERDR_EXTENSION_IPC_SOCKET` and restarts the runtime. A `service restart` of a unit written by an older runtime does not add that variable. After the new runtime is up, register the channel and restart Chrome so it launches the host:
+
+```bash
+herdr-mcp service install
+herdr-mcp native-host use standalone
+# or: herdr-mcp native-host install
+herdr-mcp native-host status
+```
+
+Then reload the extension (or restart Chrome) and confirm `herdr-mcp webchat endpoints` shows the browser endpoint. `extension.sock` should be a mode-`0600` socket owned by your user.
+
 ## First use
 
 1. Make sure Runtime + ChatGPT Connector already work.
@@ -102,11 +129,11 @@ The browser owns interaction and visualization; Native Host is the trusted local
 5. Keep Auto off while you verify status, Pinned Target, and manual controls.
 6. Enable scoped Continuity automation only when you actually need unattended long-running work.
 
-Settings keep the common path short: language, the ChatGPT Project Auto capability gate, and supported WebChat site access stay visible. Experimental sites, Page Assist, local connection details, continuity templates, and timing controls are collapsed until needed. Workspace binding and WebChat Control remain in the Side Panel/HUD where their current-page context is visible.
+Settings keep the common path short: language, the ChatGPT Project Auto capability gate, and supported WebChat site access stay visible. Experimental sites, Page Assist, local connection details, continuity templates, and timing controls are collapsed until needed. Workspace binding remains in the Side Panel/HUD where its current-page context is visible; registered WebChat endpoints are controllable by default and no longer expose a separate WebChat Control toggle.
 
 For semantic Auto, the extension has no provider credential or endpoint settings. It calls the local Herdr Runtime, which owns one semantic route pool with exactly two configuration layers: mode-`0600` `config.json` for the workstation and the authenticated Cloudflare Worker route pool shared across enrolled workstations. Local routes take precedence for each typed/chat capability. Both layers use the same `name / protocol / url / model / api_key` route object schema; `decision` and `decision-vercel` imply typed evaluation, while `openai-chat` implies chat; shell/process environment is not a semantic-provider configuration source. Ordinary Auto uses typed evaluation routes (Jev) -> chat routes (LLM) -> bounded script fallback; Goal-aware Auto can use Jev as an advisory semantic prior for the existing LLM Goal Supervisor. Configuration order is route priority; later routes are bounded fallbacks after failure/cooldown. Typed and chat routes share bounded per-route attempts, separate total deadlines, cooldown, and serial failover. Existing `config.toml` migrates once to JSON. The script fallback keeps basic Auto available without a semantic provider, while Work Memory/TODO evidence and deterministic safety guards remain authoritative.
 
-1.0 browser support covers ChatGPT, Claude, and Grok. Their Project / Project-chat surfaces share workspace binding and WebChat Control; a global new-chat/home surface keeps WebChat Control but has no workspace binding until a Project or conversation scope exists. ChatGPT additionally supports conversation `create`, archive, and self-handoff. Claude and Grok support signed-in session dispatch, settled results, and reload recovery. Gemini stays opt-in experimental and is outside the 1.0 acceptance boundary.
+1.0 browser support covers ChatGPT, Claude, and Grok. Their registered WebChat endpoints are controllable by default; Project / Project-chat surfaces additionally expose workspace binding, while global new-chat/home surfaces have no workspace binding until a Project or conversation scope exists. ChatGPT additionally supports conversation `create`, archive, and self-handoff. Claude and Grok support signed-in session dispatch, settled results, and reload recovery. Gemini stays opt-in experimental and is outside the 1.0 acceptance boundary.
 
 The z.ai / DeepSeek JSON → MCP integrations are experimental and disabled by default; enable them explicitly in Herdr experimental settings.
 

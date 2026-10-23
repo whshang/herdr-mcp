@@ -3,8 +3,12 @@ import test from "node:test";
 
 import {
   DEFAULT_SUPERVISOR_POLICY,
+  EVIDENCE_KINDS,
+  RETRY_CLASSES,
   SUPERVISOR_DECISIONS,
   SUPERVISOR_LIMITS,
+  SUPERVISOR_SYSTEM_PROMPT,
+  TODO_STATUSES,
   applyTodoUpdates,
   buildSupervisorInput,
   claimSupervisorBoundary,
@@ -545,6 +549,44 @@ test("user never receives an action from a malformed model answer | Given prose,
   assert.equal(result.status, "provider_failed");
   assert.equal(result.effects, null);
   assert.ok(calls.length <= DEFAULT_SUPERVISOR_POLICY.maxDecisionAttempts);
+});
+
+test("user gets a repairable rejection | Given a supervisor reply rejected for an out-of-vocabulary todo status | When the bounded adapter retries the decision | Then the repair message names the exact allowed status values so the model can correct it", async () => {
+  const rejected = {
+    decision: "CONTINUE",
+    reason: "Open TODO t1 is pending, agent idle and no blocker.",
+    retry_class: "none",
+    todo_updates: [{ id: "t1", status: "in_progress", owner: "assistant" }],
+    message_to_send: "continue the work",
+  };
+  const corrected = { ...rejected, todo_updates: [{ id: "t1", status: "working", owner: "assistant" }] };
+  assert.equal(parseSupervisorDecision(JSON.stringify(rejected)).ok, false);
+  assert.equal(parseSupervisorDecision(JSON.stringify(rejected)).error, "todo_update_status_required");
+
+  const { adapter, calls } = adapterFor([rejected, corrected]);
+  const result = await supervise({ ledger: ledger(), boundaryEvent: { type: "turn_settled" }, runtime: healthyRuntime, adapter, now: 10_000 });
+  assert.equal(result.ok, true);
+  assert.equal(result.decision, "CONTINUE");
+  assert.equal(result.ledger.todos[0].status, "working");
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].user.includes("todo_update_status_required"), true);
+  assert.equal(calls[1].user.includes(TODO_STATUSES.join(" | ")), true);
+  assert.equal(calls[1].system, SUPERVISOR_SYSTEM_PROMPT);
+});
+
+test("user is told the executable vocabulary up front | Given the supervisor system prompt | When it is compared with the strict parser vocabulary | Then every allowed todo status and evidence kind is stated there", () => {
+  for (const status of TODO_STATUSES) {
+    assert.equal(SUPERVISOR_SYSTEM_PROMPT.includes(status), true, `status ${status} must be documented`);
+  }
+  for (const kind of EVIDENCE_KINDS) {
+    assert.equal(SUPERVISOR_SYSTEM_PROMPT.includes(kind), true, `evidence kind ${kind} must be documented`);
+  }
+  for (const decision of SUPERVISOR_DECISIONS) {
+    assert.equal(SUPERVISOR_SYSTEM_PROMPT.includes(decision), true, `decision ${decision} must be documented`);
+  }
+  for (const retryClass of RETRY_CLASSES) {
+    assert.equal(SUPERVISOR_SYSTEM_PROMPT.includes(retryClass), true, `retry class ${retryClass} must be documented`);
+  }
 });
 
 test("user is not supervised at all without a configured provider | Given no LLM configuration | When the supervisor runs | Then no transport call is made", async () => {
