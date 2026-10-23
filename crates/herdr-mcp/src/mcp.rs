@@ -3128,6 +3128,42 @@ fn browser_session_apply_classification_reason(response: &mut Value, reason: Opt
     }
 }
 
+/// Fence the target of the source-turn evidence for one applied
+/// `browser_dispatch.submit`.
+///
+/// Only what the runtime itself delivered is trusted: the text this submit sent
+/// to the exact session it was fenced to, proven accepted by the applied
+/// postcondition. Nothing here reads a caller-supplied "current user message",
+/// so a model cannot choose which turn is recorded. The target is re-read under
+/// the caller's store lock because the Extension may have re-observed resources
+/// while the actuation was in flight; evidence is emitted only while the session
+/// and its account lineage still match this submit's endpoint, provider and
+/// generation.
+fn browser_dispatch_source_turn_target(
+    store: &StateStore,
+    session: &crate::state_store::BrowserResourceRecord,
+    session_ref: &str,
+    expected_generation: i64,
+) -> Result<(), String> {
+    let current = store
+        .browser_resource(session_ref)?
+        .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+    if current.kind != "session"
+        || current.provider != "chatgpt"
+        || current.endpoint_ref != session.endpoint_ref
+    {
+        return Err("browser_current_turn_scope_mismatch".to_owned());
+    }
+    if current.observation_generation != expected_generation {
+        return Err("browser_current_turn_stale".to_owned());
+    }
+    // The same account-lineage fence the WebChat authorization path applies, so
+    // evidence is never recorded against a session whose account is unknown or
+    // scoped to another endpoint/provider.
+    browser_resource_account_ref(store, &current)?;
+    Ok(())
+}
+
 fn browser_dispatch_submit(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -3290,7 +3326,7 @@ fn browser_dispatch_submit(
     };
     let dispatch = match current.delivery_state {
         BrowserDeliveryState::Uncertain if delivery_state != BrowserDeliveryState::Uncertain => {
-            match store.settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+            let settlement = BrowserDispatchUpdateInput {
                 dispatch_id: &reserved.dispatch_id,
                 expected_generation,
                 delivery_state,
@@ -3301,7 +3337,44 @@ fn browser_dispatch_submit(
                     None
                 },
                 updated_at: now,
-            }) {
+            };
+            let settled = if delivery_state == BrowserDeliveryState::Applied
+                && session.provider == "chatgpt"
+            {
+                // A hidden/auto-submitted turn never produces a DOM source-turn
+                // observation, so the runtime records the turn it just delivered
+                // as the session's current source-turn evidence. The write is in
+                // the settlement transaction, and its fences re-run there against
+                // the live target: caller grant, account, endpoint and provider
+                // generation were already enforced before actuation, so evidence
+                // is recorded only for the exact session this submit was fenced
+                // to. Any mismatch refuses the settlement, leaving the dispatch
+                // uncertain and the evidence unwritten (fail closed).
+                if let Err(error) = browser_dispatch_source_turn_target(
+                    &store,
+                    &session,
+                    session_ref,
+                    expected_generation,
+                ) {
+                    return browser_store_error(error);
+                }
+                // The provider renders composer line breaks as blank lines, so
+                // the durable turn identity is the whitespace-trimmed submitted
+                // text, exactly like `source_turn.observe` and the WebChat
+                // binding path.
+                let turn_digest = browser_sha256(message.trim());
+                store.settle_browser_dispatch_with_source_turn(
+                    settlement,
+                    crate::state_store::BrowserDispatchSourceTurn {
+                        session_ref,
+                        user_text_sha256: &turn_digest,
+                        observed_at: browser_epoch_ms(),
+                    },
+                )
+            } else {
+                store.settle_uncertain_browser_dispatch(settlement)
+            };
+            match settled {
                 Ok(dispatch) => dispatch,
                 Err(error) => return browser_store_error(error),
             }
@@ -23248,6 +23321,503 @@ mod tests {
         assert_ne!(result["delivery_state"], "delivery_unknown", "{result}");
         assert_eq!(result["retry_safe"], true, "{result}");
         assert_eq!(result["retryable"], true, "{result}");
+    }
+}
+
+#[cfg(test)]
+mod browser_dispatch_source_turn_tests {
+    use super::*;
+    use crate::state_store::{
+        BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+        BrowserResourceObservationInput,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const GENERATION: i64 = 7;
+
+    fn accepted_text_result(message: &str, accepted_ref: &str) -> Value {
+        json!({
+            "accepted_user_message_ref": accepted_ref,
+            "accepted_user_text_sha256": browser_sha256(message.trim()),
+            "accepted_user_body_sha256": browser_sha256(message.trim()),
+            "accepted_user_text_canonical_sha256": browser_sha256(
+                &browser_readback_text_canonical(message)
+            ),
+            "accepted_user_body_canonical_sha256": browser_sha256(
+                &browser_readback_text_canonical(message)
+            ),
+        })
+    }
+
+    fn applied_evidence(params: &Value, expected_generation: i64) -> BrowserPostconditionEvidence {
+        BrowserPostconditionEvidence {
+            observed_generation: expected_generation,
+            command_accepted: true,
+            browser_online: true,
+            resource_available: true,
+            rejected: false,
+            stable_resource_ref_observed: true,
+            lifecycle_observed: true,
+            canonical_url_observed: true,
+            accepted_message_observed: true,
+            message_baseline_advanced: false,
+            reasoning_effort_readback: None,
+            required_apps_readback: Vec::new(),
+            generation_owner: Some(expected_generation),
+            generation_status_observed: true,
+            generation_stopped: false,
+            result: Some(accepted_text_result(
+                params["message"].as_str().unwrap(),
+                "provider-user-source-turn",
+            )),
+        }
+    }
+
+    fn chatgpt_account(
+        store: &mut StateStore,
+        endpoint_ref: &str,
+        label: &str,
+    ) -> (String, String) {
+        let account = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: &format!("source-turn-account-{label}"),
+                display_label: None,
+                observation_generation: GENERATION,
+                observed_at: 12,
+            })
+            .unwrap();
+        let session = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&account.resource_ref),
+                native_identity: &format!("source-turn-session-{label}"),
+                display_label: None,
+                observation_generation: GENERATION,
+                observed_at: 13,
+            })
+            .unwrap();
+        (account.resource_ref, session.resource_ref)
+    }
+
+    /// One ChatGPT endpoint with one observed account and session per label.
+    fn chatgpt_fixture(label: &str) -> (Arc<Mutex<StateStore>>, String, Vec<(String, String)>) {
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let mut guard = store.lock().unwrap();
+        let endpoint = guard
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                profile_seed: &format!("source-turn-profile-{label}"),
+                browser_family: "chrome",
+                extension_version: "0.1.236",
+                observed_at: 10,
+            })
+            .unwrap();
+        guard
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: GENERATION,
+                capabilities_json: r#"{"operations":["composer.submit","generation.status"]}"#,
+                observed_at: 11,
+            })
+            .unwrap();
+        let first = chatgpt_account(&mut guard, &endpoint.endpoint_ref, label);
+        drop(guard);
+        (store, endpoint.endpoint_ref, vec![first])
+    }
+
+    fn add_account(
+        store: &Arc<Mutex<StateStore>>,
+        endpoint_ref: &str,
+        label: &str,
+    ) -> (String, String) {
+        let mut guard = store.lock().unwrap();
+        chatgpt_account(&mut guard, endpoint_ref, label)
+    }
+
+    fn submit(
+        store: &Arc<Mutex<StateStore>>,
+        session_ref: &str,
+        message: &str,
+        expected_generation: i64,
+        idempotency_key: &str,
+        actuator: Option<&dyn BrowserActuator>,
+    ) -> Value {
+        browser_operation_call_with_grant(
+            store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": message,
+                "expected_generation": expected_generation,
+                "idempotency_key": idempotency_key,
+            }),
+            true,
+            actuator,
+        )
+    }
+
+    fn resolve(store: &Arc<Mutex<StateStore>>, text: &str) -> Result<(String, i64), String> {
+        store
+            .lock()
+            .unwrap()
+            .resolve_browser_source_turn(&browser_sha256(text.trim()), browser_epoch_ms())
+    }
+
+    /// user sees the trusted turn | Given an applied dispatch submit | When the runtime settles it | Then the exact trimmed turn resolves to that session and generation
+    #[test]
+    fn applied_submit_records_the_trusted_trimmed_turn_for_its_session() {
+        let (store, _endpoint_ref, accounts) = chatgpt_fixture("applied");
+        let session_ref = accounts[0].1.clone();
+        let message = "  deliver the requested turn  ";
+
+        struct AppliedSubmit;
+        impl BrowserActuator for AppliedSubmit {
+            fn actuate(
+                &self,
+                _operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Ok(applied_evidence(params, expected_generation))
+            }
+        }
+
+        let applied = submit(
+            &store,
+            &session_ref,
+            message,
+            GENERATION,
+            "source-turn-applied-1",
+            Some(&AppliedSubmit),
+        );
+        assert_eq!(applied["ok"], true, "{applied}");
+        assert_eq!(applied["dispatch"]["delivery_state"], "applied");
+        assert_eq!(
+            resolve(&store, message),
+            Ok((session_ref.clone(), GENERATION))
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&browser_sha256(message), browser_epoch_ms())
+                .unwrap_err(),
+            "browser_current_turn_not_found",
+            "the un-trimmed text is not the observed turn"
+        );
+        assert!(!applied.to_string().contains(message.trim()));
+    }
+
+    /// user stays unbound | Given a dispatch submit without a proven applied postcondition | When it settles uncertain, rejected or unavailable | Then no source turn is recorded
+    #[test]
+    fn unproven_submit_outcomes_record_no_source_turn() {
+        let (store, _endpoint_ref, accounts) = chatgpt_fixture("unproven");
+        let session_ref = accounts[0].1.clone();
+
+        struct UncertainSubmit;
+        impl BrowserActuator for UncertainSubmit {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.resource_available = true;
+                Ok(evidence)
+            }
+        }
+        struct RejectedSubmit;
+        impl BrowserActuator for RejectedSubmit {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.resource_available = true;
+                evidence.rejected = true;
+                Ok(evidence)
+            }
+        }
+
+        let uncertain = submit(
+            &store,
+            &session_ref,
+            "uncertain turn",
+            GENERATION,
+            "source-turn-uncertain-1",
+            Some(&UncertainSubmit),
+        );
+        assert_eq!(uncertain["code"], "uncertain", "{uncertain}");
+        assert_eq!(uncertain["dispatch"]["delivery_state"], "uncertain");
+
+        let rejected = submit(
+            &store,
+            &session_ref,
+            "rejected turn",
+            GENERATION,
+            "source-turn-rejected-1",
+            Some(&RejectedSubmit),
+        );
+        assert_eq!(rejected["code"], "rejected", "{rejected}");
+
+        let unavailable = submit(
+            &store,
+            &session_ref,
+            "unavailable turn",
+            GENERATION,
+            "source-turn-unavailable-1",
+            None,
+        );
+        assert_eq!(unavailable["code"], "resource_unavailable", "{unavailable}");
+
+        for text in ["uncertain turn", "rejected turn", "unavailable turn"] {
+            assert_eq!(
+                resolve(&store, text).unwrap_err(),
+                "browser_current_turn_not_found",
+                "{text} must not become trusted turn evidence"
+            );
+        }
+    }
+
+    /// user gets a stale refusal | Given the provider generation moves while the submit is in flight | When the runtime settles it | Then nothing is recorded and the dispatch stays uncertain
+    #[test]
+    fn stale_generation_submit_records_no_source_turn() {
+        let (store, endpoint_ref, accounts) = chatgpt_fixture("stale");
+        let session_ref = accounts[0].1.clone();
+
+        let fenced = submit(
+            &store,
+            &session_ref,
+            "stale entrypoint turn",
+            GENERATION - 1,
+            "source-turn-entrypoint-stale-1",
+            None,
+        );
+        assert_eq!(fenced["code"], "stale_capability_generation", "{fenced}");
+        assert_eq!(
+            resolve(&store, "stale entrypoint turn").unwrap_err(),
+            "browser_current_turn_not_found"
+        );
+
+        struct GenerationAdvanceActuator {
+            store: Arc<Mutex<StateStore>>,
+            endpoint_ref: String,
+            dispatch_ids: Mutex<Vec<String>>,
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for GenerationAdvanceActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.dispatch_ids
+                    .lock()
+                    .unwrap()
+                    .push(dispatch_id.unwrap().to_owned());
+                // An extension reload re-observes the provider while the submit
+                // is in flight, so the settlement can no longer be proven
+                // against the generation this submit was fenced to.
+                self.store
+                    .lock()
+                    .unwrap()
+                    .observe_browser_provider(BrowserProviderObservationInput {
+                        endpoint_ref: &self.endpoint_ref,
+                        provider: "chatgpt",
+                        adapter_protocol_version: 1,
+                        observation_generation: GENERATION + 1,
+                        capabilities_json: r#"{"operations":["composer.submit","generation.status"]}"#,
+                        observed_at: 20,
+                    })
+                    .unwrap();
+                Ok(applied_evidence(params, expected_generation))
+            }
+        }
+        let actuator = GenerationAdvanceActuator {
+            store: store.clone(),
+            endpoint_ref,
+            dispatch_ids: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        };
+        let moved = submit(
+            &store,
+            &session_ref,
+            "mid-flight generation turn",
+            GENERATION,
+            "source-turn-midflight-stale-1",
+            Some(&actuator),
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(moved["code"], "stale_capability_generation", "{moved}");
+        let dispatch_ids = actuator.dispatch_ids.lock().unwrap().clone();
+        let stored = store
+            .lock()
+            .unwrap()
+            .browser_dispatch(&dispatch_ids[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.delivery_state, BrowserDeliveryState::Uncertain);
+        assert_eq!(
+            resolve(&store, "mid-flight generation turn").unwrap_err(),
+            "browser_current_turn_not_found"
+        );
+    }
+
+    /// user keeps newer evidence | Given an applied submit | When the same idempotency key replays | Then no earlier turn is rewritten or refreshed
+    #[test]
+    fn replayed_submit_does_not_rewrite_recorded_source_turn() {
+        let (store, _endpoint_ref, accounts) = chatgpt_fixture("replay");
+        let session_ref = accounts[0].1.clone();
+
+        struct AppliedSubmit;
+        impl BrowserActuator for AppliedSubmit {
+            fn actuate(
+                &self,
+                _operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Ok(applied_evidence(params, expected_generation))
+            }
+        }
+
+        let applied = submit(
+            &store,
+            &session_ref,
+            "first delivered turn",
+            GENERATION,
+            "source-turn-replay-1",
+            Some(&AppliedSubmit),
+        );
+        assert_eq!(
+            applied["dispatch"]["delivery_state"], "applied",
+            "{applied}"
+        );
+
+        let newer = browser_sha256("later typed turn");
+        store
+            .lock()
+            .unwrap()
+            .observe_browser_source_turn(&session_ref, GENERATION, &newer, browser_epoch_ms())
+            .unwrap();
+
+        let replay = submit(
+            &store,
+            &session_ref,
+            "first delivered turn",
+            GENERATION,
+            "source-turn-replay-1",
+            Some(&AppliedSubmit),
+        );
+        assert_eq!(replay["replayed"], true, "{replay}");
+        assert_eq!(replay["dispatch"]["delivery_state"], "applied");
+        assert_eq!(
+            resolve(&store, "later typed turn"),
+            Ok((session_ref.clone(), GENERATION))
+        );
+        assert_eq!(
+            resolve(&store, "first delivered turn").unwrap_err(),
+            "browser_current_turn_not_found",
+            "a replay must not resurrect an older turn"
+        );
+    }
+
+    /// user cannot cross accounts | Given two ChatGPT accounts on one endpoint | When both receive the same turn | Then only the exact session is recorded and the shared text stays ambiguous
+    #[test]
+    fn shared_turn_across_accounts_records_only_the_exact_session() {
+        let (store, endpoint_ref, accounts) = chatgpt_fixture("cross-account");
+        let first_session = accounts[0].1.clone();
+        let second = add_account(&store, &endpoint_ref, "second");
+        let second_session = second.1.clone();
+
+        struct AppliedSubmit;
+        impl BrowserActuator for AppliedSubmit {
+            fn actuate(
+                &self,
+                _operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Ok(applied_evidence(params, expected_generation))
+            }
+        }
+
+        let second_applied = submit(
+            &store,
+            &second_session,
+            "second account turn",
+            GENERATION,
+            "source-turn-cross-account-2",
+            Some(&AppliedSubmit),
+        );
+        assert_eq!(second_applied["ok"], true, "{second_applied}");
+        assert_eq!(
+            resolve(&store, "second account turn"),
+            Ok((second_session.clone(), GENERATION))
+        );
+
+        let first_applied = submit(
+            &store,
+            &first_session,
+            "first account turn",
+            GENERATION,
+            "source-turn-cross-account-1",
+            Some(&AppliedSubmit),
+        );
+        assert_eq!(first_applied["ok"], true, "{first_applied}");
+        assert_eq!(
+            resolve(&store, "first account turn"),
+            Ok((first_session.clone(), GENERATION)),
+            "the first account keeps its own turn"
+        );
+
+        let shared = submit(
+            &store,
+            &first_session,
+            "shared wording",
+            GENERATION,
+            "source-turn-cross-account-3",
+            Some(&AppliedSubmit),
+        );
+        assert_eq!(shared["ok"], true, "{shared}");
+        let shared_again = submit(
+            &store,
+            &second_session,
+            "shared wording",
+            GENERATION,
+            "source-turn-cross-account-4",
+            Some(&AppliedSubmit),
+        );
+        assert_eq!(shared_again["ok"], true, "{shared_again}");
+        assert_eq!(
+            resolve(&store, "shared wording").unwrap_err(),
+            "browser_current_turn_ambiguous",
+            "identical text in two sessions must never guess one binding"
+        );
     }
 }
 

@@ -600,6 +600,20 @@ pub struct BrowserDispatchUpdateInput<'a> {
     pub updated_at: i64,
 }
 
+/// The user turn one settled `browser_dispatch.submit` actually delivered to its
+/// target session.
+///
+/// The hidden/auto-submit browser path produces no DOM `source_turn.observe`, so
+/// the runtime-side proof of the delivered turn is the only source-turn evidence
+/// a later WebChat `agent.task.dispatch` can bind to. Only the digest of the
+/// trimmed submitted text is carried; plaintext never reaches the store.
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserDispatchSourceTurn<'a> {
+    pub session_ref: &'a str,
+    pub user_text_sha256: &'a str,
+    pub observed_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserDispatchRecord {
     pub dispatch_id: String,
@@ -3639,25 +3653,13 @@ impl StateStore {
             return Err("browser_current_turn_invalid".to_owned());
         }
         self.prune_browser_source_turns(observed_at)?;
-        self.conn
-            .execute(
-                "INSERT INTO browser_source_turns(
-                     session_ref, expected_generation, user_text_sha256, observed_at
-                 ) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(session_ref) DO UPDATE SET
-                     expected_generation = excluded.expected_generation,
-                     user_text_sha256 = excluded.user_text_sha256,
-                     observed_at = excluded.observed_at
-                 WHERE excluded.observed_at >= browser_source_turns.observed_at",
-                params![
-                    session_ref,
-                    expected_generation,
-                    user_text_sha256,
-                    observed_at
-                ],
-            )
-            .map_err(|error| format!("cannot observe browser source turn: {error}"))?;
-        Ok(())
+        write_browser_source_turn(
+            &self.conn,
+            session_ref,
+            expected_generation,
+            user_text_sha256,
+            observed_at,
+        )
     }
 
     /// Resolve exactly one session from a user-text digest.
@@ -5049,6 +5051,32 @@ impl StateStore {
         &mut self,
         input: BrowserDispatchUpdateInput<'_>,
     ) -> Result<BrowserDispatchRecord, String> {
+        self.settle_browser_dispatch(input, None)
+    }
+
+    /// Settle one uncertain dispatch and, for a proven `applied`
+    /// `browser_dispatch.submit`, record the delivered user turn as its target
+    /// session's source-turn evidence in the same transaction.
+    ///
+    /// The evidence and the settlement become visible together, so a later
+    /// WebChat dispatch can never observe an applied submit whose trusted turn is
+    /// still missing. Every evidence fence (submit operation, exact target
+    /// session, session/provider generation) is checked inside that transaction:
+    /// any mismatch refuses the settlement instead of recording evidence the
+    /// binding path would have to reject as stale.
+    pub fn settle_browser_dispatch_with_source_turn(
+        &mut self,
+        input: BrowserDispatchUpdateInput<'_>,
+        source_turn: BrowserDispatchSourceTurn<'_>,
+    ) -> Result<BrowserDispatchRecord, String> {
+        self.settle_browser_dispatch(input, Some(source_turn))
+    }
+
+    fn settle_browser_dispatch(
+        &mut self,
+        input: BrowserDispatchUpdateInput<'_>,
+        source_turn: Option<BrowserDispatchSourceTurn<'_>>,
+    ) -> Result<BrowserDispatchRecord, String> {
         validate_browser_dispatch_id(input.dispatch_id)?;
         if input.expected_generation < 1 {
             return Err("browser_expected_generation_invalid".to_owned());
@@ -5067,6 +5095,15 @@ impl StateStore {
         }
         if let Some(accepted) = input.accepted_user_message_ref {
             validate_browser_ref_text(accepted, 512, "accepted_user_message_ref")?;
+        }
+        if let Some(source_turn) = source_turn {
+            if input.delivery_state != BrowserDeliveryState::Applied {
+                return Err("browser_dispatch_source_turn_not_applied".to_owned());
+            }
+            validate_browser_resource_ref(source_turn.session_ref)?;
+            if !is_browser_digest(source_turn.user_text_sha256) || source_turn.observed_at < 0 {
+                return Err("browser_current_turn_invalid".to_owned());
+            }
         }
 
         let tx = self
@@ -5091,6 +5128,27 @@ impl StateStore {
             return Err("browser_dispatch_already_settled".to_owned());
         }
 
+        if let Some(source_turn) = source_turn {
+            if current_record.operation != "browser_dispatch.submit"
+                || current_record.target_session_ref != source_turn.session_ref
+            {
+                return Err("browser_dispatch_source_turn_scope_mismatch".to_owned());
+            }
+            require_browser_session_target(
+                &tx,
+                &current_record.endpoint_ref,
+                &current_record.provider,
+                source_turn.session_ref,
+                input.expected_generation,
+            )?;
+            require_current_browser_generation(
+                &tx,
+                &current_record.endpoint_ref,
+                &current_record.provider,
+                input.expected_generation,
+            )?;
+        }
+
         let changed = tx
             .execute(
                 "UPDATE browser_dispatches
@@ -5111,6 +5169,15 @@ impl StateStore {
             .map_err(|error| format!("cannot settle browser dispatch: {error}"))?;
         if changed != 1 {
             return Err("browser_dispatch_settlement_raced".to_owned());
+        }
+        if let Some(source_turn) = source_turn {
+            write_browser_source_turn(
+                &tx,
+                source_turn.session_ref,
+                input.expected_generation,
+                source_turn.user_text_sha256,
+                source_turn.observed_at,
+            )?;
         }
         let record = read_browser_dispatch_by_ref(&tx, input.dispatch_id)?
             .ok_or_else(|| "browser_dispatch_not_found".to_owned())
@@ -5900,6 +5967,36 @@ fn parse_browser_required_apps(value: &str) -> Result<Vec<String>, String> {
         return Err("browser_required_apps_invalid".to_owned());
     }
     Ok(parsed)
+}
+
+/// Upsert one session's current source turn. Shared by the Extension IPC
+/// observation path and the runtime-proven dispatch settlement so both agree on
+/// the single-row / late-observation-must-not-win semantics.
+fn write_browser_source_turn(
+    conn: &Connection,
+    session_ref: &str,
+    expected_generation: i64,
+    user_text_sha256: &str,
+    observed_at: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO browser_source_turns(
+             session_ref, expected_generation, user_text_sha256, observed_at
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_ref) DO UPDATE SET
+             expected_generation = excluded.expected_generation,
+             user_text_sha256 = excluded.user_text_sha256,
+             observed_at = excluded.observed_at
+         WHERE excluded.observed_at >= browser_source_turns.observed_at",
+        params![
+            session_ref,
+            expected_generation,
+            user_text_sha256,
+            observed_at
+        ],
+    )
+    .map_err(|error| format!("cannot observe browser source turn: {error}"))?;
+    Ok(())
 }
 
 fn require_current_browser_generation(
