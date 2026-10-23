@@ -809,6 +809,8 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "page_ref": {"type": "string", "maxLength": 67},
                     "action": {"type": "string",  "enum": ["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "extract", "extract_table", "press"]},
                     "max_chars": {"type": ["integer", "null"], "minimum": 1, "maximum": 100000},
+                    "element_offset": {"type": ["integer", "null"], "minimum": 0, "maximum": 10000, "description": "observe only: skip this many document-order observable elements. Re-observing mints a new generation, so page then observe again before acting."},
+                    "element_limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 128, "description": "observe only: build at most this many refs (default 128). The response reports elements_truncated and next_element_offset."},
                     "generation": {"type": ["string", "null"], "maxLength": 256},
                     "ref": {"type": ["string", "null"], "maxLength": 256},
                     "value": {"type": ["string", "null"], "maxLength": 10000},

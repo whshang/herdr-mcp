@@ -208,6 +208,61 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   assert.equal(linkClick.navigation_url, "https://app.test/details");
 });
 
+test("user pages past the first 128 observed elements | Given a long page with 140 visible buttons | When observe requests offset 128 | Then the later elements receive refs from a new generation and the page reports truncation metadata", () => {
+  const buttons = Array.from({ length: 140 }, (_, index) => (
+    createElement({ tag: "button", type: "button", text: `Action ${index}` })
+  ));
+  const h = harness({ elements: buttons });
+
+  const first = h.send({
+    type: "h2w_page_assist",
+    action: "observe",
+    expectedOrigin: "https://app.test",
+  });
+  assert.equal(first.ok, true);
+  assert.equal(first.elements.length, 128);
+  assert.equal(first.elements[0].text, "Action 0");
+  assert.equal(first.elements.at(-1).text, "Action 127");
+  assert.equal(first.element_offset, 0);
+  assert.equal(first.element_limit, 128);
+  assert.equal(first.elements_truncated, true);
+  assert.equal(first.next_element_offset, 128);
+
+  const second = h.send({
+    type: "h2w_page_assist",
+    action: "observe",
+    expectedOrigin: "https://app.test",
+    elementOffset: 128,
+    elementLimit: 128,
+  });
+  assert.equal(second.ok, true);
+  assert.equal(second.elements.length, 12);
+  assert.equal(second.elements[0].text, "Action 128");
+  assert.equal(second.elements.at(-1).text, "Action 139");
+  assert.equal(second.element_offset, 128);
+  assert.equal(second.elements_truncated, false);
+  assert.equal(second.next_element_offset, null);
+  assert.ok(second.elements.every((item) => item.ref.startsWith(`ref_${second.generation}_`)));
+
+  const stale = h.send({
+    type: "h2w_page_assist",
+    action: "click",
+    expectedOrigin: "https://app.test",
+    generation: first.generation,
+    ref: first.elements[0].ref,
+  });
+  assert.equal(stale.error, "stale_generation");
+
+  const invalid = h.send({
+    type: "h2w_page_assist",
+    action: "observe",
+    expectedOrigin: "https://app.test",
+    elementOffset: -1,
+  });
+  assert.equal(invalid.error, "observe_params_invalid");
+  assert.equal(first.generation, first.generation, "invalid paging must not mint a generation");
+});
+
 test("user hovers a bounded visible card | Given a CSS-hidden edit button | When an observed hover-only ref is prepared | Then the revealed button receives its own ref only after a new observation", () => {
   const card = createElement({
     tag: "div", text: "Existing evaluation", attrs: { class: "evaluationCard__sample" },
