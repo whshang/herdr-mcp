@@ -3128,42 +3128,6 @@ fn browser_session_apply_classification_reason(response: &mut Value, reason: Opt
     }
 }
 
-/// Fence the target of the source-turn evidence for one applied
-/// `browser_dispatch.submit`.
-///
-/// Only what the runtime itself delivered is trusted: the text this submit sent
-/// to the exact session it was fenced to, proven accepted by the applied
-/// postcondition. Nothing here reads a caller-supplied "current user message",
-/// so a model cannot choose which turn is recorded. The target is re-read under
-/// the caller's store lock because the Extension may have re-observed resources
-/// while the actuation was in flight; evidence is emitted only while the session
-/// and its account lineage still match this submit's endpoint, provider and
-/// generation.
-fn browser_dispatch_source_turn_target(
-    store: &StateStore,
-    session: &crate::state_store::BrowserResourceRecord,
-    session_ref: &str,
-    expected_generation: i64,
-) -> Result<(), String> {
-    let current = store
-        .browser_resource(session_ref)?
-        .ok_or_else(|| "browser_resource_not_found".to_owned())?;
-    if current.kind != "session"
-        || current.provider != "chatgpt"
-        || current.endpoint_ref != session.endpoint_ref
-    {
-        return Err("browser_current_turn_scope_mismatch".to_owned());
-    }
-    if current.observation_generation != expected_generation {
-        return Err("browser_current_turn_stale".to_owned());
-    }
-    // The same account-lineage fence the WebChat authorization path applies, so
-    // evidence is never recorded against a session whose account is unknown or
-    // scoped to another endpoint/provider.
-    browser_resource_account_ref(store, &current)?;
-    Ok(())
-}
-
 fn browser_dispatch_submit(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -3343,21 +3307,14 @@ fn browser_dispatch_submit(
             {
                 // A hidden/auto-submitted turn never produces a DOM source-turn
                 // observation, so the runtime records the turn it just delivered
-                // as the session's current source-turn evidence. The write is in
-                // the settlement transaction, and its fences re-run there against
-                // the live target: caller grant, account, endpoint and provider
-                // generation were already enforced before actuation, so evidence
-                // is recorded only for the exact session this submit was fenced
-                // to. Any mismatch refuses the settlement, leaving the dispatch
-                // uncertain and the evidence unwritten (fail closed).
-                if let Err(error) = browser_dispatch_source_turn_target(
-                    &store,
-                    &session,
-                    session_ref,
-                    expected_generation,
-                ) {
-                    return browser_store_error(error);
-                }
+                // as the session's current source-turn evidence. Only ChatGPT
+                // WebChat sessions have a source-turn consumer. The settlement
+                // transaction owns every fence for that write (submit operation,
+                // exact target session, endpoint/provider, session and provider
+                // generation, account lineage); authorization already ran before
+                // actuation. Any mismatch refuses the settlement, leaving the
+                // dispatch uncertain and the evidence unwritten (fail closed).
+                //
                 // The provider renders composer line breaks as blank lines, so
                 // the durable turn identity is the whitespace-trimmed submitted
                 // text, exactly like `source_turn.observe` and the WebChat
