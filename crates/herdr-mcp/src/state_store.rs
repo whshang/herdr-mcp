@@ -600,6 +600,20 @@ pub struct BrowserDispatchUpdateInput<'a> {
     pub updated_at: i64,
 }
 
+/// The user turn one settled `browser_dispatch.submit` actually delivered to its
+/// target session.
+///
+/// The hidden/auto-submit browser path produces no DOM `source_turn.observe`, so
+/// the runtime-side proof of the delivered turn is the only source-turn evidence
+/// a later WebChat `agent.task.dispatch` can bind to. Only the digest of the
+/// trimmed submitted text is carried; plaintext never reaches the store.
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserDispatchSourceTurn<'a> {
+    pub session_ref: &'a str,
+    pub user_text_sha256: &'a str,
+    pub observed_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserDispatchRecord {
     pub dispatch_id: String,
@@ -3639,25 +3653,13 @@ impl StateStore {
             return Err("browser_current_turn_invalid".to_owned());
         }
         self.prune_browser_source_turns(observed_at)?;
-        self.conn
-            .execute(
-                "INSERT INTO browser_source_turns(
-                     session_ref, expected_generation, user_text_sha256, observed_at
-                 ) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(session_ref) DO UPDATE SET
-                     expected_generation = excluded.expected_generation,
-                     user_text_sha256 = excluded.user_text_sha256,
-                     observed_at = excluded.observed_at
-                 WHERE excluded.observed_at >= browser_source_turns.observed_at",
-                params![
-                    session_ref,
-                    expected_generation,
-                    user_text_sha256,
-                    observed_at
-                ],
-            )
-            .map_err(|error| format!("cannot observe browser source turn: {error}"))?;
-        Ok(())
+        write_browser_source_turn(
+            &self.conn,
+            session_ref,
+            expected_generation,
+            user_text_sha256,
+            observed_at,
+        )
     }
 
     /// Resolve exactly one session from a user-text digest.
@@ -5049,6 +5051,34 @@ impl StateStore {
         &mut self,
         input: BrowserDispatchUpdateInput<'_>,
     ) -> Result<BrowserDispatchRecord, String> {
+        self.settle_browser_dispatch(input, None)
+    }
+
+    /// Settle one uncertain dispatch and, for a proven `applied`
+    /// `browser_dispatch.submit`, record the delivered user turn as its target
+    /// session's source-turn evidence in the same transaction.
+    ///
+    /// The evidence and the settlement become visible together, so a later
+    /// WebChat dispatch can never observe an applied submit whose trusted turn is
+    /// still missing. Every evidence fence (submit operation, exact target
+    /// session, session/provider generation, account lineage) is checked inside
+    /// that transaction. When a fence refuses, nothing is settled and nothing is
+    /// written: the returned record is the still-`uncertain` row the
+    /// pre-actuation claim recorded, so the response can state `uncertain`
+    /// instead of a rejection the store does not hold.
+    pub fn settle_browser_dispatch_with_source_turn(
+        &mut self,
+        input: BrowserDispatchUpdateInput<'_>,
+        source_turn: BrowserDispatchSourceTurn<'_>,
+    ) -> Result<BrowserDispatchRecord, String> {
+        self.settle_browser_dispatch(input, Some(source_turn))
+    }
+
+    fn settle_browser_dispatch(
+        &mut self,
+        input: BrowserDispatchUpdateInput<'_>,
+        source_turn: Option<BrowserDispatchSourceTurn<'_>>,
+    ) -> Result<BrowserDispatchRecord, String> {
         validate_browser_dispatch_id(input.dispatch_id)?;
         if input.expected_generation < 1 {
             return Err("browser_expected_generation_invalid".to_owned());
@@ -5067,6 +5097,15 @@ impl StateStore {
         }
         if let Some(accepted) = input.accepted_user_message_ref {
             validate_browser_ref_text(accepted, 512, "accepted_user_message_ref")?;
+        }
+        if let Some(source_turn) = source_turn {
+            if input.delivery_state != BrowserDeliveryState::Applied {
+                return Err("browser_dispatch_source_turn_not_applied".to_owned());
+            }
+            validate_browser_resource_ref(source_turn.session_ref)?;
+            if !is_browser_digest(source_turn.user_text_sha256) || source_turn.observed_at < 0 {
+                return Err("browser_current_turn_invalid".to_owned());
+            }
         }
 
         let tx = self
@@ -5091,6 +5130,46 @@ impl StateStore {
             return Err("browser_dispatch_already_settled".to_owned());
         }
 
+        if let Some(source_turn) = source_turn {
+            // A refused evidence fence must leave no trace of success anywhere:
+            // the dispatch keeps the `uncertain` state its pre-actuation claim
+            // already recorded, no source turn is written, and the caller gets
+            // that exact record back. Reporting a rejection-style error instead
+            // would contradict the stored row and invite a fresh idempotency key
+            // that could deliver a second time; instead the same key stays the
+            // way to check the outcome.
+            let fenced = current_record.operation == "browser_dispatch.submit"
+                && current_record.target_session_ref == source_turn.session_ref
+                && require_browser_session_target(
+                    &tx,
+                    &current_record.endpoint_ref,
+                    &current_record.provider,
+                    source_turn.session_ref,
+                    input.expected_generation,
+                )
+                .is_ok()
+                && require_browser_session_account_lineage(
+                    &tx,
+                    &current_record.endpoint_ref,
+                    &current_record.provider,
+                    source_turn.session_ref,
+                    input.expected_generation,
+                )
+                .is_ok()
+                && require_current_browser_generation(
+                    &tx,
+                    &current_record.endpoint_ref,
+                    &current_record.provider,
+                    input.expected_generation,
+                )
+                .is_ok();
+            if !fenced {
+                tx.commit()
+                    .map_err(|error| format!("cannot commit browser dispatch: {error}"))?;
+                return Ok(current_record);
+            }
+        }
+
         let changed = tx
             .execute(
                 "UPDATE browser_dispatches
@@ -5111,6 +5190,15 @@ impl StateStore {
             .map_err(|error| format!("cannot settle browser dispatch: {error}"))?;
         if changed != 1 {
             return Err("browser_dispatch_settlement_raced".to_owned());
+        }
+        if let Some(source_turn) = source_turn {
+            write_browser_source_turn(
+                &tx,
+                source_turn.session_ref,
+                input.expected_generation,
+                source_turn.user_text_sha256,
+                source_turn.observed_at,
+            )?;
         }
         let record = read_browser_dispatch_by_ref(&tx, input.dispatch_id)?
             .ok_or_else(|| "browser_dispatch_not_found".to_owned())
@@ -5900,6 +5988,93 @@ fn parse_browser_required_apps(value: &str) -> Result<Vec<String>, String> {
         return Err("browser_required_apps_invalid".to_owned());
     }
     Ok(parsed)
+}
+
+/// Upsert one session's current source turn. Shared by the Extension IPC
+/// observation path and the runtime-proven dispatch settlement so both agree on
+/// the single-row / late-observation-must-not-win semantics.
+fn write_browser_source_turn(
+    conn: &Connection,
+    session_ref: &str,
+    expected_generation: i64,
+    user_text_sha256: &str,
+    observed_at: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO browser_source_turns(
+             session_ref, expected_generation, user_text_sha256, observed_at
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_ref) DO UPDATE SET
+             expected_generation = excluded.expected_generation,
+             user_text_sha256 = excluded.user_text_sha256,
+             observed_at = excluded.observed_at
+         WHERE excluded.observed_at >= browser_source_turns.observed_at",
+        params![
+            session_ref,
+            expected_generation,
+            user_text_sha256,
+            observed_at
+        ],
+    )
+    .map_err(|error| format!("cannot observe browser source turn: {error}"))?;
+    Ok(())
+}
+
+/// Require the target session's observed account lineage to stay inside the
+/// same endpoint/provider at the exact expected generation.
+///
+/// Authorization already fenced the caller before actuation; this is the
+/// integrity fence for the evidence write, so a session whose parent account was
+/// replaced, re-scoped or left behind by a generation change can never become a
+/// source-turn target for another account's turn. Reuses the observation-time
+/// parent validator for each lineage edge instead of restating its rules.
+fn require_browser_session_account_lineage(
+    conn: &Connection,
+    endpoint_ref: &str,
+    provider: &str,
+    session_ref: &str,
+    expected_generation: i64,
+) -> Result<(), String> {
+    let read_parent = |resource_ref: &str| -> Result<String, String> {
+        conn.query_row(
+            "SELECT parent_ref FROM browser_resources WHERE resource_ref = ?1",
+            [resource_ref],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("cannot inspect browser resource lineage: {error}"))?
+        .flatten()
+        .ok_or_else(|| "browser_resource_parent_required".to_owned())
+    };
+    let parent_ref = read_parent(session_ref)?;
+    // A session either hangs off its account directly or off a project space.
+    validate_browser_resource_parent(
+        conn,
+        endpoint_ref,
+        provider,
+        "session",
+        &parent_ref,
+        expected_generation,
+    )?;
+    let parent_kind = conn
+        .query_row(
+            "SELECT kind FROM browser_resources WHERE resource_ref = ?1",
+            [&parent_ref],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| format!("cannot inspect browser resource lineage: {error}"))?;
+    if parent_kind != "space" {
+        return Ok(());
+    }
+    let account_ref = read_parent(&parent_ref)?;
+    validate_browser_resource_parent(
+        conn,
+        endpoint_ref,
+        provider,
+        "space",
+        &account_ref,
+        expected_generation,
+    )
 }
 
 fn require_current_browser_generation(
@@ -12474,5 +12649,260 @@ mod tests {
             reprobed_capabilities["limits"]["provider_message_chars"]["max"],
             16
         );
+    }
+
+    /// user never records another account's turn | Given a project-space session and an applied settle with evidence | When the account lineage is re-scoped or left behind | Then the settlement is refused and no source turn is written
+    #[test]
+    fn browser_dispatch_source_turn_requires_the_exact_account_lineage() {
+        const GENERATION: i64 = 7;
+        let path = temp_db_path();
+        let mut store = StateStore::open(&path).unwrap();
+        let endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                profile_seed: "source-turn-lineage-profile",
+                browser_family: "chrome",
+                extension_version: "0.1.236",
+                observed_at: 1,
+            })
+            .unwrap();
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: GENERATION,
+                capabilities_json: r#"{"operations":["composer.submit","generation.status"]}"#,
+                observed_at: 2,
+            })
+            .unwrap();
+        let account = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: "source-turn-lineage-account",
+                display_label: None,
+                observation_generation: GENERATION,
+                observed_at: 3,
+            })
+            .unwrap();
+        let space = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "space",
+                parent_ref: Some(&account.resource_ref),
+                native_identity: "source-turn-lineage-space",
+                display_label: Some("Project"),
+                observation_generation: GENERATION,
+                observed_at: 4,
+            })
+            .unwrap();
+        let session = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&space.resource_ref),
+                native_identity: "source-turn-lineage-session",
+                display_label: None,
+                observation_generation: GENERATION,
+                observed_at: 5,
+            })
+            .unwrap();
+
+        // A second endpoint's account stands in for a re-scoped parent.
+        let foreign_endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                profile_seed: "source-turn-lineage-foreign",
+                browser_family: "chrome",
+                extension_version: "0.1.236",
+                observed_at: 1,
+            })
+            .unwrap();
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &foreign_endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: GENERATION,
+                capabilities_json: r#"{"operations":["composer.submit","generation.status"]}"#,
+                observed_at: 2,
+            })
+            .unwrap();
+        let foreign_account = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &foreign_endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: "source-turn-lineage-foreign-account",
+                display_label: None,
+                observation_generation: GENERATION,
+                observed_at: 3,
+            })
+            .unwrap();
+
+        let reserve = |store: &mut StateStore, key: &str| {
+            let request_digest = sha256_text(key);
+            let message_digest = sha256_text(key);
+            let required_apps: [&str; 0] = [];
+            let BrowserDispatchReservation::Reserved(dispatch) = store
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    operation: "browser_dispatch.submit",
+                    target_session_ref: &session.resource_ref,
+                    request_digest: &request_digest,
+                    message_digest: &message_digest,
+                    message_canonical_digest: None,
+                    reasoning_effort: None,
+                    required_apps: &required_apps,
+                    expected_generation: GENERATION,
+                    idempotency_key_digest: &sha256_text(&format!("{key}-idempotency")),
+                    parent_dispatch_id: None,
+                    authorization: None,
+                    work_chain_id: None,
+                    lane_id: None,
+                    created_at: 10,
+                })
+                .unwrap()
+            else {
+                panic!("every reservation here is new");
+            };
+            // The submit path claims its actuation lane as uncertain before any
+            // browser command can be sent; mirror that here.
+            store
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &dispatch.dispatch_id,
+                    expected_generation: GENERATION,
+                    delivery_state: BrowserDeliveryState::Uncertain,
+                    generation_owner: None,
+                    accepted_user_message_ref: None,
+                    updated_at: 11,
+                })
+                .unwrap();
+            dispatch.dispatch_id
+        };
+        let settle = |store: &mut StateStore, dispatch_id: &str, digest: &str, observed_at: i64| {
+            store.settle_browser_dispatch_with_source_turn(
+                BrowserDispatchUpdateInput {
+                    dispatch_id,
+                    expected_generation: GENERATION,
+                    delivery_state: BrowserDeliveryState::Applied,
+                    generation_owner: Some(GENERATION),
+                    accepted_user_message_ref: Some("provider-user-lineage"),
+                    updated_at: observed_at,
+                },
+                BrowserDispatchSourceTurn {
+                    session_ref: &session.resource_ref,
+                    user_text_sha256: digest,
+                    observed_at,
+                },
+            )
+        };
+        let resolve =
+            |store: &mut StateStore, digest: &str| store.resolve_browser_source_turn(digest, 200);
+
+        // The project-space lineage is the positive path: space -> account.
+        let deliverable = sha256_text("lineage positive turn");
+        let positive_dispatch = reserve(&mut store, "lineage-positive");
+        assert_eq!(
+            settle(&mut store, &positive_dispatch, &deliverable, 100)
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Applied
+        );
+        assert_eq!(
+            resolve(&mut store, &deliverable).unwrap(),
+            (session.resource_ref.clone(), GENERATION)
+        );
+
+        // A re-scoped parent from another endpoint must refuse the settlement.
+        store
+            .conn
+            .execute(
+                "UPDATE browser_resources SET parent_ref = ?2 WHERE resource_ref = ?1",
+                params![session.resource_ref, foreign_account.resource_ref],
+            )
+            .unwrap();
+        let foreign_turn = sha256_text("lineage foreign turn");
+        let foreign_dispatch = reserve(&mut store, "lineage-foreign");
+        // A refused evidence fence keeps the pre-actuation uncertainty and
+        // reports exactly that state back, so the caller checks the same key
+        // instead of retrying with a new one.
+        assert_eq!(
+            settle(&mut store, &foreign_dispatch, &foreign_turn, 110)
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain
+        );
+        assert_eq!(
+            store
+                .browser_dispatch(&foreign_dispatch)
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain
+        );
+        assert_eq!(
+            resolve(&mut store, &foreign_turn).unwrap_err(),
+            "browser_current_turn_not_found"
+        );
+        // The same settlement attempt stays a no-evidence uncertainty: it never
+        // flips to applied later or writes evidence on the second attempt.
+        assert_eq!(
+            settle(&mut store, &foreign_dispatch, &foreign_turn, 111)
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain
+        );
+        assert_eq!(
+            resolve(&mut store, &foreign_turn).unwrap_err(),
+            "browser_current_turn_not_found"
+        );
+
+        // A parent account left behind by a generation change refuses it too.
+        store
+            .conn
+            .execute(
+                "UPDATE browser_resources SET parent_ref = ?2 WHERE resource_ref = ?1",
+                params![session.resource_ref, space.resource_ref],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE browser_resources SET observation_generation = ?2 WHERE resource_ref = ?1",
+                params![account.resource_ref, GENERATION + 1],
+            )
+            .unwrap();
+        let stale_turn = sha256_text("lineage stale turn");
+        let stale_dispatch = reserve(&mut store, "lineage-stale");
+        assert_eq!(
+            settle(&mut store, &stale_dispatch, &stale_turn, 120)
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain
+        );
+        assert_eq!(
+            store
+                .browser_dispatch(&stale_dispatch)
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain
+        );
+        assert_eq!(
+            resolve(&mut store, &stale_turn).unwrap_err(),
+            "browser_current_turn_not_found"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
     }
 }
