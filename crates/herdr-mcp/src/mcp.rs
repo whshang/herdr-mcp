@@ -1343,8 +1343,8 @@ fn continuity_call(
                                 .flatten()
                                 .map(|resource| resource.provider);
                             if let Some(provider) = provider
-                                && let Some(value) =
-                                    store.continuity_for_provider_session(&provider, &session_ref)?
+                                && let Some(value) = store
+                                    .continuity_for_provider_session(&provider, &session_ref)?
                             {
                                 return Ok(Some(value));
                             }
@@ -1376,9 +1376,12 @@ fn continuity_call(
             let continuity_id = if let Some(value) = explicit_id {
                 value.to_owned()
             } else if let Some(raw_url) = conversation_url {
-                let Some((conversation_id, project_id)) = chatgpt_conversation_url_ref(raw_url)
+                let Some((conversation_id, project_id)) = browser_conversation_url_ref(raw_url)
+                    .ok()
+                    .flatten()
+                    .map(|reference| (reference.conversation_id, reference.project_id))
                 else {
-                    return json!({"ok": false, "code": "continuity_resume_params_invalid", "message": "conversation_url must be a ChatGPT conversation URL"});
+                    return json!({"ok": false, "code": "continuity_resume_params_invalid", "message": "conversation_url must be a registered WebChat conversation URL"});
                 };
                 match resolve_identity(&conversation_id, project_id.as_deref(), Some(raw_url)) {
                     Ok(Some(value)) => value,
@@ -1502,13 +1505,13 @@ fn continuity_call(
                 Err(error) => return error,
             };
             let (url_conversation_id, url_project_id) = match conversation_url {
-                Some(raw) => match chatgpt_conversation_url_ref(raw) {
-                    Some((conversation_id, project_id)) => (Some(conversation_id), project_id),
+                Some(raw) => match browser_conversation_url_ref(raw).ok().flatten() {
+                    Some(reference) => (Some(reference.conversation_id), reference.project_id),
                     None => {
                         return json!({
                             "ok": false,
                             "code": "continuity_search_params_invalid",
-                            "message": "conversation_url must be a ChatGPT conversation URL",
+                            "message": "conversation_url must be a registered WebChat conversation URL",
                         });
                     }
                 },
@@ -23529,8 +23532,7 @@ mod tests {
         // resume; the same session must NOT be readable through a chatgpt
         // continuity binding (the historical bug), and a chatgpt binding on a
         // different session keeps working.
-        let claude_url =
-            "https://claude.ai/chat/5d2a9c3e-1f4b-4a6d-8e2f-0b7c9d1e3a5b";
+        let claude_url = "https://claude.ai/chat/5d2a9c3e-1f4b-4a6d-8e2f-0b7c9d1e3a5b";
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         {
             let mut guard = store.lock().unwrap();
