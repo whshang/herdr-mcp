@@ -23627,8 +23627,13 @@ mod browser_dispatch_source_turn_tests {
             Some(&actuator),
         );
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(moved["code"], "stale_capability_generation", "{moved}");
+        // A refused pre-write fence must not look like a rejection: the response
+        // reports the delivery state the row actually holds.
+        assert_eq!(moved["ok"], false, "{moved}");
+        assert_eq!(moved["code"], "uncertain", "{moved}");
+        assert_eq!(moved["dispatch"]["delivery_state"], "uncertain", "{moved}");
         let dispatch_ids = actuator.dispatch_ids.lock().unwrap().clone();
+        assert_eq!(moved["dispatch"]["dispatch_id"], dispatch_ids[0]);
         let stored = store
             .lock()
             .unwrap()
@@ -23636,6 +23641,38 @@ mod browser_dispatch_source_turn_tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.delivery_state, BrowserDeliveryState::Uncertain);
+        assert_eq!(
+            resolve(&store, "mid-flight generation turn").unwrap_err(),
+            "browser_current_turn_not_found"
+        );
+
+        // The reservation stays intact and addressable: the response exposes the
+        // dispatch id the caller must check, and neither the stale request nor a
+        // refreshed-generation retry actuates again or invents evidence.
+        let refreshed = submit(
+            &store,
+            &session_ref,
+            "mid-flight generation turn",
+            GENERATION + 1,
+            "source-turn-midflight-stale-1",
+            Some(&actuator),
+        );
+        assert_eq!(refreshed["ok"], false, "{refreshed}");
+        assert_eq!(
+            refreshed["code"], "stale_capability_generation",
+            "{refreshed}"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .browser_dispatch(&dispatch_ids[0])
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain
+        );
         assert_eq!(
             resolve(&store, "mid-flight generation turn").unwrap_err(),
             "browser_current_turn_not_found"

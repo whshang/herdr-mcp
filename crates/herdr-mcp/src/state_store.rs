@@ -5061,9 +5061,11 @@ impl StateStore {
     /// The evidence and the settlement become visible together, so a later
     /// WebChat dispatch can never observe an applied submit whose trusted turn is
     /// still missing. Every evidence fence (submit operation, exact target
-    /// session, session/provider generation) is checked inside that transaction:
-    /// any mismatch refuses the settlement instead of recording evidence the
-    /// binding path would have to reject as stale.
+    /// session, session/provider generation, account lineage) is checked inside
+    /// that transaction. When a fence refuses, nothing is settled and nothing is
+    /// written: the returned record is the still-`uncertain` row the
+    /// pre-actuation claim recorded, so the response can state `uncertain`
+    /// instead of a rejection the store does not hold.
     pub fn settle_browser_dispatch_with_source_turn(
         &mut self,
         input: BrowserDispatchUpdateInput<'_>,
@@ -5129,31 +5131,43 @@ impl StateStore {
         }
 
         if let Some(source_turn) = source_turn {
-            if current_record.operation != "browser_dispatch.submit"
-                || current_record.target_session_ref != source_turn.session_ref
-            {
-                return Err("browser_dispatch_source_turn_scope_mismatch".to_owned());
+            // A refused evidence fence must leave no trace of success anywhere:
+            // the dispatch keeps the `uncertain` state its pre-actuation claim
+            // already recorded, no source turn is written, and the caller gets
+            // that exact record back. Reporting a rejection-style error instead
+            // would contradict the stored row and invite a fresh idempotency key
+            // that could deliver a second time; instead the same key stays the
+            // way to check the outcome.
+            let fenced = current_record.operation == "browser_dispatch.submit"
+                && current_record.target_session_ref == source_turn.session_ref
+                && require_browser_session_target(
+                    &tx,
+                    &current_record.endpoint_ref,
+                    &current_record.provider,
+                    source_turn.session_ref,
+                    input.expected_generation,
+                )
+                .is_ok()
+                && require_browser_session_account_lineage(
+                    &tx,
+                    &current_record.endpoint_ref,
+                    &current_record.provider,
+                    source_turn.session_ref,
+                    input.expected_generation,
+                )
+                .is_ok()
+                && require_current_browser_generation(
+                    &tx,
+                    &current_record.endpoint_ref,
+                    &current_record.provider,
+                    input.expected_generation,
+                )
+                .is_ok();
+            if !fenced {
+                tx.commit()
+                    .map_err(|error| format!("cannot commit browser dispatch: {error}"))?;
+                return Ok(current_record);
             }
-            require_browser_session_target(
-                &tx,
-                &current_record.endpoint_ref,
-                &current_record.provider,
-                source_turn.session_ref,
-                input.expected_generation,
-            )?;
-            require_browser_session_account_lineage(
-                &tx,
-                &current_record.endpoint_ref,
-                &current_record.provider,
-                source_turn.session_ref,
-                input.expected_generation,
-            )?;
-            require_current_browser_generation(
-                &tx,
-                &current_record.endpoint_ref,
-                &current_record.provider,
-                input.expected_generation,
-            )?;
         }
 
         let changed = tx
@@ -12817,14 +12831,31 @@ mod tests {
             .unwrap();
         let foreign_turn = sha256_text("lineage foreign turn");
         let foreign_dispatch = reserve(&mut store, "lineage-foreign");
+        // A refused evidence fence keeps the pre-actuation uncertainty and
+        // reports exactly that state back, so the caller checks the same key
+        // instead of retrying with a new one.
         assert_eq!(
-            settle(&mut store, &foreign_dispatch, &foreign_turn, 110).unwrap_err(),
-            "browser_resource_parent_scope_mismatch"
+            settle(&mut store, &foreign_dispatch, &foreign_turn, 110)
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain
         );
         assert_eq!(
             store
                 .browser_dispatch(&foreign_dispatch)
                 .unwrap()
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain
+        );
+        assert_eq!(
+            resolve(&mut store, &foreign_turn).unwrap_err(),
+            "browser_current_turn_not_found"
+        );
+        // The same settlement attempt stays a no-evidence uncertainty: it never
+        // flips to applied later or writes evidence on the second attempt.
+        assert_eq!(
+            settle(&mut store, &foreign_dispatch, &foreign_turn, 111)
                 .unwrap()
                 .delivery_state,
             BrowserDeliveryState::Uncertain
@@ -12852,8 +12883,10 @@ mod tests {
         let stale_turn = sha256_text("lineage stale turn");
         let stale_dispatch = reserve(&mut store, "lineage-stale");
         assert_eq!(
-            settle(&mut store, &stale_dispatch, &stale_turn, 120).unwrap_err(),
-            "stale_capability_generation"
+            settle(&mut store, &stale_dispatch, &stale_turn, 120)
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain
         );
         assert_eq!(
             store
