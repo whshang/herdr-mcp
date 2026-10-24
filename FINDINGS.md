@@ -64,6 +64,7 @@ Template:
 
 **The acceptance trio (rollback, real-usage, NOT run) must appear in the landing merge commit body and in an acceptance PR comment—not only in a feature commit or the PR description.**
 - After #609 landed the AGENTS.md rule, merge commits #609 (619e254a), #625 (caf1584f), and #627 (d193380a) carried only short subject lines; #625/#627 had empty PR comment threads. Feature/PR bodies had partial or full statements that did not transfer to the landing commit.
-- Fix: none yet (docs process). Recorded by daily retro 2026-10-13.
-- Done right: #591 (91bf2aae), #611 (05d83989), and #620 (07c91731) merge bodies each state rollback, real-usage, and NOT run; #592 also left acceptance evidence in PR comments.
-- Seen 1× (2026-10-13).
+- 2026-10-23: GitHub merge commits #686 (2cec2c49), #689 (9206f2a9), #693 (bc27cd9b), #694 (bfd9035c), and #692 (c7a0729b) again have only the PR title. #686 and #689 have no issue comments; #693/#694/#692 review comments explicitly say "Do not merge" and never state rollback, real-usage, and NOT run together. Same-day squash landings (#676, #581, #631, #677–#683, #685, #680, #682, #688, #687) do carry the trio in the landing commit body.
+- Fix: none yet (docs process). Recorded by daily retros 2026-10-13 and 2026-10-23.
+- Done right: #591 (91bf2aae), #611 (05d83989), and #620 (07c91731) merge bodies each state rollback, real-usage, and NOT run; #592 also left acceptance evidence in PR comments. On 2026-10-23, squash #687 (560728ff) and #688 (bba6a68f) put all three items in the landing commit body.
+- Seen 2× (2026-10-13, 2026-10-23).
