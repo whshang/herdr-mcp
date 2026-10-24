@@ -61,9 +61,3 @@ Template:
 - Fix: 61ee9b99 renames the case to "runtime refusal relayed unchanged", requires a forwarded trace, and comments that runtime enforcement is pinned by the Rust test; merge body 05d83989 discloses real-usage not done and no true Edge-to-runtime integration test.
 - Done right: 05d83989 / 61ee9b99 keep relay-only and Rust fail-closed scopes explicit, with NOT run listed.
 - Seen 1× (2026-10-13).
-
-**The acceptance trio (rollback, real-usage, NOT run) must appear in the landing merge commit body and in an acceptance PR comment—not only in a feature commit or the PR description.**
-- After #609 landed the AGENTS.md rule, merge commits #609 (619e254a), #625 (caf1584f), and #627 (d193380a) carried only short subject lines; #625/#627 had empty PR comment threads. Feature/PR bodies had partial or full statements that did not transfer to the landing commit.
-- Fix: none yet (docs process). Recorded by daily retro 2026-10-13.
-- Done right: #591 (91bf2aae), #611 (05d83989), and #620 (07c91731) merge bodies each state rollback, real-usage, and NOT run; #592 also left acceptance evidence in PR comments.
-- Seen 1× (2026-10-13).
