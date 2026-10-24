@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -2198,7 +2200,137 @@ fn read_final_excerpt(
     {
         return None;
     }
-    Some(excerpt)
+    // A pane narrower than the readable floor stores hard-wrapped viewport
+    // fragments (a TUI agent wraps its own layout, so `recent_unwrapped` has no
+    // soft-wrap to rejoin). Its logical lines still exist in the agent's own
+    // session transcript, so read those instead of publishing wrapping noise
+    // (#684). Unknown geometry fails closed: never publish rows that cannot be
+    // qualified as the agent's own output.
+    match final_excerpt_pane_columns(client, target) {
+        Some(cols) if crate::pane_width::excerpt_is_readable(cols) => Some(excerpt),
+        Some(_) => logical_excerpt_from_agent_session(
+            client,
+            target,
+            capture_seq,
+            task.terminal_status.as_deref(),
+        ),
+        None => None,
+    }
+}
+
+/// Bytes of the agent transcript tail inspected for the last assistant message.
+const FINAL_EXCERPT_SESSION_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Recovers the child's last assistant message from its own session file.
+///
+/// This is the logical-line path for panes too narrow to read: it returns the
+/// text the agent produced, not the column-wrapped rows it painted. The
+/// filesystem read is slower than a pane read, so the same pane-reuse fence is
+/// applied twice: the `agent.get` that resolves the session path must already
+/// sit on this task's terminal transition, and the pane must still report the
+/// same identity, status and `state_change_seq` after the transcript is read.
+/// Anything unreadable, unparsable or moved leaves the excerpt absent.
+fn logical_excerpt_from_agent_session(
+    client: &HerdrClient,
+    target: &str,
+    capture_seq: u64,
+    terminal_status: Option<&str>,
+) -> Option<String> {
+    let response = client
+        .call_with_timeout(
+            "agent.get",
+            json!({"target": target}),
+            FINAL_EXCERPT_VERIFY_TIMEOUT,
+        )
+        .ok()?;
+    if !pane_still_serves_capture(&response, target, capture_seq, terminal_status) {
+        return None;
+    }
+    let agent = response.get("agent").unwrap_or(&response);
+    let session = agent.get("agent_session")?;
+    if session.get("kind").and_then(Value::as_str) != Some("path") {
+        return None;
+    }
+    let path = session.get("value").and_then(Value::as_str)?;
+    let text = read_session_tail_text(Path::new(path))?;
+    let excerpt = shape_final_excerpt(&text);
+    if excerpt.trim().is_empty() {
+        return None;
+    }
+    // A pane reused while the transcript was read would make this excerpt
+    // belong to a later task, so re-prove the fence after the read.
+    let after = client
+        .call_with_timeout(
+            "agent.get",
+            json!({"target": target}),
+            FINAL_EXCERPT_VERIFY_TIMEOUT,
+        )
+        .ok()?;
+    pane_still_serves_capture(&after, target, capture_seq, terminal_status).then_some(excerpt)
+}
+
+/// True when the pane still reports this task's pane id, terminal status and
+/// captured state sequence.
+fn pane_still_serves_capture(
+    response: &Value,
+    target: &str,
+    capture_seq: u64,
+    terminal_status: Option<&str>,
+) -> bool {
+    agent_state_from_value(response).is_some_and(|state| {
+        state.pane_id.as_deref() == Some(target)
+            && state.state_change_seq == Some(capture_seq)
+            && state.agent_status.as_deref() == terminal_status
+    })
+}
+
+/// Last assistant message text from the tail of a JSONL agent transcript.
+fn read_session_tail_text(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(FINAL_EXCERPT_SESSION_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = String::new();
+    file.take(FINAL_EXCERPT_SESSION_TAIL_BYTES)
+        .read_to_string(&mut tail)
+        .ok()?;
+    tail.lines()
+        .rev()
+        .find_map(assistant_text_from_session_line)
+}
+
+fn assistant_text_from_session_line(line: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let message = value.get("message").unwrap_or(&value);
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    match message.get("content") {
+        Some(Value::String(text)) => (!text.trim().is_empty()).then(|| text.clone()),
+        Some(Value::Array(blocks)) => {
+            let text: Vec<&str> = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect();
+            (!text.is_empty()).then(|| text.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+/// Column width of the pane the excerpt was read from. A missing or failed
+/// `pane.layout` read is not treated as readable: the caller fails closed
+/// because rows that cannot be qualified may be wrapping noise.
+fn final_excerpt_pane_columns(client: &HerdrClient, target: &str) -> Option<u16> {
+    let response = client
+        .call_with_timeout(
+            "pane.layout",
+            json!({"pane_id": target}),
+            FINAL_EXCERPT_VERIFY_TIMEOUT,
+        )
+        .ok()?;
+    crate::pane_width::pane_columns_from_layout_response(&response, target)
 }
 
 /// Returns the pane state sequence this capture is fenced on, after proving the
@@ -5350,6 +5482,18 @@ mod tests {
         })
     }
 
+    fn layout_response(width: u16) -> Value {
+        json!({"result": {"layout": {
+            "panes": [{"pane_id": "w1:p1", "focused": true,
+                       "rect": {"x": 0, "y": 0, "width": width, "height": 30}}],
+            "area": {"x": 0, "y": 0, "width": 200, "height": 30},
+        }}})
+    }
+
+    fn wide_layout_response() -> Value {
+        layout_response(crate::pane_width::MIN_READABLE_PANE_COLS + 60)
+    }
+
     fn excerpt_test_task(task_id: &str) -> PromptTaskRecord {
         PromptTaskRecord {
             schema_version: 1,
@@ -5400,6 +5544,7 @@ mod tests {
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
                 json!({"result": {"read": {"content": "analyzing module\n\u{1b}[32mprogress: 50%\u{1b}[0m\nDONE: report at /tmp/report.md\n\n\n"}}}),
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                wide_layout_response(),
             ],
             Arc::clone(&requests),
         );
@@ -5427,7 +5572,11 @@ mod tests {
         assert!(excerpt.ends_with("DONE: report at /tmp/report.md\n"));
 
         let recorded = requests.lock().unwrap();
-        assert_eq!(recorded.len(), 3, "capture must verify, read and re-verify");
+        assert_eq!(
+            recorded.len(),
+            4,
+            "capture must verify, read, re-verify and probe the pane width"
+        );
         assert_eq!(recorded[0].0, "agent.get");
         assert_eq!(recorded[0].1["target"], "w1:p1");
         assert_eq!(recorded[1].0, "agent.read");
@@ -5437,6 +5586,8 @@ mod tests {
         assert_eq!(recorded[1].1["strip_ansi"], true);
         assert_eq!(recorded[2].0, "agent.get");
         assert_eq!(recorded[2].1["target"], "w1:p1");
+        assert_eq!(recorded[3].0, "pane.layout");
+        assert_eq!(recorded[3].1["pane_id"], "w1:p1");
         drop(recorded);
 
         // A terminal task is immutable and must never trigger another read.
@@ -5452,8 +5603,271 @@ mod tests {
         .unwrap();
         assert!(!changed_again);
         assert_eq!(task.final_excerpt.as_deref(), Some(excerpt.as_str()));
-        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert_eq!(requests.lock().unwrap().len(), 4);
         server.join().unwrap();
+    }
+
+    /// user parent | Given a child pane only four columns wide whose TUI agent
+    /// hard-wrapped its report | When the terminal transition is reconciled |
+    /// Then the task stays terminal and notifiable but publishes no
+    /// `final_excerpt`, because column fragments are not an outcome the parent
+    /// can close out on (#684).
+    #[test]
+    fn final_excerpt_recovers_logical_lines_from_a_narrow_pane() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let transcript = temp_socket().with_extension("jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"older turn\"}]}}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"go\"}}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"cb604c6f\"},{\"type\":\"text\",\"text\":\"T259-DONE\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        let session_path = transcript.to_string_lossy().into_owned();
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": " cb\n 60\n 4c\n 6f\n\n T2\n 59\n -D\n ON\n E\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                layout_response(4),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done",
+                    "state_change_seq": 2,
+                    "agent_session": {"agent": "pi", "kind": "path", "value": session_path}}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-narrow-pane");
+
+        let changed = apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        let excerpt = task.final_excerpt.clone().expect(
+            "a four-column pane must still publish the agent's logical lines, not wrapping noise",
+        );
+        assert!(excerpt.contains("cb604c6f"), "excerpt: {excerpt:?}");
+        assert!(excerpt.contains("T259-DONE"), "excerpt: {excerpt:?}");
+        assert!(
+            !excerpt.contains(" cb") && !excerpt.contains(" 60") && !excerpt.contains(" 4c"),
+            "column fragments must never reach the parent: {excerpt:?}"
+        );
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            6,
+            "read, verify, probe the width, bracket the transcript read with agent.get"
+        );
+        assert_eq!(recorded[3].0, "pane.layout");
+        assert_eq!(recorded[4].0, "agent.get");
+        assert_eq!(recorded[5].0, "agent.get");
+        drop(recorded);
+        server.join().unwrap();
+        fs::remove_file(&socket).ok();
+        fs::remove_file(&transcript).ok();
+    }
+
+    /// user parent | Given a narrow pane whose state sequence advances while the
+    /// agent transcript is being read | When the transcript excerpt would be
+    /// published | Then it is dropped, because the pane no longer serves this
+    /// task's terminal transition.
+    #[test]
+    fn transcript_excerpt_is_dropped_when_the_pane_moves_during_the_read() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let transcript = temp_socket().with_extension("jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"cb604c6f\\nT259-DONE\"}}\n",
+        )
+        .unwrap();
+        let session_path = transcript.to_string_lossy().into_owned();
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": " cb\n 60\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                layout_response(4),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done",
+                    "state_change_seq": 2,
+                    "agent_session": {"agent": "pi", "kind": "path", "value": session_path}}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 3}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-transcript-moved");
+
+        apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(
+            task.final_excerpt, None,
+            "a transcript read must not publish after the pane moved past the captured sequence"
+        );
+        let recorded = requests.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            6,
+            "the fence must be re-proved after the read"
+        );
+        assert_eq!(recorded[5].0, "agent.get");
+        drop(recorded);
+        server.join().unwrap();
+        fs::remove_file(&socket).ok();
+        fs::remove_file(&transcript).ok();
+    }
+
+    /// user parent | Given a narrow pane whose agent transcript cannot be read |
+    /// When the terminal transition is reconciled | Then the excerpt stays absent
+    /// rather than falling back to wrapped viewport fragments.
+    #[test]
+    fn final_excerpt_stays_absent_for_a_narrow_pane_without_a_transcript() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": " cb\n 60\n 4c\n 6f\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                layout_response(4),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done",
+                    "agent_session": {"agent": "pi", "kind": "path",
+                                      "value": "/nonexistent/herdr-mcp/session.jsonl"}}}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-narrow-no-transcript");
+
+        apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(
+            task.final_excerpt, None,
+            "without a readable transcript a narrow pane must fail closed, never ship fragments"
+        );
+        server.join().unwrap();
+        fs::remove_file(&socket).ok();
+    }
+
+    /// user parent | Given the pane width probe fails | When the terminal
+    /// transition is reconciled | Then no excerpt is published, because unwrapped
+    /// rows that cannot be qualified may be wrapping garbage.
+    #[test]
+    fn final_excerpt_stays_absent_when_the_width_probe_fails() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": " cb\n 60\n 4c\n 6f\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"error": {"code": "internal_error", "message": "layout unavailable"}}),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-width-probe-failed");
+
+        apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(
+            task.final_excerpt, None,
+            "an unverifiable pane width must fail closed instead of publishing unqualified rows"
+        );
+        server.join().unwrap();
+        fs::remove_file(&socket).ok();
+    }
+
+    /// user parent | Given a child pane at the readable-width floor | When the
+    /// terminal transition is reconciled | Then the excerpt is captured, so the
+    /// narrow-pane guard never suppresses a usable outcome.
+    #[test]
+    fn final_excerpt_is_captured_at_the_readable_width_floor() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let server = scripted_read_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                json!({"result": {"read": {"content": "cb604c6f\nT259-DONE\n"}}}),
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                layout_response(crate::pane_width::MIN_READABLE_PANE_COLS),
+            ],
+            Arc::clone(&requests),
+        );
+        let client = HerdrClient::new(&socket);
+        let mut task = excerpt_test_task("dispatch:prompt:excerpt-floor-pane");
+
+        apply_events_with_final_excerpt(
+            Some(&client),
+            None,
+            &mut task,
+            &[json!({
+                "cursor": 101,
+                "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
+            })],
+        )
+        .unwrap();
+
+        let excerpt = task
+            .final_excerpt
+            .clone()
+            .expect("a pane at the readable floor still publishes an excerpt");
+        assert!(excerpt.contains("cb604c6f"));
+        assert!(excerpt.contains("T259-DONE"));
+        server.join().unwrap();
+        fs::remove_file(&socket).ok();
     }
 
     /// user owner | Given a pane is reused before an old task is reconciled |
@@ -5517,6 +5931,7 @@ mod tests {
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
                 json!({"result": {"read": {"content": "LIVE EXCERPT OK\n"}}}),
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                wide_layout_response(),
             ],
             Arc::clone(&requests),
         );
@@ -5725,6 +6140,7 @@ mod tests {
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
                 json!({"result": {"read": {"content": "RC3_EXCERPT_UAT_PASS\n"}}}),
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                wide_layout_response(),
             ],
             Arc::clone(&requests),
         );
@@ -5990,6 +6406,7 @@ mod tests {
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
                 json!({"result": {"read": {"content": "COMPANION EVENT EXCERPT\n"}}}),
                 json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}}),
+                wide_layout_response(),
             ],
             Arc::clone(&requests),
         );
