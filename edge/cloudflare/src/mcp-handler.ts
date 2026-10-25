@@ -1363,9 +1363,10 @@ export async function handleMcp(
     // existing Page Assist grants work without migration and Page Assist deny
     // revokes it; explicitly issued per-provider grants are unaffected.
     //
-    // The `agent.task.dispatch` parent-session gate evaluates those same
-    // explicit grants before it binds a task to a WebChat session, so a
-    // dispatch caller receives the identical device-scoped projection.
+    // `agent.task.dispatch` is included because its parent-session binder
+    // evaluates these same explicit grants before binding a task to a WebChat
+    // session. The projection stays device-scoped to the routed device; this
+    // does not mint, widen, or persist any grant.
     const webchatControlGrants: Array<{ endpoint_ref: string; provider: string; account_ref: string }> = [];
     if ((isBrowserPrivateMethod || localMethod === "herdr_mcp.agent.task.dispatch") && initialRouteDeviceId) {
       const seen = new Set<string>();

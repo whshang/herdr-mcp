@@ -2272,3 +2272,44 @@ test("user dispatches an agent task from a WebChat turn | Given WebChat and Page
   );
   assert.equal(d.calls[0].trace?.page_assist_grants, undefined, "dispatch is not a Page Assist caller");
 });
+
+test("user dispatches an agent task from a caller-session-routed WebChat turn | Given no device selector, WebChat and Page Assist grants on the resolved device, and a grant on another device | When herdr_mcp.agent.task.dispatch is forwarded | Then the resolved device's exact grants reach the parent-session gate and the other device's endpoint never travels", async () => {
+  const d = pageScopedGrantDeps();
+  const wiredDevice = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  d.value.resolveDevice = async (selector) => selector === undefined
+    ? { ok: true, device_id: wiredDevice, workstation_id: "w-target", routing_reason: "caller_session" }
+    : { ok: false, code: "device_not_found" };
+  const res = await handleMcp(
+    req(1, "tools/call", {
+      name: "herdr_call",
+      _meta: { "openai/session": "openai-session-dispatch-caller-route" },
+      arguments: {
+        method: "herdr_mcp.agent.task.dispatch",
+        params: JSON.stringify({
+          target: "pi",
+          text: "do durable child work",
+          current_user_message: "hand this to the workstation",
+          idempotency_key: "edge-agent-task-dispatch-caller-route",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1, "agent task dispatch forwards exactly once");
+  assert.deepEqual(d.calls[0].trace?.webchat_control_grants, [{
+    endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    provider: "chatgpt",
+    account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  }, {
+    endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    provider: "*",
+    account_ref: "*",
+  }], "a caller-session-routed dispatch carries the resolved device's grants without an explicit device selector");
+  assert.equal(
+    JSON.stringify(d.calls[0].trace ?? {}).includes("be_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+    false,
+    "another device's grant endpoint must never travel with the dispatch",
+  );
+});
