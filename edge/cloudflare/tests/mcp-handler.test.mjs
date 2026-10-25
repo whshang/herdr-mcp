@@ -2221,3 +2221,54 @@ test("user calls every page-scoped method without a device | Given page-scoped f
     assert.equal(d.calls.length, 0, `${method} must not forward without a routed device`);
   }
 });
+
+test("user dispatches an agent task from a WebChat turn | Given WebChat and Page Assist grants on the routed device and a grant on another device | When herdr_mcp.agent.task.dispatch is forwarded | Then the routed device's exact grants reach the parent-session gate and the other device's endpoint never travels", async () => {
+  const d = pageScopedGrantDeps();
+  const res = await handleMcp(
+    req(1, "tools/call", {
+      name: "herdr_call",
+      _meta: { "openai/session": "openai-session-dispatch-grant-123" },
+      arguments: {
+        method: "herdr_mcp.agent.task.dispatch",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          target: "pi",
+          text: "do durable child work",
+          current_user_message: "hand this to the workstation",
+          idempotency_key: "edge-agent-task-dispatch-grant-test",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1, "agent task dispatch forwards exactly once");
+  assert.equal(d.calls[0].args.method, "herdr_mcp.agent.task.dispatch");
+  assert.deepEqual(d.calls[0].trace, {
+    webchat_control_grants: [{
+      endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      provider: "chatgpt",
+      account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }, {
+      endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      provider: "*",
+      account_ref: "*",
+    }],
+    webchat_authorization: {
+      principal_ref: "connector:conn_pagescopedgrant123",
+      connector_id: "conn_pagescopedgrant123",
+      grant_generation: 3,
+    },
+    browser_caller_session: {
+      provider: "chatgpt",
+      opaque_session_id: "openai-session-dispatch-grant-123",
+    },
+  }, "dispatch carries the routed device's explicit and Page Assist-derived grants plus caller provenance");
+  assert.equal(
+    JSON.stringify(d.calls[0].trace ?? {}).includes("be_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+    false,
+    "another device's grant endpoint must never travel with the dispatch",
+  );
+  assert.equal(d.calls[0].trace?.page_assist_grants, undefined, "dispatch is not a Page Assist caller");
+});
