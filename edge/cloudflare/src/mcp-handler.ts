@@ -1237,6 +1237,12 @@ export async function handleMcp(
       && !isPageAssistPrivateMethod;
     const isAgentTaskCaller = name === "herdr_prompt"
       || localMethod === "herdr_mcp.agent.task.dispatch";
+    // The WebChat control grant projection keeps PR #698's dispatch-only
+    // contract: `webchat_authorization` / `browser_caller_session` may cover the
+    // wider caller predicate above, but legacy `herdr_prompt` must not gain new
+    // trace authority (its forwarded trace shape is unchanged).
+    const isWebchatControlGrantCaller = isBrowserPrivateMethod
+      || (name === "herdr_call" && localMethod === "herdr_mcp.agent.task.dispatch");
     if (isBrowserPrivateMethod || isPageAssistPrivateMethod) {
       if (typeof selectorValue !== "string" || selectorValue.trim().length === 0) {
         return rpcResult(id, callToolResult({
@@ -1363,36 +1369,42 @@ export async function handleMcp(
     // existing Page Assist grants work without migration and Page Assist deny
     // revokes it; explicitly issued per-provider grants are unaffected.
     //
-    // The projection is gated by the same caller predicate that attaches
-    // `webchat_authorization` / `browser_caller_session` (`isAgentTaskCaller`),
-    // so caller provenance and the grants the runtime gate reads always travel
-    // together. `agent.task.dispatch` is the consumer: its parent-session binder
-    // evaluates these explicit grants before binding a task to a WebChat
-    // session. The projection stays device-scoped to the routed device; this
-    // does not mint, widen, or persist any grant.
-    const webchatControlGrants: Array<{ endpoint_ref: string; provider: string; account_ref: string }> = [];
-    if ((isBrowserPrivateMethod || isAgentTaskCaller) && initialRouteDeviceId) {
+    // The projection is gated by the dispatch-only caller predicate
+    // (`isWebchatControlGrantCaller`), so `agent.task.dispatch` receives the
+    // grants its parent-session binder reads while legacy `herdr_prompt` keeps
+    // its previous trace shape. The projection stays device-scoped to the
+    // routed device; this does not mint, widen, or persist any grant.
+    // Both grant projections below are functions of the routed device, never of
+    // the seed route alone: the `device_route_unverified` retry replaces `route`
+    // with the authoritative registry answer and re-projects from that device, so
+    // a seed device's grants can never travel with a call executed elsewhere.
+    const projectWebchatControlGrants = (deviceId: string | null | undefined) => {
+      const projected: Array<{ endpoint_ref: string; provider: string; account_ref: string }> = [];
+      if (!isWebchatControlGrantCaller || !deviceId) return projected;
       const seen = new Set<string>();
       const push = (grant: { endpoint_ref: string; provider: string; account_ref: string }) => {
         const key = `${grant.endpoint_ref}\u0000${grant.provider}\u0000${grant.account_ref}`;
-        if (seen.has(key) || webchatControlGrants.length >= 32) return;
+        if (seen.has(key) || projected.length >= 32) return;
         seen.add(key);
-        webchatControlGrants.push(grant);
+        projected.push(grant);
       };
       for (const grant of deps.client?.webchatControlGrants ?? []) {
-        if (grant.device_id !== initialRouteDeviceId) continue;
+        if (grant.device_id !== deviceId) continue;
         push({ endpoint_ref: grant.endpoint_ref, provider: grant.provider, account_ref: grant.account_ref });
       }
       for (const grant of deps.client?.pageAssistGrants ?? []) {
-        if (grant.device_id !== initialRouteDeviceId) continue;
+        if (grant.device_id !== deviceId) continue;
         push({ endpoint_ref: grant.endpoint_ref, provider: "*", account_ref: "*" });
       }
-    }
-    const pageAssistGrants = isPageAssistPrivateMethod && initialRouteDeviceId
+      return projected;
+    };
+    const projectPageAssistGrants = (deviceId: string | null | undefined) => isPageAssistPrivateMethod && deviceId
       ? (deps.client?.pageAssistGrants ?? [])
-        .filter((grant) => grant.device_id === initialRouteDeviceId)
+        .filter((grant) => grant.device_id === deviceId)
         .map((grant) => ({ endpoint_ref: grant.endpoint_ref }))
       : [];
+    const webchatControlGrants = projectWebchatControlGrants(initialRouteDeviceId);
+    const pageAssistGrants = projectPageAssistGrants(initialRouteDeviceId);
     const webchatAuthorization = (isBrowserPrivateMethod || isAgentTaskCaller)
       && deps.client?.connectorId
       && Number.isSafeInteger(deps.client.grantGeneration)
@@ -1588,10 +1600,27 @@ export async function handleMcp(
         route = authoritative;
         usedCanonicalFastRoute = false;
         activeRequestId = retryRequestId;
+        // The authoritative route may name a different device than the seed
+        // route (a canonical id the registry no longer maps to its own
+        // workstation). Recompute both device-scoped grant projections from it
+        // so the seed device's grants never travel with a call the workstation
+        // executes for another device. Connector authorization and caller
+        // session are device-independent and are carried over unchanged.
+        const authoritativeWebchatControlGrants = projectWebchatControlGrants(route.device_id);
+        const authoritativePageAssistGrants = projectPageAssistGrants(route.device_id);
+        const authoritativeTrace: InternalForwardRequest["trace"] = {
+          ...(authoritativeWebchatControlGrants.length > 0 ? { webchat_control_grants: authoritativeWebchatControlGrants } : {}),
+          ...(authoritativePageAssistGrants.length > 0 ? { page_assist_grants: authoritativePageAssistGrants } : {}),
+          ...(webchatAuthorization ? { webchat_authorization: webchatAuthorization } : {}),
+          ...(browserCallerSession ? { browser_caller_session: browserCallerSession } : {}),
+        };
         activeInternal = {
           ...activeInternal,
           requestId: retryRequestId,
           ...(route.device_id ? { routeDeviceId: route.device_id } : { routeDeviceId: undefined }),
+          ...(authoritativeTrace && Object.keys(authoritativeTrace).length > 0
+            ? { trace: authoritativeTrace }
+            : { trace: undefined }),
           ...(route.execution_fence ? { executionFence: route.execution_fence } : { executionFence: undefined }),
         };
         forwarded = undefined;
