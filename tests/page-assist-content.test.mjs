@@ -208,6 +208,121 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   assert.equal(linkClick.navigation_url, "https://app.test/details");
 });
 
+test("user pages past the first 128 observed elements | Given a 260-control page with sensitive and hidden controls interleaved | When observe advances element_offset | Then every page returns fresh refs and next_element_offset reaches the end", () => {
+  const items = Array.from({ length: 260 }, (_, index) => (
+    createElement({ tag: "button", type: "button", text: `Action ${index}` })
+  ));
+  const password = createElement({ tag: "input", type: "password", value: "private" });
+  const hidden = createElement({ tag: "button", text: "Hidden action", visible: false });
+  // The ineligible controls sit at document position 130/131, i.e. after the
+  // first page, so they must not consume any page slot either.
+  const h = harness({ elements: [...items.slice(0, 130), password, hidden, ...items.slice(130)] });
+
+  const first = h.send({
+    type: "h2w_page_assist",
+    action: "observe",
+    expectedOrigin: "https://app.test",
+  });
+  assert.equal(first.ok, true);
+  assert.equal(first.elements.length, 128);
+  assert.equal(first.elements[0].text, "Action 0");
+  assert.equal(first.elements.at(-1).text, "Action 127");
+  assert.equal(first.element_offset, 0);
+  assert.equal(first.next_element_offset, 128);
+  assert.ok(first.elements.every((item) => item.ref.startsWith(`ref_${first.generation}_`)));
+
+  const second = h.send({
+    type: "h2w_page_assist",
+    action: "observe",
+    expectedOrigin: "https://app.test",
+    elementOffset: 128,
+  });
+  assert.equal(second.ok, true);
+  assert.equal(second.elements.length, 128);
+  assert.equal(second.elements[0].text, "Action 128");
+  assert.equal(second.elements.at(-1).text, "Action 255");
+  assert.equal(second.element_offset, 128);
+  assert.equal(second.next_element_offset, 256);
+  assert.notEqual(second.generation, first.generation);
+  assert.ok(second.elements.every((item) => item.ref.startsWith(`ref_${second.generation}_`)));
+  assert.equal(second.elements.some((item) => item.text === "Hidden action"), false);
+
+  const stale = h.send({
+    type: "h2w_page_assist",
+    action: "click",
+    expectedOrigin: "https://app.test",
+    generation: first.generation,
+    ref: first.elements[0].ref,
+  });
+  assert.equal(stale.error, "stale_generation");
+  assert.equal(items[0].clicked, 0, "a stale page-1 ref must never actuate");
+
+  // Real usage: the ref reached through paging is the control on the page.
+  const pagedClick = h.send({
+    type: "h2w_page_assist",
+    action: "click",
+    expectedOrigin: "https://app.test",
+    generation: second.generation,
+    ref: second.elements[0].ref,
+  });
+  assert.equal(pagedClick.ok, true);
+  assert.equal(items[128].clicked, 1);
+  assert.equal(items[0].clicked, 0);
+
+  const last = h.send({
+    type: "h2w_page_assist",
+    action: "observe",
+    expectedOrigin: "https://app.test",
+    elementOffset: second.next_element_offset,
+  });
+  assert.equal(last.ok, true);
+  assert.deepEqual(Array.from(last.elements, (item) => item.text), ["Action 256", "Action 257", "Action 258", "Action 259"]);
+  assert.equal(last.element_offset, 256);
+  assert.equal(last.next_element_offset, null);
+
+  for (const elementOffset of [-1, 1.5, 4097, "128", null]) {
+    const rejected = h.send({
+      type: "h2w_page_assist",
+      action: "observe",
+      expectedOrigin: "https://app.test",
+      elementOffset,
+    });
+    assert.equal(rejected.error, "element_offset_invalid", `element_offset ${String(elementOffset)}`);
+  }
+  // A rejected offset must not mint a generation, so the last good refs survive.
+  const stillLive = h.send({
+    type: "h2w_page_assist",
+    action: "click",
+    expectedOrigin: "https://app.test",
+    generation: last.generation,
+    ref: last.elements[0].ref,
+  });
+  assert.equal(stillLive.ok, true);
+  assert.equal(items[256].clicked, 1);
+
+  // An offset past the last eligible control is a legitimate empty page, not
+  // an error: next_element_offset is null instead of a cursor that loops.
+  const beyondEnd = h.send({
+    type: "h2w_page_assist",
+    action: "observe",
+    expectedOrigin: "https://app.test",
+    elementOffset: 4096,
+  });
+  assert.equal(beyondEnd.ok, true);
+  assert.equal(beyondEnd.elements.length, 0);
+  assert.equal(beyondEnd.element_offset, 4096);
+  assert.equal(beyondEnd.next_element_offset, null);
+});
+
+test("user observes a page that fits the ref cap | Given fewer than 128 eligible controls | When observe runs without an offset | Then the response reports no paging cursor to follow", () => {
+  const h = harness({ elements: [createElement({ tag: "button", text: "Only action" })] });
+  const observed = h.send({ type: "h2w_page_assist", action: "observe", expectedOrigin: "https://app.test" });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.elements.length, 1);
+  assert.equal(Object.hasOwn(observed, "element_offset"), false);
+  assert.equal(Object.hasOwn(observed, "next_element_offset"), false);
+});
+
 test("user hovers a bounded visible card | Given a CSS-hidden edit button | When an observed hover-only ref is prepared | Then the revealed button receives its own ref only after a new observation", () => {
   const card = createElement({
     tag: "div", text: "Existing evaluation", attrs: { class: "evaluationCard__sample" },
@@ -356,7 +471,7 @@ function tableHarness({ rows, extraElements = [] }) {
   return { h, table };
 }
 
-test("user reads a table after long navigation | Given more than 128 links before a visible table | When inspect assigns bounded refs | Then the table can still be extracted", () => {
+test("user pages to a table after long navigation | Given more than 128 links before a visible table | When inspect advances the bounded offset | Then the table can still be extracted", () => {
   const navigation = Array.from({ length: 140 }, (_, index) => createElement({
     tag: "a", text: `Nav ${index}`, attrs: { href: `/nav/${index}` },
   }));
@@ -368,10 +483,22 @@ test("user reads a table after long navigation | Given more than 128 links befor
     tableDomRow({ doc, cells: [tableDomNode({ doc, text: "Alpha" })] }),
   ]);
 
-  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
-  assert.equal(observed.elements.length, 128);
+  const firstPage = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(firstPage.elements.length, 128);
+  assert.equal(firstPage.next_element_offset, 128);
+  assert.equal(firstPage.elements.some((element) => element.tag === "table"), false);
+
+  const observed = h.send({
+    type: "h2w_page_assist",
+    action: "inspect",
+    expectedOrigin: "https://app.test",
+    elementOffset: firstPage.next_element_offset,
+  });
+  assert.equal(observed.element_offset, 128);
+  assert.equal(observed.next_element_offset, null);
+  assert.notEqual(observed.generation, firstPage.generation);
   const tableRef = observed.elements.find((element) => element.tag === "table")?.ref;
-  assert.ok(tableRef, "long navigation must not hide the table from observed refs");
+  assert.ok(tableRef, "the next page must expose the table ref");
 
   const extracted = h.send({
     type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",

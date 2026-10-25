@@ -189,7 +189,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "view": {
                         "type": "string",
                         "enum": ["full", "compact"],
-                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured."
+                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured. final_excerpt is omitted, not degraded, when the child pane is narrower than 40 columns: a TUI agent hard-wraps its own layout there, so the only readable options are reading the pane or giving the agent a wider pane (a new tab, a reused wide pane, or a down split)."
                     },
                 },
                 "required": [],
@@ -809,6 +809,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "page_ref": {"type": "string", "maxLength": 67},
                     "action": {"type": "string",  "enum": ["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "extract", "extract_table", "press", "navigate", "reload", "back", "forward"]},
                     "max_chars": {"type": ["integer", "null"], "minimum": 1, "maximum": 100000},
+                    "element_offset": {"type": ["integer", "null"], "minimum": 0, "maximum": 4096, "description": "observe only: skip this many eligible, visible controls before building refs. A response still holds at most 128 refs and reports next_element_offset (null at the end). Each observation mints a new generation, so page, re-observe, then act."},
                     "generation": {"type": ["string", "null"], "maxLength": 256},
                     "ref": {"type": ["string", "null"], "maxLength": 256},
                     "value": {"type": ["string", "null"], "maxLength": 10000},

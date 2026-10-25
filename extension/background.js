@@ -3663,6 +3663,7 @@ async function handleBrowserActuation(command) {
         expectedUrl: params.expected_url,
         url: params.url,
         pageGeneration: params.page_generation,
+        elementOffset: params.element_offset,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -9466,6 +9467,7 @@ async function performBrowserPageActionRequest(msg) {
     amount: msg?.amount,
     key: msg?.key,
     maxRows: msg?.maxRows,
+    elementOffset: msg?.elementOffset,
     ...(action === "fill" ? { mainWorldFill: true } : {}),
   };
 

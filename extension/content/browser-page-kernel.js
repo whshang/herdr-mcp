@@ -252,15 +252,21 @@
     return cleanText(collectVisibleText(el, 121), 120).length > 0;
   }
 
+  // Page cursor over eligible, visible controls only. The 128-element response
+  // cap is retained; the offset lets a caller reach controls past it instead of
+  // seeing the same document-order prefix on every observation.
+  function parseObserveOffset(options = {}) {
+    const offset = options.elementOffset === undefined ? 0 : options.elementOffset;
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > MAX_ELEMENT_OFFSET) return null;
+    return offset;
+  }
+
   function scanDocument(options = {}) {
     if (isCrossOriginFrame()) {
       return { ok: false, error: "cross_origin_iframe_blocked" };
     }
-
-    const elementOffset = options.elementOffset === undefined ? 0 : options.elementOffset;
-    if (!Number.isSafeInteger(elementOffset) || elementOffset < 0 || elementOffset > MAX_ELEMENT_OFFSET) {
-      return { ok: false, error: "element_offset_invalid" };
-    }
+    const elementOffset = parseObserveOffset(options);
+    if (elementOffset === null) return { ok: false, error: "element_offset_invalid" };
 
     generationSeq += 1;
     currentGenerationToken = `pa_gen_${documentNonce}_${generationSeq}_${Date.now().toString(36)}`;
@@ -273,23 +279,13 @@
     if (!doc) return { ok: false, error: "document_unavailable" };
 
     const candidates = doc.querySelectorAll(OBSERVABLE_CONTROL_SELECTOR);
-    // Expose table refs even when a long navigation consumes the normal limit.
-    function* tableFirstCandidates() {
-      for (const el of candidates) {
-        if (el.tagName?.toLowerCase() === "table") yield el;
-      }
-      for (const el of candidates) {
-        if (el.tagName?.toLowerCase() !== "table") yield el;
-      }
-    }
-
     const elements = [];
     let elementIndex = 0;
     let eligibleIndex = 0;
     let hoverTargets = 0;
     let hasMoreElements = false;
 
-    for (const el of tableFirstCandidates()) {
+    for (const el of candidates) {
       const tag = (el.tagName || "").toLowerCase();
 
       const clickable = isObservableControlCandidate(el);
@@ -303,6 +299,8 @@
       if (isElementHidden(el)) continue;
       if (isElementDisabled(el)) continue;
 
+      // Only eligible, visible controls advance the cursor, so a skipped
+      // password/hidden/disabled control never consumes a page slot.
       if (hoverOnly) hoverTargets += 1;
       if (eligibleIndex++ < elementOffset) continue;
       if (elements.length >= MAX_ELEMENTS) {
@@ -387,6 +385,10 @@
       origin: String(global.location ? global.location.origin : "").slice(0, 512),
       title: String(doc.title || "").slice(0, 512),
       generation: currentGenerationToken,
+      ...(hasMoreElements || options.elementOffset !== undefined ? {
+        element_offset: elementOffset,
+        next_element_offset: hasMoreElements ? elementOffset + elements.length : null,
+      } : {}),
       scroll: {
         y: Math.max(0, Math.round(Number(global.scrollY) || 0)),
         max_y: Math.max(0, Math.round((Number(doc.documentElement?.scrollHeight) || 0) - (Number(global.innerHeight) || 0))),

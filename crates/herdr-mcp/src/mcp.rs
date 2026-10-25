@@ -8,6 +8,7 @@ use crate::fs_tools;
 use crate::git_tools;
 use crate::herdr::HerdrClient;
 use crate::native_tools;
+use crate::pane_width;
 use crate::progressive_skills::{
     BILIBILI_VIDEO_TRANSCRIPT_METHOD, BROWSER_COMPOSER_SET_APPS_METHOD,
     BROWSER_COMPOSER_SET_REASONING_METHOD, BROWSER_DISPATCH_STATUS_METHOD,
@@ -741,6 +742,19 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &params,
                     parent_session_ref.as_deref(),
                 )
+            } else if method == pane_width::SPLIT_METHOD {
+                // A horizontal split must not create a pane whose agent output
+                // can only be captured as wrapping noise (#684).
+                match pane_width::guard_split(&context.cache.snapshot(), &params) {
+                    pane_width::SplitPlan::Forward(params) => native_tools::call_with_local(
+                        context.client,
+                        context.skill,
+                        &context.cache.snapshot(),
+                        method,
+                        params,
+                    ),
+                    pane_width::SplitPlan::Refuse(result) => result,
+                }
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
             } else {
@@ -9431,6 +9445,10 @@ fn browser_page_action_call(
         return json!({"ok": false, "code": "invalid_params", "message": "page_generation is accepted only for navigation actions"});
     }
 
+    if action != "observe" && object.contains_key("element_offset") {
+        return json!({"ok": false, "code": "invalid_params", "message": "element_offset is accepted only for observe"});
+    }
+
     let mut bridge_params = json!({
         "page_ref": page_ref,
         "action": action,
@@ -9523,6 +9541,17 @@ fn browser_page_action_call(
                     return json!({"ok": false, "code": "invalid_params", "message": "max_chars must be between 1 and 100000"});
                 }
                 bridge_params["max_chars"] = json!(max_chars);
+            }
+            if action == "observe"
+                && let Some(element_offset) = object.get("element_offset")
+            {
+                let Some(element_offset) = element_offset.as_u64() else {
+                    return json!({"ok": false, "code": "invalid_params", "message": "element_offset must be an integer"});
+                };
+                if element_offset > 4096 {
+                    return json!({"ok": false, "code": "invalid_params", "message": "element_offset must be between 0 and 4096"});
+                }
+                bridge_params["element_offset"] = json!(element_offset);
             }
         }
         "expect" => {
@@ -22399,6 +22428,176 @@ mod tests {
         let focused = browser_page_action_call(&store, &with_ref, &grants, Some(&actuator));
         assert_eq!(focused["ok"], true);
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn browser_page_observe_paging_forwards_a_bounded_read_only_offset_without_a_mutation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        // #615: only refs, not page text, are capped at 128 per observation.
+        // The read-only cursor must reach the extension unchanged while the
+        // call stays outside the idempotency/mutation reservation path.
+        struct ObservePagingActuator {
+            calls: AtomicUsize,
+            seen: Mutex<Vec<Value>>,
+        }
+        impl BrowserActuator for ObservePagingActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("observe must route through the exact browser endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert!(
+                    dispatch_id.is_none(),
+                    "observe must never reserve a mutation dispatch"
+                );
+                assert_eq!(params["action"], "observe");
+                self.seen.lock().unwrap().push(params.clone());
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "generation": "pa_gen_page_2",
+                    "element_offset": params.get("element_offset").cloned(),
+                    "next_element_offset": null,
+                    "elements": [],
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = ObservePagingActuator {
+            calls: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+        };
+        let page_ref = format!("bp_{}", "d".repeat(64));
+
+        let paged = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_test",
+                "page_ref": page_ref,
+                "action": "observe",
+                "element_offset": 128,
+            }),
+            &grants,
+            Some(&actuator),
+        );
+        assert_eq!(paged["ok"], true, "{paged}");
+        assert_eq!(paged["page_ref"], page_ref);
+        assert_eq!(paged["element_offset"], 128);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        let defaults = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_test",
+                "page_ref": page_ref,
+                "action": "observe",
+            }),
+            &grants,
+            Some(&actuator),
+        );
+        assert_eq!(defaults["ok"], true, "{defaults}");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+        {
+            let seen = actuator.seen.lock().unwrap();
+            assert_eq!(
+                seen[0]["element_offset"], 128,
+                "the cursor must reach the extension"
+            );
+            assert!(
+                seen[1].get("element_offset").is_none(),
+                "an offset-free observe must not invent a cursor"
+            );
+        }
+
+        for invalid_offset in [json!(4097), json!(-1), json!(1.5), json!("128")] {
+            let rejected = browser_page_action_call(
+                &store,
+                &json!({
+                    "endpoint_ref": "bep_test",
+                    "page_ref": page_ref,
+                    "action": "observe",
+                    "element_offset": invalid_offset,
+                }),
+                &grants,
+                Some(&actuator),
+            );
+            assert_eq!(
+                rejected["code"], "invalid_params",
+                "element_offset {invalid_offset} must fail closed"
+            );
+        }
+        for action in [
+            "click",
+            "screenshot",
+            "expect",
+            "extract",
+            "scroll",
+            "press",
+        ] {
+            let mut request = json!({
+                "endpoint_ref": "bep_test",
+                "page_ref": page_ref,
+                "action": action,
+                "element_offset": 128,
+            });
+            if action == "click" {
+                request["generation"] = json!("pa_gen_page_2");
+                request["ref"] = json!("ref_pa_gen_page_2_0");
+                request["idempotency_key"] = json!("observe-paging-click");
+            }
+            assert_eq!(
+                browser_page_action_call(&store, &request, &grants, Some(&actuator))["code"],
+                "invalid_params",
+                "{action} must not accept an observe cursor"
+            );
+        }
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            2,
+            "rejected parameters must not reach the browser"
+        );
+
+        let upper_bound = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_test",
+                "page_ref": page_ref,
+                "action": "observe",
+                "element_offset": 4096,
+            }),
+            &grants,
+            Some(&actuator),
+        );
+        assert_eq!(upper_bound["ok"], true, "{upper_bound}");
+        assert_eq!(upper_bound["element_offset"], 4096);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
