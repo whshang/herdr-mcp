@@ -2314,10 +2314,11 @@ test("user dispatches an agent task from a caller-session-routed WebChat turn | 
   );
 });
 
-// One caller predicate, three projections. `webchat_control_grants`,
-// `webchat_authorization` and `browser_caller_session` are derived from the same
-// `isAgentTaskCaller` gate, so a method can never receive caller provenance
-// without the device-scoped grants the runtime gate reads (or the reverse).
+// Caller provenance and grant projection have distinct consumers.
+// `webchat_authorization` and `browser_caller_session` use `isAgentTaskCaller`
+// (`herdr_prompt` and `agent.task.dispatch`); `webchat_control_grants` is limited
+// to browser-private methods and `herdr_call(agent.task.dispatch)`, the paths
+// that consume device-scoped grants in the runtime.
 const CALLER_PREDICATE_DEVICE = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const CALLER_PREDICATE_OTHER_DEVICE_ENDPOINT = `be_${"f".repeat(64)}`;
 const CALLER_PREDICATE_SESSION = "openai-session-caller-predicate-parity";
@@ -2555,4 +2556,79 @@ test("user dispatches through a cold execution fence | Given a canonical seed de
   for (const seedRef of [REROUTE_ENDPOINT_A, REROUTE_PAGE_A]) {
     assert.equal(retriedTrace.includes(seedRef), false, `the retry must not carry the seed device's grant ${seedRef}`);
   }
+});
+
+// The short-window read dedupe key is a device-scoped identity: the
+// WorkstationDO replays an in-flight/recent read completion keyed by it and
+// wraps the reply with the current `routeDeviceId`. Reusing a seed-device key
+// after the authoritative retry re-routes to another device would return one
+// device's cached read result as another device's reply.
+test("user reads through a cold execution fence | Given a canonical seed device A with an authoritative re-resolution to device B | When the first forward reports device_route_unverified | Then the retried read is keyed to device B and cannot replay the seed device's cached read", async () => {
+  let attempts = 0;
+  let registryReads = 0;
+  const d = deps({
+    client: { connectorId: "conn_readdedupe123", grantGeneration: 4, authSource: "oauth_edge" },
+    resolveDevice: async (selector) => {
+      registryReads += 1;
+      assert.equal(selector, REROUTE_DEVICE_A, "only the authoritative retry consults the registry");
+      return {
+        ok: true,
+        device_id: REROUTE_DEVICE_B,
+        workstation_id: "ws-b",
+        routing_reason: "explicit_device",
+        execution_fence: {
+          device_id: REROUTE_DEVICE_B,
+          workstation_id: "ws-b",
+          authorization: "active",
+          scheduling: "enabled",
+          revision: 12,
+        },
+      };
+    },
+    forward: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response(JSON.stringify({
+          status: "error",
+          error: { ok: false, code: "device_route_unverified", retryable: false, delivery_state: "not_delivered" },
+        }), { status: 428, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { served: true } },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  const read = (id, device) => handleMcp(req(id, "tools/call", {
+    name: "herdr_git",
+    arguments: { device, root: "/repo", action: "status" },
+  }), "w1", d.value);
+
+  const retried = await read("read-dedupe-reroute", REROUTE_DEVICE_A);
+  assert.equal(retried.body.result.isError, undefined, "the retried read settles on the authoritative route");
+  assert.equal(registryReads, 1, "the seed canonical route is registry-free; only the retry reads the registry");
+  assert.deepEqual(d.targets, [REROUTE_DEVICE_A, "ws-b"], "the retry follows the authoritative workstation");
+  assert.equal(d.calls.length, 2, "device_route_unverified must retry exactly once");
+  assert.equal(d.calls[0].routeDeviceId, REROUTE_DEVICE_A);
+  assert.match(d.calls[0].readDedupeKey, /^read_[0-9a-f]{64}$/, "the seeded read carries a dedupe key");
+  assert.equal(d.calls[1].routeDeviceId, REROUTE_DEVICE_B);
+  assert.equal(d.calls[1].executionFence?.device_id, REROUTE_DEVICE_B);
+  assert.match(d.calls[1].readDedupeKey, /^read_[0-9a-f]{64}$/, "the retried read still coalesces");
+  assert.notEqual(
+    d.calls[1].readDedupeKey,
+    d.calls[0].readDedupeKey,
+    "a retry routed to another device must not reuse the seed device's dedupe key",
+  );
+
+  // Control reads routed directly (no fence bootstrap) prove which device each
+  // key belongs to: the seed key is device A's key and the retried key is
+  // exactly the key device B would have produced.
+  const directA = await read("read-dedupe-direct-a", REROUTE_DEVICE_A);
+  const directB = await read("read-dedupe-direct-b", REROUTE_DEVICE_B);
+  assert.equal(directA.body.result.isError, undefined);
+  assert.equal(directB.body.result.isError, undefined);
+  assert.equal(d.calls.length, 4);
+  assert.equal(d.calls[2].readDedupeKey, d.calls[0].readDedupeKey, "the seed forward used device A's read key");
+  assert.equal(d.calls[3].readDedupeKey, d.calls[1].readDedupeKey, "the retried forward used device B's read key");
+  assert.equal(d.calls[3].routeDeviceId, REROUTE_DEVICE_B, "the control read routed to device B directly");
 });

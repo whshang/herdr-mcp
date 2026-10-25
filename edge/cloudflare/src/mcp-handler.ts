@@ -1418,20 +1418,27 @@ export async function handleMcp(
     const browserCallerSession = (isBrowserPrivateMethod || isAgentTaskCaller) && openaiSession
       ? { provider: "chatgpt", opaque_session_id: openaiSession }
       : null;
-    const readDedupeKey = opClass === "read"
+    // The short-window read dedupe key is a device-scoped identity, not just a
+    // coalescing hint: the WorkstationDO replays an in-flight/recent read
+    // completion keyed by it and wraps the reply with the *current*
+    // `routeDeviceId`, so a key built for one routed device must never be reused
+    // after the route changes to another device. Built from an explicit device so
+    // the authoritative route retry below can recompute it with the same fields.
+    const buildReadDedupeKey = async (deviceId: string | null | undefined) => opClass === "read"
       ? `read_${await sha256Hex(JSON.stringify(stableDedupeValue({
           op: name,
           args: runtimeArgs,
-          route_device_id: route.device_id ?? null,
+          route_device_id: deviceId ?? null,
           connector_id: deps.client?.connectorId ?? null,
           grant_generation: deps.client?.grantGeneration ?? null,
           auth_source: deps.client?.authSource ?? null,
           automation_device_id: deps.client?.automationDeviceId ?? null,
-          webchat_control_grants: webchatControlGrants,
-          page_assist_grants: pageAssistGrants,
+          webchat_control_grants: projectWebchatControlGrants(deviceId),
+          page_assist_grants: projectPageAssistGrants(deviceId),
           browser_caller_session: browserCallerSession,
         })))}`
       : undefined;
+    const readDedupeKey = await buildReadDedupeKey(route.device_id);
     const requestedToolTimeoutMs =
       typeof runtimeArgs.timeout_ms === "number" && Number.isFinite(runtimeArgs.timeout_ms)
         ? Math.max(1, runtimeArgs.timeout_ms)
@@ -1621,6 +1628,10 @@ export async function handleMcp(
           ...(authoritativeTrace && Object.keys(authoritativeTrace).length > 0
             ? { trace: authoritativeTrace }
             : { trace: undefined }),
+          // The dedupe key is device-scoped too: replaying a completion cached
+          // for the seed device under a route to the authoritative device would
+          // wrap another device's read result in this call's reply.
+          readDedupeKey: await buildReadDedupeKey(route.device_id),
           ...(route.execution_fence ? { executionFence: route.execution_fence } : { executionFence: undefined }),
         };
         forwarded = undefined;
