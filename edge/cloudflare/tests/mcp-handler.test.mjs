@@ -2322,3 +2322,115 @@ test("user dispatches an agent task from a caller-session-routed WebChat turn | 
     "another device's grant endpoint must never travel with the dispatch",
   );
 });
+
+// One caller predicate, three projections. `webchat_control_grants`,
+// `webchat_authorization` and `browser_caller_session` are derived from the same
+// `isAgentTaskCaller` gate, so a method can never receive caller provenance
+// without the device-scoped grants the runtime gate reads (or the reverse).
+const CALLER_PREDICATE_DEVICE = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const CALLER_PREDICATE_OTHER_DEVICE_ENDPOINT = `be_${"f".repeat(64)}`;
+const CALLER_PREDICATE_SESSION = "openai-session-caller-predicate-parity";
+
+function callerPredicateRequest(id, caller, session) {
+  if (caller.surface === "herdr_prompt") {
+    return req(id, "tools/call", {
+      name: "herdr_prompt",
+      _meta: { "openai/session": session },
+      arguments: {
+        device: CALLER_PREDICATE_DEVICE,
+        target: "pi",
+        text: "do durable child work",
+        idempotency_key: `edge-caller-predicate-${id}`,
+      },
+    });
+  }
+  return req(id, "tools/call", {
+    name: "herdr_call",
+    _meta: { "openai/session": session },
+    arguments: {
+      method: caller.method,
+      device: CALLER_PREDICATE_DEVICE,
+      params: JSON.stringify(caller.params),
+    },
+  });
+}
+
+test("user dispatches from an agent-task caller | Given WebChat and Page Assist grants on the routed device and a grant on another device | When herdr_mcp.agent.task.dispatch and herdr_prompt are forwarded | Then each carries the routed device's grants together with the caller authorization and session, and never the other device's endpoint", async () => {
+  const callers = [{
+    label: "agent task dispatch",
+    surface: "herdr_call",
+    method: "herdr_mcp.agent.task.dispatch",
+    params: {
+      target: "pi",
+      text: "do durable child work",
+      current_user_message: "hand this to the workstation",
+      idempotency_key: "edge-caller-predicate-dispatch",
+    },
+  }, {
+    label: "agent prompt",
+    surface: "herdr_prompt",
+  }];
+  for (const [index, caller] of callers.entries()) {
+    const d = pageScopedGrantDeps();
+    const res = await handleMcp(
+      callerPredicateRequest(`caller-predicate-${index}`, caller, CALLER_PREDICATE_SESSION),
+      "w1",
+      d.value,
+    );
+    assert.equal(res.body.result.isError, undefined, `${caller.label} forwards`);
+    assert.equal(d.calls.length, 1, `${caller.label} forwards exactly once`);
+    assert.deepEqual(d.calls[0].trace, {
+      webchat_control_grants: [{
+        endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        provider: "chatgpt",
+        account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }, {
+        endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        provider: "*",
+        account_ref: "*",
+      }],
+      webchat_authorization: {
+        principal_ref: "connector:conn_pagescopedgrant123",
+        connector_id: "conn_pagescopedgrant123",
+        grant_generation: 3,
+      },
+      browser_caller_session: {
+        provider: "chatgpt",
+        opaque_session_id: CALLER_PREDICATE_SESSION,
+      },
+    }, `${caller.label} carries the same caller predicate's grants and provenance`);
+    assert.equal(
+      JSON.stringify(d.calls[0].trace ?? {}).includes(CALLER_PREDICATE_OTHER_DEVICE_ENDPOINT),
+      false,
+      `${caller.label} must never carry another device's grant endpoint`,
+    );
+  }
+});
+
+test("user calls an ordinary tool from the same WebChat turn | Given WebChat and Page Assist grants on the routed device | When a non-agent-task, non-browser method is forwarded | Then no WebChat control grant and no caller authorization travel with it", async () => {
+  const d = pageScopedGrantDeps();
+  const res = await handleMcp(
+    req("caller-predicate-ordinary", "tools/call", {
+      name: "herdr_call",
+      _meta: { "openai/session": CALLER_PREDICATE_SESSION },
+      arguments: {
+        method: "pane.read",
+        device: CALLER_PREDICATE_DEVICE,
+        params: JSON.stringify({ pane_id: "w1:p1", source: "recent" }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined, "the ordinary tool still routes to the device it was told to");
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].args.method, "pane.read");
+  assert.equal(d.calls[0].trace, undefined, "an ordinary tool gets no caller projection at all");
+  assert.equal(d.calls[0].trace?.webchat_control_grants, undefined, "no WebChat control grant is forwarded");
+  assert.equal(d.calls[0].trace?.webchat_authorization, undefined, "no caller authorization is forwarded");
+  assert.equal(
+    JSON.stringify(d.calls[0]).includes(CALLER_PREDICATE_OTHER_DEVICE_ENDPOINT),
+    false,
+    "another device's grant endpoint must never travel with an ordinary tool",
+  );
+});
