@@ -1552,6 +1552,15 @@ test("browser and Page Assist private methods require explicit enrolled device s
   assert.equal(agentPrompt.body.result.isError, undefined);
   assert.equal(d.calls.length, 7, "agent prompt forwards once to the selected workstation");
   assert.deepEqual(d.calls[6].trace, {
+    webchat_control_grants: [{
+      endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      provider: "chatgpt",
+      account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }, {
+      endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      provider: "*",
+      account_ref: "*",
+    }],
     webchat_authorization: {
       principal_ref: "connector:conn_auditconnector123",
       connector_id: "conn_auditconnector123",
@@ -1561,7 +1570,7 @@ test("browser and Page Assist private methods require explicit enrolled device s
       provider: "chatgpt",
       opaque_session_id: "openai-session-anon-123",
     },
-  }, "agent prompt carries exact caller session provenance without WebChat control grants");
+  }, "agent prompt carries the same caller predicate's device-scoped grants plus exact caller session provenance");
 });
 
 
