@@ -1394,6 +1394,10 @@ export async function handleMcp(
       }
       for (const grant of deps.client?.pageAssistGrants ?? []) {
         if (grant.device_id !== deviceId) continue;
+        // A wildcard Page Assist endpoint must never derive a wildcard
+        // provider/account grant, which would widen it into device scope.
+        // Skip the row entirely; concrete endpoints still derive their grant.
+        if (grant.endpoint_ref === "*") continue;
         push({ endpoint_ref: grant.endpoint_ref, provider: "*", account_ref: "*" });
       }
       return projected;

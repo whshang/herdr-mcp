@@ -1865,6 +1865,16 @@ test("user has no grants | Given no Page Assist and no WebChat control grant | W
   assert.equal(grants, undefined);
 });
 
+test("user cannot derive device scope from a wildcard Page Assist endpoint | Given a wildcard Page Assist grant row for the routed device next to a concrete endpoint | When a WebChat dispatch method is forwarded | Then only the concrete endpoint derives a grant and no full-wildcard triplet appears", async () => {
+  const grants = await dispatchStatusTrace({
+    pageAssistGrants: [
+      { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: "*" },
+      { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: DERIVED_E },
+    ],
+  });
+  assert.deepEqual(grants, [{ endpoint_ref: DERIVED_E, provider: "*", account_ref: "*" }]);
+});
+
 test("user lists browser endpoints | Given a connector with Page Assist grants | When a non-page method is forwarded | Then no Page Assist grant is attached", async () => {
   const d = pageScopedGrantDeps();
   const res = await handleMcp(
