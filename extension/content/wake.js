@@ -5887,19 +5887,19 @@ function normalizeHerdrMentionAlias(value) {
       if (userChanged) {
         // ChatGPT virtualizes old turns while scrolling. A mounted user node
         // changing is not sufficient evidence by itself. Pair it with the fresh
-        // pending-submit anchor and the exact composer/extension text before
-        // persisting the user intent, so a failed Send click is never recorded
-        // as an accepted conversation turn.
+        // pending-submit anchor and exact composer/extension text before
+        // persisting the user intent. The accepted user message may already have
+        // finished generating before this watcher tick, so reply-pending is not
+        // part of the acceptance proof.
         const submitAt = syncPendingSubmitAnchor();
         const expectedUser = pendingUserTextHint();
         const comparableCurrentUser = normText(currentUserText);
-        const confirmedPendingUser = hasPendingReply()
-          && submitAt > 0
+        const confirmedPendingUser = submitAt > 0
           && Date.now() - submitAt <= 30000
           && expectedUser
           && (comparableCurrentUser.includes(expectedUser.slice(0, 160))
             || expectedUser.includes(comparableCurrentUser.slice(0, 160)));
-        const journalKey = `${submitAt}:${currentUserSignature}`;
+        const journalKey = `${submitAt}`;
         if (confirmedPendingUser && journalKey !== lastStartedJournalKey) {
           lastStartedJournalKey = journalKey;
           void sendBg({
