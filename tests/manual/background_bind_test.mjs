@@ -4416,6 +4416,9 @@ console.log("\n[Source-turn observe retry covers the fresh-conversation registra
   ok(attempts.every((attempt) => attempt.user_text === "确认当前用户回合"
       && attempt.observed_at === startedAt),
     "every retry replays the same trimmed text and original submit time");
+  ok(attempts.every((attempt) => attempt.endpoint_ref === "bep_test"),
+    "user records trusted endpoint provenance | Given the extension registered endpoint bep_test | When a source turn is observed | Then every attempt carries that endpoint_ref instead of a tab- or text-derived value",
+    JSON.stringify(attempts));
   await new Promise((resolve) => setTimeout(resolve, 3500));
   ok(observesFor(retryConv).length === 3,
     "the retry stops after the bounded schedule instead of polling",

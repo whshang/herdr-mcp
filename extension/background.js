@@ -12395,8 +12395,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "continuity-fields-incomplete" });
         return;
       }
+      // Provenance for the runtime's source-turn lookup is this extension's own
+      // registered endpoint, never the tab URL and never the message text. The
+      // runtime resolves the exact session only inside that endpoint's current
+      // provider generation, so a stale duplicate registration elsewhere can
+      // never capture the turn.
+      let endpointRef = "";
+      try {
+        endpointRef = String((await currentBrowserEndpoint())?.endpoint_ref || "").trim();
+      } catch (_) {}
+      if (!endpointRef) {
+        callLog("current source turn observe skipped: browser-endpoint-unavailable");
+        sendResponse({ ok: false, error: "browser-endpoint-unavailable" });
+        return;
+      }
       const observeSourceTurn = () => postBrowserRegistry({
         operation: "source_turn.observe",
+        endpoint_ref: endpointRef,
         canonical_url: convKey,
         user_text: userText,
         observed_at: msg?.startedAt || Date.now(),
@@ -12405,6 +12420,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await observeSourceTurn();
       } catch (error) {
         callLog("current source turn observe failed:", error?.message || String(error));
+        if (error?.message === "browser_canonical_url_ambiguous") {
+          // Observable, content-free diagnosis: the endpoint's current
+          // generation still has more than one session for this URL, so the
+          // runtime refused to guess. Only the typed code is logged.
+          callLog("current source turn observe ambiguous; caller session left unbound");
+        }
         if (error?.message === "browser_source_session_not_found") {
           // The first turn of a brand-new conversation can mount before the
           // 1s route poll registers the session for its canonical URL, so the

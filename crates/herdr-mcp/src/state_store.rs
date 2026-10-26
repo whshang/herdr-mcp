@@ -3527,6 +3527,83 @@ impl StateStore {
         }
     }
 
+    /// Resolves the browser session that one trusted-extension source turn
+    /// belongs to, scoped to the reporting endpoint.
+    ///
+    /// The extension posts `source_turn.observe` for the tab it is driving, and
+    /// that tab belongs to the endpoint the extension registered itself. The
+    /// endpoint reference is therefore the only provenance the Runtime can use
+    /// to tell a live registration apart from historical rows: the same
+    /// canonical URL legitimately exists under many sessions across endpoints,
+    /// accounts and earlier registration epochs, and none of those may be
+    /// selected by recency, by the largest generation, or by tab text.
+    ///
+    /// A session is in scope only when all of the following hold:
+    /// * it belongs to the reporting `endpoint_ref`,
+    /// * it is a `session` resource of the reporting provider,
+    /// * its locator canonical URL is the reported conversation URL,
+    /// * both its locator and resource generations equal that endpoint's
+    ///   current `browser_provider_state.observation_generation`.
+    ///
+    /// Zero in-scope sessions is `None` (the caller fails closed as
+    /// `browser_source_session_not_found`), and more than one in-scope session
+    /// stays `browser_canonical_url_ambiguous`. There is no cross-endpoint or
+    /// cross-generation fallback.
+    pub fn browser_current_generation_source_session_ref(
+        &self,
+        endpoint_ref: &str,
+        provider: &str,
+        canonical_url: &str,
+    ) -> Result<Option<String>, String> {
+        validate_browser_endpoint_ref(endpoint_ref)?;
+        validate_browser_token(provider, 32, "provider")?;
+        if canonical_url.is_empty()
+            || canonical_url.len() > 2048
+            || canonical_url != canonical_url.trim()
+            || canonical_url.chars().any(char::is_control)
+            || !canonical_url.starts_with("https://")
+        {
+            return Err("browser_canonical_url_invalid".to_owned());
+        }
+        let provider_state = self
+            .browser_provider_state(endpoint_ref, provider)?
+            .ok_or_else(|| "browser_capability_unknown".to_owned())?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.resource_ref
+                 FROM browser_resource_locators l
+                 JOIN browser_resources r ON r.resource_ref = l.resource_ref
+                 WHERE l.canonical_url = ?1
+                   AND r.kind = 'session'
+                   AND r.provider = ?2
+                   AND r.endpoint_ref = ?3
+                   AND l.observation_generation = ?4
+                   AND r.observation_generation = ?4
+                 GROUP BY r.resource_ref
+                 LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare browser source session lookup: {error}"))?;
+        let mut refs = stmt
+            .query_map(
+                params![
+                    canonical_url,
+                    provider,
+                    endpoint_ref,
+                    provider_state.observation_generation
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("cannot query browser source session lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser source session lookup: {error}"))?;
+        match refs.len() {
+            0 => Ok(None),
+            1 => Ok(Some(refs.remove(0))),
+            _ => Err("browser_canonical_url_ambiguous".to_owned()),
+        }
+    }
+
     /// Persist one fail-closed correlation between an opaque MCP caller session
     /// and an already-observed browser session. The caller session itself is
     /// never stored. A key already bound to another browser session is a

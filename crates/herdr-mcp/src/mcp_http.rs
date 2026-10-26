@@ -602,7 +602,11 @@ async fn post_extension_browser_registry(State(state): State<AppState>, body: By
         "provider.observe" => extension_browser_provider_observe(&state, &payload, observed_at),
         "resource.observe" => extension_browser_resource_observe(&state, &payload, observed_at),
         "source_turn.observe" => {
-            extension_browser_source_turn_observe(&state, &payload, observed_at)
+            let result = extension_browser_source_turn_observe(&state, &payload, observed_at);
+            if let Err(code) = &result {
+                log_browser_registry_rejection("source_turn.observe", code);
+            }
+            result
         }
         "archive.claim" => extension_browser_archive_claim(&state, &payload, observed_at),
         "archive.begin" => extension_browser_archive_begin(&state, &payload, observed_at),
@@ -1062,8 +1066,19 @@ fn extension_browser_source_turn_observe(
 ) -> Result<Value, String> {
     browser_registry_allow_fields(
         payload,
-        &["operation", "canonical_url", "user_text", "observed_at"],
+        &[
+            "operation",
+            "endpoint_ref",
+            "canonical_url",
+            "user_text",
+            "observed_at",
+        ],
     )?;
+    // The reporting endpoint is required provenance, never inferred from the
+    // conversation URL or the user text. It identifies which trusted extension
+    // registration observed this turn, which is the only way to distinguish the
+    // live session from historical rows sharing the same canonical URL.
+    let endpoint_ref = browser_registry_string(payload, "endpoint_ref", 128)?;
     let canonical_url = browser_registry_string(payload, "canonical_url", 2048)?;
     let user_text = browser_registry_string(payload, "user_text", MAX_BROWSER_RESULT_TEXT_BYTES)?;
     if !canonical_url.starts_with("https://chatgpt.com/") {
@@ -1075,7 +1090,7 @@ fn extension_browser_source_turn_observe(
         .lock()
         .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
     let session_ref = store
-        .browser_session_ref_for_canonical_url(canonical_url)?
+        .browser_current_generation_source_session_ref(endpoint_ref, "chatgpt", canonical_url)?
         .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
     let session = store
         .browser_resource(&session_ref)?
@@ -2471,6 +2486,31 @@ fn epoch_ms() -> u64 {
 
 /// Process-wide start timestamp of this runtime generation.
 static RUNTIME_STARTED_AT_MS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// Bounded diagnostics for rejected trusted-extension registry operations.
+///
+/// Only the stable operation label and the typed error code are logged: never
+/// the conversation URL, the user or assistant text, the resource refs, or any
+/// account/device identity carried in the same payload. A single line per
+/// operation per minute keeps a hostile or looping caller from turning a
+/// rejected observation into an unbounded log source.
+const BROWSER_REGISTRY_LOG_INTERVAL_MS: u64 = 60_000;
+static LAST_BROWSER_REGISTRY_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+fn log_browser_registry_rejection(operation: &'static str, code: &str) {
+    let now = epoch_ms();
+    let last = LAST_BROWSER_REGISTRY_LOG_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < BROWSER_REGISTRY_LOG_INTERVAL_MS {
+        return;
+    }
+    if LAST_BROWSER_REGISTRY_LOG_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    eprintln!("herdr-mcp: browser registry rejected operation={operation} code={code}");
+}
 
 fn runtime_started_at_ms() -> i64 {
     *RUNTIME_STARTED_AT_MS.get_or_init(|| i64::try_from(epoch_ms()).unwrap_or(i64::MAX))
@@ -3893,6 +3933,7 @@ mod tests {
 
         let source_turn = json!({
             "operation": "source_turn.observe",
+            "endpoint_ref": endpoint_ref,
             "canonical_url": "https://chatgpt.com/c/session-http-locator-1",
             "user_text": "归档当前对话",
             "observed_at": 1005
@@ -5931,6 +5972,7 @@ mod tests {
 
         let source_turn = json!({
             "operation": "source_turn.observe",
+            "endpoint_ref": endpoint_ref,
             "canonical_url": canonical_url,
             "user_text": user_text,
             "observed_at": observed_at
@@ -5946,6 +5988,434 @@ mod tests {
         assert_eq!(result["ok"], true);
         assert_eq!(result["session_ref"], session_ref);
         (app, session_ref)
+    }
+
+    /// Bumps one ChatGPT provider registration epoch on an already registered
+    /// endpoint, exactly as a fresh extension registration does.
+    async fn observe_chatgpt_provider_generation(
+        app: axum::Router,
+        profile_seed: &str,
+        endpoint_ref: &str,
+        observation_generation: i64,
+        observed_at: i64,
+    ) -> axum::Router {
+        let provider = json!({
+            "operation": "provider.observe",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "adapter_protocol_version": 1,
+            "observation_generation": observation_generation,
+            "capabilities": {"operations": ["identity.inspect", "space.list"]},
+            "observed_at": observed_at
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(provider))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        app
+    }
+
+    /// Observes one ChatGPT account + session for an exact canonical URL at an
+    /// already established provider generation.
+    async fn observe_chatgpt_generation_session(
+        app: axum::Router,
+        profile_seed: &str,
+        endpoint_ref: &str,
+        label: &str,
+        canonical_url: &str,
+        observation_generation: i64,
+        observed_at: i64,
+    ) -> (axum::Router, String, String) {
+        let account = json!({
+            "operation": "resource.observe",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "account",
+            "native_identity": format!("native-account-{label}"),
+            "display_label": format!("account-{label}"),
+            "observation_generation": observation_generation,
+            "observed_at": observed_at
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(account))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        let account_ref = result["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let session = json!({
+            "operation": "resource.observe",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "session",
+            "parent_ref": account_ref,
+            "native_identity": format!("generation-session-{label}"),
+            "display_label": null,
+            "canonical_url": canonical_url,
+            "observation_generation": observation_generation,
+            "observed_at": observed_at
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        let session_ref = result["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        (app, account_ref, session_ref)
+    }
+
+    fn browser_registry_test_state(root: &std::path::Path) -> AppState {
+        let mut state = test_state(root);
+        state.trusted_extension_ipc = true;
+        state.local_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned());
+        state
+    }
+
+    #[tokio::test]
+    async fn source_turn_observe_uses_the_reporting_endpoint_current_generation() {
+        let root = test_root("source-turn-endpoint-generation");
+        let state = browser_registry_test_state(&root);
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let canonical_url = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/6adafccc-88a4-83e9-9917-968bae77e514";
+        let (app, profile_seed, endpoint_ref, _account_ref) =
+            register_chatgpt_endpoint(app, "endpoint-generation", now).await;
+        let (app, _old_account, historical_session) = observe_chatgpt_generation_session(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            "historical",
+            canonical_url,
+            1,
+            now,
+        )
+        .await;
+        let app =
+            observe_chatgpt_provider_generation(app, &profile_seed, &endpoint_ref, 2, now + 1)
+                .await;
+        let (app, _new_account, current_session) = observe_chatgpt_generation_session(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            "current",
+            canonical_url,
+            2,
+            now + 2,
+        )
+        .await;
+        assert_ne!(historical_session, current_session);
+
+        let user_text = "归档当前对话";
+        let source_turn = json!({
+            "operation": "source_turn.observe",
+            "endpoint_ref": endpoint_ref,
+            "canonical_url": canonical_url,
+            "user_text": user_text,
+            "observed_at": now + 3
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(source_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["session_ref"], current_session.as_str());
+        assert_eq!(result["expected_generation"], 2);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&mcp::browser_sha256(user_text), now + 4)
+                .unwrap()
+                .0,
+            current_session
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn source_turn_observe_never_crosses_endpoints_that_hold_a_newer_generation() {
+        let root = test_root("source-turn-cross-endpoint");
+        let state = browser_registry_test_state(&root);
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let canonical_url = "https://chatgpt.com/c/6ab0118a-c3f8-83e9-a4a4-054b81cc5f71";
+        // The reporting endpoint observed the conversation once, and is current
+        // for it.
+        let (app, reporting_seed, reporting_endpoint, _reporting_account) =
+            register_chatgpt_endpoint(app, "cross-reporting", now).await;
+        let (app, _reporting_owner, reporting_session) = observe_chatgpt_generation_session(
+            app,
+            &reporting_seed,
+            &reporting_endpoint,
+            "reporting",
+            canonical_url,
+            1,
+            now,
+        )
+        .await;
+        // A different endpoint reports a strictly newer generation for the same
+        // canonical URL. A larger foreign generation must never win.
+        let (app, other_seed, other_endpoint, _other_account) =
+            register_chatgpt_endpoint(app, "cross-other", now + 1).await;
+        let app =
+            observe_chatgpt_provider_generation(app, &other_seed, &other_endpoint, 2, now + 2)
+                .await;
+        let (app, _other_owner, other_session) = observe_chatgpt_generation_session(
+            app,
+            &other_seed,
+            &other_endpoint,
+            "other",
+            canonical_url,
+            2,
+            now + 3,
+        )
+        .await;
+        assert_ne!(reporting_session, other_session);
+
+        let user_text = "归档当前对话";
+        let source_turn = json!({
+            "operation": "source_turn.observe",
+            "endpoint_ref": reporting_endpoint,
+            "canonical_url": canonical_url,
+            "user_text": user_text,
+            "observed_at": now + 4
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(source_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["session_ref"], reporting_session.as_str());
+        assert_ne!(result["session_ref"], other_session.as_str());
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&mcp::browser_sha256(user_text), now + 5)
+                .unwrap()
+                .0,
+            reporting_session
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn source_turn_observe_fails_closed_without_a_current_generation_session_in_scope() {
+        let root = test_root("source-turn-no-current-generation");
+        let state = browser_registry_test_state(&root);
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let canonical_url = "https://chatgpt.com/c/6ab3b127-b110-83ea-ba81-3ae1513612f3";
+        // The reporting endpoint re-registered without re-observing this
+        // conversation, so its historical session is no longer current.
+        let (app, reporting_seed, reporting_endpoint, _reporting_account) =
+            register_chatgpt_endpoint(app, "stale-reporting", now).await;
+        let (app, _reporting_owner, stale_session) = observe_chatgpt_generation_session(
+            app,
+            &reporting_seed,
+            &reporting_endpoint,
+            "stale-reporting",
+            canonical_url,
+            1,
+            now,
+        )
+        .await;
+        let app = observe_chatgpt_provider_generation(
+            app,
+            &reporting_seed,
+            &reporting_endpoint,
+            2,
+            now + 1,
+        )
+        .await;
+        // Another endpoint holds the newest observation of the same URL.
+        let (app, other_seed, other_endpoint, _other_account) =
+            register_chatgpt_endpoint(app, "stale-other", now + 2).await;
+        let app =
+            observe_chatgpt_provider_generation(app, &other_seed, &other_endpoint, 2, now + 3)
+                .await;
+        let (app, _other_owner, other_session) = observe_chatgpt_generation_session(
+            app,
+            &other_seed,
+            &other_endpoint,
+            "stale-other",
+            canonical_url,
+            2,
+            now + 4,
+        )
+        .await;
+        assert_ne!(stale_session, other_session);
+
+        let user_text = "归档当前对话";
+        let source_turn = json!({
+            "operation": "source_turn.observe",
+            "endpoint_ref": reporting_endpoint,
+            "canonical_url": canonical_url,
+            "user_text": user_text,
+            "observed_at": now + 5
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(source_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "browser_source_session_not_found");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&mcp::browser_sha256(user_text), now + 6),
+            Err("browser_current_turn_not_found".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn source_turn_observe_requires_endpoint_provenance() {
+        let root = test_root("source-turn-endpoint-required");
+        let state = browser_registry_test_state(&root);
+        let app = candidate_router(state);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let canonical_url = "https://chatgpt.com/c/6ad727a4-0a88-83ec-89be-b1ee908ba151";
+        let (app, profile_seed, endpoint_ref, _account_ref) =
+            register_chatgpt_endpoint(app, "endpoint-required", now).await;
+        let (app, _owner, session_ref) = observe_chatgpt_generation_session(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            "endpoint-required",
+            canonical_url,
+            1,
+            now,
+        )
+        .await;
+        assert!(!session_ref.is_empty());
+        let source_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": canonical_url,
+            "user_text": "归档当前对话",
+            "observed_at": now + 1
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(source_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "browser_endpoint_ref_required");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn source_turn_observe_stays_ambiguous_inside_one_endpoint_scope() {
+        let root = test_root("source-turn-scope-tie");
+        let state = browser_registry_test_state(&root);
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let canonical_url = "https://chatgpt.com/c/6ab0118a-c3f8-83e9-a4a4-054b81cc5f71";
+        let (app, profile_seed, endpoint_ref, _account_ref) =
+            register_chatgpt_endpoint(app, "scope-tie", now).await;
+        let app =
+            observe_chatgpt_provider_generation(app, &profile_seed, &endpoint_ref, 2, now + 1)
+                .await;
+        // Two accounts on the reporting endpoint observe the same conversation
+        // inside the same registration generation, so neither supersedes the
+        // other.
+        let (app, _first_account, first_session) = observe_chatgpt_generation_session(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            "scope-tie-a",
+            canonical_url,
+            2,
+            now + 2,
+        )
+        .await;
+        let (app, _second_account, second_session) = observe_chatgpt_generation_session(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            "scope-tie-b",
+            canonical_url,
+            2,
+            now + 3,
+        )
+        .await;
+        assert_ne!(first_session, second_session);
+
+        let user_text = "归档当前对话";
+        let source_turn = json!({
+            "operation": "source_turn.observe",
+            "endpoint_ref": endpoint_ref,
+            "canonical_url": canonical_url,
+            "user_text": user_text,
+            "observed_at": now + 4
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(source_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "browser_canonical_url_ambiguous");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&mcp::browser_sha256(user_text), now + 5),
+            Err("browser_current_turn_not_found".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     async fn webchat_tool_call(
