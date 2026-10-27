@@ -83,11 +83,15 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   async getAccountNativeIdentity(timeoutMs = 1500) {
-    if (Date.now() < (this._accountIdentity429Until || 0)) return null;
-    return (await this.getAccountObservation(timeoutMs)).nativeIdentity;
+    return (await this.getAccountObservation(timeoutMs))?.nativeIdentity ?? null;
   }
 
   async getAccountObservation(timeoutMs = 1500) {
+    // The cooldown lives on the shared observation entrypoint so every caller
+    // (identity probes and registration observations alike) is gated by it.
+    if (Date.now() < (this._accountIdentity429Until || 0)) {
+      return { nativeIdentity: null, email: null };
+    }
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -100,8 +104,11 @@ class ChatGPTAdapter extends BaseAdapter {
           signal: controller.signal,
         });
         if (response.status === 429) {
+          // A throttled probe stops here: the cooldown covers both
+          // authenticated endpoints. The neutral observation keeps the
+          // `{nativeIdentity, email}` contract every caller reads.
           this.noteAccountIdentity429(response);
-          return null;
+          return { nativeIdentity: null, email: null };
         }
         if (!response.ok) continue;
         this._accountIdentity429Count = 0;
