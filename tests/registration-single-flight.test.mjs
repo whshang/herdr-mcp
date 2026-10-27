@@ -42,7 +42,7 @@ async function flush(turns = 12) {
   for (let i = 0; i < turns; i += 1) await Promise.resolve();
 }
 
-function registrationHarness(initialConvKey = KEY_A) {
+function registrationHarness(initialConvKey = KEY_A, { site = "claude", projectSequence = null } = {}) {
   const sends = [];
   let resolveAccount;
   let resolveCatalog;
@@ -63,7 +63,7 @@ function registrationHarness(initialConvKey = KEY_A) {
     let browserRegistrationAttempt = 0;
     const pending = sends;
     const ADAPTER = {
-      name: "claude",
+      name: ${JSON.stringify(site)},
       getConversationKey: () => currentConvKey,
       resolveProjectIdentity: async () => null,
     };
@@ -71,7 +71,14 @@ function registrationHarness(initialConvKey = KEY_A) {
     const runtimeAlive = () => true;
     const browserAccountNativeIdentity = () => accountBox.promise.then((value) => value);
     const chatGptProjectCatalog = () => catalogBox.promise.then((projects) => projects);
-    const currentChatGptProjectFromCatalog = () => null;
+    const projectSequence = ${JSON.stringify(projectSequence)};
+    let projectCalls = 0;
+    const currentChatGptProjectFromCatalog = () => {
+      if (!projectSequence) return null;
+      const value = projectSequence[Math.min(projectCalls, projectSequence.length - 1)];
+      projectCalls += 1;
+      return value;
+    };
     const sendBg = async (payload) => new Promise((resolve) => pending.push({ payload, resolve }));
     const ensureConversationHealth = async () => {};
     const chatGptConversationId = () => null;
@@ -98,6 +105,7 @@ function registrationHarness(initialConvKey = KEY_A) {
     return {
       register: registerCurrentConversation,
       setRoute(value) { currentConvKey = value; currentUrl = value; },
+      status() { return lastBrowserRegistrationStatus; },
       state() {
         return {
           convKey: registeredConvKey,
@@ -114,6 +122,7 @@ function registrationHarness(initialConvKey = KEY_A) {
     register: (reason, options) => api.register(reason, options),
     setRoute: (value) => api.setRoute(value),
     state: () => api.state(),
+    status: () => api.status(),
     sends,
     // Resolve the stalled pre-registration work and make later runs flow.
     releaseAccount(identity = "opaque-account") {
@@ -259,7 +268,7 @@ test("user gets exactly one registration per conversation | Given slow pre-regis
   });
 });
 
-test("user cannot register a stale account | Given an account switch during project discovery | When registration is about to publish | Then no old-account identity is sent", async () => {
+test("user cannot register a stale account | Given an account switch during project discovery | When registration is about to publish | Then no old-account identity is sent and the stale tab scope is cleared", async () => {
   const harness = registrationHarness(KEY_A);
   const registration = harness.register("startup");
   harness.releaseAccount("account-one");
@@ -268,7 +277,37 @@ test("user cannot register a stale account | Given an account switch during proj
   harness.releaseCatalog();
   const result = await registration;
   assert.equal(result, null);
-  assert.equal(harness.sends.length, 0, "the old account must never reach h2w_register");
+  assert.deepEqual(harness.sends.map((send) => send.payload.type), ["h2w_clear_scope"],
+    "the old account must never reach h2w_register and the stale scope must be dropped");
+  assert.equal(harness.status(), "account_changed", "the refusal reason stays a fixed enum");
+});
+
+test("user cannot register a switched project | Given the conversation's project changes during discovery | When registration is about to publish | Then no registration is sent and the stale tab scope is cleared", async () => {
+  const harness = registrationHarness(KEY_A, {
+    site: "chatgpt",
+    projectSequence: [{ id: "g-p-expected", name: "Expected" }, { id: "g-p-other", name: "Other" }],
+  });
+  const registration = harness.register("startup");
+  harness.releaseAccount("opaque-account");
+  await flush();
+  harness.releaseCatalog();
+  const result = await registration;
+  assert.equal(result, null);
+  assert.deepEqual(harness.sends.map((send) => send.payload.type), ["h2w_clear_scope"],
+    "a project change must refuse registration and drop the stale tab scope");
+  assert.equal(harness.status(), "project_changed", "the refusal reason stays a fixed enum");
+});
+
+test("user clears a scope it cannot re-verify | Given a ChatGPT tab without an authenticated identity | When registration runs | Then nothing is published and the tab scope is cleared", async () => {
+  const harness = registrationHarness(KEY_A, { site: "chatgpt" });
+  const registration = harness.register("startup");
+  harness.releaseAccount(null);
+  await flush();
+  const result = await registration;
+  assert.equal(result, null);
+  assert.deepEqual(harness.sends.map((send) => send.payload.type), ["h2w_clear_scope"],
+    "an unauthenticated ChatGPT tab must not keep its scope");
+  assert.equal(harness.status(), "identity_unavailable");
 });
 
 test("user refreshes registration observation without cancelling the in-flight run | Given one slow in-flight registration | When an identity-recovery handshake requests refreshObservation | Then the in-flight run still lands and a fresh registration follows it", async () => {

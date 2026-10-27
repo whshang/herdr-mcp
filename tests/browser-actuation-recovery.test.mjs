@@ -4237,6 +4237,16 @@ test("user learns safe registration failures | Given a create scope handshake af
   assert.match(createSegment, /identityProbeResponded = true/);
   assert.match(createSegment, /message_submitted:\s*false/);
   assert.doesNotMatch(createSegment, /registration_status:\s*(?:accountRefCreate|accountNativeIdentity)/);
+  // A fenced refusal and a throttled identity probe are first-class enum states:
+  // the content script names them and the background must let them through.
+  assert.match(wakeSource, /"account_changed"/);
+  assert.match(wakeSource, /"project_changed"/);
+  assert.match(wakeSource, /authenticated_rate_limited: "identity_rate_limited"/);
+  assert.match(createSegment, /"account_changed", "project_changed", "identity_rate_limited"/);
+  // Every refusal path drops the stale tab scope through the clear message.
+  assert.match(wakeSource, /function clearBrowserRegistrationScope\(\)/);
+  assert.match(wakeSource, /void sendBg\(\{ type: "h2w_clear_scope" \}\)/);
+  assert.match(backgroundSource, /if \(msg\?\.type === "h2w_clear_scope"\)/);
 });
 
 test("ChatGPT session.create carries one durable reservation across the new-conversation route", () => {
