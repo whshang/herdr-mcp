@@ -2289,8 +2289,8 @@ function archiveCleanupHarness({
   };
 }
 
-function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") {
-  return new Function(`
+function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", { provider = "claude", routeAuthorized = true, messageIdAvailable = true } = {}) {
+  return new Function("provider", "routeAuthorized", "messageIdAvailable", `
     let currentConvKey = ${JSON.stringify(initialConvKey)};
     let currentUrl = currentConvKey;
     let registeredConvKey = currentConvKey;
@@ -2299,7 +2299,7 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     let browserRegistrationAttempt = 0;
     const pending = [];
     const ADAPTER = {
-      name: "claude",
+      name: provider,
       getConversationKey: () => currentConvKey,
       resolveProjectIdentity: () => null,
     };
@@ -2310,7 +2310,12 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     const currentChatGptProjectFromCatalog = () => null;
     const sendBg = async (payload) => new Promise((resolve) => pending.push({ payload, resolve }));
     const ensureConversationHealth = async () => {};
-    const chatGptConversationId = () => null;
+    const chatGptConversationId = () => provider === "chatgpt" ? "6ad1c73f-a03c-83ea-a661-27a64edee2a0" : null;
+    const registrationReadbackTimeouts = [];
+    const fetchChatGptConversationSnapshot = async (timeoutMs = 6000) => {
+      registrationReadbackTimeouts.push(timeoutMs);
+      return { ok: routeAuthorized, userMessageId: messageIdAvailable ? "prior-user-message" : null };
+    };
     const refreshQueuedInsertStatus = () => {};
     const backfillCurrentChatGptContinuity = () => {};
     const restoreBrowserResultAssignment = () => {};
@@ -2325,6 +2330,7 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     return {
       register: registerCurrentConversation,
       pending,
+      registrationReadbackTimeouts,
       setRoute(value) { currentConvKey = value; currentUrl = value; },
       state() {
         return {
@@ -2335,7 +2341,7 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
         };
       },
     };
-  `)();
+  `)(provider, routeAuthorized, messageIdAvailable);
 }
 
 async function flushRegistrationToSend(harness) {
@@ -2876,6 +2882,33 @@ test("user keeps provider-specific Project resolution inside the adapter | Given
   assert.doesNotMatch(projectIdentitySource, /ADAPTER\.name/);
 });
 
+test("user rejects a stale other-account ChatGPT conversation | Given a previous account's tab whose conversation is unreadable in the current provider session | When Browser Registry registration runs | Then nothing is registered and a real provider user-message ID is required", async () => {
+  const url = "https://chatgpt.com/g/g-p-6ab246bef27c81918744ac4fc330dac2/c/6ab474db-ced0-83ec-9a37-cd6b4e183d96";
+  const denied = registrationHarness(url, { provider: "chatgpt", routeAuthorized: false });
+  const deniedAttempt = denied.register("account-switched");
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  assert.equal(denied.pending.length, 0, "unreadable previous-account conversation must never be registered");
+  assert.equal(await deniedAttempt, null);
+
+  const empty = registrationHarness(url, { provider: "chatgpt", routeAuthorized: true, messageIdAvailable: false });
+  const emptyAttempt = empty.register("empty-provider-snapshot");
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const emptyPublished = empty.pending.length;
+  for (const pending of empty.pending) pending.resolve(null);
+  await emptyAttempt;
+  assert.equal(emptyPublished, 0, "HTTP success without a real user-message ID cannot associate another account's conversation");
+
+  const valid = registrationHarness(url, { provider: "chatgpt", routeAuthorized: true });
+  const started = valid.register("current-account");
+  await flushRegistrationToSend(valid);
+  assert.equal(valid.pending.length, 1);
+  assert.deepEqual(valid.registrationReadbackTimeouts, [6000],
+    "account validation should use the existing bounded provider readback budget");
+  valid.pending[0].resolve({ browser_session_ref: "br_verified", browser_generation: 9, bound: true });
+  await started;
+  assert.equal(valid.state().sessionRef, "br_verified");
+});
+
 test("conversation registration fences route changes before and after async background registration", () => {
   const send = registrationSource.indexOf("const response = await sendBg({");
   const fences = [...registrationSource.matchAll(/registrationAttempt !== browserRegistrationAttempt \|\| ADAPTER\.getConversationKey\(\) !== convKey/g)].map((match) => match.index);
@@ -2949,7 +2982,10 @@ test("user Given unavailable browser actuation When the content script rejects i
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart, "browser evidence helpers must remain extractable");
   assert.ok(commandStart >= 0 && commandEnd > commandStart, "browser actuation command must remain extractable");
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
 
   function makeActuator(ctx = {}) {
     return new Function("ctx", `
@@ -3062,7 +3098,10 @@ test("user can stop a live answer | Given an explicit visible stop control while
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
   const ctx = { clicked: false };
   const act = new Function("ctx", `
     const stopButton = {
@@ -3179,12 +3218,20 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
   const ctx = {
     snapshotTimeouts: [],
     wakeArgs: [],
     reservationWrites: [],
     reservationRemovals: 0,
+    now: 0,
+    delivered: false,
+    submitted: false,
+    serverAssistantProgressOnly: false,
+    baselineAvailable: true,
   };
 
   const act = new Function("ctx", `
@@ -3214,19 +3261,31 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     const currentHerdrRequiredApps = () => ["herdr"];
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
-    const isTurnInProgress = () => false;
+    const isTurnInProgress = () => ctx.delivered && ctx.submitted && !ctx.serverAssistantProgressOnly;
     const runtimeAlive = () => true;
-    const wait = async () => {};
+    const Date = { now: () => ctx.now };
+    const wait = async () => { ctx.now += 1000; };
     const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
     const fetchChatGptConversationSnapshot = async (timeoutMs) => {
       ctx.snapshotTimeouts.push(timeoutMs);
-      return { ok: false };
+      return ctx.delivered
+        ? (ctx.submitted
+          ? { ok: true, userMessageId: "new-user-message", userText: "next turn", messageId: "new-assistant" }
+          : { ok: true, userMessageId: "prior-user-message", userText: "prior turn", messageId: "prior-assistant" })
+        : (ctx.baselineAvailable
+          ? { ok: true, userMessageId: "prior-user-message", userText: "prior turn", messageId: "prior-assistant" }
+          : { ok: false });
     };
     const performWake = async (args) => {
       ctx.wakeArgs.push(args);
+      ctx.submitted = true;
       return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
     };
     const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
+    const exactDomAcceptedUserMessageRef = () => null;
+    const providerUserTextMatchesSubmitted = (value, baseline) => value === baseline.messageText;
+    const providerAcceptanceDigests = async () => ({ accepted_user_text_sha256: "a".repeat(64) });
+    const acceptedDispatchAssignments = new Map();
     ${evidenceSource}
     ${commandSource}
     return performBrowserActuationCommand;
@@ -3239,7 +3298,9 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   });
 
   assert.equal(ctx.wakeArgs[0].browserActuation, true);
-  assert.deepEqual(ctx.snapshotTimeouts, [1200]);
+  assert.ok(ctx.snapshotTimeouts.length > 1, "unconfirmed submit continues bounded readback");
+  assert.ok(ctx.snapshotTimeouts.every((ms) => ms === 3000), "dispatch allows bounded provider readback latency");
+  const firstReadbacks = ctx.snapshotTimeouts.length;
   assert.equal(result.command_accepted, true);
   assert.equal(result.rejected, false);
   assert.equal(result.accepted_message_observed, false);
@@ -3257,12 +3318,85 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   });
 
   assert.equal(ctx.wakeArgs[1].browserActuation, true);
-  assert.deepEqual(ctx.snapshotTimeouts, [1200, 1200]);
+  assert.ok(ctx.snapshotTimeouts.length > firstReadbacks + 1, "unconfirmed create also continues bounded readback");
+  assert.ok(ctx.snapshotTimeouts.slice(firstReadbacks).every((ms) => ms === 1200));
   assert.equal(create.command_accepted, true);
   assert.equal(create.rejected, false);
   assert.equal(create.stable_resource_ref_observed, false);
   assert.deepEqual(ctx.reservationWrites, [["herdrBrowserSessionReservationV1", reservationRef]]);
   assert.equal(ctx.reservationRemovals, 0);
+
+  ctx.delivered = true;
+  ctx.submitted = false;
+  ctx.serverAssistantProgressOnly = true;
+  const late = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    params: { message: "next turn", required_apps: [] },
+  });
+  assert.equal(late.command_accepted, true);
+  assert.equal(late.accepted_message_observed, true, "exact provider ref upgrades late acceptance");
+  assert.equal(late.result?.accepted_user_message_ref, "new-user-message");
+  assert.equal(late.generation_status_observed, true, "exact new provider assistant ID proves generation progress");
+  assert.equal(late.generation_owner, 17);
+  assert.equal(ctx.wakeArgs.length, 3, "each simulated intent invokes one provider submit only");
+
+  ctx.delivered = false;
+  ctx.submitted = false;
+  ctx.baselineAvailable = false;
+  const priorSends = ctx.wakeArgs.length;
+  const noBaseline = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    params: { message: "next turn", required_apps: [] },
+  });
+  assert.equal(noBaseline.rejected, true, "unreadable provider baseline must refuse the mutation");
+  assert.equal(noBaseline.result?.error, "browser_dispatch_baseline_unavailable");
+  assert.equal(ctx.wakeArgs.length, priorSends, "unreadable provider baseline must never submit");
+});
+
+test("user preserves late browser dispatch evidence | Given content completes after the broker initial wait | When the same fenced content message resolves | Then Dispatch waits within late-completion TTL without any second send", async () => {
+  const timeoutMatch = backgroundSource.match(/const BROWSER_DISPATCH_CONTENT_TIMEOUT_MS = ([0-9_]+);/);
+  assert.ok(timeoutMatch, "dispatch needs a dedicated bounded content-response timeout");
+  const timeoutMs = Number(timeoutMatch[1].replace(/_/g, ""));
+  assert.ok(timeoutMs > 22000 && timeoutMs <= 45000, "allow proof after the 22s broker wait but before 60s late TTL");
+  const start = backgroundSource.indexOf("async function sendBrowserActuationTabMessage(");
+  const end = backgroundSource.indexOf("\nasync function handoffMessageWithRequiredApps(", start);
+  assert.ok(start >= 0 && end > start);
+  const calls = [];
+  const func = new Function("sendTabMessageWithTimeout", "BROWSER_DISPATCH_CONTENT_TIMEOUT_MS",
+    backgroundSource.slice(start, end) + "\nreturn sendBrowserActuationTabMessage;")(
+    async (_tabId, command, timeout) => {
+      calls.push({ op: command.command.operation, timeout });
+      // A simulated 25s single physical response must not be abandoned.
+      return timeout >= 25000 ? { evidence: { accepted_message_observed: true } } : { evidence: null };
+    },
+    timeoutMs,
+  );
+  const accepted = await func(9, { command: { operation: "herdr_mcp.browser_dispatch.submit" } });
+  assert.equal(accepted?.evidence?.accepted_message_observed, true);
+  assert.equal(calls.length, 1, "never replay a sent command");
+  assert.equal(calls[0].timeout, timeoutMs);
+  await func(9, { command: { operation: "herdr_mcp.browser_session.archive" } });
+  assert.equal(calls[1].timeout, 18000, "non-Dispatch operations retain their previous bound");
+});
+
+test("user can classify an unavailable Provider dispatch baseline | Given authenticated readback or user-ID failures | When the bounded pre-submit baseline rejects | Then the error is an enum and there is no second submit", () => {
+  const start = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  const end = wakeSource.indexOf("  async function performBrowserActuationCommand(", start);
+  assert.ok(start >= 0 && end > start);
+  const classify = new Function(wakeSource.slice(start, end) + "\nreturn chatGptDispatchBaselineRejectionReason;")();
+  assert.equal(classify({ ok: false, reason: "http-429" }), "browser_dispatch_baseline_http429");
+  assert.equal(classify({ ok: false, reason: "timeout" }), "browser_dispatch_baseline_timeout");
+  assert.equal(classify({ ok: false, reason: "auth" }), "browser_dispatch_baseline_auth");
+  assert.equal(classify({ ok: false, reason: "http-403" }), "browser_dispatch_baseline_forbidden");
+  assert.equal(classify({ ok: false, reason: "http-404" }), "browser_dispatch_baseline_not_found");
+  assert.equal(classify({ ok: false, reason: "fetch-failed" }), "browser_dispatch_baseline_network");
+  assert.equal(classify({ ok: false, reason: "http-500" }), "browser_dispatch_baseline_server");
+  assert.equal(classify({ ok: true, userMessageId: null }), "browser_dispatch_baseline_user_id_missing");
+  assert.equal(classify({ ok: false, reason: "some-untrusted-text" }), "browser_dispatch_baseline_unavailable");
+  const command = wakeSource.slice(end, wakeSource.indexOf("  async function reportBrowserResultSettlement(", end));
+  assert.match(command, /return browserRejectedEvidence\(evidence, chatGptDispatchBaselineRejectionReason\(beforeServer\)\)/);
 });
 
 test("user waits through transient fresh ChatGPT composer busy without a second submit | Given the new Project tab is scoped but still hydrating | When composer readiness changes from busy to idle | Then the same actuation submits once and keeps its reservation", async () => {
@@ -3273,11 +3407,15 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
   const ctx = {
     busyChecks: 0,
     busySequence: [true, true, false, true, false, false, false, true],
     waits: 0,
+    now: 0,
     wakeCalls: 0,
     reservationRemovals: 0,
   };
@@ -3315,7 +3453,8 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
       return value;
     };
     const runtimeAlive = () => true;
-    const wait = async () => { ctx.waits += 1; };
+    const Date = { now: () => ctx.now };
+    const wait = async () => { ctx.waits += 1; ctx.now += 1000; };
     const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
     const fetchChatGptConversationSnapshot = async () => ({ ok: false });
     const performWake = async () => {
@@ -3323,6 +3462,7 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
       return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
     };
     const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
+    const exactDomAcceptedUserMessageRef = () => null;
     ${evidenceSource}
     ${commandSource}
     return performBrowserActuationCommand;
@@ -3354,7 +3494,10 @@ test("user receives exact content rejection reasons | Given browser controls rej
   assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
 
   function makeActuator(ctx = {}) {
     return new Function("ctx", `
@@ -5347,7 +5490,10 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
   assert.ok(helperStart >= 0 && helperEnd > helperStart, "exact acceptance helpers must remain extractable");
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
   const helperSource = wakeSource.slice(helperStart, helperEnd);
-  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  assert.ok(baselineHelperStart >= 0 && baselineHelperStart < commandStart,
+    "the baseline enum classifier must accompany the isolated command");
+  const commandSource = wakeSource.slice(baselineHelperStart, commandEnd);
   return new Function("ctx", `
     const crypto = ctx.crypto;
     const ADAPTER = {
@@ -5416,7 +5562,32 @@ function browserSubmitAcceptanceHarness(ctx = {}) {
   `)({ crypto: webcrypto, ...ctx });
 }
 
-test("user dispatch stays uncertain | Given the before snapshot fails and the latest user id is unchanged | When dispatch.submit acknowledges | Then the previous user message is not recorded", async () => {
+test("user can service nested submit requests | Given one Dispatch with a pending content response | When the browser actuation push event arrives | Then the shared push handler releases without waiting for content", async () => {
+  const start = backgroundSource.indexOf("async function handlePushBlock(");
+  const end = backgroundSource.indexOf('  if (event === "hello")', start);
+  assert.ok(start >= 0 && end > start);
+  let releaseContent;
+  const content = new Promise((resolve) => { releaseContent = resolve; });
+  let evidencePosted = false;
+  const handler = new Function("handleBrowserActuation", "callLog",
+    backgroundSource.slice(start, end) + "\n}\nreturn handlePushBlock;")(
+    async () => { await content; evidencePosted = true; },
+    () => {},
+  );
+  const pushEvent = 'event: browser_actuation\ndata: {"operation":"herdr_mcp.browser_dispatch.submit"}';
+  const processing = handler(pushEvent);
+  let pushReleased = false;
+  void processing.then(() => { pushReleased = true; });
+  for (let i = 0; i < 6; i += 1) await Promise.resolve();
+  const releasedBeforeContent = pushReleased;
+  releaseContent();
+  await processing;
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  assert.equal(releasedBeforeContent, true, "Dispatch must not starve nested service-worker requests");
+  assert.equal(evidencePosted, true, "the original attempt still completes exactly once");
+});
+
+test("user refuses dispatch before mutation | Given the provider user-message baseline is unreadable | When dispatch.submit starts | Then no provider mutation is attempted and the refusal is a fixed enum", async () => {
   const act = browserSubmitAcceptanceHarness({
     currentConvKey: "https://chatgpt.com/c/current",
     snapshots: [{ ok: false }, { ok: false }],
@@ -5431,11 +5602,11 @@ test("user dispatch stays uncertain | Given the before snapshot fails and the la
     params: { message: "next turn", required_apps: [] },
   });
 
-  assert.equal(result.command_accepted, true);
+  assert.equal(result.command_accepted, false);
+  assert.equal(result.rejected, true);
   assert.equal(result.accepted_message_observed, false);
-  assert.equal(result.message_baseline_advanced, false);
   assert.equal(result.generation_owner, null);
-  assert.equal(result.result, undefined, "no provider identity may be recorded without a before snapshot or an exact new turn");
+  assert.equal(result.result?.error, "browser_dispatch_baseline_unavailable");
 });
 
 test("user dispatch does not adopt a short overlapping turn | Given a submitted prompt that contains 'ok' | When a new user turn is only 'ok' | Then delivery stays uncertain and no accepted user message is recorded", async () => {

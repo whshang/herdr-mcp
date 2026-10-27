@@ -164,9 +164,15 @@ herdr_call(
 herdr-mcp connector approve <approval-request-id>
 herdr-mcp connector list
 herdr-mcp connector revoke <connector-id> --confirm
+herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> --clear
+herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
+herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm
 ```
 
 承認コマンドは 6 桁のコードを対話的に読み取ります。そのコードを argv や shell history に置かないでください。enrollment 済みのデバイスは等価な Worker 管理チャネルであり、owner/member のデバイス階層はありません。
+
+`connector label`、`allow-device`、`deny-device` にはそれぞれのルートを実装した Edge が必要で、その Edge は別途配布されます。未対応の Edge では `connector_label_requires_edge_support` または `device_grant_requires_edge_support` で失敗し、何も書き込みません。
 
 GitLab CI のような無人呼び出し元は、独立に revoke できる Automation Client を使用します:
 

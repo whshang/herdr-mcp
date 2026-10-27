@@ -266,11 +266,17 @@ ok(backgroundSource.includes("SUPPORTED_SITE_PERMISSION_PATTERNS")
 const browserActuationSendSource = backgroundSource.match(
   /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
 )?.[0] || "";
-ok(browserActuationSendSource.includes("sendTabMessageWithTimeout(tabId, message, 18000)")
+const dispatchContentTimeout = Number(
+  (backgroundSource.match(/const BROWSER_DISPATCH_CONTENT_TIMEOUT_MS = ([0-9_]+);/) || [])[1]?.replace(/_/g, ""),
+);
+ok(dispatchContentTimeout > 22000 && dispatchContentTimeout <= 45000
+    && browserActuationSendSource.includes('message?.command?.operation === "herdr_mcp.browser_dispatch.submit"')
+    && browserActuationSendSource.includes("BROWSER_DISPATCH_CONTENT_TIMEOUT_MS : 18000")
+    && browserActuationSendSource.includes("sendTabMessageWithTimeout(tabId, message, timeoutMs)")
     && !browserActuationSendSource.includes("chrome.tabs.reload")
     && !browserActuationSendSource.includes("sendChatGptTabMessage")
     && backgroundSource.includes("const response = await sendBrowserActuationTabMessage(target.tabId"),
-  "browser actuation is one bounded strict attempt and cannot inherit handoff reload recovery");
+  "browser actuation stays one strict attempt and retains bounded late Dispatch evidence without reload recovery");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -811,6 +817,28 @@ ok(
   ok(await vm.runInContext("window.__H2W_ADAPTER__.getAccountNativeIdentity()", accountCtx)
       === "chatgpt-user-123",
     "ChatGPT account identity is observed through the provider adapter hook");
+
+  const labeledAccountCtx = vm.createContext({
+    window: {},
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    location: { origin: u.origin, pathname: "/c/test" },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    fetch: async (url, options) => ({
+      ok: url === "/backend-api/me"
+        && options?.method === "GET"
+        && options?.credentials === "include"
+        && options?.cache === "no-store",
+      json: async () => ({ id: "chatgpt-user-123", email: "Whshang1@gmail.com" }),
+    }),
+    console,
+  });
+  vm.runInContext(baseCode, labeledAccountCtx);
+  vm.runInContext(chatgptCode, labeledAccountCtx);
+  ok(JSON.stringify(await vm.runInContext("window.__H2W_ADAPTER__.getAccountObservation()", labeledAccountCtx))
+      === JSON.stringify({ nativeIdentity: "chatgpt-user-123", email: "whshang1@gmail.com" }),
+    "ChatGPT display email is metadata beside the unchanged native identity");
 
   const accountFallbackCtx = vm.createContext({
     window: {},
@@ -1437,7 +1465,7 @@ ok((backgroundSource.match(/await moveQueuedInsertForHandoff\(/g) || []).length 
   "handoff commit migrates queued user messages to every supported target cutover path");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
-const fixed = ["background.js", "background/json-bridge.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js", "content/chatgpt-perf-main.js",
+const fixed = ["background.js", "account-display.js", "background/json-bridge.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js", "content/chatgpt-perf-main.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/gemini.js", "content/injector/claude.js",
   "content/injector/grok.js", "content/injector/chatgpt.js", "content/browser-page-kernel.js", "content/page-assist.js",
   "content/webmcp/speaks-json.js", "content/wake.js"];
