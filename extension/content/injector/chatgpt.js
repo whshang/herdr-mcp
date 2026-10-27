@@ -59,6 +59,12 @@ class ChatGPTAdapter extends BaseAdapter {
     return { ok: false, error: "chat_mode_switch_timeout" };
   }
 
+  displayEmailFromPayload(payload) {
+    const raw = payload?.email || payload?.user?.email || payload?.account?.email || payload?.email_address || null;
+    const email = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+    return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null;
+  }
+
   // Bounded cooldown for authenticated account-identity probes. ChatGPT answers
   // identity reads with HTTP 429 when the account is throttled, and account
   // registration observations can repeat, so a throttled probe must stop both
@@ -77,7 +83,15 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   async getAccountNativeIdentity(timeoutMs = 1500) {
-    if (Date.now() < (this._accountIdentity429Until || 0)) return null;
+    return (await this.getAccountObservation(timeoutMs))?.nativeIdentity ?? null;
+  }
+
+  async getAccountObservation(timeoutMs = 1500) {
+    // The cooldown lives on the shared observation entrypoint so every caller
+    // (identity probes and registration observations alike) is gated by it.
+    if (Date.now() < (this._accountIdentity429Until || 0)) {
+      return { nativeIdentity: null, email: null };
+    }
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -90,20 +104,24 @@ class ChatGPTAdapter extends BaseAdapter {
           signal: controller.signal,
         });
         if (response.status === 429) {
+          // A throttled probe stops here: the cooldown covers both
+          // authenticated endpoints. The neutral observation keeps the
+          // `{nativeIdentity, email}` contract every caller reads.
           this.noteAccountIdentity429(response);
-          return null;
+          return { nativeIdentity: null, email: null };
         }
         if (!response.ok) continue;
         this._accountIdentity429Count = 0;
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-        if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+        const nativeIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+        if (nativeIdentity) return { nativeIdentity, email: this.displayEmailFromPayload(payload) };
       } catch (_) {
       } finally {
         clearTimeout(timer);
       }
     }
-    return null;
+    return { nativeIdentity: null, email: null };
   }
 
   getConversationKey() {
