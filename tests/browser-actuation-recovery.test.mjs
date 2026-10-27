@@ -2233,9 +2233,9 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
   `)();
 }
 
-async function flushRegistrationToSend(harness) {
-  for (let i = 0; i < 4; i += 1) await Promise.resolve();
-  assert.ok(harness.pending.length > 0, "registration must reach background send");
+async function flushRegistrationToSend(harness, expected = 1) {
+  for (let i = 0; i < 24 && harness.pending.length < expected; i += 1) await Promise.resolve();
+  assert.ok(harness.pending.length >= expected, "registration must reach background send");
 }
 
 test("canonical ChatGPT session recovery reuses one slugged Project alias instead of opening a duplicate tab", async () => {
@@ -2807,10 +2807,10 @@ test("A to B to A registration cannot resurrect an older A response", async () =
   await flushRegistrationToSend(harness);
   harness.setRoute(b);
   const pendingB = harness.register("b");
-  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  await flushRegistrationToSend(harness, 2);
   harness.setRoute(a);
   const newA = harness.register("new-a");
-  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  await flushRegistrationToSend(harness, 3);
   assert.equal(harness.pending.length, 3);
 
   harness.pending[2].resolve({ browser_session_ref: "br_a_new", browser_generation: 12, bound: false });
@@ -4214,6 +4214,29 @@ test("shared native push stream fences retired runtime boots and reconnects", ()
   const agentsSegment = backgroundSource.slice(agentsStart, agentsEnd);
   assert.match(agentsSegment, /const state = await fetchStateFresh\(\)/);
   assert.match(agentsSegment, /await ensureAlive\(undefined, state\)/);
+});
+
+test("user learns safe registration failures | Given a create scope handshake after account switch | When registration cannot publish a scope | Then diagnostics are enum-only and no account IDs are exposed", () => {
+  assert.match(wakeSource, /registrationStatus:\s*lastBrowserRegistrationStatus/);
+  const registrationStart = wakeSource.indexOf("async function runConversationRegistration");
+  const registrationStatus = wakeSource.slice(registrationStart, registrationStart + 1300);
+  assert.match(registrationStatus, /lastBrowserRegistrationStatus\s*=\s*accountNativeIdentity/);
+  assert.match(registrationStatus, /"id_conflict_matching_email"/);
+  assert.match(registrationStatus, /"id_conflict_different_email"/);
+  const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
+  const end = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")', start);
+  assert.ok(start >= 0 && end > start);
+  const createSegment = backgroundSource.slice(start, end);
+  assert.match(createSegment, /registration_status:\s*probeRegistrationStatus/);
+  assert.match(createSegment, /identity_relation:\s*probeIdentityRelation/);
+  assert.match(createSegment, /contact_proof:\s*probeEmailProof/);
+  assert.match(createSegment, /bearer_relation:\s*probeBearerRelation/);
+  assert.match(wakeSource, /bearerRelation:\s*lastBrowserBearerRelation/);
+  assert.match(wakeSource, /identityRelation:\s*lastBrowserIdentityRelation/);
+  assert.match(wakeSource, /contactProof:\s*lastBrowserContactProof/);
+  assert.match(createSegment, /identityProbeResponded = true/);
+  assert.match(createSegment, /message_submitted:\s*false/);
+  assert.doesNotMatch(createSegment, /registration_status:\s*(?:accountRefCreate|accountNativeIdentity)/);
 });
 
 test("ChatGPT session.create carries one durable reservation across the new-conversation route", () => {
