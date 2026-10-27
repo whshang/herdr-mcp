@@ -699,6 +699,9 @@ impl StateStore {
             ensure_browser_archive_auxiliary_schema(&conn)?;
             ensure_browser_dispatch_auxiliary_schema(&conn)?;
             ensure_work_journal_auxiliary_schema(&conn)?;
+            // Durable residue from an account identity change is cleaned before
+            // this process serves any canonical-URL lookup.
+            retire_stale_browser_session_locators_in(&conn)?;
             return Ok(Self { path: None, conn });
         }
 
@@ -711,6 +714,7 @@ impl StateStore {
         ensure_browser_archive_auxiliary_schema(&conn)?;
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
         ensure_work_journal_auxiliary_schema(&conn)?;
+        retire_stale_browser_session_locators_in(&conn)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
             conn,
@@ -737,6 +741,7 @@ impl StateStore {
         ensure_browser_archive_auxiliary_schema(&conn)?;
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
         ensure_work_journal_auxiliary_schema(&conn)?;
+        retire_stale_browser_session_locators_in(&conn)?;
         Ok(Self {
             path: Some(path),
             conn,
@@ -3380,6 +3385,13 @@ impl StateStore {
                 ],
             )
             .map_err(|error| format!("cannot store browser resource locator: {error}"))?;
+        // A locator can only be written for a current-generation session, so this
+        // write may be the first current observation of this URL after an account
+        // identity change. Converge the URL here instead of waiting for the next
+        // process restart: the historical session is now provably not the page in
+        // front of the user. The just-written locator is current and is never a
+        // retirement candidate.
+        retire_stale_browser_session_locators_in(&self.conn)?;
         self.browser_resource_locator(resource_ref)?
             .ok_or_else(|| "browser_resource_locator_not_found".to_owned())
     }
@@ -3533,13 +3545,16 @@ impl StateStore {
     /// One canonical conversation URL legitimately accumulates historical
     /// sessions on this device: after an account identity change the same
     /// Project and conversations are re-registered under a new account-scoped
-    /// space on the same endpoint, and the previous rows are never retired. The
-    /// strict global lookup above must stay fail-closed for archive and
-    /// dispatch callers, so this scoped variant keeps only sessions whose
-    /// locator and resource observation generations both equal their own
-    /// endpoint/provider's current `browser_provider_state` generation. Zero
-    /// current sessions is no match, several current sessions stay ambiguous,
-    /// and there is no recency or largest-generation fallback.
+    /// space on the same endpoint. Their locators are retired by
+    /// `retire_stale_browser_session_locators` once the current generation is
+    /// observed for the URL, but a stale registration can still be present in
+    /// the window before that sweep runs, and the strict global lookup above
+    /// must stay fail-closed for archive and dispatch callers. This scoped
+    /// variant therefore keeps only sessions whose locator and resource
+    /// observation generations both equal their own endpoint/provider's current
+    /// `browser_provider_state` generation. Zero current sessions is no match,
+    /// several current sessions stay ambiguous, and there is no recency or
+    /// largest-generation fallback.
     pub fn browser_current_generation_source_session_ref(
         &self,
         canonical_url: &str,
@@ -3582,6 +3597,19 @@ impl StateStore {
             1 => Ok(Some(refs.remove(0))),
             _ => Err("browser_canonical_url_ambiguous".to_owned()),
         }
+    }
+
+    /// Drop the canonical-URL locators of historical sessions so they stop
+    /// participating in canonical-URL resolution.
+    ///
+    /// The predicate is documented on
+    /// `RETIRE_STALE_BROWSER_SESSION_LOCATORS_SQL`. Only disposable locator rows
+    /// are deleted, never `browser_resources`, so dispatches, archive intents and
+    /// continuity keep their provider-identity rows. The statement is idempotent:
+    /// running it again removes nothing and every canonical-URL lookup answer is
+    /// unchanged.
+    pub fn retire_stale_browser_session_locators(&mut self) -> Result<usize, String> {
+        retire_stale_browser_session_locators_in(&self.conn)
     }
 
     /// Persist one fail-closed correlation between an opaque MCP caller session
@@ -5712,6 +5740,67 @@ fn decode_browser_dispatch(stored: StoredBrowserDispatch) -> Result<BrowserDispa
         created_at: stored.created_at,
         updated_at: stored.updated_at,
     })
+}
+
+/// Retire canonical-URL locators whose session can no longer be the page the
+/// user is looking at.
+///
+/// A stale registration is not an ambiguity, but the strict lookups
+/// (`browser_session_ref_for_canonical_url`, its adapter-scoped variant) cannot
+/// tell the difference on their own, so archive/dispatch stay fail-closed on a
+/// URL that legitimately has one live session plus historical ones. A
+/// canonical URL locator is explicitly disposable local state (`MIGRATION_V9`),
+/// so the stale locator is deleted while its `browser_resources` row — the
+/// provider-identity row that dispatches/archives reference — stays intact.
+///
+/// A locator is retired only when every one of these holds:
+///
+/// - its resource is a `session`;
+/// - its own locator generation and its resource generation are not both equal
+///   to its own endpoint/provider `browser_provider_state` generation;
+/// - some other session shares the same endpoint, provider and exact canonical
+///   URL, and that session satisfies the `#700` current-generation definition
+///   (locator generation *and* resource generation equal the provider-side
+///   current generation).
+///
+/// Nothing is retired when the URL has no current-generation session (the
+/// provider generation moved on but nothing was re-observed), and a URL with
+/// several current-generation sessions keeps every locator. Endpoints and
+/// providers are never crossed: the same URL on another browser profile or
+/// adapter is independent state.
+const RETIRE_STALE_BROWSER_SESSION_LOCATORS_SQL: &str = r#"
+DELETE FROM browser_resource_locators
+WHERE EXISTS (
+    SELECT 1
+    FROM browser_resources stale
+    JOIN browser_provider_state p
+      ON p.endpoint_ref = stale.endpoint_ref
+     AND p.provider = stale.provider
+    WHERE stale.resource_ref = browser_resource_locators.resource_ref
+      AND stale.kind = 'session'
+      AND (
+            browser_resource_locators.observation_generation <> p.observation_generation
+         OR stale.observation_generation <> p.observation_generation
+      )
+      AND EXISTS (
+          SELECT 1
+          FROM browser_resource_locators current_locator
+          JOIN browser_resources current_session
+            ON current_session.resource_ref = current_locator.resource_ref
+          WHERE current_locator.canonical_url = browser_resource_locators.canonical_url
+            AND current_locator.resource_ref <> stale.resource_ref
+            AND current_session.kind = 'session'
+            AND current_session.endpoint_ref = stale.endpoint_ref
+            AND current_session.provider = stale.provider
+            AND current_locator.observation_generation = p.observation_generation
+            AND current_session.observation_generation = p.observation_generation
+      )
+)
+"#;
+
+fn retire_stale_browser_session_locators_in(conn: &Connection) -> Result<usize, String> {
+    conn.execute(RETIRE_STALE_BROWSER_SESSION_LOCATORS_SQL, [])
+        .map_err(|error| format!("cannot retire stale browser session locators: {error}"))
 }
 
 fn decode_browser_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserEndpointRecord> {
@@ -12719,6 +12808,564 @@ mod tests {
                 .browser_session_ref_for_canonical_url("https://chatgpt.com/c/never-observed")
                 .unwrap(),
             None
+        );
+    }
+
+    /// Register one provider account generation on `profile_seed`'s endpoint the
+    /// way an account identity change looks on a single browser profile: a new
+    /// account-scoped Space and the same conversation native identity. Returns
+    /// the endpoint ref and the session locator owner.
+    fn observe_browser_session_url(
+        store: &mut StateStore,
+        provider: &str,
+        profile_seed: &str,
+        generation: i64,
+        account_identity: &str,
+        url: &str,
+        observed_at: i64,
+    ) -> (String, String) {
+        let endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                profile_seed,
+                browser_family: "ego",
+                extension_version: "0.1.91",
+                observed_at,
+            })
+            .unwrap();
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider,
+                adapter_protocol_version: 1,
+                observation_generation: generation,
+                capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                observed_at,
+            })
+            .unwrap();
+        let account = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider,
+                kind: "account",
+                parent_ref: None,
+                native_identity: account_identity,
+                display_label: None,
+                observation_generation: generation,
+                observed_at,
+            })
+            .unwrap();
+        let space = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider,
+                kind: "space",
+                parent_ref: Some(&account.resource_ref),
+                native_identity: &format!("{account_identity}-space"),
+                display_label: None,
+                observation_generation: generation,
+                observed_at,
+            })
+            .unwrap();
+        let session = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider,
+                kind: "session",
+                parent_ref: Some(&space.resource_ref),
+                native_identity: "shared-conversation",
+                display_label: None,
+                observation_generation: generation,
+                observed_at,
+            })
+            .unwrap();
+        store
+            .upsert_browser_resource_locator(&session.resource_ref, url, generation, observed_at)
+            .unwrap();
+        (endpoint.endpoint_ref, session.resource_ref)
+    }
+
+    #[test]
+    fn retiring_stale_browser_session_locators_resolves_the_current_generation_session() {
+        const PROFILE_SEED: &str = "seed-shared-endpoint";
+        const URL: &str = "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/6adafccc-88a4-83e9-9917-968bae77e514";
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (_, account_a_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            PROFILE_SEED,
+            1,
+            "account-a",
+            URL,
+            100,
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(account_a_session.as_str())
+        );
+
+        // Account identity change: the provider generation advances and the same
+        // Project/conversation is re-registered under the new account's Space on
+        // the same endpoint. Account A's session is never re-observed.
+        let (_, account_b_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            PROFILE_SEED,
+            2,
+            "account-b",
+            URL,
+            200,
+        );
+        assert_ne!(account_a_session, account_b_session);
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(account_b_session.as_str()),
+            "a stale-generation session must stop making the URL ambiguous"
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url_for_adapters(URL, &["chatgpt", "claude"])
+                .unwrap()
+                .as_deref(),
+            Some(account_b_session.as_str())
+        );
+        assert!(
+            store
+                .browser_resource_locator(&account_a_session)
+                .unwrap()
+                .is_none(),
+            "the stale locator is disposable and must be retired"
+        );
+        assert_eq!(
+            store
+                .browser_resource_locator(&account_b_session)
+                .unwrap()
+                .unwrap()
+                .canonical_url,
+            URL
+        );
+        // Retirement drops disposable locators only: the provider-identity row
+        // that dispatches and archive intents reference stays.
+        assert_eq!(
+            store
+                .browser_resource(&account_a_session)
+                .unwrap()
+                .unwrap()
+                .kind,
+            "session"
+        );
+        assert_eq!(
+            store
+                .browser_resource(&account_a_session)
+                .unwrap()
+                .unwrap()
+                .endpoint_ref,
+            store
+                .browser_resource(&account_b_session)
+                .unwrap()
+                .unwrap()
+                .endpoint_ref
+        );
+
+        // Residue left by a pre-fix runtime. The current code can no longer write
+        // a stale locator, so the retired row is re-inserted directly to prove the
+        // sweep removes exactly one locator and stays idempotent.
+        store
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO browser_resource_locators(
+                    resource_ref, canonical_url, observation_generation, observed_at
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![&account_a_session, URL, 1, 100],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous"
+        );
+        assert_eq!(store.retire_stale_browser_session_locators().unwrap(), 1);
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(account_b_session.as_str())
+        );
+        assert_eq!(store.retire_stale_browser_session_locators().unwrap(), 0);
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(account_b_session.as_str()),
+            "a second sweep must not change the answer"
+        );
+        assert!(
+            store
+                .browser_resource_locator(&account_a_session)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .browser_resource(&account_a_session)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn opening_the_state_store_retires_legacy_stale_browser_session_locators() {
+        const URL: &str = "https://chatgpt.com/c/legacy-stale-locator";
+        let path = temp_db_path();
+        let (account_a_session, account_b_session) = {
+            let mut store = StateStore::open(&path).unwrap();
+            let (_, account_a_session) = observe_browser_session_url(
+                &mut store,
+                "chatgpt",
+                "seed-legacy-profile",
+                1,
+                "account-a",
+                URL,
+                100,
+            );
+            let (_, account_b_session) = observe_browser_session_url(
+                &mut store,
+                "chatgpt",
+                "seed-legacy-profile",
+                2,
+                "account-b",
+                URL,
+                200,
+            );
+            // Legacy residue: an older runtime never retired this row.
+            store
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO browser_resource_locators(
+                        resource_ref, canonical_url, observation_generation, observed_at
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![&account_a_session, URL, 1, 100],
+                )
+                .unwrap();
+            (account_a_session, account_b_session)
+        };
+
+        // Reopening the durable store is the recovery path for a device that
+        // already accumulated stale sessions under an older runtime.
+        let mut reopened = StateStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .browser_resource_locator(&account_a_session)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .browser_resource_locator(&account_b_session)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            reopened
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(account_b_session.as_str())
+        );
+        assert_eq!(reopened.retire_stale_browser_session_locators().unwrap(), 0);
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retiring_stale_browser_session_locators_never_crosses_endpoints() {
+        const URL: &str = "https://chatgpt.com/c/shared-across-endpoints";
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (other_endpoint, other_profile_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            "seed-other-profile",
+            1,
+            "other-account",
+            URL,
+            100,
+        );
+        let (_, current_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            "seed-current-profile",
+            2,
+            "current-account",
+            URL,
+            200,
+        );
+        // The other browser profile moved to a new provider generation without
+        // re-observing its session. Its locator is stale on its own endpoint, but
+        // that endpoint has no current-generation session for this URL.
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &other_endpoint,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 2,
+                capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                observed_at: 300,
+            })
+            .unwrap();
+
+        assert_eq!(store.retire_stale_browser_session_locators().unwrap(), 0);
+        assert!(
+            store
+                .browser_resource_locator(&other_profile_session)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .browser_resource_locator(&current_session)
+                .unwrap()
+                .is_some()
+        );
+        // Two browser profiles observed this URL, so the strict lookup stays
+        // fail-closed instead of routing work into another profile's session.
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous"
+        );
+    }
+
+    #[test]
+    fn retiring_stale_browser_session_locators_never_crosses_providers() {
+        const PROFILE_SEED: &str = "seed-shared-provider-endpoint";
+        // Deliberately the same canonical URL for both adapters: a locator must
+        // never be retired because a *different* provider has a session on it.
+        const URL: &str = "https://chatgpt.com/c/shared-across-providers";
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, chatgpt_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            PROFILE_SEED,
+            1,
+            "account-chatgpt",
+            URL,
+            100,
+        );
+        // A second adapter on the same endpoint (same device + browser profile)
+        // observes the same URL at its own current generation.
+        let (_, claude_session) = observe_browser_session_url(
+            &mut store,
+            "claude",
+            PROFILE_SEED,
+            1,
+            "account-claude",
+            URL,
+            200,
+        );
+        // The chatgpt provider generation moves on without re-observing the
+        // chatgpt session, while the claude session stays current on its own
+        // provider.
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 2,
+                capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                observed_at: 300,
+            })
+            .unwrap();
+
+        // The claude session is current, but it is not a chatgpt current session,
+        // so the stale chatgpt locator must survive.
+        assert_eq!(store.retire_stale_browser_session_locators().unwrap(), 0);
+        assert!(
+            store
+                .browser_resource_locator(&chatgpt_session)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .browser_resource_locator(&claude_session)
+                .unwrap()
+                .is_some()
+        );
+        // A single chatgpt session still resolves through the chatgpt-scoped
+        // lookup, while an adapter set that admits both providers stays
+        // fail-closed on the shared URL.
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(chatgpt_session.as_str())
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url_for_adapters(URL, &["chatgpt", "claude"])
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous"
+        );
+
+        // Once chatgpt re-observes the shared URL at its new generation, a
+        // current chatgpt session exists, so the stale chatgpt locator is
+        // retired while the claude locator on the same URL is kept.
+        let (_, chatgpt_current_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            PROFILE_SEED,
+            2,
+            "account-chatgpt-next",
+            URL,
+            400,
+        );
+        assert!(
+            store
+                .browser_resource_locator(&chatgpt_session)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .browser_resource_locator(&claude_session)
+                .unwrap()
+                .is_some()
+        );
+        // The claude provider generation then moves on with no current claude
+        // session, so its locator is kept as well.
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "claude",
+                adapter_protocol_version: 1,
+                observation_generation: 2,
+                capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                observed_at: 500,
+            })
+            .unwrap();
+        assert_eq!(store.retire_stale_browser_session_locators().unwrap(), 0);
+        assert!(
+            store
+                .browser_resource_locator(&claude_session)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .browser_resource_locator(&chatgpt_current_session)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn retiring_stale_browser_session_locators_keeps_locators_without_a_current_session() {
+        const URL: &str = "https://chatgpt.com/c/has-no-current-session";
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, historical_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            "seed-single-profile",
+            1,
+            "account-a",
+            URL,
+            100,
+        );
+        // The provider generation advanced but nothing was re-observed, so no
+        // session is current and no locator may be dropped.
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 2,
+                capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                observed_at: 200,
+            })
+            .unwrap();
+
+        assert_eq!(store.retire_stale_browser_session_locators().unwrap(), 0);
+        assert!(
+            store
+                .browser_resource_locator(&historical_session)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(historical_session.as_str())
+        );
+    }
+
+    #[test]
+    fn retiring_stale_browser_session_locators_keeps_two_current_sessions_ambiguous() {
+        const URL: &str = "https://chatgpt.com/c/two-current-sessions";
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (_, first_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            "seed-shared-profile-seed",
+            1,
+            "account-a",
+            URL,
+            100,
+        );
+        let (_, second_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            "seed-shared-profile-seed",
+            1,
+            "account-b",
+            URL,
+            200,
+        );
+        assert_ne!(first_session, second_session);
+
+        // Both sessions are current for the same URL, so they are genuinely
+        // indistinguishable: nothing is retired and both lookups stay fail-closed.
+        assert_eq!(store.retire_stale_browser_session_locators().unwrap(), 0);
+        assert!(
+            store
+                .browser_resource_locator(&first_session)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .browser_resource_locator(&second_session)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous"
+        );
+        assert_eq!(
+            store
+                .browser_current_generation_source_session_ref(URL)
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous"
         );
     }
 
