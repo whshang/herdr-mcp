@@ -346,9 +346,22 @@ function sanitizeClientName(raw: string): string {
   );
   const collapsed = stripped.replace(/\s+/g, " ").trim();
   if (!collapsed) return "";
-  return collapsed.length > CLIENT_NAME_MAX_CHARS
-    ? `${collapsed.slice(0, CLIENT_NAME_MAX_CHARS - 1)}…`
+  // Cap by code points so a surrogate pair (emoji) is never split.
+  const chars = Array.from(collapsed);
+  return chars.length > CLIENT_NAME_MAX_CHARS
+    ? `${chars.slice(0, CLIENT_NAME_MAX_CHARS - 1).join("")}…`
     : collapsed;
+}
+
+/**
+ * Page display name: sanitized registered name, with the synthesized ChatGPT
+ * CIMD record shown as plain "ChatGPT". Display-layer only — the stored
+ * record, resolveClient, and all provider logic are unchanged. Returns ""
+ * when no name is registered; callers apply the locale fallback.
+ */
+function pageClientName(clientName: string | undefined): string {
+  const sanitized = clientName ? sanitizeClientName(clientName) : "";
+  return sanitized === "ChatGPT CIMD" ? "ChatGPT" : sanitized;
 }
 
 /** Hostname of an already-validated redirect_uri (empty string if unparseable). */
@@ -360,11 +373,19 @@ function redirectUriHost(redirectUri: string): string {
   }
 }
 
+/**
+ * Display name plus verified redirect host as the trust anchor, e.g.
+ * "Claude · claude.ai". The separator and host are omitted when the host
+ * cannot be parsed (empty anchor must never render as "Name · ").
+ */
+function clientTrustLabel(displayName: string, redirectUri: string): string {
+  const host = redirectUriHost(redirectUri);
+  return host ? `${displayName} · ${host}` : displayName;
+}
+
 function mcpEndpointErrorPage(issuer: string, clientName?: string): Response {
   const endpoint = `${issuer}/mcp`;
-  const redirectHost = issuer.startsWith("https://") ? (redirectUriHost(issuer) || issuer) : issuer;
-  const sanitized = clientName ? sanitizeClientName(clientName) : "";
-  const client = sanitized || "this app";
+  const client = pageClientName(clientName) || "this app";
   const html = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Check the Herdr MCP server URL</title>
@@ -410,10 +431,11 @@ const APPROVAL_COPY = {
     waiting: "Waiting for approval",
     allowTitle: "Allow {client} to access Herdr?",
     fallbackName: "this app",
+    fallbackReturnName: "the app",
     grant: "Approving grants ordinary MCP access to the devices enrolled in this Herdr Worker. It does not grant fleet administration.",
     denyNotice: "If you didn't start this request, close this page.",
     step1Title: "Open Terminal and run this command",
-    step1Help: "Run it on a computer already enrolled in this Worker. The CLI checks that the local herdr-mcp service and Herdr server are ready, then asks for the code.",
+    step1Help: "Run it on a computer already enrolled in this Worker. The CLI checks that the local herdr-mcp service and Herdr server are ready, then asks for the code. If the CLI says unknown command 'connector', update herdr-mcp and retry.",
     copy: "Copy",
     copied: "Copied",
     copyFailed: "Copy failed",
@@ -441,10 +463,11 @@ const APPROVAL_COPY = {
     waiting: "等待批准",
     allowTitle: "允许 {client} 访问 Herdr？",
     fallbackName: "该应用",
+    fallbackReturnName: "该应用",
     grant: "批准后仅授予普通 MCP 访问权限，可访问本 Herdr Worker 已登记的设备；不授予设备管理权限。",
     denyNotice: "如果这不是你发起的请求，请直接关闭本页。",
     step1Title: "打开终端并运行这条命令",
-    step1Help: "在已登记的电脑上运行。CLI 会先确认本机 herdr-mcp 服务和 Herdr server 可用，再要求输入验证码。",
+    step1Help: "在已登记的电脑上运行。CLI 会先确认本机 herdr-mcp 服务和 Herdr server 可用，再要求输入验证码。如果 CLI 提示 unknown command 'connector'，请先更新 herdr-mcp 后重试。",
     copy: "复制",
     copied: "已复制",
     copyFailed: "复制失败",
@@ -472,10 +495,11 @@ const APPROVAL_COPY = {
     waiting: "承認待ち",
     allowTitle: "{client} に Herdr へのアクセスを許可しますか？",
     fallbackName: "このアプリ",
+    fallbackReturnName: "このアプリ",
     grant: "承認すると、この Herdr Worker に登録済みの端末への通常の MCP アクセスだけが許可されます。端末管理権限は付与されません。",
     denyNotice: "身に覚えのないリクエストの場合は、このページを閉じてください。",
     step1Title: "ターミナルを開いてこのコマンドを実行",
-    step1Help: "登録済みのコンピュータで実行します。CLI はローカルの herdr-mcp サービスと Herdr server を確認してからコードを要求します。",
+    step1Help: "登録済みのコンピュータで実行します。CLI はローカルの herdr-mcp サービスと Herdr server を確認してからコードを要求します。unknown command 'connector' と表示された場合は herdr-mcp を更新して再試行してください。",
     copy: "コピー",
     copied: "コピー済み",
     copyFailed: "コピー失敗",
@@ -497,6 +521,18 @@ const APPROVAL_COPY = {
     footer: "登録済みの端末がこのリクエストを承認し、認証結果だけを元の OAuth callback に返します。",
   },
 } as const;
+
+/**
+ * Natural-spacing substitution for zh/ja templates: CJK text takes no space
+ * around a placeholder, so after replacing {client}/{name} drop a space that
+ * ends up between two CJK characters (e.g. "允许 该应用 访问" → "允许该应用访问").
+ * en templates keep their Latin spacing (plain replacement only).
+ */
+function fillTemplate(template: string, name: string, locale: ApprovalLocale): string {
+  const filled = template.replaceAll("{client}", name).replaceAll("{name}", name);
+  if (locale === "en") return filled;
+  return filled.replace(/([\u3000-\u9fff\uf900-\ufaff\uff00-\uffef]) ([\u3000-\u9fff\uf900-\ufaff\uff00-\uffef])/g, "$1$2");
+}
 
 function approvalLocale(acceptLanguage: string | null): ApprovalLocale {
   for (const part of (acceptLanguage ?? "").split(",")) {
@@ -521,20 +557,19 @@ function approvalPage(input: {
   const poll = `${input.issuer}${AUTHORIZE_POLL_PATH}`;
   const expiresAt = new Date(input.expiresAtMs).toISOString();
   const copy = APPROVAL_COPY[input.locale];
+  // Display name: sanitized registered name (synthesized "ChatGPT CIMD"
+  // renders as "ChatGPT") or neutral locale fallback. The verified redirect
+  // host is the trust anchor and is never client-controlled text.
+  const displayName = pageClientName(input.clientName) || copy.fallbackName;
+  const clientLabel = clientTrustLabel(displayName, input.redirectUri);
   const redirectHost = redirectUriHost(input.redirectUri);
-  // Display name: sanitized registered name or neutral fallback. The verified
-  // redirect host is always shown as the trust anchor and is never
-  // client-controlled text.
-  const sanitized = input.clientName ? sanitizeClientName(input.clientName) : "";
-  const displayName = sanitized || copy.fallbackName;
-  const clientLabel = `${displayName} · ${redirectHost}`;
-  const title = copy.allowTitle.replaceAll("{client}", displayName);
+  const title = fillTemplate(copy.allowTitle, displayName, input.locale);
   const approvalCommand = `herdr-mcp connector approve ${input.requestId}`;
   const scriptCopy = {
     copy: copy.copy,
     copied: copy.copied,
     copyFailed: copy.copyFailed,
-    approved: copy.approved.replaceAll("{name}", displayName),
+    approved: fillTemplate(copy.approved, displayName === copy.fallbackName ? copy.fallbackReturnName : displayName, input.locale),
     failed: copy.failed,
     unavailable: copy.unavailable,
   };
@@ -552,7 +587,7 @@ function approvalPage(input: {
 <section class="card" aria-labelledby="approval-title"><div class="main">
 <div class="eyebrow"><span class="eyebrow-label">${escapeHtml(copy.eyebrow)}</span><span class="pill" id="status-pill"><span class="pill-dot" aria-hidden="true"></span>${escapeHtml(copy.waiting)}</span></div>
 <h1 id="approval-title">${escapeHtml(title)}</h1>
-<p class="trust"><span class="connector">${escapeHtml(displayName)}</span><span class="dot" aria-hidden="true"> · </span><code>${escapeHtml(redirectHost)}</code></p>
+<p class="trust"><span class="connector">${escapeHtml(displayName)}</span>${redirectHost ? `<span class="dot" aria-hidden="true"> · </span><code>${escapeHtml(redirectHost)}</code>` : ""}</p>
 <p class="lead">${escapeHtml(copy.grant)}</p>
 <p class="deny">${escapeHtml(copy.denyNotice)}</p>
 <div class="steps">
@@ -568,7 +603,7 @@ function approvalPage(input: {
   </div></div>
 </div>
 <div class="status" id="status-wrap" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="status">${escapeHtml(copy.pending)}</span></div>
-<div class="continue-row" id="continue-row" hidden><a class="continue-link" id="continue-link" href="#">${escapeHtml(copy.continue.replaceAll("{name}", displayName))}</a><span class="continue-help">${escapeHtml(copy.continueHelp)}</span></div>
+<div class="continue-row" id="continue-row" hidden><a class="continue-link" id="continue-link" href="#">${escapeHtml(fillTemplate(copy.continue, displayName === copy.fallbackName ? copy.fallbackReturnName : displayName, input.locale))}</a><span class="continue-help">${escapeHtml(copy.continueHelp)}</span></div>
 <details><summary>${escapeHtml(copy.details)}</summary><dl class="details-grid"><dt>${escapeHtml(copy.connector)}</dt><dd>${escapeHtml(clientLabel)}</dd><dt>${escapeHtml(copy.requestId)}</dt><dd><code>${escapeHtml(input.requestId)}</code></dd><dt>${escapeHtml(copy.expires)}</dt><dd>${escapeHtml(expiresAt)}</dd></dl></details>
 <p class="security"><strong>${escapeHtml(copy.securityLabel)}</strong>${escapeHtml(copy.security)}</p>
 </div><div class="footer">${escapeHtml(copy.footer)}</div></section></main>
@@ -628,10 +663,8 @@ function pendingApprovalPage(input: {
   const expiresAt = new Date(input.expiresAtMs).toISOString();
   const retryAfterMs = Math.max(250, input.expiresAtMs - input.nowMs + 250);
   const retryAfterSec = Math.max(1, Math.ceil(retryAfterMs / 1000));
-  const redirectHost = redirectUriHost(input.redirectUri);
-  const sanitized = input.clientName ? sanitizeClientName(input.clientName) : "";
-  const displayName = sanitized || "this app";
-  const clientLabel = `${displayName} · ${redirectHost}`;
+  const displayName = pageClientName(input.clientName) || "this app";
+  const clientLabel = clientTrustLabel(displayName, input.redirectUri);
   const html = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Connector approval already pending</title>

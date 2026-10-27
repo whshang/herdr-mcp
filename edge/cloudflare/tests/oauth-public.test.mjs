@@ -138,6 +138,7 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
   assert.match(html, /document\.execCommand\('copy'\)/);
   assert.match(html, /computer already enrolled in this Worker/);
   assert.match(html, /visible CLI prompt/);
+  assert.match(html, /unknown command (?:'|&#39;)connector(?:'|&#39;), update herdr-mcp/);
   assert.doesNotMatch(html, /no-echo prompt/);
   assert.match(html, /Approval grants ordinary MCP access|Approving grants ordinary MCP access/);
   assert.match(html, /If you didn(?:'|&#39;)t start this request, close this page\./);
@@ -513,7 +514,7 @@ test("authorize: ChatGPT bare issuer fails before approval and points to /mcp", 
   const html = await resp.text();
   assert.match(html, /Check the MCP server URL/);
   assert.match(html, /missing the MCP endpoint path/);
-  assert.match(html, /ChatGPT CIMD reached the Herdr site/);
+  assert.match(html, /ChatGPT reached the Herdr site/);
   assert.match(html, /Return to the app and set the MCP Server URL/);
   assert.doesNotMatch(html, /Return to ChatGPT/);
   assert.match(html, new RegExp(`${ISSUER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\/mcp`));
@@ -1728,18 +1729,52 @@ test("approval page shows sanitized client_name with verified redirect host, no 
   }
 });
 
-test("chatgpt.com client_id keeps its synthesized provider record name on the generic page", async () => {
-  // Provider logic unchanged: chatgpt.com CIMD client_ids resolve to the
-  // synthesized "ChatGPT CIMD" record without a metadata fetch; the page just
-  // renders it through the same client-agnostic template.
-  const html = await approvalPageForCimd(makeOptions(), {
+test("zh and ja named-client templates keep natural spacing", async () => {
+  const clientId = "https://claude.ai/oauth/mcp-client-metadata";
+  const redirect = "https://claude.ai/api/mcp/auth_callback";
+  const fetchFn = async () => new Response(JSON.stringify({
+    client_id: clientId,
+    client_name: "Claude",
+    redirect_uris: [redirect],
+    token_endpoint_auth_method: "none",
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const challenge = await s256Challenge("Z".repeat(43) + "zZ-._");
+  for (const [accept, title, cont] of [
+    ["zh-CN,zh;q=0.9", "允许 Claude 访问 Herdr？", "返回 Claude"],
+    ["ja-JP,ja;q=0.9", "Claude に Herdr へのアクセスを許可しますか？", "Claude に戻る"],
+  ]) {
+    const opts = makeOptions({ fetchFn });
+    const qs = new URLSearchParams({
+      client_id: clientId, redirect_uri: redirect, response_type: "code",
+      code_challenge: challenge, code_challenge_method: "S256",
+    });
+    const resp = await GET(`/oauth/authorize?${qs}`, opts, { headers: { "accept-language": accept } });
+    assert.equal(resp.status, 200);
+    const html = await resp.text();
+    assert.ok(html.includes(title), `${accept}: ${title}`);
+    assert.ok(html.includes(cont), `${accept}: ${cont}`);
+  }
+});
+
+test("chatgpt.com client_id displays as ChatGPT on the generic page", async () => {
+  // Display-layer only: the synthesized "ChatGPT CIMD" record name renders as
+  // plain "ChatGPT" on the page. The stored record, resolveClient, and the
+  // provider branch are unchanged.
+  const opts = makeOptions();
+  const html = await approvalPageForCimd(opts, {
     clientId: "https://chatgpt.com/oauth/connector/client/xyz",
     redirect: "https://chatgpt.com/connector_platform_oauth_redirect",
     clientName: "Ignored Metadata Name",
   });
-  assert.match(html, /<h1 id="approval-title">Allow ChatGPT CIMD to access Herdr\?<\/h1>/);
-  assert.ok(html.includes("ChatGPT CIMD</span>"));
+  assert.match(html, /<h1 id="approval-title">Allow ChatGPT to access Herdr\?<\/h1>/);
+  assert.ok(html.includes("ChatGPT</span>"));
   assert.ok(html.includes("<code>chatgpt.com</code>"));
+  assert.ok(html.includes("Approved. Returning to ChatGPT…"));
+  assert.ok(html.includes("Return to ChatGPT"));
+  // The raw record value must not leak onto the page.
+  assert.doesNotMatch(html, /ChatGPT CIMD/);
+  // Display mapping must not affect the stored record: the approval in the DO
+  // still carries the synthesized client_name.
 });
 
 test("approval page falls back to neutral name when metadata omits client_name", async () => {
@@ -1748,8 +1783,8 @@ test("approval page falls back to neutral name when metadata omits client_name",
   const html = await approvalPageForCimd(makeOptions(), { clientId, redirect, clientName: undefined });
   assert.match(html, /<h1 id="approval-title">Allow this app to access Herdr\?<\/h1>/);
   assert.ok(html.includes(`this app</span><span class="dot" aria-hidden="true"> · </span><code>client.example</code>`));
-  assert.match(html, /Return to this app/);
-  assert.ok(html.includes("Approved. Returning to this app…"));
+  assert.match(html, /Return to the app/);
+  assert.ok(html.includes("Approved. Returning to the app…"));
   assert.doesNotMatch(html, /ChatGPT/);
 });
 
@@ -1771,6 +1806,9 @@ test("approval page sanitizes hostile client_name: escapes markup, strips bidi/c
     { name: "Ale\u202EX\x1b[31mrt", expect: "AleX[31mrt" },
     { name: "\u061C\u200F\u202ERLO-hidden\u200E", expect: "RLO-hidden" },
     { name: `${"x".repeat(500)}-overflow`, expect: `${"x".repeat(39)}…` },
+    // Surrogate pair at the cap boundary: the emoji is dropped whole, never split.
+    { name: `${"x".repeat(39)}😀${"y".repeat(10)}`, expect: `${"x".repeat(39)}…` },
+    { name: `${"x".repeat(38)}😀`, expect: `${"x".repeat(38)}😀` },
   ];
   for (const testCase of cases) {
     const html = await approvalPageForCimd(makeOptions(), { clientId, redirect, clientName: testCase.name });
@@ -1820,9 +1858,9 @@ test("approval page honors per-locale fallback names and titles", async () => {
   }), { status: 200, headers: { "content-type": "application/json" } });
   const challenge = await s256Challenge("W".repeat(43) + "zZ-._");
   for (const [accept, title, cont] of [
-    ["zh-CN,zh;q=0.9", "允许 该应用 访问 Herdr？", "返回 该应用"],
-    ["ja-JP,ja;q=0.9", "このアプリ に Herdr へのアクセスを許可しますか？", "このアプリ に戻る"],
-    ["en-GB,en;q=0.9", "Allow this app to access Herdr?", "Return to this app"],
+    ["zh-CN,zh;q=0.9", "允许该应用访问 Herdr？", "返回该应用"],
+    ["ja-JP,ja;q=0.9", "このアプリに Herdr へのアクセスを許可しますか？", "このアプリに戻る"],
+    ["en-GB,en;q=0.9", "Allow this app to access Herdr?", "Return to the app"],
   ]) {
     const opts = makeOptions({ fetchFn });
     const qs = new URLSearchParams({
@@ -1856,21 +1894,32 @@ test("pending-approval retry page shows sanitized name and redirect host", async
     token_endpoint_auth_method: "none",
   }), { status: 200, headers: { "content-type": "application/json" } });
 
-  const first = await GET(`/oauth/authorize?${qs}`, makeOptions({ fetchFn }));
+  // Force the duplicate_pending path deterministically: the first authorize
+  // request seeds the existing request id/expiry, then the store reports the
+  // retry as a duplicate of it.
+  let existing = null;
+  const seedingStore = {
+    getClient: async () => null,
+    getGrant: async () => null,
+    putApproval: async (requestId, record) => {
+      if (!existing) {
+        existing = { requestId, expiresAtMs: record.expires_at_ms };
+        return { ok: true };
+      }
+      return { ok: false, code: "duplicate_pending", status: 409, existing_request_id: existing.requestId, expires_at_ms: existing.expiresAtMs };
+    },
+  };
+  const first = await GET(`/oauth/authorize?${qs}`, makeOptions({ fetchFn, store: seedingStore }));
   assert.equal(first.status, 200);
-  const firstHtml = await first.text();
-  // Double space in the registered name collapses to one.
-  assert.match(firstHtml, /Allow Page Assist to access Herdr\?/);
+  assert.match(await first.text(), /Allow Page Assist to access Herdr\?/);
 
-  const retry = await GET(`/oauth/authorize?${qs}`, makeOptions({ fetchFn }));
+  const retry = await GET(`/oauth/authorize?${qs}`, makeOptions({ fetchFn, store: seedingStore }));
   assert.equal(retry.status, 200);
   const retryHtml = await retry.text();
-  if (retryHtml.includes("Approval already pending")) {
-    assert.match(retryHtml, /Page Assist · client\.example/);
-    assert.match(retryHtml, /herdr-mcp connector cancel /);
-  } else {
-    // Same-auth-attempt retry may share the approval; either page stays client-agnostic.
-    assert.match(retryHtml, /Allow Page Assist to access Herdr\?/);
-  }
+  assert.match(retryHtml, /Approval already pending/);
+  // Double space in the registered name collapses to one; trust anchor is the
+  // verified redirect host.
+  assert.match(retryHtml, /Page Assist · client\.example/);
+  assert.match(retryHtml, /herdr-mcp connector cancel /);
   assert.doesNotMatch(retryHtml, /ChatGPT/);
 });
