@@ -1708,7 +1708,7 @@ async function approvalPageForCimd(opts, { clientId, redirect, clientName }) {
   return resp.text();
 }
 
-test("approval page shows sanitized client_name with verified redirect host, no ChatGPT copy", async () => {
+test("user sees the sanitized client_name with the verified redirect host and no ChatGPT copy | Given a CIMD client with a registered client_name | When the authorization page renders | Then the heading, trust line, and return copy use the sanitized name and redirect host", async () => {
   for (const [clientName, host] of [
     ["Claude", "claude.ai"],
     ["Grok", "grok.com"],
@@ -1729,7 +1729,7 @@ test("approval page shows sanitized client_name with verified redirect host, no 
   }
 });
 
-test("zh and ja named-client templates keep natural spacing", async () => {
+test("user sees natural zh and ja spacing for named clients and fallbacks | Given zh or ja locales with a named client and without one | When the authorization page renders | Then named-client templates keep normal spacing and CJK fallbacks drop the placeholder space", async () => {
   const clientId = "https://claude.ai/oauth/mcp-client-metadata";
   const redirect = "https://claude.ai/api/mcp/auth_callback";
   const fetchFn = async () => new Response(JSON.stringify({
@@ -1756,7 +1756,7 @@ test("zh and ja named-client templates keep natural spacing", async () => {
   }
 });
 
-test("chatgpt.com client_id displays as ChatGPT on the generic page", async () => {
+test("user sees ChatGPT instead of the synthesized record name on the generic page | Given a chatgpt.com CIMD client_id | When the authorization page renders | Then the page shows ChatGPT with its verified host and never leaks the raw ChatGPT CIMD record name", async () => {
   // Display-layer only: the synthesized "ChatGPT CIMD" record name renders as
   // plain "ChatGPT" on the page. The stored record, resolveClient, and the
   // provider branch are unchanged.
@@ -1777,7 +1777,7 @@ test("chatgpt.com client_id displays as ChatGPT on the generic page", async () =
   // still carries the synthesized client_name.
 });
 
-test("approval page falls back to neutral name when metadata omits client_name", async () => {
+test("user sees a neutral app name when the client metadata omits client_name | Given a CIMD client without client_name | When the authorization page renders | Then the heading, trust line, and return copy use the locale fallback name with the verified redirect host", async () => {
   const clientId = "https://client.example/oauth/client-metadata";
   const redirect = "https://client.example/oauth/callback";
   const html = await approvalPageForCimd(makeOptions(), { clientId, redirect, clientName: undefined });
@@ -1798,7 +1798,7 @@ function escapeHtmlForTest(value) {
     .replaceAll("'", "&#39;");
 }
 
-test("approval page sanitizes hostile client_name: escapes markup, strips bidi/control, caps length", async () => {
+test("user never sees raw markup or control characters from a hostile client_name | Given client_names containing script tags, img tags, bidi marks, ESC, and 500-char overflow | When the authorization page renders | Then the name is stripped, entity-escaped, and capped at 40 code points while the trust anchor stays the verified host", async () => {
   const clientId = "https://evil.example/oauth/client-metadata";
   const redirect = "https://evil.example/oauth/callback";
   const cases = [
@@ -1834,7 +1834,7 @@ test("approval page sanitizes hostile client_name: escapes markup, strips bidi/c
   }
 });
 
-test("approval page never renders client-controlled text as a verified indicator", async () => {
+test("user never sees client-controlled text styled as a verification badge | Given a client_name claiming Verified By Herdr Team | When the authorization page renders | Then the name renders as plain text with no badge or verified styling and the host remains the trust anchor", async () => {
   const clientId = "https://spoof.example/oauth/client-metadata";
   const redirect = "https://spoof.example/oauth/callback";
   const html = await approvalPageForCimd(makeOptions(), {
@@ -1848,7 +1848,7 @@ test("approval page never renders client-controlled text as a verified indicator
   assert.ok(html.includes("<code>spoof.example</code>"));
 });
 
-test("approval page honors per-locale fallback names and titles", async () => {
+test("user sees the correct locale fallback name, title, and return label | Given zh, ja, and en browsers with metadata that omits client_name | When the authorization page renders | Then each locale shows its own fallback title and return label with natural spacing", async () => {
   const clientId = "https://i18n.example/oauth/client-metadata";
   const redirect = "https://i18n.example/oauth/callback";
   const fetchFn = async () => new Response(JSON.stringify({
@@ -1875,7 +1875,7 @@ test("approval page honors per-locale fallback names and titles", async () => {
   }
 });
 
-test("pending-approval retry page shows sanitized name and redirect host", async () => {
+test("user sees the sanitized name and redirect host on the pending-approval retry page | Given a duplicate authorization request while one is already pending | When the duplicate_pending page renders | Then it shows the collapsed client name with the verified host and the cancel command", async () => {
   const clientId = "https://client.example/oauth/client-metadata";
   const redirect = "https://client.example/oauth/callback";
   const clientName = "Page  Assist";
