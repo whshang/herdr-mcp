@@ -4403,6 +4403,7 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
 function chatGptTitleProjectionHarness({
   initialTitle = "Provider title",
   readbackTitles = [],
+  readbackStatus = 200,
   patchOk = true,
 } = {}) {
   const start = wakeSource.indexOf("  async function projectChatGptConversationTitle(");
@@ -4415,6 +4416,8 @@ function chatGptTitleProjectionHarness({
     lastRead: initialTitle,
     patchCalls: [],
     patchOk,
+    readbackStatus,
+    readCount: 0,
   };
   const project = new Function("ctx", `
     const ADAPTER = { name: "chatgpt", capabilities: { titleProjection: true } };
@@ -4425,6 +4428,10 @@ function chatGptTitleProjectionHarness({
       const title = ctx.reads.length ? ctx.reads.shift() : ctx.lastRead;
       ctx.lastRead = title;
       ctx.now += 100;
+      ctx.readCount += 1;
+      if (ctx.readCount > 1 && ctx.readbackStatus === 429) {
+        return { ok: false, status: 429, reason: "http-429" };
+      }
       return { ok: true, body: { title } };
     };
     const readChatGptAccessToken = async () => {
@@ -4473,6 +4480,15 @@ test("user sees the requested ChatGPT worker title | Given a new conversation ha
   assert.equal(ctx.patchCalls[0].init.headers.authorization, "Bearer short-lived-test-token");
   assert.deepEqual(JSON.parse(ctx.patchCalls[0].init.body), { title: "Worker A" });
   assert.equal(JSON.stringify(result).includes("short-lived-test-token"), false);
+});
+
+test("user avoids retrying a rate-limited title readback | Given provider title verification returns 429 | When a title is projected | Then one readback attempt is made", async () => {
+  const { ctx, project } = chatGptTitleProjectionHarness({ readbackStatus: 429 });
+  const result = await project("Worker C");
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "title_projection_readback_unverified");
+  assert.equal(ctx.patchCalls.length, 1);
+  assert.equal(ctx.readCount, 2, "one initial read and one throttled readback");
 });
 
 test("user keeps a successful create when title projection cannot be verified | Given the provider keeps returning another title | When session.create attempts projection | Then the projection fails after one PATCH without claiming readback success", async () => {
@@ -6378,4 +6394,105 @@ test("user never replays an unconfirmed history command | Given the history comm
   assert.equal(result.mutation_submitted, true);
   assert.equal([...tabs.values()][0].url, "https://example.com/second");
   assert.equal(h.browserPagesByRef.get(opened.page_ref)?.stale, true);
+
+});
+
+test("user avoids re-reading ChatGPT while rate limited | Given a conversation GET returns HTTP 429 and Retry-After | When settlement probes repeat | Then no authenticated reads occur before the cooldown expires", async () => {
+  const start = wakeSource.indexOf("  // Shared authenticated ChatGPT conversation fetch.");
+  const end = wakeSource.indexOf("  async function projectChatGptConversationTitle(", start);
+  const authStart = wakeSource.indexOf("  async function readChatGptAccessToken(", end);
+  const authEnd = wakeSource.indexOf("  const HERDR_PROJECT_CONTEXT_START", authStart);
+  assert.ok(start > 0 && end > start && authStart > end && authEnd > authStart);
+
+  const context = { now: 0, urls: [] };
+  const read = new Function("ctx", `
+    const ADAPTER = { name: "chatgpt" };
+    const CORE = { conversationsUrl: (id) => "/backend-api/conversations/" + id };
+    const BROWSER_PERFORMANCE = { rateLimitBackoffMs: () => 30000 };
+    const Date = { now: () => ctx.now };
+    const setTimeout = () => 1;
+    const clearTimeout = () => {};
+    class AbortController { constructor() { this.signal = {}; } abort() {} }
+    const noteChatGptRateLimit = () => {};
+    const fetch = async (url) => {
+      ctx.urls.push(url);
+      if (url === "/api/auth/session") {
+        if (ctx.authThrottled) return { ok: false, status: 429, headers: { get: () => "30" } };
+        return { ok: true, json: async () => ({ accessToken: "test-token" }) };
+      }
+      if (ctx.urls.filter((x) => x.startsWith("/backend-api/")).length === 1) {
+        return { ok: false, status: 429, headers: { get: () => "45" } };
+      }
+      return { ok: true, json: async () => ({ mapping: {} }) };
+    };
+    ${wakeSource.slice(start, end)}
+    ${wakeSource.slice(authStart, authEnd)}
+    return fetchChatGptConversation;
+  `)(context);
+
+  const first = await read({ conversationId: "conv-1" });
+  assert.equal(first.status, 429);
+  assert.equal(context.urls.length, 2);
+  context.now = 1000;
+  const suppressed = await read({ conversationId: "conv-1" });
+  assert.equal(suppressed.status, 429);
+  assert.equal(context.urls.length, 2, "the cooldown must suppress both auth and conversation requests");
+
+  context.now = 46000;
+  const resumed = await read({ conversationId: "conv-1" });
+  assert.equal(resumed.ok, true);
+  assert.equal(context.urls.length, 4);
+
+  context.now = 47000;
+  context.authThrottled = true;
+  const authThrottled = await read({ conversationId: "conv-1" });
+  assert.equal(authThrottled.status, 429);
+  assert.equal(context.urls.length, 5);
+  context.now = 48000;
+  await read({ conversationId: "conv-1" });
+  assert.equal(context.urls.length, 5, "auth endpoint 429 must also block repeated reads");
+});
+
+test("user bounds an untrusted read Retry-After | Given an authenticated conversation GET returns HTTP 429 with Retry-After 999999 | When the settlement probes repeat | Then the cooldown stays at the bounded policy minimum instead of trusting the header", async () => {
+  const start = wakeSource.indexOf("  // Shared authenticated ChatGPT conversation fetch.");
+  const end = wakeSource.indexOf("  async function projectChatGptConversationTitle(", start);
+  const authStart = wakeSource.indexOf("  async function readChatGptAccessToken(", end);
+  const authEnd = wakeSource.indexOf("  const HERDR_PROJECT_CONTEXT_START", authStart);
+  assert.ok(start > 0 && end > start && authStart > end && authEnd > authStart);
+
+  const context = { now: 0, urls: [] };
+  const read = new Function("ctx", `
+    const ADAPTER = { name: "chatgpt" };
+    const CORE = { conversationsUrl: (id) => "/backend-api/conversations/" + id };
+    const BROWSER_PERFORMANCE = { rateLimitBackoffMs: () => 30000 };
+    const Date = { now: () => ctx.now };
+    const setTimeout = () => 1;
+    const clearTimeout = () => {};
+    class AbortController { constructor() { this.signal = {}; } abort() {} }
+    const noteChatGptRateLimit = () => {};
+    const fetch = async (url) => {
+      ctx.urls.push(url);
+      if (url === "/api/auth/session") {
+        return { ok: true, json: async () => ({ accessToken: "test-token" }) };
+      }
+      return { ok: false, status: 429, headers: { get: () => "999999" } };
+    };
+    ${wakeSource.slice(start, end)}
+    ${wakeSource.slice(authStart, authEnd)}
+    return fetchChatGptConversation;
+  `)(context);
+
+  const first = await read({ conversationId: "conv-1" });
+  assert.equal(first.status, 429);
+  const urlsAfterFirst = context.urls.length;
+
+  // The minimum cooldown still applies, so an immediate repeat reads nothing.
+  context.now = 29000;
+  assert.equal((await read({ conversationId: "conv-1" })).status, 429);
+  assert.equal(context.urls.length, urlsAfterFirst, "the cooldown must not be shorter than the policy minimum");
+
+  // 999999 seconds must never be trusted: one policy step later the read runs.
+  context.now = 31000;
+  assert.equal((await read({ conversationId: "conv-1" })).status, 429);
+  assert.ok(context.urls.length > urlsAfterFirst, "an unbounded Retry-After must not disable reads permanently");
 });
