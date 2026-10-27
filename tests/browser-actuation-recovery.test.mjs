@@ -3465,6 +3465,46 @@ test("accepted ChatGPT user turns register a current-source identity before cont
   assert.match(segment, /user_text:\s*userText/);
 });
 
+test("user records a fast-settled ChatGPT turn | Given a fresh submit anchor and matching new user message | When the assistant reply is already settled before the next tick | Then source-turn observation is emitted once with the accepted user text", () => {
+  const start = wakeSource.indexOf("const onTick = () => {");
+  const end = wakeSource.indexOf('      const currentAssistant = roleSnapshot("assistant");', start);
+  assert.ok(start >= 0 && end > start, "ChatGPT turn observer must remain extractable");
+  const onTickSource = `${wakeSource.slice(start, end)}\n};\nreturn onTick;`;
+  const submitAt = Date.now() - 1000;
+  const conversationUrl = "https://chatgpt.com/c/source-turn-fast-reply";
+  const sent = [];
+  // The first sampled render is a truncated form of the accepted message; a
+  // later render of the same turn is the full text. Both belong to one submit.
+  let sampledUserText = "Accepted prompt";
+  const onTick = new Function(
+    "document", "uiPressure", "chatGptConversationId", "generating", "sawGrowth", "stableRounds",
+    "markLatestTurnsDirty", "settleTimer", "clearInterval", "syncPendingSubmitAnchor",
+    "isComposerGenerating", "wasStopping", "roleSnapshot", "assistantSignature", "lastUserSignature",
+    "lastUserCount", "normText", "pendingUserTextHint", "hasPendingReply", "lastStartedJournalKey",
+    "sendBg", "ADAPTER", "Date",
+    onTickSource,
+  )(
+    { hidden: false }, null, () => "conversation", false, false, 0, () => {}, null, () => {},
+    () => submitAt, () => false, false,
+    () => ({ text: sampledUserText, count: 2 }),
+    (value) => String(value ?? "").trim().toLowerCase(), "previous user turn", 1,
+    (value) => String(value ?? "").trim().toLowerCase(), () => "accepted prompt", () => false, "",
+    (message) => { sent.push(message); }, { getConversationKey: () => conversationUrl }, Date,
+  );
+
+  onTick();
+  onTick();
+  sampledUserText = "Accepted prompt with the rest of the message now rendered";
+  onTick();
+
+  assert.deepEqual(sent, [{
+    type: "h2w_turn_started",
+    convKey: conversationUrl,
+    startedAt: submitAt,
+    userText: "Accepted prompt",
+  }]);
+});
+
 test("user keeps a source turn fail-closed | Given a page-captured turn whose canonical URL no longer resolves to one current session | When source_turn.observe is rejected | Then the service worker warns the typed code and retries only a missing registration", () => {
   const start = backgroundSource.indexOf('if (msg?.type === "h2w_turn_started")');
   const end = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")', start);
