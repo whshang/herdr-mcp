@@ -6126,7 +6126,9 @@ mod tests {
 
         // Account identity change: a new provider generation, then the same
         // Project/conversation re-registered under a new account-scoped space on
-        // the same endpoint. The generation-1 rows are left untouched.
+        // the same endpoint. The generation-1 resource row is left untouched; its
+        // canonical URL locator is disposable and is retired once the current
+        // generation is observed for that URL.
         let app =
             observe_chatgpt_provider_generation(app, &profile_seed, &endpoint_ref, 2, 2004).await;
         let (app, _account_b_ref, session_b_refs) = observe_chatgpt_account_generation(
@@ -6143,13 +6145,23 @@ mod tests {
         assert_ne!(session_a_ref, session_b_ref);
         {
             let guard = store.lock().unwrap();
-            assert_eq!(
+            // A stale-generation registration can never be the page the user is
+            // looking at, so its locator stops participating in canonical URL
+            // resolution instead of making every lookup fail closed forever.
+            assert!(
                 guard
                     .browser_resource_locator(&session_a_ref)
                     .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                guard
+                    .browser_resource(&session_a_ref)
                     .unwrap()
-                    .canonical_url,
-                SHARED_URL
+                    .unwrap()
+                    .kind,
+                "session",
+                "only the disposable locator is retired, never the session row"
             );
             assert_eq!(
                 guard
@@ -6159,11 +6171,16 @@ mod tests {
                     .canonical_url,
                 SHARED_URL
             );
-            // The strict global lookup stays fail-closed for archive.claim and
-            // every other caller: two sessions still own this canonical URL.
+            // The strict global lookup used by archive.claim resolves the URL the
+            // user is actually on. Fail-closed ambiguity is still enforced when
+            // two *current* sessions share a URL (see
+            // source_turn_observe_stays_ambiguous_for_two_current_generation_sessions).
             assert_eq!(
-                guard.browser_session_ref_for_canonical_url(SHARED_URL),
-                Err("browser_canonical_url_ambiguous".to_owned())
+                guard
+                    .browser_session_ref_for_canonical_url(SHARED_URL)
+                    .unwrap()
+                    .as_deref(),
+                Some(session_b_ref.as_str())
             );
         }
 
