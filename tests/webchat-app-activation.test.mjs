@@ -512,3 +512,50 @@ test("user dispatches with a required App | Given two native suggestions match t
   assert.equal(result.error, "required-app-ambiguous");
   assert.deepEqual([...adapter.getSelectedComposerApps()], []);
 });
+
+test("user dispatches with a required App | Given the current ChatGPT mention shell has no aria-controls | When the trusted @herdr search shows one exact provider suggestion | Then only that provider-owned suggestion is activated", async () => {
+  const document = createFakeDocument();
+  const adapter = loadChatGptAdapter(document);
+  const { composer } = createComposer(document);
+
+  // A control outside the provider's mention shell shares the exact label; it
+  // must never be a candidate.
+  const decoy = document.createElement("button");
+  const decoyLabel = document.createElement("span");
+  decoyLabel.appendText("herdr");
+  decoy.appendChild(decoyLabel);
+  document.body.appendChild(decoy);
+
+  const insertMainWorld = createMainWorldInserter(composer);
+  const gate = loadActivationGate({
+    adapter,
+    document,
+    insertMainWorld,
+    onTrustedMention(keyword) {
+      // Live 2026-10-25 ChatGPT: the focused ProseMirror editor carries no
+      // aria-controls/aria-owns; the picker is one provider-owned
+      // ComposerTopMenuShell-* overlay holding a button labelled exactly the
+      // keyword.
+      composer.textContent = `@${keyword}`;
+      const shell = document.createElement("div");
+      shell.setAttribute("class", "ComposerTopMenuShell-test");
+      document.body.appendChild(shell);
+      const button = document.createElement("button");
+      const label = document.createElement("span");
+      label.appendText(keyword);
+      button.appendChild(label);
+      button.onClick = () => {
+        composer.textContent = "";
+        composer.appendChild(verifiedAppPill(document, keyword));
+        shell.remove();
+      };
+      shell.appendChild(button);
+    },
+  });
+
+  const result = await gate(["herdr"]);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.deepEqual([...(result.apps || [])], ["herdr"]);
+  assert.deepEqual([...adapter.getSelectedComposerApps()], ["herdr"]);
+  assert.equal(decoy.clicked, 0, "only the provider-owned shell suggestion may be activated");
+});
