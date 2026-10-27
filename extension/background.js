@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.214";
+const H2W_SCRIPT_VERSION = "0.1.216";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -252,6 +252,10 @@ function hudLabels() {
 }
 
 function callLog(...args) { console.log("[h2w]", ...args); }
+// A fail-closed rejection that is never retried must still be visible. Callers
+// pass the typed Runtime error code only: never a conversation URL, user text or
+// account identity.
+function warnLog(...args) { console.warn("[h2w]", ...args); }
 function runtimeAlive() { try { return !!chrome.runtime?.id; } catch { return false; } }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -12024,8 +12028,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         await observeSourceTurn();
       } catch (error) {
-        callLog("current source turn observe failed:", error?.message || String(error));
-        if (error?.message === "browser_source_session_not_found") {
+        const code = error?.message || String(error);
+        callLog("current source turn observe failed:", code);
+        if (code === "browser_source_session_not_found") {
           // The first turn of a brand-new conversation can mount before the
           // 1s route poll registers the session for its canonical URL, so the
           // exact-turn evidence is dropped exactly when a fresh WebChat
@@ -12042,12 +12047,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 await observeSourceTurn();
                 return;
               } catch (retryError) {
-                const code = retryError?.message || String(retryError);
-                callLog("current source turn observe retry failed:", code);
-                if (retryError?.message !== "browser_source_session_not_found") return;
+                const retryCode = retryError?.message || String(retryError);
+                callLog("current source turn observe retry failed:", retryCode);
+                if (retryCode !== "browser_source_session_not_found") {
+                  warnLog("source_turn.observe failed:", retryCode);
+                  return;
+                }
               }
             }
           })();
+        } else {
+          // A non-registration rejection is never retried, so this is the only
+          // record of it. Warn with the typed Runtime code alone: the canonical
+          // URL and the captured user turn must never reach the console.
+          warnLog("source_turn.observe failed:", code);
         }
       }
       let session = [];
