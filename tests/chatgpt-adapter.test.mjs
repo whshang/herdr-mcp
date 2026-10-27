@@ -356,11 +356,14 @@ test("user avoids hammering a throttled identity endpoint | Given /backend-api/m
   };
   const adapter = loadAdapterWithDocument({}, fetch);
 
+  // Measure from before the call so the lower-bound assertion cannot lose a
+  // millisecond to scheduling between arming the cooldown and checking it.
+  const armedAtOrAfter = Date.now();
   assert.equal(await adapter.getAccountNativeIdentity(), null, "a throttled probe reports no identity");
   assert.deepEqual(requests, ["/backend-api/me"], "the first 429 must short-circuit the second authenticated fetch");
   assert.equal(await adapter.getAccountNativeIdentity(), null);
   assert.equal(requests.length, 1, "back-to-back identity probes must not re-read inside the cooldown");
-  assert.ok(adapter._accountIdentity429Until - Date.now() >= 45000, "Retry-After is honoured as a lower bound");
+  assert.ok(adapter._accountIdentity429Until - armedAtOrAfter >= 45000, "Retry-After is honoured as a lower bound");
 
   // The cooldown is a bounded delay, not a permanent identity blackout.
   adapter._accountIdentity429Until = Date.now() - 1;
