@@ -3670,7 +3670,12 @@ function normalizeHerdrMentionAlias(value) {
   const registrationInFlight = new Map();
 
   async function runConversationRegistration(reason, convKey, registrationAttempt) {
-    const accountObservation = await browserAccountObservation();
+    // A provider with the richer account-observation hook records a display-only
+    // platform-account label beside the native identity. Providers without it
+    // keep the original single-hop identity read.
+    const accountObservation = typeof ADAPTER.getAccountObservation === "function"
+      ? await browserAccountObservation()
+      : { nativeIdentity: await browserAccountNativeIdentity(), email: null };
     const accountNativeIdentity = accountObservation.nativeIdentity;
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
