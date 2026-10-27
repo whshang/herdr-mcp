@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.222";
+const H2W_SCRIPT_VERSION = "0.1.224";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -3665,6 +3665,8 @@ async function handleBrowserActuation(command) {
         maxRows: params.max_rows,
         expectedUrl: params.expected_url,
         elementOffset: params.element_offset,
+        url: params.url,
+        pageGeneration: params.page_generation,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -3928,6 +3930,10 @@ async function handleBrowserActuation(command) {
     let lastObservedScope = null;
     let identityProbeResponded = false;
     let identityProbeFailed = false;
+    let probeRegistrationStatus = "probe_not_completed";
+    let probeIdentityRelation = "not_observed";
+    let probeEmailProof = "not_observed";
+    let probeBearerRelation = "not_observed";
     const scopeDeadline = Date.now() + BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS;
     let nextProbeAt = 0;
     let probeInFlight = false;
@@ -3954,8 +3960,40 @@ async function handleBrowserActuation(command) {
         probeInFlight = true;
         nextProbeAt = now + 500;
         void chrome.tabs.sendMessage(createdTab.id, { type: "h2w_get_convkey" })
-          .then(() => {
+          .then((response) => {
             identityProbeResponded = true;
+            // Only a small allowlisted enum crosses into failed-create
+            // evidence. Do not copy any URL, email, account ID, or raw reply.
+            const status = response?.registrationStatus;
+            if ([
+              "not_observed", "identity_observed", "identity_unavailable",
+              "id_conflict_matching_email", "id_conflict_different_email",
+              "id_conflict_unverified_email", "email_conflict",
+              "account_changed", "project_changed", "identity_rate_limited",
+              "provider_readback_unavailable",
+              "background_unavailable", "registry_observed", "registry_unobserved",
+            ].includes(status)) probeRegistrationStatus = status;
+            const relation = response?.identityRelation;
+            if ([
+              "me_matches_session_account_id",
+              "me_differs_session_user_and_account_id",
+              "me_differs_session_user_without_account_id",
+              "unclassified", "not_observed",
+            ].includes(relation)) probeIdentityRelation = relation;
+            const contactProof = response?.contactProof;
+            if ([
+              "emails_match", "emails_differ", "session_email_missing",
+              "me_email_missing", "both_emails_missing", "not_observed",
+            ].includes(contactProof)) probeEmailProof = contactProof;
+            const bearerRelation = response?.bearerRelation;
+            if ([
+              "bearer_token_unavailable", "bearer_not_authorized",
+              "bearer_rate_limited", "bearer_response_unavailable",
+              "bearer_identity_missing", "bearer_matches_session_user",
+              "bearer_matches_session_account", "bearer_matches_cookie_me",
+              "bearer_differs_from_session", "bearer_network_unavailable",
+              "not_observed",
+            ].includes(bearerRelation)) probeBearerRelation = bearerRelation;
           })
           .catch(() => {
             identityProbeFailed = true;
@@ -4015,6 +4053,10 @@ async function handleBrowserActuation(command) {
             },
             observed_scope: observedScope,
             scope_failure: scopeFailure,
+            registration_status: probeRegistrationStatus,
+            identity_relation: probeIdentityRelation,
+            contact_proof: probeEmailProof,
+            bearer_relation: probeBearerRelation,
             tab_opened: true,
             tab_closed: tabClosed,
             tab_cleanup_verified: tabCleanupVerified,
@@ -8685,6 +8727,15 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "scroll_unavailable",
   "press_params_invalid",
   "press_unavailable",
+  "browser_page_generation_stale",
+  "browser_page_navigation_owned_only",
+  "browser_page_navigation_unchanged",
+  "browser_page_navigation_unavailable",
+  "browser_page_navigation_history_unavailable",
+  "browser_page_navigation_history_ambiguous",
+  "browser_page_navigation_history_out_of_scope",
+  "browser_page_navigation_history_mismatch",
+  "browser_page_navigation_view_changed",
   "hover_only_target",
   "hover_target_offscreen",
   "hover_target_obscured",
@@ -8749,6 +8800,309 @@ async function adoptAppliedBrowserPageNavigation(page, tabId, rawNavigationUrl, 
     await sleep(100);
   }
   return false;
+}
+
+const BROWSER_PAGE_NAVIGATION_ACTIONS = new Set(["navigate", "reload", "back", "forward"]);
+const BROWSER_PAGE_NAVIGATION_TIMEOUT_MS = 5000;
+
+function isBrowserPageMutation(action) {
+  return action === "click"
+    || action === "hover"
+    || action === "fill"
+    || action === "scroll"
+    || action === "press"
+    || BROWSER_PAGE_NAVIGATION_ACTIONS.has(action);
+}
+
+// Navigation destinations are bounded to the exact authorized page origin. The
+// caller states the destination explicitly; a history move never guesses one.
+function browserPageNavigationUrl(rawUrl, page) {
+  try {
+    const parsed = new URL(String(rawUrl || ""));
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    if (parsed.username || parsed.password) return null;
+    if (!page?.origin || parsed.origin.toLowerCase() !== page.origin) return null;
+    return parsed.href;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function markBrowserPageNavigationStale(page) {
+  page.stale = true;
+  page.last_seen_at = Date.now();
+  await persistBrowserPages();
+}
+
+// Track only after Chrome settles a document this action actually produced.
+// reload has no URL change to prove progress, so it must observe a loading
+// event first; navigate/back/forward must observe the different destination
+// URL. The listener exists before the dispatch, and any read started before
+// the dispatch is finished before the tracker accepts evidence, so a stale
+// pre-navigation snapshot can never be mistaken for the result.
+async function trackBrowserPageNavigation(tabId, page, { reload = false, timeoutMs = BROWSER_PAGE_NAVIGATION_TIMEOUT_MS } = {}) {
+  const previousUrl = page.canonical_url;
+  let loadingSeen = false;
+  let done = false;
+  let timer = null;
+  let resolveWait = null;
+  const inspect = async () => {
+    let tab = null;
+    try { tab = await chrome.tabs.get(tabId); } catch (_) { return null; }
+    if (!tab?.url) return null;
+    const liveUrl = browserPageNavigationUrl(tab.url, page);
+    const urlChanged = Boolean(liveUrl && liveUrl !== previousUrl);
+    const leftOrigin = Boolean(tab.url) && !liveUrl;
+    if (tab.status === "complete" && (urlChanged || leftOrigin || (reload && loadingSeen))) {
+      return { tab, liveUrl, originChanged: leftOrigin };
+    }
+    return null;
+  };
+
+  // Baseline: this read was started before the dispatch, so its result cannot
+  // be evidence of the navigation. Do not attach the listener until it settles.
+  await inspect();
+
+  const deadline = Date.now() + timeoutMs;
+  const promise = new Promise((resolve) => { resolveWait = resolve; });
+  const finish = (value) => {
+    if (done) return;
+    done = true;
+    if (timer) clearTimeout(timer);
+    try { chrome.tabs.onUpdated.removeListener(listener); } catch (_) {}
+    resolveWait(value);
+  };
+  let stepping = false;
+  const step = () => {
+    if (done || stepping) return;
+    stepping = true;
+    inspect().then((value) => {
+      stepping = false;
+      if (done) return;
+      if (value) return finish(value);
+      if (Date.now() >= deadline) return finish(null);
+      timer = setTimeout(step, 50);
+    }).catch(() => {
+      stepping = false;
+      finish(null);
+    });
+  };
+  const listener = (updatedTabId, changeInfo) => {
+    if (updatedTabId !== tabId) return;
+    if (changeInfo?.status === "loading" || changeInfo?.pendingUrl) loadingSeen = true;
+    if (changeInfo?.status === "complete" || typeof changeInfo?.url === "string") step();
+  };
+  chrome.tabs.onUpdated.addListener(listener);
+  step();
+  return { wait: () => promise, stop: () => finish(null) };
+}
+
+async function settleBrowserPageNavigation(outcome, page, destination, { reload = false } = {}) {
+  const liveUrl = outcome ? browserPageNavigationUrl(outcome.tab?.url, page) : null;
+  if (!outcome || outcome.tab?.status !== "complete" || liveUrl !== destination) {
+    await markBrowserPageNavigationStale(page);
+    const error = outcome && outcome.originChanged
+      ? "browser_page_navigation_out_of_scope"
+      : outcome
+        ? "browser_page_navigation_mismatch"
+        : "browser_page_navigation_unverified";
+    return { ok: false, error };
+  }
+  const previous = {
+    canonical_url: page.canonical_url,
+    page_generation: page.page_generation,
+    observation_generation: page.observation_generation,
+    last_seen_at: page.last_seen_at,
+  };
+  page.canonical_url = destination;
+  page.page_generation = Number.isSafeInteger(page.page_generation)
+    ? page.page_generation + 1
+    : 1;
+  page.observation_generation = await getBrowserObservationGeneration();
+  page.last_seen_at = Date.now();
+  if (!await persistBrowserPages()) {
+    Object.assign(page, previous);
+    return { ok: false, error: "browser_page_storage_unavailable" };
+  }
+  return reload
+    ? { ok: true, reloaded: true, reloaded_url: destination }
+    : { ok: true, navigated: true, navigated_url: destination };
+}
+
+// History entries are not origin-scoped in Chrome: a task-owned tab can carry
+// a cross-origin entry immediately behind or ahead of the current document.
+// chrome.tabs.goBack/goForward would commit that entry before any postcondition
+// check, so history traversal is preflighted over CDP instead: prove the live
+// current entry is the recorded same-origin document and that the exact
+// adjacent entry equals the caller-supplied same-origin expected URL, then
+// navigate to that validated entry id only. Anything unavailable, ambiguous or
+// different fails closed before a navigation is committed.
+async function browserPageNavigateHistory(page, tab, action, destination) {
+  if (!chrome.debugger?.attach || !chrome.debugger?.sendCommand || !chrome.debugger?.detach) {
+    return { ok: false, error: "browser_page_navigation_history_unavailable", dispatched: false };
+  }
+  const exactTab = async () => {
+    try {
+      const live = await chrome.tabs.get(tab.id);
+      return live?.windowId === tab.windowId
+        && live?.url === page.canonical_url
+        && live?.status === "complete";
+    } catch (_) {
+      return false;
+    }
+  };
+  const target = { tabId: tab.id };
+  let attached = false;
+  let dispatched = false;
+  let failure = null;
+  try {
+    if (!await exactTab()) {
+      failure = { error: "browser_page_navigation_view_changed", dispatched: false };
+      return failure;
+    }
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    // Read-only: the raw entry list never leaves this function, and no entry
+    // URL/title is echoed in a result or diagnostic.
+    const history = await chrome.debugger.sendCommand(target, "Page.getNavigationHistory");
+    const entries = Array.isArray(history?.entries) ? history.entries : [];
+    const currentIndex = Number(history?.currentIndex);
+    const adjacentIndex = action === "back" ? currentIndex - 1 : currentIndex + 1;
+    if (!Number.isInteger(currentIndex)
+        || currentIndex < 0
+        || currentIndex >= entries.length
+        || !Number.isInteger(adjacentIndex)
+        || adjacentIndex < 0
+        || adjacentIndex >= entries.length) {
+      failure = { error: "browser_page_navigation_history_ambiguous", dispatched: false };
+    } else {
+      const currentUrl = browserPageNavigationUrl(entries[currentIndex]?.url, page);
+      const adjacentUrl = browserPageNavigationUrl(entries[adjacentIndex]?.url, page);
+      const adjacentId = Number(entries[adjacentIndex]?.id);
+      if (currentUrl !== page.canonical_url) {
+        failure = {
+          error: currentUrl
+            ? "browser_page_navigation_history_mismatch"
+            : "browser_page_navigation_history_out_of_scope",
+          dispatched: false,
+        };
+      } else if (adjacentUrl !== destination) {
+        failure = {
+          error: adjacentUrl
+            ? "browser_page_navigation_history_mismatch"
+            : "browser_page_navigation_history_out_of_scope",
+          dispatched: false,
+        };
+      } else if (!Number.isSafeInteger(adjacentId)) {
+        failure = { error: "browser_page_navigation_history_ambiguous", dispatched: false };
+      } else if (!await exactTab()) {
+        // Re-read after the history snapshot: a tab or document race in the
+        // preflight window must fail closed, never commit the stale entry.
+        failure = { error: "browser_page_navigation_view_changed", dispatched: false };
+      } else {
+        dispatched = true;
+        await chrome.debugger.sendCommand(target, "Page.navigateToHistoryEntry", {
+          entryId: adjacentId,
+        });
+      }
+    }
+  } catch (_) {
+    failure = dispatched
+      ? { error: "browser_page_navigation_history_unconfirmed", dispatched: true }
+      : { error: "browser_page_navigation_history_unavailable", dispatched: false };
+  } finally {
+    if (attached) {
+      let detachVerified = false;
+      for (let attempt = 0; attempt < 2 && !detachVerified; attempt += 1) {
+        try {
+          await chrome.debugger.detach(target);
+          detachVerified = true;
+        } catch (_) {}
+      }
+      if (!detachVerified) {
+        return {
+          ok: false,
+          error: "browser_page_navigation_debugger_detach_unverified",
+          dispatched,
+        };
+      }
+    }
+  }
+  return failure ? { ok: false, ...failure } : { ok: true };
+}
+
+async function performBrowserPageNavigation(page, tab, action, msg) {
+  const pageGeneration = Number(msg?.pageGeneration);
+  if (!Number.isSafeInteger(pageGeneration) || pageGeneration !== page.page_generation) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_generation_stale",
+    }, page, false);
+  }
+  // Every navigation rewrites the tab's document or history state, so all
+  // four actions stay task-owned; a claimed user tab must never be navigated.
+  if (page.ownership !== "owned") {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_owned_only",
+    }, page, false);
+  }
+  const destination = action === "navigate"
+    ? browserPageNavigationUrl(msg?.url, page)
+    : (action === "back" || action === "forward")
+      ? browserPageNavigationUrl(msg?.expectedUrl, page)
+      : page.canonical_url;
+  if (!destination) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_out_of_scope",
+    }, page, false);
+  }
+  if (action !== "reload" && destination === page.canonical_url) {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_unchanged",
+    }, page, false);
+  }
+  if (tab?.status !== "complete") {
+    return browserPageMutationEnvelope({
+      ok: false,
+      error: "browser_page_navigation_unavailable",
+    }, page, false);
+  }
+  const tracked = await trackBrowserPageNavigation(tab.id, page, { reload: action === "reload" });
+  if (action === "back" || action === "forward") {
+    const traversal = await browserPageNavigateHistory(page, tab, action, destination);
+    if (!traversal.ok) {
+      tracked.stop();
+      if (traversal.dispatched) await markBrowserPageNavigationStale(page);
+      return browserPageMutationEnvelope({
+        ok: false,
+        error: traversal.error,
+      }, page, traversal.dispatched);
+    }
+  } else {
+    try {
+      if (action === "navigate") {
+        await chrome.tabs.update(tab.id, { url: destination });
+      } else {
+        await chrome.tabs.reload(tab.id);
+      }
+    } catch (error) {
+      tracked.stop();
+      await markBrowserPageNavigationStale(page);
+      return browserPageMutationEnvelope({
+        ok: false,
+        error: "browser_page_navigation_transport_failed",
+        detail: String(error?.message || error || ""),
+      }, page, true);
+    }
+  }
+
+  const settled = await settleBrowserPageNavigation(await tracked.wait(), page, destination, {
+    reload: action === "reload",
+  });
+  return browserPageMutationEnvelope(settled, page, true);
 }
 
 function browserImageArtifactMetadata(response) {
@@ -9035,7 +9389,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table"].includes(action)) {
+  if (!["observe", "click", "hover", "fill", "expect", "screenshot", "scroll", "press", "extract", "extract_table", "navigate", "reload", "back", "forward"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -9045,7 +9399,7 @@ async function performBrowserPageActionRequest(msg) {
 
   const pageRef = String(msg?.pageRef || "");
   if (!validBrowserPageRef(pageRef)) {
-    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
+    return isBrowserPageMutation(action)
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
       : { ok: false, error: "browser_page_ref_invalid" };
   }
@@ -9053,12 +9407,12 @@ async function performBrowserPageActionRequest(msg) {
   await loadBrowserPages();
   const record = browserPagesByRef.get(pageRef);
   if (!record) {
-    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
+    return isBrowserPageMutation(action)
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
       : { ok: false, error: "browser_page_not_found" };
   }
   if (record.endpoint_ref !== endpointRef) {
-    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
+    return isBrowserPageMutation(action)
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
       : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
   }
@@ -9071,18 +9425,21 @@ async function performBrowserPageActionRequest(msg) {
       reason: "host_permission_missing",
       origin: record.origin,
     };
-    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
+    return isBrowserPageMutation(action)
       ? browserPageMutationEnvelope(denied, record, false)
       : withBrowserPageIdentity(denied, record);
   }
 
   const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
   if (!resolved.ok) {
-    return action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press"
+    return isBrowserPageMutation(action)
       ? browserPageMutationEnvelope(resolved, record, false)
       : withBrowserPageIdentity(resolved, record);
   }
   const page = resolved.page;
+  if (BROWSER_PAGE_NAVIGATION_ACTIONS.has(action)) {
+    return performBrowserPageNavigation(page, resolved.tab, action, msg);
+  }
   if (action === "screenshot") {
     return captureBrowserPageScreenshot(page, resolved.tab);
   }
@@ -9117,7 +9474,7 @@ async function performBrowserPageActionRequest(msg) {
     ...(action === "fill" ? { mainWorldFill: true } : {}),
   };
 
-  const mutation = action === "click" || action === "hover" || action === "fill" || action === "scroll" || action === "press";
+  const mutation = isBrowserPageMutation(action);
   let sendAttempted = false;
   const send = async () => {
     sendAttempted = true;
@@ -10756,6 +11113,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
+  }
+
+  if (msg?.type === "h2w_clear_scope") {
+    // A refused conversation registration asks the background to forget this
+    // tab's Browser Registry scope and session targets. The tab is no longer
+    // proven to be the account/project the association was created for, so a
+    // later create or dispatch must not bind to it.
+    const clearedTabId = sender.tab?.id;
+    if (!clearedTabId) {
+      sendResponse({ cleared: false, reason: "missing_sender_tab" });
+      return false;
+    }
+    browserTabScopes.delete(clearedTabId);
+    for (const [sessionRef, target] of browserSessionTargets) {
+      if (target?.tabId === clearedTabId) browserSessionTargets.delete(sessionRef);
+    }
+    sendResponse({ cleared: true });
+    return false;
   }
 
   if (msg?.type === "h2w_extension_owner_status") {

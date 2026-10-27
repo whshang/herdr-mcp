@@ -9296,6 +9296,22 @@ fn browser_fast_path_call_with_semantic(
     unreachable!("bounded browser fast path loop always returns")
 }
 
+fn browser_page_action_http_url(value: Option<&Value>) -> Option<url::Url> {
+    let raw = value?.as_str()?;
+    if raw.len() > 4096 || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let url = url::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+    {
+        return None;
+    }
+    Some(url)
+}
+
 fn browser_page_action_call(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -9323,6 +9339,8 @@ fn browser_page_action_call(
         "key",
         "max_rows",
         "expected_url",
+        "url",
+        "page_generation",
     ];
     if let Some(key) = object
         .keys()
@@ -9387,13 +9405,14 @@ fn browser_page_action_call(
     let action = match object.get("action").and_then(Value::as_str) {
         Some(
             value @ ("observe" | "click" | "hover" | "fill" | "expect" | "screenshot" | "scroll"
-            | "extract" | "extract_table" | "press"),
+            | "extract" | "extract_table" | "press" | "navigate" | "reload" | "back"
+            | "forward"),
         ) => value,
         _ => {
             return json!({
                 "ok": false,
                 "code": "invalid_params",
-                "message": "action must be observe, click, hover, fill, expect, screenshot, scroll, extract, extract_table, or press",
+                "message": "action must be observe, click, hover, fill, expect, screenshot, scroll, extract, extract_table, press, navigate, reload, back, or forward",
             });
         }
     };
@@ -9406,8 +9425,18 @@ fn browser_page_action_call(
         });
     }
 
-    if action != "click" && object.contains_key("expected_url") {
-        return json!({"ok": false, "code": "invalid_params", "message": "expected_url is accepted only for click"});
+    if action != "navigate" && object.contains_key("url") {
+        return json!({"ok": false, "code": "invalid_params", "message": "url is accepted only for navigate"});
+    }
+
+    if !matches!(action, "click" | "back" | "forward") && object.contains_key("expected_url") {
+        return json!({"ok": false, "code": "invalid_params", "message": "expected_url is accepted only for click, back, or forward"});
+    }
+
+    if !matches!(action, "navigate" | "reload" | "back" | "forward")
+        && object.contains_key("page_generation")
+    {
+        return json!({"ok": false, "code": "invalid_params", "message": "page_generation is accepted only for navigation actions"});
     }
 
     if action != "observe" && object.contains_key("element_offset") {
@@ -9418,13 +9447,20 @@ fn browser_page_action_call(
         "page_ref": page_ref,
         "action": action,
     });
-    let mutation = matches!(action, "click" | "hover" | "fill" | "scroll" | "press");
+    let mutation = matches!(
+        action,
+        "click"
+            | "hover"
+            | "fill"
+            | "scroll"
+            | "press"
+            | "navigate"
+            | "reload"
+            | "back"
+            | "forward"
+    );
     let mut mutation_key: Option<&str> = None;
     let mut semantic_objective: Option<&str> = None;
-
-    if action != "scroll" && (object.contains_key("direction") || object.contains_key("amount")) {
-        return json!({"ok": false, "code": "invalid_params", "message": "direction/amount are accepted only for scroll"});
-    }
 
     match action {
         "observe" | "screenshot" => {
@@ -9716,6 +9752,86 @@ fn browser_page_action_call(
             bridge_params["ref"] = json!(element_ref);
             bridge_params["max_rows"] = json!(max_rows);
         }
+        "navigate" | "reload" | "back" | "forward" => {
+            for disallowed in [
+                "max_chars",
+                "generation",
+                "ref",
+                "value",
+                "condition",
+                "timeout_ms",
+                "objective",
+                "direction",
+                "amount",
+                "key",
+                "max_rows",
+            ] {
+                if object.contains_key(disallowed) {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": format!("{disallowed} is not accepted for {action}"),
+                    });
+                }
+            }
+            let page_generation = match object.get("page_generation").and_then(Value::as_u64) {
+                Some(value) if value > 0 && value <= i64::MAX as u64 => value,
+                _ => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "page_generation must be a positive integer",
+                    });
+                }
+            };
+            let idempotency_key = match object
+                .get("idempotency_key")
+                .and_then(Value::as_str)
+                .map(str::trim)
+            {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 256
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "idempotency_key is required for a browser page mutation",
+                    });
+                }
+            };
+            match action {
+                "navigate" => {
+                    let Some(url) = browser_page_action_http_url(object.get("url")) else {
+                        return json!({
+                            "ok": false,
+                            "code": "invalid_params",
+                            "message": "url must be a bounded absolute http(s) URL for navigate",
+                        });
+                    };
+                    bridge_params["url"] = json!(url.to_string());
+                }
+                "back" | "forward" => {
+                    let Some(expected) = browser_page_action_http_url(object.get("expected_url"))
+                    else {
+                        return json!({
+                            "ok": false,
+                            "code": "invalid_params",
+                            "message": "expected_url must be a bounded absolute http(s) URL for back/forward",
+                        });
+                    };
+                    bridge_params["expected_url"] = json!(expected.to_string());
+                }
+                "reload" => {}
+                _ => unreachable!(),
+            }
+            bridge_params["page_generation"] = json!(page_generation);
+            mutation_key = Some(idempotency_key);
+        }
         "click" | "hover" | "fill" | "scroll" | "press" => {
             for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
                 if object.contains_key(disallowed) {
@@ -9809,22 +9925,7 @@ fn browser_page_action_call(
             if action == "click"
                 && let Some(raw_expected) = object.get("expected_url")
             {
-                let valid_expected_url = || -> Option<url::Url> {
-                    let raw = raw_expected.as_str()?;
-                    if raw.len() > 4096 || raw.chars().any(char::is_control) {
-                        return None;
-                    }
-                    let url = url::Url::parse(raw).ok()?;
-                    if !matches!(url.scheme(), "http" | "https")
-                        || !url.username().is_empty()
-                        || url.password().is_some()
-                        || url.host_str().is_none()
-                    {
-                        return None;
-                    }
-                    Some(url)
-                };
-                let Some(expected) = valid_expected_url() else {
+                let Some(expected) = browser_page_action_http_url(Some(raw_expected)) else {
                     return json!({"ok": false, "code": "invalid_params", "message": "expected_url must be a bounded absolute http(s) URL"});
                 };
                 bridge_params["expected_url"] = json!(expected.to_string());
@@ -9991,6 +10092,16 @@ fn browser_page_action_call(
             "generation": bridge_params["generation"],
             "ref": bridge_params.get("ref"),
             "key": bridge_params["key"],
+        })
+    } else if matches!(action, "navigate" | "reload" | "back" | "forward") {
+        json!({
+            "operation": BROWSER_PAGE_ACTION_METHOD,
+            "endpoint_ref": endpoint_ref,
+            "page_ref": page_ref,
+            "action": action,
+            "page_generation": bridge_params["page_generation"],
+            "url": bridge_params.get("url"),
+            "expected_url": bridge_params.get("expected_url"),
         })
     } else {
         // Keep preexisting click/fill hashes identical when expected_url is absent.
@@ -22467,6 +22578,250 @@ mod tests {
         assert_eq!(upper_bound["ok"], true, "{upper_bound}");
         assert_eq!(upper_bound["element_offset"], 4096);
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn browser_page_navigation_actions_are_same_origin_generation_fenced_and_idempotent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct NavigationActuator {
+            calls: AtomicUsize,
+            seen: Mutex<Vec<Value>>,
+        }
+        impl BrowserActuator for NavigationActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("navigation must use the exact browser endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert!(dispatch_id.is_some());
+                assert!(params.get("endpoint_ref").is_none());
+                assert!(params.get("generation").is_none());
+                let action = params["action"].as_str().unwrap();
+                let mut result = json!({
+                    "ok": true,
+                    "delivery_state": "applied",
+                    "retry_safe": false,
+                    "mutation_submitted": true,
+                    "postcondition_observed": false,
+                });
+                match action {
+                    "navigate" => {
+                        result["navigated"] = json!(true);
+                        result["navigated_url"] = params["url"].clone();
+                        assert!(params.get("expected_url").is_none());
+                    }
+                    "reload" => {
+                        result["reloaded"] = json!(true);
+                        result["reloaded_url"] = json!("https://example.com/start");
+                        assert!(params.get("url").is_none());
+                        assert!(params.get("expected_url").is_none());
+                    }
+                    "back" | "forward" => {
+                        result["navigated"] = json!(true);
+                        result["navigated_url"] = params["expected_url"].clone();
+                        assert!(params.get("url").is_none());
+                    }
+                    other => panic!("unexpected navigation action {other}"),
+                }
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.seen.lock().unwrap().push(params.clone());
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(result);
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = NavigationActuator {
+            calls: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+        };
+        let page_ref = format!("bp_{}", "b".repeat(64));
+        let navigate = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "navigate",
+            "page_generation": 3,
+            "url": "https://example.com/next",
+            "idempotency_key": "navigate-once-1",
+        });
+
+        let applied = browser_page_action_call(&store, &navigate, &grants, Some(&actuator));
+        assert_eq!(applied["ok"], true, "{applied}");
+        assert_eq!(applied["delivery_state"], "applied");
+        assert_eq!(applied["navigated_url"], "https://example.com/next");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        {
+            let seen = actuator.seen.lock().unwrap();
+            assert_eq!(seen[0]["action"], "navigate");
+            assert_eq!(seen[0]["page_generation"], 3);
+            assert_eq!(seen[0]["url"], "https://example.com/next");
+        }
+
+        let replay = browser_page_action_call(&store, &navigate, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["navigated_url"], "https://example.com/next");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        for (field, value) in [
+            ("url", json!("https://example.com/other")),
+            ("page_generation", json!(4)),
+        ] {
+            let mut conflict = navigate.clone();
+            conflict[field] = value;
+            let result = browser_page_action_call(&store, &conflict, &grants, Some(&actuator));
+            assert_eq!(result["code"], "idempotency_key_conflict", "{result}");
+        }
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        for (field, value) in [
+            ("url", json!("javascript:alert(1)")),
+            ("url", json!("https://user:secret@example.com/next")),
+            ("url", json!("/relative")),
+            ("page_generation", json!(0)),
+            ("generation", json!("pa_gen_nav")),
+            ("expected_url", json!("https://example.com/next")),
+            ("ref", json!("ref_pa_gen_nav_0")),
+        ] {
+            let mut invalid = navigate.clone();
+            invalid[field] = value;
+            invalid["idempotency_key"] = json!(format!("navigate-invalid-{field}"));
+            assert_eq!(
+                browser_page_action_call(&store, &invalid, &grants, Some(&actuator))["code"],
+                "invalid_params",
+                "field {field}"
+            );
+        }
+        let mut missing_key = navigate.clone();
+        missing_key["idempotency_key"] = json!("");
+        assert_eq!(
+            browser_page_action_call(&store, &missing_key, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        let mut missing_generation = navigate.clone();
+        missing_generation
+            .as_object_mut()
+            .unwrap()
+            .remove("page_generation");
+        missing_generation["idempotency_key"] = json!("navigate-missing-generation");
+        assert_eq!(
+            browser_page_action_call(&store, &missing_generation, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        let reload = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "reload",
+            "page_generation": 4,
+            "idempotency_key": "reload-once-1",
+        });
+        let reloaded = browser_page_action_call(&store, &reload, &grants, Some(&actuator));
+        assert_eq!(reloaded["ok"], true, "{reloaded}");
+        assert_eq!(reloaded["reloaded_url"], "https://example.com/start");
+        let reload_replay = browser_page_action_call(&store, &reload, &grants, Some(&actuator));
+        assert_eq!(reload_replay["idempotent_replay"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+        {
+            let seen = actuator.seen.lock().unwrap();
+            assert_eq!(seen[1]["action"], "reload");
+            assert_eq!(seen[1]["page_generation"], 4);
+        }
+        let mut reload_with_url = reload.clone();
+        reload_with_url["url"] = json!("https://example.com/start");
+        reload_with_url["idempotency_key"] = json!("reload-invalid-url");
+        assert_eq!(
+            browser_page_action_call(&store, &reload_with_url, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+
+        for action in ["back", "forward"] {
+            let request = json!({
+                "endpoint_ref": "bep_test",
+                "page_ref": page_ref,
+                "action": action,
+                "page_generation": 5,
+                "expected_url": "https://example.com/start",
+                "idempotency_key": format!("{action}-once-1"),
+            });
+            let applied = browser_page_action_call(&store, &request, &grants, Some(&actuator));
+            assert_eq!(applied["ok"], true, "{applied}");
+            assert_eq!(applied["navigated_url"], "https://example.com/start");
+            let replay = browser_page_action_call(&store, &request, &grants, Some(&actuator));
+            assert_eq!(replay["idempotent_replay"], true);
+            let mut changed = request.clone();
+            changed["expected_url"] = json!("https://example.com/other");
+            assert_eq!(
+                browser_page_action_call(&store, &changed, &grants, Some(&actuator))["code"],
+                "idempotency_key_conflict"
+            );
+        }
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 4);
+        {
+            let seen = actuator.seen.lock().unwrap();
+            assert_eq!(seen[2]["action"], "back");
+            assert_eq!(seen[2]["expected_url"], "https://example.com/start");
+            assert_eq!(seen[3]["action"], "forward");
+            assert_eq!(seen[3]["expected_url"], "https://example.com/start");
+        }
+
+        let mut back_with_url = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "back",
+            "page_generation": 6,
+            "url": "https://example.com/start",
+            "idempotency_key": "back-url-invalid",
+        });
+        assert_eq!(
+            browser_page_action_call(&store, &back_with_url, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        back_with_url["expected_url"] = json!("https://example.com/start");
+        assert_eq!(
+            browser_page_action_call(&store, &back_with_url, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+
+        let click_with_generation = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "click",
+            "generation": "pa_gen_nav",
+            "ref": "ref_pa_gen_nav_0",
+            "page_generation": 6,
+            "idempotency_key": "click-page-generation-invalid",
+        });
+        assert_eq!(
+            browser_page_action_call(&store, &click_with_generation, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]
