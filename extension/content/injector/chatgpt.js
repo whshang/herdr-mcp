@@ -401,6 +401,35 @@ class ChatGPTAdapter extends BaseAdapter {
       : 'div.ProseMirror[role="textbox"][contenteditable="true"]';
   }
 
+  // Page-level generation authority. The composer-scoped candidate list can miss
+  // the stop control during thinking/tool phases, while the page-wide control is
+  // still present. Any visible, strictly validated stop control on the
+  // conversation page means a generation is running; the same page-wide scan is
+  // already used by the MAIN-world render-containment script.
+  isGenerationInProgress() {
+    const stopLabel = /^(?:stop|stop generating|stop streaming|stop response|停止|停止生成|停止流式|停止回答)$/i;
+    const selectors = [
+      'button[data-testid*="stop"]',
+      '[role="button"][data-testid*="stop"]',
+      'button[aria-label*="stop" i]',
+      '[role="button"][aria-label*="stop" i]',
+      'button[aria-label*="停止"]',
+      '[role="button"][aria-label*="停止"]',
+    ];
+    for (const selector of selectors) {
+      for (const el of document.querySelectorAll(selector)) {
+        if (!this.elementVisible(el)) continue;
+        const testId = String(el.getAttribute('data-testid') || '').trim().toLowerCase();
+        if (testId.includes('stop')) return true;
+        const values = [el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText, el.textContent]
+          .map((value) => String(value || '').trim().replace(/\s+/g, ' '))
+          .filter(Boolean);
+        if (values.some((value) => stopLabel.test(value))) return true;
+      }
+    }
+    return false;
+  }
+
   getSendButtonCandidates() {
     const selectors = [
       'button[data-testid="send-button"]',
