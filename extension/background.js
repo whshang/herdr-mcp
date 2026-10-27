@@ -3958,6 +3958,7 @@ async function handleBrowserActuation(command) {
               "not_observed", "identity_observed", "identity_unavailable",
               "id_conflict_matching_email", "id_conflict_different_email",
               "id_conflict_unverified_email", "email_conflict",
+              "account_changed", "project_changed", "identity_rate_limited",
               "provider_readback_unavailable",
               "background_unavailable", "registry_observed", "registry_unobserved",
             ].includes(status)) probeRegistrationStatus = status;
@@ -10779,6 +10780,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
+  }
+
+  if (msg?.type === "h2w_clear_scope") {
+    // A refused conversation registration asks the background to forget this
+    // tab's Browser Registry scope and session targets. The tab is no longer
+    // proven to be the account/project the association was created for, so a
+    // later create or dispatch must not bind to it.
+    const clearedTabId = sender.tab?.id;
+    if (!clearedTabId) {
+      sendResponse({ cleared: false, reason: "missing_sender_tab" });
+      return false;
+    }
+    browserTabScopes.delete(clearedTabId);
+    for (const [sessionRef, target] of browserSessionTargets) {
+      if (target?.tabId === clearedTabId) browserSessionTargets.delete(sessionRef);
+    }
+    sendResponse({ cleared: true });
+    return false;
   }
 
   if (msg?.type === "h2w_extension_owner_status") {

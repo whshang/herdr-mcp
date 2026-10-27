@@ -159,11 +159,13 @@ function loadAdapterWithDocument(document, fetch = undefined) {
     BaseAdapter,
     registerH2WAdapter: (registered) => { adapter = registered; },
     document,
-    fetch,
+    location: { origin: "https://chatgpt.com", pathname: "/c/current" },
+    // Browser globals the adapter legitimately uses; the vm context does not
+    // provide them by itself.
     AbortController,
     setTimeout,
     clearTimeout,
-    location: { origin: "https://chatgpt.com", pathname: "/c/current" },
+    ...(fetch ? { fetch } : {}),
   }, { filename: "chatgpt.js" });
   return adapter;
 }
@@ -341,6 +343,86 @@ test("user refuses unproven bearer login identity | Given a mismatched cookie us
   payloads["/api/auth/session"].user.id = "changed-session-user";
   const noEmail = await adapter.getAccountObservation();
   assert.equal(noEmail.nativeIdentity, null, "bearer proof alone cannot publish an unlabeled account");
+});
+
+test("user avoids hammering a throttled identity endpoint | Given /backend-api/me returns HTTP 429 with Retry-After | When account identity is observed twice in a row | Then the second authenticated endpoint is never read and nothing is read inside the cooldown", async () => {
+  const requests = [];
+  let rateLimited = true;
+  const fetch = async (url) => {
+    requests.push(url);
+    return rateLimited
+      ? { ok: false, status: 429, headers: { get: (key) => key.toLowerCase() === "retry-after" ? "45" : null } }
+      : { ok: true, status: 200, json: async () => ({ id: "current-user" }) };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+
+  assert.equal(await adapter.getAccountNativeIdentity(), null, "a throttled probe reports no identity");
+  assert.deepEqual(requests, ["/backend-api/me"], "the first 429 must short-circuit the second authenticated fetch");
+  assert.equal(await adapter.getAccountNativeIdentity(), null);
+  assert.equal(requests.length, 1, "back-to-back identity probes must not re-read inside the cooldown");
+  assert.ok(adapter._accountIdentity429Until - Date.now() >= 45000, "Retry-After is honoured as a lower bound");
+
+  // The cooldown is a bounded delay, not a permanent identity blackout.
+  adapter._accountIdentity429Until = Date.now() - 1;
+  rateLimited = false;
+  assert.equal(await adapter.getAccountNativeIdentity(), "current-user", "identity probing resumes after the cooldown");
+  assert.deepEqual(requests.slice(1), ["/backend-api/me", "/api/auth/session"],
+    "the resumed observation cross-checks both authenticated endpoints");
+});
+
+test("user cools the secondary identity endpoint | Given /backend-api/me has no user id and /api/auth/session returns HTTP 429 | When a new identity probe arrives | Then both authenticated endpoints are read once and repeated probes are suppressed", async () => {
+  const requests = [];
+  const fetch = async (url) => {
+    requests.push(url);
+    return url === "/backend-api/me"
+      ? { ok: true, status: 200, json: async () => ({}) }
+      : { ok: false, status: 429, headers: { get: () => "30" } };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+
+  assert.equal(await adapter.getAccountNativeIdentity(), null);
+  assert.deepEqual(requests, ["/backend-api/me", "/api/auth/session"]);
+  assert.equal(await adapter.getAccountNativeIdentity(), null);
+  assert.equal(requests.length, 2, "the cooldown must cover both authenticated endpoints");
+});
+
+test("user bounds an untrusted Retry-After | Given the identity endpoint returns HTTP 429 with Retry-After 999999 | When the probe computes its cooldown | Then the delay stays inside the bounded policy instead of trusting the header", async () => {
+  const fetch = async () => ({ ok: false, status: 429, headers: { get: () => "999999" } });
+  const adapter = loadAdapterWithDocument({}, fetch);
+
+  assert.equal(await adapter.getAccountNativeIdentity(), null);
+  const remainingMs = adapter._accountIdentity429Until - Date.now();
+  assert.ok(remainingMs > 0 && remainingMs <= 120000, `cooldown ${remainingMs}ms must stay bounded`);
+});
+
+test("user cools the identity probe after a throttled bearer check | Given the cookie endpoints disagree and the bearer verification returns HTTP 429 | When the next observation runs | Then the bearer check arms the cooldown and no identity read happens inside it", async () => {
+  const requests = [];
+  const fetch = async (url, options = {}) => {
+    requests.push(options.headers?.authorization ? `${url}#bearer` : url);
+    if (url === "/backend-api/me" && options.headers?.authorization) {
+      return { ok: false, status: 429, headers: { get: () => "20" } };
+    }
+    if (url === "/backend-api/me") return { ok: true, json: async () => ({ id: "cookie-user" }) };
+    return {
+      ok: true,
+      json: async () => ({
+        user: { id: "session-user", email: "current@example.com" },
+        accessToken: "test-token-not-for-logging",
+      }),
+    };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const observed = await adapter.getAccountObservation();
+  assert.equal(observed.nativeIdentity, null);
+  assert.equal(observed.bearerRelation, "bearer_rate_limited");
+  assert.deepEqual(requests, ["/backend-api/me", "/api/auth/session", "/backend-api/me#bearer"]);
+  const armedMs = adapter._accountIdentity429Until - Date.now();
+  assert.ok(armedMs > 0 && armedMs <= 120000, `a bearer 429 must arm a bounded cooldown, got ${armedMs}ms`);
+
+  const throttled = await adapter.getAccountObservation();
+  assert.equal(throttled.nativeIdentity, null);
+  assert.equal(throttled.reason, "authenticated_rate_limited");
+  assert.equal(requests.length, 3, "no authenticated identity read may run inside the cooldown");
 });
 
 test("user never accepts plain text as an App identity | Given an accepted turn with only the text @herdr | When the accepted message identity is read | Then no App is reported", () => {
