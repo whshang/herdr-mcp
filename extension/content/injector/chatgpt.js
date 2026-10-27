@@ -59,6 +59,12 @@ class ChatGPTAdapter extends BaseAdapter {
     return { ok: false, error: "chat_mode_switch_timeout" };
   }
 
+  displayEmailFromPayload(payload) {
+    const raw = payload?.email || payload?.user?.email || payload?.account?.email || payload?.email_address || null;
+    const email = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+    return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null;
+  }
+
   // Bounded cooldown for authenticated account-identity probes. ChatGPT answers
   // identity reads with HTTP 429 when the account is throttled, and account
   // registration observations can repeat, so a throttled probe must stop both
@@ -77,7 +83,22 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   async getAccountNativeIdentity(timeoutMs = 1500) {
-    if (Date.now() < (this._accountIdentity429Until || 0)) return null;
+    return (await this.getAccountObservation(timeoutMs))?.nativeIdentity ?? null;
+  }
+
+  // One authenticated observation of the signed-in account. The two provider
+  // endpoints are cross-checked instead of trusting the first response: an old
+  // tab can retain the former account's /me payload after an account switch.
+  // Only the identity/email facts and a fixed diagnostic vocabulary leave this
+  // method; raw payloads, IDs and tokens never reach the extension host.
+  async getAccountObservation(timeoutMs = 1500) {
+    // The cooldown lives on the shared observation entrypoint so every caller
+    // (identity probes and registration observations alike) is gated by it.
+    if (Date.now() < (this._accountIdentity429Until || 0)) {
+      return { nativeIdentity: null, email: null };
+    }
+    let nativeIdentity = null;
+    let email = null;
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -90,20 +111,130 @@ class ChatGPTAdapter extends BaseAdapter {
           signal: controller.signal,
         });
         if (response.status === 429) {
+          // A throttled probe stops here: the cooldown covers both
+          // authenticated endpoints. The neutral observation keeps the
+          // `{nativeIdentity, email}` contract every caller reads.
           this.noteAccountIdentity429(response);
-          return null;
+          return { nativeIdentity: null, email: null };
         }
         if (!response.ok) continue;
         this._accountIdentity429Count = 0;
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-        if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+        const observedIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+        if (!observedIdentity) continue;
+        const observedEmail = this.displayEmailFromPayload(payload);
+        // An old tab can retain the former account's authenticated /me response
+        // after a ChatGPT account switch. Reject conflicting provider identities.
+        if (nativeIdentity && observedIdentity !== nativeIdentity) {
+          const reason = email && observedEmail
+            ? (email === observedEmail
+              ? "native_id_conflict_matching_email" : "native_id_conflict_different_email")
+            : "native_id_conflict_unverified_email";
+          // Only compare identity equality and source shape. Never return the
+          // raw identifiers or session/account payload to the extension host.
+          const sessionAccountId = typeof payload?.account?.id === "string"
+            ? payload.account.id.trim() : "";
+          const idRelation = url === "/api/auth/session"
+            ? (sessionAccountId
+              ? (nativeIdentity === sessionAccountId
+                ? "me_matches_session_account_id" : "me_differs_session_user_and_account_id")
+              : "me_differs_session_user_without_account_id")
+            : "unclassified";
+          const emailProof = email && observedEmail
+            ? (email === observedEmail ? "emails_match" : "emails_differ")
+            : (email ? "session_email_missing"
+              : (observedEmail ? "me_email_missing" : "both_emails_missing"));
+          let bearerRelation = "bearer_token_unavailable";
+          // Probe only after conflicting cookie-authenticated responses. The
+          // bearer token remains in this page's memory and never enters a
+          // background message, log, Registry record or diagnostic payload.
+          if (url === "/api/auth/session" && typeof payload?.accessToken === "string"
+              && payload.accessToken.trim()) {
+            const now = Date.now();
+            const cached = this._bearerIdentityProbe;
+            if (cached && cached.meId === nativeIdentity
+                && cached.sessionUserId === observedIdentity
+                && cached.sessionAccountId === sessionAccountId
+                && now - cached.checkedAt < 30_000) {
+              bearerRelation = cached.relation;
+            } else {
+              const bearerController = new AbortController();
+              const bearerTimer = setTimeout(() => bearerController.abort(), timeoutMs);
+              try {
+                const verified = await fetch("/backend-api/me", {
+                  method: "GET",
+                  credentials: "include",
+                  cache: "no-store",
+                  headers: {
+                    accept: "application/json",
+                    authorization: `Bearer ${payload.accessToken}`,
+                  },
+                  signal: bearerController.signal,
+                });
+                if (!verified.ok) {
+                  // A throttled bearer probe arms the same cooldown: the account is
+                  // rate limited on both authenticated paths, so the next
+                  // observation must not immediately re-read either endpoint.
+                  if (verified.status === 429) this.noteAccountIdentity429(verified);
+                  bearerRelation = verified.status === 401 || verified.status === 403
+                    ? "bearer_not_authorized" : verified.status === 429
+                      ? "bearer_rate_limited" : "bearer_response_unavailable";
+                } else {
+                  const identity = await verified.json();
+                  const candidateId = identity?.id || identity?.user?.id || identity?.account?.id;
+                  const bearerId = typeof candidateId === "string" ? candidateId.trim() : "";
+                  bearerRelation = !bearerId ? "bearer_identity_missing"
+                    : bearerId === observedIdentity ? "bearer_matches_session_user"
+                    : bearerId === sessionAccountId ? "bearer_matches_session_account"
+                    : bearerId === nativeIdentity ? "bearer_matches_cookie_me"
+                    : "bearer_differs_from_session";
+                }
+              } catch (_) {
+                bearerRelation = "bearer_network_unavailable";
+              } finally {
+                clearTimeout(bearerTimer);
+              }
+              this._bearerIdentityProbe = {
+                meId: nativeIdentity,
+                sessionUserId: observedIdentity,
+                sessionAccountId,
+                relation: bearerRelation,
+                checkedAt: now,
+              };
+            }
+          }
+          // The cookie-backed /me ID may come from a stale account or a
+          // different ID namespace. Accept only a current-session user ID
+          // independently confirmed by /me using that session's bearer token,
+          // with a valid current email and no contradictory email evidence.
+          // All other conflicts continue to fail closed.
+          if (bearerRelation === "bearer_matches_session_user"
+              && observedEmail && (!email || email === observedEmail)) {
+            this._accountIdentity429Count = 0;
+            return {
+              nativeIdentity: observedIdentity,
+              email: observedEmail,
+              identityVerification: "bearer_verified_session_user",
+              idRelation, emailProof, bearerRelation,
+            };
+          }
+          return { nativeIdentity: null, email: null, reason, idRelation, emailProof, bearerRelation };
+        }
+        if (email && observedEmail && email !== observedEmail) {
+          return { nativeIdentity: null, email: null, reason: "email_conflict" };
+        }
+        nativeIdentity = observedIdentity;
+        email ||= observedEmail;
       } catch (_) {
       } finally {
         clearTimeout(timer);
       }
     }
-    return null;
+    if (nativeIdentity) this._accountIdentity429Count = 0;
+    return nativeIdentity
+      ? { nativeIdentity, email }
+      : { nativeIdentity: null, email: null, reason: "authenticated_identity_unavailable" };
   }
 
   getConversationKey() {
@@ -204,11 +335,13 @@ class ChatGPTAdapter extends BaseAdapter {
     return this.getComposerTextWithoutAppPills() === '';
   }
 
-  // The composer's own native mention popup, resolved only through the
-  // provider's own association attributes (aria-controls / aria-owns). There is
-  // deliberately no document-wide fallback: when the composer does not own a
-  // visible popup, App selection fails closed instead of clicking an unrelated
-  // control that happens to share the keyword.
+  // The composer's own native mention popup, resolved through the provider's
+  // own association attributes (aria-controls / aria-owns) or, on newer
+  // ChatGPT builds, the provider's own mention shell class. There is
+  // deliberately no document-wide menu/button fallback: when neither the
+  // composer nor a strictly validated provider shell owns a visible popup, App
+  // selection fails closed instead of clicking an unrelated control that
+  // happens to share the keyword.
   getComposerOwnedPopup(input = this.getInputEl()) {
     if (!input) return null;
     const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
@@ -218,7 +351,25 @@ class ChatGPTAdapter extends BaseAdapter {
       const popup = document.getElementById(id);
       if (popup && !input.contains(popup) && visible(popup)) return popup;
     }
-    return null;
+    return this.getProviderMentionShell(input, visible);
+  }
+
+  // Live 2026-10-25 evidence: the current ChatGPT @ picker is a single
+  // provider-owned `ComposerTopMenuShell-*` overlay with no aria-controls or
+  // aria-owns link on the input, and no menu/listbox/option roles. It is
+  // accepted as this composer's popup only while this composer is the focused
+  // editor in a focused document and its plain input text is still exactly the
+  // mention search (`@` or `@keyword`), and only when exactly one such visible
+  // shell exists. Anything else returns nothing.
+  getProviderMentionShell(input, visible) {
+    if (input !== document.activeElement && !input.contains(document.activeElement)) return null;
+    if (typeof document.hasFocus === 'function' && !document.hasFocus()) return null;
+    if (!/^@[a-z0-9_-]{0,64}$/.test(String(this.getComposerTextWithoutAppPills() || '').toLowerCase())) return null;
+    const isMentionShell = (element) => String(element.getAttribute('class') || '').split(/\s+/)
+      .some((token) => /^ComposerTopMenuShell-.+$/.test(token));
+    const shells = [...document.querySelectorAll('div[class*="ComposerTopMenuShell-"]')]
+      .filter((element) => isMentionShell(element) && visible(element) && !input.contains(element));
+    return shells.length === 1 ? shells[0] : null;
   }
 
   // Live 0.1.168 evidence: after trusted `@herdr` keys ChatGPT renders the
@@ -488,6 +639,7 @@ class ChatGPTAdapter extends BaseAdapter {
       'button[aria-label="Stop streaming" i]',
       'button[aria-label="停止生成"]',
       'button[aria-label="停止流式"]',
+      'button[aria-label="停止"]',
     ];
     const seen = new Set();
     const out = [];

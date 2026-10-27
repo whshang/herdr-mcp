@@ -150,7 +150,7 @@ function matchesSimple(element, selector) {
   return true;
 }
 
-function loadAdapterWithDocument(document, fetch) {
+function loadAdapterWithDocument(document, fetch = undefined) {
   let adapter;
   class BaseAdapter {
     elementVisible(element) { return element?.visible === true; }
@@ -225,6 +225,126 @@ test("user app search fails closed without a composer-owned popup | Given a matc
   assert.equal(adapter.getComposerAppSuggestionButtons("herdr").length, 0);
 });
 
+test("user rejects inconsistent ChatGPT account identity | Given authenticated endpoints name different users | When the adapter observes login | Then registration identity is unavailable", async () => {
+  const payloads = {
+    "/backend-api/me": { id: "prior-login", email: "prior@example.com" },
+    "/api/auth/session": { user: { id: "new-login", email: "current@example.com" } },
+  };
+  const fetch = async (url) => ({ ok: true, json: async () => payloads[url] });
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const mismatch = await adapter.getAccountObservation();
+  assert.equal(mismatch.nativeIdentity, null);
+  assert.equal(mismatch.email, null);
+  assert.equal(mismatch.reason, "native_id_conflict_different_email");
+  payloads["/api/auth/session"].account = { id: "prior-login" };
+  const accountIdMatchesMe = await adapter.getAccountObservation();
+  assert.equal(accountIdMatchesMe.nativeIdentity, null, "do not silently reconcile different identity namespaces");
+  assert.equal(accountIdMatchesMe.idRelation, "me_matches_session_account_id");
+  assert.equal(accountIdMatchesMe.emailProof, "emails_differ");
+  payloads["/api/auth/session"].account.id = "other-account";
+  const accountIdDiffersMe = await adapter.getAccountObservation();
+  assert.equal(accountIdDiffersMe.idRelation, "me_differs_session_user_and_account_id");
+  assert.equal(accountIdDiffersMe.emailProof, "emails_differ");
+  delete payloads["/api/auth/session"].account;
+  const noAccountId = await adapter.getAccountObservation();
+  assert.equal(noAccountId.idRelation, "me_differs_session_user_without_account_id");
+
+  payloads["/api/auth/session"].user.email = "prior@example.com";
+  const sameEmailDifferentId = await adapter.getAccountObservation();
+  assert.equal(sameEmailDifferentId.nativeIdentity, null);
+  assert.equal(sameEmailDifferentId.reason, "native_id_conflict_matching_email");
+  payloads["/api/auth/session"].user.email = "current@example.com";
+
+  payloads["/api/auth/session"].user.id = "prior-login";
+  const emailConflict = await adapter.getAccountObservation();
+  assert.equal(emailConflict.nativeIdentity, null, "conflicting verified emails also fail closed");
+  assert.equal(emailConflict.email, null);
+  assert.equal(emailConflict.reason, "email_conflict");
+  payloads["/api/auth/session"].user.email = "prior@example.com";
+  const consistent = await adapter.getAccountObservation();
+  assert.equal(consistent.nativeIdentity, "prior-login");
+  assert.equal(consistent.email, "prior@example.com");
+});
+
+test("user safely adopts a bearer-verified session identity | Given conflicting cookie and session IDs | When the active bearer proves the session user | Then the canonical account identity is bounded and cache-safe", async () => {
+  let bearerCalls = 0;
+  const payloads = {
+    "/backend-api/me": { id: "old-identity" },
+    "/api/auth/session": {
+      user: { id: "current-user", email: "current@example.com" },
+      account: { id: "current-account" },
+      accessToken: "test-token-not-for-logging",
+    },
+  };
+  const fetch = async (url, options = {}) => {
+    if (url === "/backend-api/me" && options.headers?.authorization) {
+      bearerCalls++;
+      assert.equal(options.headers.authorization, "Bearer test-token-not-for-logging");
+      return { ok: true, json: async () => ({ id: "current-user" }) };
+    }
+    return { ok: true, json: async () => payloads[url] };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const observed = await adapter.getAccountObservation();
+  assert.equal(observed.nativeIdentity, "current-user", "bearer-proven active session user becomes the canonical identity");
+  assert.equal(observed.email, "current@example.com");
+  assert.equal(observed.identityVerification, "bearer_verified_session_user");
+  assert.equal(observed.bearerRelation, "bearer_matches_session_user");
+  assert.equal(observed.emailProof, "me_email_missing");
+  assert.equal(bearerCalls, 1);
+  const again = await adapter.getAccountObservation();
+  assert.equal(again.nativeIdentity, "current-user");
+  assert.equal(again.bearerRelation, "bearer_matches_session_user");
+  assert.equal(bearerCalls, 1, "do not hammer /backend-api/me on every registration poll");
+
+  payloads["/api/auth/session"].user.id = "new-session-user";
+  const changed = await adapter.getAccountObservation();
+  assert.equal(changed.nativeIdentity, null);
+  assert.equal(changed.bearerRelation, "bearer_differs_from_session");
+  assert.equal(bearerCalls, 2, "a changed authenticated identity invalidates the cached proof");
+});
+
+test("user refuses unproven bearer login identity | Given a mismatched cookie user | When bearer verification fails or session email is unsafe | Then no account is registered", async () => {
+  const payloads = {
+    "/backend-api/me": { id: "stale-cookie-user" },
+    "/api/auth/session": {
+      user: { id: "live-session-user", email: "current@example.com" },
+      accessToken: "private-token",
+    },
+  };
+  let bearerStatus = 403;
+  const fetch = async (url, options = {}) => {
+    if (url === "/backend-api/me" && options.headers?.authorization) {
+      return bearerStatus === 200
+        ? { ok: true, json: async () => ({ id: "live-session-user" }) }
+        : { ok: false, status: bearerStatus };
+    }
+    return { ok: true, json: async () => payloads[url] };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const denied = await adapter.getAccountObservation();
+  assert.equal(denied.nativeIdentity, null);
+  assert.equal(denied.bearerRelation, "bearer_not_authorized");
+
+  payloads["/api/auth/session"].user.id = "different-active-user";
+  bearerStatus = 429;
+  const limited = await adapter.getAccountObservation();
+  assert.equal(limited.nativeIdentity, null);
+  assert.equal(limited.bearerRelation, "bearer_rate_limited");
+
+  payloads["/backend-api/me"].email = "different@example.com";
+  bearerStatus = 200;
+  payloads["/api/auth/session"].user.id = "live-session-user";
+  const disagree = await adapter.getAccountObservation();
+  assert.equal(disagree.nativeIdentity, null, "different authenticated emails must reject even a valid session bearer");
+
+  delete payloads["/backend-api/me"].email;
+  delete payloads["/api/auth/session"].user.email;
+  payloads["/api/auth/session"].user.id = "changed-session-user";
+  const noEmail = await adapter.getAccountObservation();
+  assert.equal(noEmail.nativeIdentity, null, "bearer proof alone cannot publish an unlabeled account");
+});
+
 test("user avoids hammering a throttled identity endpoint | Given /backend-api/me returns HTTP 429 with Retry-After | When account identity is observed twice in a row | Then the second authenticated endpoint is never read and nothing is read inside the cooldown", async () => {
   const requests = [];
   let rateLimited = true;
@@ -236,17 +356,21 @@ test("user avoids hammering a throttled identity endpoint | Given /backend-api/m
   };
   const adapter = loadAdapterWithDocument({}, fetch);
 
+  // Measure from before the call so the lower-bound assertion cannot lose a
+  // millisecond to scheduling between arming the cooldown and checking it.
+  const armedAtOrAfter = Date.now();
   assert.equal(await adapter.getAccountNativeIdentity(), null, "a throttled probe reports no identity");
   assert.deepEqual(requests, ["/backend-api/me"], "the first 429 must short-circuit the second authenticated fetch");
   assert.equal(await adapter.getAccountNativeIdentity(), null);
   assert.equal(requests.length, 1, "back-to-back identity probes must not re-read inside the cooldown");
-  assert.ok(adapter._accountIdentity429Until - Date.now() >= 45000, "Retry-After is honoured as a lower bound");
+  assert.ok(adapter._accountIdentity429Until - armedAtOrAfter >= 45000, "Retry-After is honoured as a lower bound");
 
   // The cooldown is a bounded delay, not a permanent identity blackout.
   adapter._accountIdentity429Until = Date.now() - 1;
   rateLimited = false;
   assert.equal(await adapter.getAccountNativeIdentity(), "current-user", "identity probing resumes after the cooldown");
-  assert.equal(requests.length, 2);
+  assert.deepEqual(requests.slice(1), ["/backend-api/me", "/api/auth/session"],
+    "the resumed observation cross-checks both authenticated endpoints");
 });
 
 test("user cools the secondary identity endpoint | Given /backend-api/me has no user id and /api/auth/session returns HTTP 429 | When a new identity probe arrives | Then both authenticated endpoints are read once and repeated probes are suppressed", async () => {
@@ -265,6 +389,27 @@ test("user cools the secondary identity endpoint | Given /backend-api/me has no 
   assert.equal(requests.length, 2, "the cooldown must cover both authenticated endpoints");
 });
 
+test("user observes an account inside the identity cooldown | Given /backend-api/me returned HTTP 429 | When a registration observation runs inside the cooldown | Then no authenticated endpoint is read again and the observation is neutral", async () => {
+  const requests = [];
+  const fetch = async (url) => {
+    requests.push(url);
+    return { ok: false, status: 429, headers: { get: () => "45" } };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+
+  assert.equal(
+    JSON.stringify(await adapter.getAccountObservation()),
+    JSON.stringify({ nativeIdentity: null, email: null }),
+    "a throttled observation reports no identity and no display email",
+  );
+  assert.deepEqual(requests, ["/backend-api/me"]);
+  assert.equal(
+    JSON.stringify(await adapter.getAccountObservation()),
+    JSON.stringify({ nativeIdentity: null, email: null }),
+  );
+  assert.equal(requests.length, 1, "the cooldown also gates the observation entrypoint");
+});
+
 test("user bounds an untrusted Retry-After | Given the identity endpoint returns HTTP 429 with Retry-After 999999 | When the probe computes its cooldown | Then the delay stays inside the bounded policy instead of trusting the header", async () => {
   const fetch = async () => ({ ok: false, status: 429, headers: { get: () => "999999" } });
   const adapter = loadAdapterWithDocument({}, fetch);
@@ -272,6 +417,36 @@ test("user bounds an untrusted Retry-After | Given the identity endpoint returns
   assert.equal(await adapter.getAccountNativeIdentity(), null);
   const remainingMs = adapter._accountIdentity429Until - Date.now();
   assert.ok(remainingMs > 0 && remainingMs <= 120000, `cooldown ${remainingMs}ms must stay bounded`);
+});
+
+test("user cools the identity probe after a throttled bearer check | Given the cookie endpoints disagree and the bearer verification returns HTTP 429 | When the next observation runs | Then the bearer check arms the cooldown and no identity read happens inside it", async () => {
+  const requests = [];
+  const fetch = async (url, options = {}) => {
+    requests.push(options.headers?.authorization ? `${url}#bearer` : url);
+    if (url === "/backend-api/me" && options.headers?.authorization) {
+      return { ok: false, status: 429, headers: { get: () => "20" } };
+    }
+    if (url === "/backend-api/me") return { ok: true, json: async () => ({ id: "cookie-user" }) };
+    return {
+      ok: true,
+      json: async () => ({
+        user: { id: "session-user", email: "current@example.com" },
+        accessToken: "test-token-not-for-logging",
+      }),
+    };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+  const observed = await adapter.getAccountObservation();
+  assert.equal(observed.nativeIdentity, null);
+  assert.equal(observed.bearerRelation, "bearer_rate_limited");
+  assert.deepEqual(requests, ["/backend-api/me", "/api/auth/session", "/backend-api/me#bearer"]);
+  const armedMs = adapter._accountIdentity429Until - Date.now();
+  assert.ok(armedMs > 0 && armedMs <= 120000, `a bearer 429 must arm a bounded cooldown, got ${armedMs}ms`);
+
+  const throttled = await adapter.getAccountObservation();
+  assert.equal(throttled.nativeIdentity, null);
+  assert.equal(throttled.email, null, "a throttled observation stays neutral");
+  assert.equal(requests.length, 3, "no authenticated identity read may run inside the cooldown");
 });
 
 test("user never accepts plain text as an App identity | Given an accepted turn with only the text @herdr | When the accepted message identity is read | Then no App is reported", () => {

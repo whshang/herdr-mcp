@@ -209,3 +209,31 @@ A real ChatGPT integration should satisfy:
 - a safe command can execute;
 - permissions behave as expected;
 - browser continuity works for long-running tasks when installed.
+
+## Platform accounts
+
+`connector_id` remains the grant principal, together with `grant_generation`. `platform_account` is display metadata in `<platform>-<email>` form, for example `grokbot-whshang@gmail.com`. An OAuth `client_name` such as `Cursor` is not an account. The owner sets or clears the label by `connector_id`:
+
+```bash
+herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> --clear
+```
+
+The label route ships with the Edge slice, not with this runtime alone: against an Edge without it the command fails with `connector_label_requires_edge_support` and writes nothing.
+
+`connector list` shows `platform_account` beside `client_name`. WebChat control and Page Assist grant commands accept one unambiguous active `platform_account` in place of `connector_id`. Zero matches and more than one match fail closed.
+
+A shared label is not a shared grant. One label matching several active connectors is an error. A future group would need its own principal and generation and an explicit owner binding. It must not be inferred from `client_name`.
+
+## Device-wide WebChat control
+
+**Not available from this runtime alone.** `allow-device` and `deny-device` need an Edge that implements the device-scope route; that Edge ships separately. Against an Edge without it the command fails with `device_grant_requires_edge_support` and changes nothing. `connector label` fails the same way with `connector_label_requires_edge_support`. A 401/403 still reports the real authorization failure.
+
+Authorization on this runtime is per endpoint and provider. A forwarded grant whose `endpoint_ref` is `*` — including the `{ "*", "*", "*" }` tuple an older Edge derives from a wildcard Page Assist row — is dropped and covers no endpoint. Page Assist also refuses `endpoint_ref` `*` locally for the same reason.
+
+Once that Edge is deployed, an authenticated owner device may `allow-device` or `deny-device` for any non-revoked device in the same fleet. The requester must still be an owner device. A non-owner requester is rejected with `connector_owner_device_required`. A target that is missing or revoked in this fleet is `connector_owner_device_mismatch`. If the device registry cannot be read, the result is `connector_target_device_unresolved` and the grant is not written. A suspended or revoked target can still be denied so a stale grant cannot resurface, but cannot be newly allowed. `--confirm` is required. The audit event records `requesterDeviceId`, `targetDeviceId`, and `connectorId`. Device-wide scope stores endpoint `*`, provider `*`, and account `*`, stays bound to `{connector_id, grant_generation, device_id, endpoint_ref}`, and is recorded as belonging to that one device. **This runtime still does not honor it.** `webchat_control_grant_covers` requires an exact endpoint, so a `*` endpoint authorizes no WebChat control here; deploying that Edge stores and audits the device-wide grant without granting it. Honoring it needs a later runtime change that verifies the Edge's owner marker on this side. Per-endpoint allow and deny are unchanged, and Page Assist grants are unchanged.
+
+```bash
+herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
+herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm
+```

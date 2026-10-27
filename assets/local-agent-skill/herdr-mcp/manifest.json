@@ -8,7 +8,7 @@
     },
     {
       "path": "references/browser-control.md",
-      "sha256": "db0bd98572c6484ba954016d17bd4d6227ff4bfeddeed622507b1f65840e85ec"
+      "sha256": "5155f6c760b2f23315c961a920c48cb87d7590199e4419f08958818b4fa7e8c7"
     },
     {
       "path": "references/memory.md",
@@ -16,7 +16,7 @@
     },
     {
       "path": "references/webchat-control.md",
-      "sha256": "3f879b9b762c4d656bbeae01ba6d93fa5be0249d3d7cd8b5605175f924c6fabe"
+      "sha256": "1a72286076a405766e41ae185600f3e4d011b8f12ce37d372641f8801196cd61"
     },
     {
       "path": "references/webchat.md",
