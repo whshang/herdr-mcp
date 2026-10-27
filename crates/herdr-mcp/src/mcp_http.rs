@@ -2924,6 +2924,9 @@ fn trusted_edge_webchat_control_grants(
             || !(valid_browser_grant_provider(provider)
                 || provider == crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER)
             || !valid_browser_grant_ref(account_ref, 96)
+            || (endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
+                && (provider != crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
+                    || account_ref != crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT))
         {
             return Err(());
         }
@@ -4486,6 +4489,23 @@ mod tests {
         );
         assert_eq!(authorization.connector_id, "conn_auditconnector123");
         assert_eq!(authorization.grant_generation, 7);
+        headers.insert(
+            EDGE_WEBCHAT_AUTHORIZATION_HEADER,
+            HeaderValue::from_static(
+                r#"{"principal_ref":"connector:conn_auditconnector123","connector_id":"conn_auditconnector123","grant_generation":7,"platform_account":"grokbot-owner@example.com"}"#,
+            ),
+        );
+        assert_eq!(
+            trusted_edge_webchat_authorization(&trusted_state, &headers),
+            Err(()),
+            "the authorization wire stays three-field: a fourth field is rejected"
+        );
+        headers.insert(
+            EDGE_WEBCHAT_AUTHORIZATION_HEADER,
+            HeaderValue::from_static(
+                r#"{"principal_ref":"connector:conn_auditconnector123","connector_id":"conn_auditconnector123","grant_generation":7}"#,
+            ),
+        );
         assert_eq!(
             trusted_edge_browser_caller_session(&trusted_state, &headers),
             Ok(Some(BrowserCallerSessionIdentity {

@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.216";
+const H2W_CONTENT_VERSION = "0.1.217";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3616,10 +3616,28 @@ function normalizeHerdrMentionAlias(value) {
     return ADAPTER.resolveProjectIdentity(convKey);
   }
 
+  async function browserAccountObservation() {
+    try {
+      if (typeof ADAPTER.getAccountObservation === "function") {
+        const observed = await ADAPTER.getAccountObservation();
+        const nativeIdentity = typeof observed?.nativeIdentity === "string" && observed.nativeIdentity.trim()
+          ? observed.nativeIdentity.trim()
+          : null;
+        const email = typeof observed?.email === "string" ? observed.email.trim().toLowerCase() : "";
+        return {
+          nativeIdentity,
+          email: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null,
+        };
+      }
+    } catch (_) {}
+    return { nativeIdentity: await browserAccountNativeIdentity(), email: null };
+  }
+
   const registrationInFlight = new Map();
 
   async function runConversationRegistration(reason, convKey, registrationAttempt) {
-    const accountNativeIdentity = await browserAccountNativeIdentity();
+    const accountObservation = await browserAccountObservation();
+    const accountNativeIdentity = accountObservation.nativeIdentity;
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
       try {
@@ -3668,6 +3686,7 @@ function normalizeHerdrMentionAlias(value) {
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
+      accountDisplayEmail: accountObservation.email,
       browserProjects,
       browserAppKeywords,
       browserCurrentProjectId: browserCurrentProject?.id || null,

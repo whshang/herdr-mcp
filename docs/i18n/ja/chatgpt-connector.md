@@ -209,3 +209,27 @@ Connector は Web AI がワークステーションに到達する問題を解�
 - 安全なコマンドを実行できる;
 - 権限が期待どおりに動作する;
 - インストールされている場合、長時間タスクでブラウザ continuity が動作する。
+
+## プラットフォームアカウント
+
+`connector_id` は `grant_generation` と組になって付与の主体のままです。`platform_account` は `<platform>-<email>` 形式の表示用メタデータです。例: `grokbot-whshang@gmail.com`。OAuth の `client_name`（たとえば `Cursor`）はアカウントではありません。所有者は `connector_id` でラベルを設定または消去します。
+
+```bash
+herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> --clear
+```
+
+`connector list` は `client_name` と並べて `platform_account` を表示します。WebChat control と Page Assist の付与コマンドは、有効な `platform_account` がちょうど 1 件のときだけ `connector_id` の代わりに受け付けます。0 件と複数件は失敗します。
+
+同じラベルは共有の付与にはなりません。1 つのラベルが複数の有効なコネクターに一致する場合はエラーです。将来のグループには、独自の主体と generation、および明示的な所有者の紐付けが必要です。`client_name` から推測してはなりません。
+
+## デバイス全体の WebChat control
+
+認証されたオーナーデバイスは、同じフリート内の取り消されていない任意のデバイスに対して `allow-device` または `deny-device` できます。要求元は引き続きオーナーデバイスでなければなりません。オーナー以外の要求元は `connector_owner_device_required` で拒否されます。このフリートに存在しない、または取り消された対象は `connector_owner_device_mismatch` です。デバイスレジストリを読めない場合は `connector_target_device_unresolved` となり、付与は書き込まれません。`--confirm` が必要です。監査イベントには `requesterDeviceId`、`targetDeviceId`、`connectorId` が記録されます。
+
+```bash
+herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
+herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm
+```
+
+デバイス全体のスコープは endpoint `*`、provider `*`、account `*` を保存します。対象はそのデバイス上の WebChat endpoint だけです。エンドポイント単位の allow / deny は変わりません。Page Assist の付与も変わりません。付与は `{connector_id, grant_generation, device_id, endpoint_ref}` に束縛されたままです。

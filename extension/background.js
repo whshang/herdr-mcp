@@ -38,6 +38,7 @@ import {
   bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
 } from "./artifact-capture-gate.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
+import { formatPlatformAccountDisplay } from "./account-display.js";
 import { jsonBridgeRpc, normalizeJsonBridgeBatch, runJsonBridgeBatch } from "./background/json-bridge.js";
 import { NATIVE_HOST_NOT_INSTALLED, NATIVE_ORIGIN_NOT_ACTIVE } from "./native-host-diagnostics.js";
 import { captureImageArtifactNative, captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
@@ -56,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.216";
+const H2W_SCRIPT_VERSION = "0.1.217";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -2201,6 +2202,7 @@ async function observeBrowserConversation({
   convKey,
   pageInfo,
   accountNativeIdentity,
+  accountDisplayLabel = null,
   projects = [],
   reservationRef = null,
 }) {
@@ -2231,7 +2233,7 @@ async function observeBrowserConversation({
     kind: "account",
     parent_ref: null,
     native_identity: accountNativeIdentity,
-    display_label: null,
+    display_label: accountDisplayLabel,
     canonical_url: accountLaunchUrl,
     observation_generation: observationGeneration,
     observed_at: Date.now(),
@@ -2288,6 +2290,7 @@ async function observeBrowserConversation({
     spaceRef,
     projectId: pageInfo.project_id || null,
     projectName: pageInfo.project_name || null,
+    accountDisplay: accountDisplayLabel,
     observationGeneration,
     lastSeenAt: Date.now(),
   });
@@ -10969,6 +10972,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
       const accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
+      const accountDisplayLabel = formatPlatformAccountDisplay(
+        registeringSite,
+        String(msg.accountDisplayEmail || ""),
+      );
       if (registeringSite === "chatgpt" && sender.tab?.id && !accountNativeIdentity) {
         browserTabScopes.delete(sender.tab.id);
         for (const [sessionRef, target] of browserSessionTargets) {
@@ -10983,6 +10990,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           convKey: String(msg.convKey || ""),
           pageInfo: browserPageInfo,
           accountNativeIdentity,
+          accountDisplayLabel,
           projects: Array.isArray(msg.browserProjects) ? msg.browserProjects : [],
           reservationRef: String(msg.browserSessionReservationRef || "").trim() || null,
         };
@@ -11650,6 +11658,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({
         convInfo,
         pageInfo,
+        accountDisplay: msg.tabId ? (browserTabScopes.get(msg.tabId)?.accountDisplay || null) : null,
         bindingKey,
         browserEndpoint: browserEndpointView(browserEndpoint),
         binding: bindingViewOne,
