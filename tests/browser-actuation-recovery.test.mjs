@@ -3465,6 +3465,30 @@ test("accepted ChatGPT user turns register a current-source identity before cont
   assert.match(segment, /user_text:\s*userText/);
 });
 
+test("user keeps a source turn fail-closed | Given a page-captured turn whose canonical URL no longer resolves to one current session | When source_turn.observe is rejected | Then the service worker warns the typed code and retries only a missing registration", () => {
+  const start = backgroundSource.indexOf('if (msg?.type === "h2w_turn_started")');
+  const end = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")', start);
+  assert.ok(start >= 0 && end > start, "turn-start handler must remain extractable");
+  const segment = backgroundSource.slice(start, end);
+  assert.ok(
+    backgroundSource.indexOf("function warnLog(...args) { console.warn(\"[h2w]\", ...args); }") >= 0,
+    "a rejected source turn must be visible on the warn channel",
+  );
+  assert.match(segment, /warnLog\("source_turn\.observe failed:", code\)/);
+  assert.match(segment, /warnLog\("source_turn\.observe failed:", retryCode\)/);
+  assert.doesNotMatch(
+    segment,
+    /warnLog\([^)]*(convKey|userText|canonical_url)/,
+    "the warn line may carry the typed Runtime code only",
+  );
+  // Only a missing registration may schedule the bounded retry; an ambiguous
+  // canonical URL (or any other rejection) stops immediately and stays
+  // fail-closed instead of replaying the observe.
+  assert.match(segment, /if \(code === "browser_source_session_not_found"\)/);
+  assert.match(segment, /if \(retryCode !== "browser_source_session_not_found"\) \{/);
+  assert.doesNotMatch(segment, /browser_canonical_url_ambiguous/);
+});
+
 test("ChatGPT session.archive targets the exact registered session and verifies provider archive state", () => {
   assert.match(backgroundSource, /"session\.archive"/);
   const start = wakeSource.indexOf("const PENDING_SELF_ARCHIVE_STORAGE_KEY");

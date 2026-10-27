@@ -602,7 +602,11 @@ async fn post_extension_browser_registry(State(state): State<AppState>, body: By
         "provider.observe" => extension_browser_provider_observe(&state, &payload, observed_at),
         "resource.observe" => extension_browser_resource_observe(&state, &payload, observed_at),
         "source_turn.observe" => {
-            extension_browser_source_turn_observe(&state, &payload, observed_at)
+            let result = extension_browser_source_turn_observe(&state, &payload, observed_at);
+            if let Err(code) = &result {
+                log_browser_registry_rejection("source_turn.observe", code);
+            }
+            result
         }
         "archive.claim" => extension_browser_archive_claim(&state, &payload, observed_at),
         "archive.begin" => extension_browser_archive_begin(&state, &payload, observed_at),
@@ -1075,7 +1079,7 @@ fn extension_browser_source_turn_observe(
         .lock()
         .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
     let session_ref = store
-        .browser_session_ref_for_canonical_url(canonical_url)?
+        .browser_current_generation_source_session_ref(canonical_url)?
         .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
     let session = store
         .browser_resource(&session_ref)?
@@ -2471,6 +2475,30 @@ fn epoch_ms() -> u64 {
 
 /// Process-wide start timestamp of this runtime generation.
 static RUNTIME_STARTED_AT_MS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// Bounded diagnostics for a rejected trusted-extension registry operation.
+///
+/// Only the stable operation label and the typed error code are logged: never
+/// the conversation URL, the user or assistant text, or any identity carried in
+/// the same payload. One line per minute keeps a hostile or looping caller from
+/// turning a rejected observation into an unbounded log source.
+const BROWSER_REGISTRY_LOG_INTERVAL_MS: u64 = 60_000;
+static LAST_BROWSER_REGISTRY_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+fn log_browser_registry_rejection(operation: &'static str, code: &str) {
+    let now = epoch_ms();
+    let last = LAST_BROWSER_REGISTRY_LOG_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < BROWSER_REGISTRY_LOG_INTERVAL_MS {
+        return;
+    }
+    if LAST_BROWSER_REGISTRY_LOG_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    eprintln!("herdr-mcp: browser registry rejected operation={operation} code={code}");
+}
 
 fn runtime_started_at_ms() -> i64 {
     *RUNTIME_STARTED_AT_MS.get_or_init(|| i64::try_from(epoch_ms()).unwrap_or(i64::MAX))
@@ -5924,6 +5952,313 @@ mod tests {
         assert_eq!(result["ok"], true);
         assert_eq!(result["session_ref"], session_ref);
         (app, session_ref)
+    }
+
+    /// Registers one ChatGPT account generation on an already registered
+    /// endpoint, then observes one space and every `(native_identity,
+    /// canonical_url)` session inside it. Repeating this for a second account
+    /// on the same endpoint is exactly what an account identity switch does:
+    /// the same Project conversations come back under a new account-scoped
+    /// space at a new observation generation while the previous rows stay.
+    async fn observe_chatgpt_account_generation(
+        app: axum::Router,
+        profile_seed: &str,
+        endpoint_ref: &str,
+        label: &str,
+        generation: i64,
+        sessions: &[(&str, &str)],
+        observed_at: i64,
+    ) -> (axum::Router, String, Vec<String>) {
+        let account = json!({
+            "operation": "resource.observe",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "account",
+            "native_identity": format!("native-account-{label}"),
+            "display_label": "Work",
+            "observation_generation": generation,
+            "observed_at": observed_at
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(account))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        let account_ref = result["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let space = json!({
+            "operation": "resource.observe",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "space",
+            "parent_ref": account_ref,
+            "native_identity": format!("native-space-{label}"),
+            "display_label": "Project",
+            "canonical_url": format!("https://chatgpt.com/g/g-p-{label}"),
+            "observation_generation": generation,
+            "observed_at": observed_at
+        });
+        let response = app.clone().oneshot(registry_request(space)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        let space_ref = result["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let app = app;
+        let mut session_refs = Vec::new();
+        for (native_identity, canonical_url) in sessions {
+            let session = json!({
+                "operation": "resource.observe",
+                "profile_seed": profile_seed,
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "kind": "session",
+                "parent_ref": space_ref,
+                "native_identity": native_identity,
+                "display_label": null,
+                "canonical_url": canonical_url,
+                "observation_generation": generation,
+                "observed_at": observed_at
+            });
+            let response = app
+                .clone()
+                .oneshot(registry_request(session))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            session_refs.push(
+                result["resource"]["resource_ref"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        (app, account_ref, session_refs)
+    }
+
+    async fn observe_chatgpt_provider_generation(
+        app: axum::Router,
+        profile_seed: &str,
+        endpoint_ref: &str,
+        generation: i64,
+        observed_at: i64,
+    ) -> axum::Router {
+        let provider = json!({
+            "operation": "provider.observe",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "adapter_protocol_version": 1,
+            "observation_generation": generation,
+            "capabilities": {"operations": ["identity.inspect", "space.list"]},
+            "observed_at": observed_at
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(provider))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        app
+    }
+
+    #[tokio::test]
+    async fn source_turn_observe_resolves_the_current_generation_session_after_an_account_switch() {
+        // Regression: one canonical ChatGPT conversation URL legitimately holds
+        // both the historical session and the session re-registered after an
+        // account identity change on the same endpoint. A user turn captured on
+        // the live page must still register against the current session instead
+        // of being refused as browser_canonical_url_ambiguous.
+        const SHARED_URL: &str =
+            "https://chatgpt.com/g/g-p-source-turn/c/6adafccc-88a4-83e9-9917-968bae77e514";
+        let root = test_root("source-turn-current-generation");
+        let mut extension_state = test_state(&root);
+        extension_state.trusted_extension_ipc = true;
+        extension_state.local_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned());
+        let store = extension_state.state_store.clone();
+        let app = candidate_router(extension_state);
+
+        let (app, profile_seed, endpoint_ref, _account_a_ref) =
+            register_chatgpt_endpoint(app, "source-turn-generation", 2001).await;
+        let (app, _account_ref, session_a_refs) = observe_chatgpt_account_generation(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            "source-turn-account-a",
+            1,
+            &[("source-turn-session-a", SHARED_URL)],
+            2002,
+        )
+        .await;
+        let session_a_ref = session_a_refs[0].clone();
+
+        // The turn captured before the identity change belongs to the session
+        // that was current at generation 1.
+        let source_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": SHARED_URL,
+            "user_text": "归档当前对话",
+            "observed_at": 2003
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(source_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["session_ref"], session_a_ref);
+        assert_eq!(result["expected_generation"], 1);
+
+        // Account identity change: a new provider generation, then the same
+        // Project/conversation re-registered under a new account-scoped space on
+        // the same endpoint. The generation-1 rows are left untouched.
+        let app =
+            observe_chatgpt_provider_generation(app, &profile_seed, &endpoint_ref, 2, 2004).await;
+        let (app, _account_b_ref, session_b_refs) = observe_chatgpt_account_generation(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            "source-turn-account-b",
+            2,
+            &[("source-turn-session-b", SHARED_URL)],
+            2005,
+        )
+        .await;
+        let session_b_ref = session_b_refs[0].clone();
+        assert_ne!(session_a_ref, session_b_ref);
+        {
+            let guard = store.lock().unwrap();
+            assert_eq!(
+                guard
+                    .browser_resource_locator(&session_a_ref)
+                    .unwrap()
+                    .unwrap()
+                    .canonical_url,
+                SHARED_URL
+            );
+            assert_eq!(
+                guard
+                    .browser_resource_locator(&session_b_ref)
+                    .unwrap()
+                    .unwrap()
+                    .canonical_url,
+                SHARED_URL
+            );
+            // The strict global lookup stays fail-closed for archive.claim and
+            // every other caller: two sessions still own this canonical URL.
+            assert_eq!(
+                guard.browser_session_ref_for_canonical_url(SHARED_URL),
+                Err("browser_canonical_url_ambiguous".to_owned())
+            );
+        }
+
+        let source_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": SHARED_URL,
+            "user_text": "总结今天的改动",
+            "observed_at": 2006
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(source_turn))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a page-captured turn must register on the current-generation session: {result}"
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["session_ref"], session_b_ref);
+        assert_eq!(result["expected_generation"], 2);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&mcp::browser_sha256("总结今天的改动"), 2007)
+                .unwrap(),
+            (session_b_ref.clone(), 2)
+        );
+        assert!(
+            !result.to_string().contains("总结今天的改动"),
+            "the trusted IPC response must not echo user plaintext"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn source_turn_observe_stays_ambiguous_for_two_current_generation_sessions() {
+        // Two sessions that are both current for the same canonical URL cannot be
+        // told apart, so the scoped lookup must stay fail-closed instead of
+        // picking either one by recency or generation size.
+        const SHARED_URL: &str = "https://chatgpt.com/c/source-turn-two-current";
+        let root = test_root("source-turn-two-current");
+        let mut extension_state = test_state(&root);
+        extension_state.trusted_extension_ipc = true;
+        extension_state.local_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned());
+        let store = extension_state.state_store.clone();
+        let app = candidate_router(extension_state);
+
+        let (app, profile_seed, endpoint_ref, _account_ref) =
+            register_chatgpt_endpoint(app, "source-turn-two-current", 3001).await;
+        let (app, _account_ref, session_refs) = observe_chatgpt_account_generation(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            "source-turn-two-current",
+            1,
+            &[
+                ("source-turn-two-current-a", SHARED_URL),
+                ("source-turn-two-current-b", SHARED_URL),
+            ],
+            3002,
+        )
+        .await;
+        assert_eq!(session_refs.len(), 2);
+
+        let source_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": SHARED_URL,
+            "user_text": "归档当前对话",
+            "observed_at": 3003
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(source_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "browser_canonical_url_ambiguous");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&mcp::browser_sha256("归档当前对话"), 3004),
+            Err("browser_current_turn_not_found".to_owned())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     async fn webchat_tool_call(

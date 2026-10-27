@@ -4458,6 +4458,38 @@ console.log("\n[Source-turn observe retry covers the fresh-conversation registra
   ok(observesFor(failClosedConv).length === 2,
     "a non-registration failure stops the retry schedule instead of issuing the third attempt",
     JSON.stringify(observesFor(failClosedConv)));
+
+  // An ambiguous canonical URL is never retried, so the warning is the only
+  // record that the turn was dropped. It must carry the typed code alone.
+  const warnedConv = "https://chatgpt.com/c/source-turn-warn-ambiguous";
+  const warnedUserText = "歧义只告警一次";
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.join(" ")); };
+  try {
+    pendingSourceTurnObserveFailures = ["browser_canonical_url_ambiguous"];
+    await dispatchMessage({
+      type: "h2w_turn_started",
+      convKey: warnedConv,
+      userText: warnedUserText,
+      startedAt: Date.now(),
+    });
+    ok(await waitForTest(
+      () => warnings.some((line) => line.includes("browser_canonical_url_ambiguous")),
+      4000,
+    ),
+      "user sees an ambiguous source turn | Given the canonical URL resolves to more than one current session | When source_turn.observe returns browser_canonical_url_ambiguous | Then the service worker warns the typed code once and does not retry",
+      JSON.stringify(warnings));
+  } finally {
+    console.warn = realWarn;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 3500));
+  ok(observesFor(warnedConv).length === 1,
+    "the warned failure is not replayed: an ambiguous source turn makes exactly one observe attempt",
+    JSON.stringify(observesFor(warnedConv)));
+  ok(!warnings.some((line) => line.includes(warnedConv) || line.includes(warnedUserText)),
+    "the warn line carries the typed code only, never the conversation URL or the captured user text",
+    JSON.stringify(warnings));
 }
 
 

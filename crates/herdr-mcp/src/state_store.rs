@@ -3527,6 +3527,63 @@ impl StateStore {
         }
     }
 
+    /// Current-generation canonical URL -> session lookup used by
+    /// `source_turn.observe`.
+    ///
+    /// One canonical conversation URL legitimately accumulates historical
+    /// sessions on this device: after an account identity change the same
+    /// Project and conversations are re-registered under a new account-scoped
+    /// space on the same endpoint, and the previous rows are never retired. The
+    /// strict global lookup above must stay fail-closed for archive and
+    /// dispatch callers, so this scoped variant keeps only sessions whose
+    /// locator and resource observation generations both equal their own
+    /// endpoint/provider's current `browser_provider_state` generation. Zero
+    /// current sessions is no match, several current sessions stay ambiguous,
+    /// and there is no recency or largest-generation fallback.
+    pub fn browser_current_generation_source_session_ref(
+        &self,
+        canonical_url: &str,
+    ) -> Result<Option<String>, String> {
+        if canonical_url.is_empty()
+            || canonical_url.len() > 2048
+            || canonical_url != canonical_url.trim()
+            || canonical_url.chars().any(char::is_control)
+            || !canonical_url.starts_with("https://")
+        {
+            return Err("browser_canonical_url_invalid".to_owned());
+        }
+        // A stale registration is not an ambiguity: it cannot be the page the
+        // user is looking at. A session whose endpoint/provider has no provider
+        // state row can never be current, so the inner join drops it.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.resource_ref
+                 FROM browser_resource_locators l
+                 JOIN browser_resources r ON r.resource_ref = l.resource_ref
+                 JOIN browser_provider_state p
+                   ON p.endpoint_ref = r.endpoint_ref AND p.provider = r.provider
+                 WHERE l.canonical_url = ?1
+                   AND r.kind = 'session'
+                   AND r.provider = 'chatgpt'
+                   AND l.observation_generation = p.observation_generation
+                   AND r.observation_generation = p.observation_generation
+                 GROUP BY r.resource_ref
+                 LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare browser session URL lookup: {error}"))?;
+        let mut refs = stmt
+            .query_map([canonical_url], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query browser session URL lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser session URL lookup: {error}"))?;
+        match refs.len() {
+            0 => Ok(None),
+            1 => Ok(Some(refs.remove(0))),
+            _ => Err("browser_canonical_url_ambiguous".to_owned()),
+        }
+    }
+
     /// Persist one fail-closed correlation between an opaque MCP caller session
     /// and an already-observed browser session. The caller session itself is
     /// never stored. A key already bound to another browser session is a
