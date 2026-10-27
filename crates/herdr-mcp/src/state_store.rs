@@ -3545,13 +3545,16 @@ impl StateStore {
     /// One canonical conversation URL legitimately accumulates historical
     /// sessions on this device: after an account identity change the same
     /// Project and conversations are re-registered under a new account-scoped
-    /// space on the same endpoint, and the previous rows are never retired. The
-    /// strict global lookup above must stay fail-closed for archive and
-    /// dispatch callers, so this scoped variant keeps only sessions whose
-    /// locator and resource observation generations both equal their own
-    /// endpoint/provider's current `browser_provider_state` generation. Zero
-    /// current sessions is no match, several current sessions stay ambiguous,
-    /// and there is no recency or largest-generation fallback.
+    /// space on the same endpoint. Their locators are retired by
+    /// `retire_stale_browser_session_locators` once the current generation is
+    /// observed for the URL, but a stale registration can still be present in
+    /// the window before that sweep runs, and the strict global lookup above
+    /// must stay fail-closed for archive and dispatch callers. This scoped
+    /// variant therefore keeps only sessions whose locator and resource
+    /// observation generations both equal their own endpoint/provider's current
+    /// `browser_provider_state` generation. Zero current sessions is no match,
+    /// several current sessions stay ambiguous, and there is no recency or
+    /// largest-generation fallback.
     pub fn browser_current_generation_source_session_ref(
         &self,
         canonical_url: &str,
@@ -12808,16 +12811,16 @@ mod tests {
         );
     }
 
-    /// Register one ChatGPT account generation on `profile_seed`'s endpoint the
+    /// Register one provider account generation on `profile_seed`'s endpoint the
     /// way an account identity change looks on a single browser profile: a new
     /// account-scoped Space and the same conversation native identity. Returns
     /// the endpoint ref and the session locator owner.
     fn observe_browser_session_url(
         store: &mut StateStore,
+        provider: &str,
         profile_seed: &str,
         generation: i64,
         account_identity: &str,
-        session_identity: &str,
         url: &str,
         observed_at: i64,
     ) -> (String, String) {
@@ -12833,7 +12836,7 @@ mod tests {
         store
             .observe_browser_provider(BrowserProviderObservationInput {
                 endpoint_ref: &endpoint.endpoint_ref,
-                provider: "chatgpt",
+                provider,
                 adapter_protocol_version: 1,
                 observation_generation: generation,
                 capabilities_json: r#"{"operations":["session.inspect"]}"#,
@@ -12843,7 +12846,7 @@ mod tests {
         let account = store
             .observe_browser_resource(BrowserResourceObservationInput {
                 endpoint_ref: &endpoint.endpoint_ref,
-                provider: "chatgpt",
+                provider,
                 kind: "account",
                 parent_ref: None,
                 native_identity: account_identity,
@@ -12855,7 +12858,7 @@ mod tests {
         let space = store
             .observe_browser_resource(BrowserResourceObservationInput {
                 endpoint_ref: &endpoint.endpoint_ref,
-                provider: "chatgpt",
+                provider,
                 kind: "space",
                 parent_ref: Some(&account.resource_ref),
                 native_identity: &format!("{account_identity}-space"),
@@ -12867,10 +12870,10 @@ mod tests {
         let session = store
             .observe_browser_resource(BrowserResourceObservationInput {
                 endpoint_ref: &endpoint.endpoint_ref,
-                provider: "chatgpt",
+                provider,
                 kind: "session",
                 parent_ref: Some(&space.resource_ref),
-                native_identity: session_identity,
+                native_identity: "shared-conversation",
                 display_label: None,
                 observation_generation: generation,
                 observed_at,
@@ -12890,10 +12893,10 @@ mod tests {
         let mut store = StateStore::open(":memory:").unwrap();
         let (_, account_a_session) = observe_browser_session_url(
             &mut store,
+            "chatgpt",
             PROFILE_SEED,
             1,
             "account-a",
-            "shared-conversation",
             URL,
             100,
         );
@@ -12910,10 +12913,10 @@ mod tests {
         // the same endpoint. Account A's session is never re-observed.
         let (_, account_b_session) = observe_browser_session_url(
             &mut store,
+            "chatgpt",
             PROFILE_SEED,
             2,
             "account-b",
-            "shared-conversation",
             URL,
             200,
         );
@@ -13028,19 +13031,19 @@ mod tests {
             let mut store = StateStore::open(&path).unwrap();
             let (_, account_a_session) = observe_browser_session_url(
                 &mut store,
+                "chatgpt",
                 "seed-legacy-profile",
                 1,
                 "account-a",
-                "shared-conversation",
                 URL,
                 100,
             );
             let (_, account_b_session) = observe_browser_session_url(
                 &mut store,
+                "chatgpt",
                 "seed-legacy-profile",
                 2,
                 "account-b",
-                "shared-conversation",
                 URL,
                 200,
             );
@@ -13085,25 +13088,25 @@ mod tests {
     }
 
     #[test]
-    fn retiring_stale_browser_session_locators_never_crosses_endpoint_or_provider() {
+    fn retiring_stale_browser_session_locators_never_crosses_endpoints() {
         const URL: &str = "https://chatgpt.com/c/shared-across-endpoints";
 
         let mut store = StateStore::open(":memory:").unwrap();
         let (other_endpoint, other_profile_session) = observe_browser_session_url(
             &mut store,
+            "chatgpt",
             "seed-other-profile",
             1,
             "other-account",
-            "shared-conversation",
             URL,
             100,
         );
         let (_, current_session) = observe_browser_session_url(
             &mut store,
+            "chatgpt",
             "seed-current-profile",
             2,
             "current-account",
-            "shared-conversation",
             URL,
             200,
         );
@@ -13145,16 +13148,140 @@ mod tests {
     }
 
     #[test]
+    fn retiring_stale_browser_session_locators_never_crosses_providers() {
+        const PROFILE_SEED: &str = "seed-shared-provider-endpoint";
+        // Deliberately the same canonical URL for both adapters: a locator must
+        // never be retired because a *different* provider has a session on it.
+        const URL: &str = "https://chatgpt.com/c/shared-across-providers";
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, chatgpt_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            PROFILE_SEED,
+            1,
+            "account-chatgpt",
+            URL,
+            100,
+        );
+        // A second adapter on the same endpoint (same device + browser profile)
+        // observes the same URL at its own current generation.
+        let (_, claude_session) = observe_browser_session_url(
+            &mut store,
+            "claude",
+            PROFILE_SEED,
+            1,
+            "account-claude",
+            URL,
+            200,
+        );
+        // The chatgpt provider generation moves on without re-observing the
+        // chatgpt session, while the claude session stays current on its own
+        // provider.
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 2,
+                capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                observed_at: 300,
+            })
+            .unwrap();
+
+        // The claude session is current, but it is not a chatgpt current session,
+        // so the stale chatgpt locator must survive.
+        assert_eq!(store.retire_stale_browser_session_locators().unwrap(), 0);
+        assert!(
+            store
+                .browser_resource_locator(&chatgpt_session)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .browser_resource_locator(&claude_session)
+                .unwrap()
+                .is_some()
+        );
+        // A single chatgpt session still resolves through the chatgpt-scoped
+        // lookup, while an adapter set that admits both providers stays
+        // fail-closed on the shared URL.
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(chatgpt_session.as_str())
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url_for_adapters(URL, &["chatgpt", "claude"])
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous"
+        );
+
+        // Reverse direction: the new chatgpt generation retires only the stale
+        // chatgpt locator, never the claude one.
+        let (_, chatgpt_current_session) = observe_browser_session_url(
+            &mut store,
+            "chatgpt",
+            PROFILE_SEED,
+            2,
+            "account-chatgpt-next",
+            URL,
+            400,
+        );
+        assert!(
+            store
+                .browser_resource_locator(&chatgpt_session)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .browser_resource_locator(&claude_session)
+                .unwrap()
+                .is_some()
+        );
+        // The claude provider generation then moves on with no current claude
+        // session, so its locator is kept as well.
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "claude",
+                adapter_protocol_version: 1,
+                observation_generation: 2,
+                capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                observed_at: 500,
+            })
+            .unwrap();
+        assert_eq!(store.retire_stale_browser_session_locators().unwrap(), 0);
+        assert!(
+            store
+                .browser_resource_locator(&claude_session)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .browser_resource_locator(&chatgpt_current_session)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn retiring_stale_browser_session_locators_keeps_locators_without_a_current_session() {
         const URL: &str = "https://chatgpt.com/c/has-no-current-session";
 
         let mut store = StateStore::open(":memory:").unwrap();
         let (endpoint_ref, historical_session) = observe_browser_session_url(
             &mut store,
+            "chatgpt",
             "seed-single-profile",
             1,
             "account-a",
-            "shared-conversation",
             URL,
             100,
         );
@@ -13194,19 +13321,19 @@ mod tests {
         let mut store = StateStore::open(":memory:").unwrap();
         let (_, first_session) = observe_browser_session_url(
             &mut store,
+            "chatgpt",
             "seed-shared-profile-seed",
             1,
             "account-a",
-            "conversation-a",
             URL,
             100,
         );
         let (_, second_session) = observe_browser_session_url(
             &mut store,
+            "chatgpt",
             "seed-shared-profile-seed",
             1,
             "account-b",
-            "conversation-b",
             URL,
             200,
         );
