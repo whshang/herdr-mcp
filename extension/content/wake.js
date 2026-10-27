@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.224";
+const H2W_CONTENT_VERSION = "0.1.220";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -4192,11 +4192,41 @@ function normalizeHerdrMentionAlias(value) {
   // /backend-api/conversations/<id> endpoint with a Bearer header. Any
   // 401/404/timeout fails closed and returns an error payload only; the token
   // never leaves this function scope and is never logged/stored.
+  // A provider 429 must stop all authenticated conversation reads, including
+  // the extra /api/auth/session preflight. Keep the cooldown local to this tab.
+  let chatGptReadRateLimitUntil = 0;
+  let chatGptReadRateLimitCount = 0;
+
+  function chatGptReadRateLimit() {
+    const remaining = chatGptReadRateLimitUntil - Date.now();
+    return remaining > 0
+      ? { ok: false, error: "conversation-http", reason: "http-429", status: 429,
+          retryAfterS: Math.ceil(remaining / 1000) }
+      : null;
+  }
+
+  function noteChatGptRead429(response) {
+    const rawSeconds = Number.parseInt(response.headers?.get?.("retry-after") || "", 10);
+    const retryAfterMs = Number.isSafeInteger(rawSeconds) && rawSeconds >= 0 && rawSeconds <= 86400
+      ? rawSeconds * 1000 : 0;
+    chatGptReadRateLimitCount = Math.min(8, chatGptReadRateLimitCount + 1);
+    const policyMs = BROWSER_PERFORMANCE?.rateLimitBackoffMs?.(chatGptReadRateLimitCount) || 30000;
+    chatGptReadRateLimitUntil = Math.max(
+      chatGptReadRateLimitUntil,
+      Date.now() + Math.max(30000, policyMs, retryAfterMs),
+    );
+    noteChatGptRateLimit(Date.now(), "authenticated_conversation");
+  }
+
   async function fetchChatGptConversationDetail({ conversationId, timeoutMs = 6000 } = {}) {
     if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, error: "not-chatgpt-conversation" };
+    const cooldown = chatGptReadRateLimit();
+    if (cooldown) return cooldown;
     const accessToken = await readChatGptAccessToken(4000);
     const sessionToken = String(accessToken || "");
-    if (!sessionToken || sessionToken.length > 4096) return { ok: false, reason: "auth" };
+    if (!sessionToken || sessionToken.length > 4096) {
+      return chatGptReadRateLimit() || { ok: false, reason: "auth" };
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -4207,7 +4237,11 @@ function normalizeHerdrMentionAlias(value) {
         headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
         signal: controller.signal,
       });
-      if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+      if (!response.ok) {
+        if (response.status === 429) noteChatGptRead429(response);
+        return { ok: false, reason: `http-${response.status}` };
+      }
+      chatGptReadRateLimitCount = 0;
       return { ok: true, body: await response.json() };
     } catch (error) {
       return { ok: false, reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
@@ -4224,8 +4258,13 @@ function normalizeHerdrMentionAlias(value) {
     if (!conversationId || ADAPTER.name !== "chatgpt") {
       return { ok: false, error: "not-chatgpt-conversation" };
     }
+    const cooldown = chatGptReadRateLimit();
+    if (cooldown) return cooldown;
     const accessToken = await readChatGptAccessToken(authTimeoutMs);
-    if (!accessToken) return { ok: false, error: "session-missing", reason: "auth", status: 401 };
+    if (!accessToken) {
+      return chatGptReadRateLimit()
+        || { ok: false, error: "session-missing", reason: "auth", status: 401 };
+    }
     const sessionToken = String(accessToken);
     if (sessionToken.length === 0 || sessionToken.length > 4096) {
       return { ok: false, error: "session-missing", reason: "auth" };
@@ -4242,6 +4281,7 @@ function normalizeHerdrMentionAlias(value) {
         signal: controller.signal,
       });
       if (!response.ok) {
+        if (response.status === 429) noteChatGptRead429(response);
         const retryAfter = Number.parseInt(response.headers?.get?.("retry-after") || "", 10);
         return {
           ok: false, error: "conversation-http", reason: `http-${response.status}`, status: response.status,
@@ -4249,6 +4289,7 @@ function normalizeHerdrMentionAlias(value) {
         };
       }
       const body = await response.json();
+      chatGptReadRateLimitCount = 0;
       return { ok: true, body };
     } catch (error) {
       return { ok: false, error: "conversation-failed", reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
@@ -4335,6 +4376,9 @@ function normalizeHerdrMentionAlias(value) {
         authTimeoutMs: remainingTimeout(800),
       });
       if (observed?.ok && observed.body?.title === title) return verified(true);
+      // A throttled readback is not a transient miss: stop the loop so the
+      // cooldown is not hammered for the rest of the deadline.
+      if (observed?.status === 429) break;
       if (Date.now() < deadline) await wait(150);
     }
     return failed("title_projection_readback_unverified");
@@ -4398,6 +4442,7 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function readChatGptAccessToken(timeoutMs = 4000) {
+    if (chatGptReadRateLimit()) return null;
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -4409,7 +4454,10 @@ function normalizeHerdrMentionAlias(value) {
           headers: { accept: "application/json" },
           signal: controller.signal,
         });
-        if (!response.ok) return null;
+        if (!response.ok) {
+          if (response.status === 429) noteChatGptRead429(response);
+          return null;
+        }
         const body = await response.json();
         return String(body?.accessToken || "") || null;
       } finally {
