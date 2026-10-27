@@ -62,8 +62,9 @@
     return false;
   }
 
-  // Visible-text projection for extract: never falls back to raw textContent,
-  // so hidden, aria-hidden, sensitive or form-control descendants cannot leak.
+  // Visible-text projection for observe body text and extract: never falls back
+  // to raw textContent, so hidden, aria-hidden, sensitive or form-control
+  // descendants cannot leak.
   function collectVisibleText(root, limit) {
     if (!root || !root.childNodes) return String(root?.innerText || "");
     const parts = [];
@@ -374,8 +375,9 @@
       });
     }
 
-    const rawBody = doc.body ? (doc.body.innerText || doc.body.textContent || "") : "";
-    const text = cleanText(rawBody, options.maxChars);
+    const maxTextChars = Math.max(1, Math.min(Number(options.maxChars) || DEFAULT_MAX_CHARS, MAX_CHARS_CEILING));
+    const rawBody = doc.body ? collectVisibleText(doc.body, maxTextChars + 1) : "";
+    const text = cleanText(rawBody, maxTextChars);
 
     return {
       ok: true,
