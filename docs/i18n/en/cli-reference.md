@@ -172,6 +172,8 @@ herdr-mcp connector webchat-control deny-device <connector-id-or-platform-accoun
 
 The approval command reads the six-digit code interactively; do not put that code on argv or in shell history. Any enrolled device is an equivalent Worker administration channel; there is no owner/member device hierarchy.
 
+`connector label`, `allow-device` and `deny-device` need an Edge that implements their routes; that Edge ships separately. Against an Edge without them the command fails with `connector_label_requires_edge_support` or `device_grant_requires_edge_support` and writes nothing.
+
 Unattended callers such as GitLab CI use independently revocable Automation Clients:
 
 ```bash

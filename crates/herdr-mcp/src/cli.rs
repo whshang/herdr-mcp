@@ -1487,6 +1487,15 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             if endpoint_ref.starts_with('-') || endpoint_ref.trim().is_empty() || endpoint_ref.len() > 96 {
                 return Err("connector page-assist requires a valid endpoint ref".to_owned());
             }
+            // Page Assist is per-endpoint authority only. A wildcard endpoint
+            // is accepted by a pre-#713 Edge and derives device-wide WebChat
+            // control from it, so it is refused before it can be stored.
+            if endpoint_ref.trim() == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT {
+                return Err(
+                    "connector page-assist requires a concrete endpoint ref: a wildcard endpoint would derive device-wide WebChat control"
+                        .to_owned(),
+                );
+            }
             if confirm != "--confirm" {
                 return Err("connector page-assist requires --confirm".to_owned());
             }
@@ -2592,10 +2601,10 @@ User path:\n\
   herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
   herdr-mcp connector revoke-client <client-id> --confirm  (legacy client/grant kill switch)\n\
   herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm  (enrolled owner device)\n\
-  herdr-mcp connector label <connector-id> <platform-account> | <connector-id> --clear\n\
+  herdr-mcp connector label <connector-id> <platform-account> | <connector-id> --clear  (requires Edge connector-label support; otherwise fails connector_label_requires_edge_support)\n\
   herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm  (macOS/Linux enrolled owner device)\n\
-  herdr-mcp connector webchat-control <allow-device|deny-device> <connector-id-or-platform-account> <device-id> --confirm  (owner device; any non-revoked device in the same fleet)\n\
-  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
+  herdr-mcp connector webchat-control <allow-device|deny-device> <connector-id-or-platform-account> <device-id> --confirm  (owner device; requires Edge device-grant support, otherwise fails device_grant_requires_edge_support)\n\
+  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device; the endpoint ref must be concrete)\n\
   herdr-mcp connector page-assist orphans [list] [--device-id <device-id>]  (read-only: grant rows left under a previous connector; always scoped server-side to the authenticated owner device; --device-id is only an assertion and must match it, else 403 orphans_device_mismatch)\n\
   herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id> [--idempotency-key <key>] [--confirm]  (dry run without --confirm; with --confirm fetches the device-scoped plan, prints it plus the idempotency key, and applies it by plan_digest)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
@@ -2728,9 +2737,9 @@ pub fn connector_help() -> &'static str {
     "Herdr MCP connector management (OAuth connectors registered against the fleet)\n\n\
 All of these require the credential of a device already enrolled in the fleet;\nthere is no WebChat delegated admin path. Secrets are never echoed or written\nto argv.\n\n\
   herdr-mcp connector list [--all]\n      Lists current/actionable Connector state by default. --all also includes\n      revoked Connector instances and legacy client/grant tombstones retained\n      for audit and credential fencing.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector cancel <approval-request-id>\n      Cancels a pending or approved-but-never-used request so the OAuth flow can be restarted.\n      Refuses cancellation after credentials have been issued.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes only that Connector instance and its attributed credentials.\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Client-level kill switch: revokes every Connector/grant for that OAuth client\n      and invalidates its issued access/refresh credentials.\n\n\
-  herdr-mcp connector label <connector-id> <platform-account>\n      Sets the display label `<platform>-<email>`. It does not change grants.\n      `--clear` removes the label. `connector_id` stays the grant principal.\n\n\
-  herdr-mcp connector webchat-control <allow|deny> ... --confirm\n      Provider-scoped grant for one endpoint. A platform-account label may\n      replace the connector id when it matches exactly one active connector.\n\n\
-  herdr-mcp connector webchat-control <allow-device|deny-device> <selector> <device-id> --confirm\n      Device-wide grant. The requester must be an owner device. The target\n      must be a non-revoked device in the same fleet.\n"
+  herdr-mcp connector label <connector-id> <platform-account>\n      Sets the display label `<platform>-<email>`. It does not change grants.\n      `--clear` removes the label. `connector_id` stays the grant principal.\n      Needs an Edge with the connector-label route; otherwise the command\n      fails with connector_label_requires_edge_support and writes nothing.\n\n\
+  herdr-mcp connector webchat-control <allow|deny> ... --confirm\n      Provider-scoped grant for one endpoint. A platform-account label may\n      replace the connector id when it matches exactly one active connector.\n      The endpoint ref must be concrete: a wildcard endpoint is refused.\n\n\
+  herdr-mcp connector webchat-control <allow-device|deny-device> <selector> <device-id> --confirm\n      Device-wide grant. Needs an Edge with device-scope support; otherwise the\n      command fails with device_grant_requires_edge_support and writes nothing.\n      Once that Edge is deployed the requester must be an owner device and the\n      target a non-revoked device in the same fleet.\n"
 }
 
 pub fn automation_help() -> &'static str {
@@ -4703,6 +4712,40 @@ mod tests {
                 "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ]))
             .is_err()
+        );
+    }
+
+    /// user owner | Given a wildcard Page Assist endpoint | When the command is parsed | Then it is rejected, because a pre-#713 Edge derives device-wide WebChat control from that row
+    #[test]
+    fn user_owner_given_wildcard_page_assist_endpoint_when_parsed_then_rejected() {
+        for action in ["allow", "deny"] {
+            let error = parse(args(&[
+                "connector",
+                "page-assist",
+                action,
+                "conn_pageassist_test_1",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "*",
+                "--confirm",
+            ]))
+            .unwrap_err();
+            assert!(
+                error.contains("concrete endpoint ref"),
+                "{action} must refuse a wildcard endpoint: {error}"
+            );
+        }
+        // A concrete endpoint still parses.
+        assert!(
+            parse(args(&[
+                "connector",
+                "page-assist",
+                "allow",
+                "conn_pageassist_test_1",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--confirm",
+            ]))
+            .is_ok()
         );
     }
 

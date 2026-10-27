@@ -279,17 +279,21 @@ herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
 herdr-mcp connector label <connector-id> --clear
 ```
 
+标签路由随 Edge 切片发布，不随本 runtime 单独提供：面对没有该路由的 Edge，命令会以 `connector_label_requires_edge_support` 失败，且不写入任何东西。
+
 `connector list` 会在 `client_name` 旁边显示 `platform_account`。WebChat control 与 Page Assist 的授权命令只在某个 `platform_account` 恰好对应一个有效 connector 时，才可以用它代替 `connector_id`。零个或多个匹配都会失败。
 
 相同标签不是共享授权。一个标签对应多个有效 connector 时是错误。将来的分组需要自己的主体和 generation，以及明确的所有者绑定。不得从 `client_name` 推断。
 
 ## 设备级 WebChat control
 
-已认证的所有者设备可以对同一 fleet 中任何未撤销的设备执行 `allow-device` 或 `deny-device`。请求者仍然必须是所有者设备。非所有者请求会被 `connector_owner_device_required` 拒绝。在本 fleet 中不存在或已撤销的目标是 `connector_owner_device_mismatch`。设备注册表无法读取时返回 `connector_target_device_unresolved`，并且不会写入授权。必须带 `--confirm`。审计事件记录 `requesterDeviceId`、`targetDeviceId` 和 `connectorId`。
+**单靠本 runtime 不可用。** `allow-device` 与 `deny-device` 需要实现了设备级路由的 Edge，而那部分 Edge 单独发布。面对没有该路由的 Edge，命令会以 `device_grant_requires_edge_support` 失败，且不修改任何东西。`connector label` 同样以 `connector_label_requires_edge_support` 失败。401/403 仍然按真实的授权失败报告。
+
+本 runtime 的授权按 endpoint 和 provider 匹配。转发来的、`endpoint_ref` 为 `*` 的授权（包括旧 Edge 从通配 Page Assist 行推导出的 `{ "*", "*", "*" }`）会被丢弃，不覆盖任何 endpoint。出于同样原因，Page Assist 也在本地拒绝 `endpoint_ref` `*`。
+
+该 Edge 部署之后：已认证的所有者设备可以对同一 fleet 中任何未撤销的设备执行 `allow-device` 或 `deny-device`。请求者仍然必须是所有者设备。非所有者请求会被 `connector_owner_device_required` 拒绝。在本 fleet 中不存在或已撤销的目标是 `connector_owner_device_mismatch`。设备注册表无法读取时返回 `connector_target_device_unresolved`，并且不会写入授权。已暂停或已撤销的目标只允许 deny，避免旧授权在设备恢复后重新生效。必须带 `--confirm`。审计事件记录 `requesterDeviceId`、`targetDeviceId` 和 `connectorId`。设备级范围保存 endpoint `*`、provider `*` 和 account `*`，只覆盖该设备上的 WebChat endpoint；按 endpoint 的 allow 与 deny 不变，Page Assist 授权不变，授权仍然绑定 `{connector_id, grant_generation, device_id, endpoint_ref}`。
 
 ```bash
 herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
 herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm
 ```
-
-设备级范围保存 endpoint `*`、provider `*` 和 account `*`。它只覆盖该设备上的 WebChat endpoint。按 endpoint 的 allow 与 deny 不变。Page Assist 授权不变。授权仍然绑定 `{connector_id, grant_generation, device_id, endpoint_ref}`。

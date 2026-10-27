@@ -173,6 +173,8 @@ herdr-mcp connector webchat-control deny-device <connector-id-or-platform-accoun
 
 批准命令会交互式读取 6 位授权码，不要把授权码放进 argv 或 shell history。所有已登记 Device 都是平等的 Worker 管理通道，不存在 owner/member 设备层级。
 
+`connector label`、`allow-device` 与 `deny-device` 需要实现了对应路由的 Edge，而那部分 Edge 单独发布。面对没有这些路由的 Edge，命令会以 `connector_label_requires_edge_support` 或 `device_grant_requires_edge_support` 失败，且不写入任何东西。
+
 GitLab CI 等无人值守调用方使用可独立 revoke 的 Automation Client：
 
 ```bash

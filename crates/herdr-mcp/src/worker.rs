@@ -1743,13 +1743,50 @@ fn resolve_connector_selector(
     select_active_connector_id(selector, &inventory)
 }
 
-#[cfg(all(
-    any(target_os = "macos", target_os = "linux", target_os = "windows"),
-    test
-))]
-fn valid_webchat_control_scope(endpoint_ref: &str, provider: &str, account_ref: &str) -> bool {
+/// A device-wide (`allow-device` / `deny-device`) grant and the connector label
+/// route both ship with the Edge slice. Against a Worker that predates them the
+/// write cannot happen, and reporting a generic grant failure would leave the
+/// operator believing it did. These fixed codes name the real cause.
+const DEVICE_GRANT_REQUIRES_EDGE_SUPPORT: &str = "device_grant_requires_edge_support";
+const CONNECTOR_LABEL_REQUIRES_EDGE_SUPPORT: &str = "connector_label_requires_edge_support";
+
+/// Statuses a Worker uses when it does not implement the requested route or
+/// request body: 400 for an unknown body key (`scope`, `platform_account`),
+/// 404 for a missing path, 405 for a missing method, 501 for an explicit stub.
+/// A 401/403 stays an authorization failure and 409/5xx stay real failures, so
+/// neither is ever reported as "the Edge is too old".
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+fn edge_feature_unsupported(status: u16) -> bool {
+    matches!(status, 400 | 404 | 405 | 501)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn parse_edge_feature_response(
+    response: Response,
+    operation: &str,
+    unsupported: &str,
+) -> Result<Value, String> {
+    if edge_feature_unsupported(response.status().as_u16()) {
+        return Err(unsupported.to_owned());
+    }
+    parse_json_response(response, operation)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+fn valid_webchat_control_scope(
+    endpoint_ref: &str,
+    provider: &str,
+    account_ref: &str,
+    device_wide: bool,
+) -> bool {
+    // A wildcard endpoint is only meaningful as the complete `*/*/*` tuple of an
+    // explicit device-wide request. A per-endpoint grant must name a concrete
+    // endpoint: a wildcard Page Assist row would otherwise derive device-wide
+    // WebChat control at forward time on a pre-#713 Edge, and a partial wildcard
+    // record is never authority either way.
     if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
-        && (provider != crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
+        && (!device_wide
+            || provider != crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
             || account_ref != crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT)
     {
         return false;
@@ -1791,18 +1828,9 @@ fn set_connector_webchat_control(
         {
             return Err("browser account ref is invalid".to_owned());
         }
-        if provider.is_empty()
-            || provider.len() > 32
-            || !provider.chars().enumerate().all(|(index, ch)| {
-                if index == 0 {
-                    ch.is_ascii_lowercase() || ch.is_ascii_digit()
-                } else {
-                    ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
-                }
-            })
-        {
-            return Err("browser provider is invalid".to_owned());
-        }
+    }
+    if !valid_webchat_control_scope(endpoint_ref, provider, account_ref, device_wide) {
+        return Err("browser endpoint ref or grant scope is invalid".to_owned());
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_owner_link_identity(paths, &config)?;
@@ -1843,7 +1871,16 @@ fn set_connector_webchat_control(
         .json(&body)
         .send()
         .map_err(|error| format!("cannot change Connector WebChat Control grant: {error}"))?;
-    let payload = parse_json_response(response, "connector WebChat Control")?;
+    let payload = if device_wide {
+        // Device scope needs an Edge that understands `scope: "device"`.
+        parse_edge_feature_response(
+            response,
+            "connector WebChat Control",
+            DEVICE_GRANT_REQUIRES_EDGE_SUPPORT,
+        )?
+    } else {
+        parse_json_response(response, "connector WebChat Control")?
+    };
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -1903,7 +1940,11 @@ fn label_connector(
         }))
         .send()
         .map_err(|error| format!("cannot label connector: {error}"))?;
-    let payload = parse_json_response(response, "connector label")?;
+    let payload = parse_edge_feature_response(
+        response,
+        "connector label",
+        CONNECTOR_LABEL_REQUIRES_EDGE_SUPPORT,
+    )?;
     println!(
         "{}",
         serde_json::to_string_pretty(&payload)
@@ -1939,6 +1980,14 @@ fn set_connector_page_assist(
         || endpoint_ref.chars().any(char::is_control)
     {
         return Err("browser endpoint ref is invalid".to_owned());
+    }
+    // Page Assist is per-endpoint authority only. A pre-#713 Edge accepts and
+    // stores a wildcard endpoint and then derives device-wide WebChat control
+    // from it at forward time, so the wildcard is refused before it is stored.
+    if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT {
+        return Err(
+            "browser endpoint ref is invalid: Page Assist requires a concrete endpoint".to_owned(),
+        );
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_owner_link_identity(paths, &config)?;
@@ -3461,13 +3510,38 @@ fn print_json(value: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// user owner | Given the owner grant transport | When a device-wide or per-endpoint scope tuple is validated | Then only a complete device triple may use a wildcard endpoint
     #[test]
-    fn device_wide_webchat_grant_requires_complete_scope_at_owner_transport() {
-        assert!(valid_webchat_control_scope("*", "*", "*"));
-        assert!(valid_webchat_control_scope("bep_a", "*", "*"));
-        assert!(valid_webchat_control_scope("bep_a", "grok", "*"));
-        assert!(!valid_webchat_control_scope("*", "grok", "*"));
-        assert!(!valid_webchat_control_scope("*", "*", "br_specific"));
+    fn user_owner_given_scope_when_validated_then_wildcard_needs_full_device_triple() {
+        assert!(valid_webchat_control_scope("*", "*", "*", true));
+        assert!(valid_webchat_control_scope("bep_a", "*", "*", false));
+        assert!(valid_webchat_control_scope("bep_a", "grok", "*", false));
+        // A wildcard endpoint is never per-endpoint authority: this is the
+        // Page Assist row shape a pre-#713 Edge still stores and derives from.
+        assert!(!valid_webchat_control_scope("*", "*", "*", false));
+        assert!(!valid_webchat_control_scope("*", "grok", "*", true));
+        assert!(!valid_webchat_control_scope("*", "*", "br_specific", true));
+        assert!(!valid_webchat_control_scope("bep_a", "", "*", false));
+        assert!(!valid_webchat_control_scope("bep_a", "Grok", "*", false));
+    }
+
+    /// user owner | Given an Edge response status | When the runtime decides whether the feature exists there | Then only route/body rejections map to "requires edge support"
+    #[test]
+    fn user_owner_given_edge_status_when_classified_then_auth_and_real_failures_stay_explicit() {
+        for status in [400, 404, 405, 501] {
+            assert!(edge_feature_unsupported(status), "{status}");
+        }
+        for status in [200, 201, 204, 401, 403, 409, 429, 500, 503] {
+            assert!(!edge_feature_unsupported(status), "{status}");
+        }
+        assert_eq!(
+            DEVICE_GRANT_REQUIRES_EDGE_SUPPORT,
+            "device_grant_requires_edge_support"
+        );
+        assert_eq!(
+            CONNECTOR_LABEL_REQUIRES_EDGE_SUPPORT,
+            "connector_label_requires_edge_support"
+        );
     }
 
     #[test]

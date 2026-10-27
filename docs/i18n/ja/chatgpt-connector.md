@@ -219,17 +219,21 @@ herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
 herdr-mcp connector label <connector-id> --clear
 ```
 
+ラベルのルートは Edge スライス側で提供されます。未対応の Edge では `connector_label_requires_edge_support` で失敗し、何も書き込みません。
+
 `connector list` は `client_name` と並べて `platform_account` を表示します。WebChat control と Page Assist の付与コマンドは、有効な `platform_account` がちょうど 1 件のときだけ `connector_id` の代わりに受け付けます。0 件と複数件は失敗します。
 
 同じラベルは共有の付与にはなりません。1 つのラベルが複数の有効なコネクターに一致する場合はエラーです。将来のグループには、独自の主体と generation、および明示的な所有者の紐付けが必要です。`client_name` から推測してはなりません。
 
 ## デバイス全体の WebChat control
 
-認証されたオーナーデバイスは、同じフリート内の取り消されていない任意のデバイスに対して `allow-device` または `deny-device` できます。要求元は引き続きオーナーデバイスでなければなりません。オーナー以外の要求元は `connector_owner_device_required` で拒否されます。このフリートに存在しない、または取り消された対象は `connector_owner_device_mismatch` です。デバイスレジストリを読めない場合は `connector_target_device_unresolved` となり、付与は書き込まれません。`--confirm` が必要です。監査イベントには `requesterDeviceId`、`targetDeviceId`、`connectorId` が記録されます。
+**このランタイム単体では利用できません。** `allow-device` と `deny-device` にはデバイススコープのルートを実装した Edge が必要で、その Edge は別途配布されます。未対応の Edge では `device_grant_requires_edge_support` で失敗し、何も変更されません。`connector label` も同様に `connector_label_requires_edge_support` で失敗します。401/403 は従来どおり実際の認可エラーとして報告されます。
+
+このランタイムの認可はエンドポイント単位と provider 単位です。`endpoint_ref` が `*` の転送付与（古い Edge がワイルドカード Page Assist 行から導出する `{ "*", "*", "*" }` を含む）は破棄され、どのエンドポイントもカバーしません。同じ理由で Page Assist も `endpoint_ref` `*` をローカルで拒否します。
+
+その Edge が配備された後は、認証されたオーナーデバイスが同じフリート内の取り消されていない任意のデバイスに対して `allow-device` または `deny-device` できます。要求元は引き続きオーナーデバイスでなければなりません。オーナー以外の要求元は `connector_owner_device_required` で拒否されます。このフリートに存在しない、または取り消された対象は `connector_owner_device_mismatch` です。デバイスレジストリを読めない場合は `connector_target_device_unresolved` となり、付与は書き込まれません。停止・取り消し済みの対象は deny のみ可能で、再活性化時に古い付与が復活しないようにします。`--confirm` が必要です。監査イベントには `requesterDeviceId`、`targetDeviceId`、`connectorId` が記録されます。デバイス全体のスコープは endpoint `*`、provider `*`、account `*` を保存し、対象はそのデバイス上の WebChat endpoint だけです。エンドポイント単位の allow / deny は変わりません。Page Assist の付与も変わりません。付与は `{connector_id, grant_generation, device_id, endpoint_ref}` に束縛されたままです。
 
 ```bash
 herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
 herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm
 ```
-
-デバイス全体のスコープは endpoint `*`、provider `*`、account `*` を保存します。対象はそのデバイス上の WebChat endpoint だけです。エンドポイント単位の allow / deny は変わりません。Page Assist の付与も変わりません。付与は `{connector_id, grant_generation, device_id, endpoint_ref}` に束縛されたままです。

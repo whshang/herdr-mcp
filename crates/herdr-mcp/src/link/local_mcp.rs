@@ -367,6 +367,12 @@ impl LocalMcpTransport {
                 .get("account_ref")
                 .and_then(Value::as_str)
                 .ok_or(())?;
+            // A wildcard endpoint is not per-endpoint authority. A pre-#713
+            // Edge derives the `*/*/*` tuple from a wildcard Page Assist row,
+            // so drop the row here rather than forwarding it as device scope.
+            if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT {
+                continue;
+            }
             // Provider `*` is the WebChat control wildcard (exact endpoint, any
             // provider); this runtime advertises `webchat_control.any_provider`.
             if !valid_grant_ref(endpoint_ref, 96)
@@ -405,6 +411,11 @@ impl LocalMcpTransport {
                 .get("endpoint_ref")
                 .and_then(Value::as_str)
                 .ok_or(())?;
+            // Page Assist is per-endpoint authority only; a wildcard row is
+            // dropped so it can never derive device-wide WebChat control.
+            if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT {
+                continue;
+            }
             if !valid_grant_ref(endpoint_ref, 96) {
                 return Err(());
             }

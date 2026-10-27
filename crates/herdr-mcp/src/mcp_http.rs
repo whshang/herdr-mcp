@@ -2920,13 +2920,18 @@ fn trusted_edge_webchat_control_grants(
             None => crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
             Some(value) => value.as_str().ok_or(())?,
         };
+        // A wildcard endpoint is not per-endpoint authority. A pre-#713 Edge
+        // still derives the `*/*/*` tuple from a wildcard Page Assist row, so
+        // the row is dropped here instead of being treated as device scope.
+        // The owner `allow-device` marker that would make it authoritative is
+        // not verifiable on this path yet, so it confers nothing.
+        if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT {
+            continue;
+        }
         if !valid_browser_grant_ref(endpoint_ref, 96)
             || !(valid_browser_grant_provider(provider)
                 || provider == crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER)
             || !valid_browser_grant_ref(account_ref, 96)
-            || (endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
-                && (provider != crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
-                    || account_ref != crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT))
         {
             return Err(());
         }
@@ -2968,6 +2973,11 @@ fn trusted_edge_page_assist_grants(
             .get("endpoint_ref")
             .and_then(Value::as_str)
             .ok_or(())?;
+        // Page Assist is per-endpoint authority only. A wildcard row would
+        // derive device-wide WebChat control upstream, so it is dropped here.
+        if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT {
+            continue;
+        }
         if !valid_browser_grant_ref(endpoint_ref, 96) {
             return Err(());
         }
@@ -4685,11 +4695,11 @@ mod tests {
         assert_eq!(local["actuation_reason"], "caller_grant_missing");
         assert!(!local.to_string().contains("native-session-hidden"));
 
-        let trusted = candidate_router(extension_state);
+        let trusted = candidate_router(extension_state.clone());
         let trusted_request = rpc_request(
             Method::POST,
             "/mcp",
-            Some(body),
+            Some(body.clone()),
             &[
                 (EDGE_WEBCHAT_CONTROL_GRANTS_HEADER, grant_header.as_str()),
                 (
@@ -4708,6 +4718,46 @@ mod tests {
         assert_eq!(local["actuation_available"], true);
         assert!(local["actuation_reason"].is_null());
         assert!(!local.to_string().contains("native-session-hidden"));
+
+        // A Page Assist row with a wildcard endpoint still reaches this runtime
+        // from a pre-#713 Edge as the `*/*/*` tuple, and its wildcard endpoint
+        // must never be treated as device-wide authority. Only the exact
+        // endpoint grant above authorizes the call; the derived tuple (and a
+        // grant for another concrete endpoint) authorize nothing.
+        let derived_header = serde_json::to_string(&json!([
+            {"endpoint_ref": "*", "provider": "*", "account_ref": "*"},
+            {
+                "endpoint_ref": "be_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "provider": "*",
+                "account_ref": "*",
+            },
+        ]))
+        .unwrap();
+        let derived = candidate_router(extension_state);
+        let derived_request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(body),
+            &[
+                (EDGE_WEBCHAT_CONTROL_GRANTS_HEADER, derived_header.as_str()),
+                (
+                    EDGE_EXPECTED_RUNTIME_GENERATION_HEADER,
+                    "rust-caller-grant-proof",
+                ),
+            ],
+        );
+        let response = derived.oneshot(derived_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = payload["result"]["content"][0]["text"].as_str().unwrap();
+        let local: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(local["ok"], true);
+        assert_eq!(
+            local["actuation_available"], false,
+            "a wildcard endpoint grant must not authorize a concrete endpoint"
+        );
+        assert_eq!(local["actuation_reason"], "caller_grant_missing");
         std::fs::remove_dir_all(root).ok();
     }
 

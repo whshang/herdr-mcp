@@ -162,18 +162,31 @@ exact device/endpoint, tab ownership, origin and sensitive-field checks are unch
 when it matches one active connector. `client_name` such as `Cursor` is not the account,
 and a label is not a shared grant. Set it with `herdr-mcp connector label <connector-id> <platform-account>`.
 
-An owner device may also grant or revoke WebChat control for any other non-revoked device
-in the same fleet. `--confirm` stays required. A non-owner requester is
-`connector_owner_device_required`. A target outside this fleet is
-`connector_owner_device_mismatch`.
+**Label and device-wide availability.** `connector label`, `allow-device` and `deny-device`
+need an Edge that implements the matching routes; that Edge ships separately from this
+runtime. Against an Edge without them the command fails with a fixed code and changes
+nothing: `connector_label_requires_edge_support` or `device_grant_requires_edge_support`.
+A 401/403 still reports the real authorization failure. Never read the failure as "the
+grant was written".
 
 ```sh
 herdr-mcp connector webchat-control allow-device CONNECTOR_OR_PLATFORM_ACCOUNT DEVICE_ID --confirm
 herdr-mcp connector webchat-control deny-device CONNECTOR_OR_PLATFORM_ACCOUNT DEVICE_ID --confirm
 ```
 
-Device-wide scope is endpoint `*`, provider `*`, and account `*` on that device only.
-Page Assist grants are unchanged.
+**A wildcard endpoint is never device-wide authority on this runtime.** Authorization is
+provider-scoped and needs an exact `endpoint_ref` + `provider` match. A forwarded grant whose
+`endpoint_ref` is `*` — including the `{ "*", "*", "*" }` tuple an older Edge derives from a
+wildcard Page Assist row — is dropped at the trusted ingress and covers no endpoint. The
+`allow-device` marker that would make it authoritative, and the Edge-side target checks
+(`connector_owner_device_required`, `connector_owner_device_mismatch`,
+`connector_target_device_unresolved`, suspend/revoke deny-only cleanup and the
+`requesterDeviceId` / `targetDeviceId` audit fields), arrive with that Edge. Do not plan a
+device-wide grant before it does.
+
+**Page Assist is per-endpoint only.** `connector page-assist allow|deny` refuses `endpoint_ref`
+`*` locally, because an older Edge would store that row and derive full device-wide WebChat
+control from it at forward time.
 
 **Provider wildcard and Page Assist implication (2026-10-11 23:03).** A grant may use
 provider `*` (exact endpoint, any provider). Edge derives a `*` WebChat control grant at
