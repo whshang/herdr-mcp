@@ -82,17 +82,20 @@ class ChatGPTAdapter extends BaseAdapter {
     );
   }
 
+  async getAccountNativeIdentity(timeoutMs = 1500) {
+    return (await this.getAccountObservation(timeoutMs))?.nativeIdentity ?? null;
+  }
+
   // One authenticated observation of the signed-in account. The two provider
   // endpoints are cross-checked instead of trusting the first response: an old
   // tab can retain the former account's /me payload after an account switch.
   // Only the identity/email facts and a fixed diagnostic vocabulary leave this
   // method; raw payloads, IDs and tokens never reach the extension host.
   async getAccountObservation(timeoutMs = 1500) {
-    // Honor the cooldown armed by an earlier 429 (noteAccountIdentity429): a
-    // throttled account must not be re-probed by registration, the create scope
-    // handshake, or any other caller, and the caller sees a fixed reason.
+    // The cooldown lives on the shared observation entrypoint so every caller
+    // (identity probes and registration observations alike) is gated by it.
     if (Date.now() < (this._accountIdentity429Until || 0)) {
-      return { nativeIdentity: null, email: null, reason: "authenticated_rate_limited" };
+      return { nativeIdentity: null, email: null };
     }
     let nativeIdentity = null;
     let email = null;
@@ -108,8 +111,11 @@ class ChatGPTAdapter extends BaseAdapter {
           signal: controller.signal,
         });
         if (response.status === 429) {
+          // A throttled probe stops here: the cooldown covers both
+          // authenticated endpoints. The neutral observation keeps the
+          // `{nativeIdentity, email}` contract every caller reads.
           this.noteAccountIdentity429(response);
-          return { nativeIdentity: null, email: null, reason: "authenticated_rate_limited" };
+          return { nativeIdentity: null, email: null };
         }
         if (!response.ok) continue;
         this._accountIdentity429Count = 0;
@@ -229,10 +235,6 @@ class ChatGPTAdapter extends BaseAdapter {
     return nativeIdentity
       ? { nativeIdentity, email }
       : { nativeIdentity: null, email: null, reason: "authenticated_identity_unavailable" };
-  }
-
-  async getAccountNativeIdentity(timeoutMs = 1500) {
-    return (await this.getAccountObservation(timeoutMs)).nativeIdentity;
   }
 
   getConversationKey() {

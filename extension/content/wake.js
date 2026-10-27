@@ -2428,6 +2428,21 @@ function normalizeHerdrMentionAlias(value) {
     return evidence;
   }
 
+  function chatGptDispatchBaselineRejectionReason(snapshot) {
+    // The returned error is a fixed enum: never forward URLs, status bodies,
+    // user messages, or raw Provider errors. This remains a pre-send refusal.
+    if (snapshot?.ok && !snapshot.userMessageId) return "browser_dispatch_baseline_user_id_missing";
+    const reason = String(snapshot?.reason || "");
+    if (reason === "http-429") return "browser_dispatch_baseline_http429";
+    if (reason === "auth" || reason === "http-401") return "browser_dispatch_baseline_auth";
+    if (reason === "http-403") return "browser_dispatch_baseline_forbidden";
+    if (reason === "http-404") return "browser_dispatch_baseline_not_found";
+    if (reason === "timeout") return "browser_dispatch_baseline_timeout";
+    if (reason === "fetch-failed") return "browser_dispatch_baseline_network";
+    if (/^http-5[0-9][0-9]$/.test(reason)) return "browser_dispatch_baseline_server";
+    return "browser_dispatch_baseline_unavailable";
+  }
+
   async function performBrowserActuationCommand(command) {
     const dispatchId = typeof command?.dispatch_id === "string" ? command.dispatch_id : "";
     const expectedGeneration = Number(command?.expected_generation || 0);
@@ -2628,12 +2643,19 @@ function normalizeHerdrMentionAlias(value) {
     const boundedChatGptSubmit = exactChatGptDispatchIdentity || (
       ADAPTER.name === "chatgpt" && creatingSession
     );
-    const snapshotTimeoutMs = exactChatGptDispatchIdentity || creatingSession ? 1200 : 6000;
+    let snapshotTimeoutMs = 6000;
+    if (creatingSession) snapshotTimeoutMs = 1200;
+    if (exactChatGptDispatchIdentity) snapshotTimeoutMs = 3000;
     const beforeServer = ADAPTER.name === "chatgpt"
       ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
       : { ok: false };
     const beforeDom = providerMessageSnapshot("user");
     const beforeAssistant = providerMessageSnapshot("assistant");
+    // Dispatch needs a provider-owned pre-submit user ID to prove advancement.
+    // Refuse before touching the composer when that baseline is unavailable.
+    if (exactChatGptDispatchIdentity && (!beforeServer?.ok || !beforeServer.userMessageId)) {
+      return browserRejectedEvidence(evidence, chatGptDispatchBaselineRejectionReason(beforeServer));
+    }
     const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
     const result = await performWake({
       template: message,
@@ -2643,13 +2665,18 @@ function normalizeHerdrMentionAlias(value) {
       expectedConvKey: command?.expectedConvKey ?? null,
       requiredApps,
     });
-    if (!result?.ok) {
-      if (boundedChatGptSubmit && result?.uncertain === true) {
-        evidence.command_accepted = true;
-        evidence.resource_available = true;
-        evidence.canonical_url_observed = providerCanonicalConversationObserved();
-        return evidence;
-      }
+    // A previously latched uncertain submit cannot be attributed to this
+    // dispatch. Preserve uncertainty without attempting another provider send.
+    if (boundedChatGptSubmit && result?.blocked === "submit-uncertain") {
+      evidence.command_accepted = true;
+      evidence.resource_available = true;
+      evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      return evidence;
+    }
+    // A one-shot send may succeed after its immediate UI acknowledgement
+    // expires. Use existing bounded exact-message readback without resubmitting.
+    const submitUnconfirmed = boundedChatGptSubmit && result?.uncertain === true;
+    if (!result?.ok && !submitUnconfirmed) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
@@ -2798,9 +2825,16 @@ function normalizeHerdrMentionAlias(value) {
         afterAssistant.text
         && afterAssistant.text !== beforeAssistant.text,
       );
+      const providerAssistantAdvanced = Boolean(
+        conversationStillExpected && serverAdvanced
+        && typeof beforeServer?.messageId === "string" && beforeServer.messageId
+        && typeof afterServer?.messageId === "string" && afterServer.messageId
+        && afterServer.messageId !== beforeServer.messageId,
+      );
       evidence.generation_status_observed = Boolean(
         isTurnInProgress()
-        || assistantAdvanced,
+        || assistantAdvanced
+        || providerAssistantAdvanced,
       );
       if (evidence.accepted_message_observed
           && (creatingSession || evidence.generation_status_observed)
@@ -3631,8 +3665,8 @@ function normalizeHerdrMentionAlias(value) {
   // a bounded observation (identity + display email + fixed conflict codes);
   // otherwise only the native identity is read. Nothing else crosses this
   // boundary - never a raw payload, token, or provider identifier. The display
-  // email is kept for the connector label consumer and is not part of the
-  // registration payload in this change.
+  // email is the display-only platform-account label the background accepts
+  // (never an identity source).
   async function browserAccountObservation() {
     try {
       if (typeof ADAPTER.getAccountObservation === "function") {
@@ -3648,7 +3682,7 @@ function normalizeHerdrMentionAlias(value) {
             "native_id_conflict_matching_email",
             "native_id_conflict_different_email",
             "native_id_conflict_unverified_email",
-            "email_conflict", "authenticated_rate_limited",
+            "email_conflict",
           ].includes(observed?.reason) ? observed.reason : null,
           idRelation: [
             "me_matches_session_account_id",
@@ -3684,17 +3718,25 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function runConversationRegistration(reason, convKey, registrationAttempt) {
-    const accountObservation = await browserAccountObservation();
+    // A provider with the richer account-observation hook records a display-only
+    // platform-account label beside the native identity. Providers without it
+    // keep the original single-hop identity read.
+    const accountObservation = typeof ADAPTER.getAccountObservation === "function"
+      ? await browserAccountObservation()
+      : { nativeIdentity: await browserAccountNativeIdentity(), email: null };
     const accountNativeIdentity = accountObservation.nativeIdentity;
     const conflictStatuses = {
       native_id_conflict_matching_email: "id_conflict_matching_email",
       native_id_conflict_different_email: "id_conflict_different_email",
       native_id_conflict_unverified_email: "id_conflict_unverified_email",
       email_conflict: "email_conflict",
-      authenticated_rate_limited: "identity_rate_limited",
     };
+    // A throttled bearer verification means the identity is unknown, not
+    // conflicting: report the bounded rate-limit state instead.
+    const throttledStatus = accountObservation?.bearerRelation === "bearer_rate_limited"
+      ? "identity_rate_limited" : null;
     lastBrowserRegistrationStatus = accountNativeIdentity ? "identity_observed"
-      : conflictStatuses[accountObservation?.reason] || "identity_unavailable";
+      : conflictStatuses[accountObservation?.reason] || throttledStatus || "identity_unavailable";
     lastBrowserIdentityRelation = accountObservation?.idRelation || "not_observed";
     lastBrowserContactProof = accountObservation?.emailProof || "not_observed";
     lastBrowserBearerRelation = accountObservation?.bearerRelation || "not_observed";
@@ -3743,10 +3785,6 @@ function normalizeHerdrMentionAlias(value) {
         browserSessionReservationRef = null;
       }
     } catch (_) {}
-    const browserAppKeywords = ADAPTER.name === "chatgpt"
-      && typeof ADAPTER.getLatestUserAppKeywords === "function"
-      ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
-      : [];
     // A previous account's tab can retain its old DOM after account switching.
     // Verify this exact conversation is readable in the current signed-in
     // provider session before publishing any account/session association.
@@ -3765,6 +3803,10 @@ function normalizeHerdrMentionAlias(value) {
         return null;
       }
     }
+    const browserAppKeywords = ADAPTER.name === "chatgpt"
+      && typeof ADAPTER.getLatestUserAppKeywords === "function"
+      ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
+      : [];
     // Async project discovery can outlive an account or project switch, so the
     // registration is fenced against the current page immediately before it is
     // published. A superseded attempt or route stays a silent no-op; a changed
@@ -3806,6 +3848,7 @@ function normalizeHerdrMentionAlias(value) {
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
+      accountDisplayEmail: accountObservation.email,
       browserProjects,
       browserAppKeywords,
       browserCurrentProjectId: browserCurrentProject?.id || null,

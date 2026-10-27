@@ -389,6 +389,27 @@ test("user cools the secondary identity endpoint | Given /backend-api/me has no 
   assert.equal(requests.length, 2, "the cooldown must cover both authenticated endpoints");
 });
 
+test("user observes an account inside the identity cooldown | Given /backend-api/me returned HTTP 429 | When a registration observation runs inside the cooldown | Then no authenticated endpoint is read again and the observation is neutral", async () => {
+  const requests = [];
+  const fetch = async (url) => {
+    requests.push(url);
+    return { ok: false, status: 429, headers: { get: () => "45" } };
+  };
+  const adapter = loadAdapterWithDocument({}, fetch);
+
+  assert.equal(
+    JSON.stringify(await adapter.getAccountObservation()),
+    JSON.stringify({ nativeIdentity: null, email: null }),
+    "a throttled observation reports no identity and no display email",
+  );
+  assert.deepEqual(requests, ["/backend-api/me"]);
+  assert.equal(
+    JSON.stringify(await adapter.getAccountObservation()),
+    JSON.stringify({ nativeIdentity: null, email: null }),
+  );
+  assert.equal(requests.length, 1, "the cooldown also gates the observation entrypoint");
+});
+
 test("user bounds an untrusted Retry-After | Given the identity endpoint returns HTTP 429 with Retry-After 999999 | When the probe computes its cooldown | Then the delay stays inside the bounded policy instead of trusting the header", async () => {
   const fetch = async () => ({ ok: false, status: 429, headers: { get: () => "999999" } });
   const adapter = loadAdapterWithDocument({}, fetch);
@@ -424,7 +445,7 @@ test("user cools the identity probe after a throttled bearer check | Given the c
 
   const throttled = await adapter.getAccountObservation();
   assert.equal(throttled.nativeIdentity, null);
-  assert.equal(throttled.reason, "authenticated_rate_limited");
+  assert.equal(throttled.email, null, "a throttled observation stays neutral");
   assert.equal(requests.length, 3, "no authenticated identity read may run inside the cooldown");
 });
 
