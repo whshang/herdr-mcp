@@ -5211,12 +5211,51 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
-  async function maybeSendRecoveryProbe() {
+  // Recovery probe authorization evidence. A probe is a new user turn, so the
+  // policy only escalates on a proven terminal provider fact. A busy page, an
+  // unreadable provider snapshot, and a still-open turn all fail closed here.
+  async function observeRecoveryEvidence(record = conversationHealth) {
+    if (typeof RECOVERY_CONTROLLER?.recoveryProbeAllowed !== "function") return null;
+    // Gate the authenticated provider fetch before it happens. The 5s health
+    // watch and the post-load reconcile both land here, and last_user_submit_at
+    // survives markTurnEnded(), so a settled conversation used to keep fetching
+    // the provider snapshot indefinitely. Only a pending, evidence-due reply is
+    // fetched; an ended, Auto-off, or not-yet-due conversation stops here.
+    if (typeof RECOVERY_CONTROLLER.shouldObserveRecoveryEvidence !== "function"
+      || !RECOVERY_CONTROLLER.shouldObserveRecoveryEvidence(record, { automationEnabled, now: Date.now() })) {
+      return null;
+    }
+    const safety = recoverySafetySnapshot();
+    const dom = {
+      streaming: safety.streaming,
+      toolRunning: safety.toolRunning,
+      composerBusy: safety.composerBusy,
+      permissionCardActive: safety.permissionCardActive,
+      assistantText: lastMessageByRole("assistant"),
+    };
+    if (safety.streaming || safety.toolRunning || safety.composerBusy || safety.permissionCardActive) {
+      return { dom };
+    }
+    const server = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+    return { dom, server };
+  }
+
+  async function maybeSendRecoveryProbe(evidence = null) {
     if (!conversationHealth || !RECOVERY_CONTROLLER) return false;
     if (!automationEnabled) return false;
-    if (!RECOVERY_CONTROLLER.shouldSendRecovery(conversationHealth)) return false;
+    if (!RECOVERY_CONTROLLER.shouldSendRecovery(
+      conversationHealth,
+      RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY,
+      Date.now(),
+      evidence,
+    )) return false;
     const safety = recoverySafetySnapshot();
     if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return false;
+    // Re-verify immediately before submitting. Other watchers (stale-view
+    // refresh, explicit-error handling) run between the polling tick and this
+    // point, and a probe is a new user turn that must never race live work.
+    const live = await observeRecoveryEvidence(conversationHealth);
+    if (!RECOVERY_CONTROLLER.recoveryProbeAllowed(live, conversationHealth.last_user_submit_at)) return false;
     const result = await performWake({
       template: hudLabels.recovery_probe_template,
       autoAllow: false,
@@ -5362,7 +5401,13 @@ function normalizeHerdrMentionAlias(value) {
     if (ADAPTER.name === "chatgpt" && !chatGptConversationId()) return;
     const record = await ensureConversationHealth();
     if (!record || !RECOVERY_CONTROLLER) return;
-    const suspect = RECOVERY_CONTROLLER.classifyReplyTimeout(record);
+    const evidence = await observeRecoveryEvidence(record);
+    const suspect = RECOVERY_CONTROLLER.classifyReplyTimeout(
+      record,
+      Date.now(),
+      RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs,
+      evidence,
+    );
     if (suspect !== record) markConversationState(suspect);
     await maybeEscalateRecoveryRollover();
   }
@@ -5382,10 +5427,16 @@ function normalizeHerdrMentionAlias(value) {
         if (await maybeRecoverPageHealth()) return;
         if (await maybeRecoverExplicitChatGptFailure()) return;
         if (await maybeRecoverExplicitThreadError()) return;
-        const next = RECOVERY_CONTROLLER.classifyReplyTimeout(conversationHealth);
+        const evidence = await observeRecoveryEvidence();
+        const next = RECOVERY_CONTROLLER.classifyReplyTimeout(
+          conversationHealth,
+          Date.now(),
+          RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs,
+          evidence,
+        );
         if (next !== conversationHealth) markConversationState(next);
         if (await maybeRefreshStaleView()) return;
-        if (await maybeSendRecoveryProbe()) return;
+        if (await maybeSendRecoveryProbe(evidence)) return;
         if (await maybeReloadForRecovery()) return;
         if (await maybeEscalateContextRollover()) return;
         await maybeEscalateRecoveryRollover();
