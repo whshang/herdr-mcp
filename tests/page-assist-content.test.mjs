@@ -471,6 +471,44 @@ function tableHarness({ rows, extraElements = [] }) {
   return { h, table };
 }
 
+test("user pages to a table after long navigation | Given more than 128 links before a visible table | When inspect advances the bounded offset | Then the table can still be extracted", () => {
+  const navigation = Array.from({ length: 140 }, (_, index) => createElement({
+    tag: "a", text: `Nav ${index}`, attrs: { href: `/nav/${index}` },
+  }));
+  const table = createElement({ tag: "table" });
+  const h = harness({ elements: [...navigation, table] });
+  const doc = table.ownerDocument;
+  attachTableRows(table, [
+    tableDomRow({ doc, cells: [tableDomNode({ doc, tag: "th", text: "Name" })] }),
+    tableDomRow({ doc, cells: [tableDomNode({ doc, text: "Alpha" })] }),
+  ]);
+
+  const firstPage = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(firstPage.elements.length, 128);
+  assert.equal(firstPage.next_element_offset, 128);
+  assert.equal(firstPage.elements.some((element) => element.tag === "table"), false);
+
+  const observed = h.send({
+    type: "h2w_page_assist",
+    action: "inspect",
+    expectedOrigin: "https://app.test",
+    elementOffset: firstPage.next_element_offset,
+  });
+  assert.equal(observed.element_offset, 128);
+  assert.equal(observed.next_element_offset, null);
+  assert.notEqual(observed.generation, firstPage.generation);
+  const tableRef = observed.elements.find((element) => element.tag === "table")?.ref;
+  assert.ok(tableRef, "the next page must expose the table ref");
+
+  const extracted = h.send({
+    type: "h2w_page_assist", action: "extract_table", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: tableRef, maxRows: 2,
+  });
+  assert.equal(extracted.ok, true);
+  assert.deepEqual(Array.from(extracted.headers), ["Name"]);
+  assert.deepEqual(Array.from(extracted.rows[0]), ["Alpha"]);
+});
+
 test("user extracts one observed table | Given a page with a visible table ref | When extract_table requests bounded rows | Then headers and cell text return without markup or hidden values", () => {
   const longCell = "v".repeat(400);
   const button = createElement({ tag: "button", text: "Filter" });
@@ -1564,4 +1602,24 @@ test("user observes only bounded choice controls | Given inert tags and unsafe c
   const h = harness({ elements: [...inert, inertDiv, broad, sensitive, createElement({ text: "Cancel" })] });
   const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
   assert.deepEqual(Array.from(observed.elements, (el) => el.text), ["Cancel"]);
+});
+
+test("user observes only safe body text | Given hidden and sensitive descendants | When inspect runs | Then their text is excluded", () => {
+  const button = createElement({ tag: "button", text: "Save" });
+  const h = harness({ elements: [button], bodyText: "Visible SECRET_ARIA SECRET_HIDDEN SECRET_PASSWORD tail" });
+  const doc = button.ownerDocument;
+  const textNode = (value) => ({ nodeType: 3, nodeValue: value });
+  const child = (options, nodes) => Object.assign(createElement(options), { nodeType: 1, ownerDocument: doc, childNodes: nodes });
+  doc.body.nodeType = 1;
+  doc.body.childNodes = [
+    textNode("Visible "),
+    child({ tag: "span", attrs: { "aria-hidden": "true" } }, [textNode("SECRET_ARIA")]),
+    child({ tag: "span", visible: false }, [textNode("SECRET_HIDDEN")]),
+    child({ tag: "input", type: "password" }, [textNode("SECRET_PASSWORD")]),
+    textNode("tail"),
+  ];
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.text, "Visible tail");
+  assert.doesNotMatch(observed.text, /SECRET_/);
 });
