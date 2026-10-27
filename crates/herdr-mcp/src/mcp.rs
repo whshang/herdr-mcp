@@ -82,6 +82,59 @@ pub struct BrowserCallerAuthorization {
     pub principal_ref: String,
     pub connector_id: String,
     pub grant_generation: i64,
+    // Display-only platform_account labels live Edge-side; they never ride
+    // the authorization wire and are not part of the runtime struct.
+}
+
+/// `<platform>-<email>` display label. The first `-` separates the platform
+/// from the account, so the email may itself contain `-`.
+pub(crate) fn normalize_platform_account(value: &str) -> Option<String> {
+    let text = value.trim().to_ascii_lowercase();
+    if text.len() < 6 || text.len() > 128 {
+        return None;
+    }
+    let (platform, account) = text.split_once('-')?;
+    if !is_platform_account_token(platform) || !is_platform_account_email(account) {
+        return None;
+    }
+    Some(text)
+}
+
+fn is_platform_account_token(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_lowercase()
+        && value.len() <= 32
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+}
+
+fn is_platform_account_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || !local.chars().all(|ch| {
+            ch.is_ascii_lowercase()
+                || ch.is_ascii_digit()
+                || matches!(ch, '.' | '_' | '%' | '+' | '-')
+        })
+    {
+        return false;
+    }
+    let Some((host, tld)) = domain.rsplit_once('.') else {
+        return false;
+    };
+    !host.is_empty()
+        && !host.starts_with(['.', '-'])
+        && !host.ends_with(['.', '-'])
+        && !host.contains("..")
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-'))
+        && (2..=24).contains(&tld.len())
+        && tld.chars().all(|ch| ch.is_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7149,7 +7202,7 @@ fn browser_operation_resource(
     Ok(resource)
 }
 
-/// WebChat control grants are provider-scoped: exact endpoint + provider.
+/// WebChat control grants are provider-scoped: **exact** endpoint + provider.
 /// `account_ref` (legacy per-account grants, or the `*` provider-scope marker)
 /// is accepted for backward compatibility and does not narrow the match.
 pub(crate) const WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT: &str = "*";
@@ -7167,6 +7220,17 @@ fn webchat_control_grant_covers(
 /// on its exact endpoint (issued explicitly, or derived by Edge from a Page
 /// Assist endpoint grant).
 pub(crate) const WEBCHAT_CONTROL_ANY_PROVIDER: &str = "*";
+
+/// Device-wide marker.
+///
+/// A pre-#713 Edge still accepts a wildcard Page Assist row and derives the
+/// `*/*/*` tuple from it at forward time, so this runtime must never widen a
+/// wildcard endpoint: a grant whose `endpoint_ref` is `*` matches no endpoint
+/// here at all (`webchat_control_grant_covers` requires an exact endpoint).
+/// Honouring device scope needs the owner `allow-device` marker and the
+/// deny-only cleanup rules from the Edge slice, together with a verifiable
+/// owner check on this side; until both exist the marker is inert.
+pub(crate) const WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT: &str = "*";
 
 fn browser_resource_actuation_decision(
     store: &StateStore,
@@ -24565,11 +24629,75 @@ mod webchat_control_provider_scope_tests {
         );
     }
 
+    /// user owner | Given a wildcard Page Assist row forwarded as the `*/*/*` tuple | When any endpoint or provider is controlled | Then it covers nothing, because a wildcard endpoint is never device-wide authority
+    #[test]
+    fn user_owner_given_wildcard_endpoint_grant_when_any_endpoint_then_denied() {
+        let derived = grant(
+            WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT,
+            WEBCHAT_CONTROL_ANY_PROVIDER,
+            WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+        );
+        for (endpoint, provider) in [
+            ("bep_a", "grok"),
+            ("bep_b", "claude"),
+            ("bep_a", "chatgpt"),
+            ("bep_a", WEBCHAT_CONTROL_ANY_PROVIDER),
+        ] {
+            assert!(
+                !webchat_control_grant_covers(&derived, endpoint, provider),
+                "{endpoint}/{provider} must not be covered by a wildcard endpoint"
+            );
+        }
+    }
+
+    /// user owner | Given a Page Assist-shaped device-wide row next to a real endpoint grant | When an unrelated endpoint is controlled | Then only the exact endpoint grant authorizes it
+    #[test]
+    fn user_owner_given_derived_and_exact_grants_when_other_endpoint_then_only_exact_applies() {
+        let grants = [
+            grant(
+                WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT,
+                WEBCHAT_CONTROL_ANY_PROVIDER,
+                WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+            ),
+            grant(
+                "bep_a",
+                WEBCHAT_CONTROL_ANY_PROVIDER,
+                WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+            ),
+        ];
+        let covered = grants
+            .iter()
+            .any(|candidate| webchat_control_grant_covers(candidate, "bep_b", "grok"));
+        assert!(!covered, "a derived wildcard row must not cover bep_b");
+        let own = grants
+            .iter()
+            .any(|candidate| webchat_control_grant_covers(candidate, "bep_a", "grok"));
+        assert!(own, "the exact endpoint grant still applies");
+    }
+
     /// user owner | Given a legacy grant carrying an explicit account_ref | When that provider on that endpoint is controlled | Then it still works (account_ref is ignored)
     #[test]
     fn user_owner_given_legacy_account_grant_when_same_endpoint_provider_then_authorized() {
         let g = grant("bep_a", "chatgpt", "br_legacy_account");
         assert!(webchat_control_grant_covers(&g, "bep_a", "chatgpt"));
+    }
+
+    #[test]
+    fn platform_account_label_accepts_platform_email_and_rejects_client_name() {
+        assert_eq!(
+            normalize_platform_account("  Grokbot-Whshang@gmail.com "),
+            Some("grokbot-whshang@gmail.com".to_owned())
+        );
+        assert_eq!(
+            normalize_platform_account("chatgpt-user.name+tag@example.com"),
+            Some("chatgpt-user.name+tag@example.com".to_owned())
+        );
+        assert_eq!(normalize_platform_account("Cursor"), None);
+        assert_eq!(normalize_platform_account("grokbot-not-an-email"), None);
+        assert_eq!(
+            normalize_platform_account("grok_bot-owner@example.com"),
+            None
+        );
     }
 }
 
