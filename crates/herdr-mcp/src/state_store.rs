@@ -13221,8 +13221,9 @@ mod tests {
             "browser_canonical_url_ambiguous"
         );
 
-        // Reverse direction: the new chatgpt generation retires only the stale
-        // chatgpt locator, never the claude one.
+        // Once chatgpt re-observes the shared URL at its new generation, a
+        // current chatgpt session exists, so the stale chatgpt locator is
+        // retired while the claude locator on the same URL is kept.
         let (_, chatgpt_current_session) = observe_browser_session_url(
             &mut store,
             "chatgpt",
