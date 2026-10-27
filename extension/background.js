@@ -56,8 +56,12 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.220";
+const H2W_SCRIPT_VERSION = "0.1.221";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
+// Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
+// fence. Keep listening for the ORIGINAL content reply within that fence;
+// never issue a second provider mutation when the initial wait expires.
+const BROWSER_DISPATCH_CONTENT_TIMEOUT_MS = 40_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -2985,13 +2989,15 @@ async function sendChatGptTabMessage(tabId, message, responseTimeoutMs = 0) {
 }
 
 async function sendBrowserActuationTabMessage(tabId, message, responseTimeoutMs = 0) {
-  // Browser dispatch stays a single fenced mutation attempt. Bound the content
-  // response so one stale view cannot block the shared push queue past the
-  // runtime actuation deadline; never reload or resend a submit/stop command.
-  if (Number(responseTimeoutMs) > 0) {
-    return sendTabMessageWithTimeout(tabId, message, Number(responseTimeoutMs));
-  }
-  return sendTabMessageWithTimeout(tabId, message, 18000);
+  // Preserve a single fenced physical mutation. A Dispatch response may finish
+  // after the Runtime's initial 22s wait; the Runtime retains exact late
+  // completion for 60s. This callback runs off the shared SSE push queue, so
+  // waiting for the original proof cannot starve later events. Never retry
+  // or reload a tab after uncertain submission.
+  const defaultTimeoutMs = message?.command?.operation === "herdr_mcp.browser_dispatch.submit"
+    ? BROWSER_DISPATCH_CONTENT_TIMEOUT_MS : 18000;
+  const timeoutMs = Number(responseTimeoutMs) > 0 ? Number(responseTimeoutMs) : defaultTimeoutMs;
+  return sendTabMessageWithTimeout(tabId, message, timeoutMs);
 }
 
 async function handoffMessageWithRequiredApps(site, message) {
@@ -4596,7 +4602,14 @@ async function handlePushBlock(block, streamCtrl = null) {
   }
   if (!event || !data) return;
   if (event === "browser_actuation") {
-    await handleBrowserActuation(data);
+    if (data.operation === "herdr_mcp.browser_dispatch.submit") {
+      // A ChatGPT submit makes nested content-to-background MAIN-world calls.
+      // Keep the single attempt running without blocking the shared push queue.
+      void handleBrowserActuation(data)
+        .catch((error) => callLog("dispatch actuation failed:", error?.message || String(error)));
+    } else {
+      await handleBrowserActuation(data);
+    }
     return;
   }
   if (event === "hello") {
