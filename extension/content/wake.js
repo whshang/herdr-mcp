@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.222";
+const H2W_CONTENT_VERSION = "0.1.223";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3233,6 +3233,10 @@ function normalizeHerdrMentionAlias(value) {
             browserProjectName: project?.name || null,
             browserSessionRef: identityMatchesRoute ? registeredBrowserSessionRef : null,
             browserGeneration: identityMatchesRoute ? registeredBrowserGeneration : null,
+            registrationStatus: lastBrowserRegistrationStatus,
+            identityRelation: lastBrowserIdentityRelation,
+            contactProof: lastBrowserContactProof,
+            bearerRelation: lastBrowserBearerRelation,
           });
         })();
         return true;
@@ -3650,6 +3654,19 @@ function normalizeHerdrMentionAlias(value) {
     return ADAPTER.resolveProjectIdentity(convKey);
   }
 
+  const registrationInFlight = new Map();
+  // Privacy-preserving registration diagnostics: finite states only, never IDs.
+  let lastBrowserRegistrationStatus = "not_observed";
+  let lastBrowserIdentityRelation = "not_observed";
+  let lastBrowserContactProof = "not_observed";
+  let lastBrowserBearerRelation = "not_observed";
+
+  // Authenticated account observation for registration. The adapter may expose
+  // a bounded observation (identity + display email + fixed conflict codes);
+  // otherwise only the native identity is read. Nothing else crosses this
+  // boundary - never a raw payload, token, or provider identifier. The display
+  // email is the display-only platform-account label the background accepts
+  // (never an identity source).
   async function browserAccountObservation() {
     try {
       if (typeof ADAPTER.getAccountObservation === "function") {
@@ -3661,13 +3678,44 @@ function normalizeHerdrMentionAlias(value) {
         return {
           nativeIdentity,
           email: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null,
+          reason: [
+            "native_id_conflict_matching_email",
+            "native_id_conflict_different_email",
+            "native_id_conflict_unverified_email",
+            "email_conflict",
+          ].includes(observed?.reason) ? observed.reason : null,
+          idRelation: [
+            "me_matches_session_account_id",
+            "me_differs_session_user_and_account_id",
+            "me_differs_session_user_without_account_id",
+            "unclassified",
+          ].includes(observed?.idRelation) ? observed.idRelation : null,
+          emailProof: [
+            "emails_match", "emails_differ", "session_email_missing",
+            "me_email_missing", "both_emails_missing",
+          ].includes(observed?.emailProof) ? observed.emailProof : null,
+          bearerRelation: [
+            "bearer_token_unavailable", "bearer_not_authorized",
+            "bearer_rate_limited", "bearer_response_unavailable",
+            "bearer_identity_missing", "bearer_matches_session_user",
+            "bearer_matches_session_account", "bearer_matches_cookie_me",
+            "bearer_differs_from_session", "bearer_network_unavailable",
+          ].includes(observed?.bearerRelation) ? observed.bearerRelation : null,
         };
       }
     } catch (_) {}
     return { nativeIdentity: await browserAccountNativeIdentity(), email: null };
   }
 
-  const registrationInFlight = new Map();
+  // A refused registration must not leave the background's tab scope / session
+  // target association in place: the tab is no longer proven to be the account
+  // or project the association was created for. The scope is keyed by the sender
+  // tab, so the content script asks the background to drop it explicitly (the
+  // same clear h2w_register performs when no authenticated identity is present).
+  // Fire-and-forget: a refused registration never blocks on this.
+  function clearBrowserRegistrationScope() {
+    void sendBg({ type: "h2w_clear_scope" });
+  }
 
   async function runConversationRegistration(reason, convKey, registrationAttempt) {
     // A provider with the richer account-observation hook records a display-only
@@ -3677,6 +3725,28 @@ function normalizeHerdrMentionAlias(value) {
       ? await browserAccountObservation()
       : { nativeIdentity: await browserAccountNativeIdentity(), email: null };
     const accountNativeIdentity = accountObservation.nativeIdentity;
+    const conflictStatuses = {
+      native_id_conflict_matching_email: "id_conflict_matching_email",
+      native_id_conflict_different_email: "id_conflict_different_email",
+      native_id_conflict_unverified_email: "id_conflict_unverified_email",
+      email_conflict: "email_conflict",
+    };
+    // A throttled bearer verification means the identity is unknown, not
+    // conflicting: report the bounded rate-limit state instead.
+    const throttledStatus = accountObservation?.bearerRelation === "bearer_rate_limited"
+      ? "identity_rate_limited" : null;
+    lastBrowserRegistrationStatus = accountNativeIdentity ? "identity_observed"
+      : conflictStatuses[accountObservation?.reason] || throttledStatus || "identity_unavailable";
+    lastBrowserIdentityRelation = accountObservation?.idRelation || "not_observed";
+    lastBrowserContactProof = accountObservation?.emailProof || "not_observed";
+    lastBrowserBearerRelation = accountObservation?.bearerRelation || "not_observed";
+    // Never attempt to associate a ChatGPT route when no authenticated
+    // identity is available. A fresh tab can have conflicting login endpoints
+    // during an account switch; report only a bounded diagnostic state.
+    if (ADAPTER.name === "chatgpt" && !accountNativeIdentity) {
+      clearBrowserRegistrationScope();
+      return null;
+    }
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
       try {
@@ -3721,6 +3791,7 @@ function normalizeHerdrMentionAlias(value) {
     if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
       const proof = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
       if (!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim()) {
+        lastBrowserRegistrationStatus = "provider_readback_unavailable";
         if (registeredConvKey === convKey) {
           registeredConvKey = null;
           registeredBrowserSessionRef = null;
@@ -3728,6 +3799,7 @@ function normalizeHerdrMentionAlias(value) {
           registeredHerdrAppKeyword = null;
           registeredConversationBound = false;
         }
+        clearBrowserRegistrationScope();
         return null;
       }
     }
@@ -3735,6 +3807,41 @@ function normalizeHerdrMentionAlias(value) {
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
       ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
       : [];
+    // Async project discovery can outlive an account or project switch, so the
+    // registration is fenced against the current page immediately before it is
+    // published. A superseded attempt or route stays a silent no-op; a changed
+    // account or project is a refusal that also drops the background's stale
+    // tab scope (see clearBrowserRegistrationScope).
+    const currentAccount = await browserAccountObservation();
+    // ChatGPT's adapter has no DOM project identity method, so its current
+    // project is re-derived from the live conversation anchor against the same
+    // catalog the association was resolved with. A Project route carries its
+    // project in the URL, which the route fence below already proves.
+    const currentProject = typeof ADAPTER.getProjectIdentity === "function"
+      ? ADAPTER.getProjectIdentity()
+      : (ADAPTER.name === "chatgpt" && !chatGptProjectRoute
+        ? currentChatGptProjectFromCatalog(browserProjects)
+        : browserCurrentProject);
+    if (registrationAttempt !== browserRegistrationAttempt
+        || ADAPTER.getConversationKey() !== convKey) {
+      if (registeredConvKey === convKey && ADAPTER.getConversationKey() !== convKey) {
+        registeredBrowserSessionRef = null;
+        registeredBrowserGeneration = null;
+        registeredHerdrAppKeyword = null;
+        registeredConversationBound = false;
+      }
+      return null;
+    }
+    if (currentAccount.nativeIdentity !== accountNativeIdentity) {
+      lastBrowserRegistrationStatus = "account_changed";
+      clearBrowserRegistrationScope();
+      return null;
+    }
+    if ((currentProject?.id || null) !== (browserCurrentProject?.id || null)) {
+      lastBrowserRegistrationStatus = "project_changed";
+      clearBrowserRegistrationScope();
+      return null;
+    }
     const response = await sendBg({
       type: "h2w_register",
       convKey,
@@ -3748,6 +3855,10 @@ function normalizeHerdrMentionAlias(value) {
       browserCurrentProjectName: browserCurrentProject?.name || null,
       browserSessionReservationRef,
     });
+    lastBrowserRegistrationStatus = response === null ? "background_unavailable"
+      : Number.isSafeInteger(response?.browser_generation) && response.browser_generation > 0
+        && typeof response?.browser_account_ref === "string" && response.browser_account_ref
+        ? "registry_observed" : "registry_unobserved";
     if (response !== null) {
       if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
         if (registeredConvKey === convKey) {
