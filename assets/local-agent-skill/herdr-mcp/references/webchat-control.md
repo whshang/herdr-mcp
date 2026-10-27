@@ -184,6 +184,10 @@ wildcard Page Assist row — is dropped at the trusted ingress and covers no end
 `requesterDeviceId` / `targetDeviceId` audit fields), arrive with that Edge. Do not plan a
 device-wide grant before it does.
 
+Even after that Edge lands, this runtime stores and audits a device-wide grant without
+honoring it: `webchat_control_grant_covers` needs an exact endpoint, so a `*` endpoint
+still authorizes nothing until a later runtime change verifies the Edge's owner marker.
+
 **Page Assist is per-endpoint only.** `connector page-assist allow|deny` refuses `endpoint_ref`
 `*` locally, because an older Edge would store that row and derive full device-wide WebChat
 control from it at forward time.

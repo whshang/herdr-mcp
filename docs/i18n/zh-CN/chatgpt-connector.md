@@ -291,7 +291,7 @@ herdr-mcp connector label <connector-id> --clear
 
 本 runtime 的授权按 endpoint 和 provider 匹配。转发来的、`endpoint_ref` 为 `*` 的授权（包括旧 Edge 从通配 Page Assist 行推导出的 `{ "*", "*", "*" }`）会被丢弃，不覆盖任何 endpoint。出于同样原因，Page Assist 也在本地拒绝 `endpoint_ref` `*`。
 
-该 Edge 部署之后：已认证的所有者设备可以对同一 fleet 中任何未撤销的设备执行 `allow-device` 或 `deny-device`。请求者仍然必须是所有者设备。非所有者请求会被 `connector_owner_device_required` 拒绝。在本 fleet 中不存在或已撤销的目标是 `connector_owner_device_mismatch`。设备注册表无法读取时返回 `connector_target_device_unresolved`，并且不会写入授权。已暂停或已撤销的目标只允许 deny，避免旧授权在设备恢复后重新生效。必须带 `--confirm`。审计事件记录 `requesterDeviceId`、`targetDeviceId` 和 `connectorId`。设备级范围保存 endpoint `*`、provider `*` 和 account `*`，只覆盖该设备上的 WebChat endpoint；按 endpoint 的 allow 与 deny 不变，Page Assist 授权不变，授权仍然绑定 `{connector_id, grant_generation, device_id, endpoint_ref}`。
+该 Edge 部署之后：已认证的所有者设备可以对同一 fleet 中任何未撤销的设备执行 `allow-device` 或 `deny-device`。请求者仍然必须是所有者设备。非所有者请求会被 `connector_owner_device_required` 拒绝。在本 fleet 中不存在或已撤销的目标是 `connector_owner_device_mismatch`。设备注册表无法读取时返回 `connector_target_device_unresolved`，并且不会写入授权。已暂停或已撤销的目标只允许 deny，避免旧授权在设备恢复后重新生效。必须带 `--confirm`。审计事件记录 `requesterDeviceId`、`targetDeviceId` 和 `connectorId`。设备级范围保存 endpoint `*`、provider `*` 和 account `*`，绑定 `{connector_id, grant_generation, device_id, endpoint_ref}`，并记录为属于那一台设备。**本 runtime 仍然不承认它。** `webchat_control_grant_covers` 要求 endpoint 完全一致，因此 `*` endpoint 在这里不授予任何 WebChat control；即使部署了那部分 Edge，设备级授权也只是被保存和审计。要真正承认它，还需要后续的 runtime 变更在本侧校验 Edge 的所有者标记。按 endpoint 的 allow 与 deny 不变，Page Assist 授权不变。
 
 ```bash
 herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
