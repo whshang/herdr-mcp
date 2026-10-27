@@ -59,7 +59,25 @@ class ChatGPTAdapter extends BaseAdapter {
     return { ok: false, error: "chat_mode_switch_timeout" };
   }
 
+  // Bounded cooldown for authenticated account-identity probes. ChatGPT answers
+  // identity reads with HTTP 429 when the account is throttled, and account
+  // registration observations can repeat, so a throttled probe must stop both
+  // authenticated endpoints instead of retrying them. Only timing state is kept;
+  // no payload, identifier, or token is ever logged or stored.
+  noteAccountIdentity429(response) {
+    const retryAfter = Number.parseInt(response?.headers?.get?.("retry-after") || "", 10);
+    const boundedRetryAfterMs = Number.isSafeInteger(retryAfter)
+      && retryAfter >= 0 && retryAfter <= 86_400 ? retryAfter * 1000 : 0;
+    this._accountIdentity429Count = Math.min(8, (this._accountIdentity429Count || 0) + 1);
+    const policyMs = Math.min(120_000, 30_000 * (2 ** Math.min(2, this._accountIdentity429Count - 1)));
+    this._accountIdentity429Until = Math.max(
+      this._accountIdentity429Until || 0,
+      Date.now() + Math.max(30_000, policyMs, boundedRetryAfterMs),
+    );
+  }
+
   async getAccountNativeIdentity(timeoutMs = 1500) {
+    if (Date.now() < (this._accountIdentity429Until || 0)) return null;
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -71,7 +89,12 @@ class ChatGPTAdapter extends BaseAdapter {
           headers: { accept: "application/json" },
           signal: controller.signal,
         });
+        if (response.status === 429) {
+          this.noteAccountIdentity429(response);
+          return null;
+        }
         if (!response.ok) continue;
+        this._accountIdentity429Count = 0;
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
         if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
