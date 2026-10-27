@@ -5812,29 +5812,35 @@ test("user navigates one owned page to an exact same-origin URL | Given an owned
   assert.equal(oldGeneration.delivery_state, "not_applied");
   assert.equal(updates, 1);
   assert.equal(live.url, "https://example.com/next?view=2");
+});
 
-  // A claimed user tab may still be navigated explicitly on its own origin,
-  // just like a click on a same-origin link. Reload/history stay owned-only.
-  const claimedTabs = new Map([[93, { id: 93, url: "https://example.com/claimed-start", status: "complete", active: true }]]);
-  const claimedHarness = browserPageLifecycleHarness({ tabs: claimedTabs });
-  const claimed = await claimedHarness.performBrowserPageLifecycleRequest({
+test("user refuses to navigate a claimed user tab | Given a claimed BrowserPage and its current page generation | When navigate requests an exact same-origin destination | Then no navigation is dispatched and the rejection is not_applied and retry-safe", async () => {
+  const tabs = new Map([
+    [93, { id: 93, url: "https://example.com/claimed-start", status: "complete", active: true }],
+  ]);
+  const h = browserPageLifecycleHarness({ tabs });
+  const claimed = await h.performBrowserPageLifecycleRequest({
     action: "claim",
     targetOrigin: "https://example.com",
     url: "https://example.com/claimed-start",
-    idempotencyKey: "claim-navigate-1",
+    idempotencyKey: "claim-navigate-owned-only-1",
   });
-  const claimedNavigate = await claimedHarness.performBrowserPageActionRequest({
+  assert.equal(claimed.ok, true);
+  assert.equal(claimed.ownership, "claimed");
+
+  const refused = await h.performBrowserPageActionRequest({
     action: "navigate",
     pageRef: claimed.page_ref,
     url: "https://example.com/claimed-next",
     pageGeneration: claimed.page_generation,
   });
-  assert.equal(claimedNavigate.ok, true);
-  assert.equal(claimedNavigate.delivery_state, "applied");
-  assert.equal(claimedNavigate.navigated_url, "https://example.com/claimed-next");
-  assert.equal(claimedNavigate.page_generation, claimed.page_generation + 1);
-  assert.equal(claimedTabs.get(93).url, "https://example.com/claimed-next");
-  assert.equal(claimedHarness.browserPagesByRef.get(claimed.page_ref)?.stale, false);
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error, "browser_page_navigation_owned_only");
+  assert.equal(refused.delivery_state, "not_applied");
+  assert.equal(refused.retry_safe, true);
+  assert.equal(refused.mutation_submitted, false);
+  assert.equal(tabs.get(93).url, "https://example.com/claimed-start");
+  assert.equal(h.browserPagesByRef.get(claimed.page_ref)?.stale, false);
 });
 
 test("user refuses to guess after an unverified navigation | Given Chrome accepts the navigation call but lands on another document | When the destination document cannot be proven | Then delivery stays unknown and the old page handle is stale", async () => {

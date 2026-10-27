@@ -40,9 +40,9 @@ remain open, so the parent item stays open.
 | Targeted text extract | `get text`, `extract` | `action extract` | verified-real | 0.1.156, generation + ref bound |
 | Table extract | `extract` (table reads) | `action extract_table` (0.1.192) | unit-test-only | observed table refs, bounded headers/rows (max_rows 1..100, 32 cols, 200 chars/cell), visible-only cell text, hidden rows dropped, rowspan/colspan flattened per occurrence; Chrome UAT script ready in `v1.1-browser-adapter-platform.md` pending section |
 | Screenshot | `screenshot` | `action screenshot` | verified-real | earlier UAT |
-| Navigate / goto | `goto`, `navigate` | `action navigate` (0.1.217) | unit-test-only | explicit same-origin `url` + `page_generation` + idempotency key; verified destination adopted, mismatch/off-origin stays delivery-unknown and stale; Chrome UAT pending |
-| Reload | `reload` | `action reload` (0.1.217) | unit-test-only | owned pages only; same-URL reload verified through a loading/complete cycle, generation advanced; page-reload-mid-dispatch recovery UAT still pending |
-| Back / forward | `back`, `forward` | `action back/forward` (0.1.217) | unit-test-only | owned pages only; caller states the exact same-origin `expected_url`; CDP `Page.getNavigationHistory` preflight proves the current and exact adjacent entry before `Page.navigateToHistoryEntry` (never blind `goBack`), so a cross-origin adjacent entry fails closed; Chrome UAT pending |
+| Navigate / goto | `goto`, `navigate` | `action navigate` (0.1.223) | unit-test-only | owned pages only; explicit same-origin `url` + `page_generation` + idempotency key; verified destination adopted, mismatch/off-origin stays delivery-unknown and stale; Chrome UAT pending |
+| Reload | `reload` | `action reload` (0.1.223) | unit-test-only | owned pages only; same-URL reload verified through a loading/complete cycle, generation advanced; page-reload-mid-dispatch recovery UAT still pending |
+| Back / forward | `back`, `forward` | `action back/forward` (0.1.223) | unit-test-only | owned pages only; caller states the exact same-origin `expected_url`; CDP `Page.getNavigationHistory` preflight proves the current and exact adjacent entry before `Page.navigateToHistoryEntry` (never blind `goBack`), so a cross-origin adjacent entry fails closed; Chrome UAT pending |
 | Tab list / select | `tab list` | `webchat resources`, claim by URL | unit-test-only | no generic tab enumeration action; claim needs an exact URL |
 | Keyboard press / hotkeys | `press`, `keys` | `action press` (single-key vocabulary, 0.1.192) | unit-test-only | fixed 14-key vocabulary, optional observed ref to focus; no text/modifier combos; Chrome UAT script ready in `v1.1-browser-adapter-platform.md` pending section |
 | Hover / double-click / drag | `hover`, `dblclick`, `drag` | none | later | |
@@ -83,7 +83,7 @@ remain open, so the parent item stays open.
 
 ## Gaps that 1.1 needs
 
-1. Navigation is implemented in the existing action path as 0.1.217
+1. Navigation is implemented in the existing action path as 0.1.223
    `navigate`/`reload`/`back`/`forward` (unit-tested); the remaining work is
    real Chrome UAT, including page-reload-mid-dispatch recovery and
    history-destination verification.

@@ -820,7 +820,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "amount": {"type": ["integer", "null"], "minimum": 1, "maximum": 1500},
                     "max_rows": {"type": ["integer", "null"], "minimum": 1, "maximum": 100},
                     "expected_url": {"type": "string", "maxLength": 4096, "description": "Click/back/forward only: explicit absolute same-origin destination to verify after a navigation, including a history move. Never auto-retry an unverified navigation."},
-                    "url": {"type": "string", "maxLength": 4096, "description": "navigate only: explicit absolute same-origin destination URL. Reuses the mutation ledger and advances the page generation."},
+                    "url": {"type": "string", "maxLength": 4096, "description": "navigate only: explicit absolute same-origin destination URL on an owned BrowserPage. Reuses the mutation ledger and advances the page generation."},
                     "page_generation": {"type": ["integer", "null"], "minimum": 1, "description": "navigate/reload/back/forward only: current page_generation from the page view; the page record advances it after a verified navigation."},
                     "key": {"type": ["string", "null"], "enum": ["Enter", "Escape", "Tab", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Space", null]},
                     "objective": {"type": ["string", "null"], "maxLength": 1024},

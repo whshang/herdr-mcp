@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.217";
+const H2W_SCRIPT_VERSION = "0.1.223";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
@@ -8983,9 +8983,9 @@ async function performBrowserPageNavigation(page, tab, action, msg) {
       error: "browser_page_generation_stale",
     }, page, false);
   }
-  // Reload and history rewrite a user's tab state, so they stay task-owned.
-  // navigate is explicit and same-origin, like a click on a link.
-  if (action !== "navigate" && page.ownership !== "owned") {
+  // Every navigation rewrites the tab's document or history state, so all
+  // four actions stay task-owned; a claimed user tab must never be navigated.
+  if (page.ownership !== "owned") {
     return browserPageMutationEnvelope({
       ok: false,
       error: "browser_page_navigation_owned_only",
