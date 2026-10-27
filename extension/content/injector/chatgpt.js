@@ -59,7 +59,25 @@ class ChatGPTAdapter extends BaseAdapter {
     return { ok: false, error: "chat_mode_switch_timeout" };
   }
 
+  // Bounded cooldown for authenticated account-identity probes. ChatGPT answers
+  // identity reads with HTTP 429 when the account is throttled, and account
+  // registration observations can repeat, so a throttled probe must stop both
+  // authenticated endpoints instead of retrying them. Only timing state is kept;
+  // no payload, identifier, or token is ever logged or stored.
+  noteAccountIdentity429(response) {
+    const retryAfter = Number.parseInt(response?.headers?.get?.("retry-after") || "", 10);
+    const boundedRetryAfterMs = Number.isSafeInteger(retryAfter)
+      && retryAfter >= 0 && retryAfter <= 86_400 ? retryAfter * 1000 : 0;
+    this._accountIdentity429Count = Math.min(8, (this._accountIdentity429Count || 0) + 1);
+    const policyMs = Math.min(120_000, 30_000 * (2 ** Math.min(2, this._accountIdentity429Count - 1)));
+    this._accountIdentity429Until = Math.max(
+      this._accountIdentity429Until || 0,
+      Date.now() + Math.max(30_000, policyMs, boundedRetryAfterMs),
+    );
+  }
+
   async getAccountNativeIdentity(timeoutMs = 1500) {
+    if (Date.now() < (this._accountIdentity429Until || 0)) return null;
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -71,7 +89,12 @@ class ChatGPTAdapter extends BaseAdapter {
           headers: { accept: "application/json" },
           signal: controller.signal,
         });
+        if (response.status === 429) {
+          this.noteAccountIdentity429(response);
+          return null;
+        }
         if (!response.ok) continue;
+        this._accountIdentity429Count = 0;
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
         if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
@@ -181,11 +204,13 @@ class ChatGPTAdapter extends BaseAdapter {
     return this.getComposerTextWithoutAppPills() === '';
   }
 
-  // The composer's own native mention popup, resolved only through the
-  // provider's own association attributes (aria-controls / aria-owns). There is
-  // deliberately no document-wide fallback: when the composer does not own a
-  // visible popup, App selection fails closed instead of clicking an unrelated
-  // control that happens to share the keyword.
+  // The composer's own native mention popup, resolved through the provider's
+  // own association attributes (aria-controls / aria-owns) or, on newer
+  // ChatGPT builds, the provider's own mention shell class. There is
+  // deliberately no document-wide menu/button fallback: when neither the
+  // composer nor a strictly validated provider shell owns a visible popup, App
+  // selection fails closed instead of clicking an unrelated control that
+  // happens to share the keyword.
   getComposerOwnedPopup(input = this.getInputEl()) {
     if (!input) return null;
     const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
@@ -195,7 +220,25 @@ class ChatGPTAdapter extends BaseAdapter {
       const popup = document.getElementById(id);
       if (popup && !input.contains(popup) && visible(popup)) return popup;
     }
-    return null;
+    return this.getProviderMentionShell(input, visible);
+  }
+
+  // Live 2026-10-25 evidence: the current ChatGPT @ picker is a single
+  // provider-owned `ComposerTopMenuShell-*` overlay with no aria-controls or
+  // aria-owns link on the input, and no menu/listbox/option roles. It is
+  // accepted as this composer's popup only while this composer is the focused
+  // editor in a focused document and its plain input text is still exactly the
+  // mention search (`@` or `@keyword`), and only when exactly one such visible
+  // shell exists. Anything else returns nothing.
+  getProviderMentionShell(input, visible) {
+    if (input !== document.activeElement && !input.contains(document.activeElement)) return null;
+    if (typeof document.hasFocus === 'function' && !document.hasFocus()) return null;
+    if (!/^@[a-z0-9_-]{0,64}$/.test(String(this.getComposerTextWithoutAppPills() || '').toLowerCase())) return null;
+    const isMentionShell = (element) => String(element.getAttribute('class') || '').split(/\s+/)
+      .some((token) => /^ComposerTopMenuShell-.+$/.test(token));
+    const shells = [...document.querySelectorAll('div[class*="ComposerTopMenuShell-"]')]
+      .filter((element) => isMentionShell(element) && visible(element) && !input.contains(element));
+    return shells.length === 1 ? shells[0] : null;
   }
 
   // Live 0.1.168 evidence: after trusted `@herdr` keys ChatGPT renders the
@@ -465,6 +508,7 @@ class ChatGPTAdapter extends BaseAdapter {
       'button[aria-label="Stop streaming" i]',
       'button[aria-label="停止生成"]',
       'button[aria-label="停止流式"]',
+      'button[aria-label="停止"]',
     ];
     const seen = new Set();
     const out = [];
