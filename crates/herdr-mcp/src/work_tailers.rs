@@ -1314,9 +1314,9 @@ mod tests {
         }
     }
 
-    /// helper for grok directory names: percent-encode every byte.
+    /// Encode path separators without tripling every byte into an invalidly long filename.
     fn percent_encode(text: &str) -> String {
-        text.bytes().map(|byte| format!("%{byte:02X}")).collect()
+        text.replace('%', "%25").replace('/', "%2F")
     }
 
     /// user droid transcript tail | Given a factory session log | When the
