@@ -38,6 +38,7 @@ import {
   bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
 } from "./artifact-capture-gate.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
+import { formatPlatformAccountDisplay } from "./account-display.js";
 import { jsonBridgeRpc, normalizeJsonBridgeBatch, runJsonBridgeBatch } from "./background/json-bridge.js";
 import { NATIVE_HOST_NOT_INSTALLED, NATIVE_ORIGIN_NOT_ACTIVE } from "./native-host-diagnostics.js";
 import { captureImageArtifactNative, captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
@@ -56,8 +57,12 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.217";
+const H2W_SCRIPT_VERSION = "0.1.222";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
+// Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
+// fence. Keep listening for the ORIGINAL content reply within that fence;
+// never issue a second provider mutation when the initial wait expires.
+const BROWSER_DISPATCH_CONTENT_TIMEOUT_MS = 40_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -2201,6 +2206,7 @@ async function observeBrowserConversation({
   convKey,
   pageInfo,
   accountNativeIdentity,
+  accountDisplayLabel = null,
   projects = [],
   reservationRef = null,
 }) {
@@ -2231,7 +2237,7 @@ async function observeBrowserConversation({
     kind: "account",
     parent_ref: null,
     native_identity: accountNativeIdentity,
-    display_label: null,
+    display_label: accountDisplayLabel,
     canonical_url: accountLaunchUrl,
     observation_generation: observationGeneration,
     observed_at: Date.now(),
@@ -2288,6 +2294,7 @@ async function observeBrowserConversation({
     spaceRef,
     projectId: pageInfo.project_id || null,
     projectName: pageInfo.project_name || null,
+    accountDisplay: accountDisplayLabel,
     observationGeneration,
     lastSeenAt: Date.now(),
   });
@@ -2985,13 +2992,15 @@ async function sendChatGptTabMessage(tabId, message, responseTimeoutMs = 0) {
 }
 
 async function sendBrowserActuationTabMessage(tabId, message, responseTimeoutMs = 0) {
-  // Browser dispatch stays a single fenced mutation attempt. Bound the content
-  // response so one stale view cannot block the shared push queue past the
-  // runtime actuation deadline; never reload or resend a submit/stop command.
-  if (Number(responseTimeoutMs) > 0) {
-    return sendTabMessageWithTimeout(tabId, message, Number(responseTimeoutMs));
-  }
-  return sendTabMessageWithTimeout(tabId, message, 18000);
+  // Preserve a single fenced physical mutation. A Dispatch response may finish
+  // after the Runtime's initial 22s wait; the Runtime retains exact late
+  // completion for 60s. This callback runs off the shared SSE push queue, so
+  // waiting for the original proof cannot starve later events. Never retry
+  // or reload a tab after uncertain submission.
+  const defaultTimeoutMs = message?.command?.operation === "herdr_mcp.browser_dispatch.submit"
+    ? BROWSER_DISPATCH_CONTENT_TIMEOUT_MS : 18000;
+  const timeoutMs = Number(responseTimeoutMs) > 0 ? Number(responseTimeoutMs) : defaultTimeoutMs;
+  return sendTabMessageWithTimeout(tabId, message, timeoutMs);
 }
 
 async function handoffMessageWithRequiredApps(site, message) {
@@ -4596,7 +4605,14 @@ async function handlePushBlock(block, streamCtrl = null) {
   }
   if (!event || !data) return;
   if (event === "browser_actuation") {
-    await handleBrowserActuation(data);
+    if (data.operation === "herdr_mcp.browser_dispatch.submit") {
+      // A ChatGPT submit makes nested content-to-background MAIN-world calls.
+      // Keep the single attempt running without blocking the shared push queue.
+      void handleBrowserActuation(data)
+        .catch((error) => callLog("dispatch actuation failed:", error?.message || String(error)));
+    } else {
+      await handleBrowserActuation(data);
+    }
     return;
   }
   if (event === "hello") {
@@ -10969,6 +10985,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
       const accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
+      const accountDisplayLabel = formatPlatformAccountDisplay(
+        registeringSite,
+        String(msg.accountDisplayEmail || ""),
+      );
       if (registeringSite === "chatgpt" && sender.tab?.id && !accountNativeIdentity) {
         browserTabScopes.delete(sender.tab.id);
         for (const [sessionRef, target] of browserSessionTargets) {
@@ -10983,6 +11003,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           convKey: String(msg.convKey || ""),
           pageInfo: browserPageInfo,
           accountNativeIdentity,
+          accountDisplayLabel,
           projects: Array.isArray(msg.browserProjects) ? msg.browserProjects : [],
           reservationRef: String(msg.browserSessionReservationRef || "").trim() || null,
         };
@@ -11650,6 +11671,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({
         convInfo,
         pageInfo,
+        accountDisplay: msg.tabId ? (browserTabScopes.get(msg.tabId)?.accountDisplay || null) : null,
         bindingKey,
         browserEndpoint: browserEndpointView(browserEndpoint),
         binding: bindingViewOne,

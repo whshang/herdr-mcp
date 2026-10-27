@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.217";
+const H2W_CONTENT_VERSION = "0.1.222";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2428,6 +2428,21 @@ function normalizeHerdrMentionAlias(value) {
     return evidence;
   }
 
+  function chatGptDispatchBaselineRejectionReason(snapshot) {
+    // The returned error is a fixed enum: never forward URLs, status bodies,
+    // user messages, or raw Provider errors. This remains a pre-send refusal.
+    if (snapshot?.ok && !snapshot.userMessageId) return "browser_dispatch_baseline_user_id_missing";
+    const reason = String(snapshot?.reason || "");
+    if (reason === "http-429") return "browser_dispatch_baseline_http429";
+    if (reason === "auth" || reason === "http-401") return "browser_dispatch_baseline_auth";
+    if (reason === "http-403") return "browser_dispatch_baseline_forbidden";
+    if (reason === "http-404") return "browser_dispatch_baseline_not_found";
+    if (reason === "timeout") return "browser_dispatch_baseline_timeout";
+    if (reason === "fetch-failed") return "browser_dispatch_baseline_network";
+    if (/^http-5[0-9][0-9]$/.test(reason)) return "browser_dispatch_baseline_server";
+    return "browser_dispatch_baseline_unavailable";
+  }
+
   async function performBrowserActuationCommand(command) {
     const dispatchId = typeof command?.dispatch_id === "string" ? command.dispatch_id : "";
     const expectedGeneration = Number(command?.expected_generation || 0);
@@ -2628,12 +2643,19 @@ function normalizeHerdrMentionAlias(value) {
     const boundedChatGptSubmit = exactChatGptDispatchIdentity || (
       ADAPTER.name === "chatgpt" && creatingSession
     );
-    const snapshotTimeoutMs = exactChatGptDispatchIdentity || creatingSession ? 1200 : 6000;
+    let snapshotTimeoutMs = 6000;
+    if (creatingSession) snapshotTimeoutMs = 1200;
+    if (exactChatGptDispatchIdentity) snapshotTimeoutMs = 3000;
     const beforeServer = ADAPTER.name === "chatgpt"
       ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
       : { ok: false };
     const beforeDom = providerMessageSnapshot("user");
     const beforeAssistant = providerMessageSnapshot("assistant");
+    // Dispatch needs a provider-owned pre-submit user ID to prove advancement.
+    // Refuse before touching the composer when that baseline is unavailable.
+    if (exactChatGptDispatchIdentity && (!beforeServer?.ok || !beforeServer.userMessageId)) {
+      return browserRejectedEvidence(evidence, chatGptDispatchBaselineRejectionReason(beforeServer));
+    }
     const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
     const result = await performWake({
       template: message,
@@ -2643,13 +2665,18 @@ function normalizeHerdrMentionAlias(value) {
       expectedConvKey: command?.expectedConvKey ?? null,
       requiredApps,
     });
-    if (!result?.ok) {
-      if (boundedChatGptSubmit && result?.uncertain === true) {
-        evidence.command_accepted = true;
-        evidence.resource_available = true;
-        evidence.canonical_url_observed = providerCanonicalConversationObserved();
-        return evidence;
-      }
+    // A previously latched uncertain submit cannot be attributed to this
+    // dispatch. Preserve uncertainty without attempting another provider send.
+    if (boundedChatGptSubmit && result?.blocked === "submit-uncertain") {
+      evidence.command_accepted = true;
+      evidence.resource_available = true;
+      evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      return evidence;
+    }
+    // A one-shot send may succeed after its immediate UI acknowledgement
+    // expires. Use existing bounded exact-message readback without resubmitting.
+    const submitUnconfirmed = boundedChatGptSubmit && result?.uncertain === true;
+    if (!result?.ok && !submitUnconfirmed) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
@@ -2798,9 +2825,16 @@ function normalizeHerdrMentionAlias(value) {
         afterAssistant.text
         && afterAssistant.text !== beforeAssistant.text,
       );
+      const providerAssistantAdvanced = Boolean(
+        conversationStillExpected && serverAdvanced
+        && typeof beforeServer?.messageId === "string" && beforeServer.messageId
+        && typeof afterServer?.messageId === "string" && afterServer.messageId
+        && afterServer.messageId !== beforeServer.messageId,
+      );
       evidence.generation_status_observed = Boolean(
         isTurnInProgress()
-        || assistantAdvanced,
+        || assistantAdvanced
+        || providerAssistantAdvanced,
       );
       if (evidence.accepted_message_observed
           && (creatingSession || evidence.generation_status_observed)
@@ -3616,10 +3650,33 @@ function normalizeHerdrMentionAlias(value) {
     return ADAPTER.resolveProjectIdentity(convKey);
   }
 
+  async function browserAccountObservation() {
+    try {
+      if (typeof ADAPTER.getAccountObservation === "function") {
+        const observed = await ADAPTER.getAccountObservation();
+        const nativeIdentity = typeof observed?.nativeIdentity === "string" && observed.nativeIdentity.trim()
+          ? observed.nativeIdentity.trim()
+          : null;
+        const email = typeof observed?.email === "string" ? observed.email.trim().toLowerCase() : "";
+        return {
+          nativeIdentity,
+          email: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null,
+        };
+      }
+    } catch (_) {}
+    return { nativeIdentity: await browserAccountNativeIdentity(), email: null };
+  }
+
   const registrationInFlight = new Map();
 
   async function runConversationRegistration(reason, convKey, registrationAttempt) {
-    const accountNativeIdentity = await browserAccountNativeIdentity();
+    // A provider with the richer account-observation hook records a display-only
+    // platform-account label beside the native identity. Providers without it
+    // keep the original single-hop identity read.
+    const accountObservation = typeof ADAPTER.getAccountObservation === "function"
+      ? await browserAccountObservation()
+      : { nativeIdentity: await browserAccountNativeIdentity(), email: null };
+    const accountNativeIdentity = accountObservation.nativeIdentity;
     let chatGptProjectRoute = false;
     if (ADAPTER.name === "chatgpt") {
       try {
@@ -3658,6 +3715,22 @@ function normalizeHerdrMentionAlias(value) {
         browserSessionReservationRef = null;
       }
     } catch (_) {}
+    // A previous account's tab can retain its old DOM after account switching.
+    // Verify this exact conversation is readable in the current signed-in
+    // provider session before publishing any account/session association.
+    if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
+      const proof = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+      if (!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim()) {
+        if (registeredConvKey === convKey) {
+          registeredConvKey = null;
+          registeredBrowserSessionRef = null;
+          registeredBrowserGeneration = null;
+          registeredHerdrAppKeyword = null;
+          registeredConversationBound = false;
+        }
+        return null;
+      }
+    }
     const browserAppKeywords = ADAPTER.name === "chatgpt"
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
       ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
@@ -3668,6 +3741,7 @@ function normalizeHerdrMentionAlias(value) {
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
+      accountDisplayEmail: accountObservation.email,
       browserProjects,
       browserAppKeywords,
       browserCurrentProjectId: browserCurrentProject?.id || null,
@@ -4173,11 +4247,41 @@ function normalizeHerdrMentionAlias(value) {
   // /backend-api/conversations/<id> endpoint with a Bearer header. Any
   // 401/404/timeout fails closed and returns an error payload only; the token
   // never leaves this function scope and is never logged/stored.
+  // A provider 429 must stop all authenticated conversation reads, including
+  // the extra /api/auth/session preflight. Keep the cooldown local to this tab.
+  let chatGptReadRateLimitUntil = 0;
+  let chatGptReadRateLimitCount = 0;
+
+  function chatGptReadRateLimit() {
+    const remaining = chatGptReadRateLimitUntil - Date.now();
+    return remaining > 0
+      ? { ok: false, error: "conversation-http", reason: "http-429", status: 429,
+          retryAfterS: Math.ceil(remaining / 1000) }
+      : null;
+  }
+
+  function noteChatGptRead429(response) {
+    const rawSeconds = Number.parseInt(response.headers?.get?.("retry-after") || "", 10);
+    const retryAfterMs = Number.isSafeInteger(rawSeconds) && rawSeconds >= 0 && rawSeconds <= 86400
+      ? rawSeconds * 1000 : 0;
+    chatGptReadRateLimitCount = Math.min(8, chatGptReadRateLimitCount + 1);
+    const policyMs = BROWSER_PERFORMANCE?.rateLimitBackoffMs?.(chatGptReadRateLimitCount) || 30000;
+    chatGptReadRateLimitUntil = Math.max(
+      chatGptReadRateLimitUntil,
+      Date.now() + Math.max(30000, policyMs, retryAfterMs),
+    );
+    noteChatGptRateLimit(Date.now(), "authenticated_conversation");
+  }
+
   async function fetchChatGptConversationDetail({ conversationId, timeoutMs = 6000 } = {}) {
     if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, error: "not-chatgpt-conversation" };
+    const cooldown = chatGptReadRateLimit();
+    if (cooldown) return cooldown;
     const accessToken = await readChatGptAccessToken(4000);
     const sessionToken = String(accessToken || "");
-    if (!sessionToken || sessionToken.length > 4096) return { ok: false, reason: "auth" };
+    if (!sessionToken || sessionToken.length > 4096) {
+      return chatGptReadRateLimit() || { ok: false, reason: "auth" };
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -4188,7 +4292,11 @@ function normalizeHerdrMentionAlias(value) {
         headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
         signal: controller.signal,
       });
-      if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+      if (!response.ok) {
+        if (response.status === 429) noteChatGptRead429(response);
+        return { ok: false, reason: `http-${response.status}` };
+      }
+      chatGptReadRateLimitCount = 0;
       return { ok: true, body: await response.json() };
     } catch (error) {
       return { ok: false, reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
@@ -4205,8 +4313,13 @@ function normalizeHerdrMentionAlias(value) {
     if (!conversationId || ADAPTER.name !== "chatgpt") {
       return { ok: false, error: "not-chatgpt-conversation" };
     }
+    const cooldown = chatGptReadRateLimit();
+    if (cooldown) return cooldown;
     const accessToken = await readChatGptAccessToken(authTimeoutMs);
-    if (!accessToken) return { ok: false, error: "session-missing", reason: "auth", status: 401 };
+    if (!accessToken) {
+      return chatGptReadRateLimit()
+        || { ok: false, error: "session-missing", reason: "auth", status: 401 };
+    }
     const sessionToken = String(accessToken);
     if (sessionToken.length === 0 || sessionToken.length > 4096) {
       return { ok: false, error: "session-missing", reason: "auth" };
@@ -4223,6 +4336,7 @@ function normalizeHerdrMentionAlias(value) {
         signal: controller.signal,
       });
       if (!response.ok) {
+        if (response.status === 429) noteChatGptRead429(response);
         const retryAfter = Number.parseInt(response.headers?.get?.("retry-after") || "", 10);
         return {
           ok: false, error: "conversation-http", reason: `http-${response.status}`, status: response.status,
@@ -4230,6 +4344,7 @@ function normalizeHerdrMentionAlias(value) {
         };
       }
       const body = await response.json();
+      chatGptReadRateLimitCount = 0;
       return { ok: true, body };
     } catch (error) {
       return { ok: false, error: "conversation-failed", reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
@@ -4316,6 +4431,9 @@ function normalizeHerdrMentionAlias(value) {
         authTimeoutMs: remainingTimeout(800),
       });
       if (observed?.ok && observed.body?.title === title) return verified(true);
+      // A throttled readback is not a transient miss: stop the loop so the
+      // cooldown is not hammered for the rest of the deadline.
+      if (observed?.status === 429) break;
       if (Date.now() < deadline) await wait(150);
     }
     return failed("title_projection_readback_unverified");
@@ -4379,6 +4497,7 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function readChatGptAccessToken(timeoutMs = 4000) {
+    if (chatGptReadRateLimit()) return null;
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -4390,7 +4509,10 @@ function normalizeHerdrMentionAlias(value) {
           headers: { accept: "application/json" },
           signal: controller.signal,
         });
-        if (!response.ok) return null;
+        if (!response.ok) {
+          if (response.status === 429) noteChatGptRead429(response);
+          return null;
+        }
         const body = await response.json();
         return String(body?.accessToken || "") || null;
       } finally {

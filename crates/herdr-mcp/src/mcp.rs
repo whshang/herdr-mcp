@@ -82,6 +82,59 @@ pub struct BrowserCallerAuthorization {
     pub principal_ref: String,
     pub connector_id: String,
     pub grant_generation: i64,
+    // Display-only platform_account labels live Edge-side; they never ride
+    // the authorization wire and are not part of the runtime struct.
+}
+
+/// `<platform>-<email>` display label. The first `-` separates the platform
+/// from the account, so the email may itself contain `-`.
+pub(crate) fn normalize_platform_account(value: &str) -> Option<String> {
+    let text = value.trim().to_ascii_lowercase();
+    if text.len() < 6 || text.len() > 128 {
+        return None;
+    }
+    let (platform, account) = text.split_once('-')?;
+    if !is_platform_account_token(platform) || !is_platform_account_email(account) {
+        return None;
+    }
+    Some(text)
+}
+
+fn is_platform_account_token(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_lowercase()
+        && value.len() <= 32
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+}
+
+fn is_platform_account_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || !local.chars().all(|ch| {
+            ch.is_ascii_lowercase()
+                || ch.is_ascii_digit()
+                || matches!(ch, '.' | '_' | '%' | '+' | '-')
+        })
+    {
+        return false;
+    }
+    let Some((host, tld)) = domain.rsplit_once('.') else {
+        return false;
+    };
+    !host.is_empty()
+        && !host.starts_with(['.', '-'])
+        && !host.ends_with(['.', '-'])
+        && !host.contains("..")
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-'))
+        && (2..=24).contains(&tld.len())
+        && tld.chars().all(|ch| ch.is_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4685,6 +4738,27 @@ fn browser_session_create_reconcile_uncertain_inner(
             Err(error) => return browser_store_error(error),
         }
     }
+    let (app_refusal_reason, app_selection_probe) =
+        browser_session_create_app_refusal_fields(delivery_state, &evidence);
+    let mut value = json!({
+        "ok": false,
+        "code": delivery_state.as_str(),
+        "reservation_ref": settled.reservation_ref,
+        "reservation_state": settled.state,
+        "delivery_state": settled.delivery_state,
+        "app_refusal_reason": app_refusal_reason,
+        "app_selection_probe": app_selection_probe,
+        "replayed": replayed,
+        "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
+    });
+    browser_session_apply_classification_reason(&mut value, classification_reason);
+    value
+}
+
+fn browser_session_create_app_refusal_fields(
+    delivery_state: BrowserDeliveryState,
+    evidence: &BrowserPostconditionEvidence,
+) -> (Option<String>, Option<Value>) {
     // The provider can return arbitrary strings. Surface only a fixed set of
     // non-sensitive App-selection failures rather than echoing DOM text.
     let app_refusal_reason = if delivery_state == BrowserDeliveryState::Rejected {
@@ -4746,19 +4820,125 @@ fn browser_session_create_reconcile_uncertain_inner(
         }
         (!out.is_empty()).then_some(Value::Object(out))
     });
-    let mut value = json!({
-        "ok": false,
-        "code": delivery_state.as_str(),
-        "reservation_ref": settled.reservation_ref,
-        "reservation_state": settled.state,
-        "delivery_state": settled.delivery_state,
-        "app_refusal_reason": app_refusal_reason,
-        "app_selection_probe": app_selection_probe,
-        "replayed": replayed,
-        "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
-    });
-    browser_session_apply_classification_reason(&mut value, classification_reason);
-    value
+    (app_refusal_reason.map(str::to_owned), app_selection_probe)
+}
+
+fn browser_session_create_public_delivery_evidence(
+    result: Option<&Value>,
+    app_refusal_reason: Option<&str>,
+    app_selection_probe: Option<&Value>,
+) -> Value {
+    // The extension observes untrusted provider content. Never echo arbitrary
+    // objects, page text, account profile JSON, cookies or token-shaped data.
+    let mut public = serde_json::Map::new();
+    if let Some(result) = result {
+        const SAFE_BOOLEANS: &[&str] = &[
+            "message_submitted",
+            "retry_safe",
+            "tab_opened",
+            "tab_closed",
+            "tab_cleanup_verified",
+            "session_materialized",
+            "canonical_url_observed",
+        ];
+        for key in SAFE_BOOLEANS {
+            if let Some(value) = result.get(*key).and_then(Value::as_bool) {
+                public.insert((*key).to_owned(), Value::Bool(value));
+            }
+        }
+        if result
+            .get("accepted_user_message_ref")
+            .is_some_and(Value::is_null)
+        {
+            public.insert("accepted_user_message_ref".to_owned(), Value::Null);
+        }
+
+        // Operational diagnostics consist exclusively of fixed vocabularies.
+        // Future provider strings require an explicit contract change.
+        const SAFE_CODES: &[(&str, &[&str])] = &[
+            (
+                "registration_status",
+                &[
+                    "not_observed",
+                    "identity_observed",
+                    "identity_unavailable",
+                    "registry_observed",
+                    "registry_unobserved",
+                    "background_unavailable",
+                    "provider_readback_unavailable",
+                    "probe_not_completed",
+                    "identity_conflict",
+                    "id_conflict_matching_email",
+                    "id_conflict_different_email",
+                    "id_conflict_unverified_email",
+                    "email_conflict",
+                ],
+            ),
+            (
+                "identity_relation",
+                &[
+                    "me_matches_session_account_id",
+                    "me_differs_session_user_and_account_id",
+                    "me_differs_session_user_without_account_id",
+                    "unclassified",
+                    "not_observed",
+                ],
+            ),
+            (
+                "contact_proof",
+                &[
+                    "emails_match",
+                    "emails_differ",
+                    "session_email_missing",
+                    "me_email_missing",
+                    "both_emails_missing",
+                    "not_observed",
+                ],
+            ),
+            (
+                "bearer_relation",
+                &[
+                    "bearer_token_unavailable",
+                    "bearer_not_authorized",
+                    "bearer_rate_limited",
+                    "bearer_response_unavailable",
+                    "bearer_identity_missing",
+                    "bearer_matches_session_user",
+                    "bearer_matches_session_account",
+                    "bearer_matches_cookie_me",
+                    "bearer_differs_from_session",
+                    "bearer_network_unavailable",
+                    "not_observed",
+                ],
+            ),
+            (
+                "scope_failure",
+                &[
+                    "scope_missing",
+                    "provider_mismatch",
+                    "account_mismatch",
+                    "space_mismatch",
+                    "generation_mismatch",
+                    "registry_handshake_delay",
+                    "content_script_unavailable",
+                ],
+            ),
+        ];
+        for (key, known) in SAFE_CODES {
+            if let Some(value) = result.get(*key).and_then(Value::as_str)
+                && known.contains(&value)
+            {
+                public.insert((*key).to_owned(), Value::String(value.to_owned()));
+            }
+        }
+    }
+    if let Some(reason) = app_refusal_reason {
+        public.insert("error".to_owned(), Value::String(reason.to_owned()));
+    }
+    if let Some(probe) = app_selection_probe {
+        public.insert("app_selection_probe".to_owned(), probe.clone());
+    }
+    Value::Object(public)
 }
 
 fn browser_session_create_params_from_source(
@@ -5698,6 +5878,13 @@ fn browser_session_create(
             classification_reason,
         );
     }
+    let (app_refusal_reason, app_selection_probe) =
+        browser_session_create_app_refusal_fields(delivery_state, &evidence);
+    let delivery_evidence = browser_session_create_public_delivery_evidence(
+        evidence.result.as_ref(),
+        app_refusal_reason.as_deref(),
+        app_selection_probe.as_ref(),
+    );
     json!({
         "ok": false,
         "code": unavailable_reason.as_deref().unwrap_or_else(|| observed_delivery_state.as_str()),
@@ -5708,7 +5895,9 @@ fn browser_session_create(
         "delivery_state": updated.delivery_state,
         "replayed": replayed,
         "reconciled": false,
-        "delivery_evidence": evidence.result,
+        "app_refusal_reason": app_refusal_reason,
+        "app_selection_probe": app_selection_probe,
+        "delivery_evidence": delivery_evidence,
     })
 }
 
@@ -7013,7 +7202,7 @@ fn browser_operation_resource(
     Ok(resource)
 }
 
-/// WebChat control grants are provider-scoped: exact endpoint + provider.
+/// WebChat control grants are provider-scoped: **exact** endpoint + provider.
 /// `account_ref` (legacy per-account grants, or the `*` provider-scope marker)
 /// is accepted for backward compatibility and does not narrow the match.
 pub(crate) const WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT: &str = "*";
@@ -7031,6 +7220,17 @@ fn webchat_control_grant_covers(
 /// on its exact endpoint (issued explicitly, or derived by Edge from a Page
 /// Assist endpoint grant).
 pub(crate) const WEBCHAT_CONTROL_ANY_PROVIDER: &str = "*";
+
+/// Device-wide marker.
+///
+/// A pre-#713 Edge still accepts a wildcard Page Assist row and derives the
+/// `*/*/*` tuple from it at forward time, so this runtime must never widen a
+/// wildcard endpoint: a grant whose `endpoint_ref` is `*` matches no endpoint
+/// here at all (`webchat_control_grant_covers` requires an exact endpoint).
+/// Honouring device scope needs the owner `allow-device` marker and the
+/// deny-only cleanup rules from the Edge slice, together with a verifiable
+/// owner check on this side; until both exist the marker is inert.
+pub(crate) const WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT: &str = "*";
 
 fn browser_resource_actuation_decision(
     store: &StateStore,
@@ -14649,7 +14849,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "gap found by this task's Gap 1 work, not fixed here (product change out of scope): the first-attempt create rejection echoes the extension's whole raw `result` object as `delivery_evidence`, so the fixed App-probe allowlist and `app_refusal_reason` projection that the reconcile path applies are not enforced on the path that actually reports the refusal. The runtime comment at the reconcile projection states provider strings are never echoed; an extension key such as `page_text` therefore crosses to the caller. Needs a product decision: project `delivery_evidence` (and surface `app_refusal_reason`) on the first attempt too."]
     fn browser_create_rejection_should_project_only_allowlisted_app_probe_keys() {
         use std::sync::atomic::AtomicUsize;
 
@@ -24430,11 +24629,75 @@ mod webchat_control_provider_scope_tests {
         );
     }
 
+    /// user owner | Given a wildcard Page Assist row forwarded as the `*/*/*` tuple | When any endpoint or provider is controlled | Then it covers nothing, because a wildcard endpoint is never device-wide authority
+    #[test]
+    fn user_owner_given_wildcard_endpoint_grant_when_any_endpoint_then_denied() {
+        let derived = grant(
+            WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT,
+            WEBCHAT_CONTROL_ANY_PROVIDER,
+            WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+        );
+        for (endpoint, provider) in [
+            ("bep_a", "grok"),
+            ("bep_b", "claude"),
+            ("bep_a", "chatgpt"),
+            ("bep_a", WEBCHAT_CONTROL_ANY_PROVIDER),
+        ] {
+            assert!(
+                !webchat_control_grant_covers(&derived, endpoint, provider),
+                "{endpoint}/{provider} must not be covered by a wildcard endpoint"
+            );
+        }
+    }
+
+    /// user owner | Given a Page Assist-shaped device-wide row next to a real endpoint grant | When an unrelated endpoint is controlled | Then only the exact endpoint grant authorizes it
+    #[test]
+    fn user_owner_given_derived_and_exact_grants_when_other_endpoint_then_only_exact_applies() {
+        let grants = [
+            grant(
+                WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT,
+                WEBCHAT_CONTROL_ANY_PROVIDER,
+                WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+            ),
+            grant(
+                "bep_a",
+                WEBCHAT_CONTROL_ANY_PROVIDER,
+                WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+            ),
+        ];
+        let covered = grants
+            .iter()
+            .any(|candidate| webchat_control_grant_covers(candidate, "bep_b", "grok"));
+        assert!(!covered, "a derived wildcard row must not cover bep_b");
+        let own = grants
+            .iter()
+            .any(|candidate| webchat_control_grant_covers(candidate, "bep_a", "grok"));
+        assert!(own, "the exact endpoint grant still applies");
+    }
+
     /// user owner | Given a legacy grant carrying an explicit account_ref | When that provider on that endpoint is controlled | Then it still works (account_ref is ignored)
     #[test]
     fn user_owner_given_legacy_account_grant_when_same_endpoint_provider_then_authorized() {
         let g = grant("bep_a", "chatgpt", "br_legacy_account");
         assert!(webchat_control_grant_covers(&g, "bep_a", "chatgpt"));
+    }
+
+    #[test]
+    fn platform_account_label_accepts_platform_email_and_rejects_client_name() {
+        assert_eq!(
+            normalize_platform_account("  Grokbot-Whshang@gmail.com "),
+            Some("grokbot-whshang@gmail.com".to_owned())
+        );
+        assert_eq!(
+            normalize_platform_account("chatgpt-user.name+tag@example.com"),
+            Some("chatgpt-user.name+tag@example.com".to_owned())
+        );
+        assert_eq!(normalize_platform_account("Cursor"), None);
+        assert_eq!(normalize_platform_account("grokbot-not-an-email"), None);
+        assert_eq!(
+            normalize_platform_account("grok_bot-owner@example.com"),
+            None
+        );
     }
 }
 
