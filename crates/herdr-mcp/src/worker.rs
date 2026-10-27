@@ -359,6 +359,10 @@ pub fn run(command: WorkerCommand, language: Locale) -> Result<ExitCode, String>
         WorkerCommand::ConnectorClientRevoke { client_id } => {
             revoke_connector_client(&paths, &client_id)
         }
+        WorkerCommand::ConnectorLabel {
+            connector_id,
+            platform_account,
+        } => label_connector(&paths, &connector_id, platform_account.as_deref()),
         WorkerCommand::ConnectorPlannerControl { action, request_id } => {
             connector_planner_control(&paths, &action, request_id.as_deref())
         }
@@ -369,14 +373,18 @@ pub fn run(command: WorkerCommand, language: Locale) -> Result<ExitCode, String>
             provider,
             account_ref,
             allowed,
+            device_wide,
         } => set_connector_webchat_control(
             &paths,
-            &connector_id,
-            &device_id,
-            &endpoint_ref,
-            &provider,
-            &account_ref,
-            allowed,
+            &WebChatControlRequest {
+                selector: &connector_id,
+                device_id: &device_id,
+                endpoint_ref: &endpoint_ref,
+                provider: &provider,
+                account_ref: &account_ref,
+                allowed,
+                device_wide,
+            },
         ),
         WorkerCommand::ConnectorPageAssistOrphans {
             from,
@@ -1651,15 +1659,20 @@ fn generate_idempotency_key() -> String {
     format!("m{nanos:x}{pid:x}")
 }
 
+struct WebChatControlRequest<'a> {
+    selector: &'a str,
+    device_id: &'a str,
+    endpoint_ref: &'a str,
+    provider: &'a str,
+    account_ref: &'a str,
+    allowed: bool,
+    device_wide: bool,
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn set_connector_webchat_control(
     _paths: &RuntimePaths,
-    _connector_id: &str,
-    _device_id: &str,
-    _endpoint_ref: &str,
-    _provider: &str,
-    _account_ref: &str,
-    _allowed: bool,
+    _request: &WebChatControlRequest<'_>,
 ) -> Result<ExitCode, String> {
     Err(
         "connector WebChat Control requires a supported enrolled-owner credential backend"
@@ -1667,52 +1680,157 @@ fn set_connector_webchat_control(
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-fn set_connector_webchat_control(
-    paths: &RuntimePaths,
-    connector_id: &str,
-    device_id: &str,
-    endpoint_ref: &str,
-    provider: &str,
-    account_ref: &str,
-    allowed: bool,
-) -> Result<ExitCode, String> {
-    let connector_id = connector_id.trim();
-    let device_id = crate::config::normalize_device_id(device_id)?;
-    let endpoint_ref = endpoint_ref.trim();
-    let provider = provider.trim();
-    let account_ref = account_ref.trim();
-    if !connector_id.starts_with("conn_")
-        || connector_id.len() < 13
-        || connector_id.len() > 133
-        || !connector_id
+fn explicit_connector_id(connector_id: &str) -> bool {
+    connector_id.starts_with("conn_")
+        && (13..=133).contains(&connector_id.len())
+        && connector_id
             .chars()
             .skip(5)
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-    {
-        return Err("connector id is invalid".to_owned());
+}
+
+/// Resolve a grant selector. An explicit `conn_` id is not looked up. A
+/// platform-account label must match exactly one active connector.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+fn select_active_connector_id(selector: &str, inventory: &Value) -> Result<String, String> {
+    if explicit_connector_id(selector) {
+        return Ok(selector.to_owned());
     }
-    if endpoint_ref.is_empty()
-        || endpoint_ref.len() > 96
-        || endpoint_ref.chars().any(char::is_control)
-    {
-        return Err("browser endpoint ref is invalid".to_owned());
+    let Some(label) = crate::mcp::normalize_platform_account(selector) else {
+        return Err("connector selector must be a conn_ id or a platform-account label".to_owned());
+    };
+    let connectors = inventory
+        .get("connectors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "connector inventory is invalid".to_owned())?;
+    let mut ids = Vec::new();
+    for connector in connectors {
+        if connector.get("status").and_then(Value::as_str) != Some("active") {
+            continue;
+        }
+        if connector.get("platform_account").and_then(Value::as_str) != Some(label.as_str()) {
+            continue;
+        }
+        if let Some(id) = connector.get("connector_id").and_then(Value::as_str) {
+            ids.push(id.to_owned());
+        }
     }
-    if account_ref.is_empty() || account_ref.len() > 96 || account_ref.chars().any(char::is_control)
-    {
-        return Err("browser account ref is invalid".to_owned());
+    match ids.len() {
+        1 => Ok(ids.remove(0)),
+        0 => Err(format!("no active connector is labeled {label}")),
+        _ => Err(format!(
+            "platform account {label} matches multiple active connectors ({}); pass a conn_ id",
+            ids.join(", ")
+        )),
     }
-    if provider.is_empty()
-        || provider.len() > 32
-        || !provider.chars().enumerate().all(|(index, ch)| {
-            if index == 0 {
-                ch.is_ascii_lowercase() || ch.is_ascii_digit()
-            } else {
-                ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
-            }
-        })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn resolve_connector_selector(
+    edge_origin: &str,
+    headers: &HeaderMap,
+    selector: &str,
+) -> Result<String, String> {
+    if explicit_connector_id(selector) {
+        return Ok(selector.to_owned());
+    }
+    let response = client_for_origin(edge_origin)?
+        .get(endpoint(edge_origin, "/connectors")?)
+        .headers(headers.clone())
+        .send()
+        .map_err(|error| format!("cannot resolve platform account {selector}: {error}"))?;
+    let inventory = parse_json_response(response, "connector inventory")?;
+    select_active_connector_id(selector, &inventory)
+}
+
+/// A device-wide (`allow-device` / `deny-device`) grant and the connector label
+/// route both ship with the Edge slice. Against a Worker that predates them the
+/// write cannot happen, and reporting a generic grant failure would leave the
+/// operator believing it did. These fixed codes name the real cause.
+const DEVICE_GRANT_REQUIRES_EDGE_SUPPORT: &str = "device_grant_requires_edge_support";
+const CONNECTOR_LABEL_REQUIRES_EDGE_SUPPORT: &str = "connector_label_requires_edge_support";
+
+/// Statuses a Worker uses when it does not implement the requested route or
+/// request body: 400 for an unknown body key (`scope`, `platform_account`),
+/// 404 for a missing path, 405 for a missing method, 501 for an explicit stub.
+/// A 401/403 stays an authorization failure and 409/5xx stay real failures, so
+/// neither is ever reported as "the Edge is too old".
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+fn edge_feature_unsupported(status: u16) -> bool {
+    matches!(status, 400 | 404 | 405 | 501)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn parse_edge_feature_response(
+    response: Response,
+    operation: &str,
+    unsupported: &str,
+) -> Result<Value, String> {
+    if edge_feature_unsupported(response.status().as_u16()) {
+        return Err(unsupported.to_owned());
+    }
+    parse_json_response(response, operation)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+fn valid_webchat_control_scope(
+    endpoint_ref: &str,
+    provider: &str,
+    account_ref: &str,
+    device_wide: bool,
+) -> bool {
+    // A wildcard endpoint is only meaningful as the complete `*/*/*` tuple of an
+    // explicit device-wide request. A per-endpoint grant must name a concrete
+    // endpoint: a wildcard Page Assist row would otherwise derive device-wide
+    // WebChat control at forward time on a pre-#713 Edge, and a partial wildcard
+    // record is never authority either way.
+    if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
+        && (!device_wide
+            || provider != crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
+            || account_ref != crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT)
     {
-        return Err("browser provider is invalid".to_owned());
+        return false;
+    }
+    provider == crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER
+        || (!provider.is_empty()
+            && provider.len() <= 32
+            && provider.chars().enumerate().all(|(index, ch)| {
+                if index == 0 {
+                    ch.is_ascii_lowercase() || ch.is_ascii_digit()
+                } else {
+                    ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+                }
+            }))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn set_connector_webchat_control(
+    paths: &RuntimePaths,
+    request: &WebChatControlRequest<'_>,
+) -> Result<ExitCode, String> {
+    let connector_selector = request.selector;
+    let endpoint_ref = request.endpoint_ref.trim();
+    let provider = request.provider.trim();
+    let account_ref = request.account_ref.trim();
+    let allowed = request.allowed;
+    let device_wide = request.device_wide;
+    let device_id = crate::config::normalize_device_id(request.device_id)?;
+    if !device_wide {
+        if endpoint_ref.is_empty()
+            || endpoint_ref.len() > 96
+            || endpoint_ref.chars().any(char::is_control)
+        {
+            return Err("browser endpoint ref is invalid".to_owned());
+        }
+        if account_ref.is_empty()
+            || account_ref.len() > 96
+            || account_ref.chars().any(char::is_control)
+        {
+            return Err("browser account ref is invalid".to_owned());
+        }
+    }
+    if !valid_webchat_control_scope(endpoint_ref, provider, account_ref, device_wide) {
+        return Err("browser endpoint ref or grant scope is invalid".to_owned());
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_owner_link_identity(paths, &config)?;
@@ -1722,23 +1840,47 @@ fn set_connector_webchat_control(
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client_for_origin(&identity.edge_origin)?
-        .post(endpoint(
-            &identity.edge_origin,
-            "/connectors/webchat-control",
-        )?)
-        .headers(headers)
-        .json(&json!({
+    let connector_id =
+        resolve_connector_selector(&identity.edge_origin, &headers, connector_selector.trim())?;
+    if !explicit_connector_id(&connector_id) {
+        return Err("connector id is invalid".to_owned());
+    }
+    let body = if device_wide {
+        json!({
+            "connector_id": connector_id,
+            "device_id": device_id,
+            "scope": "device",
+            "allowed": allowed,
+        })
+    } else {
+        json!({
             "connector_id": connector_id,
             "device_id": device_id,
             "endpoint_ref": endpoint_ref,
             "provider": provider,
             "account_ref": account_ref,
             "allowed": allowed,
-        }))
+        })
+    };
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(
+            &identity.edge_origin,
+            "/connectors/webchat-control",
+        )?)
+        .headers(headers)
+        .json(&body)
         .send()
         .map_err(|error| format!("cannot change Connector WebChat Control grant: {error}"))?;
-    let payload = parse_json_response(response, "connector WebChat Control")?;
+    let payload = if device_wide {
+        // Device scope needs an Edge that understands `scope: "device"`.
+        parse_edge_feature_response(
+            response,
+            "connector WebChat Control",
+            DEVICE_GRANT_REQUIRES_EDGE_SUPPORT,
+        )?
+    } else {
+        parse_json_response(response, "connector WebChat Control")?
+    };
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -1746,12 +1888,67 @@ fn set_connector_webchat_control(
             "action": "connector_webchat_control_set",
             "connector_id": connector_id,
             "device_id": device_id,
-            "endpoint_ref": endpoint_ref,
-            "provider": provider,
-            "account_ref": account_ref,
+            "endpoint_ref": payload.get("endpoint_ref").cloned().unwrap_or(Value::String(endpoint_ref.to_owned())),
+            "provider": payload.get("provider").cloned().unwrap_or(Value::String(provider.to_owned())),
+            "account_ref": payload.get("account_ref").cloned().unwrap_or(Value::String(account_ref.to_owned())),
+            "scope": payload.get("scope").cloned().unwrap_or(Value::String(if device_wide { "device" } else { "endpoint" }.to_owned())),
             "allowed": payload.get("allowed").cloned().unwrap_or(Value::Bool(allowed)),
         }))
         .map_err(|error| format!("cannot encode Connector WebChat Control result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn label_connector(
+    _paths: &RuntimePaths,
+    _connector_id: &str,
+    _platform_account: Option<&str>,
+) -> Result<ExitCode, String> {
+    Err("connector label requires a supported enrolled-device credential backend".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn label_connector(
+    paths: &RuntimePaths,
+    connector_id: &str,
+    platform_account: Option<&str>,
+) -> Result<ExitCode, String> {
+    let connector_id = connector_id.trim();
+    if !explicit_connector_id(connector_id) {
+        return Err("connector id is invalid".to_owned());
+    }
+    if let Some(label) = platform_account
+        && crate::mcp::normalize_platform_account(label).as_deref() != Some(label)
+    {
+        return Err("platform account label is invalid".to_owned());
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(&identity.edge_origin, "/connectors/label")?)
+        .headers(headers)
+        .json(&json!({
+            "connector_id": connector_id,
+            "platform_account": platform_account,
+        }))
+        .send()
+        .map_err(|error| format!("cannot label connector: {error}"))?;
+    let payload = parse_edge_feature_response(
+        response,
+        "connector label",
+        CONNECTOR_LABEL_REQUIRES_EDGE_SUPPORT,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("cannot encode connector label result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -1775,24 +1972,22 @@ fn set_connector_page_assist(
     endpoint_ref: &str,
     allowed: bool,
 ) -> Result<ExitCode, String> {
-    let connector_id = connector_id.trim();
+    let connector_selector = connector_id.trim();
     let device_id = crate::config::normalize_device_id(device_id)?;
     let endpoint_ref = endpoint_ref.trim();
-    if !connector_id.starts_with("conn_")
-        || connector_id.len() < 13
-        || connector_id.len() > 133
-        || !connector_id
-            .chars()
-            .skip(5)
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-    {
-        return Err("connector id is invalid".to_owned());
-    }
     if endpoint_ref.is_empty()
         || endpoint_ref.len() > 96
         || endpoint_ref.chars().any(char::is_control)
     {
         return Err("browser endpoint ref is invalid".to_owned());
+    }
+    // Page Assist is per-endpoint authority only. A pre-#713 Edge accepts and
+    // stores a wildcard endpoint and then derives device-wide WebChat control
+    // from it at forward time, so the wildcard is refused before it is stored.
+    if endpoint_ref == crate::mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT {
+        return Err(
+            "browser endpoint ref is invalid: Page Assist requires a concrete endpoint".to_owned(),
+        );
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_owner_link_identity(paths, &config)?;
@@ -1802,6 +1997,11 @@ fn set_connector_page_assist(
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
+    let connector_id =
+        resolve_connector_selector(&identity.edge_origin, &headers, connector_selector)?;
+    if !explicit_connector_id(&connector_id) {
+        return Err("connector id is invalid".to_owned());
+    }
     let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/connectors/page-assist")?)
         .headers(headers)
@@ -3310,6 +3510,40 @@ fn print_json(value: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// user owner | Given the owner grant transport | When a device-wide or per-endpoint scope tuple is validated | Then only a complete device triple may use a wildcard endpoint
+    #[test]
+    fn user_owner_given_scope_when_validated_then_wildcard_needs_full_device_triple() {
+        assert!(valid_webchat_control_scope("*", "*", "*", true));
+        assert!(valid_webchat_control_scope("bep_a", "*", "*", false));
+        assert!(valid_webchat_control_scope("bep_a", "grok", "*", false));
+        // A wildcard endpoint is never per-endpoint authority: this is the
+        // Page Assist row shape a pre-#713 Edge still stores and derives from.
+        assert!(!valid_webchat_control_scope("*", "*", "*", false));
+        assert!(!valid_webchat_control_scope("*", "grok", "*", true));
+        assert!(!valid_webchat_control_scope("*", "*", "br_specific", true));
+        assert!(!valid_webchat_control_scope("bep_a", "", "*", false));
+        assert!(!valid_webchat_control_scope("bep_a", "Grok", "*", false));
+    }
+
+    /// user owner | Given an Edge response status | When the runtime decides whether the feature exists there | Then only route/body rejections map to "requires edge support"
+    #[test]
+    fn user_owner_given_edge_status_when_classified_then_auth_and_real_failures_stay_explicit() {
+        for status in [400, 404, 405, 501] {
+            assert!(edge_feature_unsupported(status), "{status}");
+        }
+        for status in [200, 201, 204, 401, 403, 409, 429, 500, 503] {
+            assert!(!edge_feature_unsupported(status), "{status}");
+        }
+        assert_eq!(
+            DEVICE_GRANT_REQUIRES_EDGE_SUPPORT,
+            "device_grant_requires_edge_support"
+        );
+        assert_eq!(
+            CONNECTOR_LABEL_REQUIRES_EDGE_SUPPORT,
+            "connector_label_requires_edge_support"
+        );
+    }
+
     #[test]
     fn production_link_identity_reads_legacy_single_device_link_environment() {
         let env = std::collections::BTreeMap::from([
@@ -4575,5 +4809,34 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod platform_account_selector_tests {
+    use super::*;
+
+    /// user owner | Given two active connectors and one revoked connector sharing labels | When a grant selector is resolved | Then only an unambiguous active label or an explicit conn_ id is accepted
+    #[test]
+    fn user_owner_given_labeled_connectors_when_selector_resolved_then_unambiguous_active_only() {
+        let inventory = json!({
+            "connectors": [
+                {"connector_id": "conn_active_one", "status": "active", "platform_account": "grokbot-owner@example.com"},
+                {"connector_id": "conn_active_two", "status": "active", "platform_account": "grokbot-owner@example.com"},
+                {"connector_id": "conn_revoked", "status": "revoked", "platform_account": "chatgpt-owner@example.com"},
+                {"connector_id": "conn_chatgpt", "status": "active", "platform_account": "chatgpt-owner@example.com"}
+            ]
+        });
+        assert_eq!(
+            select_active_connector_id("chatgpt-owner@example.com", &inventory).unwrap(),
+            "conn_chatgpt"
+        );
+        assert_eq!(
+            select_active_connector_id("conn_explicit_id1", &inventory).unwrap(),
+            "conn_explicit_id1"
+        );
+        assert!(select_active_connector_id("grokbot-owner@example.com", &inventory).is_err());
+        assert!(select_active_connector_id("claude-missing@example.com", &inventory).is_err());
+        assert!(select_active_connector_id("Cursor", &inventory).is_err());
     }
 }
