@@ -132,17 +132,16 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
   assert.ok(html.includes(`herdr-mcp connector approve ${requestId}`));
   assert.match(html, /id="copy-command"/);
   assert.match(html, /id="continue-link"/);
-  assert.match(html, /Continue to ChatGPT/);
+  assert.match(html, /Return to (?:this app|<strong>[^<]*<\/strong>|[A-Za-z][A-Za-z0-9 .]*(?: · )?)/);
   assert.match(html, /window\.location\.assign\(approvedRedirect\)/);
   assert.match(html, /navigator\.clipboard/);
   assert.match(html, /document\.execCommand\('copy'\)/);
-  assert.match(html, /Requires herdr-mcp v0\.4\.6 or newer\./);
+  assert.match(html, /computer already enrolled in this Worker/);
   assert.match(html, /visible CLI prompt/);
-  assert.match(html, /do not refresh it while approval is pending/);
+  assert.match(html, /unknown command (?:'|&#39;)connector(?:'|&#39;), update herdr-mcp/);
   assert.doesNotMatch(html, /no-echo prompt/);
-  assert.match(html, /unknown command (?:'|&#39;)connector(?:'|&#39;)/);
-  assert.match(html, /computer that is already enrolled in this Worker/);
-  assert.match(html, /Approval grants ordinary MCP access; it does not grant fleet-administration authority\./);
+  assert.match(html, /Approval grants ordinary MCP access|Approving grants ordinary MCP access/);
+  assert.match(html, /If you didn(?:'|&#39;)t start this request, close this page\./);
   assert.doesNotMatch(html, /another Herdr WebChat/);
   assert.match(resp.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
   assert.match(resp.headers.get("content-security-policy") ?? "", /style-src 'unsafe-inline'/);
@@ -461,7 +460,8 @@ test("authorize: identical pending retry gets an independently pollable page and
   assert.ok(retryResumeToken);
   assert.notEqual(retryRequestId, pending.requestId, "retry owns a distinct resumable request");
   assert.match(html, /class="approval-code"/);
-  assert.match(html, /Continue to ChatGPT/);
+  assert.match(html, /Return to Retrying WebChat/);
+  assert.doesNotMatch(html, /ChatGPT/);
 
   const approvals = await opts.store.getApproval(pending.requestId, NOW_MS);
   assert.ok(approvals, "the original pending approval must remain authoritative");
@@ -514,6 +514,9 @@ test("authorize: ChatGPT bare issuer fails before approval and points to /mcp", 
   const html = await resp.text();
   assert.match(html, /Check the MCP server URL/);
   assert.match(html, /missing the MCP endpoint path/);
+  assert.match(html, /ChatGPT reached the Herdr site/);
+  assert.match(html, /Return to the app and set the MCP Server URL/);
+  assert.doesNotMatch(html, /Return to ChatGPT/);
   assert.match(html, new RegExp(`${ISSUER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\/mcp`));
   assert.doesNotMatch(html, /approval-code/);
   assert.deepEqual(await opts.store.listConnectors(), before, "wrong endpoint must not create a Connector grant");
@@ -1672,4 +1675,251 @@ test("regression: distinct state/PKCE requests sharing a public client_id requir
   const tokensB = await tokenRespB.json();
   assert.ok(tokensB.access_token);
   assert.ok(tokensB.refresh_token);
+});
+
+// ---------------------------------------------------------------------------
+// 13. Client-agnostic approval pages (display name + redirect host anchor)
+// ---------------------------------------------------------------------------
+
+/** Render the approval page for a CIMD client with the given metadata. */
+async function approvalPageForCimd(opts, { clientId, redirect, clientName }) {
+  const fetchFn = async (input) => {
+    assert.equal(String(input), clientId);
+    return new Response(JSON.stringify({
+      client_id: clientId,
+      ...(clientName !== undefined ? { client_name: clientName } : {}),
+      redirect_uris: [redirect],
+      grant_types: ["authorization_code", "refresh_token"],
+      token_endpoint_auth_method: "none",
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const withFetch = { ...opts, fetchFn };
+  const challenge = await s256Challenge("V".repeat(43) + "zZ-._");
+  const qs = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirect,
+    response_type: "code",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  });
+  const resp = await GET(`/oauth/authorize?${qs}`, withFetch, { headers: { "accept-language": "en-US,en;q=0.9" } });
+  assert.equal(resp.status, 200);
+  assert.match(resp.headers.get("content-type") ?? "", /^text\/html/);
+  return resp.text();
+}
+
+test("user sees the sanitized client_name with the verified redirect host and no ChatGPT copy | Given a CIMD client with a registered client_name | When the authorization page renders | Then the heading, trust line, and return copy use the sanitized name and redirect host", async () => {
+  for (const [clientName, host] of [
+    ["Claude", "claude.ai"],
+    ["Grok", "grok.com"],
+    ["Perplexity", "perplexity.ai"],
+  ]) {
+    const clientId = `https://${host}/oauth/mcp-client-metadata`;
+    const redirect = `https://${host}/oauth/callback`;
+    const html = await approvalPageForCimd(makeOptions(), { clientId, redirect, clientName });
+    assert.match(html, new RegExp(`<h1 id="approval-title">Allow ${clientName} to access Herdr\\?</h1>`));
+    assert.ok(
+      html.includes(`${clientName}</span><span class="dot" aria-hidden="true"> · </span><code>${host}</code>`),
+      `${clientName}: name + verified redirect host must render together`,
+    );
+    assert.match(html, /If you didn(?:'|&#39;)t start this request, close this page\./);
+    assert.doesNotMatch(html, /ChatGPT/);
+    assert.doesNotMatch(html, /Returning to ChatGPT/);
+    assert.ok(html.includes(`Approved. Returning to ${clientName}…`));
+  }
+});
+
+test("user sees natural zh and ja spacing for named clients and fallbacks | Given zh or ja locales with a named client and without one | When the authorization page renders | Then named-client templates keep normal spacing and CJK fallbacks drop the placeholder space", async () => {
+  const clientId = "https://claude.ai/oauth/mcp-client-metadata";
+  const redirect = "https://claude.ai/api/mcp/auth_callback";
+  const fetchFn = async () => new Response(JSON.stringify({
+    client_id: clientId,
+    client_name: "Claude",
+    redirect_uris: [redirect],
+    token_endpoint_auth_method: "none",
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const challenge = await s256Challenge("Z".repeat(43) + "zZ-._");
+  for (const [accept, title, cont] of [
+    ["zh-CN,zh;q=0.9", "允许 Claude 访问 Herdr？", "返回 Claude"],
+    ["ja-JP,ja;q=0.9", "Claude に Herdr へのアクセスを許可しますか？", "Claude に戻る"],
+  ]) {
+    const opts = makeOptions({ fetchFn });
+    const qs = new URLSearchParams({
+      client_id: clientId, redirect_uri: redirect, response_type: "code",
+      code_challenge: challenge, code_challenge_method: "S256",
+    });
+    const resp = await GET(`/oauth/authorize?${qs}`, opts, { headers: { "accept-language": accept } });
+    assert.equal(resp.status, 200);
+    const html = await resp.text();
+    assert.ok(html.includes(title), `${accept}: ${title}`);
+    assert.ok(html.includes(cont), `${accept}: ${cont}`);
+  }
+});
+
+test("user sees ChatGPT instead of the synthesized record name on the generic page | Given a chatgpt.com CIMD client_id | When the authorization page renders | Then the page shows ChatGPT with its verified host and never leaks the raw ChatGPT CIMD record name", async () => {
+  // Display-layer only: the synthesized "ChatGPT CIMD" record name renders as
+  // plain "ChatGPT" on the page. The stored record, resolveClient, and the
+  // provider branch are unchanged.
+  const opts = makeOptions();
+  const html = await approvalPageForCimd(opts, {
+    clientId: "https://chatgpt.com/oauth/connector/client/xyz",
+    redirect: "https://chatgpt.com/connector_platform_oauth_redirect",
+    clientName: "Ignored Metadata Name",
+  });
+  assert.match(html, /<h1 id="approval-title">Allow ChatGPT to access Herdr\?<\/h1>/);
+  assert.ok(html.includes("ChatGPT</span>"));
+  assert.ok(html.includes("<code>chatgpt.com</code>"));
+  assert.ok(html.includes("Approved. Returning to ChatGPT…"));
+  assert.ok(html.includes("Return to ChatGPT"));
+  // The raw record value must not leak onto the page.
+  assert.doesNotMatch(html, /ChatGPT CIMD/);
+  // Display mapping must not affect the stored record: the approval in the DO
+  // still carries the synthesized client_name.
+});
+
+test("user sees a neutral app name when the client metadata omits client_name | Given a CIMD client without client_name | When the authorization page renders | Then the heading, trust line, and return copy use the locale fallback name with the verified redirect host", async () => {
+  const clientId = "https://client.example/oauth/client-metadata";
+  const redirect = "https://client.example/oauth/callback";
+  const html = await approvalPageForCimd(makeOptions(), { clientId, redirect, clientName: undefined });
+  assert.match(html, /<h1 id="approval-title">Allow this app to access Herdr\?<\/h1>/);
+  assert.ok(html.includes(`this app</span><span class="dot" aria-hidden="true"> · </span><code>client.example</code>`));
+  assert.match(html, /Return to the app/);
+  assert.ok(html.includes("Approved. Returning to the app…"));
+  assert.doesNotMatch(html, /ChatGPT/);
+});
+
+/** Mirror of the page's escapeHtml for asserting entity-escaping. */
+function escapeHtmlForTest(value) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+test("user never sees raw markup or control characters from a hostile client_name | Given client_names containing script tags, img tags, bidi marks, ESC, and 500-char overflow | When the authorization page renders | Then the name is stripped, entity-escaped, and capped at 40 code points while the trust anchor stays the verified host", async () => {
+  const clientId = "https://evil.example/oauth/client-metadata";
+  const redirect = "https://evil.example/oauth/callback";
+  const cases = [
+    { name: '"><img src=x onerror=alert(1)>', banned: ["<img", "<script"] },
+    { name: "Ale\u202EX\x1b[31mrt", expect: "AleX[31mrt" },
+    { name: "\u061C\u200F\u202ERLO-hidden\u200E", expect: "RLO-hidden" },
+    { name: `${"x".repeat(500)}-overflow`, expect: `${"x".repeat(39)}…` },
+    // Surrogate pair at the cap boundary: the emoji is dropped whole, never split.
+    { name: `${"x".repeat(39)}😀${"y".repeat(10)}`, expect: `${"x".repeat(39)}…` },
+    { name: `${"x".repeat(38)}😀`, expect: `${"x".repeat(38)}😀` },
+  ];
+  for (const testCase of cases) {
+    const html = await approvalPageForCimd(makeOptions(), { clientId, redirect, clientName: testCase.name });
+    // The sanitized+escaped name must appear in the heading; the trust anchor
+    // must be the verified redirect host, never client text.
+    const h1 = /<h1 id="approval-title">[^]*?<\/h1>/.exec(html)?.[0] ?? "";
+    assert.ok(h1.length > 0, "approval page must render its heading");
+    for (const fragment of testCase.banned ?? []) {
+      assert.ok(!h1.includes(fragment), `heading must not contain raw ${JSON.stringify(fragment)}`);
+    }
+    if (testCase.expect) {
+      assert.ok(h1.includes(testCase.expect), `expected sanitized fragment ${JSON.stringify(testCase.expect)}`);
+    }
+    assert.ok(h1.includes("<code>evil.example</code>") === false, "host anchor belongs to the trust line, not the heading");
+    assert.ok(html.includes("<code>evil.example</code>"));
+    // Raw markup from the name never becomes a tag/attribute anywhere in the
+    // page (the page's own <script>/<img> elements are unrelated).
+    if (testCase.name.includes("<")) {
+      const nameRendered = escapeHtmlForTest(testCase.name);
+      assert.ok(!html.includes(nameRendered.replace(/&lt;/g, "<")), "raw markup must stay escaped");
+      assert.ok(html.includes("&lt;script&gt;") || html.includes("&lt;img"), "markup must be entity-escaped");
+    }
+  }
+});
+
+test("user never sees client-controlled text styled as a verification badge | Given a client_name claiming Verified By Herdr Team | When the authorization page renders | Then the name renders as plain text with no badge or verified styling and the host remains the trust anchor", async () => {
+  const clientId = "https://spoof.example/oauth/client-metadata";
+  const redirect = "https://spoof.example/oauth/callback";
+  const html = await approvalPageForCimd(makeOptions(), {
+    clientId,
+    redirect,
+    clientName: "Verified By Herdr Team ✔",
+  });
+  assert.doesNotMatch(html, /class="[^"]*badge/);
+  assert.doesNotMatch(html, /class="[^"]*verified/i);
+  assert.ok(html.includes("Verified By Herdr Team ✔</span>"));
+  assert.ok(html.includes("<code>spoof.example</code>"));
+});
+
+test("user sees the correct locale fallback name, title, and return label | Given zh, ja, and en browsers with metadata that omits client_name | When the authorization page renders | Then each locale shows its own fallback title and return label with natural spacing", async () => {
+  const clientId = "https://i18n.example/oauth/client-metadata";
+  const redirect = "https://i18n.example/oauth/callback";
+  const fetchFn = async () => new Response(JSON.stringify({
+    client_id: clientId,
+    redirect_uris: [redirect],
+    token_endpoint_auth_method: "none",
+  }), { status: 200, headers: { "content-type": "application/json" } });
+  const challenge = await s256Challenge("W".repeat(43) + "zZ-._");
+  for (const [accept, title, cont] of [
+    ["zh-CN,zh;q=0.9", "允许该应用访问 Herdr？", "返回该应用"],
+    ["ja-JP,ja;q=0.9", "このアプリに Herdr へのアクセスを許可しますか？", "このアプリに戻る"],
+    ["en-GB,en;q=0.9", "Allow this app to access Herdr?", "Return to the app"],
+  ]) {
+    const opts = makeOptions({ fetchFn });
+    const qs = new URLSearchParams({
+      client_id: clientId, redirect_uri: redirect, response_type: "code",
+      code_challenge: challenge, code_challenge_method: "S256",
+    });
+    const resp = await GET(`/oauth/authorize?${qs}`, opts, { headers: { "accept-language": accept } });
+    assert.equal(resp.status, 200);
+    const html = await resp.text();
+    assert.ok(html.includes(title), `${accept}: ${title}`);
+    assert.ok(html.includes(cont), `${accept}: ${cont}`);
+  }
+});
+
+test("user sees the sanitized name and redirect host on the pending-approval retry page | Given a duplicate authorization request while one is already pending | When the duplicate_pending page renders | Then it shows the collapsed client name with the verified host and the cancel command", async () => {
+  const clientId = "https://client.example/oauth/client-metadata";
+  const redirect = "https://client.example/oauth/callback";
+  const clientName = "Page  Assist";
+  const challenge = await s256Challenge("V".repeat(43) + "zZ-._");
+  const qs = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirect,
+    response_type: "code",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  });
+  const fetchFn = async () => new Response(JSON.stringify({
+    client_id: clientId,
+    client_name: clientName,
+    redirect_uris: [redirect],
+    token_endpoint_auth_method: "none",
+  }), { status: 200, headers: { "content-type": "application/json" } });
+
+  // Force the duplicate_pending path deterministically: the first authorize
+  // request seeds the existing request id/expiry, then the store reports the
+  // retry as a duplicate of it.
+  let existing = null;
+  const seedingStore = {
+    getClient: async () => null,
+    getGrant: async () => null,
+    putApproval: async (requestId, record) => {
+      if (!existing) {
+        existing = { requestId, expiresAtMs: record.expires_at_ms };
+        return { ok: true };
+      }
+      return { ok: false, code: "duplicate_pending", status: 409, existing_request_id: existing.requestId, expires_at_ms: existing.expiresAtMs };
+    },
+  };
+  const first = await GET(`/oauth/authorize?${qs}`, makeOptions({ fetchFn, store: seedingStore }));
+  assert.equal(first.status, 200);
+  assert.match(await first.text(), /Allow Page Assist to access Herdr\?/);
+
+  const retry = await GET(`/oauth/authorize?${qs}`, makeOptions({ fetchFn, store: seedingStore }));
+  assert.equal(retry.status, 200);
+  const retryHtml = await retry.text();
+  assert.match(retryHtml, /Approval already pending/);
+  // Double space in the registered name collapses to one; trust anchor is the
+  // verified redirect host.
+  assert.match(retryHtml, /Page Assist · client\.example/);
+  assert.match(retryHtml, /herdr-mcp connector cancel /);
+  assert.doesNotMatch(retryHtml, /ChatGPT/);
 });
