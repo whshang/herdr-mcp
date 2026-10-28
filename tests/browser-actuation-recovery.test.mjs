@@ -2289,8 +2289,8 @@ function archiveCleanupHarness({
   };
 }
 
-function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", { provider = "claude", routeAuthorized = true, messageIdAvailable = true } = {}) {
-  return new Function("provider", "routeAuthorized", "messageIdAvailable", `
+function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", { provider = "claude", routeAuthorized = true, messageIdAvailable = true, archivedConversation = false } = {}) {
+  return new Function("provider", "routeAuthorized", "messageIdAvailable", "archivedConversation", `
     let currentConvKey = ${JSON.stringify(initialConvKey)};
     let currentUrl = currentConvKey;
     let registeredConvKey = currentConvKey;
@@ -2316,6 +2316,15 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
       registrationReadbackTimeouts.push(timeoutMs);
       return { ok: routeAuthorized, userMessageId: messageIdAvailable ? "prior-user-message" : null };
     };
+    // #623: the registration precondition proof now also accepts a provider
+    // readback that proves the conversation is archived. A conversation the
+    // current provider session cannot read at all stays unreadable here too,
+    // so the other-account refusal below is unchanged.
+    const fetchChatGptConversation = async () => (
+      routeAuthorized && archivedConversation
+        ? { ok: true, body: { is_archived: true } }
+        : { ok: false, reason: "http-404" }
+    );
     const refreshQueuedInsertStatus = () => {};
     const backfillCurrentChatGptContinuity = () => {};
     const restoreBrowserResultAssignment = () => {};
@@ -6703,4 +6712,66 @@ test("user bounds an untrusted read Retry-After | Given an authenticated convers
   context.now = 31000;
   assert.equal((await read({ conversationId: "conv-1" })).status, 429);
   assert.ok(context.urls.length > urlsAfterFirst, "an unbounded Retry-After must not disable reads permanently");
+});
+test("user keeps a projected conversation title after the first assistant reply | Given ChatGPT wrote its auto-title | When the first assistant turn settles | Then the projected title is re-applied exactly once and the final state is reported", async () => {
+  const helperStart = wakeSource.indexOf("  async function reapplyChatGptConversationTitleAfterSettlement() {");
+  const helperEnd = wakeSource.indexOf("  async function projectChatGptConversationTitle(rawTitle) {", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "the bounded reapply helper must exist");
+
+  const projectionEnd = wakeSource.indexOf("  async function fetchChatGptArchivedConversationList(", helperEnd);
+  assert.ok(projectionEnd > helperEnd, "the title projection helper must exist");
+
+  const stateStart = wakeSource.indexOf("  let chatGptTitleProjectionTarget = null;");
+  const stateEnd = wakeSource.indexOf("  let registeredBrowserGeneration = null;", stateStart);
+  assert.ok(stateStart >= 0 && stateEnd > stateStart, "the title projection state must exist");
+
+  const code = wakeSource.slice(stateStart, stateEnd)
+    + wakeSource.slice(helperStart, projectionEnd)
+    + "\nreturn { reapply: reapplyChatGptConversationTitleAfterSettlement, setTarget: (value) => { chatGptTitleProjectionTarget = value; }, state: () => ({ reapplied: chatGptTitleProjectionReapplied, result: chatGptTitleProjectionResult }) };";
+
+  const factory = new Function("ctx", `
+    const ADAPTER = { name: "chatgpt" };
+    function adapterSupports(capability) { return capability === "titleProjection"; }
+    function normText(value) { return String(value ?? "").trim(); }
+    function chatGptConversationId() { return "conv-624"; }
+    async function wait() {}
+    async function readChatGptAccessToken() { return "token"; }
+    async function fetchChatGptConversation() {
+      ctx.reads += 1;
+      return { ok: true, body: { title: ctx.currentTitle } };
+    }
+    const fetch = async (url, init) => {
+      if (init?.method === "PATCH") {
+        ctx.patchCount += 1;
+        ctx.patchedTitles.push(JSON.parse(init.body).title);
+        ctx.currentTitle = JSON.parse(init.body).title;
+        return { ok: true };
+      }
+      return { ok: true };
+    };
+    ${code}
+  `);
+
+  const ctx = { reads: 0, patchCount: 0, patchedTitles: [], currentTitle: "UAT reply" };
+  const api = factory(ctx);
+
+  // Nothing projected yet: the reapply must be a no-op.
+  assert.equal(await api.reapply(), null, "no reapply without a projected title");
+  assert.equal(ctx.patchCount, 0, "no provider write without a projected title");
+
+  // The provider already wrote its auto-title over the projected one.
+  api.setTarget({ title: "Ordered", conversationId: "conv-624" });
+  const result = await api.reapply();
+  assert.equal(ctx.patchCount, 1, "the projected title is re-applied exactly once");
+  assert.deepEqual(ctx.patchedTitles, ["Ordered"], "the projected title wins over the provider auto-title");
+  assert.equal(ctx.currentTitle, "Ordered");
+  assert.equal(result?.status, "verified");
+  assert.equal(result?.changed, true);
+  assert.equal(result?.readback_verified, true);
+
+  // A later settlement must not re-apply the title again.
+  const repeat = await api.reapply();
+  assert.equal(ctx.patchCount, 1, "the reapply happens at most once per session");
+  assert.equal(repeat?.status, "verified");
+  assert.equal(api.state().reapplied, true);
 });
