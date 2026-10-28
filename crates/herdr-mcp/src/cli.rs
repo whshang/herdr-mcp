@@ -233,6 +233,11 @@ pub enum WorkerCommand {
         from: String,
         to: String,
         idempotency_key: Option<String>,
+        /// A digest from an earlier dry run. When present the write path skips
+        /// re-planning and applies that digest, so a retry with the same
+        /// idempotency key replays the stored result instead of failing on an
+        /// empty plan.
+        plan_digest: Option<String>,
     },
     ConnectorPageAssist {
         connector_id: String,
@@ -1443,11 +1448,12 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 // #626/#630: orphans list and migrate dry run are read-only Edge
                 // reads; --confirm runs the device-scoped write path.
                 return match parsed? {
-                    crate::grant_migration::MigrateCli::Migrate { from, to, confirm: true, idempotency_key } => {
+                    crate::grant_migration::MigrateCli::Migrate { from, to, confirm: true, idempotency_key, plan_digest } => {
                         Ok(Command::Worker(WorkerCommand::ConnectorPageAssistMigrate {
                             from,
                             to,
                             idempotency_key,
+                            plan_digest,
                         }))
                     }
                     crate::grant_migration::MigrateCli::Migrate { from, to, .. } => {
@@ -2606,7 +2612,7 @@ User path:\n\
   herdr-mcp connector webchat-control <allow-device|deny-device> <connector-id-or-platform-account> <device-id> --confirm  (owner device; requires Edge device-grant support, otherwise fails device_grant_requires_edge_support)\n\
   herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device; the endpoint ref must be concrete)\n\
   herdr-mcp connector page-assist orphans [list] [--device-id <device-id>]  (read-only: grant rows left under a previous connector; always scoped server-side to the authenticated owner device; --device-id is only an assertion and must match it, else 403 orphans_device_mismatch)\n\
-  herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id> [--idempotency-key <key>] [--confirm]  (dry run without --confirm; with --confirm fetches the device-scoped plan, prints it plus the idempotency key, and applies it by plan_digest)\n\
+  herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id> [--idempotency-key <key>] [--plan-digest <digest>] [--confirm]  (dry run without --confirm; with --confirm fetches the device-scoped plan, prints it plus the idempotency key, and applies it by plan_digest; --plan-digest applies a digest from an earlier dry run instead of re-planning, so a retry with the same --idempotency-key replays the stored result)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
   herdr-mcp automation list\n\
   herdr-mcp automation rotate <client-id> --confirm\n\
@@ -4514,6 +4520,7 @@ mod tests {
                 from: "conn_old000000001".to_owned(),
                 to: "conn_new000000001".to_owned(),
                 idempotency_key: None,
+                plan_digest: None,
             })
         );
         assert_eq!(
@@ -4535,6 +4542,7 @@ mod tests {
                 from: "conn_old000000001".to_owned(),
                 to: "conn_new000000001".to_owned(),
                 idempotency_key: Some("cli-key-000000000001".to_owned()),
+                plan_digest: None,
             })
         );
         // Missing selectors or a malformed idempotency key fail closed.
