@@ -149,6 +149,14 @@ function mapPageAssistGrantFailure(code: string | undefined): { code: string; st
       return { code: "page_assist_grant_capacity_reached", status: 409 };
     case "invalid_record":
       return { code: "page_assist_grant_record_invalid", status: 500 };
+    // The Durable Object bounds the grant fields itself and answers 400
+    // `bad_request` for a malformed connector_id / device_id / endpoint_ref /
+    // allowed / changed_by. Mapping it explicitly keeps that 400 (and its
+    // distinct code) instead of letting a malformed body fall through to the
+    // catch-all as a 409 store failure. The catch-all stays for codes the
+    // Durable Object cannot currently produce.
+    case "bad_request":
+      return { code: "page_assist_grant_request_invalid", status: 400 };
     default:
       return { code: "page_assist_grant_update_failed", status: 409 };
   }

@@ -99,6 +99,14 @@ test("user learns the stored record is unreadable | Given a grant update the Dur
   assert.equal(body.code, "page_assist_grant_record_invalid");
 });
 
+test("user learns the grant request body was malformed | Given a grant update the Durable Object rejects as bad_request | When the route maps the failure | Then the response reports an invalid request with status 400 rather than a store failure", async () => {
+  const response = await worker.fetch(ownerRequest(VALID_BODY), makeEnv(oauthStub("bad_request", 400)));
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.equal(body.ok, false);
+  assert.equal(body.code, "page_assist_grant_request_invalid");
+});
+
 test("user still gets the catch-all code for an unknown failure | Given a grant update the Durable Object rejects with an unknown reason | When the route maps the failure | Then the response keeps the catch-all code", async () => {
   const response = await worker.fetch(ownerRequest(VALID_BODY), makeEnv(oauthStub("something_new", 409)));
   assert.equal(response.status, 409);
