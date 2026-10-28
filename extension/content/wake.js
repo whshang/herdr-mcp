@@ -2842,8 +2842,13 @@ function normalizeHerdrMentionAlias(value) {
           && (!creatingSession || (evidence.stable_resource_ref_observed && evidence.canonical_url_observed))) {
         evidence.generation_owner = expectedGeneration;
         if (creatingSession) {
+          // A re-applied projection (after the first assistant turn settled)
+          // is the final state: report it instead of projecting again.
+          const priorProjection = typeof chatGptTitleProjectionResult === "undefined"
+            ? null
+            : chatGptTitleProjectionResult;
           const titleProjection = adapterSupports("titleProjection")
-            ? await projectChatGptConversationTitle(params.display_label)
+            ? (priorProjection ?? await projectChatGptConversationTitle(params.display_label))
             : {
                 status: "unsupported",
                 changed: null,
@@ -2851,6 +2856,15 @@ function normalizeHerdrMentionAlias(value) {
                 readback_verified: false,
                 reason: "title_projection_unsupported",
               };
+          if (typeof chatGptTitleProjectionTarget !== "undefined") {
+            chatGptTitleProjectionTarget = {
+              title: String(params.display_label ?? "").trim(),
+              conversationId: null,
+            };
+          }
+          if (typeof chatGptTitleProjectionResult !== "undefined") {
+            chatGptTitleProjectionResult = titleProjection;
+          }
           evidence.result = {
             ...(evidence.result && typeof evidence.result === "object" && !Array.isArray(evidence.result)
               ? evidence.result
@@ -2905,6 +2919,11 @@ function normalizeHerdrMentionAlias(value) {
       assistant_text: assistantText,
     });
     if (response?.ok === true) {
+      // The provider auto-title lands with the first assistant reply, so the
+      // projected title is re-applied once after that turn settled.
+      if (typeof reapplyChatGptConversationTitleAfterSettlement === "function") {
+        void reapplyChatGptConversationTitleAfterSettlement().catch(() => {});
+      }
       const current = acceptedDispatchAssignments.get(sessionRef);
       // A newer accepted assignment may arrive while the previous ACK is in
       // flight. Preserve it so its result still gets observed on the next tick.
@@ -3097,6 +3116,13 @@ function normalizeHerdrMentionAlias(value) {
   // never the provider account's raw native identity.
   let registeredConvKey = null;
   let registeredBrowserSessionRef = null;
+  // #624: ChatGPT generates its auto-title after the first assistant reply, so
+  // the title projected during session creation gets overwritten. Keep the
+  // projected target and the outcome of the single bounded reapply so the
+  // final state can be reported with the session evidence.
+  let chatGptTitleProjectionTarget = null;
+  let chatGptTitleProjectionResult = null;
+  let chatGptTitleProjectionReapplied = false;
   let registeredBrowserGeneration = null;
   let registeredHerdrAppKeyword = null;
   let registeredConversationBound = false;
@@ -4462,6 +4488,46 @@ function normalizeHerdrMentionAlias(value) {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  // #624: after the first assistant turn settles, ChatGPT may already have
+  // written its own auto-title. Wait for that title to land, then re-apply the
+  // projected title exactly once and report the final state. The reapply never
+  // blocks the settlement ACK: it runs after the ACK was already accepted.
+  async function reapplyChatGptConversationTitleAfterSettlement() {
+    if (typeof chatGptTitleProjectionReapplied !== "undefined"
+      && chatGptTitleProjectionReapplied) {
+      return typeof chatGptTitleProjectionResult === "undefined"
+        ? null
+        : chatGptTitleProjectionResult;
+    }
+    const target = typeof chatGptTitleProjectionTarget === "undefined"
+      ? null
+      : chatGptTitleProjectionTarget;
+    if (!target || !target.title) return null;
+    if (ADAPTER.name !== "chatgpt" || !adapterSupports("titleProjection")) return null;
+    if (typeof chatGptTitleProjectionReapplied !== "undefined") {
+      chatGptTitleProjectionReapplied = true;
+    }
+    const conversationId = target.conversationId || chatGptConversationId();
+    if (!conversationId) return null;
+    // Give the provider auto-title a bounded window to land. Only a title that
+    // differs from the projected one is treated as the auto-title.
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      const observed = await fetchChatGptConversation({
+        conversationId,
+        timeoutMs: 1000,
+        authTimeoutMs: 1000,
+      });
+      if (observed?.ok && observed.body?.title && observed.body.title !== target.title) break;
+      if (Date.now() < deadline) await wait(250);
+    }
+    const reapplied = await projectChatGptConversationTitle(target.title);
+    if (typeof chatGptTitleProjectionResult !== "undefined") {
+      chatGptTitleProjectionResult = reapplied;
+    }
+    return reapplied;
   }
 
   async function projectChatGptConversationTitle(rawTitle) {
