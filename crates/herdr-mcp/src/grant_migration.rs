@@ -393,9 +393,7 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
     if plan_digest.is_some() && !confirm {
         // A digest only matters for the write path; accepting it in a dry run
         // would silently ignore it.
-        return Err(
-            "connector page-assist migrate: --plan-digest requires --confirm".to_owned()
-        );
+        return Err("connector page-assist migrate: --plan-digest requires --confirm".to_owned());
     }
     Ok(MigrateCli::Migrate {
         from,
@@ -894,8 +892,25 @@ mod tests {
         // A digest without --confirm, a malformed digest, and a repeated flag
         // all fail closed.
         for bad in [
-            vec!["migrate", "--from", OLD, "--to", NEW, "--plan-digest", &digest],
-            vec!["migrate", "--from", OLD, "--to", NEW, "--plan-digest", "abc", "--confirm"],
+            vec![
+                "migrate",
+                "--from",
+                OLD,
+                "--to",
+                NEW,
+                "--plan-digest",
+                &digest,
+            ],
+            vec![
+                "migrate",
+                "--from",
+                OLD,
+                "--to",
+                NEW,
+                "--plan-digest",
+                "abc",
+                "--confirm",
+            ],
             vec![
                 "migrate",
                 "--from",
