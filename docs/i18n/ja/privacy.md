@@ -49,9 +49,11 @@
 拡張が要求する Chrome 権限は、説明した機能を提供するためだけのものです:
 
 - `storage` — ローカル設定と continuity 状態を永続化します。
+- `activeTab` — ユーザーがあるタブで拡張機能を呼び出したときに、そのタブへの一時的なアクセスを付与します。Herdr 自身のページアクセス権限は下記の `<all_urls>` host permission によるため、この権限は宣言されていますが、出荷済みのページ操作はこれに依存しません。
 - `scripting` — MV3/ページの再読み込み後に対応 Web AI タブでパッケージ済みの content-script スタックを復旧/再注入し、有界なブラウザ側 continuity アクションを実行します。
 - `alarms` — Chrome が MV3 service worker を suspend した後に、失われたローカル Herdr 状態ストリームとタイマーを復旧できるよう、定期的に起こします。
 - `nativeMessaging` — ローカルにインストールされた herdr-mcp native host に接続します。
+- `debugger` — Herdr が所有するページに Chrome DevTools Protocol をアタッチし、そのページのナビゲーション履歴の読み取り、既知の要素の上でポインタの移動、そのページのスクリーンショットの取得を行い、ユーザーが求めたブラウザ操作を実行し検証します。アタッチ対象は Herdr が所有するページと固定の DevTools コマンドに限られ、読み取ったナビゲーション履歴は保存も送信もされません。また、これらのコマンドを超えてページの内容を読み書きすることはありません。
 - `sidePanel` — Herdr Browser Control Center をホストします。
 - host access — 拡張はインストール/読み込み時に `<all_urls>` を要求し、BrowserPage がユーザーの明示的に選択した任意の http/https ページをサイトごとの追加権限要求なしで操作できるようにします。Generic Page Assist は特定の BrowserPage 対象に対してのみオンデマンドで動作し、ページアクセス直前に Chrome のその正確な origin への実効権限を確認します。ユーザーが Chrome の拡張設定でサイトアクセスを制限した場合、その origin の BrowserPage は fail closed します。Semantic provider への接続は Runtime/Edge が行うため、Provider route 用の追加 Chrome host permission は不要です。
 
