@@ -49,9 +49,11 @@ The extension does not sell user data, send user data to advertising networks, o
 The extension requests Chrome permissions only to provide the described functionality:
 
 - `storage` — persist local settings and continuity state;
+- `activeTab` — grant temporary access to the active tab when the user invokes the extension on that tab. Herdr's own host access comes from the `<all_urls>` host permission below, so this permission is declared but not required for the shipped page actions;
 - `scripting` — recover/reinject the packaged content-script stack on supported Web AI tabs after MV3/page reloads and perform bounded browser-side continuity actions;
 - `alarms` — wake the MV3 service worker periodically so it can restore missing local Herdr state streams and timers after Chrome suspends it;
 - `nativeMessaging` — connect to the locally installed herdr-mcp native host;
+- `debugger` — attach the Chrome DevTools Protocol to a Herdr-owned page so the extension can read that page's navigation history, move the pointer over a known element, and capture a screenshot of that page, used to carry out and verify a browser action the user asked for. The attachment is bounded to Herdr-owned pages and to a fixed set of DevTools commands; the navigation entries it reads are not stored or sent anywhere, and the permission is not used to read or alter page content beyond those commands;
 - `sidePanel` — host Herdr Browser Control Center;
 - host access — the extension requires `<all_urls>` at install/load time so BrowserPage can control arbitrary user-selected http/https pages without per-site permission prompts. Generic Page Assist is still invoked only for a specific BrowserPage target and checks Chrome's live permission for that exact origin before page access. Users can restrict site access from Chrome's extension controls; such a restriction makes BrowserPage fail closed for that origin. Semantic providers are contacted by Runtime/Edge rather than directly by the extension, so provider routes do not require separate Chrome host permissions.
 
