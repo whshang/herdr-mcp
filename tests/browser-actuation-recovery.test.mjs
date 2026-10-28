@@ -2289,8 +2289,8 @@ function archiveCleanupHarness({
   };
 }
 
-function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", { provider = "claude", routeAuthorized = true, messageIdAvailable = true } = {}) {
-  return new Function("provider", "routeAuthorized", "messageIdAvailable", `
+function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", { provider = "claude", routeAuthorized = true, messageIdAvailable = true, archivedConversation = false } = {}) {
+  return new Function("provider", "routeAuthorized", "messageIdAvailable", "archivedConversation", `
     let currentConvKey = ${JSON.stringify(initialConvKey)};
     let currentUrl = currentConvKey;
     let registeredConvKey = currentConvKey;
@@ -2316,6 +2316,15 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
       registrationReadbackTimeouts.push(timeoutMs);
       return { ok: routeAuthorized, userMessageId: messageIdAvailable ? "prior-user-message" : null };
     };
+    // #623: the registration precondition proof now also accepts a provider
+    // readback that proves the conversation is archived. A conversation the
+    // current provider session cannot read at all stays unreadable here too,
+    // so the other-account refusal below is unchanged.
+    const fetchChatGptConversation = async () => (
+      routeAuthorized && archivedConversation
+        ? { ok: true, body: { is_archived: true } }
+        : { ok: false, reason: "http-404" }
+    );
     const refreshQueuedInsertStatus = () => {};
     const backfillCurrentChatGptContinuity = () => {};
     const restoreBrowserResultAssignment = () => {};

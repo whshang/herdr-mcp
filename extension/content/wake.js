@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.224";
+const H2W_CONTENT_VERSION = "0.1.225";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3816,7 +3816,20 @@ function normalizeHerdrMentionAlias(value) {
     // provider session before publishing any account/session association.
     if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
       const proof = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+      // #623: an archived conversation exposes no user turn any more, so a
+      // `userMessageId`-only proof rejects it and the session can never be
+      // registered again. Accept a provider readback that proves the same
+      // conversation is archived as an equally valid ownership proof.
+      let proofArchived = false;
       if (!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim()) {
+        const archivedProof = await fetchChatGptConversation({
+          conversationId: chatGptConversationId(),
+          timeoutMs: 4000,
+        }).catch(() => ({ ok: false }));
+        proofArchived = archivedProof?.ok === true && archivedProof?.body?.is_archived === true;
+      }
+      if ((!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim())
+          && !proofArchived) {
         lastBrowserRegistrationStatus = "provider_readback_unavailable";
         if (registeredConvKey === convKey) {
           registeredConvKey = null;
