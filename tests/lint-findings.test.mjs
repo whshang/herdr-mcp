@@ -55,7 +55,9 @@ test("user keeps the lesson logs green | Given the checked-in FINDINGS.md and RU
   const result = spawnSync(process.execPath, [LINTER], { cwd: REPO_ROOT, encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /findings-lint: PASS/);
-  assert.match(result.stdout, /FINDINGS\.md \d+ entries, RULES\.md \d+ entries/);
+  // The summary pluralizes truthfully, so a log holding exactly one entry reports
+  // "1 entry". Accept either form for both logs instead of assuming a count.
+  assert.match(result.stdout, /FINDINGS\.md \d+ entr(?:y|ies), RULES\.md \d+ entr(?:y|ies)/);
 });
 
 test("user writes a truthful count | Given an entry claiming 2× with 3 distinct review dates listed | When the gate runs | Then it names the mismatched entry", async () => {
