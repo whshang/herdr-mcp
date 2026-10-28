@@ -3790,7 +3790,20 @@ function normalizeHerdrMentionAlias(value) {
     // provider session before publishing any account/session association.
     if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
       const proof = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+      // #623: an archived conversation exposes no user turn any more, so a
+      // `userMessageId`-only proof rejects it and the session can never be
+      // registered again. Accept a provider readback that proves the same
+      // conversation is archived as an equally valid ownership proof.
+      let proofArchived = false;
       if (!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim()) {
+        const archivedProof = await fetchChatGptConversation({
+          conversationId: chatGptConversationId(),
+          timeoutMs: 4000,
+        }).catch(() => ({ ok: false }));
+        proofArchived = archivedProof?.ok === true && archivedProof?.body?.is_archived === true;
+      }
+      if ((!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim())
+          && !proofArchived) {
         lastBrowserRegistrationStatus = "provider_readback_unavailable";
         if (registeredConvKey === convKey) {
           registeredConvKey = null;
