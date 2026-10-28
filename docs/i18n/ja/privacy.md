@@ -49,7 +49,6 @@
 拡張が要求する Chrome 権限は、説明した機能を提供するためだけのものです:
 
 - `storage` — ローカル設定と continuity 状態を永続化します。
-- `activeTab` — ユーザーがあるタブで拡張機能を呼び出したときに、そのタブへの一時的なアクセスを付与します。Herdr 自身のページアクセス権限は下記の `<all_urls>` host permission によるため、この権限は宣言されていますが、出荷済みのページ操作はこれに依存しません。
 - `scripting` — MV3/ページの再読み込み後に対応 Web AI タブでパッケージ済みの content-script スタックを復旧/再注入し、有界なブラウザ側 continuity アクションを実行します。
 - `alarms` — Chrome が MV3 service worker を suspend した後に、失われたローカル Herdr 状態ストリームとタイマーを復旧できるよう、定期的に起こします。
 - `nativeMessaging` — ローカルにインストールされた herdr-mcp native host に接続します。

@@ -1,12 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Herdr MCP - Workspace Connector",
-  "version": "0.1.225",
+  "version": "0.1.226",
   "minimum_chrome_version": "111",
   "description": "Connect ChatGPT, Claude, and Grok to local Herdr workspaces.",
   "permissions": [
     "storage",
-    "activeTab",
     "scripting",
     "alarms",
     "nativeMessaging",
