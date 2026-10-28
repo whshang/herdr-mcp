@@ -319,8 +319,73 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
-function chatgptMcpEndpointErrorPage(issuer: string): Response {
+/**
+ * JSON.stringify for inline <script> contexts: escapes "<" so client-derived
+ * strings can never close the script element or emit markup.
+ */
+function safeJson(value: unknown): string {
+  return JSON.stringify(value).replaceAll("<", "\\u003c");
+}
+
+/**
+ * Upper bound for client-supplied display names rendered on approval pages.
+ * Long names are truncated with an ellipsis; the redirect host stays the
+ * trust anchor regardless of what the client claims.
+ */
+const CLIENT_NAME_MAX_CHARS = 40;
+
+/**
+ * Sanitize a client-supplied display name: strip control, bidi (RLO/LRO/…)
+ * and zero-width/invisible characters, collapse whitespace, cap length.
+ * Output is plain text — callers must still HTML-escape before rendering.
+ */
+function sanitizeClientName(raw: string): string {
+  const stripped = raw.replace(
+    /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u06dd\u070f\u08e2\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb]/g,
+    "",
+  );
+  const collapsed = stripped.replace(/\s+/g, " ").trim();
+  if (!collapsed) return "";
+  // Cap by code points so a surrogate pair (emoji) is never split.
+  const chars = Array.from(collapsed);
+  return chars.length > CLIENT_NAME_MAX_CHARS
+    ? `${chars.slice(0, CLIENT_NAME_MAX_CHARS - 1).join("")}…`
+    : collapsed;
+}
+
+/**
+ * Page display name: sanitized registered name, with the synthesized ChatGPT
+ * CIMD record shown as plain "ChatGPT". Display-layer only — the stored
+ * record, resolveClient, and all provider logic are unchanged. Returns ""
+ * when no name is registered; callers apply the locale fallback.
+ */
+function pageClientName(clientName: string | undefined): string {
+  const sanitized = clientName ? sanitizeClientName(clientName) : "";
+  return sanitized === "ChatGPT CIMD" ? "ChatGPT" : sanitized;
+}
+
+/** Hostname of an already-validated redirect_uri (empty string if unparseable). */
+function redirectUriHost(redirectUri: string): string {
+  try {
+    return new URL(redirectUri).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Display name plus verified redirect host as the trust anchor, e.g.
+ * "Claude · claude.ai". The separator and host are omitted when the host
+ * cannot be parsed (empty anchor must never render as "Name · ").
+ */
+function clientTrustLabel(displayName: string, redirectUri: string): string {
+  const host = redirectUriHost(redirectUri);
+  return host ? `${displayName} · ${host}` : displayName;
+}
+
+function mcpEndpointErrorPage(issuer: string, clientName?: string): Response {
   const endpoint = `${issuer}/mcp`;
+  const client = pageClientName(clientName) || "this app";
   const html = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Check the Herdr MCP server URL</title>
@@ -331,11 +396,11 @@ function chatgptMcpEndpointErrorPage(issuer: string): Response {
 <div class="brand"><span class="mark" aria-hidden="true">H</span><span>Herdr secure access</span></div>
 <section class="card"><div class="main">
 <h1>Check the MCP server URL</h1>
-<p class="lead">ChatGPT reached the Herdr site, but the configured server URL is missing the MCP endpoint path.</p>
-<div class="notice" role="alert">Do not approve this request. Return to ChatGPT and set the MCP Server URL to the full <code>/mcp</code> endpoint.</div>
+<p class="lead">${escapeHtml(client)} reached the Herdr site, but the configured server URL is missing the MCP endpoint path.</p>
+<div class="notice" role="alert">Do not approve this request. Return to the app and set the MCP Server URL to the full <code>/mcp</code> endpoint.</div>
 <div class="endpoint"><code>${escapeHtml(endpoint)}</code></div>
 <p class="lead">The site root <code>${escapeHtml(issuer)}</code> is not the MCP server endpoint. No Herdr approval or Connector grant was created for this request.</p>
-</div><div class="footer">After correcting the URL in ChatGPT, reconnect Herdr and continue the normal approval flow.</div></section>
+</div><div class="footer">After correcting the URL in the app, reconnect Herdr and continue the normal approval flow.</div></section>
 </main></body></html>`;
   return new Response(html, {
     status: 400,
@@ -352,95 +417,122 @@ function chatgptMcpEndpointErrorPage(issuer: string): Response {
 
 type ApprovalLocale = "en" | "zh" | "ja";
 
+/**
+ * Client-agnostic approval copy. `{client}` in allowTitle is replaced with the
+ * sanitized client display name (or fallbackName); `{name}` in approved/
+ * continue is replaced the same way before the strings reach the page or the
+ * inline poll script.
+ */
 const APPROVAL_COPY = {
   en: {
     htmlLang: "en",
     brand: "Herdr secure access",
     eyebrow: "Connector authorization",
     waiting: "Waiting for approval",
-    defaultTitle: "Approve Herdr Connector",
-    leadSuffix: " is requesting access to this Herdr Worker. Approve it from a computer that is already enrolled in this Worker.",
+    allowTitle: "Allow {client} to access Herdr?",
+    fallbackName: "this app",
+    fallbackReturnName: "the app",
+    grant: "Approving grants ordinary MCP access to the devices enrolled in this Herdr Worker. It does not grant fleet administration.",
+    denyNotice: "If you didn't start this request, close this page.",
     step1Title: "Open Terminal and run this command",
-    step1Help: "Run it on the enrolled Mac. The CLI checks that the local herdr-mcp service and Herdr server are ready before it asks for the code. Requires herdr-mcp v0.4.6 or newer. If the CLI says unknown command 'connector', update herdr-mcp first and retry.",
+    step1Help: "Run it on a computer already enrolled in this Worker. The CLI checks that the local herdr-mcp service and Herdr server are ready, then asks for the code. If the CLI says unknown command 'connector', update herdr-mcp and retry.",
     copy: "Copy",
     copied: "Copied",
     copyFailed: "Copy failed",
     step2Title: "Enter the six-digit code when the CLI asks",
     codeLabel: "Approval code",
-    codeHelp: "Enter this code only at the visible CLI prompt. It is intentionally not included in the command or shell history. Keep this page open and do not refresh it while approval is pending.",
+    codeHelp: "Enter this code only at the visible CLI prompt on the enrolled computer.",
     pending: "Waiting for approval…",
-    approved: "Approved. Returning to ChatGPT…",
+    approved: "Approved. Returning to {name}…",
     failed: "Approval failed or expired.",
     unavailable: "Approval status could not be checked. Reload the original Connector flow and try again.",
-    continue: "Continue to ChatGPT",
-    continueHelp: "Use this if automatic return is blocked.",
+    continue: "Return to {name}",
+    continueHelp: "Use this if the automatic return is blocked.",
     details: "Request details",
-    connector: "Connector",
+    connector: "App",
     requestId: "Request ID",
     expires: "Expires",
     securityLabel: "Security check:",
-    security: " approve only requests you just initiated. Never enter this code into an untrusted site. Approval grants ordinary MCP access; it does not grant fleet-administration authority.",
-    footer: "Herdr keeps the workstation private: the enrolled device approves this request, then the authorization result returns only to the original OAuth callback.",
+    security: " Approve only requests you just started. The six-digit code works only in the Herdr CLI on an enrolled computer.",
+    footer: "The enrolled computer approves this request; the authorization result returns only to the original OAuth callback.",
   },
   zh: {
     htmlLang: "zh-CN",
     brand: "Herdr 安全授权",
     eyebrow: "Connector 授权",
     waiting: "等待批准",
-    defaultTitle: "批准 Herdr Connector",
-    leadSuffix: " 正在请求访问这个 Herdr Worker。请在已经登记到该 Worker 的 Mac 上完成批准。",
+    allowTitle: "允许 {client} 访问 Herdr？",
+    fallbackName: "该应用",
+    fallbackReturnName: "该应用",
+    grant: "批准后仅授予普通 MCP 访问权限，可访问本 Herdr Worker 已登记的设备；不授予设备管理权限。",
+    denyNotice: "如果这不是你发起的请求，请直接关闭本页。",
     step1Title: "打开终端并运行这条命令",
-    step1Help: "请在已登记的 Mac 上运行。CLI 会先检查本机 herdr-mcp 服务和 Herdr server 是否已就绪，再要求输入验证码。需要 herdr-mcp v0.4.6 或更高版本；如果提示 unknown command 'connector'，请先更新 herdr-mcp。",
+    step1Help: "在已登记的电脑上运行。CLI 会先确认本机 herdr-mcp 服务和 Herdr server 可用，再要求输入验证码。如果 CLI 提示 unknown command 'connector'，请先更新 herdr-mcp 后重试。",
     copy: "复制",
     copied: "已复制",
     copyFailed: "复制失败",
     step2Title: "CLI 提示后输入 6 位验证码",
     codeLabel: "批准验证码",
-    codeHelp: "只在终端出现验证码提示后输入下面的数字。验证码不会放进命令或 shell history。批准完成前请保持本页打开，不要刷新。",
+    codeHelp: "只在已登记电脑的 CLI 提示处输入这个验证码。",
     pending: "正在等待批准…",
-    approved: "已批准，正在返回 ChatGPT…",
+    approved: "已批准，正在返回 {name}…",
     failed: "批准失败或已过期。",
     unavailable: "暂时无法检查批准状态。请重新打开原来的 Connector 授权流程后重试。",
-    continue: "继续返回 ChatGPT",
+    continue: "返回 {name}",
     continueHelp: "自动返回被阻止时使用。",
     details: "请求详情",
-    connector: "Connector",
+    connector: "应用",
     requestId: "请求 ID",
     expires: "过期时间",
     securityLabel: "安全检查：",
-    security: "只批准你刚刚发起的请求。不要把验证码输入到不可信的网站。批准只授予普通 MCP 访问权限，不授予设备管理权限。",
-    footer: "Herdr 保持工作站私有：已登记设备在本地批准请求，授权结果只返回原始 OAuth callback。",
+    security: "只批准你刚刚发起的请求。6 位验证码只在已登记电脑的 Herdr CLI 中有效。",
+    footer: "由已登记的电脑批准此请求；授权结果只返回原始 OAuth callback。",
   },
   ja: {
     htmlLang: "ja",
     brand: "Herdr セキュアアクセス",
     eyebrow: "Connector 認証",
     waiting: "承認待ち",
-    defaultTitle: "Herdr Connector を承認",
-    leadSuffix: " がこの Herdr Worker へのアクセスを要求しています。この Worker に登録済みの Mac で承認してください。",
+    allowTitle: "{client} に Herdr へのアクセスを許可しますか？",
+    fallbackName: "このアプリ",
+    fallbackReturnName: "このアプリ",
+    grant: "承認すると、この Herdr Worker に登録済みの端末への通常の MCP アクセスだけが許可されます。端末管理権限は付与されません。",
+    denyNotice: "身に覚えのないリクエストの場合は、このページを閉じてください。",
     step1Title: "ターミナルを開いてこのコマンドを実行",
-    step1Help: "登録済みの Mac で実行してください。CLI はコード入力前にローカルの herdr-mcp サービスと Herdr server が利用可能か確認します。herdr-mcp v0.4.6 以降が必要です。unknown command 'connector' と表示された場合は herdr-mcp を更新してください。",
+    step1Help: "登録済みのコンピュータで実行します。CLI はローカルの herdr-mcp サービスと Herdr server を確認してからコードを要求します。unknown command 'connector' と表示された場合は herdr-mcp を更新して再試行してください。",
     copy: "コピー",
     copied: "コピー済み",
     copyFailed: "コピー失敗",
     step2Title: "CLI に求められたら 6 桁のコードを入力",
     codeLabel: "承認コード",
-    codeHelp: "ターミナルにコード入力の案内が出た後で、下の数字を入力してください。コードはコマンドや shell history には含まれません。承認が終わるまでこのページを開いたままにし、再読み込みしないでください。",
+    codeHelp: "このコードは、登録済みコンピュータの CLI プロンプトにのみ入力してください。",
     pending: "承認を待っています…",
-    approved: "承認されました。ChatGPT に戻ります…",
+    approved: "承認されました。{name} に戻ります…",
     failed: "承認に失敗したか、有効期限が切れました。",
     unavailable: "承認状態を確認できません。元の Connector 認証フローを開き直して再試行してください。",
-    continue: "ChatGPT に戻る",
+    continue: "{name} に戻る",
     continueHelp: "自動で戻らない場合に使用します。",
     details: "リクエスト詳細",
-    connector: "Connector",
+    connector: "アプリ",
     requestId: "リクエスト ID",
     expires: "有効期限",
     securityLabel: "セキュリティ確認：",
-    security: "直前に自分で開始したリクエストだけを承認してください。このコードを信頼できないサイトへ入力しないでください。承認されるのは通常の MCP アクセスだけで、端末管理権限は付与されません。",
-    footer: "Herdr はワークステーションを非公開のまま保ちます。登録済み端末で承認し、認証結果だけを元の OAuth callback に返します。",
+    security: "直前に自分で開始したリクエストだけを承認してください。6 桁のコードは登録済みコンピュータの Herdr CLI でのみ有効です。",
+    footer: "登録済みの端末がこのリクエストを承認し、認証結果だけを元の OAuth callback に返します。",
   },
 } as const;
+
+/**
+ * Natural-spacing substitution for zh/ja templates: CJK text takes no space
+ * around a placeholder, so after replacing {client}/{name} drop a space that
+ * ends up between two CJK characters (e.g. "允许 该应用 访问" → "允许该应用访问").
+ * en templates keep their Latin spacing (plain replacement only).
+ */
+function fillTemplate(template: string, name: string, locale: ApprovalLocale): string {
+  const filled = template.replaceAll("{client}", name).replaceAll("{name}", name);
+  if (locale === "en") return filled;
+  return filled.replace(/([\u3000-\u9fff\uf900-\ufaff\uff00-\uffef]) ([\u3000-\u9fff\uf900-\ufaff\uff00-\uffef])/g, "$1$2");
+}
 
 function approvalLocale(acceptLanguage: string | null): ApprovalLocale {
   for (const part of (acceptLanguage ?? "").split(",")) {
@@ -459,25 +551,25 @@ function approvalPage(input: {
   resumeToken: string;
   expiresAtMs: number;
   clientName?: string;
+  redirectUri: string;
   locale: ApprovalLocale;
 }): Response {
   const poll = `${input.issuer}${AUTHORIZE_POLL_PATH}`;
   const expiresAt = new Date(input.expiresAtMs).toISOString();
   const copy = APPROVAL_COPY[input.locale];
-  const clientLabel = input.clientName ?? "Web AI Connector";
-  const title = input.clientName
-    ? input.locale === "zh"
-      ? `批准 ${input.clientName}`
-      : input.locale === "ja"
-        ? `${input.clientName} を承認`
-        : `Approve ${input.clientName}`
-    : copy.defaultTitle;
+  // Display name: sanitized registered name (synthesized "ChatGPT CIMD"
+  // renders as "ChatGPT") or neutral locale fallback. The verified redirect
+  // host is the trust anchor and is never client-controlled text.
+  const displayName = pageClientName(input.clientName) || copy.fallbackName;
+  const clientLabel = clientTrustLabel(displayName, input.redirectUri);
+  const redirectHost = redirectUriHost(input.redirectUri);
+  const title = fillTemplate(copy.allowTitle, displayName, input.locale);
   const approvalCommand = `herdr-mcp connector approve ${input.requestId}`;
   const scriptCopy = {
     copy: copy.copy,
     copied: copy.copied,
     copyFailed: copy.copyFailed,
-    approved: copy.approved,
+    approved: fillTemplate(copy.approved, displayName === copy.fallbackName ? copy.fallbackReturnName : displayName, input.locale),
     failed: copy.failed,
     unavailable: copy.unavailable,
   };
@@ -486,7 +578,7 @@ function approvalPage(input: {
 <title>${escapeHtml(title)}</title>
 <style>
 :root{color-scheme:light dark;--bg:#fafafa;--card:#fff;--text:#171717;--muted:#666;--line:#e6e6e6;--soft:#f6f6f6;--accent:#006bff;--accentText:#fff;--good:#137333;--goodSoft:#edf7ef;--bad:#b42318;--badSoft:#fff0ee;--shadow:0 18px 60px rgba(0,0,0,.09)}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:40px 16px}.shell{width:min(680px,100%);margin:0 auto}.brand{display:flex;align-items:center;gap:9px;margin:0 0 14px 4px;font-size:13px;font-weight:650;color:#4d4d4d}.brand-mark{display:grid;place-items:center;width:25px;height:25px;border-radius:7px;background:#171717;color:#fff;font-size:13px;font-weight:800}.card{overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--card);box-shadow:var(--shadow)}.main{padding:32px}.eyebrow{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}.eyebrow-label{font-size:12px;font-weight:700;letter-spacing:.03em;color:var(--muted);text-transform:uppercase}.pill{display:inline-flex;align-items:center;gap:7px;border-radius:999px;background:var(--soft);padding:6px 9px;font-size:12px;color:var(--muted)}.pill-dot,.status-dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}h1{font-size:30px;line-height:1.16;letter-spacing:-.025em;margin:0 0 10px}.lead{margin:0 0 26px;color:var(--muted);font-size:15px;line-height:1.6}.connector{color:var(--text);font-weight:650}.steps{display:grid;gap:14px}.step{display:grid;grid-template-columns:30px minmax(0,1fr);gap:12px;border:1px solid var(--line);border-radius:13px;padding:16px;background:var(--soft)}.step-number{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:var(--text);color:var(--card);font-weight:800;font-size:13px}.step-title{font-weight:720;font-size:15px;margin:3px 0 10px}.helper{margin:9px 0 0;color:var(--muted);font-size:12px;line-height:1.55}.command-row{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:10px;background:var(--card);padding:8px}.command-row code{min-width:0;flex:1;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.copy{border:0;border-radius:8px;background:var(--text);color:var(--card);padding:8px 10px;font-weight:700;cursor:pointer}.code-card{display:flex;align-items:center;justify-content:space-between;gap:16px;border:1px solid var(--line);border-radius:10px;background:var(--card);padding:12px 14px}.code-label{color:var(--muted);font-size:12px}.approval-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:28px;letter-spacing:.15em;font-weight:760}.status{display:flex;align-items:center;gap:9px;margin-top:16px;border-radius:11px;background:var(--soft);padding:11px 13px;color:var(--muted);font-size:13px}.status.success{background:var(--goodSoft);color:var(--good)}.status.success .status-dot{background:var(--good)}.status.error{background:var(--badSoft);color:var(--bad)}.status.error .status-dot{background:var(--bad)}.continue-row{margin-top:12px;display:flex;align-items:center;gap:10px}.continue-row[hidden]{display:none!important}.continue-link{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:10px;background:var(--accent);color:var(--accentText);font-weight:750;text-decoration:none}.continue-help{color:var(--muted);font-size:12px}details{margin-top:20px;border-top:1px solid var(--line);padding-top:16px;color:var(--muted)}summary{cursor:pointer;font-size:13px;font-weight:700}.details-grid{display:grid;grid-template-columns:100px minmax(0,1fr);gap:7px 14px;margin-top:12px;font-size:12px}.details-grid dd{margin:0;min-width:0;overflow-wrap:anywhere}.security{margin:18px 0 0;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12px;line-height:1.55}.security strong{color:var(--text)}.footer{padding:14px 32px;border-top:1px solid var(--line);background:var(--soft);color:var(--muted);font-size:12px;line-height:1.5}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:40px 16px}.shell{width:min(680px,100%);margin:0 auto}.brand{display:flex;align-items:center;gap:9px;margin:0 0 14px 4px;font-size:13px;font-weight:650;color:#4d4d4d}.brand-mark{display:grid;place-items:center;width:25px;height:25px;border-radius:7px;background:#171717;color:#fff;font-size:13px;font-weight:800}.card{overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--card);box-shadow:var(--shadow)}.main{padding:32px}.eyebrow{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}.eyebrow-label{font-size:12px;font-weight:700;letter-spacing:.03em;color:var(--muted);text-transform:uppercase}.pill{display:inline-flex;align-items:center;gap:7px;border-radius:999px;background:var(--soft);padding:6px 9px;font-size:12px;color:var(--muted)}.pill-dot,.status-dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}h1{font-size:30px;line-height:1.16;letter-spacing:-.025em;margin:0 0 10px}.trust{margin:0 0 14px;font-size:15px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}.trust .connector{color:var(--text);font-weight:650}.trust code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;background:var(--soft);border:1px solid var(--line);border-radius:7px;padding:2px 8px}.lead{margin:0 0 8px;color:var(--muted);font-size:15px;line-height:1.6}.deny{margin:0 0 24px;color:var(--muted);font-size:13px}.steps{display:grid;gap:14px}.step{display:grid;grid-template-columns:30px minmax(0,1fr);gap:12px;border:1px solid var(--line);border-radius:13px;padding:16px;background:var(--soft)}.step-number{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:var(--text);color:var(--card);font-weight:800;font-size:13px}.step-title{font-weight:720;font-size:15px;margin:3px 0 10px}.helper{margin:9px 0 0;color:var(--muted);font-size:12px;line-height:1.55}.command-row{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:10px;background:var(--card);padding:8px}.command-row code{min-width:0;flex:1;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.copy{border:0;border-radius:8px;background:var(--text);color:var(--card);padding:8px 10px;font-weight:700;cursor:pointer}.code-card{display:flex;align-items:center;justify-content:space-between;gap:16px;border:1px solid var(--line);border-radius:10px;background:var(--card);padding:12px 14px}.code-label{color:var(--muted);font-size:12px}.approval-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:28px;letter-spacing:.15em;font-weight:760}.status{display:flex;align-items:center;gap:9px;margin-top:16px;border-radius:11px;background:var(--soft);padding:11px 13px;color:var(--muted);font-size:13px}.status.success{background:var(--goodSoft);color:var(--good)}.status.success .status-dot{background:var(--good)}.status.error{background:var(--badSoft);color:var(--bad)}.status.error .status-dot{background:var(--bad)}.continue-row{margin-top:12px;display:flex;align-items:center;gap:10px}.continue-row[hidden]{display:none!important}.continue-link{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:10px;background:var(--accent);color:var(--accentText);font-weight:750;text-decoration:none}.continue-help{color:var(--muted);font-size:12px}details{margin-top:20px;border-top:1px solid var(--line);padding-top:16px;color:var(--muted)}summary{cursor:pointer;font-size:13px;font-weight:700}.details-grid{display:grid;grid-template-columns:100px minmax(0,1fr);gap:7px 14px;margin-top:12px;font-size:12px}.details-grid dd{margin:0;min-width:0;overflow-wrap:anywhere}.security{margin:18px 0 0;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12px;line-height:1.55}.security strong{color:var(--text)}.footer{padding:14px 32px;border-top:1px solid var(--line);background:var(--soft);color:var(--muted);font-size:12px;line-height:1.5}
 @media(max-width:560px){body{padding:16px 10px}.main{padding:23px 18px}.footer{padding:13px 18px}.eyebrow{align-items:flex-start;flex-direction:column}.command-row,.code-card{align-items:stretch;flex-direction:column}.copy{width:100%}.approval-code{font-size:25px}.details-grid{grid-template-columns:1fr;gap:2px}.details-grid dd{margin-bottom:7px}}
 @media(prefers-color-scheme:dark){:root{--bg:#0d0f12;--card:#15181d;--text:#f4f5f7;--muted:#9aa2af;--line:#2a2f37;--soft:#111419;--accent:#4c9aff;--accentText:#07111f;--good:#70d79d;--goodSoft:#123524;--bad:#ff9a8f;--badSoft:#3a1c1a;--shadow:0 28px 80px rgba(0,0,0,.45)}.brand{color:#b2b8c2}.brand-mark{background:#f4f5f7;color:#111318}}
 </style></head>
@@ -495,7 +587,9 @@ function approvalPage(input: {
 <section class="card" aria-labelledby="approval-title"><div class="main">
 <div class="eyebrow"><span class="eyebrow-label">${escapeHtml(copy.eyebrow)}</span><span class="pill" id="status-pill"><span class="pill-dot" aria-hidden="true"></span>${escapeHtml(copy.waiting)}</span></div>
 <h1 id="approval-title">${escapeHtml(title)}</h1>
-<p class="lead"><span class="connector">${escapeHtml(clientLabel)}</span>${escapeHtml(copy.leadSuffix)}</p>
+<p class="trust"><span class="connector">${escapeHtml(displayName)}</span>${redirectHost ? `<span class="dot" aria-hidden="true"> · </span><code>${escapeHtml(redirectHost)}</code>` : ""}</p>
+<p class="lead">${escapeHtml(copy.grant)}</p>
+<p class="deny">${escapeHtml(copy.denyNotice)}</p>
 <div class="steps">
   <div class="step"><div class="step-number" aria-hidden="true">1</div><div>
     <div class="step-title">${escapeHtml(copy.step1Title)}</div>
@@ -509,16 +603,16 @@ function approvalPage(input: {
   </div></div>
 </div>
 <div class="status" id="status-wrap" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="status">${escapeHtml(copy.pending)}</span></div>
-<div class="continue-row" id="continue-row" hidden><a class="continue-link" id="continue-link" href="#">${escapeHtml(copy.continue)}</a><span class="continue-help">${escapeHtml(copy.continueHelp)}</span></div>
+<div class="continue-row" id="continue-row" hidden><a class="continue-link" id="continue-link" href="#">${escapeHtml(fillTemplate(copy.continue, displayName === copy.fallbackName ? copy.fallbackReturnName : displayName, input.locale))}</a><span class="continue-help">${escapeHtml(copy.continueHelp)}</span></div>
 <details><summary>${escapeHtml(copy.details)}</summary><dl class="details-grid"><dt>${escapeHtml(copy.connector)}</dt><dd>${escapeHtml(clientLabel)}</dd><dt>${escapeHtml(copy.requestId)}</dt><dd><code>${escapeHtml(input.requestId)}</code></dd><dt>${escapeHtml(copy.expires)}</dt><dd>${escapeHtml(expiresAt)}</dd></dl></details>
 <p class="security"><strong>${escapeHtml(copy.securityLabel)}</strong>${escapeHtml(copy.security)}</p>
 </div><div class="footer">${escapeHtml(copy.footer)}</div></section></main>
 <script>
-const endpoint=${JSON.stringify(poll)};
-const requestId=${JSON.stringify(input.requestId)};
-const resumeToken=${JSON.stringify(input.resumeToken)};
-const approvalCommand=${JSON.stringify(approvalCommand)};
-const ui=${JSON.stringify(scriptCopy)};
+const endpoint=${safeJson(poll)};
+const requestId=${safeJson(input.requestId)};
+const resumeToken=${safeJson(input.resumeToken)};
+const approvalCommand=${safeJson(approvalCommand)};
+const ui=${safeJson(scriptCopy)};
 const statusWrap=document.getElementById('status-wrap');
 const statusText=document.getElementById('status');
 const copyButton=document.getElementById('copy-command');
@@ -564,11 +658,13 @@ function pendingApprovalPage(input: {
   expiresAtMs: number;
   nowMs: number;
   clientName?: string;
+  redirectUri: string;
 }): Response {
   const expiresAt = new Date(input.expiresAtMs).toISOString();
   const retryAfterMs = Math.max(250, input.expiresAtMs - input.nowMs + 250);
   const retryAfterSec = Math.max(1, Math.ceil(retryAfterMs / 1000));
-  const clientLabel = input.clientName ?? "Web AI Connector";
+  const displayName = pageClientName(input.clientName) || "this app";
+  const clientLabel = clientTrustLabel(displayName, input.redirectUri);
   const html = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Connector approval already pending</title>
@@ -580,11 +676,11 @@ function pendingApprovalPage(input: {
 <section class="card"><div class="main">
 <h1>Approval already pending</h1>
 <p class="lead"><strong>${escapeHtml(clientLabel)}</strong> retried the same OAuth authorization request while its first Herdr approval page is still active.</p>
-<div class="notice" id="status" role="status">Use the original approval page if it is still open. If that page was closed and the enrolled computer has herdr-mcp v0.4.7 or newer, run <code>herdr-mcp connector cancel ${escapeHtml(input.requestId)}</code>, then restart the Connector authorization. Older runtimes can leave this page open; it will retry automatically after the old request expires.</div>
+<div class="notice" id="status" role="status">Use the original approval page if it is still open. If that page was closed, run <code>herdr-mcp connector cancel ${escapeHtml(input.requestId)}</code> on the enrolled computer, then restart the Connector authorization. The page below retries automatically after the original request expires.</div>
 <div class="details"><span>Request ID</span><code>${escapeHtml(input.requestId)}</code><span>Expires</span><code>${escapeHtml(expiresAt)}</code><span>Retry</span><span id="countdown">after expiry</span></div>
 </div><div class="footer">No approval code, resume token, access token or client secret is recovered or exposed on this page.</div></section></main>
 <script>
-const retryAfterMs=${retryAfterMs};
+const retryAfterMs=${safeJson(retryAfterMs)};
 const deadline=Date.now()+retryAfterMs;
 const countdown=document.getElementById('countdown');
 function tick(){const left=Math.max(0,deadline-Date.now());countdown.textContent=left>0?'in '+Math.ceil(left/1000)+'s':'retrying…';if(left>0)setTimeout(tick,1000)}
@@ -1063,7 +1159,7 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx, acceptLanguage: string
     && resourceParam
     && resourceParam.replace(/\/+$/, "") === ctx.identity.issuer
   ) {
-    return chatgptMcpEndpointErrorPage(ctx.identity.issuer);
+    return mcpEndpointErrorPage(ctx.identity.issuer, client.client_name);
   }
   const resource = normalizeResource(ctx.identity, resourceParam ?? "");
   if (!resource) {
@@ -1122,6 +1218,7 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx, acceptLanguage: string
           expiresAtMs: existingExpiresAtMs,
           nowMs,
           clientName: client.client_name,
+          redirectUri,
         });
       }
       return serverError(ctx, "duplicate Connector approval could not be resolved safely");
@@ -1141,6 +1238,7 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx, acceptLanguage: string
     resumeToken,
     expiresAtMs,
     clientName: client.client_name,
+    redirectUri: redirectUri,
     locale: approvalLocale(acceptLanguage),
   });
 }
