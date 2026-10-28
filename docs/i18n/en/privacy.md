@@ -49,7 +49,6 @@ The extension does not sell user data, send user data to advertising networks, o
 The extension requests Chrome permissions only to provide the described functionality:
 
 - `storage` — persist local settings and continuity state;
-- `activeTab` — grant temporary access to the active tab when the user invokes the extension on that tab. Herdr's own host access comes from the `<all_urls>` host permission below, so this permission is declared but not required for the shipped page actions;
 - `scripting` — recover/reinject the packaged content-script stack on supported Web AI tabs after MV3/page reloads and perform bounded browser-side continuity actions;
 - `alarms` — wake the MV3 service worker periodically so it can restore missing local Herdr state streams and timers after Chrome suspends it;
 - `nativeMessaging` — connect to the locally installed herdr-mcp native host;

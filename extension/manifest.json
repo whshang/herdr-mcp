@@ -6,7 +6,6 @@
   "description": "Connect ChatGPT, Claude, and Grok to local Herdr workspaces.",
   "permissions": [
     "storage",
-    "activeTab",
     "scripting",
     "alarms",
     "nativeMessaging",

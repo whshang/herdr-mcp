@@ -49,7 +49,6 @@
 扩展申请的 Chrome 权限用于上述功能：
 
 - `storage` — 保存本地设置和连续性状态；
-- `activeTab` — 用户在某个标签页上调用扩展时，授予该标签页的临时访问权限。Herdr 自身的网页访问权限来自下方的 `<all_urls>` host permission，因此该权限虽已声明，但已上线的页面操作并不依赖它；
 - `scripting` — 在受支持的 Web AI 标签页因 MV3/页面刷新丢失脚本后恢复或重新注入**扩展包内自带**的 content script，并执行有界的浏览器连续性动作；
 - `alarms` — 周期性唤醒 MV3 service worker，使 Chrome 挂起 worker 后能够恢复本地 Herdr 状态流和 timer；
 - `nativeMessaging` — 连接本机安装的 herdr-mcp native host；
