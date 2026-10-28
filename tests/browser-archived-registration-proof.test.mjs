@@ -56,7 +56,7 @@ async function runProof({ snapshot, conversation }) {
   return factory(snapshot, conversation);
 }
 
-test("#623 | Given an archived conversation | When the provider readback proves it is archived | Then the registration proof accepts it", async () => {
+test("user registers an archived conversation | Given an archived conversation | When the provider readback proves it is archived | Then the registration proof accepts it", async () => {
   const result = await runProof({
     // An archived conversation has no user turn left, so the snapshot carries
     // no userMessageId and the proof must fall through to the archived read.
@@ -67,7 +67,7 @@ test("#623 | Given an archived conversation | When the provider readback proves 
   assert.equal(result.cleared, false);
 });
 
-test("#623 | Given an archived conversation | When the provider readback cannot be read | Then the registration proof still refuses", async () => {
+test("user cannot register an unreadable archived conversation | Given an archived conversation | When the provider readback cannot be read | Then the registration proof still refuses", async () => {
   const result = await runProof({
     snapshot: { ok: false, reason: "http-404" },
     conversation: { ok: false, reason: "http-404" },
@@ -76,7 +76,7 @@ test("#623 | Given an archived conversation | When the provider readback cannot 
   assert.equal(result.cleared, true);
 });
 
-test("#623 | Given a live conversation | When the snapshot carries a user turn | Then the proof accepts it", async () => {
+test("user registers a live conversation | Given a live conversation | When the snapshot carries a user turn | Then the proof accepts it", async () => {
   const result = await runProof({
     snapshot: { ok: true, userMessageId: "msg-1" },
     conversation: { ok: false, reason: "should-not-be-called" },
@@ -85,7 +85,7 @@ test("#623 | Given a live conversation | When the snapshot carries a user turn |
   assert.equal(result.cleared, false);
 });
 
-test("#623 | Given a conversation the provider can read but that is not archived | When neither proof holds | Then the proof refuses", async () => {
+test("user cannot register a conversation without any proof | Given a conversation the provider can read but that is not archived | When neither proof holds | Then the proof refuses", async () => {
   const result = await runProof({
     snapshot: { ok: true, userMessageId: "   " },
     conversation: { ok: true, body: { is_archived: false } },
