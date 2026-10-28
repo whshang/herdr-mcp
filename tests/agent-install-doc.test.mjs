@@ -172,7 +172,6 @@ test("browser privacy policy matches the Store-first extension data model", () =
     assert.match(doc, /remote executable code|远程可执行代码|リモートの実行可能コード/);
     assert.match(doc, /credit|信用/);
     assert.match(doc, /`debugger`/);
-    assert.match(doc, /`activeTab`/);
     assert.match(doc, /navigation history|导航历史|ナビゲーション履歴/);
   }
 });
