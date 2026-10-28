@@ -134,6 +134,26 @@ function deviceNameFromLinkRequest(request: Request): string | undefined {
   }
 }
 
+/**
+ * #721: map the Durable Object's Page Assist grant failure reason to a
+ * stable, specific response code. `page_assist_grant_update_failed` stays as
+ * the true catch-all for an unknown reason.
+ */
+function mapPageAssistGrantFailure(code: string | undefined): { code: string; status: number } {
+  switch (code) {
+    case "not_found":
+      return { code: "page_assist_grant_connector_not_found", status: 404 };
+    case "revoked":
+      return { code: "page_assist_grant_revoked", status: 409 };
+    case "capacity":
+      return { code: "page_assist_grant_capacity_reached", status: 409 };
+    case "invalid_record":
+      return { code: "page_assist_grant_record_invalid", status: 500 };
+    default:
+      return { code: "page_assist_grant_update_failed", status: 409 };
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -605,24 +625,29 @@ export default {
       }
       const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
       const store = createOAuthPublicStore(stub);
-      const record = await store.setPageAssistGrant({
+      const update = await store.setPageAssistGrant({
         connector_id: connectorId,
         device_id: deviceId,
         endpoint_ref: endpointRef,
         allowed: parsed.value.allowed,
         changed_by: `device:${ownerDevice}`,
       });
-      return record
-        ? noStoreJsonResponse({
+      if (update.ok && update.record) {
+        return noStoreJsonResponse({
           ok: true,
           action: "connector_page_assist_set",
           connector_id: connectorId,
           device_id: deviceId,
           endpoint_ref: endpointRef,
           allowed: parsed.value.allowed,
-          grants: record.page_assist,
-        })
-        : noStoreJsonResponse({ ok: false, code: "page_assist_grant_update_failed" }, 409);
+          grants: update.record.page_assist,
+        });
+      }
+      // #721: keep the Durable Object's reason instead of collapsing every
+      // failure into one code, so an operator can tell a mistyped connector id
+      // from a revoked connector from a full grant record.
+      const mapped = mapPageAssistGrantFailure(update.code);
+      return noStoreJsonResponse({ ok: false, code: mapped.code }, mapped.status);
     }
 
     if (request.method === "POST" && url.pathname === "/automations/revoke") {
