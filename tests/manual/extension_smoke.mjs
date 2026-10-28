@@ -97,7 +97,7 @@ const hudRendererSource = readFileSync(path.join(EXT, "content", "hud", "rendere
 // alignment contracts silently stale.
 const manifestVersion = String(manifest.version || "");
 ok(/^\d+\.\d+\.\d+$/.test(manifestVersion), "manifest version stays aligned with the browser product build");
-ok(manifest.permissions?.includes("activeTab"), "Control Center can identify the user-invoked active tab while all-site browser access is granted at install/load time");
+ok(!manifest.permissions?.includes("activeTab"), "Control Center does not request activeTab; all-site browser access comes from the required <all_urls> host permission");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
 ok(backgroundSource.includes(`const H2W_SCRIPT_VERSION = "${manifestVersion}"`), "background version matches manifest");
 ok(backgroundSource.includes('routeAgentTaskInboxWake')
