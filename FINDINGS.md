@@ -62,8 +62,8 @@ Template:
 - Done right: 05d83989 / 61ee9b99 keep relay-only and Rust fail-closed scopes explicit, with NOT run listed.
 - Seen 1× (2026-10-13).
 
-**The acceptance trio (rollback, real-usage, NOT run) must appear in the landing merge commit body and in an acceptance PR comment—not only in a feature commit or the PR description.**
-- After #609 landed the AGENTS.md rule, merge commits #609 (619e254a), #625 (caf1584f), and #627 (d193380a) carried only short subject lines; #625/#627 had empty PR comment threads. Feature/PR bodies had partial or full statements that did not transfer to the landing commit.
-- Fix: none yet (docs process). Recorded by daily retro 2026-10-13.
-- Done right: #591 (91bf2aae), #611 (05d83989), and #620 (07c91731) merge bodies each state rollback, real-usage, and NOT run; #592 also left acceptance evidence in PR comments.
-- Seen 1× (2026-10-13).
+**Do not merge a change that still edits a published or tagged release note after a review asked for that edit to move.**
+- #712 squash 80b3cc24 (2026-10-27) still added a current "Agent 编排与上下文控制" section and a current known-issue line to `docs/releases/v1.1.0.md`. Comment 6438452465 (CHANGES on tip 9047cac6, the commit the merge body cites as PASS-WITH-NITS) said that file is the frozen tagged note and asked to move the material to `docs/releases/1.1-feature-list.md`. The feature list already says the tagged notes stay frozen in `v1.1.0.md`. A same-minute APPROVE (6438460913) did not remove the edit, and the squash landed it. `docs/releases/1.1-feature-list.md` is the living list; `v1.1.0.md` is the authored note a `v1.1.0` tag would publish.
+- Fix: none yet. Move those two additions out of `docs/releases/v1.1.0.md`.
+- Done right: the same squash also added the historical RC3 block to `docs/releases/1.1-feature-list.md`, which is where post-tag qualification belongs.
+- Seen 1× (2026-10-27).
