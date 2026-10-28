@@ -400,7 +400,14 @@ pub fn run(command: WorkerCommand, language: Locale) -> Result<ExitCode, String>
             from,
             to,
             idempotency_key,
-        } => connector_page_assist_migrate(&paths, &from, &to, idempotency_key.as_deref()),
+            plan_digest,
+        } => connector_page_assist_migrate(
+            &paths,
+            &from,
+            &to,
+            idempotency_key.as_deref(),
+            plan_digest.as_deref(),
+        ),
         WorkerCommand::ConnectorPageAssist {
             connector_id,
             device_id,
@@ -1558,6 +1565,7 @@ fn connector_page_assist_migrate(
     _from: &str,
     _to: &str,
     _idempotency_key: Option<&str>,
+    _plan_digest: Option<&str>,
 ) -> Result<ExitCode, String> {
     Err(
         "connector page-assist migrate requires a supported enrolled-owner credential backend"
@@ -1573,6 +1581,7 @@ fn connector_page_assist_migrate(
     from: &str,
     to: &str,
     idempotency_key: Option<&str>,
+    plan_digest: Option<&str>,
 ) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_owner_link_identity(paths, &config)?;
@@ -1585,30 +1594,48 @@ fn connector_page_assist_migrate(
     let client = client_for_origin(&identity.edge_origin)?;
 
     // 1. Device-scoped dry run: the plan and its digest cover only this device.
-    let plan_body = crate::grant_migration::orphans_request_body(Some(from), Some(to))?;
-    let plan_response = client
-        .post(endpoint(
-            &identity.edge_origin,
-            "/connectors/page-assist/orphans",
-        )?)
-        .headers(headers.clone())
-        .json(&plan_body)
-        .send()
-        .map_err(|error| format!("cannot read migrate dry-run plan: {error}"))?;
-    let plan = parse_json_response(plan_response, "migrate dry-run plan")?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&plan)
-            .map_err(|error| format!("cannot encode migrate dry-run plan: {error}"))?
-    );
-    if plan.get("ok") != Some(&serde_json::Value::Bool(true)) {
-        return Ok(ExitCode::FAILURE);
-    }
-    let plan_digest = plan
-        .get("plan_digest")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("migrate dry-run plan returned no plan_digest")?
-        .to_owned();
+    //    A supplied plan digest replaces it: re-planning after the rows were
+    //    already moved yields an empty plan (HTTP 409
+    //    migrate_no_matching_rows), which would abort before the request
+    //    reaches the Edge idempotency branch. Replaying the original digest
+    //    with the original idempotency key is what that branch expects.
+    let plan_digest = match plan_digest {
+        Some(digest) => {
+            if !crate::grant_migration::valid_plan_digest(digest) {
+                return Err(
+                    "connector page-assist migrate: --plan-digest requires 64 lowercase hex chars"
+                        .to_owned(),
+                );
+            }
+            println!("plan_digest: {digest}");
+            digest.to_owned()
+        }
+        None => {
+            let plan_body = crate::grant_migration::orphans_request_body(Some(from), Some(to))?;
+            let plan_response = client
+                .post(endpoint(
+                    &identity.edge_origin,
+                    "/connectors/page-assist/orphans",
+                )?)
+                .headers(headers.clone())
+                .json(&plan_body)
+                .send()
+                .map_err(|error| format!("cannot read migrate dry-run plan: {error}"))?;
+            let plan = parse_json_response(plan_response, "migrate dry-run plan")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan)
+                    .map_err(|error| format!("cannot encode migrate dry-run plan: {error}"))?
+            );
+            if plan.get("ok") != Some(&serde_json::Value::Bool(true)) {
+                return Ok(ExitCode::FAILURE);
+            }
+            plan.get("plan_digest")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("migrate dry-run plan returned no plan_digest")?
+                .to_owned()
+        }
+    };
 
     // 2. Confirm: same key replays to the stored result; the key is printed so
     // a retry after an interrupted run can reuse it deliberately.
