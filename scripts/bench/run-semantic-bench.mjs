@@ -12,7 +12,8 @@
 //   2. enumerates route names/protocols from config.json (read-only, never printed in full),
 //   3. runs the Rust harness once per route, sequentially, with pacing,
 //   4. scores the recorded samples with the shipped extension interpreters,
-//   5. renders the results table.
+//   5. renders the results table plus the per-route x decision-head latency margin
+//      report (how much headroom each head keeps against its production budget).
 //
 // Secrets: config.json is only parsed in memory to list route names/protocols/models.
 // No API key is copied, printed, or written to any artifact.
@@ -43,6 +44,16 @@ const fixturePath = resolve(repoRoot, "tests/bench/fixtures/semantic-cases.json"
 const PRODUCTION_BUDGET_MS = Object.freeze({
   typed: { attempt: 1800, pool: 3600, source: "browser fast-path route/pool budget" },
   chat: { attempt: 5000, pool: 12000, source: "SemanticService chat attempt/pool budget" },
+});
+
+// The semantic decision head a call is charged to. The budgets above differ per
+// head, so a latency margin is only interpretable together with the head that
+// produced it: the typed fast path the Runtime/browser consume, or the chat
+// fallback the extension uses when the typed stage is uncertain or unavailable.
+// These are decision heads, not the per-question heads in the agreement table.
+const DECISION_HEAD = Object.freeze({
+  typed: "typed fast path",
+  chat: "chat fallback",
 });
 
 const VALUE_FLAGS = new Set(["--routes", "--runs", "--pacing-ms", "--chat-pacing-ms", "--attempt-ms", "--results-dir", "--markdown", "--score-only", "--merge-only"]);
@@ -307,6 +318,105 @@ function renderHeadSection(samples) {
   return lines;
 }
 
+/**
+ * Per route x decision-head latency margin against the production budget the call
+ * is actually charged to.
+ *
+ * Every measured call is counted, successful or not: a failed or timed-out call
+ * consumes the same attempt budget as a success, and a timeout is the most
+ * margin-relevant observation a route can produce. `case_invalid` samples are the
+ * one exclusion, because they never reached a provider and record no latency.
+ */
+function marginReport(samples, routes) {
+  const order = new Map(routes.map((route, index) => [route.name, index]));
+  const groups = new Map();
+  for (const sample of samples) {
+    if (sample.verdict === "case_invalid") continue;
+    const latency = Number(sample.latency_ms);
+    if (!Number.isFinite(latency)) continue;
+    const key = `${sample.route}\u0000${sample.family}`;
+    const bucket = groups.get(key) || { route: sample.route, family: sample.family, latencies: [], ok: 0, errors: 0 };
+    bucket.latencies.push(latency);
+    if (sample.ok === true) bucket.ok += 1;
+    else bucket.errors += 1;
+    groups.set(key, bucket);
+  }
+  return [...groups.values()]
+    .map((bucket) => {
+      const sorted = [...bucket.latencies].sort((a, b) => a - b);
+      const family = bucket.family === "chat" ? "chat" : "typed";
+      const budget = PRODUCTION_BUDGET_MS[family];
+      const max = sorted[sorted.length - 1] ?? null;
+      return {
+        route: bucket.route,
+        family,
+        head: DECISION_HEAD[family],
+        calls: sorted.length,
+        ok: bucket.ok,
+        errors: bucket.errors,
+        p50: percentile(sorted, 0.5),
+        p90: percentile(sorted, 0.9),
+        max,
+        attemptBudget: budget.attempt,
+        attemptMargin: max === null ? null : budget.attempt - max,
+        attemptRatio: max === null ? null : max / budget.attempt,
+        poolBudget: budget.pool,
+        poolMargin: max === null ? null : budget.pool - max,
+        exhaustedAttempt: sorted.filter((value) => value >= budget.attempt).length,
+        exhaustedPool: sorted.filter((value) => value >= budget.pool).length,
+      };
+    })
+    .sort((a, b) => (order.get(a.route) ?? Number.MAX_SAFE_INTEGER) - (order.get(b.route) ?? Number.MAX_SAFE_INTEGER) || a.head.localeCompare(b.head));
+}
+
+function formatMargin(value) {
+  if (value === null || value === undefined) return "-";
+  return `${value > 0 ? "+" : ""}${value} ms`;
+}
+
+function formatExhaustion(row) {
+  if (row.exhaustedPool) return `yes — pool ×${row.exhaustedPool}`;
+  if (row.exhaustedAttempt) return `yes — attempt ×${row.exhaustedAttempt}`;
+  return "no";
+}
+
+/**
+ * The per route x decision-head margin table. Additive: the route table, the
+ * family aggregate and the per-question-head agreement section are unchanged.
+ */
+function renderMarginSection(samples, routes) {
+  const rows = marginReport(samples, routes);
+  if (!rows.length) return [];
+  const lines = [
+    "",
+    "Per-route × decision-head margin (margin = production budget − observed; a call at or over budget is \"margin exhausted\"):",
+    "",
+    "| # | route | decision head | family | calls | ok | errors | p50 | p90 | max | attempt budget | attempt margin | max / attempt | pool budget | pool margin | margin exhausted |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+  ];
+  rows.forEach((row, index) => {
+    lines.push([
+      `| ${index + 1}`,
+      row.route,
+      row.head,
+      row.family,
+      String(row.calls),
+      String(row.ok),
+      String(row.errors),
+      formatMs(row.p50),
+      formatMs(row.p90),
+      formatMs(row.max),
+      `${row.attemptBudget} ms`,
+      formatMargin(row.attemptMargin),
+      formatPct(row.attemptRatio),
+      `${row.poolBudget} ms`,
+      formatMargin(row.poolMargin),
+      formatExhaustion(row),
+    ].join(" | ") + " |");
+  });
+  return lines;
+}
+
 function renderMarkdown(meta, summaries, samples = []) {
   const lines = [];
   lines.push(`### Semantic route benchmark — ${meta.startedAt}`);
@@ -344,6 +454,7 @@ function renderMarkdown(meta, summaries, samples = []) {
     lines.push(`- ${label} — primary (config order 1): ${formatAggregate(familyAggregate(summaries, family, "primary"))}; fallback: ${formatAggregate(familyAggregate(summaries, family, "fallback"))}`);
   }
   lines.push(...renderHeadSection(samples));
+  lines.push(...renderMarginSection(samples, summaries.map((entry) => entry.route)));
   return `${lines.join("\n")}\n`;
 }
 
