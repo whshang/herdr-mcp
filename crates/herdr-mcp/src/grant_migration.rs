@@ -282,6 +282,11 @@ pub enum MigrateCli {
         to: String,
         confirm: bool,
         idempotency_key: Option<String>,
+        /// A previously printed plan digest. When present, `--confirm` applies
+        /// that digest instead of re-planning, which is what makes an
+        /// interrupted run replayable: the same key plus the same digest hits
+        /// the Edge idempotency branch and returns the stored result.
+        plan_digest: Option<String>,
     },
 }
 
@@ -325,6 +330,7 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
     let mut to = None;
     let mut confirm = false;
     let mut idempotency_key: Option<String> = None;
+    let mut plan_digest: Option<String> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -357,6 +363,18 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
                 }
                 idempotency_key = Some(value.clone());
             }
+            "--plan-digest" if plan_digest.is_none() => {
+                let value = iter.next().filter(|v| !v.starts_with('-')).ok_or_else(|| {
+                    "connector page-assist migrate: --plan-digest requires a value".to_owned()
+                })?;
+                if !valid_plan_digest(value) {
+                    return Err(
+                        "connector page-assist migrate: --plan-digest requires 64 lowercase hex chars"
+                            .to_owned(),
+                    );
+                }
+                plan_digest = Some(value.clone());
+            }
             "--confirm" if !confirm => confirm = true,
             other => {
                 return Err(format!(
@@ -372,11 +390,19 @@ fn parse_migrate(args: &[String]) -> Result<MigrateCli, String> {
     if from == to {
         return Err("connector page-assist migrate: --from and --to must differ".to_owned());
     }
+    if plan_digest.is_some() && !confirm {
+        // A digest only matters for the write path; accepting it in a dry run
+        // would silently ignore it.
+        return Err(
+            "connector page-assist migrate: --plan-digest requires --confirm".to_owned()
+        );
+    }
     Ok(MigrateCli::Migrate {
         from,
         to,
         confirm,
         idempotency_key,
+        plan_digest,
     })
 }
 
@@ -386,6 +412,14 @@ pub fn valid_idempotency_key(key: &str) -> bool {
         && key
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// Plan digest charset: 64 lowercase hex chars (same rule as the Edge DO).
+pub fn valid_plan_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b.is_ascii_hexdigit()))
 }
 
 /// Canonical device id: `dev_` + 26-char Crockford ULID (same rule as the Edge DO).
@@ -809,6 +843,7 @@ mod tests {
                 to: NEW.into(),
                 confirm: false,
                 idempotency_key: None,
+                plan_digest: None,
             }))
         );
         assert_eq!(
@@ -827,8 +862,55 @@ mod tests {
                 to: NEW.into(),
                 confirm: true,
                 idempotency_key: Some("rust-key-00000001".into()),
+                plan_digest: None,
             }))
         );
+    }
+
+    #[test]
+    fn cli_migrate_accepts_a_plan_digest_for_replay() {
+        let digest = "a".repeat(64);
+        assert_eq!(
+            parse_cli(&s(&[
+                "migrate",
+                "--from",
+                OLD,
+                "--to",
+                NEW,
+                "--idempotency-key",
+                "rust-key-00000001",
+                "--plan-digest",
+                &digest,
+                "--confirm"
+            ])),
+            Some(Ok(MigrateCli::Migrate {
+                from: OLD.into(),
+                to: NEW.into(),
+                confirm: true,
+                idempotency_key: Some("rust-key-00000001".into()),
+                plan_digest: Some(digest.clone()),
+            }))
+        );
+        // A digest without --confirm, a malformed digest, and a repeated flag
+        // all fail closed.
+        for bad in [
+            vec!["migrate", "--from", OLD, "--to", NEW, "--plan-digest", &digest],
+            vec!["migrate", "--from", OLD, "--to", NEW, "--plan-digest", "abc", "--confirm"],
+            vec![
+                "migrate",
+                "--from",
+                OLD,
+                "--to",
+                NEW,
+                "--plan-digest",
+                &digest,
+                "--plan-digest",
+                &digest,
+                "--confirm",
+            ],
+        ] {
+            assert!(matches!(parse_cli(&s(&bad)), Some(Err(_))), "{bad:?}");
+        }
     }
 
     #[test]
