@@ -145,7 +145,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "parent_session_ref": {
                         "type": "string",
                         "maxLength": 96,
-                        "description": "Exact registered browser session ref. Takes precedence over current_user_message and caller mapping; any failed identity, generation, grant or mapping check leaves the task unstamped with an explicit_parent_session_* reason and no fallback.",
+                        "description": "Exact registered browser session ref. Takes precedence over current_user_message. WebChat requires an already-existing caller-session mapping equal to this ref; never creates a mapping. An unmapped caller gets explicit_parent_session_caller_session_unmapped. Any failed identity, generation, grant or mapping check leaves the task unstamped with no fallback; first-time binding uses the source-turn path without an explicit ref.",
                     },
                     "current_user_message": {
                         "type": "string",

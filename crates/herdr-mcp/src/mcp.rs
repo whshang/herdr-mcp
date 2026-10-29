@@ -301,7 +301,7 @@ fn explicit_agent_task_parent_session(
     }) else {
         return AgentTaskParentSession::Unbound("explicit_parent_session_invalid");
     };
-    let Ok(mut store) = context.state_store.lock() else {
+    let Ok(store) = context.state_store.lock() else {
         return AgentTaskParentSession::Unbound("explicit_parent_session_state_store_unavailable");
     };
     let session = match store.browser_resource(session_ref) {
@@ -351,17 +351,21 @@ fn explicit_agent_task_parent_session(
             "explicit_parent_session_session_account_unavailable",
         );
     }
-    // This store operation refuses conflicting mappings; it never retargets one.
-    match store.bind_browser_caller_session(
+    // An endpoint grant does not prove conversation ownership. An explicit ref
+    // may only confirm an existing mapping; first-time binding needs a source turn.
+    match store.resolve_browser_caller_session(
         &authorization.principal_ref,
         &caller_session.provider,
         &caller_session.opaque_session_id,
-        session_ref,
-        browser_epoch_ms(),
     ) {
-        Ok(()) => AgentTaskParentSession::Bound(session_ref.to_owned()),
-        Err(error) if error == "browser_caller_session_conflict" => {
+        Ok(Some(existing)) if existing == session_ref => {
+            AgentTaskParentSession::Bound(session_ref.to_owned())
+        }
+        Ok(Some(_)) => {
             AgentTaskParentSession::Unbound("explicit_parent_session_caller_session_conflict")
+        }
+        Ok(None) => {
+            AgentTaskParentSession::Unbound("explicit_parent_session_caller_session_unmapped")
         }
         Err(_) => AgentTaskParentSession::Unbound("explicit_parent_session_binding_failed"),
     }
