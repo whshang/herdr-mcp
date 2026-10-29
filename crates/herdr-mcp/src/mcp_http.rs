@@ -3949,7 +3949,7 @@ mod tests {
             store
                 .lock()
                 .unwrap()
-                .resolve_browser_source_turn(&mcp::browser_sha256("归档当前对话"), 1006)
+                .resolve_browser_source_turn(&mcp::source_turn_sha256("归档当前对话"), 1006)
                 .unwrap(),
             (session_ref.to_owned(), 1)
         );
@@ -3963,7 +3963,7 @@ mod tests {
             match guard
                 .reserve_browser_session_archive_intent(
                     session_ref,
-                    &mcp::browser_sha256("归档当前对话"),
+                    &mcp::source_turn_sha256("归档当前对话"),
                     &mcp::browser_sha256("http-archive-request"),
                     &mcp::browser_sha256("http-archive-idempotency"),
                     1,
@@ -4039,7 +4039,7 @@ mod tests {
         let mut reopened = StateStore::open(root.join("extension").join("state-test.db")).unwrap();
         assert_eq!(
             reopened
-                .resolve_browser_source_turn(&mcp::browser_sha256("归档当前对话"), 1006)
+                .resolve_browser_source_turn(&mcp::source_turn_sha256("归档当前对话"), 1006)
                 .unwrap(),
             (session_ref.to_owned(), 1)
         );
@@ -6285,7 +6285,7 @@ mod tests {
             store
                 .lock()
                 .unwrap()
-                .resolve_browser_source_turn(&mcp::browser_sha256("总结今天的改动"), 2007)
+                .resolve_browser_source_turn(&mcp::source_turn_sha256("总结今天的改动"), 2007)
                 .unwrap(),
             (session_b_ref.clone(), 2)
         );
@@ -6346,7 +6346,7 @@ mod tests {
             store
                 .lock()
                 .unwrap()
-                .resolve_browser_source_turn(&mcp::browser_sha256("归档当前对话"), 3004),
+                .resolve_browser_source_turn(&mcp::source_turn_sha256("归档当前对话"), 3004),
             Err("browser_current_turn_not_found".to_owned())
         );
 
@@ -7094,7 +7094,7 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let mut script = Vec::new();
-        for index in 0..10 {
+        for index in 0..16 {
             let seq = 4 + index * 2;
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
@@ -7102,18 +7102,18 @@ mod tests {
         let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
+        let store = state.state_store.clone();
         let app = candidate_router(state);
         let (app, profile_seed, endpoint_ref, account_ref) =
             register_chatgpt_endpoint(app, "mention", now).await;
-        // Extension 0.1.227 hashed the raw bubble text: the chip's label glued
-        // with doubled whitespace, and no `@`.
+        // The extension samples the chip as `@name`, with doubled whitespace.
         let (app, mention_session) = observe_chatgpt_session_source_turn(
             app,
             &profile_seed,
             &endpoint_ref,
             &account_ref,
             "mention",
-            "herdr-mcp  用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+            "@herdr-mcp  用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
             now,
         )
         .await;
@@ -7150,6 +7150,41 @@ mod tests {
         )
         .await;
         assert_ne!(dup_a, dup_b);
+        // A bare `herdr` word is user text: these two turns stay distinct.
+        let (app, bare_word_session) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "mention-bare-word",
+            "archive conversation now",
+            now,
+        )
+        .await;
+        // A pre-#741 row stores the raw trimmed-text digest. Upgrading must
+        // not let a new canonical digest match it: `archive this` here must
+        // never be found for a current `@herdr archive this` turn.
+        let (app, legacy_session) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "mention-legacy",
+            "placeholder legacy turn",
+            now,
+        )
+        .await;
+        store
+            .lock()
+            .unwrap()
+            .observe_browser_source_turn(
+                &legacy_session,
+                1,
+                &mcp::browser_sha256("archive this"),
+                now + 1,
+            )
+            .unwrap();
+        let _ = &bare_word_session;
 
         let headers = |opaque: &str| {
             vec![
@@ -7201,6 +7236,28 @@ mod tests {
                 "@herdr-mcp 用 agent.task.dispatch 派发一个任务给 report-review:回复 OK",
                 json!({"bound": false, "reason": "source_turn_not_found"}),
             ),
+            // A bare (non-`@`) name is user text, not a dropped mention.
+            (
+                "opaque-mention-a",
+                "herdr-mcp 用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": false, "reason": "source_turn_not_found"}),
+            ),
+            (
+                "opaque-mention-bare",
+                "archive herdr conversation now",
+                json!({"bound": false, "reason": "source_turn_not_found"}),
+            ),
+            // Legacy raw digests never match a canonical digest.
+            (
+                "opaque-mention-legacy",
+                "@herdr archive this",
+                json!({"bound": false, "reason": "source_turn_not_found"}),
+            ),
+            (
+                "opaque-mention-legacy",
+                "archive this",
+                json!({"bound": false, "reason": "source_turn_not_found"}),
+            ),
             // A mention token is only stripped as a whole token.
             (
                 "opaque-mention-a",
@@ -7236,7 +7293,7 @@ mod tests {
             .oneshot(registry_request(json!({
                 "operation": "source_turn.observe",
                 "canonical_url": "https://chatgpt.com/c/dispatch-mention",
-                "user_text": "@herdr herdr-mcp",
+                "user_text": "@herdr @herdr-mcp",
                 "observed_at": now + 1
             })))
             .await
@@ -7608,7 +7665,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .resolve_browser_source_turn(
-                    &crate::mcp::browser_sha256(user_text.trim()),
+                    &mcp::source_turn_sha256(user_text.trim()),
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()

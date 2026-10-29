@@ -6126,11 +6126,21 @@ pub(crate) fn browser_sha256(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-/// App-name tokens ChatGPT renders for a Herdr app mention. A mention chip can
-/// reach the source-turn evidence as `@herdr`, `herdr-mcp`, or be dropped
-/// entirely depending on which surface (DOM bubble, composer, model-visible
-/// tool arguments) produced the text, so these whole tokens carry no identity.
+/// App-name tokens ChatGPT renders for a Herdr app mention. Only an explicit
+/// `@`-prefixed mention (`@herdr`, `@herdr-mcp`, `@herdr_mcp`) is dropped: the
+/// extension emits a mention chip as `@name`, and the model either echoes that
+/// or drops the mention. A bare `herdr` word is ordinary user text and stays
+/// identity, so `archive herdr conversation` never collides with
+/// `archive conversation`.
 const SOURCE_TURN_APP_MENTION_TOKENS: &[&str] = &["herdr", "herdr-mcp", "herdr_mcp"];
+
+/// Domain separator for source-turn digests. Digests written before canonical
+/// source-turn text (#741) hashed the raw trimmed text; they must never match a
+/// canonical digest (an old `@herdr archive this` row would otherwise be
+/// indistinguishable from a new `archive this` turn), so the canonical form is
+/// hashed under its own versioned prefix and every pre-#741 row fails closed
+/// until it is re-observed or expires with the 24h retention window.
+const SOURCE_TURN_DIGEST_DOMAIN: &str = "herdr-mcp/source-turn/v2\n";
 
 /// The one canonical form of a user turn used for every source-turn digest.
 ///
@@ -6138,17 +6148,20 @@ const SOURCE_TURN_APP_MENTION_TOKENS: &[&str] = &["herdr", "herdr-mcp", "herdr_m
 /// turn, the WebChat `agent.task.dispatch` binding, and the archive
 /// current-turn path must hash the same text, but each surface renders the
 /// same turn slightly differently. Canonicalization therefore: applies Unicode
-/// NFC, treats NBSP/BOM as whitespace, drops whole `@?herdr` / `herdr-mcp` /
-/// `herdr_mcp` app-mention tokens (case-insensitive), collapses whitespace runs
-/// to one space, and trims. Every other character, including full-width
-/// punctuation, is preserved, so different user text still hashes differently.
+/// NFC, treats NBSP/BOM as whitespace, drops whole `@herdr` / `@herdr-mcp` /
+/// `@herdr_mcp` app-mention tokens (case-insensitive, `@` required), collapses
+/// whitespace runs to one space, and trims. Every other character, including
+/// full-width punctuation and bare `herdr` words, is preserved, so different
+/// user text still hashes differently.
 pub(crate) fn canonical_source_turn_text(text: &str) -> String {
     let composed = icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(text);
     composed
         .replace(['\u{00a0}', '\u{feff}'], " ")
         .split_whitespace()
         .filter(|token| {
-            let name = token.strip_prefix('@').unwrap_or(token);
+            let Some(name) = token.strip_prefix('@') else {
+                return true;
+            };
             !SOURCE_TURN_APP_MENTION_TOKENS
                 .iter()
                 .any(|mention| name.eq_ignore_ascii_case(mention))
@@ -6157,9 +6170,11 @@ pub(crate) fn canonical_source_turn_text(text: &str) -> String {
         .join(" ")
 }
 
-/// SHA-256 of [`canonical_source_turn_text`]: the durable source-turn identity.
+/// Domain-separated SHA-256 of [`canonical_source_turn_text`]: the durable
+/// source-turn identity.
 pub(crate) fn source_turn_sha256(text: &str) -> String {
-    browser_sha256(&canonical_source_turn_text(text))
+    let canonical = canonical_source_turn_text(text);
+    browser_sha256(&format!("{SOURCE_TURN_DIGEST_DOMAIN}{canonical}"))
 }
 
 fn browser_epoch_ms() -> i64 {
@@ -12198,7 +12213,6 @@ mod tests {
         let canonical = "用 dispatch 派发：回复 OK";
         for variant in [
             "@herdr-mcp 用 dispatch 派发：回复 OK",
-            "herdr-mcp  用 dispatch 派发：回复 OK",
             "@Herdr\n用\u{00a0}dispatch 派发：回复 OK ",
             "\u{feff}用 dispatch @herdr_mcp 派发：回复 OK",
             "用 dispatch 派发：回复 OK",
@@ -12213,31 +12227,55 @@ mod tests {
             canonical_source_turn_text("cafe\u{301}"),
             canonical_source_turn_text("caf\u{e9}")
         );
-        // Only whole mention tokens are dropped; punctuation is identity.
+        // Only whole `@`-prefixed mention tokens are dropped; bare words and
+        // punctuation are identity.
         assert_eq!(canonical_source_turn_text("herdrx 看看"), "herdrx 看看");
         assert_eq!(canonical_source_turn_text("@herdr-mcp:"), "@herdr-mcp:");
+        assert_eq!(
+            canonical_source_turn_text("herdr-mcp  用 dispatch"),
+            "herdr-mcp 用 dispatch"
+        );
+        assert_ne!(
+            source_turn_sha256("archive herdr conversation"),
+            source_turn_sha256("archive conversation"),
+            "a bare herdr word is user text, never a dropped mention"
+        );
         assert_ne!(
             canonical_source_turn_text("派发：回复"),
             canonical_source_turn_text("派发:回复")
         );
+        // Pre-#741 rows hashed the raw trimmed text; no canonical digest may
+        // equal any of them, so an old `@herdr archive this` row can never be
+        // confused with a new `archive this` turn.
+        for legacy in ["回复 OK", "archive this", "@herdr archive this", ""] {
+            assert_ne!(source_turn_sha256(legacy), browser_sha256(legacy.trim()));
+            assert_ne!(
+                source_turn_sha256("@herdr archive this"),
+                browser_sha256(legacy)
+            );
+        }
         assert_eq!(
             source_turn_sha256(" 回复 OK "),
-            browser_sha256("回复 OK"),
-            "plain trimmed text keeps its pre-#741 digest"
+            source_turn_sha256("回复 OK")
         );
         // Mention-only text has no identity: it is rejected as evidence.
-        assert_eq!(canonical_source_turn_text(" @herdr  herdr-mcp\u{00a0}"), "");
-        for message in ["@herdr", "herdr-mcp", "@HERDR_MCP herdr"] {
+        assert_eq!(
+            canonical_source_turn_text(" @herdr  @herdr-mcp\u{00a0}"),
+            ""
+        );
+        for message in ["@herdr", "@herdr-mcp", "@HERDR_MCP @herdr"] {
             assert_eq!(
                 current_user_message_param(&json!({ "current_user_message": message })),
                 Err(()),
                 "{message:?}"
             );
         }
-        assert_eq!(
-            current_user_message_param(&json!({ "current_user_message": "@herdr 归档" })),
-            Ok(Some("@herdr 归档"))
-        );
+        for message in ["@herdr 归档", "herdr", "herdr-mcp"] {
+            assert_eq!(
+                current_user_message_param(&json!({ "current_user_message": message })),
+                Ok(Some(message))
+            );
+        }
     }
 
     #[test]
@@ -12668,7 +12706,7 @@ mod tests {
                 .observe_browser_source_turn(
                     &session.resource_ref,
                     7,
-                    &browser_sha256("归档当前对话"),
+                    &source_turn_sha256("归档当前对话"),
                     observed_at,
                 )
                 .unwrap();
@@ -12814,7 +12852,7 @@ mod tests {
             .observe_browser_source_turn(
                 &second_session.resource_ref,
                 7,
-                &browser_sha256("归档第二个对话"),
+                &source_turn_sha256("归档第二个对话"),
                 observed_at + 1,
             )
             .unwrap();
@@ -12937,7 +12975,7 @@ mod tests {
         assert_eq!(
             reopened
                 .resolve_browser_source_turn(
-                    &browser_sha256("归档当前对话"),
+                    &source_turn_sha256("归档当前对话"),
                     observed_at + 24 * 60 * 60 * 1000 + 5_000,
                 )
                 .unwrap_err(),
@@ -18041,7 +18079,7 @@ mod tests {
                 .observe_browser_source_turn(
                     &session.resource_ref,
                     7,
-                    &browser_sha256("archive this conversation"),
+                    &source_turn_sha256("archive this conversation"),
                     browser_epoch_ms(),
                 )
                 .unwrap();
@@ -19692,7 +19730,7 @@ mod tests {
             .observe_browser_source_turn(
                 &source_session_ref,
                 7,
-                &browser_sha256("归档当前对话"),
+                &source_turn_sha256("归档当前对话"),
                 current_turn_now,
             )
             .unwrap();
@@ -24614,7 +24652,7 @@ mod browser_dispatch_source_turn_tests {
         store
             .lock()
             .unwrap()
-            .resolve_browser_source_turn(&browser_sha256(text.trim()), browser_epoch_ms())
+            .resolve_browser_source_turn(&source_turn_sha256(text.trim()), browser_epoch_ms())
     }
 
     /// user sees the trusted turn | Given an applied dispatch submit | When the runtime settles it | Then the exact trimmed turn resolves to that session and generation
@@ -24658,7 +24696,7 @@ mod browser_dispatch_source_turn_tests {
                 .resolve_browser_source_turn(&browser_sha256(message), browser_epoch_ms())
                 .unwrap_err(),
             "browser_current_turn_not_found",
-            "the un-trimmed text is not the observed turn"
+            "a raw (non-canonical) digest is never the observed turn"
         );
         assert!(!applied.to_string().contains(message.trim()));
     }
@@ -24899,7 +24937,7 @@ mod browser_dispatch_source_turn_tests {
             "{applied}"
         );
 
-        let newer = browser_sha256("later typed turn");
+        let newer = source_turn_sha256("later typed turn");
         store
             .lock()
             .unwrap()
