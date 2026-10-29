@@ -6135,12 +6135,16 @@ pub(crate) fn browser_sha256(value: &str) -> String {
 const SOURCE_TURN_APP_MENTION_TOKENS: &[&str] = &["herdr", "herdr-mcp", "herdr_mcp"];
 
 /// Domain separator for source-turn digests. Digests written before canonical
-/// source-turn text (#741) hashed the raw trimmed text; they must never match a
-/// canonical digest (an old `@herdr archive this` row would otherwise be
-/// indistinguishable from a new `archive this` turn), so the canonical form is
-/// hashed under its own versioned prefix and every pre-#741 row fails closed
-/// until it is re-observed or expires with the 24h retention window.
-const SOURCE_TURN_DIGEST_DOMAIN: &str = "herdr-mcp/source-turn/v2\n";
+/// source-turn text (#741), including raw-text archive intents and rows an
+/// older binary writes after a rollback, are SHA-256 of a UTF-8 string. They
+/// must never equal a canonical digest: an old `@herdr archive this` row would
+/// otherwise be indistinguishable from a new `archive this` turn. A printable
+/// prefix is not enough, because legacy raw text can spell out that prefix. The
+/// separator therefore starts with `0xFF`, a byte that never occurs in valid
+/// UTF-8, so no legacy raw-text digest can share a preimage with a canonical
+/// digest. Every pre-#741 row fails closed until it is re-observed or expires
+/// with the 24h retention window.
+const SOURCE_TURN_DIGEST_DOMAIN: &[u8] = b"\xffherdr-mcp/source-turn/v2\n";
 
 /// The one canonical form of a user turn used for every source-turn digest.
 ///
@@ -6174,7 +6178,10 @@ pub(crate) fn canonical_source_turn_text(text: &str) -> String {
 /// source-turn identity.
 pub(crate) fn source_turn_sha256(text: &str) -> String {
     let canonical = canonical_source_turn_text(text);
-    browser_sha256(&format!("{SOURCE_TURN_DIGEST_DOMAIN}{canonical}"))
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_TURN_DIGEST_DOMAIN);
+    hasher.update(canonical.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn browser_epoch_ms() -> i64 {
@@ -12207,6 +12214,30 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn source_turn_digest_never_equals_any_legacy_raw_text_digest() {
+        // Codex counterexample: legacy raw text that spells out a printable
+        // domain prefix must not reproduce a canonical digest.
+        for (legacy_raw, current) in [
+            (
+                "herdr-mcp/source-turn/v2\narchive this",
+                "@herdr archive this",
+            ),
+            ("herdr-mcp/source-turn/v2\narchive this", "archive this"),
+            (
+                "\u{ff}herdr-mcp/source-turn/v2\narchive this",
+                "archive this",
+            ),
+            ("archive this", "archive this"),
+        ] {
+            assert_ne!(browser_sha256(legacy_raw), source_turn_sha256(current));
+        }
+        assert_eq!(
+            source_turn_sha256("@herdr archive this"),
+            source_turn_sha256("archive this")
+        );
+    }
 
     #[test]
     fn canonical_source_turn_text_reduces_app_mention_renderings_only() {
