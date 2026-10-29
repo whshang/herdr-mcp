@@ -1493,8 +1493,9 @@ enum InboxView {
 /// `final_excerpt` is present only when captured and spares the planner an
 /// `agent.read` round trip; `awaiting_children` is present only while a
 /// supervisor is held for its own children.
-const COMPACT_TASK_FIELDS: [&str; 10] = [
+const COMPACT_TASK_FIELDS: [&str; 11] = [
     "task_id",
+    "dispatch_id",
     "target",
     "pane_id",
     "lifecycle",
@@ -1520,6 +1521,7 @@ fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
 fn running_task_row(task: PromptTaskRecord) -> Value {
     let mut row = json!({
         "task_id": task.task_id,
+        "dispatch_id": task.dispatch_id,
         "workspace_id": task.workspace_id,
         "lifecycle": task.lifecycle.as_str(),
         "terminal": false,
@@ -2913,6 +2915,11 @@ pub fn run_with_parent_session(
         Ok(value) => value,
         Err(error) => return error,
     };
+    let inject_task_identity = match args.get("inject_task_identity") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return invalid("inject_task_identity must be a boolean"),
+    };
     let wait = match parse_wait(args.get("wait")) {
         Ok(value) => value,
         Err(error) => return error,
@@ -2975,9 +2982,16 @@ pub fn run_with_parent_session(
     let injection = handoff_target
         .as_ref()
         .map(|(pane_id, worktree)| registry.inject_handoff_once(pane_id, worktree, text));
-    let dispatch_text = injection
+    let mut dispatch_text = injection
         .as_ref()
         .map_or_else(|| text.to_owned(), |injection| injection.text.clone());
+    if inject_task_identity {
+        // Runtime-generated ids are bounded and contain no caller/session data.
+        // Keep this after fingerprinting and the replay return above.
+        dispatch_text.push_str(&format!(
+            "\n[herdr-task task_id={task_id} dispatch_id={dispatch_id}]\nReport completion to the parent using both task_id and dispatch_id."
+        ));
+    }
     // Native Herdr 0.9.x wait is lifecycle/status based and cannot identify the
     // prompt turn. Submit exactly once without native wait, then wait on the
     // Runtime-owned task ledger below.
@@ -3990,6 +4004,76 @@ mod tests {
                 writeln!(stream, "{response}").unwrap();
             }
         })
+    }
+
+    /// user receives explicit identity | Given opt-in or default dispatch | When replayed after changing the opt-in | Then only one prompt is submitted with the original identity and text
+    #[test]
+    fn dispatch_identity_injection_is_opt_in_and_replay_safe() {
+        for inject in [false, true] {
+            let socket = temp_socket();
+            let listener = UnixListener::bind(&socket).unwrap();
+            let texts = Arc::new(Mutex::new(Vec::new()));
+            let server = scripted_dispatch_server(
+                listener,
+                vec![
+                    json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}}),
+                    json!({"result": {"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}}),
+                ],
+                texts.clone(),
+            );
+            let client = HerdrClient::new(&socket);
+            let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+            let registry = PromptRegistry::with_store(store.clone());
+            let mut args = json!({"target": "w1:p1", "text": "original text\n", "idempotency_key": "identity-test"});
+            if inject {
+                args["inject_task_identity"] = json!(true);
+            }
+            let first = run(&client, &registry, &args);
+            assert_eq!(first["ok"], true, "{first}");
+            server.join().unwrap();
+            let task_id = first["task_id"].as_str().unwrap();
+            let dispatch_id = first["dispatch_id"].as_str().unwrap();
+            let expected = if inject {
+                format!(
+                    "original text\n\n[herdr-task task_id={task_id} dispatch_id={dispatch_id}]\nReport completion to the parent using both task_id and dispatch_id."
+                )
+            } else {
+                "original text\n".to_owned()
+            };
+            assert_eq!(*texts.lock().unwrap(), vec![expected]);
+            assert_eq!(first["task"]["task_id"], task_id);
+            assert_eq!(first["task"]["dispatch_id"], dispatch_id);
+            // Reload the durable ledger and toggle the option: target/text
+            // still denote the original submission, never a second mutation.
+            let registry = PromptRegistry::with_store(store);
+            args["inject_task_identity"] = json!(!inject);
+            let replay = run(&client, &registry, &args);
+            assert_eq!(replay["idempotent_replay"], true, "{replay}");
+            assert_eq!(replay["task_id"], task_id);
+            assert_eq!(replay["dispatch_id"], dispatch_id);
+            assert_eq!(texts.lock().unwrap().len(), 1);
+            let status = registry.task_status(task_id);
+            assert_eq!(status["task"]["dispatch_id"], dispatch_id);
+            let mut task = registry.load_task(task_id).unwrap().unwrap();
+            // Exercise the same durable terminal event path as runtime reconcile.
+            assert!(apply_task_event(
+                &mut task,
+                &json!({
+                    "type": "pane.agent_status_changed", "pane_id": "w1:p1",
+                    "agent_status": "idle", "cursor": 1,
+                })
+            ));
+            registry.save_task(&task, None).unwrap();
+            for view in [InboxView::Full, InboxView::Compact] {
+                let inbox = apply_inbox_view(
+                    registry.task_inbox(None, None, None, false, false, 10),
+                    view,
+                );
+                assert_eq!(inbox["tasks"][0]["task_id"], task_id, "{inbox}");
+                assert_eq!(inbox["tasks"][0]["dispatch_id"], dispatch_id);
+            }
+            fs::remove_file(socket).unwrap();
+        }
     }
 
     fn handoff_registry() -> PromptRegistry {
@@ -5162,6 +5246,7 @@ mod tests {
             keys,
             vec![
                 "acknowledged",
+                "dispatch_id",
                 "final_excerpt",
                 "lifecycle",
                 "pane_id",

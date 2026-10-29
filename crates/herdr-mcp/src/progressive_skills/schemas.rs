@@ -137,10 +137,20 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "text": {"type": "string", "maxLength": 65536},
                     "parent_target": {"type": "string", "maxLength": 256},
                     "idempotency_key": {"type": "string", "maxLength": 256},
+                    "inject_task_identity": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Append a bounded task_id/dispatch_id identity line and completion hint after fingerprinting. Replays never resubmit. Both ids are separate fields; callers must not assume their values are equal.",
+                    },
+                    "parent_session_ref": {
+                        "type": "string",
+                        "maxLength": 96,
+                        "description": "Exact registered browser session ref. Takes precedence over current_user_message. WebChat requires an already-existing caller-session mapping equal to this ref; never creates a mapping. An unmapped caller gets explicit_parent_session_caller_session_unmapped. Any failed identity, generation, grant or mapping check leaves the task unstamped with no fallback; first-time binding uses the source-turn path without an explicit ref.",
+                    },
                     "current_user_message": {
                         "type": "string",
                         "maxLength": 262144,
-                        "description": "WebChat callers: the exact current user turn text (trimmed, non-empty). When it matches the observed source turn of your ChatGPT conversation, the task is stamped with that conversation's session as parent_session_ref so its session-scoped inbox and wake can see it; binding failure never fails the dispatch and is reported as parent_session {bound:false, reason}.",
+                        "description": "Ignored for binding when parent_session_ref is supplied. WebChat callers: the exact current user turn text (trimmed, non-empty). When it matches the observed source turn of your ChatGPT conversation, the task is stamped with that conversation's session as parent_session_ref so its session-scoped inbox and wake can see it; binding failure never fails the dispatch and is reported as parent_session {bound:false, reason}.",
                     },
                     "wait": {
                         "type": "object",
