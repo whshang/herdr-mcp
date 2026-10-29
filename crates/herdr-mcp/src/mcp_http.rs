@@ -6692,6 +6692,63 @@ mod tests {
         serde_json::from_str(text).unwrap()
     }
 
+    /// user worker | Given a running durable task | When WebChat or TCP
+    /// callers report completion | Then access is refused without mutation;
+    /// trusted local IPC can report it exactly once.
+    #[tokio::test]
+    async fn worker_report_rejects_webchat_and_tcp_before_mutation() {
+        let root = test_root("worker-report-boundary");
+        let (socket, _) = spawn_scripted_herdr_socket(vec![
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
+        ]);
+        let mut state = dispatch_test_state(&root, &socket);
+        let tcp = candidate_router(state.clone());
+        state.trusted_extension_ipc = true;
+        let app = candidate_router(state);
+        let dispatch = webchat_tool_call(app.clone(), &[], "herdr_mcp.agent.task.dispatch", json!({"target": "w1:p1", "text": "worker report boundary", "idempotency_key": "report-boundary"})).await;
+        assert_eq!(dispatch["ok"], true, "{dispatch}");
+        let params = json!({"task_id": dispatch["task_id"], "dispatch_id": dispatch["dispatch_id"], "kind": "worker_done"});
+        let status_params = json!({"task_id": dispatch["task_id"]});
+        let before = webchat_tool_call(
+            app.clone(),
+            &[],
+            "herdr_mcp.agent.task.status",
+            status_params.clone(),
+        )
+        .await;
+        assert_eq!(
+            webchat_tool_call(tcp, &[], "herdr_mcp.agent.task.report", params.clone()).await["code"],
+            "worker_report_requires_trusted_local"
+        );
+        for mut headers in [
+            vec![("x-herdr-edge-browser-caller-session", json!({"provider": "chatgpt", "opaque_session_id": "report-caller"}).to_string())],
+            vec![("x-herdr-edge-webchat-authorization", json!({"principal_ref": "connector:conn_WorkerReport123", "connector_id": "conn_WorkerReport123", "grant_generation": 1}).to_string())],
+            vec![("x-herdr-edge-webchat-control-grants", json!([{"endpoint_ref": "bep_report", "provider": "chatgpt", "account_ref": "br_report"}]).to_string())],
+            vec![("x-herdr-edge-page-assist-grants", json!([{"endpoint_ref": "bep_report"}]).to_string())],
+        ] {
+            headers.push(("x-herdr-edge-expected-runtime-generation", "rust-caller-grant-proof".to_owned()));
+            let result = webchat_tool_call(app.clone(), &headers, "herdr_mcp.agent.task.report", params.clone()).await;
+            assert_eq!(result["code"], "worker_report_requires_trusted_local", "{result}");
+            assert_eq!(webchat_tool_call(app.clone(), &[], "herdr_mcp.agent.task.status", status_params.clone()).await, before);
+        }
+        let accepted = webchat_tool_call(
+            app.clone(),
+            &[],
+            "herdr_mcp.agent.task.report",
+            params.clone(),
+        )
+        .await;
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert_eq!(accepted["task"]["terminal_status"], "worker_done");
+        assert_eq!(
+            webchat_tool_call(app, &[], "herdr_mcp.agent.task.report", params).await["code"],
+            "worker_done_already_reported"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(socket);
+    }
+
     /// user cannot claim another conversation | Given an unmapped WebChat caller with a covering grant | When an explicit second-session ref accompanies its own source turn | Then dispatch stays unstamped and the mapping remains absent
     #[tokio::test]
     async fn webchat_dispatch_explicit_parent_cannot_claim_an_unmapped_session() {

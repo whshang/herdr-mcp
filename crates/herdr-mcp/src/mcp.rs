@@ -818,6 +818,17 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     object.insert("parent_session".to_owned(), fact);
                 }
                 result
+            } else if method == prompt::AGENT_TASK_REPORT_METHOD {
+                if !context.trusted_local_ipc
+                    || context.caller_browser_session.is_some()
+                    || context.caller_webchat_authorization.is_some()
+                    || !context.caller_webchat_control_grants.is_empty()
+                    || !context.caller_page_assist_grants.is_empty()
+                {
+                    json!({"ok": false, "code": "worker_report_requires_trusted_local"})
+                } else {
+                    prompt::task_call_with_parent_session(context.prompt, method, &params, None)
+                }
             } else if method.starts_with("herdr_mcp.agent.task.") {
                 let parent_session_ref = prompt_parent_session_ref(context);
                 prompt::task_call_with_parent_session(
