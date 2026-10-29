@@ -1,7 +1,10 @@
+pub(crate) mod decision_gates;
+
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
 use crate::progressive_skills::agent_attention_advice;
 use crate::state_cache::EventCache;
+use crate::state_store::decision_gates::DecisionGate;
 use crate::state_store::{
     OperationLedgerInput, OperationLedgerRecord, OperationReservation, StateStore,
 };
@@ -159,11 +162,13 @@ struct PromptTaskRecord {
     worker_done_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stall_after_ms: Option<u64>,
+    #[serde(skip)]
+    gate: Option<DecisionGate>,
 }
 
 impl PromptTaskRecord {
     fn is_terminal(&self) -> bool {
-        self.lifecycle.is_terminal()
+        self.gate.is_none() && self.lifecycle.is_terminal()
     }
 
     fn liveness(&self, now: u64) -> &'static str {
@@ -215,6 +220,10 @@ impl PromptTaskRecord {
             "created_at_ms": self.created_at_ms,
             "updated_at_ms": self.updated_at_ms,
         });
+        if let Some(gate) = &self.gate {
+            public["blocked_on_gate"] = json!(true);
+            public["gate"] = json!(gate);
+        }
         if let Some(object) = public.as_object_mut() {
             for (key, value) in [
                 ("last_heartbeat_at_ms", self.last_heartbeat_at_ms),
@@ -588,6 +597,7 @@ impl PromptRegistry {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            gate: None,
             final_excerpt: None,
             awaiting_children: None,
             parent_target: parent_target.map(str::to_owned),
@@ -659,7 +669,7 @@ impl PromptRegistry {
             return json!({"ok": false, "code": "agent_task_terminal"});
         }
         let now = self.now_ms();
-        let newly_completed = kind == "worker_done" && !task.is_terminal();
+        let newly_completed = kind == "worker_done" && !task.is_terminal() && task.gate.is_none();
         if kind == "heartbeat" {
             task.last_heartbeat_at_ms = Some(now);
         } else {
@@ -877,6 +887,7 @@ impl PromptRegistry {
             .into_iter()
             .filter(|task| {
                 !task.is_terminal()
+                    && task.gate.is_none()
                     && task.parent_session_ref.as_deref() == Some(parent_session_ref)
                     && workspace_id.is_none_or(|workspace_id| {
                         task.workspace_id.as_deref() == Some(workspace_id)
@@ -1004,7 +1015,7 @@ impl PromptRegistry {
         let mut terminal = scoped
             .iter()
             .copied()
-            .filter(|task| task.is_terminal())
+            .filter(|task| task.is_terminal() || task.gate.is_some())
             .cloned()
             .collect::<Vec<_>>();
         terminal.sort_by(|left, right| {
@@ -1020,6 +1031,10 @@ impl PromptRegistry {
         let mut failed = 0_u64;
         let mut uncertain = 0_u64;
         for task in &scoped {
+            if task.gate.is_some() {
+                blocked += 1;
+                continue;
+            }
             match task.lifecycle {
                 PromptTaskLifecycle::Running
                 | PromptTaskLifecycle::AwaitingActivity
@@ -1093,6 +1108,9 @@ impl PromptRegistry {
         };
         match self.load_task(task_id) {
             Ok(Some(mut task)) => {
+                if task.gate.is_some() {
+                    return json!({"ok": false, "code": "task_blocked_on_gate"});
+                }
                 let now = self.now_ms();
                 task.acknowledged_at_ms = Some(now);
                 task.notification_state = "acknowledged".to_owned();
@@ -1287,7 +1305,7 @@ impl PromptRegistry {
         let Some(parent_target) = trigger.parent_target.as_deref() else {
             return;
         };
-        if trigger.notification_state != "pending" {
+        if !trigger.is_terminal() || trigger.notification_state != "pending" {
             return;
         }
         let Some(client) = self.inner.client.as_ref() else {
@@ -1417,8 +1435,21 @@ impl PromptRegistry {
         let Some(mut task) = self.load_task(task_id)? else {
             return Ok(None);
         };
-        if task.is_terminal() {
+        if task.gate.is_some() || task.is_terminal() {
             return Ok(Some(task));
+        }
+        // A report received during a gate is durable, but completes only after
+        // the gate is released. This explicit report does not depend on cache cursors.
+        if let Some(done_at) = task.worker_done_at_ms {
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            task.terminal_status = Some("worker_done".to_owned());
+            task.terminal_at_ms = Some(done_at);
+            task.terminal_cursor = None;
+            task.awaiting_children = None;
+            task.notification_state = "pending".to_owned();
+            self.save_task(&task, None)?;
+            self.maybe_notify_parent_locked(&task);
+            return self.load_task(task_id);
         }
         let mut changed = false;
         if task.lifecycle == PromptTaskLifecycle::AwaitingActivity
@@ -1492,6 +1523,9 @@ impl PromptRegistry {
         cursor: u64,
         events: &[Value],
     ) -> Result<bool, String> {
+        if task.gate.is_some() {
+            return Ok(false);
+        }
         let mut changed = if cursor.saturating_sub(task.last_cursor) > 2048 {
             mark_delivery_uncertain(task, now_ms(), "event_history_gap")
         } else {
@@ -1565,7 +1599,9 @@ impl PromptRegistry {
         if record.kind != PROMPT_TASK_OPERATION_KIND {
             return Ok(None);
         }
-        decode_task_record(&record).map(Some)
+        let mut task = decode_task_record(&record)?;
+        task.gate = store.open_decision_gate(task_id)?;
+        Ok(Some(task))
     }
 
     fn list_tasks(&self, limit: usize) -> Result<Vec<PromptTaskRecord>, String> {
@@ -1578,7 +1614,11 @@ impl PromptRegistry {
         store
             .operation_ledgers(PROMPT_TASK_OPERATION_KIND, limit)?
             .into_iter()
-            .map(|record| decode_task_record(&record))
+            .map(|record| {
+                let mut task = decode_task_record(&record)?;
+                task.gate = store.open_decision_gate(&task.task_id)?;
+                Ok(task)
+            })
             .collect()
     }
 
@@ -1649,7 +1689,7 @@ enum InboxView {
 /// `final_excerpt` is present only when captured and spares the planner an
 /// `agent.read` round trip; `awaiting_children` is present only while a
 /// supervisor is held for its own children.
-const COMPACT_TASK_FIELDS: [&str; 12] = [
+const COMPACT_TASK_FIELDS: [&str; 14] = [
     "task_id",
     "dispatch_id",
     "target",
@@ -1662,6 +1702,8 @@ const COMPACT_TASK_FIELDS: [&str; 12] = [
     "updated_at_ms",
     "final_excerpt",
     "awaiting_children",
+    "gate",
+    "blocked_on_gate",
 ];
 
 fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
@@ -2851,6 +2893,10 @@ pub fn task_call_with_parent_session(
     caller_parent_session_ref: Option<&str>,
 ) -> Value {
     match method {
+        decision_gates::RESOLVE => json!({"ok": false, "code": "gate_resolution_requires_human"}),
+        decision_gates::CREATE | decision_gates::STATUS | decision_gates::CANCEL => {
+            registry.gate_call(method, params, caller_parent_session_ref)
+        }
         AGENT_TASK_REPORT_METHOD => {
             if caller_parent_session_ref.is_some() {
                 return json!({"ok": false, "code": "worker_report_requires_trusted_local"});
@@ -4997,6 +5043,7 @@ mod tests {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            gate: None,
             final_excerpt: None,
             awaiting_children: None,
             parent_target: Some("parent".to_owned()),
@@ -5021,6 +5068,219 @@ mod tests {
         let clock = Arc::new(AtomicU64::new(now_ms()));
         Arc::get_mut(&mut registry.inner).unwrap().clock = Some(clock.clone());
         (path, registry, clock)
+    }
+
+    /// user parent | Given a durable task in one parent scope | When a decision
+    /// gate is opened and a worker reports done | Then ack/completion stay held
+    /// across reopen, other parents cannot access it, and resolution releases it.
+    #[test]
+    fn decision_gate_blocks_ack_completion_and_preserves_scope_across_reopen() {
+        use decision_gates::{CANCEL, CREATE, RESOLVE, STATUS};
+        let (path, registry, clock) = worker_registry("decision-gates");
+        let mut task = escalation_task("gate-task", "child", PromptTaskLifecycle::Running, 0);
+        task.parent_session_ref = Some("parent-session".to_owned());
+        registry.save_task(&task, None).unwrap();
+        let call = |method, params: Value, scope| {
+            task_call_with_parent_session(&registry, method, &params, scope)
+        };
+        let create = json!({"task_id": task.task_id, "question": "Choose a path", "options": ["continue", "stop"]});
+        assert_eq!(
+            call(CREATE, create.clone(), Some("other-parent"))["code"],
+            "agent_task_parent_mismatch"
+        );
+        let opened = call(CREATE, create.clone(), Some("parent-session"));
+        assert_eq!(opened["ok"], true, "{opened}");
+        let gate_id = opened["gate"]["gate_id"].as_str().unwrap();
+        let gate_params = json!({"gate_id": gate_id});
+        assert_eq!(
+            call(CREATE, create, Some("parent-session"))["code"],
+            "task_gate_already_open"
+        );
+        let status = registry.task_status(&task.task_id);
+        assert_eq!(status["task"]["blocked_on_gate"], true);
+        assert_eq!(status["task"]["gate"], opened["gate"]);
+        assert_eq!(status["task"]["terminal"], false);
+        assert_eq!(
+            registry.task_ack(&task.task_id)["code"],
+            "task_blocked_on_gate"
+        );
+        for scope in [Some("other-parent"), None] {
+            assert_eq!(
+                call(CANCEL, gate_params.clone(), scope)["code"],
+                "agent_task_parent_mismatch"
+            );
+        }
+        assert_eq!(
+            call(STATUS, gate_params.clone(), Some("other-parent"))["code"],
+            "agent_task_parent_mismatch"
+        );
+        assert_eq!(
+            call(STATUS, gate_params.clone(), Some("parent-session"))["gate"],
+            opened["gate"]
+        );
+        for scope in [None, Some("parent-session"), Some("other-parent")] {
+            assert_eq!(
+                call(
+                    RESOLVE,
+                    json!({"gate_id": gate_id, "resolution": "continue", "human": true}),
+                    scope
+                )["code"],
+                "gate_resolution_requires_human"
+            );
+        }
+        let inbox = call(
+            AGENT_TASK_INBOX_METHOD,
+            json!({"view": "compact"}),
+            Some("parent-session"),
+        );
+        assert_eq!(inbox["tasks"][0]["gate"], opened["gate"]);
+        assert_eq!(inbox["tasks"][0]["blocked_on_gate"], true);
+        assert_eq!(inbox["summary"]["blocked"], 1);
+        let running = registry.task_inbox_with_running(None, "parent-session", 50);
+        assert_eq!(running["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(running["tasks"][0]["gate"], opened["gate"]);
+        let report = json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "worker_done"});
+        clock.fetch_add(42, Ordering::Relaxed);
+        let reported = call(AGENT_TASK_REPORT_METHOD, report.clone(), None);
+        assert_eq!(reported["ok"], true);
+        assert_eq!(reported["task"]["terminal"], false);
+        assert_eq!(reported["task"]["lifecycle"], "running");
+        assert!(reported["task"]["worker_done_at_ms"].is_u64());
+        assert_eq!(
+            call(AGENT_TASK_REPORT_METHOD, report, None)["code"],
+            "worker_done_already_reported"
+        );
+        let reopened =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(&path).unwrap())));
+        assert_eq!(
+            reopened.task_status(&task.task_id)["task"]["blocked_on_gate"],
+            true
+        );
+        {
+            // Exercise the same durable compare-and-set that the separately
+            // tested terminal boundary uses, through a second SQLite handle.
+            let store = StateStore::open(&path).unwrap();
+            assert_eq!(
+                store
+                    .close_decision_gate(gate_id, Some("invalid"), 100)
+                    .unwrap_err(),
+                "gate_invalid_resolution"
+            );
+            assert_eq!(
+                store.decision_gate(gate_id).unwrap().unwrap().status,
+                "open"
+            );
+            let resolved = store
+                .close_decision_gate(gate_id, Some("continue"), 101)
+                .unwrap();
+            assert_eq!(
+                resolved.resolved_by,
+                Some(json!({"class": "local_cli_interactive"}))
+            );
+            assert_eq!(
+                store
+                    .close_decision_gate(gate_id, Some("continue"), 102)
+                    .unwrap_err(),
+                "gate_not_open"
+            );
+        }
+        let completed = reopened.task_status(&task.task_id);
+        assert_eq!(completed["task"]["terminal"], true);
+        assert_eq!(completed["task"]["terminal_status"], "worker_done");
+        assert_ne!(completed["task"]["blocked_on_gate"], true);
+        assert_eq!(reopened.task_ack(&task.task_id)["ok"], true);
+        drop(reopened);
+        drop(registry);
+        remove_escalation_db(&path);
+    }
+
+    /// user parent | Given tasks and bounded choices | When invalid gates,
+    /// concurrent creates, cancellation and lifecycle settle are attempted |
+    /// Then validation is fail-closed and at most one open gate survives.
+    #[test]
+    fn decision_gate_validates_bounds_cancels_and_holds_lifecycle_settle() {
+        use decision_gates::{CANCEL, CREATE};
+        let (path, registry, _) = worker_registry("gate-bounds");
+        let task = escalation_task("gate-bounds", "child", PromptTaskLifecycle::Running, 0);
+        registry.save_task(&task, None).unwrap();
+        let valid =
+            json!({"task_id": task.task_id, "question": "Choose", "options": ["yes", "no"]});
+        let create = |params| task_call_with_parent_session(&registry, CREATE, &params, None);
+        for (key, value) in [
+            ("question", json!("界".repeat(342))),
+            ("question", json!("")),
+            ("question", json!("escape\u{001b}")),
+            ("options", json!(["one"])),
+            ("options", json!(["same", "same"])),
+            ("options", json!(["", "two"])),
+            ("options", json!(["界".repeat(43), "two"])),
+            (
+                "options",
+                json!(["a", "b", "c", "d", "e", "f", "g", "h", "i"]),
+            ),
+        ] {
+            let mut params = valid.clone();
+            params[key] = value;
+            assert_eq!(create(params)["code"], "invalid_params");
+        }
+        let mut missing = valid.clone();
+        missing["task_id"] = json!("missing");
+        assert_eq!(create(missing)["code"], "agent_task_not_found");
+        let workers = (0..8)
+            .map(|_| {
+                let registry = registry.clone();
+                let params = valid.clone();
+                thread::spawn(move || {
+                    task_call_with_parent_session(&registry, CREATE, &params, None)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|result| result["ok"] == true).count(),
+            1
+        );
+        let gate_id =
+            results.iter().find(|result| result["ok"] == true).unwrap()["gate"]["gate_id"].clone();
+        let mut held = registry.load_task(&task.task_id).unwrap().unwrap();
+        let settle = json!({"cursor": 1, "pane_id": "w1:p1", "agent_status": "done"});
+        assert!(
+            !registry
+                .apply_task_window(&mut held, 1, std::slice::from_ref(&settle))
+                .unwrap()
+        );
+        assert_eq!(held.lifecycle, PromptTaskLifecycle::Running);
+        assert_eq!(held.last_cursor, 0);
+        registry.save_task(&held, None).unwrap();
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["terminal"],
+            false
+        );
+        assert_eq!(
+            registry.task_ack(&task.task_id)["code"],
+            "task_blocked_on_gate"
+        );
+        let cancelled =
+            task_call_with_parent_session(&registry, CANCEL, &json!({"gate_id": gate_id}), None);
+        assert_eq!(cancelled["gate"]["status"], "cancelled");
+        assert_eq!(cancelled["gate"]["resolved_by"], Value::Null);
+        let mut released = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert!(
+            registry
+                .apply_task_window(&mut released, 1, &[settle])
+                .unwrap()
+        );
+        registry.save_task(&released, None).unwrap();
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["terminal"],
+            true
+        );
+        assert_eq!(create(valid)["code"], "agent_task_terminal");
+        drop(registry);
+        remove_escalation_db(&path);
     }
 
     /// user worker | Given a durable running task with distinct ids | When
@@ -6058,6 +6318,7 @@ mod tests {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            gate: None,
             final_excerpt: None,
             awaiting_children: None,
             parent_target: None,

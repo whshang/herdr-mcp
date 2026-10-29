@@ -1,3 +1,4 @@
+mod agent_gate_cli;
 mod agent_visibility;
 mod artifact_import;
 mod browser_control;
