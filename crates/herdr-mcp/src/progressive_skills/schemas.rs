@@ -133,7 +133,9 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "access": "mutation",
             "params": {
                 "properties": {
-                    "target": {"type": "string", "maxLength": 256},
+                    "target": {"type": "string", "maxLength": 256, "description": "Exact agent/pane or explicit @idle, @kind, @kind:idle selector. Roles choose the first idle, delegation-safe pane in live snapshot order; never broadcast (@all is rejected). Replays retain the original resolved_target and candidate evidence."},
+                    "workspace_id": {"type": "string", "maxLength": 256, "description": "Optional workspace scope for role resolution."},
+                    "max_concurrent": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Role selectors only: cap non-terminal tasks for this exact requested_target in the bound parent session, else parent_target, else caller-less global scope. Limit rejection is not_delivered."},
                     "text": {"type": "string", "maxLength": 65536},
                     "parent_target": {"type": "string", "maxLength": 256},
                     "idempotency_key": {"type": "string", "maxLength": 256},

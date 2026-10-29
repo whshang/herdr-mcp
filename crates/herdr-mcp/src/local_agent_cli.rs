@@ -106,6 +106,8 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
             idempotency_key,
             inject_task_identity,
             stall_after_ms,
+            max_concurrent,
+            workspace_id,
             parent_session_ref,
             wait,
             timeout_ms,
@@ -116,6 +118,12 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
                 "parent_target": parent_target,
                 "idempotency_key": idempotency_key,
             });
+            if let Some(value) = max_concurrent {
+                params["max_concurrent"] = json!(value);
+            }
+            if let Some(value) = workspace_id {
+                params["workspace_id"] = json!(value);
+            }
             if let Some(value) = stall_after_ms {
                 params["stall_after_ms"] = json!(value);
             }

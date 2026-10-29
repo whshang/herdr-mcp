@@ -1,4 +1,5 @@
 pub(crate) mod decision_gates;
+mod role_targets;
 
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
@@ -58,6 +59,7 @@ struct AgentState {
 struct RegisterTaskInput<'a> {
     task_id: &'a str,
     target: &'a str,
+    requested_target: Option<&'a str>,
     fingerprint: &'a str,
     idempotency_key: Option<&'a str>,
     before: Option<&'a AgentState>,
@@ -108,6 +110,8 @@ struct PromptTaskRecord {
     task_id: String,
     dispatch_id: String,
     target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_target: Option<String>,
     #[serde(default)]
     idempotency_key_digest: Option<String>,
     pane_id: Option<String>,
@@ -220,6 +224,9 @@ impl PromptTaskRecord {
             "created_at_ms": self.created_at_ms,
             "updated_at_ms": self.updated_at_ms,
         });
+        if let Some(requested) = &self.requested_target {
+            public["requested_target"] = json!(requested);
+        }
         if let Some(gate) = &self.gate {
             public["blocked_on_gate"] = json!(true);
             public["gate"] = json!(gate);
@@ -298,6 +305,7 @@ struct PromptRegistryInner {
     // Serialize durable task read/modify/write across report, lifecycle, ack and
     // parent notification so a stale snapshot cannot erase an accepted report.
     task_mutations: Mutex<()>,
+    role_dispatches: Mutex<()>,
     #[cfg(test)]
     clock: Option<Arc<AtomicU64>>,
     records: Mutex<HashMap<String, PromptRecord>>,
@@ -337,6 +345,7 @@ impl PromptRegistry {
         Self {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -356,6 +365,7 @@ impl PromptRegistry {
         let registry = Self {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -513,6 +523,7 @@ impl PromptRegistry {
         let RegisterTaskInput {
             task_id,
             target,
+            requested_target,
             fingerprint,
             idempotency_key,
             before,
@@ -577,6 +588,7 @@ impl PromptRegistry {
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
             target: target.to_owned(),
+            requested_target: requested_target.map(str::to_owned),
             idempotency_key_digest: idempotency_key
                 .map(|key| stable_digest(&[b"herdr_prompt/task_key", key.as_bytes()])),
             pane_id,
@@ -747,7 +759,8 @@ impl PromptRegistry {
         match self.reconcile_task(task_id) {
             Ok(Some(task))
                 if task.idempotency_key_digest.as_deref() == Some(digest.as_str())
-                    && task.target == target
+                    && (task.target == target
+                        || task.requested_target.as_deref() == Some(target))
                     && task.parent_session_ref.as_deref() == parent_session_ref =>
             {
                 json!({"ok": true, "task": task.public_json_at(self.now_ms())})
@@ -1689,9 +1702,10 @@ enum InboxView {
 /// `final_excerpt` is present only when captured and spares the planner an
 /// `agent.read` round trip; `awaiting_children` is present only while a
 /// supervisor is held for its own children.
-const COMPACT_TASK_FIELDS: [&str; 14] = [
+const COMPACT_TASK_FIELDS: [&str; 15] = [
     "task_id",
     "dispatch_id",
+    "requested_target",
     "target",
     "pane_id",
     "lifecycle",
@@ -1726,6 +1740,10 @@ fn running_task_row(task: PromptTaskRecord, now: u64) -> Value {
         "liveness": task.liveness(now),
         "terminal": false,
     });
+    if let Some(requested) = &task.requested_target {
+        row["target"] = json!(task.target);
+        row["requested_target"] = json!(requested);
+    }
     if let (Some(awaiting_children), Some(object)) = (task.awaiting_children, row.as_object_mut()) {
         object.insert("awaiting_children".to_owned(), json!(awaiting_children));
     }
@@ -3109,6 +3127,24 @@ pub fn run_with_parent_session(
         Ok(value) => value,
         Err(error) => return error,
     };
+    let role = match role_targets::RoleTarget::parse(target) {
+        Ok(role) => role,
+        Err(error) => return error,
+    };
+    let workspace_id = match optional_str(args, "workspace_id") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let max_concurrent = match args.get("max_concurrent") {
+        None => None,
+        Some(value) => match value.as_u64() {
+            Some(value) if (1..=16).contains(&value) => Some(value),
+            _ => return invalid("max_concurrent must be an integer in 1..=16"),
+        },
+    };
+    if max_concurrent.is_some() && role.is_none() {
+        return invalid("max_concurrent requires an explicit role selector target");
+    }
     let text = match required_str(args, "text") {
         Ok(value) => value,
         Err(error) => return error,
@@ -3146,8 +3182,23 @@ pub fn run_with_parent_session(
 
     // A parented dispatch probes the caller's own agent once for the delegation
     // guards and reuses that observation as the pre-submit baseline below.
-    let guard_observation = parent_target.and_then(|_| agent_state_of(client, target));
-    if let Some(parent_target) = parent_target
+    // Hold admission through durable task registration, including requests with
+    // no cap, so concurrent role calls cannot race a capped caller's count.
+    let role_admission = if role.is_some() {
+        match registry.inner.role_dispatches.lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => return role_targets::not_delivered("agent_task_store_unavailable"),
+        }
+    } else {
+        None
+    };
+    let guard_observation = if role.is_none() {
+        parent_target.and_then(|_| agent_state_of(client, target))
+    } else {
+        None
+    };
+    if role.is_none()
+        && let Some(parent_target) = parent_target
         && let Some(mut rejection) = delegation_guard(
             client,
             registry,
@@ -3181,8 +3232,40 @@ pub fn run_with_parent_session(
         }
     }
 
+    let requested_target = role.as_ref().map(|_| target);
+    let resolution = if let Some(role) = role.as_ref() {
+        match role.resolve(
+            client,
+            registry,
+            workspace_id,
+            parent_target,
+            parent_session_ref,
+            max_concurrent,
+        ) {
+            Ok(resolution) => Some(resolution),
+            Err(mut error) => {
+                insert_dispatch_id(&mut error, task_id);
+                insert_task_id(&mut error, task_id);
+                if let Some(key) = idempotency_key
+                    && let Err(persist_error) = registry.complete(key, &fingerprint, &error)
+                {
+                    return annotate_idempotency_persistence(error, persist_error);
+                }
+                return error;
+            }
+        }
+    } else {
+        None
+    };
+    let target = resolution
+        .as_ref()
+        .map_or(target, |resolved| resolved.target.as_str());
     let start_cursor = registry.current_task_cursor();
-    let before = guard_observation.or_else(|| agent_state_of(client, target));
+    let before = resolution
+        .as_ref()
+        .map(|resolved| resolved.before.clone())
+        .or(guard_observation)
+        .or_else(|| agent_state_of(client, target));
     let pane_id = before
         .as_ref()
         .and_then(|state| state.pane_id.as_deref())
@@ -3230,6 +3313,11 @@ pub fn run_with_parent_session(
         Err(error) => prompt_failure(client, target, before.as_ref(), false, error, task_id),
     };
     insert_task_id(&mut result, task_id);
+    if let Some(resolved) = &resolution {
+        result["requested_target"] = json!(requested_target);
+        result["resolved_target"] = json!(resolved.target);
+        result["candidates"] = json!(resolved.candidates);
+    }
 
     // A dispatch that provably never reached the agent releases the mark it
     // created so the next first dispatch re-attaches the handoff. Success and
@@ -3246,6 +3334,7 @@ pub fn run_with_parent_session(
     match registry.register_task(RegisterTaskInput {
         task_id,
         target,
+        requested_target,
         fingerprint: &fingerprint,
         idempotency_key,
         before: before.as_ref(),
@@ -3304,6 +3393,7 @@ pub fn run_with_parent_session(
         }
     }
 
+    drop(role_admission);
     if let Some(wait) = wait.as_ref() {
         apply_task_wait(registry, &mut result, task_id, wait);
     }
@@ -4294,6 +4384,376 @@ mod tests {
         }
     }
 
+    fn role_registry(agents: Value) -> PromptRegistry {
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let mut registry = PromptRegistry::with_store(store);
+        Arc::get_mut(&mut registry.inner).unwrap().cache = Some(Arc::new(
+            EventCache::from_snapshot_for_test(json!({"agents": agents, "panes": []})),
+        ));
+        registry
+    }
+
+    fn role_submitted(pane: &str) -> Value {
+        json!({"result": {"prompt": {"status": "submitted", "agent": {
+            "pane_id": pane, "agent_status": "working", "state_change_seq": 2,
+        }}}})
+    }
+
+    /// user planner | Given busy and idle codex panes | When selecting a role
+    /// and replaying without a snapshot | Then one concrete pane is delivered,
+    /// durably recorded and retained in every task projection.
+    #[test]
+    fn role_dispatch_records_idle_target_and_replays_without_resolution() {
+        for selector in ["@codex", "@codex:idle"] {
+            let socket = temp_socket();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server = scripted_read_server(
+                UnixListener::bind(&socket).unwrap(),
+                vec![role_submitted("w1:p3")],
+                requests.clone(),
+            );
+            let client = HerdrClient::new(&socket);
+            let registry = role_registry(json!([
+                {"pane_id": "w1:p1", "kind": "codex", "agent_status": "working"},
+                {"pane_id": "w1:p2", "kind": "pi", "agent_status": "idle"},
+                {"pane_id": "w1:p3", "kind": "codex", "agent_status": "idle", "api_key": "secret"},
+                {"pane_id": "w1:p4", "kind": "codex", "agent_status": "idle"},
+            ]));
+            let args = json!({"target": selector, "text": "work", "idempotency_key": "role-key", "max_concurrent": 1});
+            let first = run(&client, &registry, &args);
+            server.join().unwrap();
+            assert_eq!(first["ok"], true, "{first}");
+            assert_eq!(first["resolved_target"], "w1:p3");
+            assert_eq!(first["task"]["target"], "w1:p3");
+            assert_eq!(first["task"]["requested_target"], selector);
+            assert_eq!(first["candidates"].as_array().unwrap().len(), 3);
+            assert!(!first["candidates"].to_string().contains("secret"));
+            assert_eq!(
+                *requests.lock().unwrap(),
+                vec![(
+                    "agent.prompt".to_owned(),
+                    json!({"target": "w1:p3", "text": "work"})
+                )]
+            );
+            let store = registry.inner.store.as_ref().unwrap().clone();
+            let reloaded = PromptRegistry::with_store(store);
+            let replay = run(&client, &reloaded, &args);
+            assert_eq!(replay["idempotent_replay"], true, "{replay}");
+            assert_eq!(replay["resolved_target"], first["resolved_target"]);
+            assert_eq!(replay["candidates"], first["candidates"]);
+            let task_id = first["task_id"].as_str().unwrap();
+            assert_eq!(
+                reloaded.task_status(task_id)["task"]["requested_target"],
+                selector
+            );
+            assert_eq!(
+                reloaded.task_status_by_idempotency("role-key", selector, None)["task"]["target"],
+                "w1:p3"
+            );
+            assert_eq!(
+                reloaded.task_status_by_idempotency("role-key", selector, Some("other-session"))["code"],
+                "agent_task_not_found"
+            );
+            let mut task = reloaded.load_task(task_id).unwrap().unwrap();
+            assert_eq!(
+                running_task_row(task.clone(), now_ms())["requested_target"],
+                selector
+            );
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            reloaded.save_task(&task, None).unwrap();
+            for view in [InboxView::Full, InboxView::Compact] {
+                let inbox = apply_inbox_view(
+                    reloaded.task_inbox(None, None, None, false, false, 10),
+                    view,
+                );
+                assert_eq!(inbox["tasks"][0]["target"], "w1:p3");
+                assert_eq!(inbox["tasks"][0]["requested_target"], selector);
+            }
+            fs::remove_file(socket).unwrap();
+        }
+    }
+
+    /// user planner | Given own, working, blocked, unknown and other-workspace
+    /// panes | When requesting @idle | Then only the scoped idle worker receives it.
+    #[test]
+    fn role_idle_excludes_caller_busy_unknown_and_other_workspace() {
+        let socket = temp_socket();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let parent = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle"}}});
+        let server = scripted_dispatch_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![parent, role_submitted("w1:p5")],
+            texts.clone(),
+        );
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p1", "name": "caller", "kind": "codex", "agent_status": "idle", "workspace_id": "w1"},
+            {"pane_id": "w1:p2", "kind": "codex", "agent_status": "working", "workspace_id": "w1"},
+            {"pane_id": "w1:p3", "kind": "grok", "agent_status": "blocked", "workspace_id": "w1"},
+            {"pane_id": "w1:p4", "kind": "pi", "workspace_id": "w1"},
+            {"pane_id": "w2:p1", "kind": "pi", "agent_status": "idle", "workspace_id": "w2"},
+            {"pane_id": "w1:p5", "kind": "droid", "agent_status": "idle", "workspace_id": "w1"},
+        ]));
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "target": "@idle", "text": "work", "parent_target": "caller", "workspace_id": "w1",
+            }),
+        );
+        server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["resolved_target"], "w1:p5");
+        assert_eq!(result["candidates"][0]["reason"], "parent_target_is_target");
+        assert_eq!(*texts.lock().unwrap(), vec!["work"]);
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given no eligible pane or an unsupported selector | When
+    /// dispatching | Then the socket receives no prompt and the failure is explicit.
+    #[test]
+    fn role_unavailable_broadcast_and_invalid_limits_never_submit() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p1", "kind": "codex", "agent_status": "working"},
+            {"pane_id": "w1:p2", "kind": "codex", "agent_status": "blocked"},
+        ]));
+        let client = HerdrClient::new(&socket);
+        for selector in ["@codex", "@idle", "@grok", "@codex:idle"] {
+            let result = run(
+                &client,
+                &registry,
+                &json!({"target": selector, "text": "work"}),
+            );
+            assert_eq!(result["code"], "role_target_unavailable", "{result}");
+            assert_eq!(result["delivery_state"], "not_delivered");
+            assert_eq!(result["submitted"], false);
+        }
+        for selector in ["@all", "@all:idle", "@worktree:w1", "@codex,grok", "@"] {
+            assert_eq!(
+                run(
+                    &client,
+                    &registry,
+                    &json!({"target": selector, "text": "work"})
+                )["code"],
+                "role_target_unsupported"
+            );
+        }
+        for limit in [json!(0), json!(17), json!(1.5), json!("2"), Value::Null] {
+            assert_eq!(
+                run(
+                    &client,
+                    &registry,
+                    &json!({"target": "@codex", "text": "work", "max_concurrent": limit})
+                )["code"],
+                "invalid_params"
+            );
+        }
+        assert!(registry.list_tasks(100).unwrap().is_empty());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given two live role tasks in each scope | When capping
+    /// that selector | Then the third is rejected; terminal/other-scope work
+    /// is ignored and opening a gate keeps a task counted.
+    #[test]
+    fn role_cap_counts_all_live_tasks_in_the_exact_parent_scope() {
+        for (session, parent) in [
+            (Some("session-a"), Some("parent-a")),
+            (None, Some("parent-a")),
+            (None, None),
+        ] {
+            let registry = role_registry(json!([]));
+            for i in 0..2 {
+                let mut task = escalation_task(
+                    &format!("live-{i}"),
+                    "w1:p1",
+                    PromptTaskLifecycle::Running,
+                    0,
+                );
+                task.requested_target = Some("@codex".to_owned());
+                task.parent_session_ref = session.map(str::to_owned);
+                task.parent_target = parent.map(str::to_owned);
+                registry.save_task(&task, None).unwrap();
+            }
+            // Flood the bounded list window: the admission query must still
+            // see the two live tasks even behind more than 1024 terminal rows.
+            for i in 0..1025 {
+                let mut task = escalation_task(
+                    &format!("terminal-{i}"),
+                    "w1:p1",
+                    PromptTaskLifecycle::Completed,
+                    0,
+                );
+                task.requested_target = Some("@codex".to_owned());
+                task.parent_session_ref = session.map(str::to_owned);
+                task.parent_target = parent.map(str::to_owned);
+                registry.save_task(&task, None).unwrap();
+            }
+            let client = HerdrClient::new(temp_socket());
+            let mut args = json!({"target": "@codex", "text": "work", "max_concurrent": 2});
+            if let Some(parent) = parent {
+                args["parent_target"] = json!(parent);
+            }
+            let result = run_with_parent_session(&client, &registry, &args, session);
+            assert_eq!(result["code"], "concurrency_limit_reached", "{result}");
+            assert_eq!(result["delivery_state"], "not_delivered");
+            assert_eq!(result["submitted"], false);
+            assert_eq!(
+                run_with_parent_session(&client, &registry, &args, Some("other-session"))["code"],
+                "role_target_unavailable"
+            );
+            if session.is_some() {
+                args["parent_target"] = json!("another-pane-same-session");
+                assert_eq!(
+                    run_with_parent_session(&client, &registry, &args, session)["code"],
+                    "concurrency_limit_reached"
+                );
+            } else if parent.is_some() {
+                args["parent_target"] = json!("another-parent");
+                assert_eq!(
+                    run(&client, &registry, &args)["code"],
+                    "role_target_unavailable"
+                );
+            }
+            let gate = registry.gate_call(
+                decision_gates::CREATE,
+                &json!({
+                    "task_id": "live-0", "question": "Choose", "options": ["continue", "stop"],
+                }),
+                session,
+            );
+            assert_eq!(gate["ok"], true, "{gate}");
+            let mut task = registry.load_task("live-0").unwrap().unwrap();
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            registry.save_task(&task, None).unwrap();
+            let mut original = json!({"target": "@codex", "text": "work", "max_concurrent": 2});
+            if let Some(parent) = parent {
+                original["parent_target"] = json!(parent);
+            }
+            assert_eq!(
+                run_with_parent_session(&client, &registry, &original, session)["code"],
+                "concurrency_limit_reached"
+            );
+            assert_eq!(
+                registry.gate_call(
+                    decision_gates::CANCEL,
+                    &json!({"gate_id": gate["gate"]["gate_id"]}),
+                    session
+                )["ok"],
+                true
+            );
+            // No candidate now proves admission passed with one live task.
+            let mut original = json!({"target": "@codex", "text": "work", "max_concurrent": 2});
+            if let Some(parent) = parent {
+                original["parent_target"] = json!(parent);
+            }
+            assert_eq!(
+                run_with_parent_session(&client, &registry, &original, session)["code"],
+                "role_target_unavailable"
+            );
+        }
+    }
+
+    /// user worker | Given a two-level delegation chain | When attempting a
+    /// role sub-worker | Then the existing depth guard refuses every candidate.
+    #[test]
+    fn role_dispatch_preserves_delegation_depth_and_self_exclusion() {
+        let socket = temp_socket();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_dispatch_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![json!({"result": {"agent": {"pane_id": "w1:p2", "agent_status": "idle"}}})],
+            texts.clone(),
+        );
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p2", "name": "worker", "kind": "codex", "agent_status": "idle"},
+            {"pane_id": "w1:p3", "kind": "pi", "agent_status": "idle"},
+        ]));
+        register_running_task(
+            &registry,
+            "supervisor-task",
+            "supervisor",
+            "w1:p1",
+            Some("planner"),
+            None,
+            0,
+        );
+        register_running_task(
+            &registry,
+            "worker-task",
+            "worker",
+            "w1:p2",
+            Some("supervisor"),
+            None,
+            0,
+        );
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({"target": "@idle", "text": "work", "parent_target": "worker"}),
+        );
+        server.join().unwrap();
+        assert_eq!(result["code"], "role_target_unavailable", "{result}");
+        assert_eq!(result["candidates"][0]["reason"], "parent_target_is_target");
+        assert_eq!(
+            result["candidates"][1]["reason"],
+            "delegation_depth_exceeded"
+        );
+        assert!(texts.lock().unwrap().is_empty());
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given simultaneous role requests and a cap of one | When
+    /// both dispatch | Then only one native submission crosses the socket.
+    #[test]
+    fn role_cap_serializes_simultaneous_dispatches() {
+        let socket = temp_socket();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_dispatch_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![role_submitted("w1:p1")],
+            texts.clone(),
+        );
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p1", "kind": "codex", "agent_status": "idle"},
+        ]));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2).map(|i| {
+            let registry = registry.clone();
+            let client = HerdrClient::new(&socket);
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                run(&client, &registry, &json!({"target": "@codex", "text": format!("work-{i}"), "max_concurrent": 1}))
+            })
+        }).collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        server.join().unwrap();
+        assert_eq!(
+            results.iter().filter(|result| result["ok"] == true).count(),
+            1,
+            "{results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result["code"] == "concurrency_limit_reached")
+                .count(),
+            1
+        );
+        assert_eq!(texts.lock().unwrap().len(), 1);
+        fs::remove_file(socket).unwrap();
+    }
+
     fn handoff_registry() -> PromptRegistry {
         use crate::state_store::work_journal::WorkState;
 
@@ -4318,6 +4778,7 @@ mod tests {
         PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -4599,6 +5060,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id,
                 target: "child",
+                requested_target: None,
                 fingerprint: "fingerprint",
                 idempotency_key: Some("review-project-19-sha"),
                 before: Some(&before),
@@ -4793,6 +5255,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id,
                 target: "child",
+                requested_target: None,
                 fingerprint: "fingerprint",
                 idempotency_key: None,
                 before: Some(&idle),
@@ -4906,6 +5369,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -4929,6 +5393,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id: "dispatch:prompt:boot-fence",
                 target: "child",
+                requested_target: None,
                 fingerprint: "fp",
                 idempotency_key: None,
                 before: Some(&before),
@@ -5024,6 +5489,7 @@ mod tests {
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
             target: target.to_owned(),
+            requested_target: None,
             idempotency_key_digest: None,
             pane_id: Some("w1:p1".to_owned()),
             workspace_id: Some("w1".to_owned()),
@@ -6204,6 +6670,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -6299,6 +6766,7 @@ mod tests {
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
             target: "child".to_owned(),
+            requested_target: None,
             idempotency_key_digest: None,
             pane_id: Some("w1:p1".to_owned()),
             workspace_id: Some("w1".to_owned()),
@@ -7312,6 +7780,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -7484,6 +7953,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -7540,6 +8010,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id,
                 target,
+                requested_target: None,
                 fingerprint: task_id,
                 idempotency_key: None,
                 before: Some(&before),
@@ -7988,6 +8459,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),

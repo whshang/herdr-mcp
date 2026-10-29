@@ -7,7 +7,7 @@ description: Advise, submit, and verify useful independent coding-agent work fro
 
 Own: `herdr_prompt`. Combine this policy with live facts from `herdr_inspect`/`herdr_since`; never encode a permanent agent/model ranking or infer a worker's role from its name/kind.
 
-Call shape: target one explicit live Agent name or pane identity and use one stable `idempotency_key` for the intended prompt submission. A WebChat caller also passes the exact current user turn as `current_user_message` so the runtime can bind the task to that conversation's browser session (`parent_session_ref`); binding is evidence-based and a `parent_session: {bound:false}` fact never fails the dispatch. Normal orchestration is asynchronous; retain the returned task/dispatch identity instead of blocking on a global Agent state. After timeout or transport failure, retry only when delivery evidence says `not_delivered` or live state proves the prompt did not apply.
+Call shape: target one explicit live Agent name, pane identity, or role selector and use one stable `idempotency_key` for the intended prompt submission. A WebChat caller also passes the exact current user turn as `current_user_message` so the runtime can bind the task to that conversation's browser session (`parent_session_ref`); binding is evidence-based and a `parent_session: {bound:false}` fact never fails the dispatch. Normal orchestration is asynchronous; retain the returned task/dispatch identity instead of blocking on a global Agent state. After timeout or transport failure, retry only when delivery evidence says `not_delivered` or live state proves the prompt did not apply.
 
 Delegate non-trivial implementation per `development-orchestration`'s main-brain rule; delegation never removes the planner's own fs/exec capability.
 
@@ -54,3 +54,13 @@ Workers use `herdr-mcp agent report --task-id ID --dispatch-id ID --kind worker_
 Status and all inbox projections expose derived `liveness: active|stalled`. A non-terminal task becomes stalled after 20 minutes without heartbeat/report/progress; dispatch may override this with `stall_after_ms` (`--stall-after-ms`), bounded to 1–120 minutes. A heartbeat updates timestamps only. Stalled tasks stay non-terminal and are never automatically redispatched.
 
 Dispatch `wait` (`--wait --timeout-ms N`) timing out returns `ok:true`, `wait.completed:false`, `wait.outcome:"checkpoint"`, and the current lifecycle/liveness snapshot, with no failure field. Re-check task status/inbox using the existing identity. Delivery failure remains a failure.
+
+## Explicit role targets and concurrency
+
+`target: "@idle"` requests any idle agent pane. `@codex`, `@grok`, `@droid`, `@claude`, `@pi` (or another live kind), optionally suffixed `:idle`, filter by kind and still require idle status. Selection follows live snapshot order, excluding working/blocked/unknown panes and the `parent_target` caller pane, and preserves delegation guards. Pass the caller's own agent/pane as `parent_target`. Optional `workspace_id` confines role resolution. A role explicitly requests this candidate set; exact names/panes never fall back to another worker. `@all`, broadcast, and other selector syntax are rejected with `role_target_unsupported`; no idle candidate returns `role_target_unavailable` with `delivery_state: "not_delivered"`. No agents are spawned.
+
+Role results return non-secret `candidates`, `resolved_target`, and `requested_target`; the durable task stores the selector as `requested_target` and the concrete pane as `target`. Replaying the same idempotency key returns the original resolution without submitting or resolving again. A rejected keyed request also replays its original rejection; use a new key for a new attempt after availability changes.
+
+Optional `max_concurrent` (integer 1–16, role targets only) rejects with `concurrency_limit_reached` and `delivery_state: "not_delivered"` when non-terminal tasks for this exact selector reach the cap. Scope is the bound `parent_session_ref`, otherwise `parent_target`, otherwise caller-less global work. Open decision gates count as non-terminal. Unstamped work never shares a browser session's scope. Admission and task registration are serialized within the runtime to prevent concurrent requests exceeding the cap; unrelated exact-target behavior is unchanged.
+
+CLI: `herdr-mcp agent dispatch --target @codex "implement the task" --parent w1:p1 --idempotency-key task-1 --max-concurrent 2 [--workspace-id w1]`. The positional `<target> <text>` form remains supported.
