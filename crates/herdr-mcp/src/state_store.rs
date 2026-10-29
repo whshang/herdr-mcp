@@ -29,8 +29,8 @@ use work_journal::ensure_work_journal_auxiliary_schema;
 
 use schema::{
     META_SCHEMA_VERSION, db_file_name, ensure_browser_archive_auxiliary_schema,
-    ensure_browser_dispatch_auxiliary_schema, ensure_parent_dirs, migrate, open_connection,
-    prepare_db_file, reject_symlink,
+    ensure_browser_dispatch_auxiliary_schema, ensure_browser_source_turn_auxiliary_schema,
+    ensure_parent_dirs, migrate, open_connection, prepare_db_file, reject_symlink,
 };
 #[cfg(unix)]
 use schema::{secure_dir, set_mode};
@@ -698,6 +698,7 @@ impl StateStore {
             migrate(&mut conn)?;
             ensure_browser_archive_auxiliary_schema(&conn)?;
             ensure_browser_dispatch_auxiliary_schema(&conn)?;
+            ensure_browser_source_turn_auxiliary_schema(&conn)?;
             ensure_work_journal_auxiliary_schema(&conn)?;
             // Durable residue from an account identity change is cleaned before
             // this process serves any canonical-URL lookup.
@@ -713,6 +714,7 @@ impl StateStore {
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
+        ensure_browser_source_turn_auxiliary_schema(&conn)?;
         ensure_work_journal_auxiliary_schema(&conn)?;
         retire_stale_browser_session_locators_in(&conn)?;
         Ok(Self {
@@ -740,6 +742,7 @@ impl StateStore {
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
+        ensure_browser_source_turn_auxiliary_schema(&conn)?;
         ensure_work_journal_auxiliary_schema(&conn)?;
         retire_stale_browser_session_locators_in(&conn)?;
         Ok(Self {
@@ -3825,7 +3828,10 @@ impl StateStore {
         let evidence = tx
             .query_row(
                 "SELECT r.kind, r.provider, r.observation_generation,
-                        s.expected_generation, s.user_text_sha256, s.observed_at
+                        s.expected_generation,
+                        CASE WHEN s.canonical_user_text_sha256 = s.user_text_sha256
+                             THEN s.user_text_sha256 ELSE '' END,
+                        s.observed_at
                  FROM browser_resources r
                  JOIN browser_source_turns s ON s.session_ref = r.resource_ref
                  WHERE r.resource_ref = ?1",
@@ -3913,7 +3919,7 @@ impl StateStore {
 
     /// Persist the latest observed user turn for one browser session.
     ///
-    /// Only the caller-computed SHA-256 of the trimmed user text is accepted;
+    /// Only the caller-computed SHA-256 of the canonical user text is accepted;
     /// plaintext never reaches the database. One row is kept per session, and a
     /// late-arriving older observation must not overwrite a newer one. The
     /// retention window is enforced by deleting expired rows first.
@@ -3958,7 +3964,8 @@ impl StateStore {
             .prepare(
                 "SELECT session_ref, expected_generation
                  FROM browser_source_turns
-                 WHERE user_text_sha256 = ?1 AND observed_at <= ?2
+                 WHERE user_text_sha256 = ?1 AND canonical_user_text_sha256 = ?1
+                   AND observed_at <= ?2
                  ORDER BY session_ref
                  LIMIT 2",
             )
@@ -4024,7 +4031,9 @@ impl StateStore {
         require_current_browser_generation(&tx, &endpoint_ref, &provider, requested_generation)?;
         let source_digest = tx
             .query_row(
-                "SELECT user_text_sha256 FROM browser_source_turns WHERE session_ref = ?1",
+                "SELECT CASE WHEN canonical_user_text_sha256 = user_text_sha256
+                        THEN user_text_sha256 ELSE '' END
+                 FROM browser_source_turns WHERE session_ref = ?1",
                 params![session_ref],
                 |row| row.get::<_, String>(0),
             )
@@ -4157,7 +4166,9 @@ impl StateStore {
         .map_err(|error| format!("cannot reclaim stale browser archive claim: {error}"))?;
         let source_digest = tx
             .query_row(
-                "SELECT user_text_sha256 FROM browser_source_turns WHERE session_ref = ?1",
+                "SELECT CASE WHEN canonical_user_text_sha256 = user_text_sha256
+                        THEN user_text_sha256 ELSE '' END
+                 FROM browser_source_turns WHERE session_ref = ?1",
                 params![session_ref],
                 |row| row.get::<_, String>(0),
             )
@@ -6361,11 +6372,13 @@ fn write_browser_source_turn(
 ) -> Result<(), String> {
     conn.execute(
         "INSERT INTO browser_source_turns(
-             session_ref, expected_generation, user_text_sha256, observed_at
-         ) VALUES (?1, ?2, ?3, ?4)
+             session_ref, expected_generation, user_text_sha256, observed_at,
+             canonical_user_text_sha256
+         ) VALUES (?1, ?2, ?3, ?4, ?3)
          ON CONFLICT(session_ref) DO UPDATE SET
              expected_generation = excluded.expected_generation,
              user_text_sha256 = excluded.user_text_sha256,
+             canonical_user_text_sha256 = excluded.canonical_user_text_sha256,
              observed_at = excluded.observed_at
          WHERE excluded.observed_at >= browser_source_turns.observed_at",
         params![
@@ -10244,13 +10257,14 @@ mod tests {
             store
                 .scalar_i64("SELECT COUNT(*) FROM pragma_table_info('browser_source_turns')")
                 .unwrap(),
-            Some(4)
+            Some(5)
         );
         for column in [
             "session_ref",
             "expected_generation",
             "user_text_sha256",
             "observed_at",
+            "canonical_user_text_sha256",
         ] {
             assert_eq!(
                 store
@@ -10427,6 +10441,71 @@ mod tests {
             Some(session_ref.as_str())
         );
         drop(reopened);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn legacy_and_rollback_written_source_turns_are_never_evidence() {
+        let path = temp_db_path();
+        let legacy_session = format!("br_{}", "a".repeat(64));
+        let rolled_back_session = format!("br_{}", "b".repeat(64));
+        let legacy_digest = "c".repeat(64);
+        let rolled_back_digest = "d".repeat(64);
+        let current_digest = "e".repeat(64);
+        let now = 100_000_i64;
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            // A row exactly as a pre-#741 binary wrote it: no canonical column.
+            store
+                .conn
+                .execute(
+                    "INSERT INTO browser_source_turns(
+                         session_ref, expected_generation, user_text_sha256, observed_at
+                     ) VALUES (?1, 1, ?2, ?3)",
+                    params![legacy_session, legacy_digest, now],
+                )
+                .unwrap();
+            // A current row later overwritten by an older binary after rollback:
+            // only user_text_sha256 changes, the canonical column goes stale.
+            store
+                .observe_browser_source_turn(&rolled_back_session, 1, &current_digest, now)
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO browser_source_turns(
+                         session_ref, expected_generation, user_text_sha256, observed_at
+                     ) VALUES (?1, 1, ?2, ?3)
+                     ON CONFLICT(session_ref) DO UPDATE SET
+                         user_text_sha256 = excluded.user_text_sha256,
+                         observed_at = excluded.observed_at",
+                    params![rolled_back_session, rolled_back_digest, now + 1],
+                )
+                .unwrap();
+        }
+        let mut store = StateStore::open(&path).unwrap();
+        for digest in [&legacy_digest, &rolled_back_digest, &current_digest] {
+            assert_eq!(
+                store
+                    .resolve_browser_source_turn(digest, now + 10)
+                    .unwrap_err(),
+                "browser_current_turn_not_found",
+                "{digest}"
+            );
+        }
+        // Re-observing through the current writer restores the evidence.
+        store
+            .observe_browser_source_turn(&legacy_session, 1, &legacy_digest, now + 20)
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_browser_source_turn(&legacy_digest, now + 30)
+                .unwrap(),
+            (legacy_session.clone(), 1)
+        );
+        drop(store);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();

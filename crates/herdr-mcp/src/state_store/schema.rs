@@ -626,6 +626,36 @@ pub(super) fn ensure_browser_archive_auxiliary_schema(conn: &Connection) -> Resu
     Ok(())
 }
 
+/// Forward-additive source-turn digest versioning (#741).
+///
+/// Source-turn digests changed from SHA-256 of the raw trimmed text to the
+/// domain-separated canonical digest. A raw digest is attacker-shapeable text
+/// away from any canonical digest, so the hash input alone cannot separate the
+/// two. Every row written by this binary therefore stores its digest twice:
+/// `user_text_sha256` and `canonical_user_text_sha256`. Readers only accept a
+/// row whose two columns are equal. A pre-#741 row (or one written or updated
+/// by an older binary after a rollback, which only touches `user_text_sha256`)
+/// fails that check and is never evidence, so it fails closed until it is
+/// re-observed or expires. The column is nullable and additive (not a numbered
+/// migration), so an older binary still opens the database.
+pub(super) fn ensure_browser_source_turn_auxiliary_schema(conn: &Connection) -> Result<(), String> {
+    let has_canonical_digest = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('browser_source_turns') WHERE name = 'canonical_user_text_sha256'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("cannot inspect browser source turn auxiliary schema: {error}"))?;
+    if has_canonical_digest == 0 {
+        conn.execute(
+            "ALTER TABLE browser_source_turns ADD COLUMN canonical_user_text_sha256 TEXT",
+            [],
+        )
+        .map_err(|error| format!("cannot extend browser source turn auxiliary schema: {error}"))?;
+    }
+    Ok(())
+}
+
 /// Forward-additive browser-dispatch settlement evidence.
 ///
 /// `message_canonical_digest` is intentionally **not** a numbered migration: it

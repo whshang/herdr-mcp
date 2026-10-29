@@ -156,3 +156,63 @@ test("user accepted App identity resolves through a bubble carrier | Given a dat
   const identity = [...adapter.getAcceptedUserAppIdentity("u1")].map((app) => ({ name: app.name, path: app.path }));
   assert.deepEqual(identity, [{ name: "herdr", path: "connectors/herdr" }]);
 });
+
+function loadBrowserPerformance() {
+  const context = vm.createContext({ console, Date, Math });
+  const source = readFileSync(new URL("../extension/performance-core.js", import.meta.url), "utf8");
+  new vm.Script(source, { filename: "performance-core.js" }).runInContext(context);
+  return context.H2W_BROWSER_PERFORMANCE;
+}
+
+// Minimal Node-like tree for the sampler, which walks nodeType/childNodes.
+function textNode(value) { return { nodeType: 3, nodeValue: value, parentElement: null }; }
+function elementNode(children = [], attrs = {}) {
+  const node = {
+    nodeType: 1,
+    childNodes: children,
+    parentElement: null,
+    getAttribute(name) { return Object.hasOwn(attrs, name) ? attrs[name] : null; },
+    closest() { return null; },
+    querySelector(selector) {
+      const wantsInlineMention = selector.includes('[data-appearance="inline-mention"]');
+      const wantsLegacyPill = selector.includes("[data-inline-selection-pill]");
+      const stack = [...children];
+      while (stack.length > 0) {
+        const child = stack.shift();
+        if (child?.nodeType !== 1) continue;
+        const legacy = child.getAttribute("data-inline-selection-pill") !== null
+          && child.getAttribute("data-keyword") !== null;
+        const mention = child.getAttribute("data-appearance") === "inline-mention"
+          && child.getAttribute("app-mention-name") !== null
+          && child.getAttribute("app-mention-path") !== null;
+        if ((wantsLegacyPill && legacy) || (wantsInlineMention && mention)) return child;
+        stack.push(...child.childNodes);
+      }
+      return null;
+    },
+  };
+  for (const child of children) child.parentElement = node;
+  return node;
+}
+
+test("user App mention in a bubble is observed as the model sees it | Given a user bubble whose text holds an inline-mention App span | When the model-visible sampler reads the bubble | Then the mention is emitted as @name with single spacing", () => {
+  const perf = loadBrowserPerformance();
+  const mention = elementNode([textNode("herdr-mcp")], {
+    "data-appearance": "inline-mention",
+    "app-mention-name": "herdr-mcp",
+    "app-mention-path": "connectors/herdr-mcp",
+  });
+  const textRoot = elementNode([mention, textNode("用 agent.task.dispatch 派发一个任务给 report-review：回复 OK")]);
+  assert.equal(
+    perf.sampleChatGptModelMessageText(textRoot).text,
+    "@herdr-mcp 用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+  );
+
+  // A span without the provider path is plain text, never an App identity.
+  const lookalike = elementNode([textNode("herdr-mcp")], {
+    "data-appearance": "inline-mention",
+    "app-mention-name": "herdr-mcp",
+  });
+  const plainRoot = elementNode([lookalike, textNode(" 用 dispatch")]);
+  assert.equal(perf.sampleChatGptModelMessageText(plainRoot).text, "herdr-mcp 用 dispatch");
+});
