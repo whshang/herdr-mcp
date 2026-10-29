@@ -304,7 +304,9 @@ class ChatGPTAdapter extends BaseAdapter {
 
   getLatestUserAppKeywords(latestUser = null) {
     const latest = latestUser || (() => {
-      const turns = [...document.querySelectorAll('[data-message-author-role="user"]')];
+      let turns = [...document.querySelectorAll('[data-message-author-role="user"]')];
+      // ChatGPT (2026-10) renders user turns as div[data-user-message-bubble].
+      if (!turns.length) turns = [...document.querySelectorAll('[data-user-message-bubble="true"]')];
       return turns[turns.length - 1] || null;
     })();
     if (!latest) return [];
@@ -463,6 +465,9 @@ class ChatGPTAdapter extends BaseAdapter {
     const turn = (carrier.matches?.('[data-message-author-role="user"]') ? carrier : null)
       || carrier.querySelector?.('[data-message-author-role="user"]')
       || carrier.closest?.('[data-message-author-role="user"]')
+      || (carrier.matches?.('[data-user-message-bubble="true"]') ? carrier : null)
+      || carrier.querySelector?.('[data-user-message-bubble="true"]')
+      || carrier.closest?.('[data-user-message-bubble="true"]')
       || carrier;
     const seen = new Set();
     const out = [];

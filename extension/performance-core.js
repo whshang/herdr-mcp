@@ -17,6 +17,7 @@
   const DEFAULT_TURN_MUTATION_SELECTOR = [
     '[data-message-author-role="user"]',
     '[data-message-author-role="assistant"]',
+    '[data-user-message-bubble="true"]',
     '[data-testid^="conversation-turn-"]',
   ].join(", ");
   const DEFAULT_IGNORED_TURN_MUTATION_SELECTOR = [
