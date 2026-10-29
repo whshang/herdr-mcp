@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **ChatGPT 手动 @herdr-mcp 发送重新记录来源轮次（扩展 0.1.228 → 0.1.229，#754）：** 0.1.228 起采样器把 inline-mention 芯片输出为 `@<app-mention-name>`，而 composer 与已接受气泡的芯片渲染不一致（缺 `app-mention-path`、名称与标签不同）时，`wake.js` 的提交-气泡 160 字符包含校验失败，`source_turn.observe` 从未发出，dispatch 报 `source_turn_not_found`。现在校验同时比较去除 App 提及后的规范文本（NFC、去零宽字符、合并空白），发送给 Runtime 的来源文本省略 Herdr 提及，与 Runtime 规范化后的 `current_user_message` 摘要一致。Runtime 版本与 contract 不变。
 ## v1.1.0-rc.5 — 2026-10-29
 
 - **1.1 第五个预发布（仅 preview 通道）：** 修复 MacBook Pro PROD 验收（#728）中 `@herdr-mcp` 提及时 `agent.task.dispatch` 父会话绑定失败：Runtime 规范化来源轮次文本后再计算哈希（NFC、去掉整词 App 提及、折叠空白），使 @提及的 dispatch 能绑定来源轮次（#741）；同一 ChatGPT 会话被重新归属父级时只保留一个当前 locator、扩展只按精确 project id 推断 Project，消除 `browser_canonical_url_ambiguous`（#740）；退役被重新归属的 locator 时把来源轮次证据迁移到存活会话，避免 `source_turn_ambiguous`；扩展 0.1.228。stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.5.md](docs/releases/v1.1.0-rc.5.md)。 [PR #742](https://github.com/whshang/herdr-mcp/pull/742) [PR #743](https://github.com/whshang/herdr-mcp/pull/743) [PR #744](https://github.com/whshang/herdr-mcp/pull/744) [PR #745](https://github.com/whshang/herdr-mcp/pull/745)
