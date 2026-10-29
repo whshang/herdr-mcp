@@ -4604,6 +4604,21 @@ mod tests {
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0]["method"], "herdr_mcp.agent.task.dispatch");
         assert_eq!(methods[0]["access"], "mutation");
+        let properties = &methods[0]["params"]["properties"];
+        assert!(
+            properties["target"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("@kind")
+        );
+        assert_eq!(properties["max_concurrent"]["minimum"], 1);
+        assert_eq!(properties["max_concurrent"]["maximum"], 16);
+        assert_eq!(properties["workspace_id"]["type"], "string");
+        assert!(
+            local_method_schemas("agent.closeout.advise")[0]["params"]["properties"]
+                .get("max_concurrent")
+                .is_none()
+        );
         assert_eq!(
             methods[0]["params"]["properties"]["current_user_message"]["maxLength"],
             262144

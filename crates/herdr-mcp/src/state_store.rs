@@ -1129,6 +1129,40 @@ impl StateStore {
             .map_err(|error| format!("cannot read task lookup: {error}"))
     }
 
+    /// Count every live role task, without the bounded inbox/list window.
+    /// Session scope takes precedence; unstamped parents and caller-less work
+    /// never count tasks belonging to a browser session. Open gates stay live.
+    pub fn active_role_task_count(
+        &self,
+        requested_target: &str,
+        parent_session_ref: Option<&str>,
+        parent_target: Option<&str>,
+        now_ms: u64,
+    ) -> Result<u64, String> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM operations AS task
+             WHERE kind = 'herdr_prompt_task'
+               AND (expires_at IS NULL OR expires_at > ?4)
+               AND json_extract(result_json, '$.requested_target') = ?1
+               AND json_extract(result_json, '$.parent_session_ref') IS ?2
+               AND (?2 IS NOT NULL OR json_extract(result_json, '$.parent_target') IS ?3)
+               AND (json_extract(result_json, '$.lifecycle') NOT IN
+                    ('completed', 'blocked', 'failed', 'delivery_uncertain')
+                    OR EXISTS (SELECT 1 FROM task_decision_gates AS gate
+                               WHERE gate.task_id = task.op_id AND gate.status = 'open'))",
+                params![
+                    requested_target,
+                    parent_session_ref,
+                    parent_target,
+                    i64::try_from(now_ms).unwrap_or(i64::MAX)
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as u64)
+            .map_err(|error| format!("cannot count active role tasks: {error}"))
+    }
+
     pub fn operation_ledgers(
         &self,
         kind: &str,

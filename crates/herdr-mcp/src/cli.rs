@@ -318,6 +318,8 @@ pub enum AgentCommand {
         idempotency_key: String,
         inject_task_identity: bool,
         stall_after_ms: Option<u64>,
+        max_concurrent: Option<u64>,
+        workspace_id: Option<String>,
         parent_session_ref: Option<String>,
         wait: bool,
         timeout_ms: u64,
@@ -915,25 +917,51 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
         Some("dispatch") => {
             if args.len() < 3 {
                 return Err(
-                    "agent dispatch requires <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--wait] [--timeout-ms N]"
+                    "agent dispatch requires (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N]"
                         .to_owned(),
                 );
             }
-            let target = args[1].clone();
-            let text = args[2].clone();
+            let (target, text, mut index) = if args[1] == "--target" {
+                let target = args.get(2).ok_or("--target requires a value")?;
+                let text = args
+                    .get(3)
+                    .ok_or("agent dispatch requires text after --target <target>")?;
+                (target.clone(), text.clone(), 4)
+            } else {
+                (args[1].clone(), args[2].clone(), 3)
+            };
             if target.is_empty() || text.is_empty() {
                 return Err("agent dispatch target/text must not be empty".to_owned());
             }
             let mut inject_task_identity = false;
             let mut stall_after_ms = None;
+            let mut max_concurrent = None;
+            let mut workspace_id = None;
             let mut parent_session_ref = None;
             let mut parent_target = None;
             let mut idempotency_key = None;
             let mut wait = false;
             let mut timeout_ms = 25_000_u64;
-            let mut index = 3;
             while index < args.len() {
                 match args[index].as_str() {
+                    "--max-concurrent" => {
+                        max_concurrent = Some(
+                            args.get(index + 1)
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .filter(|value| (1..=16).contains(value))
+                                .ok_or("--max-concurrent must be an integer in 1..=16")?,
+                        );
+                        index += 2;
+                    }
+                    "--workspace-id" => {
+                        workspace_id = Some(
+                            args.get(index + 1)
+                                .filter(|value| !value.is_empty())
+                                .ok_or("--workspace-id requires a value")?
+                                .clone(),
+                        );
+                        index += 2;
+                    }
                     "--stall-after-ms" => {
                         let value = args
                             .get(index + 1)
@@ -1006,6 +1034,8 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                     .ok_or_else(|| "--idempotency-key is required".to_owned())?,
                 inject_task_identity,
                 stall_after_ms,
+                max_concurrent,
+                workspace_id,
                 parent_session_ref,
                 wait,
                 timeout_ms,
@@ -2762,7 +2792,8 @@ User path:\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp agent-skill <status|sync>  (repo-fetched user-global local-agent Skill; exact runtime source identity)\n\
   herdr-mcp continuity <search|resume> ...  (durable prior-work discovery for local coding agents)\n\
-  herdr-mcp agent dispatch <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--wait] [--timeout-ms N]\n\
+  herdr-mcp agent dispatch (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N]\n\
+      Roles: @idle, @kind, @kind:idle; first idle pane only, @all rejected. --max-concurrent caps role tasks in the parent scope.\n\
       Wait timeout returns ok:true + wait.outcome:checkpoint; re-check status/inbox.\n\
   herdr-mcp agent gate create --task-id ID --question TEXT --option TEXT --option TEXT [--option TEXT ...]\n\
   herdr-mcp agent gate status|cancel --gate-id ID\n\
@@ -3145,6 +3176,8 @@ mod tests {
                     idempotency_key: "key".to_owned(),
                     inject_task_identity: enabled,
                     stall_after_ms: None,
+                    max_concurrent: None,
+                    workspace_id: None,
                     parent_session_ref: enabled.then(|| "br_session".to_owned()),
                     wait: false,
                     timeout_ms: 25_000,
@@ -3154,6 +3187,42 @@ mod tests {
         let mut missing = base.to_vec();
         missing.push("--parent-session-ref");
         assert!(parse(args(&missing)).is_err());
+    }
+
+    #[test]
+    fn agent_dispatch_role_cli_accepts_named_target_and_bounded_cap() {
+        for prefix in [vec!["@codex", "work"], vec!["--target", "@codex", "work"]] {
+            let mut input = vec!["agent", "dispatch"];
+            input.extend(prefix);
+            input.extend([
+                "--parent",
+                "w1:p1",
+                "--idempotency-key",
+                "key",
+                "--max-concurrent",
+                "2",
+                "--workspace-id",
+                "w1",
+            ]);
+            let command = parse(args(&input)).unwrap().command;
+            assert!(matches!(command, Command::Agent(AgentCommand::Dispatch {
+                target, max_concurrent: Some(2), workspace_id: Some(workspace), ..
+            }) if target == "@codex" && workspace == "w1"));
+        }
+        for value in ["0", "17", "1.5", "invalid"] {
+            assert!(
+                parse(args(&[
+                    "agent",
+                    "dispatch",
+                    "@codex",
+                    "work",
+                    "--max-concurrent",
+                    value
+                ]))
+                .is_err()
+            );
+        }
+        assert!(parse(args(&["agent", "dispatch", "--target", "@codex"])).is_err());
     }
 
     #[test]
