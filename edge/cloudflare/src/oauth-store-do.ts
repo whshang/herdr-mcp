@@ -25,6 +25,7 @@ import {
   normalizeOAuthClient,
   normalizeOAuthCode,
   normalizeOAuthToken,
+  normalizePlatformAccount,
   normalizePageAssistGrants,
   normalizeWebChatControlGrants,
   record,
@@ -143,6 +144,7 @@ function connectorDisplayName(
   connector: OAuthConnectorRecord,
   client: OAuthClientRecord | null,
 ): string {
+  if (connector.platform_account) return connector.platform_account;
   if (connector.alias) return connector.alias;
   if (client?.client_name) return client.client_name;
   if (connector.auth_source === "chatgpt_cimd" || connector.client_id.includes("chatgpt.com")) {
@@ -207,6 +209,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist-migrate-alarm") return this.pageAssistMigrateAlarm();
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/get") return this.getConnector(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/connector/label") return this.labelConnector(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/find-active") return this.findActiveConnectorByClient(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/list") return this.listConnectors();
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/inventory") return this.connectorInventory();
@@ -493,6 +496,12 @@ export class OAuthStoreDO {
         return;
       }
       const connectorId = current.connector_id ?? `conn_${randomBase64UrlToken().slice(0, 22)}`;
+      const client = normalizeOAuthClient(
+        await txn.get<OAuthClientRecord>(CLIENT_PREFIX + current.client_id),
+      );
+      // No platform_account is derived at approval time: the OAuth
+      // client_name is client-controlled (DCR) and must never become a
+      // trusted label. Labels come only from the fleet-admin label endpoint.
       const approved: OAuthApprovalRecord = {
         ...current,
         connector_id: connectorId,
@@ -813,6 +822,7 @@ export class OAuthStoreDO {
       typeof connectorId !== "string" || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
       || !boundedString(deviceId, 64)
       || !boundedString(endpointRef, 96)
+      || (endpointRef === "*" && (provider !== "*" || accountRef !== "*"))
       || !boundedString(accountRef, 96)
       || !boundedString(provider, 32)
       || !(provider === "*" || /^[a-z0-9][a-z0-9._-]*$/.test(provider))
@@ -1219,6 +1229,9 @@ export class OAuthStoreDO {
       || !boundedString(deviceId, 64)
       || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)
       || !boundedString(endpointRef, 96)
+      // Page Assist grants are per-endpoint; the wildcard endpoint is
+      // rejected so it can never be stored as grant material.
+      || endpointRef === "*"
       || typeof allowed !== "boolean"
       || !boundedString(changedBy, 4096)
     ) {
@@ -1342,7 +1355,54 @@ export class OAuthStoreDO {
       connector: {
         ...connector,
         client_name: client?.client_name ?? null,
+        platform_account: connector.platform_account ?? null,
       },
+    });
+  }
+
+  private async labelConnector(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const connectorId = body?.connector_id;
+    const labeledBy = body?.labeled_by;
+    const clear = body?.platform_account === null;
+    const platformAccount = clear ? null : normalizePlatformAccount(body?.platform_account);
+    if (
+      typeof connectorId !== "string" || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
+      || !boundedString(labeledBy, 4096)
+    ) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    if (!clear && platformAccount === null) {
+      return json({ ok: false, code: "invalid_platform_account" }, 400);
+    }
+    const key = CONNECTOR_PREFIX + connectorId;
+    const saved = await this.state.storage.transaction(async (txn) => {
+      const current = normalizeConnector(await txn.get<OAuthConnectorRecord>(key));
+      if (!current) return { record: null as OAuthConnectorRecord | null, code: "not_found" };
+      if (current.status !== "active") return { record: null, code: "revoked" };
+      const next: OAuthConnectorRecord = { ...current };
+      if (clear) delete next.platform_account;
+      else next.platform_account = platformAccount ?? undefined;
+      const normalized = normalizeConnector(next);
+      if (!normalized) return { record: null, code: "invalid_record" };
+      await txn.put(key, normalized);
+      return { record: normalized, code: "ok" };
+    });
+    if (!saved.record) {
+      const status = saved.code === "not_found" ? 404 : saved.code === "invalid_record" ? 500 : 409;
+      return json({ ok: false, code: saved.code }, status);
+    }
+    const labeled = saved.record;
+    const client = normalizeOAuthClient(
+      await this.state.storage.get<OAuthClientRecord>(CLIENT_PREFIX + labeled.client_id),
+    );
+    return json({
+      ok: true,
+      connector_id: labeled.connector_id,
+      platform_account: labeled.platform_account ?? null,
+      connector_name: connectorDisplayName(labeled, client),
+      grant_generation: labeled.grant_generation,
+      labeled_by: labeledBy,
     });
   }
 
@@ -1371,6 +1431,7 @@ export class OAuthStoreDO {
         ...connector,
         connector_name: connectorDisplayName(connector, client),
         client_name: client?.client_name ?? null,
+        platform_account: connector.platform_account ?? null,
       });
       if (connectors.length >= 256) break;
     }
@@ -1417,6 +1478,7 @@ export class OAuthStoreDO {
         ...connector,
         client_name: client?.client_name ?? null,
         connector_name: connectorDisplayName(connector, client),
+        platform_account: connector.platform_account ?? null,
         created_at_ms: connector.approved_at_ms,
         last_used_at_ms: connector.last_used_at_ms ?? null,
         grant_origin: "explicit_approval",
@@ -2037,6 +2099,7 @@ export class OAuthStoreDO {
             grant_generation: verdict.grantGeneration ?? null,
             principal_type: verdict.principalType ?? null,
             device_id: verdict.deviceId ?? null,
+            platform_account: await this.connectorPlatformAccount(verdict.connectorId),
             ...controls,
             source: candidate === issuer ? "edge_jwt" : "edge_jwt_legacy_issuer",
           });
@@ -2063,9 +2126,18 @@ export class OAuthStoreDO {
       client_id: legacy.client_id,
       connector_id: legacy.connector_id ?? null,
       grant_generation: legacy.grant_generation ?? null,
+      platform_account: await this.connectorPlatformAccount(legacy.connector_id),
       ...controls,
       source: "opaque",
     });
+  }
+
+  private async connectorPlatformAccount(connectorId: string | undefined): Promise<string | null> {
+    if (!connectorId) return null;
+    const connector = normalizeConnector(
+      await this.state.storage.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + connectorId),
+    );
+    return connector?.platform_account ?? null;
   }
 
   private async revokePresentedToken(request: Request): Promise<Response> {
