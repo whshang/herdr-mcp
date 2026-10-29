@@ -23,7 +23,7 @@ use super::{
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
-    AGENT_TASK_STATUS_METHOD,
+    AGENT_TASK_REPORT_METHOD, AGENT_TASK_STATUS_METHOD,
 };
 use serde_json::{Value, json};
 
@@ -137,6 +137,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "text": {"type": "string", "maxLength": 65536},
                     "parent_target": {"type": "string", "maxLength": 256},
                     "idempotency_key": {"type": "string", "maxLength": 256},
+                    "stall_after_ms": {"type": "integer", "minimum": 60000, "maximum": 7200000, "description": "Liveness stall threshold; defaults to 20 minutes. Stalled is non-terminal and never redispatched automatically."},
                     "inject_task_identity": {
                         "type": "boolean",
                         "default": false,
@@ -154,6 +155,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     },
                     "wait": {
                         "type": "object",
+                        "description": "A task wait timeout is a successful checkpoint: ok:true, wait.completed:false, wait.outcome:checkpoint, with the current lifecycle/liveness snapshot. Delivery failures remain failures. Re-check status/inbox rather than redispatching.",
                         "properties": {
                             "until": {"type": "array", "items": {"type": "string"}},
                             "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 60000}
@@ -165,7 +167,24 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             },
         }),
         json!({
+            "method": AGENT_TASK_REPORT_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "mutation",
+            "description": "Trusted local IPC only; never available to WebChat callers. Matching task_id and dispatch_id are required. worker_done is durable and accepted exactly once; a late report preserves settled lifecycle and never re-notifies the parent. Heartbeats only refresh timestamps of non-terminal tasks. Summary is capped at 2048 UTF-8 bytes after control characters are stripped.",
+            "params": {
+                "properties": {
+                    "task_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "dispatch_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "kind": {"type": "string", "enum": ["heartbeat", "worker_done"]},
+                    "summary": {"type": "string", "maxLength": 2048}
+                },
+                "required": ["task_id", "dispatch_id", "kind"],
+                "empty": false
+            }
+        }),
+        json!({
             "method": AGENT_TASK_STATUS_METHOD,
+            "description": "Durable lifecycle and derived liveness (active or stalled). Stalled is non-terminal; no automatic redispatch.",
             "source": "herdr_mcp_local",
             "access": "read_only",
             "params": {
@@ -199,7 +218,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "view": {
                         "type": "string",
                         "enum": ["full", "compact"],
-                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured. final_excerpt is omitted, not degraded, when the child pane is narrower than 40 columns: a TUI agent hard-wraps its own layout there, so the only readable options are reading the pane or giving the agent a wider pane (a new tab, a reused wide pane, or a down split)."
+                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, liveness, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured. final_excerpt is omitted, not degraded, when the child pane is narrower than 40 columns: a TUI agent hard-wraps its own layout there, so the only readable options are reading the pane or giving the agent a wider pane (a new tab, a reused wide pane, or a down split)."
                     },
                 },
                 "required": [],

@@ -826,6 +826,31 @@ impl LocalMcpTransport {
         self.dispatch_inner_with_trust(request, true).await
     }
 
+    /// Worker CLI-only mutation path. The routed transport cannot select
+    /// trusted IPC without caller identity; report never falls back to TCP.
+    pub async fn dispatch_worker_report_request(
+        &self,
+        request: RuntimeRequest,
+    ) -> RuntimeToolResult {
+        if request.operation != "herdr_call"
+            || request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("method"))
+                .and_then(Value::as_str)
+                != Some(crate::prompt::AGENT_TASK_REPORT_METHOD)
+            || request.trace.is_some()
+        {
+            return self.failure(
+                code::BAD_REQUEST,
+                false,
+                "invalid local worker report",
+                None,
+            );
+        }
+        self.dispatch_inner_with_trust(request, true).await
+    }
+
     async fn dispatch_inner_with_trust(
         &self,
         request: RuntimeRequest,
@@ -1302,7 +1327,7 @@ fn find_server_version(result: &Value) -> Option<&str> {
 mod tests {
     use std::sync::Arc;
 
-    use serde_json::{Number, Value, json};
+    use serde_json::{Map, Number, Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     #[cfg(unix)]
@@ -1634,6 +1659,68 @@ mod tests {
         assert_eq!(value["method"], "tools/call");
         assert_eq!(value["params"]["name"], "herdr_inspect");
         assert_eq!(value["params"]["arguments"], json!({"query": "ping"}));
+    }
+
+    /// user worker | Given a local report request | When it is transported |
+    /// Then it uses generation-fenced Unix IPC without TCP fallback; other
+    /// methods and caller traces cannot use the worker-only path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_report_uses_trusted_ipc_and_fails_closed() {
+        let response = json!({"jsonrpc": "2.0", "id": "local-1", "result": {"ok": true}});
+        let (socket, request_rx) = spawn_unix_server(response.to_string(), "rust-test").await;
+        let mut config = LocalMcpConfig::new("token-test", "sha256:test");
+        config.trusted_ipc_socket = Some(socket.clone());
+        config.runtime_generation = Some("rust-test".to_owned());
+        let transport = LocalMcpTransport::new(config).unwrap();
+        let mut report = request("worker-report");
+        assert_eq!(
+            transport
+                .dispatch_worker_report_request(report.clone())
+                .await
+                .failure_code(),
+            Some(code::BAD_REQUEST)
+        );
+        report.operation = "herdr_call".to_owned();
+        report.arguments = Some(Map::from_iter([
+            (
+                "method".to_owned(),
+                json!(crate::prompt::AGENT_TASK_REPORT_METHOD),
+            ),
+            (
+                "params".to_owned(),
+                json!(
+                    "{\"task_id\":\"task\",\"dispatch_id\":\"dispatch\",\"kind\":\"worker_done\"}"
+                ),
+            ),
+        ]));
+        let mut remote = report.clone();
+        remote.trace = Some(Map::new());
+        assert_eq!(
+            transport
+                .dispatch_worker_report_request(remote)
+                .await
+                .failure_code(),
+            Some(code::BAD_REQUEST)
+        );
+        let outcome = transport
+            .dispatch_worker_report_request(report.clone())
+            .await;
+        assert!(matches!(outcome, RuntimeToolResult::Success { .. }));
+        let raw = request_rx.await.unwrap();
+        let lowered = raw.to_ascii_lowercase();
+        assert!(lowered.contains("x-herdr-edge-expected-runtime-generation: rust-test"));
+        assert!(!lowered.contains("authorization: bearer"));
+        assert!(!lowered.contains("x-herdr-edge-browser-caller-session"));
+        assert!(raw.contains(crate::prompt::AGENT_TASK_REPORT_METHOD));
+        assert_eq!(
+            transport
+                .dispatch_worker_report_request(report)
+                .await
+                .failure_code(),
+            Some(code::UNREACHABLE)
+        );
+        let _ = std::fs::remove_file(socket);
     }
 
     #[cfg(unix)]

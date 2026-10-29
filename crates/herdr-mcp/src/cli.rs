@@ -316,9 +316,16 @@ pub enum AgentCommand {
         parent_target: String,
         idempotency_key: String,
         inject_task_identity: bool,
+        stall_after_ms: Option<u64>,
         parent_session_ref: Option<String>,
         wait: bool,
         timeout_ms: u64,
+    },
+    Report {
+        task_id: String,
+        dispatch_id: String,
+        kind: String,
+        summary: Option<String>,
     },
     Status {
         task_id: String,
@@ -826,7 +833,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
         Some("dispatch") => {
             if args.len() < 3 {
                 return Err(
-                    "agent dispatch requires <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--wait] [--timeout-ms N]"
+                    "agent dispatch requires <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--wait] [--timeout-ms N]"
                         .to_owned(),
                 );
             }
@@ -836,6 +843,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                 return Err("agent dispatch target/text must not be empty".to_owned());
             }
             let mut inject_task_identity = false;
+            let mut stall_after_ms = None;
             let mut parent_session_ref = None;
             let mut parent_target = None;
             let mut idempotency_key = None;
@@ -844,6 +852,21 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
             let mut index = 3;
             while index < args.len() {
                 match args[index].as_str() {
+                    "--stall-after-ms" => {
+                        let value = args
+                            .get(index + 1)
+                            .ok_or_else(|| "--stall-after-ms requires a value".to_owned())?;
+                        stall_after_ms = Some(
+                            value
+                                .parse::<u64>()
+                                .ok()
+                                .filter(|value| (60_000..=7_200_000).contains(value))
+                                .ok_or_else(|| {
+                                    "--stall-after-ms must be in 60000..=7200000".to_owned()
+                                })?,
+                        );
+                        index += 2;
+                    }
                     "--inject-task-identity" => {
                         inject_task_identity = true;
                         index += 1;
@@ -900,9 +923,57 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| "--idempotency-key is required".to_owned())?,
                 inject_task_identity,
+                stall_after_ms,
                 parent_session_ref,
                 wait,
                 timeout_ms,
+            }))
+        }
+        Some("report") => {
+            let mut task_id = None;
+            let mut dispatch_id = None;
+            let mut kind = None;
+            let mut summary = None;
+            let mut index = 1;
+            while index < args.len() {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("{} requires a value", args[index]))?;
+                match args[index].as_str() {
+                    "--task-id" => task_id = Some(value.clone()),
+                    "--dispatch-id" => dispatch_id = Some(value.clone()),
+                    "--kind" => kind = Some(value.clone()),
+                    "--summary" => summary = Some(value.clone()),
+                    flag => return Err(format!("unknown agent report option '{flag}'")),
+                }
+                index += 2;
+            }
+            let valid_id = |value: Option<String>, flag: &str| {
+                value
+                    .filter(|value| !value.is_empty() && value.len() <= 128)
+                    .ok_or_else(|| format!("{flag} requires a non-empty id up to 128 bytes"))
+            };
+            let kind = kind
+                .filter(|value| matches!(value.as_str(), "heartbeat" | "worker_done"))
+                .ok_or_else(|| "--kind requires heartbeat or worker_done".to_owned())?;
+            if summary.as_ref().is_some_and(|value| {
+                value
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .map(char::len_utf8)
+                    .sum::<usize>()
+                    > 2048
+            }) {
+                return Err(
+                    "--summary must be at most 2048 bytes after stripping control characters"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::Agent(AgentCommand::Report {
+                task_id: valid_id(task_id, "--task-id")?,
+                dispatch_id: valid_id(dispatch_id, "--dispatch-id")?,
+                kind,
+                summary,
             }))
         }
         Some("status") => {
@@ -965,9 +1036,9 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
             }))
         }
         Some(value) => Err(format!(
-            "unknown agent command '{value}' (expected dispatch, status, inbox, or ack)"
+            "unknown agent command '{value}' (expected dispatch, report, status, inbox, or ack)"
         )),
-        None => Err("agent requires dispatch, status, inbox, or ack".to_owned()),
+        None => Err("agent requires dispatch, report, status, inbox, or ack".to_owned()),
     }
 }
 
@@ -2609,7 +2680,9 @@ User path:\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp agent-skill <status|sync>  (repo-fetched user-global local-agent Skill; exact runtime source identity)\n\
   herdr-mcp continuity <search|resume> ...  (durable prior-work discovery for local coding agents)\n\
-  herdr-mcp agent dispatch <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--wait] [--timeout-ms N]\n\
+  herdr-mcp agent dispatch <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--wait] [--timeout-ms N]\n\
+      Wait timeout returns ok:true + wait.outcome:checkpoint; re-check status/inbox.\n\
+  herdr-mcp agent report --task-id ID --dispatch-id ID --kind heartbeat|worker_done [--summary TEXT]  (trusted local IPC only)\n\
   herdr-mcp memory <resume|search> ...  (bounded Work Memory access for local coding agents)\n\
   herdr-mcp webchat <endpoints|resources|inspect|create|send|dispatch-status|open|archive|archive-status|handoff> ...  (supported local WebChat control)\n\
   herdr-mcp profile check --file <profile.json>  (read-only desired-vs-actual workstation drift)\n\
@@ -2793,6 +2866,85 @@ mod tests {
     }
 
     #[test]
+    fn parses_worker_report_and_bounded_stall_threshold() {
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--dispatch-id",
+                "dispatch",
+                "--kind",
+                "worker_done",
+                "--summary",
+                "done"
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Report {
+                task_id: "task".to_owned(),
+                dispatch_id: "dispatch".to_owned(),
+                kind: "worker_done".to_owned(),
+                summary: Some("done".to_owned())
+            })
+        );
+        for input in [
+            vec![
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--kind",
+                "heartbeat",
+            ],
+            vec![
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--dispatch-id",
+                "dispatch",
+                "--kind",
+                "ask",
+            ],
+            vec![
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--dispatch-id",
+                "dispatch",
+                "--kind",
+            ],
+        ] {
+            assert!(parse(args(&input)).is_err());
+        }
+        let base = [
+            "agent",
+            "dispatch",
+            "child",
+            "work",
+            "--parent",
+            "parent",
+            "--idempotency-key",
+            "key",
+            "--stall-after-ms",
+        ];
+        for (value, valid) in [
+            ("60000", true),
+            ("7200000", true),
+            ("59999", false),
+            ("7200001", false),
+            ("x", false),
+        ] {
+            let mut input = base.to_vec();
+            input.push(value);
+            assert_eq!(parse(args(&input)).is_ok(), valid);
+        }
+    }
+
+    #[test]
     fn parses_dispatch_identity_and_explicit_parent_flags() {
         let base = [
             "agent",
@@ -2821,6 +2973,7 @@ mod tests {
                     parent_target: "w1:p2".to_owned(),
                     idempotency_key: "key".to_owned(),
                     inject_task_identity: enabled,
+                    stall_after_ms: None,
                     parent_session_ref: enabled.then(|| "br_session".to_owned()),
                     wait: false,
                     timeout_ms: 25_000,
