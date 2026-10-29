@@ -3464,14 +3464,49 @@ impl StateStore {
                     if account.is_none() || self.browser_account_ancestor(&sibling)? != account {
                         continue;
                     }
-                    self.conn
-                        .execute(
-                            "DELETE FROM browser_resource_locators WHERE resource_ref = ?1",
-                            params![candidate],
-                        )
-                        .map_err(|error| {
-                            format!("cannot retire reparented browser session locator: {error}")
-                        })?;
+                    let tx = self.conn.transaction().map_err(|error| {
+                        format!("cannot begin reparented browser session retirement: {error}")
+                    })?;
+                    tx.execute(
+                        "DELETE FROM browser_resource_locators WHERE resource_ref = ?1",
+                        params![candidate],
+                    )
+                    .map_err(|error| {
+                        format!("cannot retire reparented browser session locator: {error}")
+                    })?;
+                    // The retired row is the same conversation, so its latest
+                    // source-turn evidence moves to the current session instead
+                    // of lingering as a second row with the same digest, which
+                    // would keep resolution ambiguous until it expired (#740).
+                    // The newer observation wins; nothing crosses accounts,
+                    // since the candidate passed the account-ancestor check.
+                    tx.execute(
+                        "INSERT INTO browser_source_turns(
+                             session_ref, expected_generation, user_text_sha256, observed_at
+                         )
+                         SELECT ?1, expected_generation, user_text_sha256, observed_at
+                         FROM browser_source_turns
+                         WHERE session_ref = ?2
+                         ON CONFLICT(session_ref) DO UPDATE SET
+                             expected_generation = excluded.expected_generation,
+                             user_text_sha256 = excluded.user_text_sha256,
+                             observed_at = excluded.observed_at
+                         WHERE excluded.observed_at > browser_source_turns.observed_at",
+                        params![resource_ref, candidate],
+                    )
+                    .map_err(|error| {
+                        format!("cannot carry reparented browser source turn: {error}")
+                    })?;
+                    tx.execute(
+                        "DELETE FROM browser_source_turns WHERE session_ref = ?1",
+                        params![candidate],
+                    )
+                    .map_err(|error| {
+                        format!("cannot retire reparented browser source turn: {error}")
+                    })?;
+                    tx.commit().map_err(|error| {
+                        format!("cannot commit reparented browser session retirement: {error}")
+                    })?;
                 }
             }
         }
