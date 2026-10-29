@@ -3698,14 +3698,36 @@ function normalizeHerdrMentionAlias(value) {
     return projects;
   }
 
+  // #740: the current conversation's Project is only ever taken from an exact
+  // project id: the page route (/g/g-p-<id>[-slug]/c/<conv>) or the sidebar
+  // anchor's own href for this conversation. The sidebar label (aria-label)
+  // is never substring-matched against project names: a Project named e.g.
+  // "herdr-mcp" would otherwise claim any account-level /c/<id> chat whose
+  // title or label happens to contain that text, and the same conversation
+  // would be observed under two parents in one generation.
   function currentChatGptProjectFromCatalog(projects) {
+    const projectSegmentFromPath = (pathname) => {
+      const match = String(pathname || "").match(/^\/g\/(g-p-[^/]+)(?:\/|$)/i);
+      return match ? match[1] : null;
+    };
+    const projectForSegment = (segment) => {
+      if (!segment) return null;
+      return (projects || []).find((project) => {
+        const id = typeof project?.id === "string" ? project.id : "";
+        return /^g-p-[A-Za-z0-9_-]+$/.test(id)
+          && (segment === id || segment.startsWith(`${id}-`));
+      }) || null;
+    };
+    let routeSegment = null;
+    try { routeSegment = projectSegmentFromPath(new URL(location.href).pathname); } catch (_) {}
+    if (routeSegment) return projectForSegment(routeSegment);
     const anchor = chatGptCurrentConversationAnchor();
-    const aria = normText(anchor?.getAttribute?.("aria-label") || "");
-    if (!aria) return null;
-    const matches = (projects || []).filter((project) => project?.name && aria.includes(project.name));
-    if (!matches.length) return null;
-    matches.sort((a, b) => b.name.length - a.name.length);
-    return matches[0];
+    if (!anchor) return null;
+    let anchorSegment = null;
+    try {
+      anchorSegment = projectSegmentFromPath(new URL(anchor.getAttribute?.("href") || anchor.href, location.href).pathname);
+    } catch (_) {}
+    return projectForSegment(anchorSegment);
   }
 
   function currentHerdrRequiredApps() {

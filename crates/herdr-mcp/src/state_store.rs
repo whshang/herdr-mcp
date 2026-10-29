@@ -3332,6 +3332,28 @@ impl StateStore {
             .ok_or_else(|| "browser_resource_not_found".to_owned())
     }
 
+    /// The account resource a browser resource belongs to (itself for an
+    /// account), following at most a few parent links.
+    fn browser_account_ancestor(
+        &self,
+        resource: &BrowserResourceRecord,
+    ) -> Result<Option<String>, String> {
+        let mut current = resource.clone();
+        for _ in 0..4 {
+            if current.kind == "account" {
+                return Ok(Some(current.resource_ref));
+            }
+            let Some(parent_ref) = current.parent_ref.as_deref() else {
+                return Ok(None);
+            };
+            let Some(parent) = self.browser_resource(parent_ref)? else {
+                return Ok(None);
+            };
+            current = parent;
+        }
+        Ok(None)
+    }
+
     pub fn upsert_browser_resource_locator(
         &mut self,
         resource_ref: &str,
@@ -3392,6 +3414,64 @@ impl StateStore {
         // front of the user. The just-written locator is current and is never a
         // retirement candidate.
         retire_stale_browser_session_locators_in(&self.conn)?;
+        if resource.kind == "session" {
+            // #740: one conversation (same endpoint, provider and native
+            // identity) can be observed under two parents inside one
+            // generation, e.g. first under a Project space inferred from a
+            // transient sidebar label, then under the account. Both rows are
+            // current, so the URL lookup would be ambiguous for a single
+            // conversation. This newer observation supersedes the other
+            // parent's locator; a sibling observed later than this write is
+            // left alone (it will retire this one on its next observation).
+            // Different conversations never share a native identity, so they
+            // stay ambiguous as before.
+            let candidates = {
+                let mut statement = self
+                    .conn
+                    .prepare(REPARENTED_BROWSER_SESSION_LOCATOR_CANDIDATES_SQL)
+                    .map_err(|error| {
+                        format!("cannot prepare reparented browser session locators: {error}")
+                    })?;
+                statement
+                    .query_map(
+                        params![
+                            resource_ref,
+                            resource.endpoint_ref,
+                            resource.provider,
+                            resource.native_identity_sha256,
+                            resource.parent_ref.as_deref().unwrap_or(""),
+                            observation_generation,
+                            observed_at,
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+                    .map_err(|error| {
+                        format!("cannot read reparented browser session locators: {error}")
+                    })?
+            };
+            if !candidates.is_empty() {
+                // Only a sibling under the same account is the same
+                // conversation; two accounts in one profile stay ambiguous.
+                let account = self.browser_account_ancestor(&resource)?;
+                for candidate in candidates {
+                    let Some(sibling) = self.browser_resource(&candidate)? else {
+                        continue;
+                    };
+                    if account.is_none() || self.browser_account_ancestor(&sibling)? != account {
+                        continue;
+                    }
+                    self.conn
+                        .execute(
+                            "DELETE FROM browser_resource_locators WHERE resource_ref = ?1",
+                            params![candidate],
+                        )
+                        .map_err(|error| {
+                            format!("cannot retire reparented browser session locator: {error}")
+                        })?;
+                }
+            }
+        }
         self.browser_resource_locator(resource_ref)?
             .ok_or_else(|| "browser_resource_locator_not_found".to_owned())
     }
@@ -5796,6 +5876,28 @@ WHERE EXISTS (
             AND current_session.observation_generation = p.observation_generation
       )
 )
+"#;
+
+/// Retire same-generation locators of the *same* conversation observed under a
+/// different parent (#740). Parameters: `?1` the just-written session ref,
+/// `?2` endpoint, `?3` provider, `?4` native identity digest, `?5` the new
+/// parent ref, `?6` the current generation, `?7` this observation time. The
+/// caller additionally requires the same account ancestor, and only deletes
+/// locator rows; `browser_resources` rows stay for history.
+const REPARENTED_BROWSER_SESSION_LOCATOR_CANDIDATES_SQL: &str = r#"
+    SELECT sibling.resource_ref
+    FROM browser_resources sibling
+    JOIN browser_resource_locators sibling_locator
+      ON sibling_locator.resource_ref = sibling.resource_ref
+    WHERE sibling.resource_ref <> ?1
+      AND sibling.kind = 'session'
+      AND sibling.endpoint_ref = ?2
+      AND sibling.provider = ?3
+      AND sibling.native_identity_sha256 = ?4
+      AND sibling.parent_ref <> ?5
+      AND sibling.observation_generation = ?6
+      AND sibling_locator.observation_generation = ?6
+      AND sibling_locator.observed_at <= ?7
 "#;
 
 fn retire_stale_browser_session_locators_in(conn: &Connection) -> Result<usize, String> {
