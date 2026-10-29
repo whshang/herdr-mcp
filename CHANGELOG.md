@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## v1.1.0-rc.5 — 2026-10-29
+
+- **1.1 第五个预发布（仅 preview 通道）：** 修复 MacBook Pro PROD 验收（#728）中 `@herdr-mcp` 提及时 `agent.task.dispatch` 父会话绑定失败：Runtime 规范化来源轮次文本后再计算哈希（NFC、去掉整词 App 提及、折叠空白），使 @提及的 dispatch 能绑定来源轮次（#741）；同一 ChatGPT 会话被重新归属父级时只保留一个当前 locator、扩展只按精确 project id 推断 Project，消除 `browser_canonical_url_ambiguous`（#740）；退役被重新归属的 locator 时把来源轮次证据迁移到存活会话，避免 `source_turn_ambiguous`；扩展 0.1.228。stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.5.md](docs/releases/v1.1.0-rc.5.md)。 [PR #742](https://github.com/whshang/herdr-mcp/pull/742) [PR #743](https://github.com/whshang/herdr-mcp/pull/743) [PR #744](https://github.com/whshang/herdr-mcp/pull/744) [PR #745](https://github.com/whshang/herdr-mcp/pull/745)
 - **ChatGPT inline-mention 采样与精确 Project 推断随扩展发布（扩展 0.1.227 → 0.1.228）：** #742 让 `performance-core.js` 把 ChatGPT 新的 `span[data-appearance="inline-mention"][app-mention-name][app-mention-path]` 提及芯片按旧 `data-inline-selection-pill` 同样处理，用户气泡文本采样为 `@herdr-mcp …`，配合 Runtime 端规范化使 @提及的 dispatch 能绑定来源轮次；#743 让 `wake.js` 的 `currentChatGptProjectFromCatalog` 只从精确 project id（页面路由 `/g/g-p-<id>…` 或当前会话锚点自身 href）取 Project，移除按 aria-label/名称子串推断，账号级 `/c/<id>` 会话不再因标题被归入 Project。本次只提升扩展版本，使这两项修复随扩展发布。Runtime 版本与 contract 不变。
 ## v1.1.0-rc.4 — 2026-10-29
 
