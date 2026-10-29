@@ -103,6 +103,8 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
             text,
             parent_target,
             idempotency_key,
+            inject_task_identity,
+            parent_session_ref,
             wait,
             timeout_ms,
         } => {
@@ -112,6 +114,12 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
                 "parent_target": parent_target,
                 "idempotency_key": idempotency_key,
             });
+            if inject_task_identity {
+                params["inject_task_identity"] = json!(true);
+            }
+            if let Some(session_ref) = parent_session_ref {
+                params["parent_session_ref"] = json!(session_ref);
+            }
             if wait {
                 params["wait"] = json!({
                     "until": ["idle", "done", "blocked"],

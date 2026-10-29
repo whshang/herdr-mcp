@@ -40,3 +40,9 @@ When `startable_candidates.evidence_gap.present=true`, an installed Agent exists
 ## External host outcome
 
 A response with no Herdr execution identity or result fields is not evidence that the workstation, child process, filesystem, or remote service executed anything. When Herdr result fields are present, use those fields to describe the local operation. Host policy is external to Agent Dispatch and does not change worker selection or task ownership.
+
+Optional `inject_task_identity: true` appends one `[herdr-task task_id=… dispatch_id=…]` line and a completion hint to the worker prompt. The default is false (prompt unchanged); injection does not change target/text fingerprinting, and replay never submits again. Dispatch results, task status and inbox items expose separate `task_id` and `dispatch_id` fields; callers must not assume equality even when values currently match. This does not add a worker report method.
+
+If you already obtained an exact browser session resource ref, pass `parent_session_ref`. It takes precedence over `current_user_message` (which is still stripped from the prompt path). WebChat binding requires a registered session, a supported matching provider, current provider generation, a covering endpoint/provider control grant, an available account and no conflicting durable caller mapping. Any miss leaves the task unstamped with `parent_session: {bound:false, reason:"explicit_parent_session_<reason>"}` and never falls back to turn text or the caller mapping. Trusted local IPC without WebChat identity accepts only a registered session resource. Without the explicit ref, existing source-turn/mapping behavior is unchanged. A replay reports the stored stamp and does not bind again.
+
+Local CLI: `herdr-mcp agent dispatch <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref <ref>]`.

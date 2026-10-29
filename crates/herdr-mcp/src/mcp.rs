@@ -213,8 +213,8 @@ pub struct RuntimeContext<'a> {
     pub trusted_local_ipc: bool,
 }
 
-/// The parent-session binding decision for one WebChat `agent.task.dispatch`
-/// carrying `current_user_message`.
+/// The parent-session binding decision for one `agent.task.dispatch`.
+/// An explicit ref takes precedence over source-turn evidence.
 ///
 /// The message resolves the caller's browser session through the same durable
 /// source-turn evidence model as the archive path: the canonical user text
@@ -225,10 +225,9 @@ pub struct RuntimeContext<'a> {
 /// compact non-secret reason. The opaque session id, the user text, and its
 /// hash are never echoed.
 enum AgentTaskParentSession {
-    /// Nothing was attempted: the caller passed no `current_user_message`
-    /// (or has no WebChat identity to bind), so dispatch behaves as before.
+    /// Nothing was attempted: no explicit ref or applicable turn evidence.
     NotAttempted,
-    /// The source-turn evidence resolved and the caller mapping was bound.
+    /// Explicit or source-turn evidence resolved to a registered session.
     Bound(String),
     /// Binding was attempted but must not stamp; the fact reports the reason.
     Unbound(&'static str),
@@ -292,6 +291,82 @@ fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
         .flatten()
 }
 
+/// Explicit evidence is authoritative: every miss stops binding without fallback.
+fn explicit_agent_task_parent_session(
+    context: &RuntimeContext<'_>,
+    value: &Value,
+) -> AgentTaskParentSession {
+    let Some(session_ref) = value.as_str().filter(|value| {
+        !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control)
+    }) else {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_invalid");
+    };
+    let Ok(mut store) = context.state_store.lock() else {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_state_store_unavailable");
+    };
+    let session = match store.browser_resource(session_ref) {
+        Ok(Some(session)) => session,
+        Ok(None) => return AgentTaskParentSession::Unbound("explicit_parent_session_unknown_ref"),
+        Err(_) => return AgentTaskParentSession::Unbound("explicit_parent_session_binding_failed"),
+    };
+    if session.kind != "session" {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_wrong_kind");
+    }
+    let Some(authorization) = context.caller_webchat_authorization else {
+        return if context.trusted_local_ipc && context.caller_browser_session.is_none() {
+            AgentTaskParentSession::Bound(session_ref.to_owned())
+        } else {
+            AgentTaskParentSession::Unbound("explicit_parent_session_caller_session_absent")
+        };
+    };
+    let Some(caller_session) = context.caller_browser_session else {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_caller_session_absent");
+    };
+    if !webchat_adapter_binds_parent_session(&session.provider)
+        || caller_session.provider != session.provider
+    {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_provider_mismatch");
+    }
+    let generation = match store.browser_provider_state(&session.endpoint_ref, &session.provider) {
+        Ok(Some(state)) => state.observation_generation,
+        Ok(None) => {
+            return AgentTaskParentSession::Unbound(
+                "explicit_parent_session_provider_generation_unknown",
+            );
+        }
+        Err(_) => return AgentTaskParentSession::Unbound("explicit_parent_session_binding_failed"),
+    };
+    if generation != session.observation_generation {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_stale_generation");
+    }
+    if !context
+        .caller_webchat_control_grants
+        .iter()
+        .any(|grant| webchat_control_grant_covers(grant, &session.endpoint_ref, &session.provider))
+    {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_grant_missing");
+    }
+    if browser_resource_account_ref(&store, &session).is_err() {
+        return AgentTaskParentSession::Unbound(
+            "explicit_parent_session_session_account_unavailable",
+        );
+    }
+    // This store operation refuses conflicting mappings; it never retargets one.
+    match store.bind_browser_caller_session(
+        &authorization.principal_ref,
+        &caller_session.provider,
+        &caller_session.opaque_session_id,
+        session_ref,
+        browser_epoch_ms(),
+    ) {
+        Ok(()) => AgentTaskParentSession::Bound(session_ref.to_owned()),
+        Err(error) if error == "browser_caller_session_conflict" => {
+            AgentTaskParentSession::Unbound("explicit_parent_session_caller_session_conflict")
+        }
+        Err(_) => AgentTaskParentSession::Unbound("explicit_parent_session_binding_failed"),
+    }
+}
+
 /// Resolve the `parent_session_ref` for one WebChat task dispatch.
 ///
 /// `current_user_message` is optional evidence: without it the dispatch keeps
@@ -304,6 +379,9 @@ fn agent_task_dispatch_parent_session(
     context: &RuntimeContext<'_>,
     params: &Value,
 ) -> AgentTaskParentSession {
+    if let Some(value) = params.get("parent_session_ref") {
+        return explicit_agent_task_parent_session(context, value);
+    }
     let current_user_message = match current_user_message_param(params) {
         Ok(Some(message)) => message,
         Ok(None) => return AgentTaskParentSession::NotAttempted,
@@ -722,6 +800,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 let mut prompt_params = params.clone();
                 if let Some(object) = prompt_params.as_object_mut() {
                     object.remove("current_user_message");
+                    object.remove("parent_session_ref");
                 }
                 let mut result = prompt::run_with_parent_session(
                     context.client,

@@ -315,6 +315,8 @@ pub enum AgentCommand {
         text: String,
         parent_target: String,
         idempotency_key: String,
+        inject_task_identity: bool,
+        parent_session_ref: Option<String>,
         wait: bool,
         timeout_ms: u64,
     },
@@ -824,7 +826,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
         Some("dispatch") => {
             if args.len() < 3 {
                 return Err(
-                    "agent dispatch requires <target> <text> --parent <target> --idempotency-key <key> [--wait] [--timeout-ms N]"
+                    "agent dispatch requires <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--wait] [--timeout-ms N]"
                         .to_owned(),
                 );
             }
@@ -833,6 +835,8 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
             if target.is_empty() || text.is_empty() {
                 return Err("agent dispatch target/text must not be empty".to_owned());
             }
+            let mut inject_task_identity = false;
+            let mut parent_session_ref = None;
             let mut parent_target = None;
             let mut idempotency_key = None;
             let mut wait = false;
@@ -840,6 +844,18 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
             let mut index = 3;
             while index < args.len() {
                 match args[index].as_str() {
+                    "--inject-task-identity" => {
+                        inject_task_identity = true;
+                        index += 1;
+                    }
+                    "--parent-session-ref" => {
+                        let Some(value) = args.get(index + 1).filter(|value| !value.is_empty())
+                        else {
+                            return Err("--parent-session-ref requires a value".to_owned());
+                        };
+                        parent_session_ref = Some(value.clone());
+                        index += 2;
+                    }
                     "--parent" => {
                         let Some(value) = args.get(index + 1) else {
                             return Err("--parent requires a target".to_owned());
@@ -883,6 +899,8 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                 idempotency_key: idempotency_key
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| "--idempotency-key is required".to_owned())?,
+                inject_task_identity,
+                parent_session_ref,
                 wait,
                 timeout_ms,
             }))
@@ -2591,6 +2609,7 @@ User path:\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp agent-skill <status|sync>  (repo-fetched user-global local-agent Skill; exact runtime source identity)\n\
   herdr-mcp continuity <search|resume> ...  (durable prior-work discovery for local coding agents)\n\
+  herdr-mcp agent dispatch <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--wait] [--timeout-ms N]\n\
   herdr-mcp memory <resume|search> ...  (bounded Work Memory access for local coding agents)\n\
   herdr-mcp webchat <endpoints|resources|inspect|create|send|dispatch-status|open|archive|archive-status|handoff> ...  (supported local WebChat control)\n\
   herdr-mcp profile check --file <profile.json>  (read-only desired-vs-actual workstation drift)\n\
@@ -2771,6 +2790,46 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn parses_dispatch_identity_and_explicit_parent_flags() {
+        let base = [
+            "agent",
+            "dispatch",
+            "pi",
+            "work",
+            "--parent",
+            "w1:p2",
+            "--idempotency-key",
+            "key",
+        ];
+        for enabled in [false, true] {
+            let mut input = base.to_vec();
+            if enabled {
+                input.extend([
+                    "--inject-task-identity",
+                    "--parent-session-ref",
+                    "br_session",
+                ]);
+            }
+            assert_eq!(
+                parse(args(&input)).unwrap().command,
+                Command::Agent(AgentCommand::Dispatch {
+                    target: "pi".to_owned(),
+                    text: "work".to_owned(),
+                    parent_target: "w1:p2".to_owned(),
+                    idempotency_key: "key".to_owned(),
+                    inject_task_identity: enabled,
+                    parent_session_ref: enabled.then(|| "br_session".to_owned()),
+                    wait: false,
+                    timeout_ms: 25_000,
+                })
+            );
+        }
+        let mut missing = base.to_vec();
+        missing.push("--parent-session-ref");
+        assert!(parse(args(&missing)).is_err());
     }
 
     #[test]
