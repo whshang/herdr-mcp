@@ -1073,7 +1073,7 @@ fn extension_browser_source_turn_observe(
     if !canonical_url.starts_with("https://chatgpt.com/") {
         return Err("browser_canonical_url_invalid".to_owned());
     }
-    let user_text_sha256 = mcp::browser_sha256(user_text.trim());
+    let user_text_sha256 = mcp::source_turn_sha256(user_text);
     let mut store = state
         .state_store
         .lock()
@@ -6932,6 +6932,178 @@ mod tests {
             ambiguous["parent_session"],
             json!({"bound": false, "reason": "source_turn_ambiguous"})
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn webchat_dispatch_binds_across_app_mention_rendering() {
+        // #741: ChatGPT renders an `@herdr-mcp` App mention chip differently in
+        // the DOM bubble (observed by the extension) and in the model-visible
+        // `current_user_message`. Both sides must reduce to one canonical text.
+        let root = test_root("webchat-dispatch-mention");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut script = Vec::new();
+        for index in 0..10 {
+            let seq = 4 + index * 2;
+            script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
+            script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
+        }
+        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let mut state = dispatch_test_state(&root, &socket);
+        state.trusted_extension_ipc = true;
+        let app = candidate_router(state);
+        let (app, profile_seed, endpoint_ref, account_ref) =
+            register_chatgpt_endpoint(app, "mention", now).await;
+        // Extension 0.1.227 hashed the raw bubble text: the chip's label glued
+        // with doubled whitespace, and no `@`.
+        let (app, mention_session) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "mention",
+            "herdr-mcp  用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+            now,
+        )
+        .await;
+        // NFC: the bubble carries a decomposed accent, the model a composed one.
+        let (app, nfc_session) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "mention-nfc",
+            "@herdr 派给 cafe\u{301} 队列",
+            now,
+        )
+        .await;
+        // The same canonical text in two sessions stays ambiguous.
+        let (app, dup_a) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "mention-dup-a",
+            "@Herdr 重复的派发消息",
+            now,
+        )
+        .await;
+        let (app, dup_b) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "mention-dup-b",
+            "重复的派发消息",
+            now,
+        )
+        .await;
+        assert_ne!(dup_a, dup_b);
+
+        let headers = |opaque: &str| {
+            vec![
+                (
+                    "x-herdr-edge-expected-runtime-generation",
+                    "rust-caller-grant-proof".to_owned(),
+                ),
+                (
+                    "x-herdr-edge-webchat-authorization",
+                    json!({
+                        "principal_ref": "connector:conn_DispatchMention1",
+                        "connector_id": "conn_DispatchMention1",
+                        "grant_generation": 1
+                    })
+                    .to_string(),
+                ),
+                (
+                    "x-herdr-edge-browser-caller-session",
+                    json!({"provider": "chatgpt", "opaque_session_id": opaque}).to_string(),
+                ),
+                (
+                    "x-herdr-edge-webchat-control-grants",
+                    json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+                ),
+            ]
+        };
+        let cases: &[(&str, &str, Value)] = &[
+            // The model echoes the typed mention with `@`.
+            (
+                "opaque-mention-a",
+                "@herdr-mcp 用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": true}),
+            ),
+            // The model drops the mention entirely.
+            (
+                "opaque-mention-a",
+                "用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": true}),
+            ),
+            // Extra whitespace, newlines, and a different mention spelling.
+            (
+                "opaque-mention-a",
+                "\n@HERDR_MCP\n用   agent.task.dispatch\t派发一个任务给 report-review：回复 OK  ",
+                json!({"bound": true}),
+            ),
+            // Punctuation is identity: an ASCII colon is different text.
+            (
+                "opaque-mention-a",
+                "@herdr-mcp 用 agent.task.dispatch 派发一个任务给 report-review:回复 OK",
+                json!({"bound": false, "reason": "source_turn_not_found"}),
+            ),
+            // A mention token is only stripped as a whole token.
+            (
+                "opaque-mention-a",
+                "herdr-mcpx 用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": false, "reason": "source_turn_not_found"}),
+            ),
+            // Different user text never binds.
+            (
+                "opaque-mention-a",
+                "@herdr-mcp 用 agent.task.dispatch 派发另一个任务",
+                json!({"bound": false, "reason": "source_turn_not_found"}),
+            ),
+            (
+                "opaque-mention-nfc",
+                "派给 caf\u{e9} 队列",
+                json!({"bound": true}),
+            ),
+            (
+                "opaque-mention-dup",
+                "@herdr-mcp 重复的派发消息",
+                json!({"bound": false, "reason": "source_turn_ambiguous"}),
+            ),
+        ];
+        for (index, (opaque, message, expected)) in cases.iter().enumerate() {
+            let result = webchat_tool_call(
+                app.clone(),
+                &headers(opaque),
+                "herdr_mcp.agent.task.dispatch",
+                json!({
+                    "target": "w1:p1",
+                    "text": format!("mention case {index}"),
+                    "idempotency_key": format!("dispatch-mention-{index}"),
+                    "current_user_message": message,
+                }),
+            )
+            .await;
+            assert_eq!(result["ok"], true, "case {index}: {result}");
+            assert_eq!(
+                &result["parent_session"], expected,
+                "case {index}: {message:?}"
+            );
+            let expected_ref = match (expected["bound"].as_bool(), *opaque) {
+                (Some(true), "opaque-mention-nfc") => Value::String(nfc_session.clone()),
+                (Some(true), _) => Value::String(mention_session.clone()),
+                _ => Value::Null,
+            };
+            assert_eq!(
+                result["task"]["parent_session_ref"], expected_ref,
+                "case {index}"
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

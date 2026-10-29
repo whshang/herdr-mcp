@@ -270,14 +270,32 @@
   } = {}) {
     if (!root) return sampleBoundedMessageText(root, { maxChars, tailChars, ignoredSelector });
 
+    // Two App-mention renderings reach a user turn: the legacy inline
+    // selection pill (data-keyword) and the current inline-mention span
+    // (app-mention-name + app-mention-path, #741). Both are emitted as
+    // `@name` so the observed turn matches the model-visible message.
     const inlinePillKeyword = (element) => {
       if (!element || typeof element.getAttribute !== "function") return null;
-      if (element.getAttribute("data-inline-selection-pill") === null) return null;
-      return String(element.getAttribute("data-keyword") || "").trim();
+      if (element.getAttribute("data-inline-selection-pill") !== null) {
+        return String(element.getAttribute("data-keyword") || "").trim();
+      }
+      if (element.getAttribute("data-appearance") === "inline-mention"
+        && String(element.getAttribute("app-mention-path") || "").trim() !== "") {
+        const name = String(element.getAttribute("app-mention-name") || "").trim();
+        return name || null;
+      }
+      return null;
     };
     let hasInlinePill = Boolean(inlinePillKeyword(root));
     if (!hasInlinePill && typeof root.querySelector === "function") {
       try { hasInlinePill = Boolean(root.querySelector('[data-inline-selection-pill][data-keyword]')); } catch (_) {}
+    }
+    if (!hasInlinePill && typeof root.querySelector === "function") {
+      try {
+        hasInlinePill = Boolean(root.querySelector(
+          '[data-appearance="inline-mention"][app-mention-name][app-mention-path]',
+        ));
+      } catch (_) {}
     }
     if (!hasInlinePill) {
       return sampleBoundedMessageText(root, { maxChars, tailChars, ignoredSelector });

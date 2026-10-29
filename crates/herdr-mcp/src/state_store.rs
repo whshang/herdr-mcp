@@ -3798,7 +3798,7 @@ impl StateStore {
 
     /// Persist the latest observed user turn for one browser session.
     ///
-    /// Only the caller-computed SHA-256 of the trimmed user text is accepted;
+    /// Only the caller-computed SHA-256 of the canonical user text is accepted;
     /// plaintext never reaches the database. One row is kept per session, and a
     /// late-arriving older observation must not overwrite a newer one. The
     /// retention window is enforced by deleting expired rows first.

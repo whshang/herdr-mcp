@@ -217,8 +217,9 @@ pub struct RuntimeContext<'a> {
 /// carrying `current_user_message`.
 ///
 /// The message resolves the caller's browser session through the same durable
-/// source-turn evidence model as the archive path: the exact trimmed user text
-/// observed for one registered session, never recency, tab, or URL guesses.
+/// source-turn evidence model as the archive path: the canonical user text
+/// (`canonical_source_turn_text`) observed for one registered session, never
+/// recency, tab, or URL guesses.
 /// Binding is best-effort and fail-closed — any missing, stale, ambiguous, or
 /// conflicting evidence leaves the dispatch unstamped and reports only a
 /// compact non-secret reason. The opaque session id, the user text, and its
@@ -322,7 +323,7 @@ fn agent_task_dispatch_parent_session(
     let Ok(mut store) = context.state_store.lock() else {
         return AgentTaskParentSession::Unbound("state_store_unavailable");
     };
-    let source_user_text_sha256 = browser_sha256(current_user_message);
+    let source_user_text_sha256 = source_turn_sha256(current_user_message);
     let observed_at = browser_epoch_ms();
     let (session_ref, expected_generation) = match store
         .resolve_browser_source_turn(&source_user_text_sha256, observed_at)
@@ -3518,10 +3519,10 @@ fn browser_dispatch_submit(
                 // dispatch uncertain and the evidence unwritten (fail closed).
                 //
                 // The provider renders composer line breaks as blank lines, so
-                // the durable turn identity is the whitespace-trimmed submitted
-                // text, exactly like `source_turn.observe` and the WebChat
-                // binding path.
-                let turn_digest = browser_sha256(message.trim());
+                // the durable turn identity is the canonical submitted text
+                // (`canonical_source_turn_text`), exactly like
+                // `source_turn.observe` and the WebChat binding path.
+                let turn_digest = source_turn_sha256(message);
                 store.settle_browser_dispatch_with_source_turn(
                     settlement,
                     crate::state_store::BrowserDispatchSourceTurn {
@@ -5476,7 +5477,7 @@ fn browser_session_archive_params_from_current_turn(
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
     }
     let idempotency_key = browser_required_idempotency_key(params)?;
-    let source_user_text_sha256 = browser_sha256(current_user_message);
+    let source_user_text_sha256 = source_turn_sha256(current_user_message);
     let observed_at = browser_epoch_ms();
     let (session_ref, expected_generation) =
         match store.resolve_browser_source_turn(&source_user_text_sha256, observed_at) {
@@ -6119,6 +6120,42 @@ pub(crate) fn browser_sha256(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
+/// App-name tokens ChatGPT renders for a Herdr app mention. A mention chip can
+/// reach the source-turn evidence as `@herdr`, `herdr-mcp`, or be dropped
+/// entirely depending on which surface (DOM bubble, composer, model-visible
+/// tool arguments) produced the text, so these whole tokens carry no identity.
+const SOURCE_TURN_APP_MENTION_TOKENS: &[&str] = &["herdr", "herdr-mcp", "herdr_mcp"];
+
+/// The one canonical form of a user turn used for every source-turn digest.
+///
+/// The DOM observation (`source_turn.observe`), the runtime-settled dispatch
+/// turn, the WebChat `agent.task.dispatch` binding, and the archive
+/// current-turn path must hash the same text, but each surface renders the
+/// same turn slightly differently. Canonicalization therefore: applies Unicode
+/// NFC, treats NBSP/BOM as whitespace, drops whole `@?herdr` / `herdr-mcp` /
+/// `herdr_mcp` app-mention tokens (case-insensitive), collapses whitespace runs
+/// to one space, and trims. Every other character, including full-width
+/// punctuation, is preserved, so different user text still hashes differently.
+pub(crate) fn canonical_source_turn_text(text: &str) -> String {
+    let composed = icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(text);
+    composed
+        .replace(['\u{00a0}', '\u{feff}'], " ")
+        .split_whitespace()
+        .filter(|token| {
+            let name = token.strip_prefix('@').unwrap_or(token);
+            !SOURCE_TURN_APP_MENTION_TOKENS
+                .iter()
+                .any(|mention| name.eq_ignore_ascii_case(mention))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// SHA-256 of [`canonical_source_turn_text`]: the durable source-turn identity.
+pub(crate) fn source_turn_sha256(text: &str) -> String {
+    browser_sha256(&canonical_source_turn_text(text))
+}
+
 fn browser_epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -6249,7 +6286,7 @@ fn browser_operation_call_with_controls(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(browser_sha256)
+            .map(source_turn_sha256)
     } else {
         None
     };
@@ -12149,6 +12186,40 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn canonical_source_turn_text_reduces_app_mention_renderings_only() {
+        let canonical = "用 dispatch 派发：回复 OK";
+        for variant in [
+            "@herdr-mcp 用 dispatch 派发：回复 OK",
+            "herdr-mcp  用 dispatch 派发：回复 OK",
+            "@Herdr\n用\u{00a0}dispatch 派发：回复 OK ",
+            "\u{feff}用 dispatch @herdr_mcp 派发：回复 OK",
+            "用 dispatch 派发：回复 OK",
+        ] {
+            assert_eq!(
+                canonical_source_turn_text(variant),
+                canonical,
+                "{variant:?}"
+            );
+        }
+        assert_eq!(
+            canonical_source_turn_text("cafe\u{301}"),
+            canonical_source_turn_text("caf\u{e9}")
+        );
+        // Only whole mention tokens are dropped; punctuation is identity.
+        assert_eq!(canonical_source_turn_text("herdrx 看看"), "herdrx 看看");
+        assert_eq!(canonical_source_turn_text("@herdr-mcp:"), "@herdr-mcp:");
+        assert_ne!(
+            canonical_source_turn_text("派发：回复"),
+            canonical_source_turn_text("派发:回复")
+        );
+        assert_eq!(
+            source_turn_sha256(" 回复 OK "),
+            browser_sha256("回复 OK"),
+            "plain trimmed text keeps its pre-#741 digest"
+        );
+    }
 
     #[test]
     fn browser_readback_text_canonical_ignores_composer_line_break_rendering() {
