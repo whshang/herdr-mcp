@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **ChatGPT inline-mention 采样与精确 Project 推断随扩展发布（扩展 0.1.227 → 0.1.228）：** #742 让 `performance-core.js` 把 ChatGPT 新的 `span[data-appearance="inline-mention"][app-mention-name][app-mention-path]` 提及芯片按旧 `data-inline-selection-pill` 同样处理，用户气泡文本采样为 `@herdr-mcp …`，配合 Runtime 端规范化使 @提及的 dispatch 能绑定来源轮次；#743 让 `wake.js` 的 `currentChatGptProjectFromCatalog` 只从精确 project id（页面路由 `/g/g-p-<id>…` 或当前会话锚点自身 href）取 Project，移除按 aria-label/名称子串推断，账号级 `/c/<id>` 会话不再因标题被归入 Project。本次只提升扩展版本，使这两项修复随扩展发布。Runtime 版本与 contract 不变。
 ## v1.1.0-rc.4 — 2026-10-29
 
 - **1.1 第四个预发布（仅 preview 通道）：** Gate-6B 修复（Edge 向 `agent.task.dispatch` 转发 WebChat 授权、扩展识别 ChatGPT `data-user-message-bubble` 用户轮次、扩展 0.1.227），以及 rc.3 之后合入的 WebChat 来源轮次绑定、Agent Task inbox / final excerpt、BrowserPage 分页、#666 拆分。作为 MacBook Pro PROD 升级/回滚验收（#728）的候选。stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.4.md](docs/releases/v1.1.0-rc.4.md)。 [PR #698](https://github.com/whshang/herdr-mcp/pull/698) [PR #733](https://github.com/whshang/herdr-mcp/pull/733) [PR #736](https://github.com/whshang/herdr-mcp/pull/736)
