@@ -6491,6 +6491,165 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn reparented_conversation_with_prior_source_turn_stays_unambiguous() {
+        // #740 follow-up (Codex review): the conversation's turn is already
+        // observed under the Project-space parent before it is re-observed
+        // under the account. Retiring the old locator must also retire its
+        // source-turn row, or the same digest stays on two sessions and
+        // resolution reports ambiguity until the old row expires.
+        const URL: &str = "https://chatgpt.com/c/reparented-prior-740";
+        let root = test_root("reparented-prior-740");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
+        ]);
+        let mut state = dispatch_test_state(&root, &socket);
+        state.trusted_extension_ipc = true;
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let (app, profile_seed, endpoint_ref, account_ref) =
+            register_chatgpt_endpoint(app, "reparentprior", now).await;
+        let post = |app: axum::Router, payload: Value| async move {
+            let response = app.oneshot(registry_request(payload)).await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<Value>(&body).unwrap())
+        };
+        let (status, space) = post(
+            app.clone(),
+            json!({
+                "operation": "resource.observe",
+                "profile_seed": profile_seed,
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "kind": "space",
+                "parent_ref": account_ref,
+                "native_identity": "native-space-herdr-mcp",
+                "display_label": "herdr-mcp",
+                "canonical_url": "https://chatgpt.com/g/g-p-reparentprior",
+                "observation_generation": 1,
+                "observed_at": now
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let space_ref = space["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let observe_session = |parent: String, at: i64| {
+            json!({
+                "operation": "resource.observe",
+                "profile_seed": profile_seed,
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "kind": "session",
+                "parent_ref": parent,
+                "native_identity": "conversation-reparented-prior-740",
+                "display_label": null,
+                "canonical_url": URL,
+                "observation_generation": 1,
+                "observed_at": at
+            })
+        };
+        let (status, under_space) = post(app.clone(), observe_session(space_ref, now)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, observed_early) = post(
+            app.clone(),
+            json!({
+                "operation": "source_turn.observe",
+                "canonical_url": URL,
+                "user_text": "herdr-mcp 回复 OK",
+                "observed_at": now
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{observed_early}");
+        assert_eq!(
+            observed_early["session_ref"],
+            under_space["resource"]["resource_ref"]
+        );
+        let (status, under_account) =
+            post(app.clone(), observe_session(account_ref.clone(), now + 1)).await;
+        assert_eq!(status, StatusCode::OK);
+        let space_session = under_space["resource"]["resource_ref"].as_str().unwrap();
+        let account_session = under_account["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(
+            space_session, account_session,
+            "two parent-scoped rows exist"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .browser_current_generation_source_session_ref(URL)
+                .unwrap(),
+            Some(account_session.clone())
+        );
+
+        let (status, observed) = post(
+            app.clone(),
+            json!({
+                "operation": "source_turn.observe",
+                "canonical_url": URL,
+                "user_text": "herdr-mcp 回复 OK",
+                "observed_at": now + 2
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{observed}");
+        assert_eq!(observed["session_ref"], account_session);
+
+        let headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-authorization",
+                json!({
+                    "principal_ref": "connector:conn_ReparentPrior740",
+                    "connector_id": "conn_ReparentPrior740",
+                    "grant_generation": 1
+                })
+                .to_string(),
+            ),
+            (
+                "x-herdr-edge-browser-caller-session",
+                json!({"provider": "chatgpt", "opaque_session_id": "opaque-reparent-740"})
+                    .to_string(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+            ),
+        ];
+        let result = webchat_tool_call(
+            app,
+            &headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "reply OK",
+                "idempotency_key": "dispatch-reparent-prior-740",
+                "current_user_message": "herdr-mcp 回复 OK",
+            }),
+        )
+        .await;
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["parent_session"], json!({"bound": true}));
+        assert_eq!(result["task"]["parent_session_ref"], account_session);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     async fn webchat_tool_call(
         app: axum::Router,
         headers: &[(&str, String)],
