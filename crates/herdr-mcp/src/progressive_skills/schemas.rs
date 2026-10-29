@@ -167,6 +167,36 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             },
         }),
         json!({
+            "method": crate::prompt::decision_gates::CREATE,
+            "source": "herdr_mcp_local", "access": "mutation",
+            "description": "Create one blocking decision gate on a visible non-terminal task. Bounds are UTF-8 bytes; control characters and duplicate options are rejected. Open gates block ack and completion, including worker_done.",
+            "params": {"properties": {
+                "task_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "question": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "options": {"type": "array", "minItems": 2, "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}}
+            }, "required": ["task_id", "question", "options"], "empty": false}
+        }),
+        json!({
+            "method": crate::prompt::decision_gates::STATUS,
+            "source": "herdr_mcp_local", "access": "read_only",
+            "params": {"properties": {"gate_id": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["gate_id"], "empty": false}
+        }),
+        json!({
+            "method": crate::prompt::decision_gates::CANCEL,
+            "source": "herdr_mcp_local", "access": "mutation",
+            "description": "Cancel an open gate only from its creating parent scope. Bot approvals never count as owner approval.",
+            "params": {"properties": {"gate_id": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["gate_id"], "empty": false}
+        }),
+        json!({
+            "method": crate::prompt::decision_gates::RESOLVE,
+            "source": "herdr_mcp_local", "access": "mutation",
+            "description": "Always rejected from MCP, WebChat, browser and agent paths with gate_resolution_requires_human. Only independent local CLI agent gate resolve with a controlling interactive TTY and exact retyped option may resolve. Best-effort local attestation, not cryptographic proof.",
+            "params": {"properties": {
+                "gate_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "resolution": {"type": "string", "minLength": 1, "maxLength": 128}
+            }, "required": ["gate_id", "resolution"], "empty": false}
+        }),
+        json!({
             "method": AGENT_TASK_REPORT_METHOD,
             "source": "herdr_mcp_local",
             "access": "mutation",

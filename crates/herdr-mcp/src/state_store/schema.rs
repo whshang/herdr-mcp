@@ -557,6 +557,21 @@ CREATE INDEX IF NOT EXISTS idx_browser_session_archive_intents_pending
     ON browser_session_archive_intents(session_ref, state, updated_at DESC);
 "#;
 
+/// Decision gates must not be silently ignored by pre-gate readers. Unlike
+/// optional archive metadata, this is a numbered, fail-closed migration.
+const MIGRATION_V16: &str = r#"
+CREATE TABLE IF NOT EXISTS task_decision_gates (
+    gate_id TEXT PRIMARY KEY NOT NULL,
+    task_id TEXT NOT NULL,
+    creator_parent_session_ref TEXT,
+    status TEXT NOT NULL CHECK (status IN ('open', 'resolved', 'cancelled')),
+    record_json TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES operations(op_id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_decision_gates_open
+    ON task_decision_gates(task_id) WHERE status = 'open';
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 pub(super) const MIGRATIONS: &[&str] = &[
@@ -575,6 +590,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     MIGRATION_V13,
     MIGRATION_V14,
     MIGRATION_V15,
+    MIGRATION_V16,
 ];
 
 // ---------------------------------------------------------------------------

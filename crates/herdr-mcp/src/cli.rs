@@ -310,6 +310,7 @@ pub enum MemoryCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgentCommand {
+    Gate(AgentGateCommand),
     Dispatch {
         target: String,
         text: String,
@@ -338,6 +339,25 @@ pub enum AgentCommand {
     },
     Ack {
         task_id: String,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgentGateCommand {
+    Create {
+        task_id: String,
+        question: String,
+        options: Vec<String>,
+    },
+    Status {
+        gate_id: String,
+    },
+    Cancel {
+        gate_id: String,
+    },
+    Resolve {
+        gate_id: String,
+        resolution: String,
     },
 }
 
@@ -828,8 +848,70 @@ fn parse_memory(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_agent_gate(args: &[String]) -> Result<Command, String> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("agent gate requires create, status, cancel or resolve")?;
+    let mut task_id = None;
+    let mut gate_id = None;
+    let mut question = None;
+    let mut resolution = None;
+    let mut options = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{flag} requires a value"))?
+            .clone();
+        let slot = match (action, flag) {
+            ("create", "--task-id") => &mut task_id,
+            ("create", "--question") => &mut question,
+            ("create", "--option") => {
+                options.push(value);
+                index += 2;
+                continue;
+            }
+            ("status" | "cancel" | "resolve", "--gate-id") => &mut gate_id,
+            ("resolve", "--resolution") => &mut resolution,
+            _ => return Err(format!("unknown agent gate {action} option '{flag}'")),
+        };
+        if slot.replace(value).is_some() {
+            return Err(format!("duplicate {flag}"));
+        }
+        index += 2;
+    }
+    let command = match action {
+        "create" if (2..=8).contains(&options.len()) => AgentGateCommand::Create {
+            task_id: task_id.ok_or("--task-id is required")?,
+            question: question.ok_or("--question is required")?,
+            options,
+        },
+        "status" => AgentGateCommand::Status {
+            gate_id: gate_id.ok_or("--gate-id is required")?,
+        },
+        "cancel" => AgentGateCommand::Cancel {
+            gate_id: gate_id.ok_or("--gate-id is required")?,
+        },
+        "resolve" => AgentGateCommand::Resolve {
+            gate_id: gate_id.ok_or("--gate-id is required")?,
+            resolution: resolution.ok_or("--resolution is required")?,
+        },
+        _ => {
+            return Err(
+                "agent gate requires create (2-8 --option values), status, cancel or resolve"
+                    .to_owned(),
+            );
+        }
+    };
+    Ok(Command::Agent(AgentCommand::Gate(command)))
+}
+
 fn parse_agent(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
+        Some("gate") => parse_agent_gate(&args[1..]),
         Some("dispatch") => {
             if args.len() < 3 {
                 return Err(
@@ -2682,6 +2764,9 @@ User path:\n\
   herdr-mcp continuity <search|resume> ...  (durable prior-work discovery for local coding agents)\n\
   herdr-mcp agent dispatch <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--wait] [--timeout-ms N]\n\
       Wait timeout returns ok:true + wait.outcome:checkpoint; re-check status/inbox.\n\
+  herdr-mcp agent gate create --task-id ID --question TEXT --option TEXT --option TEXT [--option TEXT ...]\n\
+  herdr-mcp agent gate status|cancel --gate-id ID\n\
+  herdr-mcp agent gate resolve --gate-id ID --resolution TEXT  (independent interactive TTY only; retype option)\n\
   herdr-mcp agent report --task-id ID --dispatch-id ID --kind heartbeat|worker_done [--summary TEXT]  (trusted local IPC only)\n\
   herdr-mcp memory <resume|search> ...  (bounded Work Memory access for local coding agents)\n\
   herdr-mcp webchat <endpoints|resources|inspect|create|send|dispatch-status|open|archive|archive-status|handoff> ...  (supported local WebChat control)\n\
@@ -2863,6 +2948,92 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// user parent | Given gate CLI commands | When choices or resolution
+    /// are supplied | Then required fields parse and ambiguous flags fail.
+    #[test]
+    fn agent_gate_commands_parse_and_reject_ambiguous_arguments() {
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "gate",
+                "create",
+                "--task-id",
+                "task",
+                "--question",
+                "Choose",
+                "--option",
+                "yes",
+                "--option",
+                "no"
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Gate(AgentGateCommand::Create {
+                task_id: "task".to_owned(),
+                question: "Choose".to_owned(),
+                options: vec!["yes".to_owned(), "no".to_owned()]
+            }))
+        );
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "gate",
+                "resolve",
+                "--gate-id",
+                "gate",
+                "--resolution",
+                "yes"
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Gate(AgentGateCommand::Resolve {
+                gate_id: "gate".to_owned(),
+                resolution: "yes".to_owned()
+            }))
+        );
+        for action in ["status", "cancel"] {
+            assert!(parse(args(&["agent", "gate", action, "--gate-id", "gate"])).is_ok());
+        }
+        for input in [
+            vec!["agent", "gate", "resolve", "--gate-id", "gate"],
+            vec![
+                "agent",
+                "gate",
+                "resolve",
+                "--gate-id",
+                "gate",
+                "--resolution",
+                "yes",
+                "--human",
+                "true",
+            ],
+            vec![
+                "agent",
+                "gate",
+                "resolve",
+                "--gate-id",
+                "gate",
+                "--gate-id",
+                "other",
+                "--resolution",
+                "yes",
+            ],
+            vec![
+                "agent",
+                "gate",
+                "create",
+                "--task-id",
+                "task",
+                "--question",
+                "Choose",
+                "--option",
+                "yes",
+            ],
+        ] {
+            assert!(parse(args(&input)).is_err());
+        }
     }
 
     #[test]

@@ -98,6 +98,7 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<ExitCode, String> {
 
 pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
     match command {
+        AgentCommand::Gate(command) => crate::agent_gate_cli::run(command),
         AgentCommand::Dispatch {
             target,
             text,
@@ -696,6 +697,10 @@ fn private_call_trace(
     (!trace.is_empty()).then_some(trace)
 }
 
+pub(crate) fn call_agent_gate(method: &str, params: Value) -> Result<Value, String> {
+    call_private(method, params, None)
+}
+
 fn call_private(
     method: &str,
     params: Value,
@@ -910,7 +915,7 @@ fn canonical_repo_id_from_remote(remote: &str) -> Option<String> {
     crate::state_store::valid_canonical_work_memory_repo_id(&repo_id).then_some(repo_id)
 }
 
-fn print_private_result(value: Value) -> Result<ExitCode, String> {
+pub(crate) fn print_private_result(value: Value) -> Result<ExitCode, String> {
     println!(
         "{}",
         serde_json::to_string_pretty(&value)
