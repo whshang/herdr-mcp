@@ -1865,6 +1865,16 @@ test("user has no grants | Given no Page Assist and no WebChat control grant | W
   assert.equal(grants, undefined);
 });
 
+test("user cannot derive device scope from a wildcard Page Assist endpoint | Given a wildcard Page Assist grant row for the routed device next to a concrete endpoint | When a WebChat dispatch method is forwarded | Then only the concrete endpoint derives a grant and no full-wildcard triplet appears", async () => {
+  const grants = await dispatchStatusTrace({
+    pageAssistGrants: [
+      { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: "*" },
+      { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: DERIVED_E },
+    ],
+  });
+  assert.deepEqual(grants, [{ endpoint_ref: DERIVED_E, provider: "*", account_ref: "*" }]);
+});
+
 test("user lists browser endpoints | Given a connector with Page Assist grants | When a non-page method is forwarded | Then no Page Assist grant is attached", async () => {
   const d = pageScopedGrantDeps();
   const res = await handleMcp(
@@ -2220,4 +2230,415 @@ test("user calls every page-scoped method without a device | Given page-scoped f
     assert.equal(res.body.result.structuredContent.delivery_state, "not_delivered", method);
     assert.equal(d.calls.length, 0, `${method} must not forward without a routed device`);
   }
+});
+
+test("user dispatches an agent task from a WebChat turn | Given WebChat and Page Assist grants on the routed device and a grant on another device | When herdr_mcp.agent.task.dispatch is forwarded | Then the routed device's exact grants reach the parent-session gate and the other device's endpoint never travels", async () => {
+  const d = pageScopedGrantDeps();
+  const res = await handleMcp(
+    req(1, "tools/call", {
+      name: "herdr_call",
+      _meta: { "openai/session": "openai-session-dispatch-grant-123" },
+      arguments: {
+        method: "herdr_mcp.agent.task.dispatch",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          target: "pi",
+          text: "do durable child work",
+          current_user_message: "hand this to the workstation",
+          idempotency_key: "edge-agent-task-dispatch-grant-test",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1, "agent task dispatch forwards exactly once");
+  assert.equal(d.calls[0].args.method, "herdr_mcp.agent.task.dispatch");
+  assert.deepEqual(d.calls[0].trace, {
+    webchat_control_grants: [{
+      endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      provider: "chatgpt",
+      account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }, {
+      endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      provider: "*",
+      account_ref: "*",
+    }],
+    webchat_authorization: {
+      principal_ref: "connector:conn_pagescopedgrant123",
+      connector_id: "conn_pagescopedgrant123",
+      grant_generation: 3,
+    },
+    browser_caller_session: {
+      provider: "chatgpt",
+      opaque_session_id: "openai-session-dispatch-grant-123",
+    },
+  }, "dispatch carries the routed device's explicit and Page Assist-derived grants plus caller provenance");
+  assert.equal(
+    JSON.stringify(d.calls[0].trace ?? {}).includes("be_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+    false,
+    "another device's grant endpoint must never travel with the dispatch",
+  );
+  assert.equal(d.calls[0].trace?.page_assist_grants, undefined, "dispatch is not a Page Assist caller");
+});
+
+test("user dispatches an agent task from a caller-session-routed WebChat turn | Given no device selector, WebChat and Page Assist grants on the resolved device, and a grant on another device | When herdr_mcp.agent.task.dispatch is forwarded | Then the resolved device's exact grants reach the parent-session gate and the other device's endpoint never travels", async () => {
+  const d = pageScopedGrantDeps();
+  const wiredDevice = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  d.value.resolveDevice = async (selector) => selector === undefined
+    ? { ok: true, device_id: wiredDevice, workstation_id: "w-target", routing_reason: "caller_session" }
+    : { ok: false, code: "device_not_found" };
+  const res = await handleMcp(
+    req(1, "tools/call", {
+      name: "herdr_call",
+      _meta: { "openai/session": "openai-session-dispatch-caller-route" },
+      arguments: {
+        method: "herdr_mcp.agent.task.dispatch",
+        params: JSON.stringify({
+          target: "pi",
+          text: "do durable child work",
+          current_user_message: "hand this to the workstation",
+          idempotency_key: "edge-agent-task-dispatch-caller-route",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1, "agent task dispatch forwards exactly once");
+  assert.deepEqual(d.calls[0].trace?.webchat_control_grants, [{
+    endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    provider: "chatgpt",
+    account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  }, {
+    endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    provider: "*",
+    account_ref: "*",
+  }], "a caller-session-routed dispatch carries the resolved device's grants without an explicit device selector");
+  assert.equal(
+    JSON.stringify(d.calls[0].trace ?? {}).includes("be_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+    false,
+    "another device's grant endpoint must never travel with the dispatch",
+  );
+});
+
+// Caller provenance and grant projection have distinct consumers.
+// `webchat_authorization` and `browser_caller_session` use `isAgentTaskCaller`
+// (`herdr_prompt` and `agent.task.dispatch`); `webchat_control_grants` is limited
+// to browser-private methods and `herdr_call(agent.task.dispatch)`, the paths
+// that consume device-scoped grants in the runtime.
+const CALLER_PREDICATE_DEVICE = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const CALLER_PREDICATE_OTHER_DEVICE_ENDPOINT = `be_${"f".repeat(64)}`;
+const CALLER_PREDICATE_SESSION = "openai-session-caller-predicate-parity";
+
+function callerPredicateRequest(id, caller, session) {
+  if (caller.surface === "herdr_prompt") {
+    return req(id, "tools/call", {
+      name: "herdr_prompt",
+      _meta: { "openai/session": session },
+      arguments: {
+        device: CALLER_PREDICATE_DEVICE,
+        target: "pi",
+        text: "do durable child work",
+        idempotency_key: `edge-caller-predicate-${id}`,
+      },
+    });
+  }
+  return req(id, "tools/call", {
+    name: "herdr_call",
+    _meta: { "openai/session": session },
+    arguments: {
+      method: caller.method,
+      device: CALLER_PREDICATE_DEVICE,
+      params: JSON.stringify(caller.params),
+    },
+  });
+}
+
+test("user dispatches from an agent-task caller | Given WebChat and Page Assist grants on the routed device and a grant on another device | When herdr_call(agent.task.dispatch) and herdr_prompt are forwarded | Then only the dispatch carries the routed device's grants while both keep caller authorization and session, and the other device's endpoint never travels", async () => {
+  const callers = [{
+    label: "agent task dispatch",
+    surface: "herdr_call",
+    method: "herdr_mcp.agent.task.dispatch",
+    params: {
+      target: "pi",
+      text: "do durable child work",
+      current_user_message: "hand this to the workstation",
+      idempotency_key: "edge-caller-predicate-dispatch",
+    },
+  }, {
+    label: "agent prompt",
+    surface: "herdr_prompt",
+  }];
+  for (const [index, caller] of callers.entries()) {
+    const d = pageScopedGrantDeps();
+    const res = await handleMcp(
+      callerPredicateRequest(`caller-predicate-${index}`, caller, CALLER_PREDICATE_SESSION),
+      "w1",
+      d.value,
+    );
+    assert.equal(res.body.result.isError, undefined, `${caller.label} forwards`);
+    assert.equal(d.calls.length, 1, `${caller.label} forwards exactly once`);
+    assert.deepEqual(d.calls[0].trace, {
+      ...(caller.surface === "herdr_call"
+        ? {
+          webchat_control_grants: [{
+            endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            provider: "chatgpt",
+            account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          }, {
+            endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            provider: "*",
+            account_ref: "*",
+          }],
+        }
+        : {}),
+      webchat_authorization: {
+        principal_ref: "connector:conn_pagescopedgrant123",
+        connector_id: "conn_pagescopedgrant123",
+        grant_generation: 3,
+      },
+      browser_caller_session: {
+        provider: "chatgpt",
+        opaque_session_id: CALLER_PREDICATE_SESSION,
+      },
+    }, `${caller.label} keeps its contracted grant and provenance shape`);
+    if (caller.surface === "herdr_prompt") {
+      assert.equal(
+        d.calls[0].trace?.webchat_control_grants,
+        undefined,
+        "legacy herdr_prompt must not receive newly forwarded WebChat control grants",
+      );
+    }
+    assert.equal(
+      JSON.stringify(d.calls[0].trace ?? {}).includes(CALLER_PREDICATE_OTHER_DEVICE_ENDPOINT),
+      false,
+      `${caller.label} must never carry another device's grant endpoint`,
+    );
+  }
+});
+
+test("user calls an ordinary tool from the same WebChat turn | Given WebChat and Page Assist grants on the routed device | When a non-agent-task, non-browser method is forwarded | Then no WebChat control grant and no caller authorization travel with it", async () => {
+  const d = pageScopedGrantDeps();
+  const res = await handleMcp(
+    req("caller-predicate-ordinary", "tools/call", {
+      name: "herdr_call",
+      _meta: { "openai/session": CALLER_PREDICATE_SESSION },
+      arguments: {
+        method: "pane.read",
+        device: CALLER_PREDICATE_DEVICE,
+        params: JSON.stringify({ pane_id: "w1:p1", source: "recent" }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined, "the ordinary tool still routes to the device it was told to");
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].args.method, "pane.read");
+  assert.equal(d.calls[0].trace, undefined, "an ordinary tool gets no caller projection at all");
+  assert.equal(d.calls[0].trace?.webchat_control_grants, undefined, "no WebChat control grant is forwarded");
+  assert.equal(d.calls[0].trace?.webchat_authorization, undefined, "no caller authorization is forwarded");
+  assert.equal(
+    JSON.stringify(d.calls[0]).includes(CALLER_PREDICATE_OTHER_DEVICE_ENDPOINT),
+    false,
+    "another device's grant endpoint must never travel with an ordinary tool",
+  );
+});
+
+// The `device_route_unverified` retry (route fence bootstrap) replaces the seed
+// route with the authoritative registry answer. Every device-scoped grant
+// projection must therefore follow the authoritative route: a seed device's
+// grants can never travel with a call the workstation executes for another
+// device, and an authoritative device's grants must appear even though the seed
+// trace was built earlier.
+const REROUTE_DEVICE_A = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const REROUTE_DEVICE_B = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+const REROUTE_ENDPOINT_A = `be_${"a".repeat(64)}`;
+const REROUTE_ENDPOINT_B = `be_${"b".repeat(64)}`;
+const REROUTE_PAGE_A = `be_${"e".repeat(64)}`;
+const REROUTE_PAGE_B = `be_${"f".repeat(64)}`;
+
+function rerouteDeps({ authoritativeFence = true } = {}) {
+  let registryReads = 0;
+  let attempts = 0;
+  const d = deps({
+    client: {
+      connectorId: "conn_reroutegrants123",
+      grantGeneration: 4,
+      webchatControlGrants: [
+        { device_id: REROUTE_DEVICE_A, endpoint_ref: REROUTE_ENDPOINT_A, provider: "chatgpt", account_ref: `br_${"1".repeat(64)}` },
+        { device_id: REROUTE_DEVICE_B, endpoint_ref: REROUTE_ENDPOINT_B, provider: "grok", account_ref: `br_${"2".repeat(64)}` },
+      ],
+      pageAssistGrants: [
+        { device_id: REROUTE_DEVICE_A, endpoint_ref: REROUTE_PAGE_A },
+        { device_id: REROUTE_DEVICE_B, endpoint_ref: REROUTE_PAGE_B },
+      ],
+    },
+    resolveDevice: async (selector) => {
+      registryReads += 1;
+      assert.equal(selector, REROUTE_DEVICE_A, "the authoritative re-resolution uses the caller's selector");
+      return {
+        ok: true,
+        device_id: REROUTE_DEVICE_B,
+        workstation_id: "ws-b",
+        routing_reason: "explicit_device",
+        ...(authoritativeFence
+          ? {
+            execution_fence: {
+              device_id: REROUTE_DEVICE_B,
+              workstation_id: "ws-b",
+              authorization: "active",
+              scheduling: "enabled",
+              revision: 11,
+            },
+          }
+          : {}),
+      };
+    },
+    forward: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response(JSON.stringify({
+          status: "error",
+          error: { ok: false, code: "device_route_unverified", retryable: false, delivery_state: "not_delivered" },
+        }), { status: 428, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { served: true } },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  return { ...d, registryReads: () => registryReads, attempts: () => attempts };
+}
+
+function rerouteDispatchRequest(id = 1) {
+  return req(id, "tools/call", {
+    name: "herdr_call",
+    _meta: { "openai/session": "openai-session-reroute-grants" },
+    arguments: {
+      method: "herdr_mcp.agent.task.dispatch",
+      device: REROUTE_DEVICE_A,
+      params: JSON.stringify({
+        target: "pi",
+        text: "do durable child work",
+        current_user_message: "hand this to the workstation",
+        idempotency_key: "edge-reroute-grants-regression",
+      }),
+    },
+  });
+}
+
+test("user dispatches through a cold execution fence | Given a canonical seed device A with grants on A and B, and an authoritative re-resolution to device B | When the first forward reports device_route_unverified | Then the retry carries only device B's grants and never device A's endpoints", async () => {
+  const d = rerouteDeps();
+  const res = await handleMcp(rerouteDispatchRequest(), "w1", d.value);
+  assert.equal(res.body.result.isError, undefined, "the retried dispatch settles on the authoritative route");
+  assert.equal(d.registryReads(), 1, "the seed canonical route is registry-free; only the retry reads the registry");
+  assert.deepEqual(d.targets, [REROUTE_DEVICE_A, "ws-b"], "the retry follows the authoritative workstation");
+  assert.equal(d.calls.length, 2, "device_route_unverified must retry exactly once");
+  assert.equal(d.calls[0].routeDeviceId, REROUTE_DEVICE_A);
+  assert.deepEqual(d.calls[0].trace?.webchat_control_grants, [
+    { endpoint_ref: REROUTE_ENDPOINT_A, provider: "chatgpt", account_ref: `br_${"1".repeat(64)}` },
+    { endpoint_ref: REROUTE_PAGE_A, provider: "*", account_ref: "*" },
+  ], "the seed forward is scoped to the seed device");
+  // The regression: the trace is rebuilt from the authoritative route, so the
+  // seed device's grants are gone and the authoritative device's grants appear.
+  assert.equal(d.calls[1].routeDeviceId, REROUTE_DEVICE_B);
+  assert.notEqual(d.calls[1].requestId, d.calls[0].requestId, "the authoritative retry uses a fresh request id");
+  assert.equal(d.calls[1].executionFence?.device_id, REROUTE_DEVICE_B);
+  assert.deepEqual(d.calls[1].trace?.webchat_control_grants, [
+    { endpoint_ref: REROUTE_ENDPOINT_B, provider: "grok", account_ref: `br_${"2".repeat(64)}` },
+    { endpoint_ref: REROUTE_PAGE_B, provider: "*", account_ref: "*" },
+  ], "the retry carries the authoritative device's explicit and Page Assist-derived grants");
+  assert.deepEqual(d.calls[1].trace?.webchat_authorization, {
+    principal_ref: "connector:conn_reroutegrants123",
+    connector_id: "conn_reroutegrants123",
+    grant_generation: 4,
+  }, "device-independent caller provenance survives the authoritative retry");
+  assert.deepEqual(d.calls[1].trace?.browser_caller_session, {
+    provider: "chatgpt",
+    opaque_session_id: "openai-session-reroute-grants",
+  });
+  const retriedTrace = JSON.stringify(d.calls[1].trace ?? {});
+  for (const seedRef of [REROUTE_ENDPOINT_A, REROUTE_PAGE_A]) {
+    assert.equal(retriedTrace.includes(seedRef), false, `the retry must not carry the seed device's grant ${seedRef}`);
+  }
+});
+
+// The short-window read dedupe key is a device-scoped identity: the
+// WorkstationDO replays an in-flight/recent read completion keyed by it and
+// wraps the reply with the current `routeDeviceId`. Reusing a seed-device key
+// after the authoritative retry re-routes to another device would return one
+// device's cached read result as another device's reply.
+test("user reads through a cold execution fence | Given a canonical seed device A with an authoritative re-resolution to device B | When the first forward reports device_route_unverified | Then the retried read is keyed to device B and cannot replay the seed device's cached read", async () => {
+  let attempts = 0;
+  let registryReads = 0;
+  const d = deps({
+    client: { connectorId: "conn_readdedupe123", grantGeneration: 4, authSource: "oauth_edge" },
+    resolveDevice: async (selector) => {
+      registryReads += 1;
+      assert.equal(selector, REROUTE_DEVICE_A, "only the authoritative retry consults the registry");
+      return {
+        ok: true,
+        device_id: REROUTE_DEVICE_B,
+        workstation_id: "ws-b",
+        routing_reason: "explicit_device",
+        execution_fence: {
+          device_id: REROUTE_DEVICE_B,
+          workstation_id: "ws-b",
+          authorization: "active",
+          scheduling: "enabled",
+          revision: 12,
+        },
+      };
+    },
+    forward: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response(JSON.stringify({
+          status: "error",
+          error: { ok: false, code: "device_route_unverified", retryable: false, delivery_state: "not_delivered" },
+        }), { status: 428, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { served: true } },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  const read = (id, device) => handleMcp(req(id, "tools/call", {
+    name: "herdr_git",
+    arguments: { device, root: "/repo", action: "status" },
+  }), "w1", d.value);
+
+  const retried = await read("read-dedupe-reroute", REROUTE_DEVICE_A);
+  assert.equal(retried.body.result.isError, undefined, "the retried read settles on the authoritative route");
+  assert.equal(registryReads, 1, "the seed canonical route is registry-free; only the retry reads the registry");
+  assert.deepEqual(d.targets, [REROUTE_DEVICE_A, "ws-b"], "the retry follows the authoritative workstation");
+  assert.equal(d.calls.length, 2, "device_route_unverified must retry exactly once");
+  assert.equal(d.calls[0].routeDeviceId, REROUTE_DEVICE_A);
+  assert.match(d.calls[0].readDedupeKey, /^read_[0-9a-f]{64}$/, "the seeded read carries a dedupe key");
+  assert.equal(d.calls[1].routeDeviceId, REROUTE_DEVICE_B);
+  assert.equal(d.calls[1].executionFence?.device_id, REROUTE_DEVICE_B);
+  assert.match(d.calls[1].readDedupeKey, /^read_[0-9a-f]{64}$/, "the retried read still coalesces");
+  assert.notEqual(
+    d.calls[1].readDedupeKey,
+    d.calls[0].readDedupeKey,
+    "a retry routed to another device must not reuse the seed device's dedupe key",
+  );
+
+  // Control reads routed directly (no fence bootstrap) prove which device each
+  // key belongs to: the seed key is device A's key and the retried key is
+  // exactly the key device B would have produced.
+  const directA = await read("read-dedupe-direct-a", REROUTE_DEVICE_A);
+  const directB = await read("read-dedupe-direct-b", REROUTE_DEVICE_B);
+  assert.equal(directA.body.result.isError, undefined);
+  assert.equal(directB.body.result.isError, undefined);
+  assert.equal(d.calls.length, 4);
+  assert.equal(d.calls[2].readDedupeKey, d.calls[0].readDedupeKey, "the seed forward used device A's read key");
+  assert.equal(d.calls[3].readDedupeKey, d.calls[1].readDedupeKey, "the retried forward used device B's read key");
+  assert.equal(d.calls[3].routeDeviceId, REROUTE_DEVICE_B, "the control read routed to device B directly");
 });

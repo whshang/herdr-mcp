@@ -1237,6 +1237,12 @@ export async function handleMcp(
       && !isPageAssistPrivateMethod;
     const isAgentTaskCaller = name === "herdr_prompt"
       || localMethod === "herdr_mcp.agent.task.dispatch";
+    // The WebChat control grant projection keeps PR #698's dispatch-only
+    // contract: `webchat_authorization` / `browser_caller_session` may cover the
+    // wider caller predicate above, but legacy `herdr_prompt` must not gain new
+    // trace authority (its forwarded trace shape is unchanged).
+    const isWebchatControlGrantCaller = isBrowserPrivateMethod
+      || (name === "herdr_call" && localMethod === "herdr_mcp.agent.task.dispatch");
     if (isBrowserPrivateMethod || isPageAssistPrivateMethod) {
       if (typeof selectorValue !== "string" || selectorValue.trim().length === 0) {
         return rpcResult(id, callToolResult({
@@ -1362,29 +1368,47 @@ export async function handleMcp(
     // on that exact device+endpoint (provider "*"). Derived at forward time, so
     // existing Page Assist grants work without migration and Page Assist deny
     // revokes it; explicitly issued per-provider grants are unaffected.
-    const webchatControlGrants: Array<{ endpoint_ref: string; provider: string; account_ref: string }> = [];
-    if (isBrowserPrivateMethod && initialRouteDeviceId) {
+    //
+    // The projection is gated by the dispatch-only caller predicate
+    // (`isWebchatControlGrantCaller`), so `agent.task.dispatch` receives the
+    // grants its parent-session binder reads while legacy `herdr_prompt` keeps
+    // its previous trace shape. The projection stays device-scoped to the
+    // routed device; this does not mint, widen, or persist any grant.
+    // Both grant projections below are functions of the routed device, never of
+    // the seed route alone: the `device_route_unverified` retry replaces `route`
+    // with the authoritative registry answer and re-projects from that device, so
+    // a seed device's grants can never travel with a call executed elsewhere.
+    const projectWebchatControlGrants = (deviceId: string | null | undefined) => {
+      const projected: Array<{ endpoint_ref: string; provider: string; account_ref: string }> = [];
+      if (!isWebchatControlGrantCaller || !deviceId) return projected;
       const seen = new Set<string>();
       const push = (grant: { endpoint_ref: string; provider: string; account_ref: string }) => {
         const key = `${grant.endpoint_ref}\u0000${grant.provider}\u0000${grant.account_ref}`;
-        if (seen.has(key) || webchatControlGrants.length >= 32) return;
+        if (seen.has(key) || projected.length >= 32) return;
         seen.add(key);
-        webchatControlGrants.push(grant);
+        projected.push(grant);
       };
       for (const grant of deps.client?.webchatControlGrants ?? []) {
-        if (grant.device_id !== initialRouteDeviceId) continue;
+        if (grant.device_id !== deviceId) continue;
         push({ endpoint_ref: grant.endpoint_ref, provider: grant.provider, account_ref: grant.account_ref });
       }
       for (const grant of deps.client?.pageAssistGrants ?? []) {
-        if (grant.device_id !== initialRouteDeviceId) continue;
+        if (grant.device_id !== deviceId) continue;
+        // A wildcard Page Assist endpoint must never derive a wildcard
+        // provider/account grant, which would widen it into device scope.
+        // Skip the row entirely; concrete endpoints still derive their grant.
+        if (grant.endpoint_ref === "*") continue;
         push({ endpoint_ref: grant.endpoint_ref, provider: "*", account_ref: "*" });
       }
-    }
-    const pageAssistGrants = isPageAssistPrivateMethod && initialRouteDeviceId
+      return projected;
+    };
+    const projectPageAssistGrants = (deviceId: string | null | undefined) => isPageAssistPrivateMethod && deviceId
       ? (deps.client?.pageAssistGrants ?? [])
-        .filter((grant) => grant.device_id === initialRouteDeviceId)
+        .filter((grant) => grant.device_id === deviceId)
         .map((grant) => ({ endpoint_ref: grant.endpoint_ref }))
       : [];
+    const webchatControlGrants = projectWebchatControlGrants(initialRouteDeviceId);
+    const pageAssistGrants = projectPageAssistGrants(initialRouteDeviceId);
     const webchatAuthorization = (isBrowserPrivateMethod || isAgentTaskCaller)
       && deps.client?.connectorId
       && Number.isSafeInteger(deps.client.grantGeneration)
@@ -1398,20 +1422,27 @@ export async function handleMcp(
     const browserCallerSession = (isBrowserPrivateMethod || isAgentTaskCaller) && openaiSession
       ? { provider: "chatgpt", opaque_session_id: openaiSession }
       : null;
-    const readDedupeKey = opClass === "read"
+    // The short-window read dedupe key is a device-scoped identity, not just a
+    // coalescing hint: the WorkstationDO replays an in-flight/recent read
+    // completion keyed by it and wraps the reply with the *current*
+    // `routeDeviceId`, so a key built for one routed device must never be reused
+    // after the route changes to another device. Built from an explicit device so
+    // the authoritative route retry below can recompute it with the same fields.
+    const buildReadDedupeKey = async (deviceId: string | null | undefined) => opClass === "read"
       ? `read_${await sha256Hex(JSON.stringify(stableDedupeValue({
           op: name,
           args: runtimeArgs,
-          route_device_id: route.device_id ?? null,
+          route_device_id: deviceId ?? null,
           connector_id: deps.client?.connectorId ?? null,
           grant_generation: deps.client?.grantGeneration ?? null,
           auth_source: deps.client?.authSource ?? null,
           automation_device_id: deps.client?.automationDeviceId ?? null,
-          webchat_control_grants: webchatControlGrants,
-          page_assist_grants: pageAssistGrants,
+          webchat_control_grants: projectWebchatControlGrants(deviceId),
+          page_assist_grants: projectPageAssistGrants(deviceId),
           browser_caller_session: browserCallerSession,
         })))}`
       : undefined;
+    const readDedupeKey = await buildReadDedupeKey(route.device_id);
     const requestedToolTimeoutMs =
       typeof runtimeArgs.timeout_ms === "number" && Number.isFinite(runtimeArgs.timeout_ms)
         ? Math.max(1, runtimeArgs.timeout_ms)
@@ -1580,10 +1611,31 @@ export async function handleMcp(
         route = authoritative;
         usedCanonicalFastRoute = false;
         activeRequestId = retryRequestId;
+        // The authoritative route may name a different device than the seed
+        // route (a canonical id the registry no longer maps to its own
+        // workstation). Recompute both device-scoped grant projections from it
+        // so the seed device's grants never travel with a call the workstation
+        // executes for another device. Connector authorization and caller
+        // session are device-independent and are carried over unchanged.
+        const authoritativeWebchatControlGrants = projectWebchatControlGrants(route.device_id);
+        const authoritativePageAssistGrants = projectPageAssistGrants(route.device_id);
+        const authoritativeTrace: InternalForwardRequest["trace"] = {
+          ...(authoritativeWebchatControlGrants.length > 0 ? { webchat_control_grants: authoritativeWebchatControlGrants } : {}),
+          ...(authoritativePageAssistGrants.length > 0 ? { page_assist_grants: authoritativePageAssistGrants } : {}),
+          ...(webchatAuthorization ? { webchat_authorization: webchatAuthorization } : {}),
+          ...(browserCallerSession ? { browser_caller_session: browserCallerSession } : {}),
+        };
         activeInternal = {
           ...activeInternal,
           requestId: retryRequestId,
           ...(route.device_id ? { routeDeviceId: route.device_id } : { routeDeviceId: undefined }),
+          ...(authoritativeTrace && Object.keys(authoritativeTrace).length > 0
+            ? { trace: authoritativeTrace }
+            : { trace: undefined }),
+          // The dedupe key is device-scoped too: replaying a completion cached
+          // for the seed device under a route to the authoritative device would
+          // wrap another device's read result in this call's reply.
+          readDedupeKey: await buildReadDedupeKey(route.device_id),
           ...(route.execution_fence ? { executionFence: route.execution_fence } : { executionFence: undefined }),
         };
         forwarded = undefined;
