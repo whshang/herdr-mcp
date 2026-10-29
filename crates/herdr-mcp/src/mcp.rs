@@ -5454,6 +5454,12 @@ fn current_user_message_param(params: &Value) -> Result<Option<&str>, ()> {
     if message.len() > 262_144 {
         return Err(());
     }
+    // A message made only of App-mention tokens canonicalizes to the empty
+    // string, which every other mention-only turn shares: it carries no
+    // identity and must never resolve a source turn (#741).
+    if canonical_source_turn_text(message).is_empty() {
+        return Err(());
+    }
     Ok(Some(message))
 }
 
@@ -12218,6 +12224,19 @@ mod tests {
             source_turn_sha256(" 回复 OK "),
             browser_sha256("回复 OK"),
             "plain trimmed text keeps its pre-#741 digest"
+        );
+        // Mention-only text has no identity: it is rejected as evidence.
+        assert_eq!(canonical_source_turn_text(" @herdr  herdr-mcp\u{00a0}"), "");
+        for message in ["@herdr", "herdr-mcp", "@HERDR_MCP herdr"] {
+            assert_eq!(
+                current_user_message_param(&json!({ "current_user_message": message })),
+                Err(()),
+                "{message:?}"
+            );
+        }
+        assert_eq!(
+            current_user_message_param(&json!({ "current_user_message": "@herdr 归档" })),
+            Ok(Some("@herdr 归档"))
         );
     }
 

@@ -1073,6 +1073,11 @@ fn extension_browser_source_turn_observe(
     if !canonical_url.starts_with("https://chatgpt.com/") {
         return Err("browser_canonical_url_invalid".to_owned());
     }
+    // Mention-only text canonicalizes to "" and would collide with every
+    // other mention-only turn; it is not source-turn evidence (#741).
+    if mcp::canonical_source_turn_text(user_text).is_empty() {
+        return Err("browser_user_text_invalid".to_owned());
+    }
     let user_text_sha256 = mcp::source_turn_sha256(user_text);
     let mut store = state
         .state_store
@@ -7075,7 +7080,31 @@ mod tests {
                 "@herdr-mcp 重复的派发消息",
                 json!({"bound": false, "reason": "source_turn_ambiguous"}),
             ),
+            // Mention-only text canonicalizes to "" and is never evidence.
+            (
+                "opaque-mention-a",
+                "@herdr-mcp",
+                json!({"bound": false, "reason": "current_user_message_invalid"}),
+            ),
         ];
+        // The extension cannot record a mention-only turn either.
+        let response = app
+            .clone()
+            .oneshot(registry_request(json!({
+                "operation": "source_turn.observe",
+                "canonical_url": "https://chatgpt.com/c/dispatch-mention",
+                "user_text": "@herdr herdr-mcp",
+                "observed_at": now + 1
+            })))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&body).contains("browser_user_text_invalid"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
         for (index, (opaque, message, expected)) in cases.iter().enumerate() {
             let result = webchat_tool_call(
                 app.clone(),
