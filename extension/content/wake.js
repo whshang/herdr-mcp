@@ -295,13 +295,48 @@ function normalizeHerdrMentionAlias(value) {
     } catch (_) {}
   }
 
+  // ---- ChatGPT user-turn selectors ----
+  // ChatGPT (2026-10) stopped rendering [data-message-author-role="user"]; a
+  // user turn is now div[data-user-message-bubble="true"] whose text lives in
+  // an inner .whitespace-pre-wrap node. The legacy attribute stays the primary
+  // selector; a bubble only counts as a user turn when no legacy author-role
+  // node already covers it, so mixed DOMs never double-count a turn.
+  const LEGACY_USER_TURN_SELECTOR = '[data-message-author-role="user"]';
+  const USER_BUBBLE_SELECTOR = '[data-user-message-bubble="true"]';
+  const USER_BUBBLE_TEXT_SELECTOR = ".whitespace-pre-wrap";
+  function userBubbleCoveredByLegacyRole(el) {
+    try {
+      return Boolean(el?.closest?.("[data-message-author-role]") || el?.querySelector?.(LEGACY_USER_TURN_SELECTOR));
+    } catch (_) {
+      return false;
+    }
+  }
+  function conversationTurnRole(el) {
+    const authored = el?.getAttribute?.("data-message-author-role");
+    if (authored) return authored;
+    if (el?.matches?.(USER_BUBBLE_SELECTOR) && !userBubbleCoveredByLegacyRole(el)) return "user";
+    return null;
+  }
+  function userTurnTextRoot(el) {
+    if (!el?.matches?.(USER_BUBBLE_SELECTOR)) return el;
+    return el.querySelector?.(USER_BUBBLE_TEXT_SELECTOR) || el;
+  }
+  function conversationTurnNodesForRole(role) {
+    if (role !== "user") return [...document.querySelectorAll(`[data-message-author-role="${role}"]`)];
+    return [...document.querySelectorAll(`${LEGACY_USER_TURN_SELECTOR}, ${USER_BUBBLE_SELECTOR}`)]
+      .filter((el) => conversationTurnRole(el) === "user");
+  }
+
   function observedConversationTurns() {
     if (!CONTEXT_PRESSURE) return [];
     const observations = [];
-    const nodes = [...document.querySelectorAll('[data-message-author-role="user"], [data-message-author-role="assistant"]')];
+    const nodes = [...document.querySelectorAll(
+      `[data-message-author-role="user"], [data-message-author-role="assistant"], ${USER_BUBBLE_SELECTOR}`,
+    )];
     for (const el of nodes) {
-      const role = el.getAttribute("data-message-author-role");
-      const text = String(el.innerText || el.textContent || "").trim();
+      const role = conversationTurnRole(el);
+      const textRoot = userTurnTextRoot(el);
+      const text = String(textRoot?.innerText || textRoot?.textContent || "").trim();
       if (!text || (role !== "user" && role !== "assistant")) continue;
       const turn = el.closest("[data-turn-id]");
       const message = el.closest("[data-message-id]");
@@ -1525,14 +1560,15 @@ function normalizeHerdrMentionAlias(value) {
   function markLatestTurnsDirty() { latestTurnsDirty = true; }
   function rediscoverLatestTurns() {
     const nodes = document.querySelectorAll(
-      '[data-message-author-role="user"], [data-message-author-role="assistant"]',
+      '[data-message-author-role="user"], [data-message-author-role="assistant"], '
+        + USER_BUBBLE_SELECTOR,
     );
     let user = null;
     let assistant = null;
     let userCount = 0;
     let assistantCount = 0;
     for (const node of nodes) {
-      const role = node.getAttribute("data-message-author-role");
+      const role = conversationTurnRole(node);
       if (role === "user") { user = node; userCount += 1; }
       else if (role === "assistant") { assistant = node; assistantCount += 1; }
     }
@@ -1545,7 +1581,7 @@ function normalizeHerdrMentionAlias(value) {
   }
   function latestTurnForRole(role) {
     if (!latestTurnCacheActive) {
-      const nodes = document.querySelectorAll(`[data-message-author-role="${role}"]`);
+      const nodes = conversationTurnNodesForRole(role);
       return nodes[nodes.length - 1] || null;
     }
     if (latestTurnsDirty) rediscoverLatestTurns();
@@ -1554,6 +1590,7 @@ function normalizeHerdrMentionAlias(value) {
 
   function sampleLatestMessageText(el, { modelVisibleUser = false } = {}) {
     if (!el) return { text: "", total_chars: 0, truncated: false };
+    el = userTurnTextRoot(el);
     if (modelVisibleUser && BROWSER_PERFORMANCE?.sampleChatGptModelMessageText) {
       return BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el);
     }
@@ -1825,7 +1862,7 @@ function normalizeHerdrMentionAlias(value) {
     const snapshot = latestDomMessageSnapshot(role);
     return {
       ...snapshot,
-      count: document.querySelectorAll(`[data-message-author-role="${role}"]`).length,
+      count: conversationTurnNodesForRole(role).length,
     };
   }
 
@@ -4136,6 +4173,8 @@ function normalizeHerdrMentionAlias(value) {
     }
     const authored = (el.matches?.(`[data-message-author-role="${role}"]`) ? el : null)
       || el.querySelector?.(`[data-message-author-role="${role}"]`)
+      || (role === "user" && conversationTurnRole(el) === "user" ? el : null)
+      || (role === "user" ? el.querySelector?.(USER_BUBBLE_SELECTOR) : null)
       || null;
     const exactMessageId = authored?.getAttribute?.("data-message-id")
       || authored?.closest?.("[data-message-id]")?.getAttribute?.("data-message-id")
@@ -4149,7 +4188,7 @@ function normalizeHerdrMentionAlias(value) {
     // a user turn-id is usable only because the candidate path later requires it
     // to equal the already accepted provider user-message identity.
     const messageId = exactMessageId || (role === "user" ? turnId : null);
-    const textRoot = authored
+    const textRoot = userTurnTextRoot(authored)
       || (role === "assistant"
         ? (el.querySelector?.("[data-message-content]") || el.querySelector?.(".markdown") || null)
         : el);
@@ -4168,12 +4207,13 @@ function normalizeHerdrMentionAlias(value) {
   function chatGptDomTurnSequence() {
     const nodes = [...document.querySelectorAll(
       '[data-message-author-role="user"], section[data-turn="user"], '
-        + '[data-message-author-role="assistant"], section[data-turn="assistant"]',
+        + '[data-message-author-role="assistant"], section[data-turn="assistant"], '
+        + USER_BUBBLE_SELECTOR,
     )];
     const seen = new Set();
     const turns = [];
     for (const el of nodes) {
-      const role = el.getAttribute?.("data-message-author-role") || el.getAttribute?.("data-turn") || null;
+      const role = conversationTurnRole(el) || el.getAttribute?.("data-turn") || null;
       if (role !== "user" && role !== "assistant") continue;
       const snapshot = domMessageSnapshotFromElement(el, role);
       const structuralId = snapshot.messageId || snapshot.turnId;
@@ -5815,6 +5855,7 @@ function normalizeHerdrMentionAlias(value) {
     let lastReportedTurnKey = "";
     const artifactCaptureTurnKeys = new Set();
     let lastStartedJournalKey = "";
+    let lastNoBubbleLoggedSubmitAt = 0;
     let lastAsstLen = initialAssistant.totalChars;
     let lastAsstSignature = assistantSignature(initialAssistant.text);
     let lastAsstCount = initialAssistant.count;
@@ -5870,7 +5911,12 @@ function normalizeHerdrMentionAlias(value) {
 
     const noteTrustedManualSubmit = () => {
       const text = composerModelVisibleText();
-      if (!text || !CONVERSATION_HEALTH || !conversationHealth) return;
+      if (!text || !CONVERSATION_HEALTH || !conversationHealth) {
+        const reason = !text ? "empty composer text"
+          : (!CONVERSATION_HEALTH ? "conversation health unavailable" : "empty conversationHealth");
+        console.debug(`[h2w] source turn capture skipped: ${reason}`);
+        return;
+      }
       const at = Date.now();
       markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth, at));
       observedSubmitAt = at;
@@ -5887,7 +5933,10 @@ function normalizeHerdrMentionAlias(value) {
     document.addEventListener("keydown", (event) => {
       if (!event.isTrusted || event.key !== "Enter" || event.shiftKey || event.isComposing) return;
       const input = ADAPTER.getInputEl();
-      if (!input) return;
+      if (!input) {
+        console.debug("[h2w] source turn capture skipped: no input el");
+        return;
+      }
       const target = event.target;
       if (target !== input && !input.contains?.(target)) return;
       noteTrustedManualSubmit();
@@ -6015,6 +6064,14 @@ function normalizeHerdrMentionAlias(value) {
       const currentUserText = currentUser.text;
       const currentUserSignature = assistantSignature(currentUserText);
       const currentUserCount = currentUser.count;
+      if (!currentUserText) {
+        const pendingSubmitAt = Number(conversationHealth?.last_user_submit_at || 0);
+        if (pendingSubmitAt > 0 && Date.now() - pendingSubmitAt <= 30000
+          && pendingSubmitAt !== lastNoBubbleLoggedSubmitAt) {
+          lastNoBubbleLoggedSubmitAt = pendingSubmitAt;
+          console.debug(`[h2w] source turn capture skipped: no user bubble (count=${currentUserCount})`);
+        }
+      }
       const userChanged = currentUserText && (currentUserSignature !== lastUserSignature || currentUserCount > lastUserCount);
       if (userChanged) {
         // ChatGPT virtualizes old turns while scrolling. A mounted user node
@@ -6032,6 +6089,11 @@ function normalizeHerdrMentionAlias(value) {
           && (comparableCurrentUser.includes(expectedUser.slice(0, 160))
             || expectedUser.includes(comparableCurrentUser.slice(0, 160)));
         const journalKey = `${submitAt}`;
+        if (!confirmedPendingUser && submitAt > 0 && journalKey !== lastStartedJournalKey) {
+          const reason = Date.now() - submitAt > 30000 ? "stale submit anchor"
+            : (!expectedUser ? "no expected user text" : "text mismatch");
+          console.debug(`[h2w] source turn capture skipped: ${reason} (expected_len=${expectedUser.length}, bubble_len=${comparableCurrentUser.length})`);
+        }
         if (confirmedPendingUser && journalKey !== lastStartedJournalKey) {
           lastStartedJournalKey = journalKey;
           void sendBg({
