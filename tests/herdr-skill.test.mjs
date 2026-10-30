@@ -161,7 +161,7 @@ test("fetchHerdrSkill appends release-matched native Herdr reference with remote
   }
 });
 
-test("WebChat dispatch guidance routes binding through agent.task.dispatch | Given the served planner policy | When a WebChat caller dispatches | Then it uses herdr_call with current_user_message, knows herdr_prompt never binds, and reports parent_session reason", () => {
+test("user gets conversation-bound WebChat dispatch guidance | Given the served planner policy | When a WebChat caller dispatches | Then it uses herdr_call with current_user_message, knows herdr_prompt never binds, and reports parent_session reason", () => {
   const globalAgents = readFileSync(new URL("../assets/herdr/AGENTS.md", import.meta.url), "utf8");
   const dispatchSkill = readFileSync(
     new URL("../assets/herdr/skills/agent-dispatch/SKILL.md", import.meta.url),
