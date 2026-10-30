@@ -312,9 +312,13 @@ pub enum MemoryCommand {
 pub enum AgentCommand {
     Gate(AgentGateCommand),
     Dispatch {
-        target: String,
+        /// Existing agent/pane/role target; absent for a spawn dispatch.
+        target: Option<String>,
         text: String,
-        parent_target: String,
+        /// One-shot spawn facts (`--spawn-*`): create the pane, start the
+        /// agent, wait for readiness and prompt it in one call.
+        spawn: Option<Box<AgentDispatchSpawn>>,
+        parent_target: Option<String>,
         idempotency_key: String,
         inject_task_identity: bool,
         stall_after_ms: Option<u64>,
@@ -342,6 +346,20 @@ pub enum AgentCommand {
     Ack {
         task_id: String,
     },
+}
+
+/// Local CLI parity for one-shot `spawn` dispatch facts. The runtime method
+/// stays `herdr_mcp.agent.task.dispatch`; these fields become its `spawn` object.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgentDispatchSpawn {
+    pub kind: String,
+    pub workspace: Option<String>,
+    pub cwd: Option<String>,
+    pub name: Option<String>,
+    pub tab_label: Option<String>,
+    pub split_from: Option<String>,
+    pub direction: Option<String>,
+    pub startup_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -911,28 +929,25 @@ fn parse_agent_gate(args: &[String]) -> Result<Command, String> {
     Ok(Command::Agent(AgentCommand::Gate(command)))
 }
 
+/// Value of one `--flag value` pair; an empty or missing value is an error
+/// instead of silently becoming an empty spawn/target field.
+fn dispatch_flag_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
+    args.get(index + 1)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
 fn parse_agent(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
         Some("gate") => parse_agent_gate(&args[1..]),
         Some("dispatch") => {
-            if args.len() < 3 {
-                return Err(
-                    "agent dispatch requires (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N]"
-                        .to_owned(),
-                );
-            }
-            let (target, text, mut index) = if args[1] == "--target" {
-                let target = args.get(2).ok_or("--target requires a value")?;
-                let text = args
-                    .get(3)
-                    .ok_or("agent dispatch requires text after --target <target>")?;
-                (target.clone(), text.clone(), 4)
-            } else {
-                (args[1].clone(), args[2].clone(), 3)
-            };
-            if target.is_empty() || text.is_empty() {
-                return Err("agent dispatch target/text must not be empty".to_owned());
-            }
+            // Two call shapes share one method name: reuse an existing agent
+            // (`target`) or spawn one from `--spawn-*` facts. A spawn dispatch
+            // has no target, so the first positional is the task text.
+            const USAGE: &str = "agent dispatch (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N] | agent dispatch --spawn-kind KIND [--spawn-workspace W] [--spawn-cwd P] [--spawn-name N] [--spawn-tab-label L] [--spawn-split-from PANE] [--spawn-direction right|down] [--spawn-startup-timeout-ms N] <text> --idempotency-key <key> [--parent <target>] [--inject-task-identity] [--stall-after-ms N] [--wait] [--timeout-ms N]";
+            let mut target = None;
+            let mut positionals: Vec<String> = Vec::new();
             let mut inject_task_identity = false;
             let mut stall_after_ms = None;
             let mut max_concurrent = None;
@@ -942,8 +957,27 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
             let mut idempotency_key = None;
             let mut wait = false;
             let mut timeout_ms = 25_000_u64;
+            let mut spawn_kind = None;
+            let mut spawn_workspace = None;
+            let mut spawn_cwd = None;
+            let mut spawn_name = None;
+            let mut spawn_tab_label = None;
+            let mut spawn_split_from = None;
+            let mut spawn_direction = None;
+            let mut spawn_startup_timeout_ms = None;
+            let mut index = 1;
             while index < args.len() {
-                match args[index].as_str() {
+                let flag = args[index].as_str();
+                if !flag.starts_with("--") {
+                    positionals.push(flag.to_owned());
+                    index += 1;
+                    continue;
+                }
+                match flag {
+                    "--target" => {
+                        target = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
                     "--max-concurrent" => {
                         max_concurrent = Some(
                             args.get(index + 1)
@@ -954,18 +988,11 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                         index += 2;
                     }
                     "--workspace-id" => {
-                        workspace_id = Some(
-                            args.get(index + 1)
-                                .filter(|value| !value.is_empty())
-                                .ok_or("--workspace-id requires a value")?
-                                .clone(),
-                        );
+                        workspace_id = Some(dispatch_flag_value(args, index, flag)?);
                         index += 2;
                     }
                     "--stall-after-ms" => {
-                        let value = args
-                            .get(index + 1)
-                            .ok_or_else(|| "--stall-after-ms requires a value".to_owned())?;
+                        let value = dispatch_flag_value(args, index, flag)?;
                         stall_after_ms = Some(
                             value
                                 .parse::<u64>()
@@ -982,25 +1009,15 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                         index += 1;
                     }
                     "--parent-session-ref" => {
-                        let Some(value) = args.get(index + 1).filter(|value| !value.is_empty())
-                        else {
-                            return Err("--parent-session-ref requires a value".to_owned());
-                        };
-                        parent_session_ref = Some(value.clone());
+                        parent_session_ref = Some(dispatch_flag_value(args, index, flag)?);
                         index += 2;
                     }
                     "--parent" => {
-                        let Some(value) = args.get(index + 1) else {
-                            return Err("--parent requires a target".to_owned());
-                        };
-                        parent_target = Some(value.clone());
+                        parent_target = Some(dispatch_flag_value(args, index, flag)?);
                         index += 2;
                     }
                     "--idempotency-key" => {
-                        let Some(value) = args.get(index + 1) else {
-                            return Err("--idempotency-key requires a value".to_owned());
-                        };
-                        idempotency_key = Some(value.clone());
+                        idempotency_key = Some(dispatch_flag_value(args, index, flag)?);
                         index += 2;
                     }
                     "--wait" => {
@@ -1008,9 +1025,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                         index += 1;
                     }
                     "--timeout-ms" => {
-                        let Some(value) = args.get(index + 1) else {
-                            return Err("--timeout-ms requires a value".to_owned());
-                        };
+                        let value = dispatch_flag_value(args, index, flag)?;
                         timeout_ms = value
                             .parse::<u64>()
                             .ok()
@@ -1020,15 +1035,125 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                             })?;
                         index += 2;
                     }
+                    "--spawn-kind" => {
+                        spawn_kind = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-workspace" => {
+                        spawn_workspace = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-cwd" => {
+                        spawn_cwd = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-name" => {
+                        spawn_name = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-tab-label" => {
+                        spawn_tab_label = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-split-from" => {
+                        spawn_split_from = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-direction" => {
+                        let value = dispatch_flag_value(args, index, flag)?;
+                        if value != "right" && value != "down" {
+                            return Err("--spawn-direction must be right or down".to_owned());
+                        }
+                        spawn_direction = Some(value);
+                        index += 2;
+                    }
+                    "--spawn-startup-timeout-ms" => {
+                        let value = dispatch_flag_value(args, index, flag)?;
+                        spawn_startup_timeout_ms = Some(
+                            value
+                                .parse::<u64>()
+                                .ok()
+                                .filter(|value| (1..=100_000).contains(value))
+                                .ok_or_else(|| {
+                                    "--spawn-startup-timeout-ms must be an integer in 1..=100000"
+                                        .to_owned()
+                                })?,
+                        );
+                        index += 2;
+                    }
                     flag => return Err(format!("unknown agent dispatch option '{flag}'")),
                 }
             }
+            let spawn = match spawn_kind {
+                Some(kind) => Some(Box::new(AgentDispatchSpawn {
+                    kind,
+                    workspace: spawn_workspace,
+                    cwd: spawn_cwd,
+                    name: spawn_name,
+                    tab_label: spawn_tab_label,
+                    split_from: spawn_split_from,
+                    direction: spawn_direction,
+                    startup_timeout_ms: spawn_startup_timeout_ms,
+                })),
+                None => {
+                    if spawn_workspace.is_some()
+                        || spawn_cwd.is_some()
+                        || spawn_name.is_some()
+                        || spawn_tab_label.is_some()
+                        || spawn_split_from.is_some()
+                        || spawn_direction.is_some()
+                        || spawn_startup_timeout_ms.is_some()
+                    {
+                        return Err(
+                            "agent dispatch --spawn-* options require --spawn-kind KIND".to_owned()
+                        );
+                    }
+                    None
+                }
+            };
+            let (target, text) = match &spawn {
+                Some(_) => {
+                    if target.is_some() {
+                        return Err(
+                            "agent dispatch --target cannot be combined with --spawn-kind"
+                                .to_owned(),
+                        );
+                    }
+                    match positionals.as_slice() {
+                        [text] => (None, text.clone()),
+                        _ => {
+                            return Err(format!(
+                                "agent dispatch --spawn-kind requires exactly one <text> positional ({USAGE})"
+                            ));
+                        }
+                    }
+                }
+                None => match (target, positionals.as_slice()) {
+                    (Some(target), [text]) => (Some(target), text.clone()),
+                    (None, [target, text]) => (Some(target.clone()), text.clone()),
+                    _ => {
+                        return Err(format!(
+                            "agent dispatch requires (<target> | --target <target>) <text> ({USAGE})"
+                        ));
+                    }
+                },
+            };
+            if text.is_empty() || target.as_deref() == Some("") {
+                return Err("agent dispatch target/text must not be empty".to_owned());
+            }
+            let parent_target = match &spawn {
+                Some(_) => parent_target,
+                None => Some(
+                    parent_target
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| "--parent is required".to_owned())?,
+                ),
+            };
             Ok(Command::Agent(AgentCommand::Dispatch {
                 target,
                 text,
-                parent_target: parent_target
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| "--parent is required".to_owned())?,
+                spawn,
+                parent_target,
                 idempotency_key: idempotency_key
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| "--idempotency-key is required".to_owned())?,
@@ -2793,6 +2918,7 @@ User path:\n\
   herdr-mcp agent-skill <status|sync>  (repo-fetched user-global local-agent Skill; exact runtime source identity)\n\
   herdr-mcp continuity <search|resume> ...  (durable prior-work discovery for local coding agents)\n\
   herdr-mcp agent dispatch (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N]\n\
+  herdr-mcp agent dispatch --spawn-kind KIND [--spawn-workspace W] [--spawn-cwd P] [--spawn-name N] [--spawn-tab-label L] [--spawn-split-from PANE] [--spawn-direction right|down] [--spawn-startup-timeout-ms N] <text> --idempotency-key <key> [--parent <target>] [--inject-task-identity]\n\
       Roles: @idle, @kind, @kind:idle; first idle pane only, @all rejected. --max-concurrent caps role tasks in the parent scope.\n\
       Wait timeout returns ok:true + wait.outcome:checkpoint; re-check status/inbox.\n\
   herdr-mcp agent gate create --task-id ID --question TEXT --option TEXT --option TEXT [--option TEXT ...]\n\
@@ -3170,9 +3296,10 @@ mod tests {
             assert_eq!(
                 parse(args(&input)).unwrap().command,
                 Command::Agent(AgentCommand::Dispatch {
-                    target: "pi".to_owned(),
+                    target: Some("pi".to_owned()),
                     text: "work".to_owned(),
-                    parent_target: "w1:p2".to_owned(),
+                    spawn: None,
+                    parent_target: Some("w1:p2".to_owned()),
                     idempotency_key: "key".to_owned(),
                     inject_task_identity: enabled,
                     stall_after_ms: None,
@@ -3207,7 +3334,7 @@ mod tests {
             let command = parse(args(&input)).unwrap().command;
             assert!(matches!(command, Command::Agent(AgentCommand::Dispatch {
                 target, max_concurrent: Some(2), workspace_id: Some(workspace), ..
-            }) if target == "@codex" && workspace == "w1"));
+            }) if target.as_deref() == Some("@codex") && workspace == "w1"));
         }
         for value in ["0", "17", "1.5", "invalid"] {
             assert!(
@@ -3223,6 +3350,162 @@ mod tests {
             );
         }
         assert!(parse(args(&["agent", "dispatch", "--target", "@codex"])).is_err());
+    }
+
+    /// user operator | Given spawn flags instead of a target | When parsing
+    /// `agent dispatch` | Then the single positional is the task text and the
+    /// spawn facts travel as one object under the same method name.
+    #[test]
+    fn agent_dispatch_spawn_cli_accepts_one_text_positional() {
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "--spawn-workspace",
+                "wVE",
+                "--spawn-cwd",
+                "/tmp/project",
+                "--spawn-name",
+                "feat-x",
+                "--spawn-tab-label",
+                "feat-x",
+                "--spawn-split-from",
+                "wVE:p1",
+                "--spawn-direction",
+                "down",
+                "--spawn-startup-timeout-ms",
+                "90000",
+                "implement the task",
+                "--idempotency-key",
+                "spawn-key",
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Dispatch {
+                target: None,
+                text: "implement the task".to_owned(),
+                spawn: Some(Box::new(AgentDispatchSpawn {
+                    kind: "pi".to_owned(),
+                    workspace: Some("wVE".to_owned()),
+                    cwd: Some("/tmp/project".to_owned()),
+                    name: Some("feat-x".to_owned()),
+                    tab_label: Some("feat-x".to_owned()),
+                    split_from: Some("wVE:p1".to_owned()),
+                    direction: Some("down".to_owned()),
+                    startup_timeout_ms: Some(90_000),
+                })),
+                parent_target: None,
+                idempotency_key: "spawn-key".to_owned(),
+                inject_task_identity: false,
+                stall_after_ms: None,
+                max_concurrent: None,
+                workspace_id: None,
+                parent_session_ref: None,
+                wait: false,
+                timeout_ms: 25_000,
+            })
+        );
+        // A supervised spawn may still name its parent.
+        assert!(matches!(
+            parse(args(&[
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "work",
+                "--idempotency-key",
+                "k",
+                "--parent",
+                "w1:p1",
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Dispatch {
+                spawn: Some(_),
+                parent_target: Some(parent),
+                ..
+            }) if parent == "w1:p1"
+        ));
+        for invalid in [
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "--target",
+                "w1:p1",
+                "work",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "work",
+                "--index",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-workspace",
+                "wVE",
+                "work",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "work",
+                "second",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "work",
+                "--idempotency-key",
+                "k",
+                "--spawn-direction",
+                "sideways",
+            ],
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "work",
+                "--idempotency-key",
+                "k",
+                "--spawn-startup-timeout-ms",
+                "0",
+            ],
+        ] {
+            assert!(parse(args(&invalid)).is_err(), "{invalid:?}");
+        }
+        // The reuse-existing-agent form still requires its parent.
+        assert!(
+            parse(args(&[
+                "agent",
+                "dispatch",
+                "pi",
+                "work",
+                "--idempotency-key",
+                "k"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
