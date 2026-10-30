@@ -5913,13 +5913,27 @@ mod tests {
     /// ledger shares the browser registry's StateStore, exactly like the
     /// managed runtime wires `PromptRegistry::with_runtime`.
     fn dispatch_test_state(root: &std::path::Path, socket: &std::path::Path) -> AppState {
+        dispatch_test_state_with_snapshot(
+            root,
+            socket,
+            json!({
+                "panes": [],
+                "agents": [],
+                "workspaces": []
+            }),
+        )
+    }
+
+    /// Same production-shaped state with a seeded live snapshot, so a dispatch
+    /// test can prove managed-root and layout facts without a real workstation.
+    fn dispatch_test_state_with_snapshot(
+        root: &std::path::Path,
+        socket: &std::path::Path,
+        snapshot: Value,
+    ) -> AppState {
         let mut state = test_state(root);
         state.client = HerdrClient::new(socket.to_owned());
-        let cache = Arc::new(EventCache::from_snapshot_for_test(json!({
-            "panes": [],
-            "agents": [],
-            "workspaces": []
-        })));
+        let cache = Arc::new(EventCache::from_snapshot_for_test(snapshot));
         state.cache = cache.clone();
         state.prompt =
             PromptRegistry::with_runtime(state.state_store.clone(), cache, state.client.clone());
@@ -7236,6 +7250,128 @@ mod tests {
         assert!(prompt.contains(task_id));
         assert!(prompt.contains(valid["dispatch_id"].as_str().unwrap()));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// user WebChat planner | Given one spawn dispatch carrying the verbatim
+    /// current turn | When the runtime creates the pane, starts the agent and
+    /// prompts it | Then the task still binds that conversation and the turn
+    /// text never reaches the prompt path.
+    #[tokio::test]
+    async fn webchat_spawn_dispatch_binds_parent_session_from_current_user_message() {
+        let root = test_root("webchat-spawn-bind");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
+            json!({"type": "tab_created", "tab": {"tab_id": "w1:t2", "workspace_id": "w1"},
+                "root_pane": {"pane_id": "w1:p9", "tab_id": "w1:t2", "workspace_id": "w1"}}),
+            json!({"type": "agent_started", "argv": [], "agent": {
+                "pane_id": "w1:p9", "tab_id": "w1:t2", "workspace_id": "w1",
+                "agent_status": "idle", "interactive_ready": true, "state_change_seq": 1,
+            }}),
+            json!({"prompt": {"status": "submitted", "agent": {
+                "pane_id": "w1:p9", "agent_status": "generating", "state_change_seq": 2,
+            }}}),
+        ]);
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut state = dispatch_test_state_with_snapshot(
+            &root,
+            &socket,
+            json!({
+                "workspaces": [{
+                    "workspace_id": "w1",
+                    "label": "spawn-bind",
+                    "worktree": {"checkout_path": project.to_string_lossy()},
+                }],
+                "panes": [{
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "cwd": project.to_string_lossy(),
+                    "agent_status": "idle",
+                }],
+                "agents": [{
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "kind": "codex",
+                    "agent_status": "idle",
+                }],
+            }),
+        );
+        state.trusted_extension_ipc = true;
+        let app = candidate_router(state);
+        let (app, seed, endpoint, account) = register_chatgpt_endpoint(app, "spawnbind", now).await;
+        let user_text = "把这条任务派给一个新的 pi";
+        let (app, session_ref) = observe_chatgpt_session_source_turn(
+            app,
+            &seed,
+            &endpoint,
+            &account,
+            "spawnbind",
+            user_text,
+            now,
+        )
+        .await;
+        let headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-authorization",
+                json!({
+                    "principal_ref": "connector:conn_SpawnBind1",
+                    "connector_id": "conn_SpawnBind1",
+                    "grant_generation": 1
+                })
+                .to_string(),
+            ),
+            (
+                "x-herdr-edge-browser-caller-session",
+                json!({"provider": "chatgpt", "opaque_session_id": "opaque-spawn-bind-1"})
+                    .to_string(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": endpoint, "provider": "chatgpt"}]).to_string(),
+            ),
+        ];
+        let result = webchat_tool_call(
+            app,
+            &headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1"},
+                "text": "do the work",
+                "idempotency_key": "dispatch-spawn-bind",
+                "current_user_message": format!("  {user_text}  "),
+            }),
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["submitted"], true);
+        assert_eq!(result["parent_session"], json!({"bound": true}));
+        assert_eq!(result["task"]["parent_session_ref"], session_ref);
+        assert_eq!(result["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(result["task"]["target"], "w1:p9");
+        let recorded = herdr_requests.lock().unwrap().clone();
+        let methods = recorded
+            .iter()
+            .filter_map(|call| call["method"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, vec!["tab.create", "agent.start", "agent.prompt"]);
+        assert_eq!(recorded[2]["params"]["text"], "do the work");
+        // The turn text is binding evidence only.
+        assert!(!result.to_string().contains(user_text.trim()));
+        assert!(
+            recorded
+                .iter()
+                .all(|call| !call.to_string().contains("current_user_message")),
+            "prompt params must not carry current_user_message: {recorded:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(socket);
     }
 
     #[tokio::test]
