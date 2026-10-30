@@ -23,7 +23,7 @@ use super::{
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
-    AGENT_TASK_STATUS_METHOD,
+    AGENT_TASK_REPORT_METHOD, AGENT_TASK_STATUS_METHOD,
 };
 use serde_json::{Value, json};
 
@@ -133,10 +133,13 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "access": "mutation",
             "params": {
                 "properties": {
-                    "target": {"type": "string", "maxLength": 256},
+                    "target": {"type": "string", "maxLength": 256, "description": "Exact agent/pane or explicit @idle, @kind, @kind:idle selector. Roles choose the first idle, delegation-safe pane in live snapshot order; never broadcast (@all is rejected). Replays retain the original resolved_target and candidate evidence."},
+                    "workspace_id": {"type": "string", "maxLength": 256, "description": "Optional workspace scope for role resolution."},
+                    "max_concurrent": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Role selectors only: cap non-terminal tasks for this exact requested_target in the bound parent session, else parent_target, else caller-less global scope. Limit rejection is not_delivered."},
                     "text": {"type": "string", "maxLength": 65536},
                     "parent_target": {"type": "string", "maxLength": 256},
                     "idempotency_key": {"type": "string", "maxLength": 256},
+                    "stall_after_ms": {"type": "integer", "minimum": 60000, "maximum": 7200000, "description": "Liveness stall threshold; defaults to 20 minutes. Stalled is non-terminal and never redispatched automatically."},
                     "inject_task_identity": {
                         "type": "boolean",
                         "default": false,
@@ -154,6 +157,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     },
                     "wait": {
                         "type": "object",
+                        "description": "A task wait timeout is a successful checkpoint: ok:true, wait.completed:false, wait.outcome:checkpoint, with the current lifecycle/liveness snapshot. Delivery failures remain failures. Re-check status/inbox rather than redispatching.",
                         "properties": {
                             "until": {"type": "array", "items": {"type": "string"}},
                             "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 60000}
@@ -165,7 +169,54 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             },
         }),
         json!({
+            "method": crate::prompt::decision_gates::CREATE,
+            "source": "herdr_mcp_local", "access": "mutation",
+            "description": "Create one blocking decision gate on a visible non-terminal task. Bounds are UTF-8 bytes; control characters and duplicate options are rejected. Open gates block ack and completion, including worker_done.",
+            "params": {"properties": {
+                "task_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "question": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "options": {"type": "array", "minItems": 2, "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}}
+            }, "required": ["task_id", "question", "options"], "empty": false}
+        }),
+        json!({
+            "method": crate::prompt::decision_gates::STATUS,
+            "source": "herdr_mcp_local", "access": "read_only",
+            "params": {"properties": {"gate_id": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["gate_id"], "empty": false}
+        }),
+        json!({
+            "method": crate::prompt::decision_gates::CANCEL,
+            "source": "herdr_mcp_local", "access": "mutation",
+            "description": "Cancel an open gate only from its creating parent scope. Bot approvals never count as owner approval.",
+            "params": {"properties": {"gate_id": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["gate_id"], "empty": false}
+        }),
+        json!({
+            "method": crate::prompt::decision_gates::RESOLVE,
+            "source": "herdr_mcp_local", "access": "mutation",
+            "description": "Always rejected from MCP, WebChat, browser and agent paths with gate_resolution_requires_human. Only independent local CLI agent gate resolve with a controlling interactive TTY and exact retyped option may resolve. Best-effort local attestation, not cryptographic proof.",
+            "params": {"properties": {
+                "gate_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "resolution": {"type": "string", "minLength": 1, "maxLength": 128}
+            }, "required": ["gate_id", "resolution"], "empty": false}
+        }),
+        json!({
+            "method": AGENT_TASK_REPORT_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "mutation",
+            "description": "Trusted local IPC only; never available to WebChat callers. Matching task_id and dispatch_id are required. worker_done is durable and accepted exactly once; a late report preserves settled lifecycle and never re-notifies the parent. Heartbeats only refresh timestamps of non-terminal tasks. Summary is capped at 2048 UTF-8 bytes after control characters are stripped.",
+            "params": {
+                "properties": {
+                    "task_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "dispatch_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "kind": {"type": "string", "enum": ["heartbeat", "worker_done"]},
+                    "summary": {"type": "string", "maxLength": 2048}
+                },
+                "required": ["task_id", "dispatch_id", "kind"],
+                "empty": false
+            }
+        }),
+        json!({
             "method": AGENT_TASK_STATUS_METHOD,
+            "description": "Durable lifecycle and derived liveness (active or stalled). Stalled is non-terminal; no automatic redispatch.",
             "source": "herdr_mcp_local",
             "access": "read_only",
             "params": {
@@ -199,7 +250,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "view": {
                         "type": "string",
                         "enum": ["full", "compact"],
-                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured. final_excerpt is omitted, not degraded, when the child pane is narrower than 40 columns: a TUI agent hard-wraps its own layout there, so the only readable options are reading the pane or giving the agent a wider pane (a new tab, a reused wide pane, or a down split)."
+                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, liveness, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured. final_excerpt is omitted, not degraded, when the child pane is narrower than 40 columns: a TUI agent hard-wraps its own layout there, so the only readable options are reading the pane or giving the agent a wider pane (a new tab, a reused wide pane, or a down split)."
                     },
                 },
                 "required": [],

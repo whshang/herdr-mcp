@@ -16,7 +16,7 @@ use crate::progressive_skills::{
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
-    AGENT_TASK_STATUS_METHOD,
+    AGENT_TASK_REPORT_METHOD, AGENT_TASK_STATUS_METHOD,
 };
 use crate::state_store::BrowserDeliveryState;
 use serde_json::{Map, Value, json};
@@ -98,12 +98,16 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<ExitCode, String> {
 
 pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
     match command {
+        AgentCommand::Gate(command) => crate::agent_gate_cli::run(command),
         AgentCommand::Dispatch {
             target,
             text,
             parent_target,
             idempotency_key,
             inject_task_identity,
+            stall_after_ms,
+            max_concurrent,
+            workspace_id,
             parent_session_ref,
             wait,
             timeout_ms,
@@ -114,6 +118,15 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
                 "parent_target": parent_target,
                 "idempotency_key": idempotency_key,
             });
+            if let Some(value) = max_concurrent {
+                params["max_concurrent"] = json!(value);
+            }
+            if let Some(value) = workspace_id {
+                params["workspace_id"] = json!(value);
+            }
+            if let Some(value) = stall_after_ms {
+                params["stall_after_ms"] = json!(value);
+            }
             if inject_task_identity {
                 params["inject_task_identity"] = json!(true);
             }
@@ -127,6 +140,18 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
                 });
             }
             print_private_result(call_private(AGENT_TASK_DISPATCH_METHOD, params, None)?)
+        }
+        AgentCommand::Report {
+            task_id,
+            dispatch_id,
+            kind,
+            summary,
+        } => {
+            let mut params = json!({"task_id": task_id, "dispatch_id": dispatch_id, "kind": kind});
+            if let Some(summary) = summary {
+                params["summary"] = json!(summary);
+            }
+            print_private_result(call_private(AGENT_TASK_REPORT_METHOD, params, None)?)
         }
         AgentCommand::Status { task_id } => print_private_result(call_private(
             AGENT_TASK_STATUS_METHOD,
@@ -680,6 +705,10 @@ fn private_call_trace(
     (!trace.is_empty()).then_some(trace)
 }
 
+pub(crate) fn call_agent_gate(method: &str, params: Value) -> Result<Value, String> {
+    call_private(method, params, None)
+}
+
 fn call_private(
     method: &str,
     params: Value,
@@ -750,7 +779,9 @@ fn call_private_with_context(
         .enable_all()
         .build()
         .map_err(|error| format!("cannot create local CLI runtime: {error}"))?;
-    let result = if trusted_local_read {
+    let result = if method == AGENT_TASK_REPORT_METHOD {
+        runtime.block_on(transport.dispatch_worker_report_request(request))
+    } else if trusted_local_read {
         runtime.block_on(transport.dispatch_trusted_local_read_request(request))
     } else {
         runtime.block_on(transport.dispatch_request(request))
@@ -892,7 +923,7 @@ fn canonical_repo_id_from_remote(remote: &str) -> Option<String> {
     crate::state_store::valid_canonical_work_memory_repo_id(&repo_id).then_some(repo_id)
 }
 
-fn print_private_result(value: Value) -> Result<ExitCode, String> {
+pub(crate) fn print_private_result(value: Value) -> Result<ExitCode, String> {
     println!(
         "{}",
         serde_json::to_string_pretty(&value)

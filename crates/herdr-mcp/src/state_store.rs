@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod decision_gates;
 mod schema;
 pub(crate) mod work_journal;
 use work_journal::ensure_work_journal_auxiliary_schema;
@@ -47,7 +48,7 @@ const BROWSER_ARCHIVE_CLAIM_LEASE_MS: i64 = 30_000;
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 // ---------------------------------------------------------------------------
 // Durable-state schema policy
@@ -915,7 +916,9 @@ impl StateStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("cannot begin operation reservation: {error}"))?;
         tx.execute(
-            "DELETE FROM operations WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            "DELETE FROM operations WHERE expires_at IS NOT NULL AND expires_at <= ?1
+             AND NOT EXISTS (SELECT 1 FROM task_decision_gates
+                             WHERE task_id = operations.op_id AND status = 'open')",
             params![now_ms],
         )
         .map_err(|error| format!("cannot prune expired operations: {error}"))?;
@@ -1124,6 +1127,40 @@ impl StateStore {
             .map_err(|error| format!("cannot query task lookup: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot read task lookup: {error}"))
+    }
+
+    /// Count every live role task, without the bounded inbox/list window.
+    /// Session scope takes precedence; unstamped parents and caller-less work
+    /// never count tasks belonging to a browser session. Open gates stay live.
+    pub fn active_role_task_count(
+        &self,
+        requested_target: &str,
+        parent_session_ref: Option<&str>,
+        parent_target: Option<&str>,
+        now_ms: u64,
+    ) -> Result<u64, String> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM operations AS task
+             WHERE kind = 'herdr_prompt_task'
+               AND (expires_at IS NULL OR expires_at > ?4)
+               AND json_extract(result_json, '$.requested_target') = ?1
+               AND json_extract(result_json, '$.parent_session_ref') IS ?2
+               AND (?2 IS NOT NULL OR json_extract(result_json, '$.parent_target') IS ?3)
+               AND (json_extract(result_json, '$.lifecycle') NOT IN
+                    ('completed', 'blocked', 'failed', 'delivery_uncertain')
+                    OR EXISTS (SELECT 1 FROM task_decision_gates AS gate
+                               WHERE gate.task_id = task.op_id AND gate.status = 'open'))",
+                params![
+                    requested_target,
+                    parent_session_ref,
+                    parent_target,
+                    i64::try_from(now_ms).unwrap_or(i64::MAX)
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as u64)
+            .map_err(|error| format!("cannot count active role tasks: {error}"))
     }
 
     pub fn operation_ledgers(
@@ -7885,7 +7922,7 @@ fn list_names(conn: &Connection, sql: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::schema::{MIGRATION_V1, MIGRATION_V2, MIGRATIONS, i64_schema_version, migrate_to};
+    use super::schema::{MIGRATION_V1, MIGRATION_V2, MIGRATIONS, migrate_to};
     use super::*;
     use std::env;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -9913,7 +9950,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v15_adds_durable_archive_intents_without_breaking_old_binary_reopen() {
+    fn schema_v15_migrates_gates_and_refuses_pre_gate_binary_reopen() {
         let path = temp_db_path();
         {
             let conn = Connection::open(&path).unwrap();
@@ -9927,6 +9964,7 @@ mod tests {
                 [META_SCHEMA_VERSION],
             )
             .unwrap();
+            conn.execute("INSERT INTO operations (op_id, kind, phase, state, result_json, created_at, updated_at) VALUES ('pre-gate-task', 'herdr_prompt_task', 'active', 'running', '{}', 1, 1)", []).unwrap();
             assert!(
                 !list_names(
                     &conn,
@@ -9938,21 +9976,36 @@ mod tests {
         }
 
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store
+                .operation_ledger("pre-gate-task")
+                .unwrap()
+                .unwrap()
+                .state
+                .as_deref(),
+            Some("running")
+        );
+
         assert!(
             store
                 .table_names()
                 .unwrap()
                 .contains(&"browser_session_archive_intents".to_owned())
         );
+        assert!(
+            store
+                .table_names()
+                .unwrap()
+                .contains(&"task_decision_gates".to_owned())
+        );
         drop(store);
 
-        // Simulate the pinned pre-feature PROD binary: it understands the same
-        // numbered schema 15, sees the additive table, and must still open the
-        // database without a downgrade or backup restore.
+        // An old reader would ignore blocking gates. Rollback must fail closed
+        // and use a pre-migration backup rather than silently bypass a gate.
         let mut old_binary_conn = open_connection(Some(&path)).unwrap();
-        migrate_to(&mut old_binary_conn, 15, MIGRATIONS).unwrap();
-        assert_eq!(i64_schema_version(&old_binary_conn).unwrap(), 15);
+        let error = migrate_to(&mut old_binary_conn, 15, &MIGRATIONS[..15]).unwrap_err();
+        assert!(error.contains("newer"), "{error}");
         drop(old_binary_conn);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
@@ -10041,6 +10094,7 @@ mod tests {
                 "browser_session_archive_intents",
                 "browser_session_reservations",
                 "browser_source_turns",
+                "task_decision_gates",
                 "work_events",
                 "work_state"
             ]
@@ -11257,7 +11311,7 @@ mod tests {
             Some(canonical_digest.as_str())
         );
         assert_eq!(after_rollback.updated_at, 10);
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
@@ -11298,7 +11352,7 @@ mod tests {
         assert_eq!(op_id, "epoch5-op");
         assert_eq!(state, "pending");
         assert_eq!(expiry, None);
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

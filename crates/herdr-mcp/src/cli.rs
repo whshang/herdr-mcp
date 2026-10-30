@@ -310,15 +310,25 @@ pub enum MemoryCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgentCommand {
+    Gate(AgentGateCommand),
     Dispatch {
         target: String,
         text: String,
         parent_target: String,
         idempotency_key: String,
         inject_task_identity: bool,
+        stall_after_ms: Option<u64>,
+        max_concurrent: Option<u64>,
+        workspace_id: Option<String>,
         parent_session_ref: Option<String>,
         wait: bool,
         timeout_ms: u64,
+    },
+    Report {
+        task_id: String,
+        dispatch_id: String,
+        kind: String,
+        summary: Option<String>,
     },
     Status {
         task_id: String,
@@ -331,6 +341,25 @@ pub enum AgentCommand {
     },
     Ack {
         task_id: String,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgentGateCommand {
+    Create {
+        task_id: String,
+        question: String,
+        options: Vec<String>,
+    },
+    Status {
+        gate_id: String,
+    },
+    Cancel {
+        gate_id: String,
+    },
+    Resolve {
+        gate_id: String,
+        resolution: String,
     },
 }
 
@@ -821,29 +850,133 @@ fn parse_memory(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_agent_gate(args: &[String]) -> Result<Command, String> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("agent gate requires create, status, cancel or resolve")?;
+    let mut task_id = None;
+    let mut gate_id = None;
+    let mut question = None;
+    let mut resolution = None;
+    let mut options = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{flag} requires a value"))?
+            .clone();
+        let slot = match (action, flag) {
+            ("create", "--task-id") => &mut task_id,
+            ("create", "--question") => &mut question,
+            ("create", "--option") => {
+                options.push(value);
+                index += 2;
+                continue;
+            }
+            ("status" | "cancel" | "resolve", "--gate-id") => &mut gate_id,
+            ("resolve", "--resolution") => &mut resolution,
+            _ => return Err(format!("unknown agent gate {action} option '{flag}'")),
+        };
+        if slot.replace(value).is_some() {
+            return Err(format!("duplicate {flag}"));
+        }
+        index += 2;
+    }
+    let command = match action {
+        "create" if (2..=8).contains(&options.len()) => AgentGateCommand::Create {
+            task_id: task_id.ok_or("--task-id is required")?,
+            question: question.ok_or("--question is required")?,
+            options,
+        },
+        "status" => AgentGateCommand::Status {
+            gate_id: gate_id.ok_or("--gate-id is required")?,
+        },
+        "cancel" => AgentGateCommand::Cancel {
+            gate_id: gate_id.ok_or("--gate-id is required")?,
+        },
+        "resolve" => AgentGateCommand::Resolve {
+            gate_id: gate_id.ok_or("--gate-id is required")?,
+            resolution: resolution.ok_or("--resolution is required")?,
+        },
+        _ => {
+            return Err(
+                "agent gate requires create (2-8 --option values), status, cancel or resolve"
+                    .to_owned(),
+            );
+        }
+    };
+    Ok(Command::Agent(AgentCommand::Gate(command)))
+}
+
 fn parse_agent(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
+        Some("gate") => parse_agent_gate(&args[1..]),
         Some("dispatch") => {
             if args.len() < 3 {
                 return Err(
-                    "agent dispatch requires <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--wait] [--timeout-ms N]"
+                    "agent dispatch requires (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N]"
                         .to_owned(),
                 );
             }
-            let target = args[1].clone();
-            let text = args[2].clone();
+            let (target, text, mut index) = if args[1] == "--target" {
+                let target = args.get(2).ok_or("--target requires a value")?;
+                let text = args
+                    .get(3)
+                    .ok_or("agent dispatch requires text after --target <target>")?;
+                (target.clone(), text.clone(), 4)
+            } else {
+                (args[1].clone(), args[2].clone(), 3)
+            };
             if target.is_empty() || text.is_empty() {
                 return Err("agent dispatch target/text must not be empty".to_owned());
             }
             let mut inject_task_identity = false;
+            let mut stall_after_ms = None;
+            let mut max_concurrent = None;
+            let mut workspace_id = None;
             let mut parent_session_ref = None;
             let mut parent_target = None;
             let mut idempotency_key = None;
             let mut wait = false;
             let mut timeout_ms = 25_000_u64;
-            let mut index = 3;
             while index < args.len() {
                 match args[index].as_str() {
+                    "--max-concurrent" => {
+                        max_concurrent = Some(
+                            args.get(index + 1)
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .filter(|value| (1..=16).contains(value))
+                                .ok_or("--max-concurrent must be an integer in 1..=16")?,
+                        );
+                        index += 2;
+                    }
+                    "--workspace-id" => {
+                        workspace_id = Some(
+                            args.get(index + 1)
+                                .filter(|value| !value.is_empty())
+                                .ok_or("--workspace-id requires a value")?
+                                .clone(),
+                        );
+                        index += 2;
+                    }
+                    "--stall-after-ms" => {
+                        let value = args
+                            .get(index + 1)
+                            .ok_or_else(|| "--stall-after-ms requires a value".to_owned())?;
+                        stall_after_ms = Some(
+                            value
+                                .parse::<u64>()
+                                .ok()
+                                .filter(|value| (60_000..=7_200_000).contains(value))
+                                .ok_or_else(|| {
+                                    "--stall-after-ms must be in 60000..=7200000".to_owned()
+                                })?,
+                        );
+                        index += 2;
+                    }
                     "--inject-task-identity" => {
                         inject_task_identity = true;
                         index += 1;
@@ -900,9 +1033,59 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| "--idempotency-key is required".to_owned())?,
                 inject_task_identity,
+                stall_after_ms,
+                max_concurrent,
+                workspace_id,
                 parent_session_ref,
                 wait,
                 timeout_ms,
+            }))
+        }
+        Some("report") => {
+            let mut task_id = None;
+            let mut dispatch_id = None;
+            let mut kind = None;
+            let mut summary = None;
+            let mut index = 1;
+            while index < args.len() {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("{} requires a value", args[index]))?;
+                match args[index].as_str() {
+                    "--task-id" => task_id = Some(value.clone()),
+                    "--dispatch-id" => dispatch_id = Some(value.clone()),
+                    "--kind" => kind = Some(value.clone()),
+                    "--summary" => summary = Some(value.clone()),
+                    flag => return Err(format!("unknown agent report option '{flag}'")),
+                }
+                index += 2;
+            }
+            let valid_id = |value: Option<String>, flag: &str| {
+                value
+                    .filter(|value| !value.is_empty() && value.len() <= 128)
+                    .ok_or_else(|| format!("{flag} requires a non-empty id up to 128 bytes"))
+            };
+            let kind = kind
+                .filter(|value| matches!(value.as_str(), "heartbeat" | "worker_done"))
+                .ok_or_else(|| "--kind requires heartbeat or worker_done".to_owned())?;
+            if summary.as_ref().is_some_and(|value| {
+                value
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .map(char::len_utf8)
+                    .sum::<usize>()
+                    > 2048
+            }) {
+                return Err(
+                    "--summary must be at most 2048 bytes after stripping control characters"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::Agent(AgentCommand::Report {
+                task_id: valid_id(task_id, "--task-id")?,
+                dispatch_id: valid_id(dispatch_id, "--dispatch-id")?,
+                kind,
+                summary,
             }))
         }
         Some("status") => {
@@ -965,9 +1148,9 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
             }))
         }
         Some(value) => Err(format!(
-            "unknown agent command '{value}' (expected dispatch, status, inbox, or ack)"
+            "unknown agent command '{value}' (expected dispatch, report, status, inbox, or ack)"
         )),
-        None => Err("agent requires dispatch, status, inbox, or ack".to_owned()),
+        None => Err("agent requires dispatch, report, status, inbox, or ack".to_owned()),
     }
 }
 
@@ -2609,7 +2792,13 @@ User path:\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp agent-skill <status|sync>  (repo-fetched user-global local-agent Skill; exact runtime source identity)\n\
   herdr-mcp continuity <search|resume> ...  (durable prior-work discovery for local coding agents)\n\
-  herdr-mcp agent dispatch <target> <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--wait] [--timeout-ms N]\n\
+  herdr-mcp agent dispatch (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N]\n\
+      Roles: @idle, @kind, @kind:idle; first idle pane only, @all rejected. --max-concurrent caps role tasks in the parent scope.\n\
+      Wait timeout returns ok:true + wait.outcome:checkpoint; re-check status/inbox.\n\
+  herdr-mcp agent gate create --task-id ID --question TEXT --option TEXT --option TEXT [--option TEXT ...]\n\
+  herdr-mcp agent gate status|cancel --gate-id ID\n\
+  herdr-mcp agent gate resolve --gate-id ID --resolution TEXT  (independent interactive TTY only; retype option)\n\
+  herdr-mcp agent report --task-id ID --dispatch-id ID --kind heartbeat|worker_done [--summary TEXT]  (trusted local IPC only)\n\
   herdr-mcp memory <resume|search> ...  (bounded Work Memory access for local coding agents)\n\
   herdr-mcp webchat <endpoints|resources|inspect|create|send|dispatch-status|open|archive|archive-status|handoff> ...  (supported local WebChat control)\n\
   herdr-mcp profile check --file <profile.json>  (read-only desired-vs-actual workstation drift)\n\
@@ -2792,6 +2981,171 @@ mod tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    /// user parent | Given gate CLI commands | When choices or resolution
+    /// are supplied | Then required fields parse and ambiguous flags fail.
+    #[test]
+    fn agent_gate_commands_parse_and_reject_ambiguous_arguments() {
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "gate",
+                "create",
+                "--task-id",
+                "task",
+                "--question",
+                "Choose",
+                "--option",
+                "yes",
+                "--option",
+                "no"
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Gate(AgentGateCommand::Create {
+                task_id: "task".to_owned(),
+                question: "Choose".to_owned(),
+                options: vec!["yes".to_owned(), "no".to_owned()]
+            }))
+        );
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "gate",
+                "resolve",
+                "--gate-id",
+                "gate",
+                "--resolution",
+                "yes"
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Gate(AgentGateCommand::Resolve {
+                gate_id: "gate".to_owned(),
+                resolution: "yes".to_owned()
+            }))
+        );
+        for action in ["status", "cancel"] {
+            assert!(parse(args(&["agent", "gate", action, "--gate-id", "gate"])).is_ok());
+        }
+        for input in [
+            vec!["agent", "gate", "resolve", "--gate-id", "gate"],
+            vec![
+                "agent",
+                "gate",
+                "resolve",
+                "--gate-id",
+                "gate",
+                "--resolution",
+                "yes",
+                "--human",
+                "true",
+            ],
+            vec![
+                "agent",
+                "gate",
+                "resolve",
+                "--gate-id",
+                "gate",
+                "--gate-id",
+                "other",
+                "--resolution",
+                "yes",
+            ],
+            vec![
+                "agent",
+                "gate",
+                "create",
+                "--task-id",
+                "task",
+                "--question",
+                "Choose",
+                "--option",
+                "yes",
+            ],
+        ] {
+            assert!(parse(args(&input)).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_worker_report_and_bounded_stall_threshold() {
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--dispatch-id",
+                "dispatch",
+                "--kind",
+                "worker_done",
+                "--summary",
+                "done"
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Report {
+                task_id: "task".to_owned(),
+                dispatch_id: "dispatch".to_owned(),
+                kind: "worker_done".to_owned(),
+                summary: Some("done".to_owned())
+            })
+        );
+        for input in [
+            vec![
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--kind",
+                "heartbeat",
+            ],
+            vec![
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--dispatch-id",
+                "dispatch",
+                "--kind",
+                "ask",
+            ],
+            vec![
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--dispatch-id",
+                "dispatch",
+                "--kind",
+            ],
+        ] {
+            assert!(parse(args(&input)).is_err());
+        }
+        let base = [
+            "agent",
+            "dispatch",
+            "child",
+            "work",
+            "--parent",
+            "parent",
+            "--idempotency-key",
+            "key",
+            "--stall-after-ms",
+        ];
+        for (value, valid) in [
+            ("60000", true),
+            ("7200000", true),
+            ("59999", false),
+            ("7200001", false),
+            ("x", false),
+        ] {
+            let mut input = base.to_vec();
+            input.push(value);
+            assert_eq!(parse(args(&input)).is_ok(), valid);
+        }
+    }
+
     #[test]
     fn parses_dispatch_identity_and_explicit_parent_flags() {
         let base = [
@@ -2821,6 +3175,9 @@ mod tests {
                     parent_target: "w1:p2".to_owned(),
                     idempotency_key: "key".to_owned(),
                     inject_task_identity: enabled,
+                    stall_after_ms: None,
+                    max_concurrent: None,
+                    workspace_id: None,
                     parent_session_ref: enabled.then(|| "br_session".to_owned()),
                     wait: false,
                     timeout_ms: 25_000,
@@ -2830,6 +3187,42 @@ mod tests {
         let mut missing = base.to_vec();
         missing.push("--parent-session-ref");
         assert!(parse(args(&missing)).is_err());
+    }
+
+    #[test]
+    fn agent_dispatch_role_cli_accepts_named_target_and_bounded_cap() {
+        for prefix in [vec!["@codex", "work"], vec!["--target", "@codex", "work"]] {
+            let mut input = vec!["agent", "dispatch"];
+            input.extend(prefix);
+            input.extend([
+                "--parent",
+                "w1:p1",
+                "--idempotency-key",
+                "key",
+                "--max-concurrent",
+                "2",
+                "--workspace-id",
+                "w1",
+            ]);
+            let command = parse(args(&input)).unwrap().command;
+            assert!(matches!(command, Command::Agent(AgentCommand::Dispatch {
+                target, max_concurrent: Some(2), workspace_id: Some(workspace), ..
+            }) if target == "@codex" && workspace == "w1"));
+        }
+        for value in ["0", "17", "1.5", "invalid"] {
+            assert!(
+                parse(args(&[
+                    "agent",
+                    "dispatch",
+                    "@codex",
+                    "work",
+                    "--max-concurrent",
+                    value
+                ]))
+                .is_err()
+            );
+        }
+        assert!(parse(args(&["agent", "dispatch", "--target", "@codex"])).is_err());
     }
 
     #[test]

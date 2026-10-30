@@ -818,14 +818,39 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     object.insert("parent_session".to_owned(), fact);
                 }
                 result
+            } else if method == prompt::AGENT_TASK_REPORT_METHOD {
+                if !context.trusted_local_ipc
+                    || context.caller_browser_session.is_some()
+                    || context.caller_webchat_authorization.is_some()
+                    || !context.caller_webchat_control_grants.is_empty()
+                    || !context.caller_page_assist_grants.is_empty()
+                {
+                    json!({"ok": false, "code": "worker_report_requires_trusted_local"})
+                } else {
+                    prompt::task_call_with_parent_session(context.prompt, method, &params, None)
+                }
+            } else if method == prompt::decision_gates::RESOLVE {
+                // No MCP principal, including trusted IPC and browser actuation,
+                // can assert that it is a human. Only the independent CLI may resolve.
+                json!({"ok": false, "code": "gate_resolution_requires_human"})
             } else if method.starts_with("herdr_mcp.agent.task.") {
                 let parent_session_ref = prompt_parent_session_ref(context);
-                prompt::task_call_with_parent_session(
-                    context.prompt,
-                    method,
-                    &params,
-                    parent_session_ref.as_deref(),
-                )
+                if method.starts_with("herdr_mcp.agent.task.gate.")
+                    && parent_session_ref.is_none()
+                    && (context.caller_browser_session.is_some()
+                        || context.caller_webchat_authorization.is_some()
+                        || !context.caller_webchat_control_grants.is_empty()
+                        || !context.caller_page_assist_grants.is_empty())
+                {
+                    json!({"ok": false, "code": "agent_task_parent_unbound"})
+                } else {
+                    prompt::task_call_with_parent_session(
+                        context.prompt,
+                        method,
+                        &params,
+                        parent_session_ref.as_deref(),
+                    )
+                }
             } else if method == pane_width::SPLIT_METHOD {
                 // A horizontal split must not create a pane whose agent output
                 // can only be captured as wrapping noise (#684).

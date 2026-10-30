@@ -1,7 +1,11 @@
+pub(crate) mod decision_gates;
+mod role_targets;
+
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
 use crate::progressive_skills::agent_attention_advice;
 use crate::state_cache::EventCache;
+use crate::state_store::decision_gates::DecisionGate;
 use crate::state_store::{
     OperationLedgerInput, OperationLedgerRecord, OperationReservation, StateStore,
 };
@@ -55,6 +59,7 @@ struct AgentState {
 struct RegisterTaskInput<'a> {
     task_id: &'a str,
     target: &'a str,
+    requested_target: Option<&'a str>,
     fingerprint: &'a str,
     idempotency_key: Option<&'a str>,
     before: Option<&'a AgentState>,
@@ -63,6 +68,7 @@ struct RegisterTaskInput<'a> {
     start_cursor: u64,
     parent_target: Option<&'a str>,
     parent_session_ref: Option<&'a str>,
+    stall_after_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +110,8 @@ struct PromptTaskRecord {
     task_id: String,
     dispatch_id: String,
     target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_target: Option<String>,
     #[serde(default)]
     idempotency_key_digest: Option<String>,
     pane_id: Option<String>,
@@ -150,14 +158,35 @@ struct PromptTaskRecord {
     acknowledged_at_ms: Option<u64>,
     created_at_ms: u64,
     updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_heartbeat_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_done_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_done_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stall_after_ms: Option<u64>,
+    #[serde(skip)]
+    gate: Option<DecisionGate>,
 }
 
 impl PromptTaskRecord {
     fn is_terminal(&self) -> bool {
-        self.lifecycle.is_terminal()
+        self.gate.is_none() && self.lifecycle.is_terminal()
     }
 
-    fn public_json(&self) -> Value {
+    fn liveness(&self, now: u64) -> &'static str {
+        if !self.is_terminal()
+            && now.saturating_sub(self.updated_at_ms)
+                >= self.stall_after_ms.unwrap_or(ESCALATION_STALL_IDLE_MS)
+        {
+            "stalled"
+        } else {
+            "active"
+        }
+    }
+
+    fn public_json_at(&self, now: u64) -> Value {
         let mut public = json!({
             "task_id": self.task_id,
             "dispatch_id": self.dispatch_id,
@@ -165,6 +194,7 @@ impl PromptTaskRecord {
             "pane_id": self.pane_id,
             "workspace_id": self.workspace_id,
             "lifecycle": self.lifecycle.as_str(),
+            "liveness": self.liveness(now),
             "activity_observed": self.activity_observed,
             "prior_settle_observed": self.prior_settle_observed,
             "turn_id": self.turn_id,
@@ -194,7 +224,26 @@ impl PromptTaskRecord {
             "created_at_ms": self.created_at_ms,
             "updated_at_ms": self.updated_at_ms,
         });
+        if let Some(requested) = &self.requested_target {
+            public["requested_target"] = json!(requested);
+        }
+        if let Some(gate) = &self.gate {
+            public["blocked_on_gate"] = json!(true);
+            public["gate"] = json!(gate);
+        }
         if let Some(object) = public.as_object_mut() {
+            for (key, value) in [
+                ("last_heartbeat_at_ms", self.last_heartbeat_at_ms),
+                ("worker_done_at_ms", self.worker_done_at_ms),
+                ("stall_after_ms", self.stall_after_ms),
+            ] {
+                if let Some(value) = value {
+                    object.insert(key.to_owned(), json!(value));
+                }
+            }
+            if let Some(summary) = &self.worker_done_summary {
+                object.insert("worker_done_summary".to_owned(), json!(summary));
+            }
             if let Some(excerpt) = &self.final_excerpt {
                 object.insert("final_excerpt".to_owned(), json!(excerpt));
             }
@@ -253,6 +302,12 @@ fn dispatch_definitely_not_delivered(result: &Value) -> bool {
 
 #[derive(Default)]
 struct PromptRegistryInner {
+    // Serialize durable task read/modify/write across report, lifecycle, ack and
+    // parent notification so a stale snapshot cannot erase an accepted report.
+    task_mutations: Mutex<()>,
+    role_dispatches: Mutex<()>,
+    #[cfg(test)]
+    clock: Option<Arc<AtomicU64>>,
     records: Mutex<HashMap<String, PromptRecord>>,
     handoff_injected_panes: Mutex<HashSet<String>>,
     store: Option<Arc<Mutex<StateStore>>>,
@@ -272,6 +327,14 @@ enum BeginPrompt {
 }
 
 impl PromptRegistry {
+    fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = &self.inner.clock {
+            return clock.load(Ordering::SeqCst);
+        }
+        now_ms()
+    }
+
     #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
@@ -281,6 +344,10 @@ impl PromptRegistry {
     pub fn with_store(store: Arc<Mutex<StateStore>>) -> Self {
         Self {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -297,6 +364,10 @@ impl PromptRegistry {
     ) -> Self {
         let registry = Self {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -317,7 +388,7 @@ impl PromptRegistry {
     }
 
     fn begin_memory(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
-        let now = now_ms();
+        let now = self.now_ms();
         let mut records = self
             .inner
             .records
@@ -452,6 +523,7 @@ impl PromptRegistry {
         let RegisterTaskInput {
             task_id,
             target,
+            requested_target,
             fingerprint,
             idempotency_key,
             before,
@@ -460,15 +532,21 @@ impl PromptRegistry {
             start_cursor,
             parent_target,
             parent_session_ref,
+            stall_after_ms,
         } = input;
         if submitted == Some(false) || self.inner.store.is_none() {
             return Ok(None);
         }
+        let guard = self
+            .inner
+            .task_mutations
+            .lock()
+            .map_err(|_| "agent task mutation lock unavailable".to_owned())?;
         if let Some(existing) = self.load_task(task_id)? {
             return Ok(Some(existing));
         }
 
-        let now = now_ms();
+        let now = self.now_ms();
         let pane_id = after
             .and_then(|state| state.pane_id.clone())
             .or_else(|| before.and_then(|state| state.pane_id.clone()));
@@ -510,6 +588,7 @@ impl PromptRegistry {
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
             target: target.to_owned(),
+            requested_target: requested_target.map(str::to_owned),
             idempotency_key_digest: idempotency_key
                 .map(|key| stable_digest(&[b"herdr_prompt/task_key", key.as_bytes()])),
             pane_id,
@@ -526,6 +605,11 @@ impl PromptRegistry {
             terminal_status: None,
             terminal_cursor: None,
             terminal_at_ms: None,
+            last_heartbeat_at_ms: None,
+            worker_done_at_ms: None,
+            worker_done_summary: None,
+            stall_after_ms: None,
+            gate: None,
             final_excerpt: None,
             awaiting_children: None,
             parent_target: parent_target.map(str::to_owned),
@@ -546,14 +630,86 @@ impl PromptRegistry {
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
             mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
         }
+        record.stall_after_ms = stall_after_ms;
         self.save_task(&record, Some(fingerprint))?;
+        drop(guard);
         let reconciled = self.reconcile_task(task_id)?;
         Ok(reconciled.or(Some(record)))
     }
 
+    fn task_report(&self, params: &Value) -> Value {
+        let task_id = match required_str(params, "task_id") {
+            Ok(value) if !value.is_empty() && value.len() <= 128 => value,
+            _ => return invalid("task_id must be a non-empty string up to 128 bytes"),
+        };
+        let dispatch_id = match required_str(params, "dispatch_id") {
+            Ok(value) if !value.is_empty() && value.len() <= 128 => value,
+            _ => return invalid("dispatch_id must be a non-empty string up to 128 bytes"),
+        };
+        let kind = match required_str(params, "kind") {
+            Ok("heartbeat") => "heartbeat",
+            Ok("worker_done") => "worker_done",
+            _ => return invalid("kind must be heartbeat or worker_done"),
+        };
+        let summary = match optional_str(params, "summary") {
+            Ok(value) => value.map(|text| {
+                text.chars()
+                    .filter(|ch| !ch.is_control())
+                    .collect::<String>()
+            }),
+            Err(error) => return error,
+        };
+        if summary.as_ref().is_some_and(|text| text.len() > 2048) {
+            return invalid(
+                "summary must be at most 2048 bytes after stripping control characters",
+            );
+        }
+        let Ok(guard) = self.inner.task_mutations.lock() else {
+            return json!({"ok": false, "code": "agent_task_store_unavailable"});
+        };
+        let mut task = match self.load_task(task_id) {
+            Ok(Some(task)) if task.task_id == task_id && task.dispatch_id == dispatch_id => task,
+            Ok(_) => return json!({"ok": false, "code": "task_identity_mismatch"}),
+            Err(error) => {
+                return json!({"ok": false, "code": "agent_task_store_unavailable", "message": error});
+            }
+        };
+        if kind == "worker_done" && task.worker_done_at_ms.is_some() {
+            return json!({"ok": false, "code": "worker_done_already_reported"});
+        }
+        if kind == "heartbeat" && task.is_terminal() {
+            return json!({"ok": false, "code": "agent_task_terminal"});
+        }
+        let now = self.now_ms();
+        let newly_completed = kind == "worker_done" && !task.is_terminal() && task.gate.is_none();
+        if kind == "heartbeat" {
+            task.last_heartbeat_at_ms = Some(now);
+        } else {
+            task.worker_done_at_ms = Some(now);
+            task.worker_done_summary = summary;
+            if newly_completed {
+                task.lifecycle = PromptTaskLifecycle::Completed;
+                task.terminal_status = Some("worker_done".to_owned());
+                task.terminal_at_ms = Some(now);
+                task.terminal_cursor = None;
+                task.awaiting_children = None;
+                task.notification_state = "pending".to_owned();
+            }
+        }
+        task.updated_at_ms = now;
+        if let Err(error) = self.save_task(&task, None) {
+            return json!({"ok": false, "code": "agent_task_store_unavailable", "message": error});
+        }
+        drop(guard);
+        if newly_completed {
+            self.maybe_notify_parent(&task);
+        }
+        json!({"ok": true, "task": task.public_json_at(now)})
+    }
+
     pub fn task_status(&self, task_id: &str) -> Value {
         match self.reconcile_task(task_id) {
-            Ok(Some(task)) => json!({"ok": true, "task": task.public_json()}),
+            Ok(Some(task)) => json!({"ok": true, "task": task.public_json_at(self.now_ms())}),
             Ok(None) => json!({
                 "ok": false,
                 "code": "agent_task_not_found",
@@ -603,10 +759,11 @@ impl PromptRegistry {
         match self.reconcile_task(task_id) {
             Ok(Some(task))
                 if task.idempotency_key_digest.as_deref() == Some(digest.as_str())
-                    && task.target == target
+                    && (task.target == target
+                        || task.requested_target.as_deref() == Some(target))
                     && task.parent_session_ref.as_deref() == parent_session_ref =>
             {
-                json!({"ok": true, "task": task.public_json()})
+                json!({"ok": true, "task": task.public_json_at(self.now_ms())})
             }
             Ok(_) => json!({"ok": false, "code": "agent_task_not_found"}),
             Err(error) => json!({
@@ -662,7 +819,7 @@ impl PromptRegistry {
     pub fn task_status_for_parent_session(&self, task_id: &str, parent_session_ref: &str) -> Value {
         match self.reconcile_task(task_id) {
             Ok(Some(task)) if task.parent_session_ref.as_deref() == Some(parent_session_ref) => {
-                json!({"ok": true, "task": task.public_json()})
+                json!({"ok": true, "task": task.public_json_at(self.now_ms())})
             }
             Ok(Some(_)) => json!({
                 "ok": false,
@@ -743,6 +900,7 @@ impl PromptRegistry {
             .into_iter()
             .filter(|task| {
                 !task.is_terminal()
+                    && task.gate.is_none()
                     && task.parent_session_ref.as_deref() == Some(parent_session_ref)
                     && workspace_id.is_none_or(|workspace_id| {
                         task.workspace_id.as_deref() == Some(workspace_id)
@@ -754,7 +912,12 @@ impl PromptRegistry {
             return payload;
         };
         let room = limit.saturating_sub(rows.len());
-        rows.extend(running.into_iter().take(room).map(running_task_row));
+        rows.extend(
+            running
+                .into_iter()
+                .take(room)
+                .map(|task| running_task_row(task, self.now_ms())),
+        );
         payload
     }
 
@@ -865,7 +1028,7 @@ impl PromptRegistry {
         let mut terminal = scoped
             .iter()
             .copied()
-            .filter(|task| task.is_terminal())
+            .filter(|task| task.is_terminal() || task.gate.is_some())
             .cloned()
             .collect::<Vec<_>>();
         terminal.sort_by(|left, right| {
@@ -881,6 +1044,10 @@ impl PromptRegistry {
         let mut failed = 0_u64;
         let mut uncertain = 0_u64;
         for task in &scoped {
+            if task.gate.is_some() {
+                blocked += 1;
+                continue;
+            }
             match task.lifecycle {
                 PromptTaskLifecycle::Running
                 | PromptTaskLifecycle::AwaitingActivity
@@ -908,9 +1075,12 @@ impl PromptRegistry {
         // Deterministic escalation facts use the scope filter only
         // (acknowledged rows still count) and are never gated on the
         // semantic `advisory` opt-in.
-        let escalation = task_escalation(tasks.iter().filter(|task| {
-            task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
-        }));
+        let escalation = task_escalation(
+            tasks.iter().filter(|task| {
+                task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
+            }),
+            self.now_ms(),
+        );
 
         Ok(json!({
             "ok": true,
@@ -921,7 +1091,7 @@ impl PromptRegistry {
                 "failed": failed,
                 "uncertain": uncertain,
             },
-            "tasks": terminal.into_iter().map(|task| task.public_json()).collect::<Vec<_>>(),
+            "tasks": terminal.into_iter().map(|task| task.public_json_at(self.now_ms())).collect::<Vec<_>>(),
             "attention": attention,
             "escalation": escalation,
         }))
@@ -946,14 +1116,20 @@ impl PromptRegistry {
     }
 
     pub fn task_ack(&self, task_id: &str) -> Value {
+        let Ok(_guard) = self.inner.task_mutations.lock() else {
+            return json!({"ok": false, "code": "agent_task_store_unavailable"});
+        };
         match self.load_task(task_id) {
             Ok(Some(mut task)) => {
-                let now = now_ms();
+                if task.gate.is_some() {
+                    return json!({"ok": false, "code": "task_blocked_on_gate"});
+                }
+                let now = self.now_ms();
                 task.acknowledged_at_ms = Some(now);
                 task.notification_state = "acknowledged".to_owned();
                 task.updated_at_ms = now;
                 match self.save_task(&task, None) {
-                    Ok(()) => json!({"ok": true, "task": task.public_json()}),
+                    Ok(()) => json!({"ok": true, "task": task.public_json_at(self.now_ms())}),
                     Err(error) => json!({
                         "ok": false,
                         "code": "agent_task_store_unavailable",
@@ -1030,7 +1206,7 @@ impl PromptRegistry {
                             "completed": true,
                             "task_id": task_id,
                             "matched": task.lifecycle.as_str(),
-                            "task": task.public_json(),
+                            "task": task.public_json_at(self.now_ms()),
                         });
                     }
                     if task.is_terminal() {
@@ -1038,7 +1214,15 @@ impl PromptRegistry {
                             "completed": true,
                             "task_id": task_id,
                             "matched": task.lifecycle.as_str(),
-                            "task": task.public_json(),
+                            "task": task.public_json_at(self.now_ms()),
+                        });
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return json!({
+                            "completed": false,
+                            "task_id": task_id,
+                            "outcome": "checkpoint",
+                            "task": task.public_json_at(self.now_ms()),
                         });
                     }
                 }
@@ -1057,20 +1241,6 @@ impl PromptRegistry {
                         "message": error,
                     });
                 }
-            }
-            if std::time::Instant::now() >= deadline {
-                let task = self
-                    .reconcile_task(task_id)
-                    .ok()
-                    .flatten()
-                    .map(|task| task.public_json())
-                    .unwrap_or(Value::Null);
-                return json!({
-                    "completed": false,
-                    "task_id": task_id,
-                    "reason": "agent_task_wait_timeout",
-                    "task": task,
-                });
             }
             thread::sleep(Duration::from_millis(25));
         }
@@ -1138,10 +1308,17 @@ impl PromptRegistry {
     }
 
     fn maybe_notify_parent(&self, trigger: &PromptTaskRecord) {
+        let Ok(_guard) = self.inner.task_mutations.lock() else {
+            return;
+        };
+        self.maybe_notify_parent_locked(trigger);
+    }
+
+    fn maybe_notify_parent_locked(&self, trigger: &PromptTaskRecord) {
         let Some(parent_target) = trigger.parent_target.as_deref() else {
             return;
         };
-        if trigger.notification_state != "pending" {
+        if !trigger.is_terminal() || trigger.notification_state != "pending" {
             return;
         }
         let Some(client) = self.inner.client.as_ref() else {
@@ -1184,7 +1361,7 @@ impl PromptRegistry {
         });
         pending.truncate(32);
 
-        let now = now_ms();
+        let now = self.now_ms();
         for task in &mut pending {
             task.notification_state = "in_flight".to_owned();
             task.notification_attempts = task.notification_attempts.saturating_add(1);
@@ -1259,22 +1436,45 @@ impl PromptRegistry {
     }
 
     fn reconcile_task(&self, task_id: &str) -> Result<Option<PromptTaskRecord>, String> {
+        let _guard = self
+            .inner
+            .task_mutations
+            .lock()
+            .map_err(|_| "agent task mutation lock unavailable".to_owned())?;
+        self.reconcile_task_locked(task_id)
+    }
+
+    fn reconcile_task_locked(&self, task_id: &str) -> Result<Option<PromptTaskRecord>, String> {
         let Some(mut task) = self.load_task(task_id)? else {
             return Ok(None);
         };
-        if task.is_terminal() {
+        if task.gate.is_some() || task.is_terminal() {
             return Ok(Some(task));
+        }
+        // A report received during a gate is durable, but completes only after
+        // the gate is released. This explicit report does not depend on cache cursors.
+        if let Some(done_at) = task.worker_done_at_ms {
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            task.terminal_status = Some("worker_done".to_owned());
+            task.terminal_at_ms = Some(done_at);
+            task.terminal_cursor = None;
+            task.awaiting_children = None;
+            task.notification_state = "pending".to_owned();
+            self.save_task(&task, None)?;
+            self.maybe_notify_parent_locked(&task);
+            return self.load_task(task_id);
         }
         let mut changed = false;
         if task.lifecycle == PromptTaskLifecycle::AwaitingActivity
-            && now_ms().saturating_sub(task.updated_at_ms) >= PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS
+            && self.now_ms().saturating_sub(task.updated_at_ms)
+                >= PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS
         {
-            changed |= mark_delivery_uncertain(&mut task, now_ms(), "activity_start_timeout");
+            changed |= mark_delivery_uncertain(&mut task, self.now_ms(), "activity_start_timeout");
         }
         if task.is_terminal() {
             if changed {
                 self.save_task(&task, None)?;
-                self.maybe_notify_parent(&task);
+                self.maybe_notify_parent_locked(&task);
                 if let Some(reloaded) = self.load_task(task_id)? {
                     task = reloaded;
                 }
@@ -1299,10 +1499,10 @@ impl PromptRegistry {
             } else {
                 "runtime_boot_unknown"
             };
-            changed |= mark_delivery_uncertain(&mut task, now_ms(), reason);
+            changed |= mark_delivery_uncertain(&mut task, self.now_ms(), reason);
             if changed {
                 self.save_task(&task, None)?;
-                self.maybe_notify_parent(&task);
+                self.maybe_notify_parent_locked(&task);
                 if let Some(reloaded) = self.load_task(task_id)? {
                     task = reloaded;
                 }
@@ -1314,7 +1514,7 @@ impl PromptRegistry {
         if changed {
             self.save_task(&task, None)?;
             if task.is_terminal() {
-                self.maybe_notify_parent(&task);
+                self.maybe_notify_parent_locked(&task);
                 if let Some(reloaded) = self.load_task(task_id)? {
                     task = reloaded;
                 }
@@ -1336,6 +1536,9 @@ impl PromptRegistry {
         cursor: u64,
         events: &[Value],
     ) -> Result<bool, String> {
+        if task.gate.is_some() {
+            return Ok(false);
+        }
         let mut changed = if cursor.saturating_sub(task.last_cursor) > 2048 {
             mark_delivery_uncertain(task, now_ms(), "event_history_gap")
         } else {
@@ -1409,7 +1612,9 @@ impl PromptRegistry {
         if record.kind != PROMPT_TASK_OPERATION_KIND {
             return Ok(None);
         }
-        decode_task_record(&record).map(Some)
+        let mut task = decode_task_record(&record)?;
+        task.gate = store.open_decision_gate(task_id)?;
+        Ok(Some(task))
     }
 
     fn list_tasks(&self, limit: usize) -> Result<Vec<PromptTaskRecord>, String> {
@@ -1422,7 +1627,11 @@ impl PromptRegistry {
         store
             .operation_ledgers(PROMPT_TASK_OPERATION_KIND, limit)?
             .into_iter()
-            .map(|record| decode_task_record(&record))
+            .map(|record| {
+                let mut task = decode_task_record(&record)?;
+                task.gate = store.open_decision_gate(&task.task_id)?;
+                Ok(task)
+            })
             .collect()
     }
 
@@ -1493,18 +1702,22 @@ enum InboxView {
 /// `final_excerpt` is present only when captured and spares the planner an
 /// `agent.read` round trip; `awaiting_children` is present only while a
 /// supervisor is held for its own children.
-const COMPACT_TASK_FIELDS: [&str; 11] = [
+const COMPACT_TASK_FIELDS: [&str; 15] = [
     "task_id",
     "dispatch_id",
+    "requested_target",
     "target",
     "pane_id",
     "lifecycle",
+    "liveness",
     "terminal",
     "acknowledged",
     "terminal_at_ms",
     "updated_at_ms",
     "final_excerpt",
     "awaiting_children",
+    "gate",
+    "blocked_on_gate",
 ];
 
 fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
@@ -1518,14 +1731,19 @@ fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
 /// One non-terminal row for the opt-in extension inbox view: identity, lane
 /// lifecycle, and the supervisor hold fact only. Deliberately no excerpt (the
 /// task has no outcome yet) and no acknowledged state (it cannot be acked).
-fn running_task_row(task: PromptTaskRecord) -> Value {
+fn running_task_row(task: PromptTaskRecord, now: u64) -> Value {
     let mut row = json!({
         "task_id": task.task_id,
         "dispatch_id": task.dispatch_id,
         "workspace_id": task.workspace_id,
         "lifecycle": task.lifecycle.as_str(),
+        "liveness": task.liveness(now),
         "terminal": false,
     });
+    if let Some(requested) = &task.requested_target {
+        row["target"] = json!(task.target);
+        row["requested_target"] = json!(requested);
+    }
     if let (Some(awaiting_children), Some(object)) = (task.awaiting_children, row.as_object_mut()) {
         object.insert("awaiting_children".to_owned(), json!(awaiting_children));
     }
@@ -1638,8 +1856,7 @@ fn task_notification_priority(task: &PromptTaskRecord) -> u32 {
 /// failure: `delivery_uncertain` neither extends an unsuccessful streak nor
 /// produces a consult hint. The raw `parent_session_ref` value stays private;
 /// callers only learn whether the lane is session scoped.
-fn task_escalation<'a>(tasks: impl IntoIterator<Item = &'a PromptTaskRecord>) -> Value {
-    let now = now_ms();
+fn task_escalation<'a>(tasks: impl IntoIterator<Item = &'a PromptTaskRecord>, now: u64) -> Value {
     let mut lanes: HashMap<(&str, Option<&str>), Vec<&PromptTaskRecord>> = HashMap::new();
     for task in tasks {
         if now.saturating_sub(task.updated_at_ms) > ESCALATION_WINDOW_MS {
@@ -1735,16 +1952,12 @@ fn task_escalation<'a>(tasks: impl IntoIterator<Item = &'a PromptTaskRecord>) ->
             ));
         }
 
-        for task in lane.iter().copied().filter(|task| {
-            matches!(
-                task.lifecycle,
-                PromptTaskLifecycle::Running | PromptTaskLifecycle::AwaitingActivity
-            )
-        }) {
+        for task in lane
+            .iter()
+            .copied()
+            .filter(|task| task.liveness(now) == "stalled")
+        {
             let idle_ms = now.saturating_sub(task.updated_at_ms);
-            if idle_ms < ESCALATION_STALL_IDLE_MS {
-                continue;
-            }
             let mut signal = escalation_signal(
                 "stall_suspected",
                 "verify_progress",
@@ -2686,6 +2899,7 @@ fn annotate_idempotency_persistence(mut result: Value, persistence_error: Value)
 }
 
 pub const AGENT_TASK_DISPATCH_METHOD: &str = "herdr_mcp.agent.task.dispatch";
+pub const AGENT_TASK_REPORT_METHOD: &str = "herdr_mcp.agent.task.report";
 pub const AGENT_TASK_STATUS_METHOD: &str = "herdr_mcp.agent.task.status";
 pub const AGENT_TASK_INBOX_METHOD: &str = "herdr_mcp.agent.task.inbox";
 pub const AGENT_TASK_ACK_METHOD: &str = "herdr_mcp.agent.task.ack";
@@ -2697,6 +2911,16 @@ pub fn task_call_with_parent_session(
     caller_parent_session_ref: Option<&str>,
 ) -> Value {
     match method {
+        decision_gates::RESOLVE => json!({"ok": false, "code": "gate_resolution_requires_human"}),
+        decision_gates::CREATE | decision_gates::STATUS | decision_gates::CANCEL => {
+            registry.gate_call(method, params, caller_parent_session_ref)
+        }
+        AGENT_TASK_REPORT_METHOD => {
+            if caller_parent_session_ref.is_some() {
+                return json!({"ok": false, "code": "worker_report_requires_trusted_local"});
+            }
+            registry.task_report(params)
+        }
         AGENT_TASK_STATUS_METHOD => {
             if let Some(key_value) = params.get("idempotency_key") {
                 let Some(key) = key_value.as_str() else {
@@ -2903,6 +3127,24 @@ pub fn run_with_parent_session(
         Ok(value) => value,
         Err(error) => return error,
     };
+    let role = match role_targets::RoleTarget::parse(target) {
+        Ok(role) => role,
+        Err(error) => return error,
+    };
+    let workspace_id = match optional_str(args, "workspace_id") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let max_concurrent = match args.get("max_concurrent") {
+        None => None,
+        Some(value) => match value.as_u64() {
+            Some(value) if (1..=16).contains(&value) => Some(value),
+            _ => return invalid("max_concurrent must be an integer in 1..=16"),
+        },
+    };
+    if max_concurrent.is_some() && role.is_none() {
+        return invalid("max_concurrent requires an explicit role selector target");
+    }
     let text = match required_str(args, "text") {
         Ok(value) => value,
         Err(error) => return error,
@@ -2914,6 +3156,13 @@ pub fn run_with_parent_session(
     let parent_target = match optional_str(args, "parent_target") {
         Ok(value) => value,
         Err(error) => return error,
+    };
+    let stall_after_ms = match args.get("stall_after_ms") {
+        None => None,
+        Some(value) => match value.as_u64() {
+            Some(value) if (60_000..=120 * 60_000).contains(&value) => Some(value),
+            _ => return invalid("stall_after_ms must be an integer in 60000..=7200000"),
+        },
     };
     let inject_task_identity = match args.get("inject_task_identity") {
         None => false,
@@ -2933,8 +3182,23 @@ pub fn run_with_parent_session(
 
     // A parented dispatch probes the caller's own agent once for the delegation
     // guards and reuses that observation as the pre-submit baseline below.
-    let guard_observation = parent_target.and_then(|_| agent_state_of(client, target));
-    if let Some(parent_target) = parent_target
+    // Hold admission through durable task registration, including requests with
+    // no cap, so concurrent role calls cannot race a capped caller's count.
+    let role_admission = if role.is_some() {
+        match registry.inner.role_dispatches.lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => return role_targets::not_delivered("agent_task_store_unavailable"),
+        }
+    } else {
+        None
+    };
+    let guard_observation = if role.is_none() {
+        parent_target.and_then(|_| agent_state_of(client, target))
+    } else {
+        None
+    };
+    if role.is_none()
+        && let Some(parent_target) = parent_target
         && let Some(mut rejection) = delegation_guard(
             client,
             registry,
@@ -2968,8 +3232,40 @@ pub fn run_with_parent_session(
         }
     }
 
+    let requested_target = role.as_ref().map(|_| target);
+    let resolution = if let Some(role) = role.as_ref() {
+        match role.resolve(
+            client,
+            registry,
+            workspace_id,
+            parent_target,
+            parent_session_ref,
+            max_concurrent,
+        ) {
+            Ok(resolution) => Some(resolution),
+            Err(mut error) => {
+                insert_dispatch_id(&mut error, task_id);
+                insert_task_id(&mut error, task_id);
+                if let Some(key) = idempotency_key
+                    && let Err(persist_error) = registry.complete(key, &fingerprint, &error)
+                {
+                    return annotate_idempotency_persistence(error, persist_error);
+                }
+                return error;
+            }
+        }
+    } else {
+        None
+    };
+    let target = resolution
+        .as_ref()
+        .map_or(target, |resolved| resolved.target.as_str());
     let start_cursor = registry.current_task_cursor();
-    let before = guard_observation.or_else(|| agent_state_of(client, target));
+    let before = resolution
+        .as_ref()
+        .map(|resolved| resolved.before.clone())
+        .or(guard_observation)
+        .or_else(|| agent_state_of(client, target));
     let pane_id = before
         .as_ref()
         .and_then(|state| state.pane_id.as_deref())
@@ -2989,7 +3285,7 @@ pub fn run_with_parent_session(
         // Runtime-generated ids are bounded and contain no caller/session data.
         // Keep this after fingerprinting and the replay return above.
         dispatch_text.push_str(&format!(
-            "\n[herdr-task task_id={task_id} dispatch_id={dispatch_id}]\nReport completion to the parent using both task_id and dispatch_id."
+            "\n[herdr-task task_id={task_id} dispatch_id={dispatch_id}]\nReport completion exactly once: herdr-mcp agent report --task-id {task_id} --dispatch-id {dispatch_id} --kind worker_done. For long tasks, report --kind heartbeat periodically."
         ));
     }
     // Native Herdr 0.9.x wait is lifecycle/status based and cannot identify the
@@ -3017,6 +3313,11 @@ pub fn run_with_parent_session(
         Err(error) => prompt_failure(client, target, before.as_ref(), false, error, task_id),
     };
     insert_task_id(&mut result, task_id);
+    if let Some(resolved) = &resolution {
+        result["requested_target"] = json!(requested_target);
+        result["resolved_target"] = json!(resolved.target);
+        result["candidates"] = json!(resolved.candidates);
+    }
 
     // A dispatch that provably never reached the agent releases the mark it
     // created so the next first dispatch re-attaches the handoff. Success and
@@ -3033,6 +3334,7 @@ pub fn run_with_parent_session(
     match registry.register_task(RegisterTaskInput {
         task_id,
         target,
+        requested_target,
         fingerprint: &fingerprint,
         idempotency_key,
         before: before.as_ref(),
@@ -3041,12 +3343,13 @@ pub fn run_with_parent_session(
         start_cursor,
         parent_target,
         parent_session_ref,
+        stall_after_ms,
     }) {
         Ok(Some(task)) => {
             if let Some(object) = result.as_object_mut() {
                 object.insert("task_tracking".to_owned(), json!(true));
                 object.insert("turn_id".to_owned(), json!(task.turn_id));
-                object.insert("task".to_owned(), task.public_json());
+                object.insert("task".to_owned(), task.public_json_at(registry.now_ms()));
             }
         }
         Ok(None) => {}
@@ -3090,6 +3393,7 @@ pub fn run_with_parent_session(
         }
     }
 
+    drop(role_admission);
     if let Some(wait) = wait.as_ref() {
         apply_task_wait(registry, &mut result, task_id, wait);
     }
@@ -3471,9 +3775,13 @@ fn apply_task_wait(registry: &PromptRegistry, result: &mut Value, task_id: &str,
             object.insert("task".to_owned(), task.clone());
         }
         object.insert("wait".to_owned(), task_wait);
-        if !completed {
+        if !completed && object.get("ok").and_then(Value::as_bool) == Some(true) {
+            if object["wait"]["outcome"] == "checkpoint" {
+                object.insert("hint".to_owned(), json!("Wait checkpoint: the task is still live; re-check agent.task.status or agent.task.inbox with the same task_id. Do not redispatch."));
+                return;
+            }
             object.insert("ok".to_owned(), json!(false));
-            object.insert("failure".to_owned(), json!("agent_task_wait_timeout"));
+            object.insert("failure".to_owned(), object["wait"]["reason"].clone());
             object.insert(
                 "failure_phase".to_owned(),
                 json!("post_submission_task_wait"),
@@ -3481,7 +3789,7 @@ fn apply_task_wait(registry: &PromptRegistry, result: &mut Value, task_id: &str,
             object.insert("retryable".to_owned(), json!(false));
             object.insert(
                 "hint".to_owned(),
-                json!("the prompt was submitted once; task wait timed out, so inspect the returned task_id/inbox before any retry"),
+                json!("The prompt may already be submitted; re-check task status/inbox before retrying."),
             );
         }
     }
@@ -4035,7 +4343,7 @@ mod tests {
             let dispatch_id = first["dispatch_id"].as_str().unwrap();
             let expected = if inject {
                 format!(
-                    "original text\n\n[herdr-task task_id={task_id} dispatch_id={dispatch_id}]\nReport completion to the parent using both task_id and dispatch_id."
+                    "original text\n\n[herdr-task task_id={task_id} dispatch_id={dispatch_id}]\nReport completion exactly once: herdr-mcp agent report --task-id {task_id} --dispatch-id {dispatch_id} --kind worker_done. For long tasks, report --kind heartbeat periodically."
                 )
             } else {
                 "original text\n".to_owned()
@@ -4076,6 +4384,376 @@ mod tests {
         }
     }
 
+    fn role_registry(agents: Value) -> PromptRegistry {
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let mut registry = PromptRegistry::with_store(store);
+        Arc::get_mut(&mut registry.inner).unwrap().cache = Some(Arc::new(
+            EventCache::from_snapshot_for_test(json!({"agents": agents, "panes": []})),
+        ));
+        registry
+    }
+
+    fn role_submitted(pane: &str) -> Value {
+        json!({"result": {"prompt": {"status": "submitted", "agent": {
+            "pane_id": pane, "agent_status": "working", "state_change_seq": 2,
+        }}}})
+    }
+
+    /// user planner | Given busy and idle codex panes | When selecting a role
+    /// and replaying without a snapshot | Then one concrete pane is delivered,
+    /// durably recorded and retained in every task projection.
+    #[test]
+    fn role_dispatch_records_idle_target_and_replays_without_resolution() {
+        for selector in ["@codex", "@codex:idle"] {
+            let socket = temp_socket();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server = scripted_read_server(
+                UnixListener::bind(&socket).unwrap(),
+                vec![role_submitted("w1:p3")],
+                requests.clone(),
+            );
+            let client = HerdrClient::new(&socket);
+            let registry = role_registry(json!([
+                {"pane_id": "w1:p1", "kind": "codex", "agent_status": "working"},
+                {"pane_id": "w1:p2", "kind": "pi", "agent_status": "idle"},
+                {"pane_id": "w1:p3", "kind": "codex", "agent_status": "idle", "api_key": "secret"},
+                {"pane_id": "w1:p4", "kind": "codex", "agent_status": "idle"},
+            ]));
+            let args = json!({"target": selector, "text": "work", "idempotency_key": "role-key", "max_concurrent": 1});
+            let first = run(&client, &registry, &args);
+            server.join().unwrap();
+            assert_eq!(first["ok"], true, "{first}");
+            assert_eq!(first["resolved_target"], "w1:p3");
+            assert_eq!(first["task"]["target"], "w1:p3");
+            assert_eq!(first["task"]["requested_target"], selector);
+            assert_eq!(first["candidates"].as_array().unwrap().len(), 3);
+            assert!(!first["candidates"].to_string().contains("secret"));
+            assert_eq!(
+                *requests.lock().unwrap(),
+                vec![(
+                    "agent.prompt".to_owned(),
+                    json!({"target": "w1:p3", "text": "work"})
+                )]
+            );
+            let store = registry.inner.store.as_ref().unwrap().clone();
+            let reloaded = PromptRegistry::with_store(store);
+            let replay = run(&client, &reloaded, &args);
+            assert_eq!(replay["idempotent_replay"], true, "{replay}");
+            assert_eq!(replay["resolved_target"], first["resolved_target"]);
+            assert_eq!(replay["candidates"], first["candidates"]);
+            let task_id = first["task_id"].as_str().unwrap();
+            assert_eq!(
+                reloaded.task_status(task_id)["task"]["requested_target"],
+                selector
+            );
+            assert_eq!(
+                reloaded.task_status_by_idempotency("role-key", selector, None)["task"]["target"],
+                "w1:p3"
+            );
+            assert_eq!(
+                reloaded.task_status_by_idempotency("role-key", selector, Some("other-session"))["code"],
+                "agent_task_not_found"
+            );
+            let mut task = reloaded.load_task(task_id).unwrap().unwrap();
+            assert_eq!(
+                running_task_row(task.clone(), now_ms())["requested_target"],
+                selector
+            );
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            reloaded.save_task(&task, None).unwrap();
+            for view in [InboxView::Full, InboxView::Compact] {
+                let inbox = apply_inbox_view(
+                    reloaded.task_inbox(None, None, None, false, false, 10),
+                    view,
+                );
+                assert_eq!(inbox["tasks"][0]["target"], "w1:p3");
+                assert_eq!(inbox["tasks"][0]["requested_target"], selector);
+            }
+            fs::remove_file(socket).unwrap();
+        }
+    }
+
+    /// user planner | Given own, working, blocked, unknown and other-workspace
+    /// panes | When requesting @idle | Then only the scoped idle worker receives it.
+    #[test]
+    fn role_idle_excludes_caller_busy_unknown_and_other_workspace() {
+        let socket = temp_socket();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let parent = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle"}}});
+        let server = scripted_dispatch_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![parent, role_submitted("w1:p5")],
+            texts.clone(),
+        );
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p1", "name": "caller", "kind": "codex", "agent_status": "idle", "workspace_id": "w1"},
+            {"pane_id": "w1:p2", "kind": "codex", "agent_status": "working", "workspace_id": "w1"},
+            {"pane_id": "w1:p3", "kind": "grok", "agent_status": "blocked", "workspace_id": "w1"},
+            {"pane_id": "w1:p4", "kind": "pi", "workspace_id": "w1"},
+            {"pane_id": "w2:p1", "kind": "pi", "agent_status": "idle", "workspace_id": "w2"},
+            {"pane_id": "w1:p5", "kind": "droid", "agent_status": "idle", "workspace_id": "w1"},
+        ]));
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "target": "@idle", "text": "work", "parent_target": "caller", "workspace_id": "w1",
+            }),
+        );
+        server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["resolved_target"], "w1:p5");
+        assert_eq!(result["candidates"][0]["reason"], "parent_target_is_target");
+        assert_eq!(*texts.lock().unwrap(), vec!["work"]);
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given no eligible pane or an unsupported selector | When
+    /// dispatching | Then the socket receives no prompt and the failure is explicit.
+    #[test]
+    fn role_unavailable_broadcast_and_invalid_limits_never_submit() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p1", "kind": "codex", "agent_status": "working"},
+            {"pane_id": "w1:p2", "kind": "codex", "agent_status": "blocked"},
+        ]));
+        let client = HerdrClient::new(&socket);
+        for selector in ["@codex", "@idle", "@grok", "@codex:idle"] {
+            let result = run(
+                &client,
+                &registry,
+                &json!({"target": selector, "text": "work"}),
+            );
+            assert_eq!(result["code"], "role_target_unavailable", "{result}");
+            assert_eq!(result["delivery_state"], "not_delivered");
+            assert_eq!(result["submitted"], false);
+        }
+        for selector in ["@all", "@all:idle", "@worktree:w1", "@codex,grok", "@"] {
+            assert_eq!(
+                run(
+                    &client,
+                    &registry,
+                    &json!({"target": selector, "text": "work"})
+                )["code"],
+                "role_target_unsupported"
+            );
+        }
+        for limit in [json!(0), json!(17), json!(1.5), json!("2"), Value::Null] {
+            assert_eq!(
+                run(
+                    &client,
+                    &registry,
+                    &json!({"target": "@codex", "text": "work", "max_concurrent": limit})
+                )["code"],
+                "invalid_params"
+            );
+        }
+        assert!(registry.list_tasks(100).unwrap().is_empty());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given two live role tasks in each scope | When capping
+    /// that selector | Then the third is rejected; terminal/other-scope work
+    /// is ignored and opening a gate keeps a task counted.
+    #[test]
+    fn role_cap_counts_all_live_tasks_in_the_exact_parent_scope() {
+        for (session, parent) in [
+            (Some("session-a"), Some("parent-a")),
+            (None, Some("parent-a")),
+            (None, None),
+        ] {
+            let registry = role_registry(json!([]));
+            for i in 0..2 {
+                let mut task = escalation_task(
+                    &format!("live-{i}"),
+                    "w1:p1",
+                    PromptTaskLifecycle::Running,
+                    0,
+                );
+                task.requested_target = Some("@codex".to_owned());
+                task.parent_session_ref = session.map(str::to_owned);
+                task.parent_target = parent.map(str::to_owned);
+                registry.save_task(&task, None).unwrap();
+            }
+            // Flood the bounded list window: the admission query must still
+            // see the two live tasks even behind more than 1024 terminal rows.
+            for i in 0..1025 {
+                let mut task = escalation_task(
+                    &format!("terminal-{i}"),
+                    "w1:p1",
+                    PromptTaskLifecycle::Completed,
+                    0,
+                );
+                task.requested_target = Some("@codex".to_owned());
+                task.parent_session_ref = session.map(str::to_owned);
+                task.parent_target = parent.map(str::to_owned);
+                registry.save_task(&task, None).unwrap();
+            }
+            let client = HerdrClient::new(temp_socket());
+            let mut args = json!({"target": "@codex", "text": "work", "max_concurrent": 2});
+            if let Some(parent) = parent {
+                args["parent_target"] = json!(parent);
+            }
+            let result = run_with_parent_session(&client, &registry, &args, session);
+            assert_eq!(result["code"], "concurrency_limit_reached", "{result}");
+            assert_eq!(result["delivery_state"], "not_delivered");
+            assert_eq!(result["submitted"], false);
+            assert_eq!(
+                run_with_parent_session(&client, &registry, &args, Some("other-session"))["code"],
+                "role_target_unavailable"
+            );
+            if session.is_some() {
+                args["parent_target"] = json!("another-pane-same-session");
+                assert_eq!(
+                    run_with_parent_session(&client, &registry, &args, session)["code"],
+                    "concurrency_limit_reached"
+                );
+            } else if parent.is_some() {
+                args["parent_target"] = json!("another-parent");
+                assert_eq!(
+                    run(&client, &registry, &args)["code"],
+                    "role_target_unavailable"
+                );
+            }
+            let gate = registry.gate_call(
+                decision_gates::CREATE,
+                &json!({
+                    "task_id": "live-0", "question": "Choose", "options": ["continue", "stop"],
+                }),
+                session,
+            );
+            assert_eq!(gate["ok"], true, "{gate}");
+            let mut task = registry.load_task("live-0").unwrap().unwrap();
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            registry.save_task(&task, None).unwrap();
+            let mut original = json!({"target": "@codex", "text": "work", "max_concurrent": 2});
+            if let Some(parent) = parent {
+                original["parent_target"] = json!(parent);
+            }
+            assert_eq!(
+                run_with_parent_session(&client, &registry, &original, session)["code"],
+                "concurrency_limit_reached"
+            );
+            assert_eq!(
+                registry.gate_call(
+                    decision_gates::CANCEL,
+                    &json!({"gate_id": gate["gate"]["gate_id"]}),
+                    session
+                )["ok"],
+                true
+            );
+            // No candidate now proves admission passed with one live task.
+            let mut original = json!({"target": "@codex", "text": "work", "max_concurrent": 2});
+            if let Some(parent) = parent {
+                original["parent_target"] = json!(parent);
+            }
+            assert_eq!(
+                run_with_parent_session(&client, &registry, &original, session)["code"],
+                "role_target_unavailable"
+            );
+        }
+    }
+
+    /// user worker | Given a two-level delegation chain | When attempting a
+    /// role sub-worker | Then the existing depth guard refuses every candidate.
+    #[test]
+    fn role_dispatch_preserves_delegation_depth_and_self_exclusion() {
+        let socket = temp_socket();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_dispatch_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![json!({"result": {"agent": {"pane_id": "w1:p2", "agent_status": "idle"}}})],
+            texts.clone(),
+        );
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p2", "name": "worker", "kind": "codex", "agent_status": "idle"},
+            {"pane_id": "w1:p3", "kind": "pi", "agent_status": "idle"},
+        ]));
+        register_running_task(
+            &registry,
+            "supervisor-task",
+            "supervisor",
+            "w1:p1",
+            Some("planner"),
+            None,
+            0,
+        );
+        register_running_task(
+            &registry,
+            "worker-task",
+            "worker",
+            "w1:p2",
+            Some("supervisor"),
+            None,
+            0,
+        );
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({"target": "@idle", "text": "work", "parent_target": "worker"}),
+        );
+        server.join().unwrap();
+        assert_eq!(result["code"], "role_target_unavailable", "{result}");
+        assert_eq!(result["candidates"][0]["reason"], "parent_target_is_target");
+        assert_eq!(
+            result["candidates"][1]["reason"],
+            "delegation_depth_exceeded"
+        );
+        assert!(texts.lock().unwrap().is_empty());
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given simultaneous role requests and a cap of one | When
+    /// both dispatch | Then only one native submission crosses the socket.
+    #[test]
+    fn role_cap_serializes_simultaneous_dispatches() {
+        let socket = temp_socket();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_dispatch_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![role_submitted("w1:p1")],
+            texts.clone(),
+        );
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p1", "kind": "codex", "agent_status": "idle"},
+        ]));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2).map(|i| {
+            let registry = registry.clone();
+            let client = HerdrClient::new(&socket);
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                run(&client, &registry, &json!({"target": "@codex", "text": format!("work-{i}"), "max_concurrent": 1}))
+            })
+        }).collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        server.join().unwrap();
+        assert_eq!(
+            results.iter().filter(|result| result["ok"] == true).count(),
+            1,
+            "{results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result["code"] == "concurrency_limit_reached")
+                .count(),
+            1
+        );
+        assert_eq!(texts.lock().unwrap().len(), 1);
+        fs::remove_file(socket).unwrap();
+    }
+
     fn handoff_registry() -> PromptRegistry {
         use crate::state_store::work_journal::WorkState;
 
@@ -4099,6 +4777,10 @@ mod tests {
         })));
         PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -4378,6 +5060,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id,
                 target: "child",
+                requested_target: None,
                 fingerprint: "fingerprint",
                 idempotency_key: Some("review-project-19-sha"),
                 before: Some(&before),
@@ -4386,6 +5069,7 @@ mod tests {
                 start_cursor: 100,
                 parent_target: Some("parent"),
                 parent_session_ref: None,
+                stall_after_ms: None,
             })
             .unwrap()
             .unwrap();
@@ -4571,6 +5255,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id,
                 target: "child",
+                requested_target: None,
                 fingerprint: "fingerprint",
                 idempotency_key: None,
                 before: Some(&idle),
@@ -4579,6 +5264,7 @@ mod tests {
                 start_cursor: 200,
                 parent_target: Some("parent"),
                 parent_session_ref: None,
+                stall_after_ms: None,
             })
             .unwrap()
             .unwrap();
@@ -4682,6 +5368,10 @@ mod tests {
         let cache = Arc::new(EventCache::from_snapshot_for_test(json!({"panes": []})));
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(Arc::clone(&store)),
@@ -4703,6 +5393,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id: "dispatch:prompt:boot-fence",
                 target: "child",
+                requested_target: None,
                 fingerprint: "fp",
                 idempotency_key: None,
                 before: Some(&before),
@@ -4711,6 +5402,7 @@ mod tests {
                 start_cursor: 100,
                 parent_target: Some("parent"),
                 parent_session_ref: None,
+                stall_after_ms: None,
             })
             .unwrap()
             .unwrap();
@@ -4797,6 +5489,7 @@ mod tests {
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
             target: target.to_owned(),
+            requested_target: None,
             idempotency_key_digest: None,
             pane_id: Some("w1:p1".to_owned()),
             workspace_id: Some("w1".to_owned()),
@@ -4812,6 +5505,11 @@ mod tests {
             terminal_status: terminal.then(|| lifecycle.as_str().to_owned()),
             terminal_cursor: None,
             terminal_at_ms: terminal.then(|| now.saturating_sub(age_ms)),
+            last_heartbeat_at_ms: None,
+            worker_done_at_ms: None,
+            worker_done_summary: None,
+            stall_after_ms: None,
+            gate: None,
             final_excerpt: None,
             awaiting_children: None,
             parent_target: Some("parent".to_owned()),
@@ -4829,6 +5527,484 @@ mod tests {
             created_at_ms: now.saturating_sub(age_ms),
             updated_at_ms: now.saturating_sub(age_ms),
         }
+    }
+
+    fn worker_registry(tag: &str) -> (PathBuf, PromptRegistry, Arc<AtomicU64>) {
+        let (path, mut registry) = task_registry(tag);
+        let clock = Arc::new(AtomicU64::new(now_ms()));
+        Arc::get_mut(&mut registry.inner).unwrap().clock = Some(clock.clone());
+        (path, registry, clock)
+    }
+
+    /// user parent | Given a durable task in one parent scope | When a decision
+    /// gate is opened and a worker reports done | Then ack/completion stay held
+    /// across reopen, other parents cannot access it, and resolution releases it.
+    #[test]
+    fn decision_gate_blocks_ack_completion_and_preserves_scope_across_reopen() {
+        use decision_gates::{CANCEL, CREATE, RESOLVE, STATUS};
+        let (path, registry, clock) = worker_registry("decision-gates");
+        let mut task = escalation_task("gate-task", "child", PromptTaskLifecycle::Running, 0);
+        task.parent_session_ref = Some("parent-session".to_owned());
+        registry.save_task(&task, None).unwrap();
+        let call = |method, params: Value, scope| {
+            task_call_with_parent_session(&registry, method, &params, scope)
+        };
+        let create = json!({"task_id": task.task_id, "question": "Choose a path", "options": ["continue", "stop"]});
+        assert_eq!(
+            call(CREATE, create.clone(), Some("other-parent"))["code"],
+            "agent_task_parent_mismatch"
+        );
+        let opened = call(CREATE, create.clone(), Some("parent-session"));
+        assert_eq!(opened["ok"], true, "{opened}");
+        let gate_id = opened["gate"]["gate_id"].as_str().unwrap();
+        let gate_params = json!({"gate_id": gate_id});
+        assert_eq!(
+            call(CREATE, create, Some("parent-session"))["code"],
+            "task_gate_already_open"
+        );
+        let status = registry.task_status(&task.task_id);
+        assert_eq!(status["task"]["blocked_on_gate"], true);
+        assert_eq!(status["task"]["gate"], opened["gate"]);
+        assert_eq!(status["task"]["terminal"], false);
+        assert_eq!(
+            registry.task_ack(&task.task_id)["code"],
+            "task_blocked_on_gate"
+        );
+        for scope in [Some("other-parent"), None] {
+            assert_eq!(
+                call(CANCEL, gate_params.clone(), scope)["code"],
+                "agent_task_parent_mismatch"
+            );
+        }
+        assert_eq!(
+            call(STATUS, gate_params.clone(), Some("other-parent"))["code"],
+            "agent_task_parent_mismatch"
+        );
+        assert_eq!(
+            call(STATUS, gate_params.clone(), Some("parent-session"))["gate"],
+            opened["gate"]
+        );
+        for scope in [None, Some("parent-session"), Some("other-parent")] {
+            assert_eq!(
+                call(
+                    RESOLVE,
+                    json!({"gate_id": gate_id, "resolution": "continue", "human": true}),
+                    scope
+                )["code"],
+                "gate_resolution_requires_human"
+            );
+        }
+        let inbox = call(
+            AGENT_TASK_INBOX_METHOD,
+            json!({"view": "compact"}),
+            Some("parent-session"),
+        );
+        assert_eq!(inbox["tasks"][0]["gate"], opened["gate"]);
+        assert_eq!(inbox["tasks"][0]["blocked_on_gate"], true);
+        assert_eq!(inbox["summary"]["blocked"], 1);
+        let running = registry.task_inbox_with_running(None, "parent-session", 50);
+        assert_eq!(running["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(running["tasks"][0]["gate"], opened["gate"]);
+        let report = json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "worker_done"});
+        clock.fetch_add(42, Ordering::Relaxed);
+        let reported = call(AGENT_TASK_REPORT_METHOD, report.clone(), None);
+        assert_eq!(reported["ok"], true);
+        assert_eq!(reported["task"]["terminal"], false);
+        assert_eq!(reported["task"]["lifecycle"], "running");
+        assert!(reported["task"]["worker_done_at_ms"].is_u64());
+        assert_eq!(
+            call(AGENT_TASK_REPORT_METHOD, report, None)["code"],
+            "worker_done_already_reported"
+        );
+        let reopened =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(&path).unwrap())));
+        assert_eq!(
+            reopened.task_status(&task.task_id)["task"]["blocked_on_gate"],
+            true
+        );
+        {
+            // Exercise the same durable compare-and-set that the separately
+            // tested terminal boundary uses, through a second SQLite handle.
+            let store = StateStore::open(&path).unwrap();
+            assert_eq!(
+                store
+                    .close_decision_gate(gate_id, Some("invalid"), 100)
+                    .unwrap_err(),
+                "gate_invalid_resolution"
+            );
+            assert_eq!(
+                store.decision_gate(gate_id).unwrap().unwrap().status,
+                "open"
+            );
+            let resolved = store
+                .close_decision_gate(gate_id, Some("continue"), 101)
+                .unwrap();
+            assert_eq!(
+                resolved.resolved_by,
+                Some(json!({"class": "local_cli_interactive"}))
+            );
+            assert_eq!(
+                store
+                    .close_decision_gate(gate_id, Some("continue"), 102)
+                    .unwrap_err(),
+                "gate_not_open"
+            );
+        }
+        let completed = reopened.task_status(&task.task_id);
+        assert_eq!(completed["task"]["terminal"], true);
+        assert_eq!(completed["task"]["terminal_status"], "worker_done");
+        assert_ne!(completed["task"]["blocked_on_gate"], true);
+        assert_eq!(reopened.task_ack(&task.task_id)["ok"], true);
+        drop(reopened);
+        drop(registry);
+        remove_escalation_db(&path);
+    }
+
+    /// user parent | Given tasks and bounded choices | When invalid gates,
+    /// concurrent creates, cancellation and lifecycle settle are attempted |
+    /// Then validation is fail-closed and at most one open gate survives.
+    #[test]
+    fn decision_gate_validates_bounds_cancels_and_holds_lifecycle_settle() {
+        use decision_gates::{CANCEL, CREATE};
+        let (path, registry, _) = worker_registry("gate-bounds");
+        let task = escalation_task("gate-bounds", "child", PromptTaskLifecycle::Running, 0);
+        registry.save_task(&task, None).unwrap();
+        let valid =
+            json!({"task_id": task.task_id, "question": "Choose", "options": ["yes", "no"]});
+        let create = |params| task_call_with_parent_session(&registry, CREATE, &params, None);
+        for (key, value) in [
+            ("question", json!("界".repeat(342))),
+            ("question", json!("")),
+            ("question", json!("escape\u{001b}")),
+            ("options", json!(["one"])),
+            ("options", json!(["same", "same"])),
+            ("options", json!(["", "two"])),
+            ("options", json!(["界".repeat(43), "two"])),
+            (
+                "options",
+                json!(["a", "b", "c", "d", "e", "f", "g", "h", "i"]),
+            ),
+        ] {
+            let mut params = valid.clone();
+            params[key] = value;
+            assert_eq!(create(params)["code"], "invalid_params");
+        }
+        let mut missing = valid.clone();
+        missing["task_id"] = json!("missing");
+        assert_eq!(create(missing)["code"], "agent_task_not_found");
+        let workers = (0..8)
+            .map(|_| {
+                let registry = registry.clone();
+                let params = valid.clone();
+                thread::spawn(move || {
+                    task_call_with_parent_session(&registry, CREATE, &params, None)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|result| result["ok"] == true).count(),
+            1
+        );
+        let gate_id =
+            results.iter().find(|result| result["ok"] == true).unwrap()["gate"]["gate_id"].clone();
+        let mut held = registry.load_task(&task.task_id).unwrap().unwrap();
+        let settle = json!({"cursor": 1, "pane_id": "w1:p1", "agent_status": "done"});
+        assert!(
+            !registry
+                .apply_task_window(&mut held, 1, std::slice::from_ref(&settle))
+                .unwrap()
+        );
+        assert_eq!(held.lifecycle, PromptTaskLifecycle::Running);
+        assert_eq!(held.last_cursor, 0);
+        registry.save_task(&held, None).unwrap();
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["terminal"],
+            false
+        );
+        assert_eq!(
+            registry.task_ack(&task.task_id)["code"],
+            "task_blocked_on_gate"
+        );
+        let cancelled =
+            task_call_with_parent_session(&registry, CANCEL, &json!({"gate_id": gate_id}), None);
+        assert_eq!(cancelled["gate"]["status"], "cancelled");
+        assert_eq!(cancelled["gate"]["resolved_by"], Value::Null);
+        let mut released = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert!(
+            registry
+                .apply_task_window(&mut released, 1, &[settle])
+                .unwrap()
+        );
+        registry.save_task(&released, None).unwrap();
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["terminal"],
+            true
+        );
+        assert_eq!(create(valid)["code"], "agent_task_terminal");
+        drop(registry);
+        remove_escalation_db(&path);
+    }
+
+    /// user worker | Given a durable running task with distinct ids | When
+    /// completion reports race and the runtime reloads | Then exactly one
+    /// succeeds, mismatches fail, and duplicate reports change no stored fact.
+    #[test]
+    fn worker_reports_are_durable_exactly_once_and_identity_bound() {
+        let (path, registry, clock) = worker_registry("reports");
+        let mut task = escalation_task("report-task", "child", PromptTaskLifecycle::Running, 0);
+        task.dispatch_id = "distinct-dispatch".to_owned();
+        registry.save_task(&task, None).unwrap();
+        let report = |params| {
+            task_call_with_parent_session(&registry, AGENT_TASK_REPORT_METHOD, &params, None)
+        };
+        for params in [
+            json!({"task_id": "missing", "dispatch_id": task.dispatch_id, "kind": "worker_done"}),
+            json!({"task_id": task.task_id, "dispatch_id": task.task_id, "kind": "worker_done"}),
+        ] {
+            assert_eq!(report(params)["code"], "task_identity_mismatch");
+            assert_eq!(registry.load_task(&task.task_id).unwrap().unwrap(), task);
+        }
+        assert_eq!(
+            report(
+                json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "worker_done", "summary": "界".repeat(683)})
+            )["code"],
+            "invalid_params"
+        );
+        let params = json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "worker_done", "summary": "done\n\u{001b}\t✓"});
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let registry = registry.clone();
+                let params = params.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    task_call_with_parent_session(
+                        &registry,
+                        AGENT_TASK_REPORT_METHOD,
+                        &params,
+                        None,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|result| result["ok"] == true).count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result["code"] == "worker_done_already_reported")
+                .count(),
+            7
+        );
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(stored.worker_done_at_ms, Some(clock.load(Ordering::SeqCst)));
+        assert_eq!(stored.worker_done_summary.as_deref(), Some("done✓"));
+        let status = registry.task_status(&task.task_id);
+        assert_eq!(status["task"]["lifecycle"], "completed");
+        assert_eq!(status["task"]["terminal_status"], "worker_done");
+        let reopened =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(&path).unwrap())));
+        assert_eq!(
+            task_call_with_parent_session(&reopened, AGENT_TASK_REPORT_METHOD, &params, None)["code"],
+            "worker_done_already_reported"
+        );
+        assert_eq!(
+            report(
+                json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "heartbeat"})
+            )["code"],
+            "agent_task_terminal"
+        );
+        assert_eq!(registry.load_task(&task.task_id).unwrap().unwrap(), stored);
+        drop(reopened);
+        drop(registry);
+        remove_task_db(&path);
+    }
+
+    /// user worker | Given a task already settled by lifecycle | When a late
+    /// worker_done arrives | Then only the report fact is added, with no second
+    /// parent notification and no lifecycle, terminal, excerpt or ack reset.
+    #[test]
+    fn late_worker_done_preserves_lifecycle_and_parent_notification() {
+        let (path, registry, _) = worker_registry("late-report");
+        for lifecycle in [
+            PromptTaskLifecycle::Completed,
+            PromptTaskLifecycle::Blocked,
+            PromptTaskLifecycle::Failed,
+            PromptTaskLifecycle::DeliveryUncertain,
+        ] {
+            let mut task = escalation_task(lifecycle.as_str(), "child", lifecycle.clone(), 1000);
+            task.notification_attempts = 1;
+            task.acknowledged_at_ms = Some(task.updated_at_ms);
+            task.final_excerpt = Some("existing output".to_owned());
+            registry.save_task(&task, None).unwrap();
+            let report = task_call_with_parent_session(
+                &registry,
+                AGENT_TASK_REPORT_METHOD,
+                &json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "worker_done"}),
+                None,
+            );
+            assert_eq!(report["ok"], true, "{report}");
+            let mut expected = task;
+            expected.worker_done_at_ms = Some(registry.now_ms());
+            expected.updated_at_ms = registry.now_ms();
+            assert_eq!(
+                registry.load_task(&expected.task_id).unwrap().unwrap(),
+                expected
+            );
+        }
+        drop(registry);
+        remove_task_db(&path);
+    }
+
+    /// user parent | Given old stored JSON without worker fields and a fake
+    /// clock | When heartbeats and progress stop for the configured interval |
+    /// Then status and both inbox views agree on non-terminal stalled liveness.
+    #[test]
+    fn old_tasks_and_heartbeats_share_stall_liveness_with_inbox() {
+        let (path, registry, clock) = worker_registry("liveness");
+        let old_json = include_str!("../tests/fixtures/prompt-task-pre-worker-report.json");
+        let task: PromptTaskRecord = serde_json::from_str(old_json).unwrap();
+        clock.store(task.updated_at_ms, Ordering::SeqCst);
+        assert!(task.last_heartbeat_at_ms.is_none());
+        assert!(task.worker_done_at_ms.is_none());
+        assert!(task.worker_done_summary.is_none());
+        assert!(task.stall_after_ms.is_none());
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(ESCALATION_STALL_IDLE_MS - 1, Ordering::SeqCst);
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["liveness"],
+            "active"
+        );
+        clock.fetch_add(1, Ordering::SeqCst);
+        let status = registry.task_status(&task.task_id);
+        assert_eq!(status["task"]["liveness"], "stalled");
+        assert_eq!(status["task"]["terminal"], false);
+        let inbox = registry.task_inbox_with_running(None, "session-worker", 10);
+        assert_eq!(inbox["tasks"][0]["liveness"], "stalled");
+        assert_eq!(inbox["escalation"]["signals"][0]["kind"], "stall_suspected");
+        assert_eq!(
+            apply_inbox_view(inbox, InboxView::Compact)["tasks"][0]["liveness"],
+            "stalled"
+        );
+        let before = registry.load_task(&task.task_id).unwrap().unwrap();
+        let heartbeat = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "heartbeat"}),
+            None,
+        );
+        assert_eq!(heartbeat["ok"], true);
+        assert_eq!(heartbeat["task"]["liveness"], "active");
+        let after = registry.load_task(&task.task_id).unwrap().unwrap();
+        let mut expected = before;
+        expected.last_heartbeat_at_ms = Some(registry.now_ms());
+        expected.updated_at_ms = registry.now_ms();
+        assert_eq!(after, expected, "heartbeat only updates its two timestamps");
+        assert!(
+            registry.task_inbox(None, None, None, false, false, 10)["escalation"]["signals"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let mut custom = after;
+        custom.stall_after_ms = Some(60_000);
+        registry.save_task(&custom, None).unwrap();
+        clock.fetch_add(59_999, Ordering::SeqCst);
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["liveness"],
+            "active"
+        );
+        clock.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["liveness"],
+            "stalled"
+        );
+        drop(registry);
+        remove_task_db(&path);
+    }
+
+    /// user parent | Given a submitted running task | When dispatch wait expires
+    /// and is repeated with the same key | Then both return successful
+    /// checkpoints, preserve task evidence and submit only once.
+    #[test]
+    fn dispatch_wait_timeout_is_a_checkpoint_without_resubmission() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_dispatch_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}}),
+                json!({"result": {"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}}),
+            ],
+            texts.clone(),
+        );
+        let client = HerdrClient::new(&socket);
+        let (path, registry, _) = worker_registry("checkpoint");
+        for value in [json!(59_999), json!(7_200_001), json!("60000")] {
+            assert_eq!(
+                run(
+                    &client,
+                    &registry,
+                    &json!({"target": "w1:p1", "text": "work", "stall_after_ms": value})
+                )["code"],
+                "invalid_params"
+            );
+        }
+        let mut args = json!({"target": "w1:p1", "text": "work", "idempotency_key": "checkpoint", "stall_after_ms": 60_000, "wait": {"timeout_ms": 1}});
+        let first = run(&client, &registry, &args);
+        server.join().unwrap();
+        args["stall_after_ms"] = json!(7_200_000);
+        let replay = run(&client, &registry, &args);
+        for result in [&first, &replay] {
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(result["wait"]["completed"], false);
+            assert_eq!(result["wait"]["outcome"], "checkpoint");
+            assert!(result.get("failure").is_none());
+            assert_eq!(result["task"]["lifecycle"], "running");
+            assert_eq!(result["task"]["liveness"], "active");
+            assert_eq!(
+                result["task"]["stall_after_ms"], 60_000,
+                "replay retains the dispatch threshold"
+            );
+            assert_eq!(result["task_id"], first["task_id"]);
+            assert_eq!(result["dispatch_id"], first["dispatch_id"]);
+        }
+        assert_eq!(texts.lock().unwrap().len(), 1);
+        assert_eq!(replay["idempotent_replay"], true);
+        let mut failure =
+            json!({"ok": false, "failure": "delivery_failed", "delivery_state": "not_delivered"});
+        apply_task_wait(
+            &registry,
+            &mut failure,
+            first["task_id"].as_str().unwrap(),
+            &json!({"timeout_ms": 0}),
+        );
+        assert_eq!(failure["ok"], false);
+        assert_eq!(failure["failure"], "delivery_failed");
+        let mut missing = json!({"ok": true});
+        apply_task_wait(
+            &registry,
+            &mut missing,
+            "unknown-task",
+            &json!({"timeout_ms": 0}),
+        );
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["failure"], "agent_task_not_found");
+        drop(registry);
+        remove_task_db(&path);
+        fs::remove_file(socket).unwrap();
     }
 
     /// user parent | Given one target/parent lane of durable tasks in the
@@ -5249,6 +6425,7 @@ mod tests {
                 "dispatch_id",
                 "final_excerpt",
                 "lifecycle",
+                "liveness",
                 "pane_id",
                 "target",
                 "task_id",
@@ -5492,6 +6669,10 @@ mod tests {
         let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -5585,6 +6766,7 @@ mod tests {
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
             target: "child".to_owned(),
+            requested_target: None,
             idempotency_key_digest: None,
             pane_id: Some("w1:p1".to_owned()),
             workspace_id: Some("w1".to_owned()),
@@ -5600,6 +6782,11 @@ mod tests {
             terminal_status: None,
             terminal_cursor: None,
             terminal_at_ms: None,
+            last_heartbeat_at_ms: None,
+            worker_done_at_ms: None,
+            worker_done_summary: None,
+            stall_after_ms: None,
+            gate: None,
             final_excerpt: None,
             awaiting_children: None,
             parent_target: None,
@@ -6592,6 +7779,10 @@ mod tests {
         let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -6761,6 +7952,10 @@ mod tests {
         let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -6815,6 +8010,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id,
                 target,
+                requested_target: None,
                 fingerprint: task_id,
                 idempotency_key: None,
                 before: Some(&before),
@@ -6823,6 +8019,7 @@ mod tests {
                 start_cursor,
                 parent_target,
                 parent_session_ref,
+                stall_after_ms: None,
             })
             .unwrap()
             .unwrap();
@@ -6982,7 +8179,7 @@ mod tests {
     fn compact_projection_keeps_the_awaiting_children_fact() {
         let mut task = excerpt_test_task("dispatch:prompt:compact-hold");
         task.awaiting_children = Some(2);
-        let projected = compact_task(task.public_json().as_object().unwrap().clone());
+        let projected = compact_task(task.public_json_at(now_ms()).as_object().unwrap().clone());
         assert_eq!(projected["awaiting_children"], 2);
         assert_eq!(projected["lifecycle"], "running");
     }
@@ -7001,7 +8198,12 @@ mod tests {
         encoded.as_object_mut().unwrap().remove("awaiting_children");
         let decoded: PromptTaskRecord = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.awaiting_children, None);
-        assert!(decoded.public_json().get("awaiting_children").is_none());
+        assert!(
+            decoded
+                .public_json_at(now_ms())
+                .get("awaiting_children")
+                .is_none()
+        );
 
         let mut held = task;
         held.awaiting_children = Some(3);
@@ -7256,6 +8458,10 @@ mod tests {
         })));
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
