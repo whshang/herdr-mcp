@@ -954,9 +954,7 @@ fn discard_state_schema_migration_record(
         &["service", "start"],
     )
     .map_err(|error| {
-        format!(
-            "cannot restart previous service after migration staging failure: {error}"
-        )
+        format!("cannot restart previous service after migration staging failure: {error}")
     })?;
 
     fs::remove_file(major_upgrade_record_path(paths))
@@ -2721,10 +2719,7 @@ mod tests {
             "fi\n",
             "exit 0\n",
         );
-        write_test_executable(
-            &source_binary,
-            source_script,
-        );
+        write_test_executable(&source_binary, source_script);
         let state = root.join("state.db");
         write_test_state(&state, 16, "after-migration");
         let backup = schema_upgrade_backup_path(&paths, 15, 16);
@@ -2744,7 +2739,10 @@ mod tests {
         recover_major_upgrade(&paths, &record).unwrap();
 
         assert_eq!(read_raw_state_schema(&state).unwrap(), Some(15));
-        assert_eq!(fs::read_to_string(root.join("old-binary-schema")).unwrap(), "15");
+        assert_eq!(
+            fs::read_to_string(root.join("old-binary-schema")).unwrap(),
+            "15"
+        );
         assert!(!dir.exists());
         fs::remove_dir_all(root).ok();
     }

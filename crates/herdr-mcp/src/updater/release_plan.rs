@@ -673,7 +673,10 @@ mod tests {
         }));
         cases.push(("missing", {
             let mut value = base.clone();
-            value.as_object_mut().unwrap().remove("state_schema_migration");
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("state_schema_migration");
             value
         }));
         cases.push(("extra", {
@@ -727,9 +730,11 @@ mod tests {
         let plan = parse_release_plan(&value, target).unwrap();
         let migration = plan.state_schema_migration.unwrap();
         assert!(migration.warning().contains("cannot be downgraded"));
-        assert!(migration
-            .warning()
-            .contains("state backup is taken before migration"));
+        assert!(
+            migration
+                .warning()
+                .contains("state backup is taken before migration")
+        );
     }
 
     #[test]
