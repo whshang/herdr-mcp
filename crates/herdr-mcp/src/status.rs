@@ -316,6 +316,14 @@ fn print_status_verbose(paths: &RuntimePaths, config: &Config, language: crate::
         ),
         crate::local_agent_skill::status_line()
     );
+    println!(
+        "{}",
+        crate::webchat_grants::summary_line(&crate::webchat_grants::snapshot(paths), language)
+    );
+    let herdr_core = crate::herdr_core::probe();
+    if herdr_core.present {
+        println!("{}", crate::herdr_core::warning_line(&herdr_core, language));
+    }
 }
 
 fn semantic_status_line(language: crate::locale::Locale) -> String {
@@ -428,6 +436,10 @@ pub fn print_doctor(
     let authenticated_local_mcp = probe_authenticated_local_mcp(config.runtime_port);
     let standalone_browser = crate::standalone_extension::doctor_report();
     let local_agent_skill = crate::local_agent_skill::status_summary();
+    // Read-only herdr-core / Herdr app detection (#765) and WebChat grant
+    // snapshot (#772). Neither affects Result.
+    let herdr_core = crate::herdr_core::probe();
+    let webchat_grants = crate::webchat_grants::snapshot(paths);
     let windows_service_healthy = if cfg!(target_os = "windows") {
         service_manager::doctor_status()
             .ok()
@@ -610,6 +622,17 @@ pub fn print_doctor(
         local_agent_skill.0,
     );
     println!("LAYER local-agent-skill {}", local_agent_skill.1);
+    if herdr_core.present {
+        println!("{}", crate::herdr_core::warning_line(&herdr_core, language));
+    }
+    println!(
+        "LAYER webchat-grants-summary {}",
+        crate::webchat_grants::summary_line(&webchat_grants, language)
+    );
+    println!(
+        "{}",
+        webchat_grants.doctor_line(&crate::webchat_grants::binding_hint(language))
+    );
     let remote = print_layer_ownership(paths, config, &report, verbose);
     println!(
         "LAYER authenticated-local-mcp {}",
@@ -645,6 +668,9 @@ pub fn print_doctor(
         "mcp_surface": remote.mcp_surface_state.as_str(),
         "standalone_extension": standalone_browser.as_json(),
         "herdr_native": native_runtime,
+        "herdr_core": crate::herdr_core::probe_json(&herdr_core),
+        "warnings": crate::herdr_core::warnings_json(&herdr_core),
+        "webchat_grants": webchat_grants.as_json(),
         "overall": readiness.as_str(),
     });
     println!("DOCTOR_JSON {doctor_json}");
@@ -823,6 +849,17 @@ pub fn print_doctor(
                 ),
                 local_agent_skill.1
             ));
+        }
+        if herdr_core.present {
+            attention.push(
+                language
+                    .text(
+                        "herdr-core / Herdr app detected; herdr-mcp v1.1 supports only the Herdr TUI (https://herdr.dev/tui/docs/) — agents started in the app are not visible to herdr-mcp",
+                        "检测到 herdr-core / Herdr app；herdr-mcp v1.1 仅支持 Herdr TUI（https://herdr.dev/tui/docs/）— 在 app 中启动的 Agent 对 herdr-mcp 不可见",
+                        "herdr-core / Herdr app を検出。herdr-mcp v1.1 は Herdr TUI のみをサポート（https://herdr.dev/tui/docs/）— app で起動した Agent は herdr-mcp から見えません",
+                    )
+                    .to_owned(),
+            );
         }
         if !attention.is_empty() {
             std::println!();
@@ -2127,5 +2164,51 @@ mod tests {
             &EventCacheHealth::Reconciling,
             false
         ));
+    }
+
+    #[test]
+    fn herdr_core_warning_never_reaches_result_or_service_health() {
+        // The warning is advisory: a present herdr-core probe must not flip
+        // service_health or readiness. Doctor's return value is
+        // `service_health && readiness != Fail`; this pins the pieces.
+        let probe = crate::herdr_core::HerdrCoreProbe {
+            present: true,
+            version: Some("hc 0.1.14".to_owned()),
+            source: Some("path"),
+            binary: None,
+        };
+        let line = crate::herdr_core::warning_line(&probe, crate::locale::Locale::En);
+        assert!(line.starts_with("WARN herdr_core_unsupported:"));
+        assert!(line.contains("hc 0.1.14"));
+        assert!(line.contains("https://herdr.dev/tui/docs/"));
+        let remote = RemoteProbeReport::absent();
+        assert_eq!(
+            overall_readiness(true, DiagnosticState::Pass, &remote),
+            OverallReadiness::NotProven
+        );
+        // Warning presence alone never creates a Fail input.
+        assert_eq!(
+            overall_readiness(false, DiagnosticState::Pass, &remote),
+            OverallReadiness::Fail
+        );
+        assert_eq!(
+            crate::herdr_core::warnings_json(&probe),
+            json!(["herdr_core_unsupported"])
+        );
+    }
+
+    #[test]
+    fn doctor_json_surface_includes_herdr_core_and_webchat_grants_keys() {
+        // Shape test for the stable doctor --json contract additions
+        // (#765, #772): keys exist even when probing degrades to unknown.
+        let absent = crate::herdr_core::HerdrCoreProbe::default();
+        let probe_json = crate::herdr_core::probe_json(&absent);
+        assert_eq!(probe_json["present"], false);
+        let unknown =
+            crate::webchat_grants::WebChatGrantSnapshot::unknown("state_db_missing".to_owned());
+        let grants_json = unknown.as_json();
+        assert_eq!(grants_json["state"], "unknown");
+        assert_eq!(grants_json["principals"], json!([]));
+        assert_eq!(grants_json["endpoints"], json!([]));
     }
 }
