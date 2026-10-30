@@ -153,7 +153,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "current_user_message": {
                         "type": "string",
                         "maxLength": 262144,
-                        "description": "Ignored for binding when parent_session_ref is supplied. WebChat callers: the exact current user turn text (trimmed, non-empty). When it matches the observed source turn of your ChatGPT conversation, the task is stamped with that conversation's session as parent_session_ref so its session-scoped inbox and wake can see it; binding failure never fails the dispatch and is reported as parent_session {bound:false, reason}.",
+                        "description": "Ignored for binding when parent_session_ref is supplied. WebChat callers: the exact current user turn text (trimmed, non-empty). When it matches the observed source turn of your ChatGPT conversation, the task is stamped with that conversation's session as parent_session_ref so its session-scoped inbox and wake can see it; binding failure never fails the dispatch and is reported as parent_session {bound:false, reason}. Pass the user's turn text verbatim, omitting the app chip or keeping it as plain @herdr-mcp (never a markdown link or quoted); on bound:false report parent_session.reason and parent_session.diagnostic to the user.",
                     },
                     "wait": {
                         "type": "object",
