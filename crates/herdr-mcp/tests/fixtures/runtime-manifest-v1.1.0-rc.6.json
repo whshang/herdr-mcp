@@ -1,0 +1,86 @@
+{
+  "schema_version": 2,
+  "product": "herdr-mcp",
+  "version": "1.1.0-rc.6",
+  "tag": "v1.1.0-rc.6",
+  "state_schema": 16,
+  "state_schema_migration": {
+    "from": 15,
+    "to": 16,
+    "reversible": false
+  },
+  "release_identity": {
+    "tag": "v1.1.0-rc.6",
+    "source_commit": "aaa52ecabc7e31d9023b652cb750442f1be8b6c1",
+    "source_ref": "refs/tags/v1.1.0-rc.6"
+  },
+  "repository_identity": {
+    "repository": "whshang/herdr-mcp",
+    "repository_id": 1340180695
+  },
+  "provenance": {
+    "predicate_type": "https://slsa.dev/provenance/v1",
+    "attestation": "github-artifact-attestation",
+    "bundle_media_type": "application/vnd.dev.sigstore.bundle.v0.3+json",
+    "workflow": ".github/workflows/rust-release.yml",
+    "workflow_name": "Rust Release",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "runner_environment": "github-hosted"
+  },
+  "contract": {
+    "epoch": 5,
+    "hash": "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",
+    "tool_count": 18
+  },
+  "contract_migration": {
+    "from": {
+      "epoch": 4,
+      "hash": "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",
+      "tool_count": 18
+    },
+    "state_schema_from": 15
+  },
+  "edge": {
+    "name": "herdr-edge-1.1.0-rc.6.mjs",
+    "size": 686399,
+    "sha256": "d02542251b3c59bedd1d1ecbba5c54bc00272d3cdff98f128ab6d382be53848b",
+    "url": "https://github.com/whshang/herdr-mcp/releases/download/v1.1.0-rc.6/herdr-edge-1.1.0-rc.6.mjs"
+  },
+  "assets": [
+    {
+      "target": "aarch64-apple-darwin",
+      "name": "herdr-mcp-1.1.0-rc.6-aarch64-apple-darwin",
+      "size": 19749552,
+      "sha256": "d80daff9eef31b1f1fd0acf88afc2f610a02266556566b5e108081ca23d5cf89",
+      "url": "https://github.com/whshang/herdr-mcp/releases/download/v1.1.0-rc.6/herdr-mcp-1.1.0-rc.6-aarch64-apple-darwin"
+    },
+    {
+      "target": "x86_64-unknown-linux-musl",
+      "name": "herdr-mcp-1.1.0-rc.6-x86_64-unknown-linux-musl",
+      "size": 23074576,
+      "sha256": "d656ed43808214634169e11ad0f47b6467477f2e9bffc0098dff26fa3479773f",
+      "url": "https://github.com/whshang/herdr-mcp/releases/download/v1.1.0-rc.6/herdr-mcp-1.1.0-rc.6-x86_64-unknown-linux-musl"
+    },
+    {
+      "target": "aarch64-unknown-linux-musl",
+      "name": "herdr-mcp-1.1.0-rc.6-aarch64-unknown-linux-musl",
+      "size": 18700000,
+      "sha256": "87ded3f3322bdb5f4389365c96f18b1bc0b61acdafdd35dae1d0c5732eb1f63c",
+      "url": "https://github.com/whshang/herdr-mcp/releases/download/v1.1.0-rc.6/herdr-mcp-1.1.0-rc.6-aarch64-unknown-linux-musl"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "name": "herdr-mcp-1.1.0-rc.6-x86_64-pc-windows-msvc.exe",
+      "size": 24870912,
+      "sha256": "959c4463fd74d10ff1dca2f51fb9b8ceb85faaa49ac21bf368ac677a449fc988",
+      "url": "https://github.com/whshang/herdr-mcp/releases/download/v1.1.0-rc.6/herdr-mcp-1.1.0-rc.6-x86_64-pc-windows-msvc.exe"
+    },
+    {
+      "target": "aarch64-pc-windows-msvc",
+      "name": "herdr-mcp-1.1.0-rc.6-aarch64-pc-windows-msvc.exe",
+      "size": 21259776,
+      "sha256": "5bf8f06a7f1cb0a9a808151a23b2d945149ba5f10917f0e07cf42e6fb3f9e99b",
+      "url": "https://github.com/whshang/herdr-mcp/releases/download/v1.1.0-rc.6/herdr-mcp-1.1.0-rc.6-aarch64-pc-windows-msvc.exe"
+    }
+  ]
+}
