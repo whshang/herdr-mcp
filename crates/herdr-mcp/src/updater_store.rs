@@ -9,7 +9,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-const UPDATE_STORE_SCHEMA_VERSION: i64 = 1;
+const UPDATE_STORE_SCHEMA_VERSION: i64 = 3;
 const META_SCHEMA_VERSION: &str = "schema_version";
 
 const UPDATE_STORE_MIGRATION_V1: &str = r#"
@@ -41,6 +41,14 @@ pub struct UpdateJobRecord {
     pub asset_name: String,
     pub sha256: String,
     pub binary_path: String,
+    /// State schema of the pre-update database. Equal to
+    /// `state_schema_target` for an ordinary update; the pair records the
+    /// declared forward state-schema migration for a bridging update (v1.0.5
+    /// stages 15 -> 16 for a schema-16 release). The values are persisted
+    /// under exactly these column names because the update worker runs inside
+    /// the staged candidate and reads them back from this database.
+    pub state_schema_source: i64,
+    pub state_schema_target: i64,
     pub state: String,
     pub detail: Option<String>,
     pub worker_pid: Option<u32>,
@@ -81,8 +89,8 @@ impl UpdateStore {
             .execute(
                 "INSERT INTO update_jobs (
                     job_id, version, target, asset_name, sha256, binary_path,
-                    state, detail, worker_pid, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    state_schema_source, state_schema_target, state, detail, worker_pid, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     record.job_id,
                     record.version,
@@ -90,6 +98,8 @@ impl UpdateStore {
                     record.asset_name,
                     record.sha256,
                     record.binary_path,
+                    record.state_schema_source,
+                    record.state_schema_target,
                     record.state,
                     bounded_detail(record.detail.as_deref()),
                     record.worker_pid.map(i64::from),
@@ -161,7 +171,7 @@ impl UpdateStore {
         self.conn
             .query_row(
                 "SELECT job_id, version, target, asset_name, sha256, binary_path,
-                        state, detail, worker_pid, created_at, updated_at
+                        state_schema_source, state_schema_target, state, detail, worker_pid, created_at, updated_at
                  FROM update_jobs WHERE job_id = ?1",
                 [job_id],
                 decode_update_job,
@@ -174,7 +184,7 @@ impl UpdateStore {
         self.conn
             .query_row(
                 "SELECT job_id, version, target, asset_name, sha256, binary_path,
-                        state, detail, worker_pid, created_at, updated_at
+                        state_schema_source, state_schema_target, state, detail, worker_pid, created_at, updated_at
                  FROM update_jobs ORDER BY created_at DESC LIMIT 1",
                 [],
                 decode_update_job,
@@ -188,7 +198,7 @@ impl UpdateStore {
         self.conn
             .query_row(
                 "SELECT job_id, version, target, asset_name, sha256, binary_path,
-                        state, detail, worker_pid, created_at, updated_at
+                        state_schema_source, state_schema_target, state, detail, worker_pid, created_at, updated_at
                  FROM update_jobs
                  WHERE state IN ('queued', 'installing')
                  ORDER BY created_at DESC LIMIT 1",
@@ -225,6 +235,49 @@ fn migrate(conn: &mut Connection) -> Result<(), String> {
         .map_err(|error| format!("cannot record update state schema version: {error}"))?;
         tx.commit()
             .map_err(|error| format!("cannot commit update state migration: {error}"))?;
+    }
+    // v2/v3 are required for cross-version updater compatibility, not only for
+    // local bookkeeping: the v1.0.5 foreground stages a 15 -> 16 job and the
+    // update worker runs inside the staged (schema-16) candidate, which reads
+    // these two columns to decide whether a failed activation must restore the
+    // pre-migration state backup. The column names, order, and `DEFAULT 15`
+    // backfill are therefore an on-disk contract shared with that candidate and
+    // must not be renamed or folded into `UPDATE_STORE_MIGRATION_V1`.
+    let current = read_schema_version(conn)?;
+    if current < 2 {
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("cannot begin update state migration v2: {error}"))?;
+        tx.execute(
+            "ALTER TABLE update_jobs ADD COLUMN state_schema_target INTEGER NOT NULL DEFAULT 15",
+            [],
+        )
+        .map_err(|error| format!("update state migration v2 failed: {error}"))?;
+        tx.execute(
+            "UPDATE meta SET value = '2' WHERE key = ?1",
+            [META_SCHEMA_VERSION],
+        )
+        .map_err(|error| format!("cannot record update state schema version 2: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit update state migration v2: {error}"))?;
+    }
+    let current = read_schema_version(conn)?;
+    if current < 3 {
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("cannot begin update state migration v3: {error}"))?;
+        tx.execute(
+            "ALTER TABLE update_jobs ADD COLUMN state_schema_source INTEGER NOT NULL DEFAULT 15",
+            [],
+        )
+        .map_err(|error| format!("update state migration v3 failed: {error}"))?;
+        tx.execute(
+            "UPDATE meta SET value = '3' WHERE key = ?1",
+            [META_SCHEMA_VERSION],
+        )
+        .map_err(|error| format!("cannot record update state schema version 3: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit update state migration v3: {error}"))?;
     }
     Ok(())
 }
@@ -297,7 +350,7 @@ fn ensure_real_dir(path: &Path) -> Result<(), String> {
 
 fn decode_update_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpdateJobRecord> {
     let worker_pid = row
-        .get::<_, Option<i64>>(8)?
+        .get::<_, Option<i64>>(10)?
         .and_then(|value| u32::try_from(value).ok());
     Ok(UpdateJobRecord {
         job_id: row.get(0)?,
@@ -306,11 +359,13 @@ fn decode_update_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpdateJobRecor
         asset_name: row.get(3)?,
         sha256: row.get(4)?,
         binary_path: row.get(5)?,
-        state: row.get(6)?,
-        detail: row.get(7)?,
+        state_schema_source: row.get(6)?,
+        state_schema_target: row.get(7)?,
+        state: row.get(8)?,
+        detail: row.get(9)?,
         worker_pid,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -357,6 +412,8 @@ mod tests {
             asset_name: "herdr-mcp-9.9.9-aarch64-apple-darwin".to_owned(),
             sha256: "a".repeat(64),
             binary_path: "/tmp/herdr-mcp-candidate".to_owned(),
+            state_schema_source: 15,
+            state_schema_target: 15,
             state: state.to_owned(),
             detail: Some("x".repeat(900)),
             worker_pid: None,
@@ -370,7 +427,7 @@ mod tests {
         let (root, paths) = fixture();
         {
             let store = UpdateStore::open(&paths).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 1);
+            assert_eq!(store.schema_version().unwrap(), 3);
             assert!(!paths.config_dir.join("state.db").exists());
             store
                 .create_update_job(&job("upd-test-12345678", "queued", 10))
@@ -427,12 +484,128 @@ mod tests {
             store
                 .conn
                 .execute(
-                    "UPDATE meta SET value = '2' WHERE key = ?1",
+                    "UPDATE meta SET value = '4' WHERE key = ?1",
                     [META_SCHEMA_VERSION],
                 )
                 .unwrap();
         }
         assert!(UpdateStore::open(&paths).unwrap_err().contains("newer"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn updater_state_v1_database_migrates_to_three_with_defaulted_schema_columns() {
+        let (root, paths) = fixture();
+        fs::create_dir_all(paths.config_dir.join("update")).unwrap();
+        let path = paths.config_dir.join("update/state.db");
+        {
+            // A database written by the released v1.0.4 updater (store schema 1).
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(UPDATE_STORE_MIGRATION_V1).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '1')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO update_jobs (
+                    job_id, version, target, asset_name, sha256, binary_path,
+                    state, detail, worker_pid, created_at, updated_at
+                 ) VALUES ('upd-legacy-12345678', '1.0.4', 'aarch64-apple-darwin',
+                           'herdr-mcp-1.0.4-aarch64-apple-darwin', 'a', '/tmp/x',
+                           'succeeded', NULL, NULL, 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = UpdateStore::open(&paths).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+        // A pre-existing row backfills to the local schema pair, so a legacy
+        // same-schema job can never be mistaken for a state-schema migration.
+        let legacy = store.update_job("upd-legacy-12345678").unwrap().unwrap();
+        assert_eq!(legacy.state_schema_source, 15);
+        assert_eq!(legacy.state_schema_target, 15);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn updater_state_migration_job_round_trips_the_declared_schema_pair() {
+        let (root, paths) = fixture();
+        {
+            let store = UpdateStore::open(&paths).unwrap();
+            let mut record = job("upd-migrating-12345678", "queued", 10);
+            record.detail = Some("verified candidate staged".to_owned());
+            record.state_schema_source = 15;
+            record.state_schema_target = 16;
+            store.create_update_job(&record).unwrap();
+            assert_eq!(
+                store.update_job("upd-migrating-12345678").unwrap().unwrap(),
+                record
+            );
+            // The staged (schema-16) candidate worker reads the same pair back
+            // from this database, so it must survive a reopen unchanged.
+        }
+        let reopened = UpdateStore::open(&paths).unwrap();
+        let record = reopened
+            .update_job("upd-migrating-12345678")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state_schema_source, 15);
+        assert_eq!(record.state_schema_target, 16);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn updater_state_on_disk_columns_match_the_candidate_worker_contract() {
+        // The update worker runs inside the staged candidate binary, so the
+        // store layout below is a cross-version on-disk contract, not private
+        // bookkeeping. Pinned against the shape declared by the schema-16
+        // bridge commit aaa52ecabc7e31d9023b652cb750442f1be8b6c1.
+        assert_eq!(UPDATE_STORE_SCHEMA_VERSION, 3);
+        let (root, paths) = fixture();
+        let store = UpdateStore::open(&paths).unwrap();
+        let columns: Vec<(String, i64, Option<String>)> = store
+            .conn
+            .prepare("SELECT name, \"notnull\", dflt_value FROM pragma_table_info('update_jobs') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            columns
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "job_id",
+                "version",
+                "target",
+                "asset_name",
+                "sha256",
+                "binary_path",
+                "state",
+                "detail",
+                "worker_pid",
+                "created_at",
+                "updated_at",
+                // `ALTER TABLE ... ADD COLUMN` appends, so the two schema
+                // columns sit last on disk exactly as they do on the
+                // schema-16 bridge commit. Reads name them explicitly.
+                "state_schema_target",
+                "state_schema_source",
+            ]
+        );
+        for name in ["state_schema_source", "state_schema_target"] {
+            let column = columns
+                .iter()
+                .find(|(column, _, _)| column == name)
+                .unwrap();
+            assert_eq!(column.1, 1, "{name} must stay NOT NULL");
+            assert_eq!(column.2.as_deref(), Some("15"), "{name} default");
+        }
         fs::remove_dir_all(root).ok();
     }
 
