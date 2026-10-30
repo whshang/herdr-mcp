@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## v1.1.0-rc.6 — 2026-10-30
+
+- **1.1 第六个预发布（仅 preview 通道）：** 加入多 Agent 编排：显式任务身份与父会话绑定（调用方必须已持有该会话映射，#748）、worker 心跳/完成报告/卡住检测与 wait checkpoint（#749）、人类专属决策闸门（仅本地交互 CLI 可解决；state schema 迁移 16，rc.5 及更早版本无法打开迁移后的数据库，回退需恢复 state 备份，#750）、`@idle` / `@<kind>` 角色目标与 `max_concurrent`（#751）；来源轮次规范化覆盖 `@` / `$` / 裸名前导提及与反引号包裹，并在未绑定时返回不含敏感信息的诊断（#759）；扩展 0.1.229（#754）。stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.6.md](docs/releases/v1.1.0-rc.6.md)。 [PR #752](https://github.com/whshang/herdr-mcp/pull/752) [PR #753](https://github.com/whshang/herdr-mcp/pull/753) [PR #756](https://github.com/whshang/herdr-mcp/pull/756) [PR #757](https://github.com/whshang/herdr-mcp/pull/757) [PR #760](https://github.com/whshang/herdr-mcp/pull/760) [PR #755](https://github.com/whshang/herdr-mcp/pull/755)
 - **ChatGPT 手动 @herdr-mcp 发送重新记录来源轮次（扩展 0.1.228 → 0.1.229，#754）：** 0.1.228 起采样器把 inline-mention 芯片输出为 `@<app-mention-name>`，而 composer 与已接受气泡的芯片渲染不一致（缺 `app-mention-path`、名称与标签不同）时，`wake.js` 的提交-气泡 160 字符包含校验失败，`source_turn.observe` 从未发出，dispatch 报 `source_turn_not_found`。现在校验同时比较去除 App 提及后的规范文本（NFC、去零宽字符、合并空白），发送给 Runtime 的来源文本省略 Herdr 提及，与 Runtime 规范化后的 `current_user_message` 摘要一致。Runtime 版本与 contract 不变。
 ## v1.1.0-rc.5 — 2026-10-29
 
