@@ -53,7 +53,9 @@ pub(super) struct StateSchemaMigration {
 impl StateSchemaMigration {
     pub(super) fn warning(&self) -> String {
         format!(
-            "⚠️ This update migrates local state schema {} → {} and cannot be downgraded; older versions will refuse the migrated database. A state backup is taken before migration; rolling back requires restoring that backup.",
+            "⚠️ This update migrates local state schema {} → {} and cannot be downgraded; "
+                "older versions will refuse the migrated database. "
+                "A state backup is taken before migration; rolling back requires restoring that backup.",
             self.from, self.to
         )
     }
@@ -371,12 +373,14 @@ fn admit_state_schema_migration(
     }
     if target_schema < local_schema {
         return Err(refuse(&format!(
-            "release state schema {target_schema} is older than local schema {local_schema}; refusing downgrade"
+            "release state schema {target_schema} is older than local schema {local_schema}; "
+                "refusing downgrade"
         )));
     }
     if target_schema > local_schema.saturating_add(1) {
         return Err(refuse(&format!(
-            "release state schema {target_schema} is more than one step ahead of local schema {local_schema}"
+            "release state schema {target_schema} is more than one step ahead of local schema "
+                "{local_schema}"
         )));
     }
 
@@ -384,7 +388,12 @@ fn admit_state_schema_migration(
         .get("state_schema_migration")
         .and_then(Value::as_object)
         .filter(|object| object.len() == 3)
-        .ok_or_else(|| refuse("missing or malformed state_schema_migration declaration"))?;
+        .ok_or_else(|| {
+            refuse(&format!(
+                "release state schema is not rollback-compatible with local schema {local_schema}: "
+                    "missing or malformed state_schema_migration declaration"
+            ))
+        })?;
     let from = declaration
         .get("from")
         .and_then(Value::as_i64)
@@ -630,15 +639,12 @@ mod tests {
         let local_same = contract::identity().unwrap();
         let (target, migration) = admit_release_contract(&same, &local_same, 15).unwrap();
         assert_eq!(target, local_same);
-        assert_eq!(
-            migration.unwrap().warning(),
-            (StateSchemaMigration {
-                from: 15,
-                to: 16,
-                reversible: false,
-            })
-                .warning()
-        );
+        let expected = StateSchemaMigration {
+            from: 15,
+            to: 16,
+            reversible: false,
+        };
+        assert_eq!(migration.unwrap().warning(), expected.warning());
     }
 
     #[test]
@@ -654,47 +660,49 @@ mod tests {
             });
             value
         };
-        let mut cases = vec![
-            ("downgrade", {
-                let mut value = base.clone();
-                value["state_schema"] = json!(SCHEMA_VERSION - 1);
-                value
-            }),
-            ("jump", {
-                let mut value = base.clone();
-                value["state_schema"] = json!(SCHEMA_VERSION + 2);
-                value
-            }),
-            ("missing", {
-                let mut value = base.clone();
-                value.as_object_mut().unwrap().remove("state_schema_migration");
-                value
-            }),
-            ("extra", {
-                let mut value = base.clone();
-                value["state_schema_migration"]["extra"] = json!(true);
-                value
-            }),
-            ("reversible", {
-                let mut value = base.clone();
-                value["state_schema_migration"]["reversible"] = json!(true);
-                value
-            }),
-            ("from", {
-                let mut value = base.clone();
-                value["state_schema_migration"]["from"] = json!(SCHEMA_VERSION - 1);
-                value
-            }),
-            ("to", {
-                let mut value = base.clone();
-                value["state_schema_migration"]["to"] = json!(SCHEMA_VERSION + 2);
-                value
-            }),
-        ];
+        let mut cases = Vec::new();
+        cases.push(("downgrade", {
+            let mut value = base.clone();
+            value["state_schema"] = json!(SCHEMA_VERSION - 1);
+            value
+        }));
+        cases.push(("jump", {
+            let mut value = base.clone();
+            value["state_schema"] = json!(SCHEMA_VERSION + 2);
+            value
+        }));
+        cases.push(("missing", {
+            let mut value = base.clone();
+            value.as_object_mut().unwrap().remove("state_schema_migration");
+            value
+        }));
+        cases.push(("extra", {
+            let mut value = base.clone();
+            value["state_schema_migration"]["extra"] = json!(true);
+            value
+        }));
+        cases.push(("reversible", {
+            let mut value = base.clone();
+            value["state_schema_migration"]["reversible"] = json!(true);
+            value
+        }));
+        cases.push(("from", {
+            let mut value = base.clone();
+            value["state_schema_migration"]["from"] = json!(SCHEMA_VERSION - 1);
+            value
+        }));
+        cases.push(("to", {
+            let mut value = base.clone();
+            value["state_schema_migration"]["to"] = json!(SCHEMA_VERSION + 2);
+            value
+        }));
         cases.push(("malformed", {
             let mut value = base.clone();
-            value["state_schema_migration"] =
-                json!({"from": "15", "to": 16, "reversible": false});
+            value["state_schema_migration"] = json!({
+                "from": "15",
+                "to": 16,
+                "reversible": false,
+            });
             value
         }));
         for (name, value) in cases {
@@ -719,7 +727,9 @@ mod tests {
         let plan = parse_release_plan(&value, target).unwrap();
         let migration = plan.state_schema_migration.unwrap();
         assert!(migration.warning().contains("cannot be downgraded"));
-        assert!(migration.warning().contains("state backup is taken before migration"));
+        assert!(migration
+            .warning()
+            .contains("state backup is taken before migration"));
     }
 
     #[test]

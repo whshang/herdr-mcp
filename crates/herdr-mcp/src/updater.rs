@@ -211,6 +211,9 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
         .state_schema_migration
         .as_ref()
         .map(StateSchemaMigration::warning);
+    if let Some(warning) = migration_warning.as_deref() {
+        eprintln!("[herdr-mcp update] {warning}");
+    }
     let next_action = if available {
         Some("herdr-mcp update apply")
     } else if worker_update_required {
@@ -536,7 +539,6 @@ fn apply_inner(
         recover_or_reject_active_update(&store, &paths)?;
         if let Some(migration) = plan.state_schema_migration.as_ref() {
             progress.phase(migration.warning());
-            prepare_state_schema_migration_record(&paths, migration)?;
         }
         progress.phase("Preparing a rollback-safe update job...");
         let (job_id, binary_path) = stage_release(&paths, &plan, &mut progress)?;
@@ -566,6 +568,23 @@ fn apply_inner(
             return Err(error);
         }
 
+        let migration_record = match plan.state_schema_migration.as_ref() {
+            Some(migration) => match prepare_state_schema_migration_record(&paths, migration) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    let _ = store.update_update_job(
+                        &job_id,
+                        "failed",
+                        Some("state-schema migration backup failed"),
+                        None,
+                        now_ms_i64(),
+                    );
+                    cleanup_staging(&binary_path);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         let child = spawn_worker(&paths, &binary_path, &job_id);
         let mut child = match child {
             Ok(child) => child,
@@ -578,7 +597,15 @@ fn apply_inner(
                     now_ms_i64(),
                 );
                 cleanup_staging(&binary_path);
-                return Err(error);
+                let cleanup = migration_record
+                    .as_ref()
+                    .map(|record| discard_state_schema_migration_record(&paths, record));
+                return Err(match cleanup {
+                    Some(Ok(())) | None => error,
+                    Some(Err(cleanup_error)) => {
+                        format!("{error}; migration backup cleanup failed: {cleanup_error}")
+                    }
+                });
             }
         };
         let worker_pid_persisted = store
@@ -827,7 +854,7 @@ fn major_upgrade_record_path(paths: &RuntimePaths) -> PathBuf {
     major_upgrade_dir(paths).join("rollback.json")
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn major_upgrade_backup_path(paths: &RuntimePaths) -> PathBuf {
     schema_upgrade_backup_path(paths, MAJOR_SOURCE_SCHEMA, SCHEMA_VERSION)
 }
@@ -892,7 +919,7 @@ fn prepare_major_upgrade_record(
         state_path,
         MAJOR_SOURCE_SCHEMA,
         SCHEMA_VERSION,
-        "major-upgrade",
+        "major state migration",
     )
 }
 
@@ -914,6 +941,42 @@ fn prepare_state_schema_migration_record(
         migration.to,
         "state-schema migration",
     )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn discard_state_schema_migration_record(
+    paths: &RuntimePaths,
+    record: &MajorUpgradeRecord,
+) -> Result<(), String> {
+    run_service_command(
+        Path::new(&record.source_binary),
+        paths,
+        &["service", "start"],
+    )
+    .map_err(|error| {
+        format!(
+            "cannot restart previous service after migration staging failure: {error}"
+        )
+    })?;
+
+    fs::remove_file(major_upgrade_record_path(paths))
+        .map_err(|error| format!("cannot remove migration rollback record: {error}"))?;
+    let backup = Path::new(&record.state_backup);
+    if backup.is_file() {
+        fs::remove_file(backup)
+            .map_err(|error| format!("cannot remove migration state backup: {error}"))?;
+    }
+    let source_binary = Path::new(&record.source_binary);
+    if source_binary.is_file() {
+        fs::remove_file(source_binary)
+            .map_err(|error| format!("cannot remove migration source binary: {error}"))?;
+    }
+    let dir = major_upgrade_dir(paths);
+    if dir.is_dir() {
+        fs::remove_dir(&dir)
+            .map_err(|error| format!("cannot remove migration rollback directory: {error}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2582,6 +2645,141 @@ mod tests {
             "a retry must not stop or reuse old material"
         );
         drop(live);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn migration_snapshot_failure_restarts_service_and_removes_rollback_material() {
+        let root = env::temp_dir().join(format!(
+            "herdr-state-migration-cleanup-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        write_test_executable(
+            &source_binary,
+            "#!/bin/sh\nif [ \"$1 $2\" = \"service start\" ]; then : > \"$HERDR_MCP_CONFIG_DIR/restarted\"; fi\nexit 0\n",
+        );
+        let state = root.join("state.db");
+        write_test_state(&state, 15, "before-migration");
+        let backup = schema_upgrade_backup_path(&paths, 15, 16);
+        write_test_state(&backup, 15, "before-migration");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            source_state_schema: 15,
+            target_state_schema: 16,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        discard_state_schema_migration_record(&paths, &record).unwrap();
+
+        assert!(root.join("restarted").is_file());
+        assert!(!major_upgrade_record_path(&paths).exists());
+        assert!(!backup.exists());
+        assert!(!source_binary.exists());
+        assert!(!dir.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn rollback_restores_schema_fifteen_before_starting_the_old_binary() {
+        let root = env::temp_dir().join(format!(
+            "herdr-state-migration-rollback-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        let source_script = concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1 $2\" = \"service install\" ]; then\n",
+            "/usr/bin/python3 - <<'PY'\n",
+            "import os, sqlite3\n",
+            "root = os.environ['HERDR_MCP_CONFIG_DIR']\n",
+            "conn = sqlite3.connect(os.path.join(root, 'state.db'))\n",
+            "schema = conn.execute(\n",
+            "    \"SELECT value FROM meta WHERE key='schema_version'\"\n",
+            ").fetchone()[0]\n",
+            "open(os.path.join(root, 'old-binary-schema'), 'w').write(schema)\n",
+            "PY\n",
+            "fi\n",
+            "exit 0\n",
+        );
+        write_test_executable(
+            &source_binary,
+            source_script,
+        );
+        let state = root.join("state.db");
+        write_test_state(&state, 16, "after-migration");
+        let backup = schema_upgrade_backup_path(&paths, 15, 16);
+        write_test_state(&backup, 15, "before-migration");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            source_state_schema: 15,
+            target_state_schema: 16,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        recover_major_upgrade(&paths, &record).unwrap();
+
+        assert_eq!(read_raw_state_schema(&state).unwrap(), Some(15));
+        assert_eq!(fs::read_to_string(root.join("old-binary-schema")).unwrap(), "15");
+        assert!(!dir.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn migration_rollback_record_validation_accepts_only_schema_fifteen_to_sixteen() {
+        let root = env::temp_dir().join(format!(
+            "herdr-state-migration-record-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let valid = |source_state_schema, target_state_schema| MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            source_state_schema,
+            target_state_schema,
+            source_binary: major_upgrade_source_binary_path(&paths)
+                .to_string_lossy()
+                .into_owned(),
+            source_binary_sha256: "0".repeat(64),
+            state_backup: schema_upgrade_backup_path(
+                &paths,
+                source_state_schema,
+                target_state_schema,
+            )
+            .to_string_lossy()
+            .into_owned(),
+            state_backup_sha256: "0".repeat(64),
+            created_at_ms: now_ms_i64(),
+        };
+        validate_major_upgrade_record(&paths, &valid(15, 16)).unwrap();
+        assert!(validate_major_upgrade_record(&paths, &valid(14, 16)).is_err());
+        assert!(validate_major_upgrade_record(&paths, &valid(15, 17)).is_err());
         fs::remove_dir_all(root).ok();
     }
 
