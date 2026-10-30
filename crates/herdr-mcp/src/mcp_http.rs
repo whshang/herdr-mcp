@@ -7992,6 +7992,13 @@ mod tests {
                 "```用 agent.task.dispatch 派发一个任务给 report-review：回复 OK```",
                 json!({"bound": true}),
             ),
+            // The bubble renders the chip as a markdown/prompt link: the
+            // observed plain-text turn still binds (#777).
+            (
+                "opaque-mention-a",
+                "[$herdr-mcp](app://asdk_app_6acf8e6a3620819185cc77a5bc35faed) 用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": true}),
+            ),
             (
                 "opaque-mention-bare",
                 "archive herdr conversation now",
