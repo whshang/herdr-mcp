@@ -102,6 +102,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
         AgentCommand::Dispatch {
             target,
             text,
+            spawn,
             parent_target,
             idempotency_key,
             inject_task_identity,
@@ -112,34 +113,56 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
             wait,
             timeout_ms,
         } => {
-            let mut params = json!({
-                "target": target,
-                "text": text,
-                "parent_target": parent_target,
-                "idempotency_key": idempotency_key,
-            });
+            let mut params = Map::new();
+            insert_optional(&mut params, "target", target);
+            params.insert("text".to_owned(), json!(text));
+            insert_optional(&mut params, "parent_target", parent_target);
+            params.insert("idempotency_key".to_owned(), json!(idempotency_key));
+            if let Some(spawn) = spawn {
+                // The runtime schema owns the field names; the CLI only passes
+                // the `spawn` object through unchanged.
+                let mut spawn_params = Map::new();
+                spawn_params.insert("kind".to_owned(), json!(spawn.kind));
+                insert_optional(&mut spawn_params, "workspace_id", spawn.workspace);
+                insert_optional(&mut spawn_params, "cwd", spawn.cwd);
+                insert_optional(&mut spawn_params, "name", spawn.name);
+                insert_optional(&mut spawn_params, "tab_label", spawn.tab_label);
+                insert_optional(&mut spawn_params, "split_from", spawn.split_from);
+                insert_optional(&mut spawn_params, "direction", spawn.direction);
+                if let Some(value) = spawn.startup_timeout_ms {
+                    spawn_params.insert("startup_timeout_ms".to_owned(), json!(value));
+                }
+                params.insert("spawn".to_owned(), Value::Object(spawn_params));
+            }
             if let Some(value) = max_concurrent {
-                params["max_concurrent"] = json!(value);
+                params.insert("max_concurrent".to_owned(), json!(value));
             }
             if let Some(value) = workspace_id {
-                params["workspace_id"] = json!(value);
+                params.insert("workspace_id".to_owned(), json!(value));
             }
             if let Some(value) = stall_after_ms {
-                params["stall_after_ms"] = json!(value);
+                params.insert("stall_after_ms".to_owned(), json!(value));
             }
             if inject_task_identity {
-                params["inject_task_identity"] = json!(true);
+                params.insert("inject_task_identity".to_owned(), json!(true));
             }
             if let Some(session_ref) = parent_session_ref {
-                params["parent_session_ref"] = json!(session_ref);
+                params.insert("parent_session_ref".to_owned(), json!(session_ref));
             }
             if wait {
-                params["wait"] = json!({
-                    "until": ["idle", "done", "blocked"],
-                    "timeout_ms": timeout_ms,
-                });
+                params.insert(
+                    "wait".to_owned(),
+                    json!({
+                        "until": ["idle", "done", "blocked"],
+                        "timeout_ms": timeout_ms,
+                    }),
+                );
             }
-            print_private_result(call_private(AGENT_TASK_DISPATCH_METHOD, params, None)?)
+            print_private_result(call_private(
+                AGENT_TASK_DISPATCH_METHOD,
+                Value::Object(params),
+                None,
+            )?)
         }
         AgentCommand::Report {
             task_id,
@@ -760,7 +783,7 @@ fn call_private_with_context(
     .cloned()
     .ok_or_else(|| "cannot construct local private call".to_owned())?;
     let trace = private_call_trace(webchat_grant, page_assist_grant);
-    let timeout_ms = local_private_timeout_ms(method);
+    let timeout_ms = local_private_timeout_ms(method, &params);
     let request = RuntimeRequest {
         workstation_id: "local-agent-cli".to_owned(),
         request_id: local_request_id(),
@@ -810,12 +833,22 @@ fn call_private_with_context(
 // the settled reservation instead of a client-side timeout that would force a
 // same-key replay. It stays under LOCAL_MCP_MAX_TIMEOUT_MS (120s) in
 // link/local_mcp.rs. Other private calls keep the 30s default.
-fn local_private_timeout_ms(method: &str) -> u64 {
+fn local_private_timeout_ms(method: &str, params: &Value) -> u64 {
     if method == "herdr_mcp.browser_session.create" {
-        115_000
-    } else {
-        30_000
+        return 115_000;
     }
+    // A spawn dispatch waits for pane creation, agent.start readiness, and the
+    // prompt in one call, so the CLI budget must cover the caller's startup
+    // window instead of the default 30s mutation budget.
+    if method == AGENT_TASK_DISPATCH_METHOD
+        && let Some(startup) = params
+            .get("spawn")
+            .and_then(|spawn| spawn.get("startup_timeout_ms"))
+            .and_then(Value::as_u64)
+    {
+        return 40_000_u64.saturating_add(startup.min(120_000));
+    }
+    30_000
 }
 
 fn decode_tool_result(result: Option<Value>) -> Result<Value, String> {
@@ -963,11 +996,32 @@ mod tests {
     #[test]
     fn browser_session_create_gets_the_extended_local_call_budget_only() {
         assert_eq!(
-            local_private_timeout_ms("herdr_mcp.browser_session.create"),
+            local_private_timeout_ms("herdr_mcp.browser_session.create", &json!({})),
             115_000
         );
         assert_eq!(
-            local_private_timeout_ms("herdr_mcp.browser_session.open"),
+            local_private_timeout_ms("herdr_mcp.browser_session.open", &json!({})),
+            30_000
+        );
+    }
+
+    /// user operator | Given a spawn dispatch | When the local CLI calls the
+    /// runtime | Then the request budget covers the spawn startup window
+    /// instead of the default mutation budget.
+    #[test]
+    fn spawn_dispatch_local_call_budget_covers_the_startup_window() {
+        assert_eq!(
+            local_private_timeout_ms(
+                AGENT_TASK_DISPATCH_METHOD,
+                &json!({"spawn": {"kind": "pi", "startup_timeout_ms": 120_000}})
+            ),
+            160_000
+        );
+        assert_eq!(
+            local_private_timeout_ms(
+                AGENT_TASK_DISPATCH_METHOD,
+                &json!({"target": "w1:p1", "text": "work"})
+            ),
             30_000
         );
     }

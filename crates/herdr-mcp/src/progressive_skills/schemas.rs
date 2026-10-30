@@ -131,10 +131,26 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "method": AGENT_TASK_DISPATCH_METHOD,
             "source": "herdr_mcp_local",
             "access": "mutation",
+            "description": "Dispatch one task card to an existing agent (target) or to a NEW agent in one call (spawn): create the pane, start the agent, wait for interactive readiness and prompt it without separate pane.split/agent.start calls. spawn and target are mutually exclusive and spawn requires idempotency_key; a replayed key never creates a second pane, tab or agent.",
             "params": {
                 "properties": {
-                    "target": {"type": "string", "maxLength": 256, "description": "Exact agent/pane or explicit @idle, @kind, @kind:idle selector. Roles choose the first idle, delegation-safe pane in live snapshot order; never broadcast (@all is rejected). Replays retain the original resolved_target and candidate evidence."},
-                    "workspace_id": {"type": "string", "maxLength": 256, "description": "Optional workspace scope for role resolution."},
+                    "target": {"type": "string", "maxLength": 256, "description": "Exact agent/pane or explicit @idle, @kind, @kind:idle selector. Roles choose the first idle, delegation-safe pane in live snapshot order; never broadcast (@all is rejected). Replays retain the original resolved_target and candidate evidence. Omit when spawn is present."},
+                    "spawn": {
+                        "type": "object",
+                        "description": "One-shot spawn-and-dispatch. Validated before any side effect; the whole chain is pane create -> agent.start -> bounded readiness -> normal dispatch. status/failed_step values are validate, pane_create, agent_start, agent_ready and prompt. Failures keep delivery_state not_delivered when the prompt was never sent and report the created pane/agent for reclaim.",
+                        "properties": {
+                            "kind": {"type": "string", "maxLength": 64, "description": "Required agent kind passed to agent.start (e.g. pi, codex, claude, grok). An unsupported kind fails at failed_step agent_start with the native code."},
+                            "name": {"type": "string", "maxLength": 32, "description": "Optional agent name matching [a-z][a-z0-9_-]{0,31}; defaults to kind plus a short stable suffix derived from the idempotency_key."},
+                            "workspace_id": {"type": "string", "maxLength": 256, "description": "Target workspace id or unique label. Required unless cwd is inside exactly one live workspace."},
+                            "cwd": {"type": "string", "maxLength": 1024, "description": "Absolute cwd inside a managed project root from the live topology; defaults to the workspace checkout path. Validated lexically, never by canonicalizing or running git."},
+                            "tab_label": {"type": "string", "maxLength": 64, "description": "Label for the new tab (default path only); defaults to the agent name."},
+                            "split_from": {"type": "string", "maxLength": 256, "description": "Optional parent pane id for pane.split. Without it the pane is created as a new tab so the agent gets the full tab width. A horizontal split still respects the readable-width floor and fails with pane_split_too_narrow."},
+                            "direction": {"type": "string", "enum": ["right", "down"], "description": "Split direction; requires split_from and defaults to right."},
+                            "startup_timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000, "description": "Budget for agent.start readiness plus the bounded readiness wait; defaults to 60000."}
+                        },
+                        "required": ["kind"],
+                    },
+                    "workspace_id": {"type": "string", "maxLength": 256, "description": "Optional workspace scope for role resolution. Not applicable with spawn (use spawn.workspace_id)."},
                     "max_concurrent": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Role selectors only: cap non-terminal tasks for this exact requested_target in the bound parent session, else parent_target, else caller-less global scope. Limit rejection is not_delivered."},
                     "text": {"type": "string", "maxLength": 65536},
                     "parent_target": {"type": "string", "maxLength": 256},
@@ -164,7 +180,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                         }
                     }
                 },
-                "required": ["target", "text", "parent_target", "idempotency_key"],
+                "required": ["text", "idempotency_key"],
                 "empty": false,
             },
         }),

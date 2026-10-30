@@ -2894,6 +2894,16 @@ fn agent_lifecycle_json(advice: &DispatchAdvice, startable_candidates: &Value) -
             "requires_human": false,
             "action": "start_agent_then_dispatch",
             "authority": "deterministic",
+            // One call replaces the manual chain: the runtime creates the
+            // pane, starts the agent, waits for readiness and prompts it.
+            "preferred": {
+                "method": "herdr_mcp.agent.task.dispatch",
+                "params": {
+                    "spawn": {"kind": "<agent kind>", "workspace_id": "<workspace id or label>"},
+                    "text": "<task card>",
+                    "idempotency_key": "<new key>"
+                }
+            },
             "sequence": ["pane.split", "agent.start", "agent.prompt_or_task_dispatch"],
             "pane_policy": "reuse only a verified task-owned free shell pane; otherwise create a planner-owned pane",
             "ownership": "agent:null is not ownership evidence",
@@ -3984,6 +3994,14 @@ mod tests {
         assert_eq!(result["agent_lifecycle"]["can_proceed"], true);
         assert_eq!(result["agent_lifecycle"]["requires_human"], false);
         assert_eq!(
+            result["agent_lifecycle"]["preferred"]["method"],
+            "herdr_mcp.agent.task.dispatch"
+        );
+        assert_eq!(
+            result["agent_lifecycle"]["preferred"]["params"]["spawn"]["kind"],
+            "<agent kind>"
+        );
+        assert_eq!(
             result["agent_lifecycle"]["sequence"],
             json!(["pane.split", "agent.start", "agent.prompt_or_task_dispatch"])
         );
@@ -4614,6 +4632,25 @@ mod tests {
         assert_eq!(properties["max_concurrent"]["minimum"], 1);
         assert_eq!(properties["max_concurrent"]["maximum"], 16);
         assert_eq!(properties["workspace_id"]["type"], "string");
+        // One-shot spawn-and-dispatch is an option on the same method, not a
+        // new tool: the catalog/contract identity must not move.
+        let spawn = &properties["spawn"];
+        assert_eq!(spawn["type"], "object");
+        assert_eq!(spawn["required"], json!(["kind"]));
+        assert_eq!(spawn["properties"]["startup_timeout_ms"]["maximum"], 120000);
+        assert!(
+            properties["target"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("spawn")
+        );
+        assert!(
+            methods[0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("spawn"),
+            "the method description must advertise the one-call spawn form"
+        );
         assert!(
             local_method_schemas("agent.closeout.advise")[0]["params"]["properties"]
                 .get("max_concurrent")
