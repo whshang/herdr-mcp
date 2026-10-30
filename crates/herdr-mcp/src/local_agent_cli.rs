@@ -834,21 +834,23 @@ fn call_private_with_context(
 // same-key replay. It stays under LOCAL_MCP_MAX_TIMEOUT_MS (120s) in
 // link/local_mcp.rs. Other private calls keep the 30s default.
 fn local_private_timeout_ms(method: &str, params: &Value) -> u64 {
+    // Keep the create budget as this block's value: the cross-language budget
+    // test parses it straight from this source text.
     if method == "herdr_mcp.browser_session.create" {
-        return 115_000;
-    }
-    // A spawn dispatch waits for pane creation, agent.start readiness, and the
-    // prompt in one call, so the CLI budget must cover the caller's startup
-    // window instead of the default 30s mutation budget.
-    if method == AGENT_TASK_DISPATCH_METHOD
+        115_000
+    } else if method == AGENT_TASK_DISPATCH_METHOD
         && let Some(startup) = params
             .get("spawn")
             .and_then(|spawn| spawn.get("startup_timeout_ms"))
             .and_then(Value::as_u64)
     {
-        return 40_000_u64.saturating_add(startup.min(120_000));
+        // A spawn dispatch waits for pane creation, agent.start readiness, and
+        // the prompt in one call, so the CLI budget must cover the caller's
+        // startup window instead of the default 30s mutation budget.
+        40_000_u64.saturating_add(startup.min(120_000))
+    } else {
+        30_000
     }
-    30_000
 }
 
 fn decode_tool_result(result: Option<Value>) -> Result<Value, String> {
