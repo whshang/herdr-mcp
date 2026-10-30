@@ -5388,6 +5388,10 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn failed_later_ordinary_update_does_not_consume_leftover_migration_record() {
+        // A real leftover from a *bridge* install: the live database is already
+        // schema 16 and the record still describes 15 -> 16. If a later
+        // ordinary (same-schema) job consumed it, the live state would be
+        // silently rolled back to 15 by an unrelated update.
         let root = env::temp_dir().join(format!(
             "herdr-state-migration-leftover-forward-{}-{}",
             std::process::id(),
@@ -5398,14 +5402,14 @@ mod tests {
         let dir = major_upgrade_dir(&paths);
         fs::create_dir_all(&dir).unwrap();
         let state = root.join("state.db");
-        write_test_state(&state, SCHEMA_VERSION, "migrated-state");
-        let backup = schema_upgrade_backup_path(&paths, 15, SCHEMA_VERSION);
-        write_test_state(&backup, 15, "migration-backup");
+        write_test_state(&state, SCHEMA_VERSION + 1, "migrated-state");
+        let backup = schema_upgrade_backup_path(&paths, SCHEMA_VERSION, SCHEMA_VERSION + 1);
+        write_test_state(&backup, SCHEMA_VERSION, "migration-backup");
         let record = MajorUpgradeRecord {
             record_version: MAJOR_UPGRADE_RECORD_VERSION,
             job_id: Some("upd-earlier-migration".to_owned()),
-            source_state_schema: 15,
-            target_state_schema: SCHEMA_VERSION,
+            source_state_schema: SCHEMA_VERSION,
+            target_state_schema: SCHEMA_VERSION + 1,
             source_binary: dir.join("source-herdr-mcp").to_string_lossy().into_owned(),
             source_binary_sha256: "0".repeat(64),
             state_backup: backup.to_string_lossy().into_owned(),
@@ -5417,7 +5421,10 @@ mod tests {
         recover_failed_state_schema_migration(&paths, &ordinary_update_job("upd-later-ordinary"))
             .unwrap();
 
-        assert_eq!(read_raw_state_schema(&state).unwrap(), Some(SCHEMA_VERSION));
+        assert_eq!(
+            read_raw_state_schema(&state).unwrap(),
+            Some(SCHEMA_VERSION + 1)
+        );
         assert!(major_upgrade_record_path(&paths).exists());
         assert!(backup.exists());
         fs::remove_dir_all(root).ok();
