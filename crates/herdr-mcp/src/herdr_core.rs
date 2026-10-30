@@ -73,9 +73,7 @@ pub(crate) fn probe_with_env(
             binary: Some(candidate),
         };
     }
-    if let Some(dir) = app_config_dir(env)
-        && dir.is_dir()
-    {
+    if app_config_dirs(env).into_iter().any(|dir| dir.is_dir()) {
         return HerdrCoreProbe {
             present: true,
             version: None,
@@ -115,13 +113,25 @@ fn binary_candidates(env: &ProbeEnv) -> Vec<(PathBuf, &'static str)> {
     out
 }
 
-fn app_config_dir(env: &ProbeEnv) -> Option<PathBuf> {
-    if let Some(home) = &env.home {
-        return Some(home.join(".config").join(APP_CONFIG_DIR_NAME));
+/// App-config marker directories, most platform-appropriate first. On Windows
+/// `%LOCALAPPDATA%\herdr-app` is probed even when `USERPROFILE` is set (the
+/// `.config` path is kept only as an extra candidate); elsewhere
+/// `~/.config/herdr-app` comes first.
+fn app_config_dirs(env: &ProbeEnv) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if cfg!(windows) {
+        if let Some(dir) = &env.local_app_data {
+            out.push(dir.join(APP_CONFIG_DIR_NAME));
+        }
+        if let Some(home) = &env.home {
+            out.push(home.join(".config").join(APP_CONFIG_DIR_NAME));
+        }
+    } else if let Some(home) = &env.home {
+        out.push(home.join(".config").join(APP_CONFIG_DIR_NAME));
+    } else if let Some(dir) = &env.local_app_data {
+        out.push(dir.join(APP_CONFIG_DIR_NAME));
     }
-    env.local_app_data
-        .as_ref()
-        .map(|dir| dir.join(APP_CONFIG_DIR_NAME))
+    out
 }
 
 fn run_version_probe(binary: &Path) -> Option<String> {

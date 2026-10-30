@@ -188,6 +188,16 @@ pub fn print_status(
     );
     println!("TCC: {tcc_summary}");
     println!("{}", semantic_status_line(language));
+    // #772: WebChat grant state is part of the default status view.
+    let webchat_grants = crate::webchat_grants::snapshot(paths);
+    println!(
+        "{}",
+        crate::webchat_grants::summary_line(&webchat_grants, language)
+    );
+    for line in webchat_grants.concise_lines().iter().skip(1) {
+        println!("{line}");
+    }
+    println!("{}", crate::webchat_grants::binding_hint(language));
     println!();
     println!(
         "{}: herdr-mcp status --verbose",
@@ -316,10 +326,16 @@ fn print_status_verbose(paths: &RuntimePaths, config: &Config, language: crate::
         ),
         crate::local_agent_skill::status_line()
     );
+    let webchat_grants = crate::webchat_grants::snapshot(paths);
     println!(
         "{}",
-        crate::webchat_grants::summary_line(&crate::webchat_grants::snapshot(paths), language)
+        crate::webchat_grants::summary_line(&webchat_grants, language)
     );
+    let grants_hint = crate::webchat_grants::binding_hint(language);
+    for line in webchat_grants.concise_lines() {
+        println!("{line}");
+    }
+    println!("{grants_hint}");
     let herdr_core = crate::herdr_core::probe();
     if herdr_core.present {
         println!("{}", crate::herdr_core::warning_line(&herdr_core, language));
@@ -756,6 +772,16 @@ pub fn print_doctor(
             diagnostic_label(authenticated_local_mcp.state)
         );
         std::println!("Edge: {} · {edge_host}", diagnostic_label(remote_summary));
+        // #772: grant state is always visible, even in the concise view.
+        let grants_hint = crate::webchat_grants::binding_hint(language);
+        std::println!(
+            "{}",
+            crate::webchat_grants::summary_line(&webchat_grants, language)
+        );
+        for line in webchat_grants.concise_lines().iter().skip(1) {
+            std::println!("{line}");
+        }
+        std::println!("{grants_hint}");
         std::println!(
             "{}: SKIP · {}",
             language.text("Remote MCP auth", "远程 MCP 认证", "リモート MCP 認証"),

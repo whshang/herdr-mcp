@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 const MAX_ENDPOINTS: usize = 8;
-const MAX_PRINCIPALS: usize = 8;
+const MAX_GRANT_ROWS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GrantState {
@@ -53,11 +53,21 @@ impl GrantState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantScope {
+    pub endpoint_ref: String,
+    pub provider: String,
+}
+
+/// One grant-evidence row: a connector's attributed dispatches observed under
+/// a concrete endpoint/provider scope (the tuple `webchat_control_grant_covers`
+/// checks).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GrantPrincipal {
     pub connector_id: String,
     pub grant_generation: Option<i64>,
     pub last_seen: Option<i64>,
     pub bound_caller_sessions: i64,
+    pub scopes: Vec<GrantScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +100,69 @@ impl WebChatGrantSnapshot {
         }
     }
 
+    /// Compact lines for the concise doctor / status views. Always starts
+    /// with the `state=` line; when a state DB exists, includes every
+    /// principal and per-endpoint consent line (bounded by the snapshot
+    /// limits), so grant state and `consent_revision` are visible without
+    /// `--verbose`.
+    pub(crate) fn concise_lines(&self) -> Vec<String> {
+        let mut lines = vec![self.doctor_line("")];
+        match self.state {
+            GrantState::Unknown => {}
+            GrantState::Absent => {
+                for endpoint in &self.endpoints {
+                    lines.push(format!(
+                        "LAYER webchat-consent endpoint_ref={} browser={} webchat_control={} tool_bridge={} tool_bridge_mutation={} consent_revision={} last_observed_at={}",
+                        endpoint.endpoint_ref,
+                        endpoint.browser_family,
+                        endpoint.webchat_control_allowed,
+                        endpoint.tool_bridge_allowed,
+                        endpoint.tool_bridge_mutation_allowed,
+                        endpoint.consent_revision,
+                        endpoint.last_observed_at,
+                    ));
+                }
+            }
+            GrantState::Present => {
+                for principal in &self.principals {
+                    lines.push(format!(
+                        "LAYER webchat-grant principal={} grant_generation={} last_seen={} bound_caller_sessions={} scopes={}",
+                        principal.connector_id,
+                        principal
+                            .grant_generation
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        principal
+                            .last_seen
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        principal.bound_caller_sessions,
+                        principal.scopes.len(),
+                    ));
+                    for scope in &principal.scopes {
+                        lines.push(format!(
+                            "LAYER webchat-grant-scope principal={} endpoint_ref={} provider={}",
+                            principal.connector_id, scope.endpoint_ref, scope.provider,
+                        ));
+                    }
+                }
+                for endpoint in &self.endpoints {
+                    lines.push(format!(
+                        "LAYER webchat-consent endpoint_ref={} browser={} webchat_control={} tool_bridge={} tool_bridge_mutation={} consent_revision={} last_observed_at={}",
+                        endpoint.endpoint_ref,
+                        endpoint.browser_family,
+                        endpoint.webchat_control_allowed,
+                        endpoint.tool_bridge_allowed,
+                        endpoint.tool_bridge_mutation_allowed,
+                        endpoint.consent_revision,
+                        endpoint.last_observed_at,
+                    ));
+                }
+            }
+        }
+        lines
+    }
+
     pub(crate) fn as_json(&self) -> Value {
         let principals = self
             .principals
@@ -100,6 +173,10 @@ impl WebChatGrantSnapshot {
                     "grant_generation": principal.grant_generation,
                     "last_seen": principal.last_seen,
                     "bound_caller_sessions": principal.bound_caller_sessions,
+                    "scopes": principal.scopes.iter().map(|scope| json!({
+                        "endpoint_ref": scope.endpoint_ref,
+                        "provider": scope.provider,
+                    })).collect::<Vec<_>>(),
                 })
             })
             .collect::<Vec<_>>();
@@ -157,7 +234,7 @@ impl WebChatGrantSnapshot {
                 );
                 for principal in &self.principals {
                     line.push_str(&format!(
-                        "\nLAYER webchat-grant principal={} grant_generation={} last_seen={} bound_caller_sessions={}",
+                        "\nLAYER webchat-grant principal={} grant_generation={} last_seen={} bound_caller_sessions={} scopes={}",
                         principal.connector_id,
                         principal
                             .grant_generation
@@ -168,7 +245,14 @@ impl WebChatGrantSnapshot {
                             .map(|value| value.to_string())
                             .unwrap_or_else(|| "unknown".to_owned()),
                         principal.bound_caller_sessions,
+                        principal.scopes.len(),
                     ));
+                    for scope in &principal.scopes {
+                        line.push_str(&format!(
+                            "\nLAYER webchat-grant-scope principal={} endpoint_ref={} provider={}",
+                            principal.connector_id, scope.endpoint_ref, scope.provider,
+                        ));
+                    }
                 }
                 for endpoint in &self.endpoints {
                     line.push_str(&format!(
@@ -188,7 +272,8 @@ impl WebChatGrantSnapshot {
     }
 }
 
-/// One-line summary used by `status --verbose` and the doctor layer rollup.
+/// One-line summary used by `status` / `status --verbose` and the doctor
+/// layer rollup. Carries the machine-readable `state=` token.
 pub(crate) fn summary_line(
     snapshot: &WebChatGrantSnapshot,
     language: crate::locale::Locale,
@@ -196,11 +281,11 @@ pub(crate) fn summary_line(
     let label = language.text("WebChat grants", "WebChat 授权", "WebChat 認可");
     match snapshot.state {
         GrantState::Present => format!(
-            "{label}: present · principals={} · missing Edge grant causes binding grant_missing",
+            "{label}: state=present principals={} · missing Edge grant causes binding grant_missing",
             snapshot.principals.len(),
         ),
         GrantState::Absent => format!(
-            "{label}: absent · {} · extension consent gates browser control",
+            "{label}: state=absent · {} · extension consent gates browser control",
             language.text(
                 "binding would fail with grant_missing",
                 "绑定将报 grant_missing",
@@ -208,7 +293,7 @@ pub(crate) fn summary_line(
             ),
         ),
         GrantState::Unknown => format!(
-            "{label}: unknown · {}",
+            "{label}: state=unknown · {}",
             snapshot.reason.as_deref().unwrap_or("unavailable"),
         ),
     }
@@ -266,9 +351,9 @@ pub(crate) fn snapshot_at_db_path(db_path: &Path) -> WebChatGrantSnapshot {
     }
 }
 
-/// Grant evidence: connector-attributed dispatches. `connector_id` and
-/// `principal_ref` are grant principals, not secrets; no token or payload
-/// column is selected.
+/// Grant evidence: connector-attributed dispatches. `connector_id`,
+/// `principal_ref`, `endpoint_ref` and `provider` are grant principals/scope,
+/// not secrets; no token or payload column is selected.
 fn read_grant_principals(conn: &rusqlite::Connection) -> Result<Vec<GrantPrincipal>, String> {
     if !table_exists(conn, "browser_dispatches") || !table_exists(conn, "browser_caller_sessions") {
         return Err("grant_tables_missing".to_owned());
@@ -277,43 +362,77 @@ fn read_grant_principals(conn: &rusqlite::Connection) -> Result<Vec<GrantPrincip
         .prepare(
             "SELECT authorization_connector_id,
                     MAX(authorization_grant_generation),
-                    MAX(updated_at)
+                    MAX(updated_at),
+                    endpoint_ref,
+                    provider
              FROM browser_dispatches
              WHERE authorization_connector_id IS NOT NULL
-             GROUP BY authorization_connector_id
+             GROUP BY authorization_connector_id, endpoint_ref, provider
              ORDER BY MAX(updated_at) DESC
              LIMIT ?1",
         )
         .map_err(|error| format!("grant_query_failed: {error}"))?;
     let rows = stmt
-        .query_map([MAX_PRINCIPALS as i64], |row| {
+        .query_map([MAX_GRANT_ROWS as i64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<i64>>(1)?,
                 row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })
         .map_err(|error| format!("grant_query_failed: {error}"))?;
-    let mut principals = Vec::new();
+    let mut principals: Vec<GrantPrincipal> = Vec::new();
     for row in rows {
-        let (connector_id, grant_generation, last_seen) =
+        let (connector_id, grant_generation, last_seen, endpoint_ref, provider) =
             row.map_err(|error| format!("grant_query_failed: {error}"))?;
-        let bound = conn
-            .query_row(
-                "SELECT COUNT(*) FROM browser_caller_sessions WHERE principal_ref = ?1",
-                rusqlite::params![format!("connector:{connector_id}")],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| format!("grant_query_failed: {error}"))
-            .unwrap_or(0);
-        principals.push(GrantPrincipal {
-            connector_id,
-            grant_generation,
-            last_seen,
-            bound_caller_sessions: bound,
+        let entry = match principals
+            .iter_mut()
+            .find(|principal| principal.connector_id == connector_id)
+        {
+            Some(entry) => entry,
+            None => {
+                // Strict: a broken caller-session read must surface as
+                // unknown, never silently as zero bound sessions.
+                let bound = caller_session_count(conn, &connector_id)?;
+                principals.push(GrantPrincipal {
+                    connector_id: connector_id.clone(),
+                    grant_generation,
+                    last_seen,
+                    bound_caller_sessions: bound,
+                    scopes: Vec::new(),
+                });
+                principals.last_mut().expect("just pushed")
+            }
+        };
+        entry.grant_generation = match (entry.grant_generation, grant_generation) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        entry.last_seen = match (entry.last_seen, last_seen) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        entry.scopes.push(GrantScope {
+            endpoint_ref,
+            provider,
         });
     }
     Ok(principals)
+}
+
+fn caller_session_count(conn: &rusqlite::Connection, connector_id: &str) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM browser_caller_sessions WHERE principal_ref = ?1",
+        rusqlite::params![format!("connector:{connector_id}")],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(|error| format!("grant_query_failed: {error}"))
 }
 
 fn read_endpoint_consent(conn: &rusqlite::Connection) -> Result<Vec<EndpointConsent>, String> {
@@ -494,6 +613,9 @@ mod tests {
         assert_eq!(principal.grant_generation, Some(3));
         assert_eq!(principal.last_seen, Some(10));
         assert_eq!(principal.bound_caller_sessions, 0);
+        assert_eq!(principal.scopes.len(), 1);
+        assert_eq!(principal.scopes[0].endpoint_ref, endpoint_ref);
+        assert_eq!(principal.scopes[0].provider, "chatgpt");
         assert_eq!(snapshot.endpoints.len(), 1);
         let endpoint = &snapshot.endpoints[0];
         // The per-endpoint WebChat switch was retired in 1.1; consent writes
@@ -505,12 +627,19 @@ mod tests {
         let json = snapshot.as_json();
         assert_eq!(json["state"], "present");
         assert_eq!(json["principals"][0]["connector_id"], "conn_webchatGrant01");
+        assert_eq!(
+            json["principals"][0]["scopes"][0]["endpoint_ref"],
+            json!(endpoint_ref)
+        );
+        assert_eq!(json["principals"][0]["scopes"][0]["provider"], "chatgpt");
         assert_eq!(json["endpoints"][0]["consent"]["webchat_control"], false);
         assert_eq!(json["endpoints"][0]["consent_revision"], 1);
 
         let line = snapshot.doctor_line("hint");
         assert!(line.contains("state=present"));
         assert!(line.contains("conn_webchatGrant01"));
+        assert!(line.contains("webchat-grant-scope"));
+        assert!(line.contains(&endpoint_ref));
         assert!(line.contains("webchat_control=false"));
         let _ = std::fs::remove_file(&path);
     }
@@ -592,5 +721,92 @@ mod tests {
         let hint = binding_hint(crate::locale::Locale::En);
         assert!(hint.contains("grant_missing"));
         assert!(hint.contains("consent"));
+    }
+
+    #[test]
+    fn bound_caller_sessions_are_counted_not_zero_fallback() {
+        let path = temp_db_path();
+        let mut store = crate::state_store::StateStore::open(&path).unwrap();
+        let endpoint_ref = register_endpoint(&mut store);
+        reserve_authorized_dispatch(&mut store, &endpoint_ref, "conn_boundCaller01");
+        // Bind one caller session for the connector's principal.
+        let account = store
+            .observe_browser_resource(crate::state_store::BrowserResourceObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: "native-identity-bound-caller-account",
+                display_label: None,
+                observation_generation: 1,
+                observed_at: 5,
+            })
+            .unwrap();
+        let session = store
+            .observe_browser_resource(crate::state_store::BrowserResourceObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&account.resource_ref),
+                native_identity: "native-identity-bound-caller-session",
+                display_label: None,
+                observation_generation: 1,
+                observed_at: 6,
+            })
+            .unwrap();
+        store
+            .bind_browser_caller_session(
+                "connector:conn_boundCaller01",
+                "chatgpt",
+                "opaque-caller-session-bound",
+                &session.resource_ref,
+                7,
+            )
+            .unwrap();
+        drop(store);
+
+        let snapshot = snapshot_at_db_path(&path);
+        assert_eq!(snapshot.state, GrantState::Present);
+        assert_eq!(snapshot.principals.len(), 1);
+        // A successful count must report the real value; the old code
+        // swallowed read errors as 0, so this pins the strict path.
+        assert_eq!(snapshot.principals[0].bound_caller_sessions, 1);
+        let line = snapshot.doctor_line("hint");
+        assert!(line.contains("bound_caller_sessions=1"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concise_lines_carry_state_and_consent_revision() {
+        // Present state: principal + scope + consent lines all present.
+        let path = temp_db_path();
+        let mut store = crate::state_store::StateStore::open(&path).unwrap();
+        let endpoint_ref = register_endpoint(&mut store);
+        store
+            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                endpoint_ref: &endpoint_ref,
+                expected_revision: 0,
+                webchat_control_allowed: true,
+                tool_bridge_allowed: false,
+                tool_bridge_mutation_allowed: false,
+                observed_at: 20,
+            })
+            .unwrap();
+        reserve_authorized_dispatch(&mut store, &endpoint_ref, "conn_conciseView01");
+        drop(store);
+        let snapshot = snapshot_at_db_path(&path);
+        let lines = snapshot.concise_lines();
+        assert!(lines.iter().any(|line| line.contains("state=present")));
+        assert!(lines.iter().any(|line| line.contains("consent_revision=")));
+        assert!(lines.iter().any(|line| line.contains("conn_conciseView01")));
+        let _ = std::fs::remove_file(&path);
+
+        // Unknown state: only the state line, still carrying `state=`.
+        let missing = temp_db_path();
+        let unknown = snapshot_at_db_path(&missing);
+        let lines = unknown.concise_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("state=unknown"));
+        assert!(lines[0].contains("state_db_missing"));
     }
 }
