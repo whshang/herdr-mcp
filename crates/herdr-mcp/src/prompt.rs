@@ -49,16 +49,28 @@ const ESCALATION_MAX_SIGNALS: usize = 16;
 const ESCALATION_MAX_TASK_IDS: usize = 8;
 static NEXT_DISPATCH_NONCE: AtomicU64 = AtomicU64::new(1);
 
-/// Bound on one `spawn` startup window: `agent.start` waits for interactive
-/// readiness in the same terminal, and the caller's budget covers both.
-const SPAWN_DEFAULT_STARTUP_MS: u64 = 60_000;
-const SPAWN_MAX_STARTUP_MS: u64 = 120_000;
-/// Native `agent.start` rejects `timeout_ms` at or below its 3s floor, so the
-/// native window is clamped while the caller's readiness budget is honored.
+/// One `spawn` call must fit the whole chain (pane create, `agent.start`,
+/// readiness, prompt submission) inside the budget the caller actually waits.
+/// A WebChat `herdr_call` without `timeout_ms` is cut by Edge at 30s and the
+/// link wire never exceeds 60s, so the default keeps headroom under the
+/// smallest transport instead of reserving work the caller will never see.
+pub(crate) const SPAWN_CHAIN_DEFAULT_MS: u64 = 25_000;
+/// Accepted ceiling for `spawn.startup_timeout_ms`. The local CLI waits the
+/// chain plus slack and never exceeds its own 120s transport cap.
+pub(crate) const SPAWN_CHAIN_MAX_MS: u64 = 100_000;
+/// Headroom kept inside the chain for the prompt submission itself. A quarter
+/// of the chain keeps tiny budgets workable instead of reserving more than the
+/// caller granted.
+const SPAWN_PROMPT_RESERVE_MS: u64 = 5_000;
+/// Native `agent.start` rejects `timeout_ms` at or below its 3s floor.
 const SPAWN_NATIVE_START_FLOOR_MS: u64 = 3_001;
 const SPAWN_READY_POLL: Duration = Duration::from_millis(200);
+/// A readiness window shorter than one poll cannot prove readiness, so the
+/// chain reports a resumable checkpoint instead of an orphan in-flight key.
+const SPAWN_READY_MIN_POLL_MS: u64 = 250;
 const SPAWN_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const SPAWN_PANE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound for one pane mutation, always cut down to the remaining chain.
+const SPAWN_PANE_TIMEOUT_MS: u64 = 10_000;
 const SPAWN_AGENT_NAME_MAX: usize = 32;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -318,6 +330,9 @@ struct PromptRegistryInner {
     // parent notification so a stale snapshot cannot erase an accepted report.
     task_mutations: Mutex<()>,
     role_dispatches: Mutex<()>,
+    /// Idempotency keys whose resumable spawn checkpoint is being continued,
+    /// so two concurrent replays cannot both prompt the same agent.
+    spawn_resumes: Mutex<HashSet<String>>,
     #[cfg(test)]
     clock: Option<Arc<AtomicU64>>,
     records: Mutex<HashMap<String, PromptRecord>>,
@@ -330,6 +345,20 @@ struct PromptRegistryInner {
 #[derive(Clone, Default)]
 pub struct PromptRegistry {
     inner: Arc<PromptRegistryInner>,
+}
+
+/// One in-flight spawn resume. Dropping it releases the key for the next replay.
+struct SpawnResumeGuard<'a> {
+    registry: &'a PromptRegistry,
+    key: String,
+}
+
+impl Drop for SpawnResumeGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.registry.inner.spawn_resumes.lock() {
+            active.remove(&self.key);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -358,6 +387,7 @@ impl PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -378,6 +408,7 @@ impl PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -390,6 +421,19 @@ impl PromptRegistry {
         registry.reconcile_active_tasks();
         registry.start_task_tracker();
         registry
+    }
+
+    /// Claim the in-flight resume slot for one idempotency key. `None` means
+    /// another replay of the same checkpoint is already continuing it.
+    fn begin_spawn_resume(&self, key: &str) -> Option<SpawnResumeGuard<'_>> {
+        let mut active = self.inner.spawn_resumes.lock().ok()?;
+        if !active.insert(key.to_owned()) {
+            return None;
+        }
+        Some(SpawnResumeGuard {
+            registry: self,
+            key: key.to_owned(),
+        })
     }
 
     fn begin(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
@@ -3229,16 +3273,18 @@ pub fn run_with_parent_session(
     // A spawn reserves its key before resolving or creating anything: a
     // concurrent call must fail closed as in-flight, and a replay must return
     // the stored outcome even when the live layout changed since.
-    let mut spawn_reserved = false;
+    let mut spawn_resume: Option<SpawnResume> = None;
     if spawn.is_some()
         && let Some(key) = idempotency_key
     {
         match reserve_dispatch(registry, key, &fingerprint, task_id, wait.as_ref()) {
-            Ok(op_id) => {
-                operation_id = op_id;
-                spawn_reserved = true;
-            }
-            Err(result) => return result,
+            DispatchReservation::Reserved(op_id) => operation_id = op_id,
+            DispatchReservation::Known(result) => match spawn_checkpoint(&result) {
+                // A chain that paused on the caller's budget resumes from its
+                // persisted pane/agent under the same key instead of spawning.
+                Some(checkpoint) => spawn_resume = Some(checkpoint),
+                None => return result,
+            },
         }
     }
     // Resolve the spawn plan (workspace, cwd, agent name) before any mutation:
@@ -3259,6 +3305,33 @@ pub fn run_with_parent_session(
         },
         (Some(_), None) => return spawn_invalid("idempotency_key is required with spawn"),
         (None, _) => None,
+    };
+
+    // Delegation depth is decidable from the task ledger, so a spawn dispatch
+    // that would create a third-level worker is refused before a pane or agent
+    // exists: nothing to reclaim and no phantom prompt step. The new pane can
+    // never be the caller itself, so only the ledger depth check applies here.
+    if spawn_dispatch.is_some()
+        && let Some(parent_target) = parent_target
+        && let Some(mut rejection) = delegation_guard(client, registry, "", None, parent_target)
+    {
+        insert_dispatch_id(&mut rejection, task_id);
+        insert_task_id(&mut rejection, task_id);
+        return rejection;
+    }
+
+    // Two concurrent replays of one checkpoint must not both prompt.
+    let _resume_guard = match (&spawn_resume, idempotency_key) {
+        (Some(checkpoint), Some(key)) => match registry.begin_spawn_resume(key) {
+            Some(guard) => Some(guard),
+            None => {
+                let mut busy = spawn_resume_in_progress(checkpoint);
+                insert_dispatch_id(&mut busy, task_id);
+                insert_task_id(&mut busy, task_id);
+                return busy;
+            }
+        },
+        _ => None,
     };
 
     // A parented dispatch probes the caller's own agent once for the delegation
@@ -3296,10 +3369,12 @@ pub fn run_with_parent_session(
         return rejection;
     }
 
-    if !spawn_reserved && let Some(key) = idempotency_key {
+    if spawn.is_none()
+        && let Some(key) = idempotency_key
+    {
         match reserve_dispatch(registry, key, &fingerprint, task_id, wait.as_ref()) {
-            Ok(op_id) => operation_id = op_id,
-            Err(result) => return result,
+            DispatchReservation::Reserved(op_id) => operation_id = op_id,
+            DispatchReservation::Known(result) => return result,
         }
     }
 
@@ -3328,31 +3403,12 @@ pub fn run_with_parent_session(
     } else {
         None
     };
-    // A spawn resolves its target by creating it. The delegation guard needs
-    // that concrete pane, so it runs here for spawn dispatches only and reports
-    // the created pane/agent for reclaim when it refuses.
+    // A spawn resolves its target by creating it, or by resuming the pane a
+    // resumable checkpoint already persisted.
     let mut spawn_outcome = None;
     let dispatched_target = match spawn_dispatch.as_ref() {
-        Some(dispatch) => match spawn_pane_and_agent(client, registry, dispatch) {
+        Some(dispatch) => match spawn_chain(client, registry, dispatch, spawn_resume.as_ref()) {
             Ok(outcome) => {
-                if let Some(parent_target) = parent_target
-                    && let Some(rejection) = delegation_guard(
-                        client,
-                        registry,
-                        &outcome.pane_id,
-                        outcome.before.as_ref(),
-                        parent_target,
-                    )
-                {
-                    let failure = spawn_prompt_failure(&outcome, &rejection);
-                    return finish_spawn_failure(
-                        registry,
-                        idempotency_key,
-                        &fingerprint,
-                        task_id,
-                        failure,
-                    );
-                }
                 let pane_id = outcome.pane_id.clone();
                 spawn_outcome = Some(outcome);
                 pane_id
@@ -3412,11 +3468,13 @@ pub fn run_with_parent_session(
         "text": dispatch_text,
     });
 
-    let mut result = match client.call_with_timeout(
-        "agent.prompt",
-        params,
-        Duration::from_millis(DEFAULT_CALL_TIMEOUT_MS),
-    ) {
+    // A spawn dispatch submits its prompt with only what is left of the chain
+    // the caller is waiting for; every other dispatch keeps the default budget.
+    let prompt_budget = spawn_outcome.as_ref().map_or_else(
+        || Duration::from_millis(DEFAULT_CALL_TIMEOUT_MS),
+        |outcome| outcome.prompt_timeout,
+    );
+    let mut result = match client.call_with_timeout("agent.prompt", params, prompt_budget) {
         Ok(response) => prompt_success(
             client,
             target,
@@ -3532,15 +3590,23 @@ pub fn run_with_parent_session(
 /// Reserve one dispatch key, or return the stored replay/rejection payload.
 ///
 /// A replay is a pure observation: it resolves no evidence and submits nothing.
+/// Outcome of reserving one dispatch idempotency key.
+enum DispatchReservation {
+    /// This call owns the key and must persist its outcome.
+    Reserved(Option<String>),
+    /// The key is already known: a completed outcome, a checkpoint, or an error.
+    Known(Value),
+}
+
 fn reserve_dispatch(
     registry: &PromptRegistry,
     key: &str,
     fingerpr: &str,
     task_id: &str,
     wait: Option<&Value>,
-) -> Result<Option<String>, Value> {
+) -> DispatchReservation {
     match registry.begin(key, fingerpr) {
-        Ok(BeginPrompt::Reserved(op_id)) => Ok(op_id),
+        Ok(BeginPrompt::Reserved(op_id)) => DispatchReservation::Reserved(op_id),
         Ok(BeginPrompt::Replay(mut result)) => {
             insert_dispatch_id(&mut result, task_id);
             insert_task_id(&mut result, task_id);
@@ -3548,12 +3614,12 @@ fn reserve_dispatch(
             if let Some(wait) = wait {
                 apply_task_wait(registry, &mut result, task_id, wait);
             }
-            Err(result)
+            DispatchReservation::Known(result)
         }
         Err(mut error) => {
             insert_dispatch_id(&mut error, task_id);
             insert_task_id(&mut error, task_id);
-            Err(error)
+            DispatchReservation::Known(error)
         }
     }
 }
@@ -3647,13 +3713,14 @@ impl SpawnStepError {
     }
 }
 
-/// Roll-forward facts for a spawn that may have failed part-way.
+/// Roll-forward facts for a spawn that may have failed or paused part-way.
 #[derive(Default)]
 struct SpawnProgress {
     pane_id: Option<String>,
     tab_id: Option<String>,
     agent_started: bool,
     steps: Vec<Value>,
+    attempts: u64,
 }
 
 impl SpawnProgress {
@@ -3685,15 +3752,143 @@ impl SpawnProgress {
         if let Some(hint) = &error.hint {
             failure["hint"] = json!(hint);
         }
-        if self.pane_id.is_some() {
-            failure["reclaim"] = json!({
-                "owner": "this_spawn",
-                "pane_id": self.pane_id,
-                "rule": "reclaim only this pane, and only when the agent is terminal or the pane is provably empty",
-            });
-        }
+        self.insert_reclaim(&mut failure);
         failure
     }
+
+    /// A chain that ran out of the caller's budget is not a dead end: the pane
+    /// and any started agent stay persisted under the same idempotency key, and
+    /// replaying that key resumes exactly there instead of spawning again.
+    fn checkpoint(
+        &self,
+        spawn: &SpawnDispatch,
+        phase: &str,
+        code: &str,
+        message: String,
+        hint: &str,
+    ) -> Value {
+        let mut checkpoint = json!({
+            "ok": false,
+            "failed_step": phase,
+            "phase": phase,
+            "resumable": true,
+            "code": code,
+            "message": message,
+            "delivery_state": "not_delivered",
+            "submitted": false,
+            "requires_human": false,
+            "attempts": self.attempts,
+            "spawn": self.facts(spawn),
+            "next": {
+                "action": "replay_same_idempotency_key",
+                "note": "replaying this key with the same spawn re-checks the persisted pane/agent, then prompts it once; it never creates a second pane, tab or agent",
+                "raise": "spawn.startup_timeout_ms if the caller has a larger transport budget",
+            },
+            "hint": hint,
+        });
+        self.insert_reclaim(&mut checkpoint);
+        checkpoint
+    }
+
+    fn insert_reclaim(&self, value: &mut Value) {
+        if self.pane_id.is_some()
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert(
+                "reclaim".to_owned(),
+                json!({
+                    "owner": "this_spawn",
+                    "pane_id": self.pane_id,
+                    "rule": "reclaim only this pane, and only when the agent is terminal or the pane is provably empty",
+                }),
+            );
+        }
+    }
+}
+
+/// A resumable checkpoint read back from the durable idempotency store.
+struct SpawnResume {
+    pane_id: String,
+    tab_id: Option<String>,
+    agent_started: bool,
+    phase: String,
+    steps: Vec<Value>,
+    attempts: u64,
+}
+
+impl SpawnResume {
+    fn progress(&self) -> SpawnProgress {
+        SpawnProgress {
+            pane_id: Some(self.pane_id.clone()),
+            tab_id: self.tab_id.clone(),
+            agent_started: self.agent_started,
+            steps: self.steps.clone(),
+            attempts: self.attempts,
+        }
+    }
+}
+
+/// Read one resumable spawn checkpoint out of a stored replay payload.
+///
+/// Only `agent_start`/`agent_ready` pauses resume: any other stored outcome is
+/// a finished dispatch (or an uncertain prompt) and stays a pure replay.
+fn spawn_checkpoint(result: &Value) -> Option<SpawnResume> {
+    if result.get("resumable").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let phase = result
+        .get("phase")
+        .and_then(Value::as_str)
+        .or_else(|| result.get("failed_step").and_then(Value::as_str))?;
+    if phase != "agent_start" && phase != "agent_ready" {
+        return None;
+    }
+    let spawn = result.get("spawn")?;
+    Some(SpawnResume {
+        pane_id: spawn.get("pane_id").and_then(Value::as_str)?.to_owned(),
+        tab_id: spawn
+            .get("tab_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        agent_started: spawn
+            .get("agent_started")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        phase: phase.to_owned(),
+        steps: spawn
+            .get("steps")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        attempts: result.get("attempts").and_then(Value::as_u64).unwrap_or(0),
+    })
+}
+
+/// A second concurrent replay of the same checkpoint must not prompt twice.
+fn spawn_resume_in_progress(checkpoint: &SpawnResume) -> Value {
+    json!({
+        "ok": false,
+        "failed_step": checkpoint.phase,
+        "phase": checkpoint.phase,
+        "resumable": true,
+        "code": "spawn_resume_in_progress",
+        "message": format!("another replay of this idempotency key is already resuming the spawn in pane {}", checkpoint.pane_id),
+        "delivery_state": "not_delivered",
+        "submitted": false,
+        "requires_human": false,
+        "hint": "wait for that replay to settle, then re-read the dispatch outcome instead of prompting again",
+    })
+}
+
+/// Prompt headroom for one chain: a quarter of the chain, never the full 5s
+/// reserve, so a small caller budget still leaves room for the pane and start.
+fn spawn_prompt_reserve_ms(chain_ms: u64) -> u64 {
+    SPAWN_PROMPT_RESERVE_MS.min(chain_ms / 4)
+}
+
+/// What a chain step may spend: the remaining chain minus the prompt reserve.
+fn spawn_step_budget_ms(chain_ms: u64, remaining_ms: u64) -> u64 {
+    remaining_ms.saturating_sub(spawn_prompt_reserve_ms(chain_ms))
 }
 
 /// A spawn whose pane, agent and readiness evidence all succeeded.
@@ -3706,6 +3901,11 @@ struct SpawnOutcome {
     cwd: Option<PathBuf>,
     steps: Vec<Value>,
     before: Option<AgentState>,
+    /// Prompt submission budget: what is left of this attempt's chain.
+    prompt_timeout: Duration,
+    /// True when this attempt continued a persisted checkpoint.
+    resumed: bool,
+    attempts: u64,
 }
 
 impl SpawnOutcome {
@@ -3727,6 +3927,8 @@ impl SpawnOutcome {
             "workspace_id": self.workspace_id,
             "cwd": self.cwd.as_ref().map(|cwd| cwd.to_string_lossy().to_string()),
             "created": true,
+            "resumed": self.resumed,
+            "attempts": self.attempts,
             "steps": steps,
         })
     }
@@ -3809,12 +4011,12 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
         ));
     }
     let startup_timeout_ms = match object.get("startup_timeout_ms") {
-        None | Some(Value::Null) => SPAWN_DEFAULT_STARTUP_MS,
+        None | Some(Value::Null) => SPAWN_CHAIN_DEFAULT_MS,
         Some(value) => match value.as_u64() {
-            Some(value) if (1..=SPAWN_MAX_STARTUP_MS).contains(&value) => value,
+            Some(value) if (1..=SPAWN_CHAIN_MAX_MS).contains(&value) => value,
             _ => {
                 return Err(spawn_invalid(
-                    "spawn.startup_timeout_ms must be an integer in 1..=120000",
+                    "spawn.startup_timeout_ms must be an integer in 1..=100000",
                 ));
             }
         },
@@ -4076,6 +4278,7 @@ fn spawn_create_pane(
     client: &HerdrClient,
     registry: &PromptRegistry,
     spawn: &SpawnDispatch,
+    timeout: Duration,
 ) -> Result<SpawnPane, SpawnStepError> {
     let cwd = spawn
         .cwd
@@ -4090,7 +4293,7 @@ fn spawn_create_pane(
             params.insert("cwd".to_owned(), json!(cwd));
         }
         let result = client
-            .call_with_timeout("tab.create", Value::Object(params), SPAWN_PANE_TIMEOUT)
+            .call_with_timeout("tab.create", Value::Object(params), timeout)
             .map_err(|error| {
                 SpawnStepError::native(
                     error,
@@ -4148,7 +4351,7 @@ fn spawn_create_pane(
         }
     };
     let result = client
-        .call_with_timeout(crate::pane_width::SPLIT_METHOD, params, SPAWN_PANE_TIMEOUT)
+        .call_with_timeout(crate::pane_width::SPLIT_METHOD, params, timeout)
         .map_err(|error| {
             SpawnStepError::native(
                 error,
@@ -4197,154 +4400,273 @@ fn spawn_agent_readiness(value: &Value) -> Option<SpawnAgentReadiness> {
     Some(SpawnAgentReadiness { state, ready })
 }
 
+/// One bounded readiness probe. Returns the agent state only when it is ready.
+fn spawn_probe_ready(client: &HerdrClient, pane_id: &str, timeout: Duration) -> Option<AgentState> {
+    let value = client
+        .call_with_timeout("agent.get", json!({"target": pane_id}), timeout)
+        .ok()?;
+    let readiness = spawn_agent_readiness(&value)?;
+    readiness.ready.then_some(readiness.state)
+}
+
+enum SpawnReadyOutcome {
+    Ready(AgentState),
+    TimedOut(Option<String>),
+}
+
+/// Wait for interactive readiness strictly inside the chain deadline.
+///
+/// A resumed chain always gets one probe even below the poll floor: replaying a
+/// checkpoint must be able to observe that the agent finished starting.
 fn spawn_wait_ready(
     client: &HerdrClient,
     registry: &PromptRegistry,
     pane_id: &str,
     deadline_ms: u64,
-) -> Result<AgentState, SpawnStepError> {
+    mut probe_even_when_exhausted: bool,
+) -> SpawnReadyOutcome {
     let mut last_status = None;
     loop {
-        let now = registry.now_ms();
-        if now >= deadline_ms {
-            return Err(SpawnStepError::runtime(
-                "agent_ready_timeout",
-                format!(
-                    "agent in pane {pane_id} was not interactive-ready within the spawn startup budget (last status: {})",
-                    last_status.as_deref().unwrap_or("unknown")
-                ),
-                Some(
-                    "the pane and agent already exist; observe them with herdr_inspect and re-prompt with a new idempotency_key once the agent is ready",
-                ),
-            ));
+        let remaining = deadline_ms.saturating_sub(registry.now_ms());
+        let probe_now = std::mem::take(&mut probe_even_when_exhausted);
+        if !probe_now {
+            if remaining < SPAWN_READY_MIN_POLL_MS {
+                return SpawnReadyOutcome::TimedOut(last_status);
+            }
+            thread::sleep(SPAWN_READY_POLL.min(Duration::from_millis(remaining.max(1))));
         }
-        let remaining = deadline_ms.saturating_sub(now).max(1);
-        thread::sleep(SPAWN_READY_POLL.min(Duration::from_millis(remaining)));
-        let Ok(value) = client.call_with_timeout(
+        let probe_timeout = SPAWN_READY_PROBE_TIMEOUT.min(Duration::from_millis(remaining.max(1)));
+        let value = match client.call_with_timeout(
             "agent.get",
             json!({"target": pane_id}),
-            SPAWN_READY_PROBE_TIMEOUT,
-        ) else {
-            continue;
+            probe_timeout,
+        ) {
+            Ok(value) => value,
+            Err(_) => continue,
         };
         let Some(readiness) = spawn_agent_readiness(&value) else {
             continue;
         };
         if readiness.ready {
-            return Ok(readiness.state);
+            return SpawnReadyOutcome::Ready(readiness.state);
         }
         last_status = readiness.state.agent_status.clone();
     }
 }
 
-/// Create the pane, start the agent, and prove interactive readiness.
-fn spawn_pane_and_agent(
+/// Create (or resume) the pane, start the agent, and prove interactive
+/// readiness, spending only what is left of one caller-visible chain budget.
+fn spawn_chain(
     client: &HerdrClient,
     registry: &PromptRegistry,
     spawn: &SpawnDispatch,
+    resume: Option<&SpawnResume>,
 ) -> Result<SpawnOutcome, Value> {
-    let started_at = registry.now_ms();
-    let mut progress = SpawnProgress::default();
-
-    let step_at = registry.now_ms();
-    let created = match spawn_create_pane(client, registry, spawn) {
-        Ok(created) => created,
-        Err(error) => return Err(progress.failure(spawn, "pane_create", &error)),
+    let chain_ms = spawn.request.startup_timeout_ms.min(SPAWN_CHAIN_MAX_MS);
+    let chain_started = registry.now_ms();
+    let deadline = chain_started.saturating_add(chain_ms);
+    let resumed = resume.is_some();
+    let mut progress = match resume {
+        Some(checkpoint) => checkpoint.progress(),
+        None => SpawnProgress::default(),
     };
-    progress.pane_id = Some(created.pane_id.clone());
-    progress.tab_id = created.tab_id.clone();
-    progress.steps.push(json!({
-        "step": "pane_create",
-        "method": created.method,
-        "ok": true,
-        "pane_id": created.pane_id,
-        "tab_id": created.tab_id,
-        "duration_ms": registry.now_ms().saturating_sub(step_at),
-    }));
+    if let Some(checkpoint) = resume {
+        progress.attempts = progress.attempts.saturating_add(1);
+        progress.steps.push(json!({
+            "step": "resume",
+            "method": "agent.task.dispatch",
+            "ok": true,
+            "phase": checkpoint.phase,
+            "attempt": progress.attempts,
+            "pane_id": checkpoint.pane_id,
+        }));
+    }
 
-    let step_at = registry.now_ms();
-    let native_timeout = spawn
-        .request
-        .startup_timeout_ms
-        .clamp(SPAWN_NATIVE_START_FLOOR_MS, SPAWN_MAX_STARTUP_MS);
-    let start_params = json!({
-        "name": spawn.agent_name,
-        "kind": spawn.request.kind,
-        "pane_id": created.pane_id,
-        "timeout_ms": native_timeout,
-    });
-    let budget = Duration::from_millis(native_timeout).saturating_add(Duration::from_secs(4));
-    let started = match client.call_with_timeout("agent.start", start_params, budget) {
-        Ok(started) => started,
-        Err(error) => {
-            return Err(progress.failure(
+    // 1. Pane. A resumed chain reuses the persisted pane and never creates one.
+    if progress.pane_id.is_none() {
+        let step_at = registry.now_ms();
+        let remaining = deadline.saturating_sub(step_at);
+        if remaining == 0 {
+            return Err(progress.checkpoint(
                 spawn,
-                "agent_start",
-                &SpawnStepError::native(
-                    error,
-                    Some("the new pane may already contain a started agent; verify it with herdr_inspect and reclaim it instead of spawning again"),
-                ),
+                "pane_create",
+                "spawn_budget_exhausted",
+                "the spawn chain had no budget left for creating the pane".to_owned(),
+                "replay the same idempotency key with a larger spawn.startup_timeout_ms",
             ));
         }
-    };
-    progress.agent_started = true;
-    progress.steps.push(json!({
-        "step": "agent_start",
-        "method": "agent.start",
-        "ok": true,
-        "agent_name": spawn.agent_name,
-        "kind": spawn.request.kind,
-        "duration_ms": registry.now_ms().saturating_sub(step_at),
-    }));
+        let timeout = Duration::from_millis(remaining.min(SPAWN_PANE_TIMEOUT_MS));
+        let created = match spawn_create_pane(client, registry, spawn, timeout) {
+            Ok(created) => created,
+            Err(error) => return Err(progress.failure(spawn, "pane_create", &error)),
+        };
+        progress.pane_id = Some(created.pane_id.clone());
+        progress.tab_id = created.tab_id.clone();
+        progress.steps.push(json!({
+            "step": "pane_create",
+            "method": created.method,
+            "ok": true,
+            "pane_id": created.pane_id,
+            "tab_id": created.tab_id,
+            "duration_ms": registry.now_ms().saturating_sub(step_at),
+        }));
+    }
+    let pane_id = progress
+        .pane_id
+        .clone()
+        .expect("a spawn chain always has a pane before the agent step");
 
-    let step_at = registry.now_ms();
-    let ready_from_start = spawn_agent_readiness(&started);
-    let (before, ready_method) = match ready_from_start {
-        Some(readiness) if readiness.ready => (readiness.state, "agent.start"),
-        _ => {
-            let deadline = started_at.saturating_add(spawn.request.startup_timeout_ms);
-            match spawn_wait_ready(client, registry, &created.pane_id, deadline) {
-                Ok(state) => (state, "agent.get"),
-                Err(error) => return Err(progress.failure(spawn, "agent_ready", &error)),
+    // 2. Agent. Every step gets only the remaining budget: the prompt reserve
+    //    is subtracted here, never added on top of the caller's window.
+    let mut before = None;
+    let mut started_method = "agent.start";
+    if !progress.agent_started {
+        // A resumed chain first checks whether the agent already came up, so a
+        // pane whose start completed while paused is reused, not restarted.
+        if resumed {
+            let probe = Duration::from_millis(
+                deadline
+                    .saturating_sub(registry.now_ms())
+                    .clamp(1, SPAWN_READY_PROBE_TIMEOUT.as_millis() as u64),
+            );
+            if let Some(state) = spawn_probe_ready(client, &pane_id, probe) {
+                started_method = "agent.get";
+                progress.agent_started = true;
+                before = Some(state);
+                progress.steps.push(json!({
+                    "step": "agent_start",
+                    "method": "agent.get",
+                    "ok": true,
+                    "already_started": true,
+                    "pane_id": pane_id,
+                }));
+            }
+        }
+        if !progress.agent_started {
+            let step_at = registry.now_ms();
+            let remaining = deadline.saturating_sub(step_at);
+            let start_budget = spawn_step_budget_ms(chain_ms, remaining);
+            if start_budget < SPAWN_NATIVE_START_FLOOR_MS {
+                return Err(progress.checkpoint(
+                    spawn,
+                    "agent_start",
+                    "spawn_budget_exhausted",
+                    format!(
+                        "only {remaining}ms of the spawn chain remained, which cannot start an agent (native floor {SPAWN_NATIVE_START_FLOOR_MS}ms plus the prompt reserve)"
+                    ),
+                    "replay the same idempotency key with a larger spawn.startup_timeout_ms; the pane is reused and the agent is started at most once",
+                ));
+            }
+            let native_timeout = start_budget.min(SPAWN_CHAIN_MAX_MS);
+            let start_params = json!({
+                "name": spawn.agent_name,
+                "kind": spawn.request.kind,
+                "pane_id": pane_id,
+                "timeout_ms": native_timeout,
+            });
+            match client.call_with_timeout(
+                "agent.start",
+                start_params,
+                Duration::from_millis(start_budget),
+            ) {
+                Ok(started) => {
+                    progress.agent_started = true;
+                    progress.steps.push(json!({
+                        "step": "agent_start",
+                        "method": "agent.start",
+                        "ok": true,
+                        "agent_name": spawn.agent_name,
+                        "kind": spawn.request.kind,
+                        "duration_ms": registry.now_ms().saturating_sub(step_at),
+                    }));
+                    if let Some(readiness) = spawn_agent_readiness(&started)
+                        && readiness.ready
+                    {
+                        before = Some(readiness.state);
+                    }
+                }
+                Err(error) if error.code == "timeout" => {
+                    return Err(progress.checkpoint(
+                        spawn,
+                        "agent_start",
+                        "spawn_budget_exhausted",
+                        format!(
+                            "agent.start did not confirm within {start_budget}ms of the spawn chain"
+                        ),
+                        "the pane may already contain a starting agent; replay the same idempotency key to re-check readiness and prompt once instead of spawning again",
+                    ));
+                }
+                Err(error) => {
+                    return Err(progress.failure(
+                        spawn,
+                        "agent_start",
+                        &SpawnStepError::native(
+                            error,
+                            Some("the new pane may already contain a started agent; verify it with herdr_inspect and reclaim it instead of spawning again"),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 3. Readiness, strictly inside what is left of the caller's budget.
+    let before = match before {
+        Some(state) => state,
+        None => {
+            let step_at = registry.now_ms();
+            match spawn_wait_ready(client, registry, &pane_id, deadline, resumed) {
+                SpawnReadyOutcome::Ready(state) => {
+                    progress.steps.push(json!({
+                        "step": "agent_ready",
+                        "method": "agent.get",
+                        "ok": true,
+                        "agent_status": state.agent_status,
+                        "duration_ms": registry.now_ms().saturating_sub(step_at),
+                    }));
+                    state
+                }
+                SpawnReadyOutcome::TimedOut(last_status) => {
+                    return Err(progress.checkpoint(
+                        spawn,
+                        "agent_ready",
+                        "agent_ready_timeout",
+                        format!(
+                            "agent in pane {pane_id} was not interactive-ready within the {}ms spawn chain (last status: {})",
+                            chain_ms,
+                            last_status.as_deref().unwrap_or("unknown")
+                        ),
+                        "replay the same idempotency key to re-check readiness and prompt once; the persisted pane and agent are reused",
+                    ));
+                }
             }
         }
     };
-    progress.steps.push(json!({
-        "step": "agent_ready",
-        "method": ready_method,
-        "ok": true,
-        "agent_status": before.agent_status,
-        "duration_ms": registry.now_ms().saturating_sub(step_at),
-    }));
+    if started_method == "agent.start" && before.agent_status.as_deref() == Some("idle") {
+        // The start response itself proved readiness; record that evidence.
+        progress.steps.push(json!({
+            "step": "agent_ready",
+            "method": "agent.start",
+            "ok": true,
+            "agent_status": before.agent_status,
+        }));
+    }
 
+    let remaining = deadline.saturating_sub(registry.now_ms());
     Ok(SpawnOutcome {
-        pane_id: created.pane_id,
-        tab_id: created.tab_id,
+        pane_id,
+        tab_id: progress.tab_id.clone(),
         agent_name: spawn.agent_name.clone(),
         kind: spawn.request.kind.clone(),
         workspace_id: spawn.workspace_id.clone(),
         cwd: spawn.cwd.clone(),
         steps: progress.steps,
         before: Some(before),
+        // The prompt must land inside the same chain the caller waits for.
+        prompt_timeout: Duration::from_millis(remaining.max(1)),
+        resumed,
+        attempts: progress.attempts,
     })
-}
-
-/// A rejected dispatch after the pane exists keeps the created facts and the
-/// idempotency record, so a replay reports them instead of spawning again.
-fn spawn_prompt_failure(outcome: &SpawnOutcome, rejection: &Value) -> Value {
-    let mut failure = rejection.clone();
-    let facts = outcome.dispatch_facts(&Value::Null);
-    if let Some(object) = failure.as_object_mut() {
-        object.insert("failed_step".to_owned(), json!("prompt"));
-        if !object.contains_key("delivery_state") {
-            object.insert("delivery_state".to_owned(), json!("not_delivered"));
-        }
-        if !object.contains_key("submitted") {
-            object.insert("submitted".to_owned(), json!(false));
-        }
-        object.insert("spawn".to_owned(), facts);
-    }
-    failure
 }
 
 /// Persist the spawn outcome for this key and annotate the identities, so the
@@ -5458,6 +5780,60 @@ mod tests {
         })
     }
 
+    /// Fake Herdr socket that answers any number of requests until stopped, so
+    /// a bounded readiness poll loop does not need one scripted reply per poll.
+    fn repeating_spawn_server(
+        listener: UnixListener,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        responses: Vec<(&'static str, Value)>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !stop.load(Ordering::SeqCst) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                requests.lock().unwrap().push(request.clone());
+                let method = request["method"].as_str().unwrap_or_default().to_owned();
+                let response = responses
+                    .iter()
+                    .find(|(name, _)| *name == method)
+                    .map(|(_, response)| response.clone())
+                    .unwrap_or_else(
+                        || json!({"error": {"code": "unscripted_method", "message": method}}),
+                    );
+                let envelope = if let Some(error) = response.get("error") {
+                    json!({"id": request["id"], "error": error})
+                } else {
+                    json!({"id": request["id"], "result": response})
+                };
+                writeln!(stream, "{envelope}").unwrap();
+            }
+        })
+    }
+
+    fn spawn_requested_methods(requests: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request["method"].as_str().map(str::to_owned))
+            .collect()
+    }
+
     fn spawn_tab_created() -> Value {
         json!({"result": {
             "type": "tab_created",
@@ -5721,46 +6097,273 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// user planner | Given the started agent never becomes interactive-ready |
-    /// When the spawn startup budget elapses | Then it fails at agent_ready and
-    /// keeps the pane instead of prompting a not-ready agent.
+    /// user planner | Given a chain budget too small to start an agent | When
+    /// the spawn returns | Then it persists a resumable checkpoint (no
+    /// in-flight key, no agent.start) and the same key replays into that pane.
     #[test]
-    fn spawn_dispatch_readiness_timeout_fails_agent_ready() {
-        let root = spawn_project_root("notready");
+    fn spawn_dispatch_budget_pause_replays_into_the_same_pane() {
+        let root = spawn_project_root("budgetpause");
+        let socket = temp_socket();
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![spawn_tab_created()],
+            first_requests.clone(),
+        );
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store.clone(), &root, 80);
+        let client = HerdrClient::new(&socket);
+        let mut args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1", "startup_timeout_ms": 1},
+            "text": "work",
+            "idempotency_key": "spawn-budget-pause",
+        });
+        let paused = run(&client, &registry, &args);
+        server.join().unwrap();
+        assert_eq!(paused["ok"], false, "{paused}");
+        assert_eq!(paused["failed_step"], "agent_start", "{paused}");
+        assert_eq!(paused["phase"], "agent_start", "{paused}");
+        assert_eq!(paused["resumable"], true, "{paused}");
+        assert_eq!(paused["code"], "spawn_budget_exhausted", "{paused}");
+        assert_eq!(paused["delivery_state"], "not_delivered");
+        assert_eq!(paused["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(paused["spawn"]["agent_started"], false);
+        assert_eq!(paused["reclaim"]["pane_id"], "w1:p9");
+        assert_eq!(
+            spawn_requested_methods(&first_requests),
+            vec!["tab.create"],
+            "a budget that cannot start an agent must not call agent.start"
+        );
+
+        // Replaying the SAME key with a larger chain continues in that pane.
+        args["spawn"]["startup_timeout_ms"] = json!(5_000);
+        fs::remove_file(&socket).unwrap();
+        let resume_requests = Arc::new(Mutex::new(Vec::new()));
+        let resume_server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                json!({"error": {"code": "agent_not_found", "message": "no agent yet"}}),
+                spawn_agent_started(true),
+                spawn_prompt_submitted(),
+            ],
+            resume_requests.clone(),
+        );
+        let resumed = run(&client, &registry, &args);
+        resume_server.join().unwrap();
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert_eq!(resumed["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(resumed["spawn"]["resumed"], true, "{resumed}");
+        assert_eq!(
+            spawn_requested_methods(&resume_requests),
+            vec!["agent.get", "agent.start", "agent.prompt"],
+            "a resume reuses the persisted pane and never creates another"
+        );
+        let resume_step = resumed["spawn"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["step"] == "resume")
+            .unwrap_or_else(|| panic!("resume step missing: {resumed}"));
+        assert_eq!(resume_step["phase"], "agent_start");
+        let tasks = registry.list_tasks(10).unwrap();
+        assert_eq!(tasks.len(), 1, "one spawn dispatch owns one durable task");
+        assert_eq!(tasks[0].target, "w1:p9");
+        // A later replay is now a pure replay: nothing more is submitted.
+        let replay = run(&client, &registry, &args);
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(spawn_requested_methods(&resume_requests).len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a chain that runs out of the caller's budget while
+    /// the agent is still starting | When the spawn returns | Then it reports a
+    /// resumable agent_ready checkpoint and the same key later prompts once.
+    #[test]
+    fn spawn_dispatch_readiness_pause_resumes_and_prompts_once() {
+        let root = spawn_project_root("readypause");
+        let socket = temp_socket();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("tab.create", spawn_tab_created()["result"].clone()),
+                ("agent.start", spawn_agent_started(false)["result"].clone()),
+                (
+                    "agent.get",
+                    json!({"agent": {
+                        "pane_id": "w1:p9", "agent_status": "working",
+                        "interactive_ready": false, "state_change_seq": 1,
+                    }}),
+                ),
+            ],
+            first_requests.clone(),
+        );
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store.clone(), &root, 80);
+        let client = HerdrClient::new(&socket);
+        // 4.2s: enough to create the pane and start the agent, not enough to
+        // finish readiness, so the chain must pause instead of holding the key.
+        let args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1", "startup_timeout_ms": 4_200},
+            "text": "work",
+            "idempotency_key": "spawn-ready-pause",
+        });
+        let paused = run(&client, &registry, &args);
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(paused["ok"], false, "{paused}");
+        assert_eq!(paused["failed_step"], "agent_ready", "{paused}");
+        assert_eq!(paused["resumable"], true, "{paused}");
+        assert_eq!(paused["code"], "agent_ready_timeout", "{paused}");
+        assert_eq!(paused["delivery_state"], "not_delivered");
+        assert_eq!(paused["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(paused["spawn"]["agent_started"], true);
+        assert_eq!(paused["reclaim"]["pane_id"], "w1:p9");
+        let first_methods = spawn_requested_methods(&first_requests);
+        assert_eq!(first_methods[0], "tab.create");
+        assert_eq!(first_methods[1], "agent.start");
+        assert!(
+            first_methods
+                .iter()
+                .filter(|method| *method == "agent.get")
+                .count()
+                >= 1,
+            "the readiness loop must have polled: {first_methods:?}"
+        );
+        assert!(!first_methods.iter().any(|method| method == "agent.prompt"));
+
+        // The replay re-checks readiness and prompts the SAME pane exactly once.
+        fs::remove_file(&socket).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resume_requests = Arc::new(Mutex::new(Vec::new()));
+        let resume_server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                (
+                    "agent.get",
+                    json!({"agent": {
+                        "pane_id": "w1:p9", "agent_status": "idle",
+                        "interactive_ready": true, "state_change_seq": 2,
+                    }}),
+                ),
+                ("agent.prompt", spawn_prompt_submitted()["result"].clone()),
+            ],
+            resume_requests.clone(),
+        );
+        let resumed = run(&client, &registry, &args);
+        stop.store(true, Ordering::SeqCst);
+        resume_server.join().unwrap();
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert_eq!(resumed["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(resumed["spawn"]["resumed"], true, "{resumed}");
+        assert_eq!(
+            spawn_requested_methods(&resume_requests),
+            vec!["agent.get", "agent.prompt"],
+            "a resume must not create a pane or restart the agent"
+        );
+        let tasks = registry.list_tasks(10).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].target, "w1:p9");
+        let replay = run(&client, &registry, &args);
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(spawn_requested_methods(&resume_requests).len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given the spawn chain budget plan | When the steps divide
+    /// the caller's window | Then every step stays inside it, the default fits
+    /// the smallest WebChat transport, and the ceiling stays under the CLI cap.
+    #[test]
+    fn spawn_chain_budget_fits_the_caller_transport() {
+        // WebChat herdr_call without timeout_ms is cut by Edge at 30s.
+        let default_fits_webchat = SPAWN_CHAIN_DEFAULT_MS < 30_000;
+        assert!(default_fits_webchat);
+        // The local CLI waits chain + 10s slack and is capped at 120s.
+        let ceiling_fits_cli_cap = SPAWN_CHAIN_MAX_MS + 10_000 <= 120_000;
+        assert!(ceiling_fits_cli_cap);
+        assert_eq!(spawn_prompt_reserve_ms(SPAWN_CHAIN_DEFAULT_MS), 5_000);
+        assert_eq!(
+            spawn_step_budget_ms(SPAWN_CHAIN_DEFAULT_MS, SPAWN_CHAIN_DEFAULT_MS),
+            SPAWN_CHAIN_DEFAULT_MS - 5_000
+        );
+        // No step may ever exceed what the caller still waits for.
+        for chain in [1_u64, 100, 4_001, 25_000, SPAWN_CHAIN_MAX_MS] {
+            for remaining in [1_u64, 250, 4_001, chain] {
+                let step = spawn_step_budget_ms(chain, remaining);
+                assert!(step <= remaining, "chain {chain} remaining {remaining}");
+                assert!(
+                    spawn_prompt_reserve_ms(chain) <= chain / 4 + 1,
+                    "the prompt reserve stays a quarter of the chain"
+                );
+            }
+        }
+        // A tiny chain cannot host a native agent.start: the chain reports a
+        // resumable checkpoint instead of reserving work the caller drops.
+        assert!(
+            spawn_step_budget_ms(1, 1) < SPAWN_NATIVE_START_FLOOR_MS,
+            "a 1ms chain must pause before agent.start"
+        );
+    }
+
+    /// user worker | Given a two-level delegation chain | When a spawn dispatch
+    /// would add a third level | Then the ledger guard refuses it before any
+    /// pane exists, with no phantom prompt step and nothing to reclaim.
+    #[test]
+    fn spawn_dispatch_delegation_refusal_happens_before_any_pane() {
+        let root = spawn_project_root("delegation");
         let socket = temp_socket();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
-            vec![spawn_tab_created(), spawn_agent_started(false)],
+            vec![json!({"agent": {"pane_id": "w1:p2", "agent_status": "working"}})],
             requests.clone(),
         );
         let registry = spawn_registry(&root, 80);
+        register_running_task(
+            &registry,
+            "supervisor-task",
+            "supervisor",
+            "w1:p1",
+            Some("planner"),
+            None,
+            0,
+        );
+        register_running_task(
+            &registry,
+            "worker-task",
+            "worker",
+            "w1:p2",
+            Some("supervisor"),
+            None,
+            0,
+        );
         let result = run(
             &HerdrClient::new(&socket),
             &registry,
             &json!({
-                "spawn": {"kind": "pi", "workspace_id": "w1", "startup_timeout_ms": 1},
+                "spawn": {"kind": "pi", "workspace_id": "w1"},
                 "text": "work",
-                "idempotency_key": "spawn-notready",
+                "idempotency_key": "spawn-delegation",
+                "parent_target": "worker",
             }),
         );
         server.join().unwrap();
         assert_eq!(result["ok"], false, "{result}");
-        assert_eq!(result["failed_step"], "agent_ready");
-        assert_eq!(result["code"], "agent_ready_timeout");
-        assert_eq!(result["delivery_state"], "not_delivered");
-        assert_eq!(result["spawn"]["pane_id"], "w1:p9");
-        assert_eq!(
-            spawn_step_names(&result["spawn"]),
-            vec!["pane_create", "agent_start"]
+        assert_eq!(result["code"], "delegation_depth_exceeded", "{result}");
+        assert!(
+            result.get("failed_step").is_none(),
+            "a pre-pane refusal is not a spawn step failure: {result}"
         );
-        let methods = requests
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|request| request["method"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(methods, vec!["tab.create", "agent.start"]);
+        assert!(result.get("spawn").is_none(), "{result}");
+        assert_eq!(
+            spawn_requested_methods(&requests),
+            vec!["agent.get"],
+            "only the caller probe runs; no pane, agent or prompt is created"
+        );
+        assert_eq!(registry.list_tasks(10).unwrap().len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6285,6 +6888,7 @@ mod tests {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -6886,6 +7490,7 @@ mod tests {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -8187,6 +8792,7 @@ mod tests {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -9297,6 +9903,7 @@ mod tests {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -9470,6 +10077,7 @@ mod tests {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -9976,6 +10584,7 @@ mod tests {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),

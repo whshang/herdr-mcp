@@ -1073,9 +1073,9 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                             value
                                 .parse::<u64>()
                                 .ok()
-                                .filter(|value| (1..=120_000).contains(value))
+                                .filter(|value| (1..=100_000).contains(value))
                                 .ok_or_else(|| {
-                                    "--spawn-startup-timeout-ms must be an integer in 1..=120000"
+                                    "--spawn-startup-timeout-ms must be an integer in 1..=100000"
                                         .to_owned()
                                 })?,
                         );

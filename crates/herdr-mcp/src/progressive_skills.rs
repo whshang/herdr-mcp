@@ -4637,7 +4637,21 @@ mod tests {
         let spawn = &properties["spawn"];
         assert_eq!(spawn["type"], "object");
         assert_eq!(spawn["required"], json!(["kind"]));
-        assert_eq!(spawn["properties"]["startup_timeout_ms"]["maximum"], 120000);
+        assert_eq!(spawn["properties"]["startup_timeout_ms"]["maximum"], 100000);
+        assert!(
+            spawn["description"]
+                .as_str()
+                .unwrap()
+                .contains("resumable checkpoint"),
+            "the schema must advertise the resumable replay contract"
+        );
+        assert!(
+            spawn["properties"]["startup_timeout_ms"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("WHOLE one-call chain"),
+            "the budget field must name the whole chain, not just startup"
+        );
         assert!(
             properties["target"]["description"]
                 .as_str()

@@ -833,21 +833,37 @@ fn call_private_with_context(
 // the settled reservation instead of a client-side timeout that would force a
 // same-key replay. It stays under LOCAL_MCP_MAX_TIMEOUT_MS (120s) in
 // link/local_mcp.rs. Other private calls keep the 30s default.
+/// Slack above one spawn chain for transport and runtime bookkeeping.
+const AGENT_DISPATCH_SPAWN_SLACK_MS: u64 = 10_000;
+/// The local MCP transport clamps at this cap; never ask for more.
+const AGENT_DISPATCH_SPAWN_MAX_WAIT_MS: u64 = 120_000;
+/// Floor so a tiny requested chain still leaves a usable transport window.
+const AGENT_DISPATCH_SPAWN_MIN_WAIT_MS: u64 = 30_000;
+
+/// The CLI must outlive the WHOLE spawn chain the runtime runs (pane create,
+/// agent.start, readiness and prompt) and never exceed the transport cap.
+fn spawn_dispatch_wait_ms(startup_timeout_ms: Option<u64>) -> u64 {
+    let chain = startup_timeout_ms
+        .unwrap_or(crate::prompt::SPAWN_CHAIN_DEFAULT_MS)
+        .min(crate::prompt::SPAWN_CHAIN_MAX_MS);
+    chain.saturating_add(AGENT_DISPATCH_SPAWN_SLACK_MS).clamp(
+        AGENT_DISPATCH_SPAWN_MIN_WAIT_MS,
+        AGENT_DISPATCH_SPAWN_MAX_WAIT_MS,
+    )
+}
+
 fn local_private_timeout_ms(method: &str, params: &Value) -> u64 {
     // Keep the create budget as this block's value: the cross-language budget
     // test parses it straight from this source text.
     if method == "herdr_mcp.browser_session.create" {
         115_000
-    } else if method == AGENT_TASK_DISPATCH_METHOD
-        && let Some(startup) = params
-            .get("spawn")
-            .and_then(|spawn| spawn.get("startup_timeout_ms"))
-            .and_then(Value::as_u64)
-    {
-        // A spawn dispatch waits for pane creation, agent.start readiness, and
-        // the prompt in one call, so the CLI budget must cover the caller's
-        // startup window instead of the default 30s mutation budget.
-        40_000_u64.saturating_add(startup.min(120_000))
+    } else if method == AGENT_TASK_DISPATCH_METHOD && params.get("spawn").is_some() {
+        spawn_dispatch_wait_ms(
+            params
+                .get("spawn")
+                .and_then(|spawn| spawn.get("startup_timeout_ms"))
+                .and_then(Value::as_u64),
+        )
     } else {
         30_000
     }
@@ -1008,16 +1024,34 @@ mod tests {
     }
 
     /// user operator | Given a spawn dispatch | When the local CLI calls the
-    /// runtime | Then the request budget covers the spawn startup window
-    /// instead of the default mutation budget.
+    /// runtime | Then the request budget covers the whole spawn chain and stays
+    /// inside the local transport cap.
     #[test]
-    fn spawn_dispatch_local_call_budget_covers_the_startup_window() {
+    fn spawn_dispatch_local_call_budget_covers_the_whole_chain() {
+        let default_wait = spawn_dispatch_wait_ms(None);
+        assert_eq!(default_wait, 35_000);
+        assert!(
+            default_wait >= crate::prompt::SPAWN_CHAIN_DEFAULT_MS,
+            "the CLI must outlive the runtime chain"
+        );
+        let requested = crate::prompt::SPAWN_CHAIN_MAX_MS;
+        let max_wait = spawn_dispatch_wait_ms(Some(requested));
+        assert_eq!(max_wait, 110_000);
+        assert!(
+            max_wait <= AGENT_DISPATCH_SPAWN_MAX_WAIT_MS,
+            "never ask for more than the transport cap"
+        );
+        assert!(
+            max_wait >= requested,
+            "the CLI must cover the chain it asked for"
+        );
+        assert_eq!(spawn_dispatch_wait_ms(Some(1)), 30_000);
         assert_eq!(
             local_private_timeout_ms(
                 AGENT_TASK_DISPATCH_METHOD,
-                &json!({"spawn": {"kind": "pi", "startup_timeout_ms": 120_000}})
+                &json!({"spawn": {"kind": "pi"}})
             ),
-            160_000
+            35_000
         );
         assert_eq!(
             local_private_timeout_ms(
