@@ -9,7 +9,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-const UPDATE_STORE_SCHEMA_VERSION: i64 = 2;
+const UPDATE_STORE_SCHEMA_VERSION: i64 = 3;
 const META_SCHEMA_VERSION: &str = "schema_version";
 
 const UPDATE_STORE_MIGRATION_V1: &str = r#"
@@ -41,6 +41,7 @@ pub struct UpdateJobRecord {
     pub asset_name: String,
     pub sha256: String,
     pub binary_path: String,
+    pub state_schema_source: i64,
     pub state_schema_target: i64,
     pub state: String,
     pub detail: Option<String>,
@@ -82,8 +83,8 @@ impl UpdateStore {
             .execute(
                 "INSERT INTO update_jobs (
                     job_id, version, target, asset_name, sha256, binary_path,
-                    state_schema_target, state, detail, worker_pid, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    state_schema_source, state_schema_target, state, detail, worker_pid, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     record.job_id,
                     record.version,
@@ -91,6 +92,7 @@ impl UpdateStore {
                     record.asset_name,
                     record.sha256,
                     record.binary_path,
+                    record.state_schema_source,
                     record.state_schema_target,
                     record.state,
                     bounded_detail(record.detail.as_deref()),
@@ -163,7 +165,7 @@ impl UpdateStore {
         self.conn
             .query_row(
                 "SELECT job_id, version, target, asset_name, sha256, binary_path,
-                        state_schema_target, state, detail, worker_pid, created_at, updated_at
+                        state_schema_source, state_schema_target, state, detail, worker_pid, created_at, updated_at
                  FROM update_jobs WHERE job_id = ?1",
                 [job_id],
                 decode_update_job,
@@ -176,7 +178,7 @@ impl UpdateStore {
         self.conn
             .query_row(
                 "SELECT job_id, version, target, asset_name, sha256, binary_path,
-                        state_schema_target, state, detail, worker_pid, created_at, updated_at
+                        state_schema_source, state_schema_target, state, detail, worker_pid, created_at, updated_at
                  FROM update_jobs ORDER BY created_at DESC LIMIT 1",
                 [],
                 decode_update_job,
@@ -190,7 +192,7 @@ impl UpdateStore {
         self.conn
             .query_row(
                 "SELECT job_id, version, target, asset_name, sha256, binary_path,
-                        state_schema_target, state, detail, worker_pid, created_at, updated_at
+                        state_schema_source, state_schema_target, state, detail, worker_pid, created_at, updated_at
                  FROM update_jobs
                  WHERE state IN ('queued', 'installing')
                  ORDER BY created_at DESC LIMIT 1",
@@ -245,6 +247,24 @@ fn migrate(conn: &mut Connection) -> Result<(), String> {
         .map_err(|error| format!("cannot record update state schema version 2: {error}"))?;
         tx.commit()
             .map_err(|error| format!("cannot commit update state migration v2: {error}"))?;
+    }
+    let current = read_schema_version(conn)?;
+    if current < 3 {
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("cannot begin update state migration v3: {error}"))?;
+        tx.execute(
+            "ALTER TABLE update_jobs ADD COLUMN state_schema_source INTEGER NOT NULL DEFAULT 15",
+            [],
+        )
+        .map_err(|error| format!("update state migration v3 failed: {error}"))?;
+        tx.execute(
+            "UPDATE meta SET value = '3' WHERE key = ?1",
+            [META_SCHEMA_VERSION],
+        )
+        .map_err(|error| format!("cannot record update state schema version 3: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit update state migration v3: {error}"))?;
     }
     Ok(())
 }
@@ -317,7 +337,7 @@ fn ensure_real_dir(path: &Path) -> Result<(), String> {
 
 fn decode_update_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpdateJobRecord> {
     let worker_pid = row
-        .get::<_, Option<i64>>(9)?
+        .get::<_, Option<i64>>(10)?
         .and_then(|value| u32::try_from(value).ok());
     Ok(UpdateJobRecord {
         job_id: row.get(0)?,
@@ -326,12 +346,13 @@ fn decode_update_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpdateJobRecor
         asset_name: row.get(3)?,
         sha256: row.get(4)?,
         binary_path: row.get(5)?,
-        state_schema_target: row.get(6)?,
-        state: row.get(7)?,
-        detail: row.get(8)?,
+        state_schema_source: row.get(6)?,
+        state_schema_target: row.get(7)?,
+        state: row.get(8)?,
+        detail: row.get(9)?,
         worker_pid,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -378,6 +399,7 @@ mod tests {
             asset_name: "herdr-mcp-9.9.9-aarch64-apple-darwin".to_owned(),
             sha256: "a".repeat(64),
             binary_path: "/tmp/herdr-mcp-candidate".to_owned(),
+            state_schema_source: 15,
             state_schema_target: 15,
             state: state.to_owned(),
             detail: Some("x".repeat(900)),
@@ -392,7 +414,7 @@ mod tests {
         let (root, paths) = fixture();
         {
             let store = UpdateStore::open(&paths).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 2);
+            assert_eq!(store.schema_version().unwrap(), 3);
             assert!(!paths.config_dir.join("state.db").exists());
             store
                 .create_update_job(&job("upd-test-12345678", "queued", 10))
@@ -449,7 +471,7 @@ mod tests {
             store
                 .conn
                 .execute(
-                    "UPDATE meta SET value = '3' WHERE key = ?1",
+                    "UPDATE meta SET value = '4' WHERE key = ?1",
                     [META_SCHEMA_VERSION],
                 )
                 .unwrap();
