@@ -44,6 +44,14 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// next observe/resolve.
 pub const BROWSER_SOURCE_TURN_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 const BROWSER_ARCHIVE_CLAIM_LEASE_MS: i64 = 30_000;
+/// #771: how long one rejected `source_turn.observe` keeps classifying a later
+/// dispatch of the same turn as `source_session_not_registered`. A brand-new
+/// chat registers its `/c/<id>` session after the first send, which the UAT
+/// measured in minutes, so the window must outlive the extension's 4.5s retry
+/// schedule without turning into durable state.
+const BROWSER_UNREGISTERED_SOURCE_TURN_TTL_MS: i64 = 10 * 60 * 1000;
+/// Bounded capacity of the same in-memory record; oldest evidence is evicted.
+const BROWSER_UNREGISTERED_SOURCE_TURN_CAPACITY: usize = 32;
 
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
@@ -684,6 +692,18 @@ pub struct BrowserDispatchResultRecord {
 pub struct StateStore {
     path: Option<PathBuf>,
     conn: Connection,
+    /// #771: turns the extension delivered while their conversation had no
+    /// session row yet (a brand-new chat). Memory only: it is diagnostic
+    /// evidence for one `parent_session.reason`, never binding authority, and
+    /// it resets with the process.
+    unregistered_source_turns: Vec<UnregisteredSourceTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnregisteredSourceTurn {
+    provider: String,
+    user_text_sha256: String,
+    recorded_at: i64,
 }
 
 impl StateStore {
@@ -704,7 +724,11 @@ impl StateStore {
             // Durable residue from an account identity change is cleaned before
             // this process serves any canonical-URL lookup.
             retire_stale_browser_session_locators_in(&conn)?;
-            return Ok(Self { path: None, conn });
+            return Ok(Self {
+                path: None,
+                conn,
+                unregistered_source_turns: Vec::new(),
+            });
         }
 
         ensure_parent_dirs(path)?;
@@ -721,6 +745,7 @@ impl StateStore {
         Ok(Self {
             path: Some(path.to_path_buf()),
             conn,
+            unregistered_source_turns: Vec::new(),
         })
     }
 
@@ -749,6 +774,7 @@ impl StateStore {
         Ok(Self {
             path: Some(path),
             conn,
+            unregistered_source_turns: Vec::new(),
         })
     }
 
@@ -4019,6 +4045,68 @@ impl StateStore {
             1 => Ok(matches.pop().unwrap()),
             _ => Err("browser_current_turn_ambiguous".to_owned()),
         }
+    }
+
+    /// #771: remember that one exact user turn was delivered while no session
+    /// row existed for its conversation, so a later dispatch of the same turn
+    /// can report `source_session_not_registered` instead of the generic
+    /// `source_turn_not_found`.
+    ///
+    /// This is bounded, in-memory diagnostic evidence: it never stamps a task,
+    /// never writes a binding, and expires after
+    /// `BROWSER_UNREGISTERED_SOURCE_TURN_TTL_MS`. Expired or evicted evidence
+    /// simply falls back to the generic reason.
+    pub fn record_unregistered_browser_source_turn(
+        &mut self,
+        provider: &str,
+        user_text_sha256: &str,
+        recorded_at: i64,
+    ) -> Result<(), String> {
+        validate_browser_token(provider, 32, "provider")?;
+        if recorded_at < 0 || !is_browser_digest(user_text_sha256) {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+        self.prune_unregistered_browser_source_turns(recorded_at);
+        self.unregistered_source_turns
+            .retain(|turn| turn.provider != provider || turn.user_text_sha256 != user_text_sha256);
+        self.unregistered_source_turns.push(UnregisteredSourceTurn {
+            provider: provider.to_owned(),
+            user_text_sha256: user_text_sha256.to_owned(),
+            recorded_at,
+        });
+        while self.unregistered_source_turns.len() > BROWSER_UNREGISTERED_SOURCE_TURN_CAPACITY {
+            self.unregistered_source_turns.remove(0);
+        }
+        Ok(())
+    }
+
+    /// #771: whether this exact turn was recently delivered for a conversation
+    /// that had no registered session. Only the dispatch diagnostic reads it.
+    ///
+    /// The key is provider plus canonical turn digest — the rejected observe
+    /// payload carries no endpoint or conversation, and Edge's session id is not
+    /// a `browser_resources` key — so another conversation's rejected turn with
+    /// the same canonical text also matches inside the TTL. That alias can only
+    /// change a `parent_session.reason`; it can never stamp or bind a task.
+    pub fn browser_source_turn_unregistered(
+        &mut self,
+        provider: &str,
+        user_text_sha256: &str,
+        now: i64,
+    ) -> bool {
+        if now < 0 || !is_browser_digest(user_text_sha256) {
+            return false;
+        }
+        self.prune_unregistered_browser_source_turns(now);
+        self.unregistered_source_turns
+            .iter()
+            .any(|turn| turn.provider == provider && turn.user_text_sha256 == user_text_sha256)
+    }
+
+    fn prune_unregistered_browser_source_turns(&mut self, now: i64) {
+        let oldest = now.saturating_sub(BROWSER_UNREGISTERED_SOURCE_TURN_TTL_MS);
+        self.unregistered_source_turns
+            .retain(|turn| turn.recorded_at >= oldest);
     }
 
     /// Return the latest canonical source-turn digest for one already-resolved
@@ -10522,6 +10610,72 @@ mod tests {
             Some(session_ref.as_str())
         );
         drop(reopened);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn unregistered_source_turn_evidence_is_bounded_per_provider_and_digest() {
+        // #771: the record classifies one diagnostic reason and must never
+        // become a second binding or ambiguity source, so it is scoped to one
+        // exact digest, bounded, and expires.
+        let path = temp_db_path();
+        let mut store = StateStore::open(&path).unwrap();
+        let digest = "a".repeat(64);
+        let other_digest = "b".repeat(64);
+        let now = 1_000_000_i64;
+        store
+            .record_unregistered_browser_source_turn("chatgpt", &digest, now)
+            .unwrap();
+        assert!(store.browser_source_turn_unregistered("chatgpt", &digest, now + 1));
+        assert!(!store.browser_source_turn_unregistered("chatgpt", &other_digest, now + 1));
+        assert!(!store.browser_source_turn_unregistered("other", &digest, now + 1));
+        // A repeat refreshes the entry instead of duplicating it.
+        store
+            .record_unregistered_browser_source_turn("chatgpt", &digest, now + 2)
+            .unwrap();
+        assert_eq!(store.unregistered_source_turns.len(), 1);
+        assert!(store.browser_source_turn_unregistered(
+            "chatgpt",
+            &digest,
+            now + 2 + BROWSER_UNREGISTERED_SOURCE_TURN_TTL_MS
+        ));
+        // Past the window the evidence is gone: the generic reason returns.
+        assert!(!store.browser_source_turn_unregistered(
+            "chatgpt",
+            &digest,
+            now + 3 + BROWSER_UNREGISTERED_SOURCE_TURN_TTL_MS
+        ));
+        // Over capacity the oldest entry is evicted, never unbounded.
+        for index in 0..BROWSER_UNREGISTERED_SOURCE_TURN_CAPACITY {
+            let digest = format!("{:064x}", index);
+            store
+                .record_unregistered_browser_source_turn("chatgpt", &digest, now + 10)
+                .unwrap();
+        }
+        assert_eq!(
+            store.unregistered_source_turns.len(),
+            BROWSER_UNREGISTERED_SOURCE_TURN_CAPACITY
+        );
+        // The oldest entry is the one recorded before the cap was reached.
+        assert!(!store.browser_source_turn_unregistered("chatgpt", &digest, now + 11));
+        let oldest = format!("{:064x}", 0);
+        assert!(store.browser_source_turn_unregistered("chatgpt", &oldest, now + 11));
+        let newest = format!("{:064x}", BROWSER_UNREGISTERED_SOURCE_TURN_CAPACITY - 1);
+        assert!(store.browser_source_turn_unregistered("chatgpt", &newest, now + 11));
+        // Malformed evidence is rejected instead of widening the record.
+        assert!(
+            store
+                .record_unregistered_browser_source_turn("chatgpt", "not-a-digest", now)
+                .is_err()
+        );
+        assert!(
+            store
+                .record_unregistered_browser_source_turn("chatgpt", &digest, -1)
+                .is_err()
+        );
+        drop(store);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
