@@ -1083,9 +1083,29 @@ fn extension_browser_source_turn_observe(
         .state_store
         .lock()
         .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
-    let session_ref = store
-        .browser_current_generation_source_session_ref(canonical_url)?
-        .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+    let session_ref = match store.browser_current_generation_source_session_ref(canonical_url)? {
+        Some(session_ref) => session_ref,
+        None => {
+            // #771: no current-generation session resolves this conversation
+            // URL. Only a URL with no session row at all is the brand-new-chat
+            // case whose first turn cannot bind yet; a row that merely fails
+            // the generation fence keeps the generic reason, so it is never
+            // recorded as "not registered".
+            if store
+                .browser_session_ref_for_canonical_url(canonical_url)?
+                .is_none()
+            {
+                // Diagnostic evidence only: recording must never replace the
+                // typed registry rejection the extension retries on.
+                let _ = store.record_unregistered_browser_source_turn(
+                    "chatgpt",
+                    &user_text_sha256,
+                    mcp::browser_epoch_ms(),
+                );
+            }
+            return Err("browser_source_session_not_found".to_owned());
+        }
+    };
     let session = store
         .browser_resource(&session_ref)?
         .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
@@ -8506,6 +8526,326 @@ mod tests {
                 .all(|call| !call.to_string().contains(user_text.trim())),
             "the delivered turn text must never reach the Herdr socket: {recorded:?}"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+    /// `tools/call` with an explicit tool name. `webchat_tool_call` always
+    /// posts `herdr_call`, which never enters the public `herdr_prompt` arm.
+    async fn webchat_named_tool_call(
+        app: axum::Router,
+        headers: &[(&str, String)],
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(AUTHORIZATION, "Bearer test-token")
+            .header(CONTENT_TYPE, "application/json")
+            .header("user-agent", "openai-mcp/1.0.0");
+        for (header, value) in headers {
+            builder = builder.header(*header, value.as_str());
+        }
+        let request = builder
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let envelope: Value = serde_json::from_slice(&body).unwrap();
+        let text = envelope["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn webchat_herdr_prompt_reports_the_binding_it_did_not_perform() {
+        // #770: `herdr_prompt` never binds a parent session. A WebChat caller
+        // must still receive the fact, otherwise the model believes the
+        // dispatch is bound and never switches to the evidence-based
+        // `agent.task.dispatch` path.
+        let root = test_root("herdr-prompt-parent-session-fact");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut script = Vec::new();
+        for index in 0..3 {
+            let seq = 4 + index * 2;
+            script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
+            script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
+        }
+        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let mut state = dispatch_test_state(&root, &socket);
+        state.trusted_extension_ipc = true;
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let (app, profile_seed, endpoint_ref, account_ref) =
+            register_chatgpt_endpoint(app, "promptfact", now).await;
+        let (app, session_ref) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "promptfact",
+            "派发一个任务给 pi",
+            now,
+        )
+        .await;
+        let principal = "connector:conn_PromptFact1";
+        let opaque = "opaque-prompt-fact-1";
+        let edge_headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-authorization",
+                json!({
+                    "principal_ref": principal,
+                    "connector_id": "conn_PromptFact1",
+                    "grant_generation": 1
+                })
+                .to_string(),
+            ),
+            (
+                "x-herdr-edge-browser-caller-session",
+                json!({"provider": "chatgpt", "opaque_session_id": opaque}).to_string(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+            ),
+        ];
+
+        // Unmapped WebChat caller: the prompt still dispatches, and the fact
+        // names the tool that cannot bind plus the call that can.
+        let unbound = webchat_named_tool_call(
+            app.clone(),
+            &edge_headers,
+            "herdr_prompt",
+            json!({
+                "target": "w1:p1",
+                "text": "run the unbound prompt lane",
+                "idempotency_key": "prompt-fact-unbound",
+            }),
+        )
+        .await;
+        assert_eq!(unbound["ok"], true, "{unbound}");
+        assert!(unbound["task"]["parent_session_ref"].is_null());
+        assert_eq!(unbound["parent_session"]["bound"], false);
+        assert_eq!(unbound["parent_session"]["reason"], "tool_does_not_bind");
+        let message = unbound["parent_session"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            message.contains("herdr_mcp.agent.task.dispatch")
+                && message.contains("current_user_message"),
+            "the fact must name the binding call: {message}"
+        );
+
+        // The same caller after a durable mapping exists: the reused mapping is
+        // reported, still without echoing the session ref into the fact.
+        store
+            .lock()
+            .unwrap()
+            .bind_browser_caller_session(principal, "chatgpt", opaque, &session_ref, now)
+            .unwrap();
+        let bound = webchat_named_tool_call(
+            app.clone(),
+            &edge_headers,
+            "herdr_prompt",
+            json!({
+                "target": "w1:p1",
+                "text": "run the bound prompt lane",
+                "idempotency_key": "prompt-fact-bound",
+            }),
+        )
+        .await;
+        assert_eq!(bound["ok"], true, "{bound}");
+        assert_eq!(bound["parent_session"], json!({"bound": true}));
+        assert_eq!(bound["task"]["parent_session_ref"], session_ref);
+
+        // A local caller has no WebChat conversation: unchanged result shape.
+        let local = webchat_named_tool_call(
+            app.clone(),
+            &[],
+            "herdr_prompt",
+            json!({
+                "target": "w1:p1",
+                "text": "run the local prompt lane",
+                "idempotency_key": "prompt-fact-local",
+            }),
+        )
+        .await;
+        assert_eq!(local["ok"], true, "{local}");
+        assert!(local.get("parent_session").is_none());
+        assert!(local["task"]["parent_session_ref"].is_null());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn webchat_dispatch_reports_an_unregistered_source_session() {
+        // #771: the first message of a brand-new chat is delivered while the
+        // conversation's `/c/<id>` session has no row yet, so the extension's
+        // `source_turn.observe` is rejected. The dispatch of that exact turn is
+        // unbound either way, but the reason must say the session is not
+        // registered yet instead of implying the text did not match.
+        let root = test_root("webchat-dispatch-source-session-unregistered");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut script = Vec::new();
+        for index in 0..3 {
+            let seq = 4 + index * 2;
+            script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
+            script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
+        }
+        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let mut state = dispatch_test_state(&root, &socket);
+        state.trusted_extension_ipc = true;
+        let app = candidate_router(state);
+        let (app, _profile_seed, endpoint_ref, account_ref) =
+            register_chatgpt_endpoint(app, "unregistered", now).await;
+        let edge_headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-authorization",
+                json!({
+                    "principal_ref": "connector:conn_Unregistered1",
+                    "connector_id": "conn_Unregistered1",
+                    "grant_generation": 1,
+                })
+                .to_string(),
+            ),
+            (
+                "x-herdr-edge-browser-caller-session",
+                json!({"provider": "chatgpt", "opaque_session_id": "opaque-unregistered-1"})
+                    .to_string(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+            ),
+        ];
+        let first_turn = "新对话的第一条消息";
+        let unregistered_url = "https://chatgpt.com/c/brand-new-771";
+
+        // The extension delivers the first turn before the conversation has a
+        // session row; the registry rejects the observation.
+        let response = app
+            .clone()
+            .oneshot(registry_request(json!({
+                "operation": "source_turn.observe",
+                "canonical_url": unregistered_url,
+                "user_text": first_turn,
+                "observed_at": now,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rejected: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rejected["code"], "browser_source_session_not_found");
+
+        // That exact turn still dispatches, unbound but with the actionable
+        // reason and hint.
+        let miss = webchat_tool_call(
+            app.clone(),
+            &edge_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "dispatch from the first turn",
+                "idempotency_key": "unregistered-dispatch-1",
+                "current_user_message": first_turn,
+            }),
+        )
+        .await;
+        assert_eq!(miss["ok"], true, "{miss}");
+        assert!(miss["task"]["parent_session_ref"].is_null());
+        assert_eq!(miss["parent_session"]["bound"], false);
+        assert_eq!(
+            miss["parent_session"]["reason"],
+            "source_session_not_registered"
+        );
+        assert!(
+            miss["parent_session"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("not registered")),
+            "the fact must say the session is not registered yet: {miss}"
+        );
+        assert_dispatch_diagnostic(&miss["parent_session"]["diagnostic"], first_turn, None);
+
+        // A turn the extension never delivered keeps the generic reason: the
+        // record is proof about one exact turn, not about the caller.
+        let other = webchat_tool_call(
+            app.clone(),
+            &edge_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "dispatch of a different turn",
+                "idempotency_key": "unregistered-dispatch-2",
+                "current_user_message": "另一条从未观察的消息",
+            }),
+        )
+        .await;
+        assert_eq!(other["ok"], true, "{other}");
+        assert!(other["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            other["parent_session"],
+            json!({
+                "bound": false,
+                "reason": "source_turn_not_found",
+                "diagnostic": {
+                    "canonical_prefix": "另一条从未观察的消息",
+                    "canonical_sha256_prefix": &mcp::source_turn_sha256("另一条从未观察的消息")[..12],
+                    "latest_source_turn_sha256_prefix": null,
+                }
+            })
+        );
+
+        // Once the conversation registers its session and the turn, the same
+        // caller binds normally: the diagnostic record never blocks binding.
+        let (app, session_ref) = observe_chatgpt_session_source_turn(
+            app,
+            "extension-profile-seed-unregistered",
+            &endpoint_ref,
+            &account_ref,
+            "unregistered",
+            first_turn,
+            now,
+        )
+        .await;
+        let bound = webchat_tool_call(
+            app.clone(),
+            &edge_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "dispatch after registration",
+                "idempotency_key": "unregistered-dispatch-3",
+                "current_user_message": first_turn,
+            }),
+        )
+        .await;
+        assert_eq!(bound["ok"], true, "{bound}");
+        assert_eq!(bound["parent_session"], json!({"bound": true}));
+        assert_eq!(bound["task"]["parent_session_ref"], session_ref);
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

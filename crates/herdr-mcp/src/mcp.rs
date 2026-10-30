@@ -251,6 +251,14 @@ fn agent_task_parent_session_fact(
         AgentTaskParentSession::Bound(_) => Some(json!({"bound": true})),
         AgentTaskParentSession::Unbound(reason) => {
             let mut fact = json!({"bound": false, "reason": reason});
+            if *reason == "source_session_not_registered" {
+                // The model acts on this fact, so the remedy travels with it
+                // (#771). `message` survives `model_visible_tool_output`;
+                // `hint` and `*_hint` keys are stripped there.
+                fact["message"] = json!(
+                    "The browser session for this turn is not registered yet. Resend from the conversation once it is registered, or retry."
+                );
+            }
             if let Some(diagnostic) = diagnostic {
                 fact["diagnostic"] = diagnostic;
             }
@@ -281,6 +289,7 @@ fn source_turn_unbound_diagnostic(
     if !matches!(
         *reason,
         "source_turn_not_found"
+            | "source_session_not_registered"
             | "source_turn_ambiguous"
             | "source_turn_stale"
             | "caller_session_conflict"
@@ -376,6 +385,30 @@ fn source_turn_unbound_reason(error: &str) -> &'static str {
     }
 }
 
+/// #771: one `not_found` digest miss covers two different causes. When the
+/// runtime already received this exact turn and no session row existed for its
+/// conversation (the first message of a brand-new chat registers its
+/// `/c/<id>` session only after the send), the caller's source session is not
+/// registered yet and the model can act on that. Every other miss — a
+/// registered session whose turn digest differs, a stale generation, or a
+/// conversation whose session row exists but fails a fence — stays the generic
+/// `source_turn_not_found`.
+fn source_turn_unbound_reason_for_caller(
+    store: &mut StateStore,
+    error: &str,
+    provider: &str,
+    user_text_sha256: &str,
+    now: i64,
+) -> &'static str {
+    if error == "browser_current_turn_not_found"
+        && webchat_adapter_binds_parent_session(provider)
+        && store.browser_source_turn_unregistered(provider, user_text_sha256, now)
+    {
+        return "source_session_not_registered";
+    }
+    source_turn_unbound_reason(error)
+}
+
 fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
     let authorization = context.caller_webchat_authorization?;
     let caller_session = context.caller_browser_session?;
@@ -390,6 +423,35 @@ fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
         )
         .ok()
         .flatten()
+}
+
+/// The `parent_session` fact for one public `herdr_prompt` call (#770).
+///
+/// `herdr_prompt` cannot bind: it only reuses an existing caller-session
+/// mapping, and its epoch-5 schema carries no turn evidence. A WebChat caller
+/// must still be told which of the two happened, otherwise the model believes
+/// the dispatch is bound to its conversation and never switches to the
+/// evidence-based `agent.task.dispatch` path. Local/trusted callers have no
+/// WebChat conversation to bind, so they keep the unchanged result shape.
+fn herdr_prompt_parent_session_fact(
+    context: &RuntimeContext<'_>,
+    parent_session_ref: Option<&str>,
+) -> Option<Value> {
+    context.caller_webchat_authorization?;
+    let caller_session = context.caller_browser_session?;
+    if !webchat_adapter_binds_parent_session(&caller_session.provider) {
+        return None;
+    }
+    Some(match parent_session_ref {
+        // The durable mapping was reused; the task already carries the ref, so
+        // the fact never echoes it.
+        Some(_) => json!({"bound": true}),
+        None => json!({
+            "bound": false,
+            "reason": "tool_does_not_bind",
+            "message": "herdr_prompt does not bind a parent session. Call herdr_call with method \"herdr_mcp.agent.task.dispatch\" and pass the verbatim current user turn as current_user_message.",
+        }),
+    })
 }
 
 /// Explicit evidence is authoritative: every miss stops binding without fallback.
@@ -508,12 +570,19 @@ fn agent_task_dispatch_parent_session(
     };
     let source_user_text_sha256 = source_turn_sha256(current_user_message);
     let observed_at = browser_epoch_ms();
-    let (session_ref, expected_generation) = match store
-        .resolve_browser_source_turn(&source_user_text_sha256, observed_at)
-    {
-        Ok(value) => value,
-        Err(error) => return AgentTaskParentSession::Unbound(source_turn_unbound_reason(&error)),
-    };
+    let (session_ref, expected_generation) =
+        match store.resolve_browser_source_turn(&source_user_text_sha256, observed_at) {
+            Ok(value) => value,
+            Err(error) => {
+                return AgentTaskParentSession::Unbound(source_turn_unbound_reason_for_caller(
+                    &mut store,
+                    &error,
+                    &caller_session.provider,
+                    &source_user_text_sha256,
+                    observed_at,
+                ));
+            }
+        };
     let session = match store.browser_resource(&session_ref) {
         Ok(Some(value)) => value,
         Ok(None) => return AgentTaskParentSession::Unbound("source_turn_not_found"),
@@ -1038,12 +1107,22 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         ),
         "herdr_prompt" => {
             let parent_session_ref = prompt_parent_session_ref(context);
-            prompt::run_with_parent_session(
+            let mut result = prompt::run_with_parent_session(
                 context.client,
                 context.prompt,
                 &arguments,
                 parent_session_ref.as_deref(),
-            )
+            );
+            // #770: a WebChat caller must never be left silently unbound. The
+            // fact is added to the unchanged prompt result; it never changes
+            // `ok` and never fails the prompt.
+            if let Some(fact) =
+                herdr_prompt_parent_session_fact(context, parent_session_ref.as_deref())
+                && let Some(object) = result.as_object_mut()
+            {
+                object.insert("parent_session".to_owned(), fact);
+            }
+            result
         }
         "herdr_skill" => context
             .skill
@@ -6623,7 +6702,7 @@ pub(crate) fn source_turn_sha256(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn browser_epoch_ms() -> i64 {
+pub(crate) fn browser_epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
