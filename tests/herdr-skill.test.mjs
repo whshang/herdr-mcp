@@ -160,3 +160,18 @@ test("fetchHerdrSkill appends release-matched native Herdr reference with remote
     else process.env.HERDR_SKILL_NETWORK = prev;
   }
 });
+
+test("user gets conversation-bound WebChat dispatch guidance | Given the served planner policy | When a WebChat caller dispatches | Then it uses herdr_call with current_user_message, knows herdr_prompt never binds, and reports parent_session reason", () => {
+  const globalAgents = readFileSync(new URL("../assets/herdr/AGENTS.md", import.meta.url), "utf8");
+  const dispatchSkill = readFileSync(
+    new URL("../assets/herdr/skills/agent-dispatch/SKILL.md", import.meta.url),
+    "utf8",
+  );
+  for (const doc of [globalAgents, dispatchSkill, plannerSkillSource]) {
+    assert.match(doc, /`herdr_call`[^\n]*`method: "herdr_mcp\.agent\.task\.dispatch"`/);
+    assert.match(doc, /verbatim current user turn|current user turn, verbatim/);
+    assert.match(doc, /`current_user_message`/);
+    assert.match(doc, /`herdr_prompt`[^\n]*never (performs source-turn binding|binds|does)/);
+    assert.match(doc, /reason/);
+  }
+});
