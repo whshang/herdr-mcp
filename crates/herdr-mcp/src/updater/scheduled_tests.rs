@@ -323,6 +323,29 @@ fn auto_refuses_skipped_epoch_missing_declaration_and_predecessor_mismatch_witho
 }
 
 #[test]
+fn auto_refuses_state_schema_migration_and_points_to_explicit_update() {
+    let _guard = crate::test_env::lock();
+    let scenario = Scenario::new(
+        |manifest| {
+            manifest["state_schema"] = json!(SCHEMA_VERSION + 1);
+            manifest["state_schema_migration"] = json!({
+                "from": SCHEMA_VERSION,
+                "to": SCHEMA_VERSION + 1,
+                "reversible": false,
+            });
+        },
+        false,
+    );
+    let error = auto().unwrap_err();
+    assert!(
+        error.contains("scheduled/automatic updates refuse state-schema migrations"),
+        "{error}"
+    );
+    assert!(error.contains("herdr-mcp update apply"), "{error}");
+    assert!(!scenario.root.join("update").exists());
+}
+
+#[test]
 fn auto_cross_epoch_install_preserves_epoch_four_generation_for_single_use_rollback() {
     let _guard = crate::test_env::lock();
     let scenario = Scenario::new(|_| {}, false);

@@ -44,11 +44,28 @@ pub(super) struct ReleaseAsset {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StateSchemaMigration {
+    pub(super) from: i64,
+    pub(super) to: i64,
+    pub(super) reversible: bool,
+}
+
+impl StateSchemaMigration {
+    pub(super) fn warning(&self) -> String {
+        format!(
+            "⚠️ This update migrates local state schema {} → {} and cannot be downgraded; older versions will refuse the migrated database. A state backup is taken before migration; rolling back requires restoring that backup.",
+            self.from, self.to
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ReleasePlan {
     pub(super) version: Version,
     pub(super) tag: String,
     pub(super) identity: ReleaseIdentity,
     pub(super) contract: contract::ContractIdentity,
+    pub(super) state_schema_migration: Option<StateSchemaMigration>,
     pub(super) asset: ReleaseAsset,
 }
 
@@ -196,7 +213,8 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
     let local = contract::identity()?;
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     let local = super::scheduled_tests::local_contract().unwrap_or(local);
-    let target_contract = admit_release_contract(value, &local, SCHEMA_VERSION)?;
+    let (target_contract, state_schema_migration) =
+        admit_release_contract(value, &local, SCHEMA_VERSION)?;
     let version_text = value
         .get("version")
         .and_then(Value::as_str)
@@ -260,6 +278,7 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
         tag,
         identity,
         contract: target_contract,
+        state_schema_migration,
         asset: ReleaseAsset {
             target: target.to_owned(),
             name,
@@ -289,7 +308,7 @@ fn admit_release_contract(
     value: &Value,
     local: &contract::ContractIdentity,
     state_schema: i64,
-) -> Result<contract::ContractIdentity, String> {
+) -> Result<(contract::ContractIdentity, Option<StateSchemaMigration>), String> {
     let target_epoch = value
         .get("contract")
         .and_then(|contract| contract.get("epoch"))
@@ -304,13 +323,9 @@ fn admit_release_contract(
         .get("contract")
         .and_then(parse_contract_identity)
         .ok_or_else(|| refuse("missing or malformed target contract"))?;
+    let state_schema_migration = admit_state_schema_migration(value, state_schema, &refuse)?;
     if target == *local {
-        if value.get("state_schema").and_then(Value::as_i64) != Some(state_schema) {
-            return Err(format!(
-                "release state schema is not rollback-compatible with local schema {state_schema}"
-            ));
-        }
-        return Ok(target);
+        return Ok((target, state_schema_migration));
     }
     if local.epoch.checked_add(1) != Some(target.epoch) {
         return Err(refuse("only an adjacent forward epoch is admissible"));
@@ -334,14 +349,74 @@ fn admit_release_contract(
             "contract_migration.from does not match the local contract",
         ));
     }
-    if migration.get("state_schema_from").and_then(Value::as_i64) != Some(state_schema)
-        || value.get("state_schema").and_then(Value::as_i64) != Some(state_schema)
-    {
+    if migration.get("state_schema_from").and_then(Value::as_i64) != Some(state_schema) {
         return Err(refuse(
             "migration state schema is not rollback-compatible with the local schema",
         ));
     }
-    Ok(target)
+    Ok((target, state_schema_migration))
+}
+
+fn admit_state_schema_migration(
+    value: &Value,
+    local_schema: i64,
+    refuse: &impl Fn(&str) -> String,
+) -> Result<Option<StateSchemaMigration>, String> {
+    let target_schema = value
+        .get("state_schema")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| refuse("missing or malformed state_schema"))?;
+    if target_schema == local_schema {
+        return Ok(None);
+    }
+    if target_schema < local_schema {
+        return Err(refuse(&format!(
+            "release state schema {target_schema} is older than local schema {local_schema}; refusing downgrade"
+        )));
+    }
+    if target_schema > local_schema.saturating_add(1) {
+        return Err(refuse(&format!(
+            "release state schema {target_schema} is more than one step ahead of local schema {local_schema}"
+        )));
+    }
+
+    let declaration = value
+        .get("state_schema_migration")
+        .and_then(Value::as_object)
+        .filter(|object| object.len() == 3)
+        .ok_or_else(|| refuse("missing or malformed state_schema_migration declaration"))?;
+    let from = declaration
+        .get("from")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| refuse("state_schema_migration.from must be an integer"))?;
+    let to = declaration
+        .get("to")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| refuse("state_schema_migration.to must be an integer"))?;
+    let reversible = declaration
+        .get("reversible")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| refuse("state_schema_migration.reversible must be a boolean"))?;
+    if from != local_schema {
+        return Err(refuse(&format!(
+            "state_schema_migration.from {from} does not match local schema {local_schema}"
+        )));
+    }
+    if to != target_schema {
+        return Err(refuse(&format!(
+            "state_schema_migration.to {to} does not match target schema {target_schema}"
+        )));
+    }
+    if reversible {
+        return Err(refuse(
+            "state_schema_migration.reversible must be false for the forward migration",
+        ));
+    }
+    Ok(Some(StateSchemaMigration {
+        from,
+        to,
+        reversible,
+    }))
 }
 
 #[cfg(test)]
@@ -411,7 +486,7 @@ mod tests {
         assert!(
             parse_release_plan(&future_schema, target)
                 .unwrap_err()
-                .contains("rollback-compatible")
+                .contains("state_schema_migration")
         );
         let mut wrong_repo = manifest_for(target, "9.9.9");
         wrong_repo["repository_identity"]["repository"] = json!("attacker/fork");
@@ -452,9 +527,11 @@ mod tests {
             contract::identity().unwrap(),
         ] {
             let valid = adjacent_manifest(&local);
-            let admitted = admit_release_contract(&valid, &local, SCHEMA_VERSION).unwrap();
+            let (admitted, migration) =
+                admit_release_contract(&valid, &local, SCHEMA_VERSION).unwrap();
             assert_eq!(admitted.epoch, local.epoch + 1);
             assert_eq!(admitted.hash, format!("sha256:{}", "c".repeat(64)));
+            assert_eq!(migration, None);
 
             let mut cases = Vec::new();
             let mut missing = valid.clone();
@@ -519,17 +596,144 @@ mod tests {
     }
 
     #[test]
+    fn one_forward_state_schema_migration_is_admitted_on_both_contract_paths() {
+        let local = contract::previous_identity().unwrap();
+        let mut adjacent = adjacent_manifest(&local);
+        adjacent["state_schema"] = json!(15 + 1);
+        adjacent["contract_migration"]["state_schema_from"] = json!(15);
+        adjacent["state_schema_migration"] = json!({
+            "from": 15,
+            "to": 16,
+            "reversible": false,
+        });
+        let (target, migration) = admit_release_contract(&adjacent, &local, 15).unwrap();
+        assert_eq!(target.epoch, local.epoch + 1);
+        assert_eq!(
+            migration,
+            Some(StateSchemaMigration {
+                from: 15,
+                to: 16,
+                reversible: false,
+            })
+        );
+
+        let same = {
+            let mut value = manifest_for(current_target().unwrap(), "9.9.9");
+            value["state_schema"] = json!(16);
+            value["state_schema_migration"] = json!({
+                "from": 15,
+                "to": 16,
+                "reversible": false,
+            });
+            value
+        };
+        let local_same = contract::identity().unwrap();
+        let (target, migration) = admit_release_contract(&same, &local_same, 15).unwrap();
+        assert_eq!(target, local_same);
+        assert_eq!(
+            migration.unwrap().warning(),
+            (StateSchemaMigration {
+                from: 15,
+                to: 16,
+                reversible: false,
+            })
+                .warning()
+        );
+    }
+
+    #[test]
+    fn state_schema_migration_rejects_every_non_exact_declaration() {
+        let local = contract::identity().unwrap();
+        let base = {
+            let mut value = manifest_for(current_target().unwrap(), "9.9.9");
+            value["state_schema"] = json!(SCHEMA_VERSION + 1);
+            value["state_schema_migration"] = json!({
+                "from": SCHEMA_VERSION,
+                "to": SCHEMA_VERSION + 1,
+                "reversible": false,
+            });
+            value
+        };
+        let mut cases = vec![
+            ("downgrade", {
+                let mut value = base.clone();
+                value["state_schema"] = json!(SCHEMA_VERSION - 1);
+                value
+            }),
+            ("jump", {
+                let mut value = base.clone();
+                value["state_schema"] = json!(SCHEMA_VERSION + 2);
+                value
+            }),
+            ("missing", {
+                let mut value = base.clone();
+                value.as_object_mut().unwrap().remove("state_schema_migration");
+                value
+            }),
+            ("extra", {
+                let mut value = base.clone();
+                value["state_schema_migration"]["extra"] = json!(true);
+                value
+            }),
+            ("reversible", {
+                let mut value = base.clone();
+                value["state_schema_migration"]["reversible"] = json!(true);
+                value
+            }),
+            ("from", {
+                let mut value = base.clone();
+                value["state_schema_migration"]["from"] = json!(SCHEMA_VERSION - 1);
+                value
+            }),
+            ("to", {
+                let mut value = base.clone();
+                value["state_schema_migration"]["to"] = json!(SCHEMA_VERSION + 2);
+                value
+            }),
+        ];
+        cases.push(("malformed", {
+            let mut value = base.clone();
+            value["state_schema_migration"] =
+                json!({"from": "15", "to": 16, "reversible": false});
+            value
+        }));
+        for (name, value) in cases {
+            let error = admit_release_contract(&value, &local, SCHEMA_VERSION).unwrap_err();
+            assert!(
+                error.contains("state schema") || error.contains("state_schema_migration"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_plan_surfaces_the_forward_migration_warning() {
+        let target = current_target().unwrap();
+        let mut value = manifest_for(target, "9.9.9");
+        value["state_schema"] = json!(SCHEMA_VERSION + 1);
+        value["state_schema_migration"] = json!({
+            "from": SCHEMA_VERSION,
+            "to": SCHEMA_VERSION + 1,
+            "reversible": false,
+        });
+        let plan = parse_release_plan(&value, target).unwrap();
+        let migration = plan.state_schema_migration.unwrap();
+        assert!(migration.warning().contains("cannot be downgraded"));
+        assert!(migration.warning().contains("state backup is taken before migration"));
+    }
+
+    #[test]
     fn same_contract_remains_admissible_without_a_migration_declaration() {
         let local = contract::identity().unwrap();
         let mut value = manifest_for(current_target().unwrap(), "9.9.9");
         assert_eq!(
             admit_release_contract(&value, &local, SCHEMA_VERSION).unwrap(),
-            local
+            (local.clone(), None)
         );
         value["contract_migration"] = json!({"ignored_on_same_contract": true});
         assert_eq!(
             admit_release_contract(&value, &local, SCHEMA_VERSION).unwrap(),
-            local
+            (local, None)
         );
     }
 
@@ -540,6 +744,7 @@ mod tests {
             parse_release_plan(&adjacent_manifest(&local), current_target().unwrap()).unwrap();
         assert_eq!(plan.contract.epoch, local.epoch + 1);
         assert_ne!(plan.contract, local);
+        assert_eq!(plan.state_schema_migration, None);
     }
 
     #[test]

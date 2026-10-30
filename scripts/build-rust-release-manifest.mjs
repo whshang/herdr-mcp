@@ -28,6 +28,8 @@ export const RUST_RELEASE_PROVENANCE = Object.freeze({
   runnerEnvironment: "github-hosted",
 });
 
+const PREVIOUS_FROZEN_RUNTIME_SCHEMA = 15;
+
 export function parseCargoPackageVersion(text) {
   const packageBlock = String(text).match(/\[package\]([\s\S]*?)(?:\n\[|$)/)?.[1] || "";
   const version = packageBlock.match(/^version\s*=\s*"([^"]+)"\s*$/m)?.[1];
@@ -101,11 +103,15 @@ export async function buildRustReleaseManifest({
         || !Number.isSafeInteger(previous.tool_count) || previous.tool_count <= 0) {
         throw new Error("invalid previous frozen runtime contract");
       }
-      if (stateSchema !== 15) throw new Error("previous frozen runtime requires rollback-compatible state schema 15");
-      // This declaration only admits rollback-compatible, unchanged schemas.
+      if (stateSchema !== PREVIOUS_FROZEN_RUNTIME_SCHEMA
+        && stateSchema !== PREVIOUS_FROZEN_RUNTIME_SCHEMA + 1) {
+        throw new Error(
+          `previous frozen runtime requires state schema ${PREVIOUS_FROZEN_RUNTIME_SCHEMA} or ${PREVIOUS_FROZEN_RUNTIME_SCHEMA + 1}`,
+        );
+      }
       contractMigration = {
         from: { epoch: previous.contract_epoch, hash: previous.contract_hash, tool_count: previous.tool_count },
-        state_schema_from: 15,
+        state_schema_from: PREVIOUS_FROZEN_RUNTIME_SCHEMA,
       };
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -145,12 +151,21 @@ export async function buildRustReleaseManifest({
     url: `https://github.com/${repo}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(edgeName)}`,
   };
 
+  const stateSchemaMigration = stateSchema === PREVIOUS_FROZEN_RUNTIME_SCHEMA + 1
+    ? {
+      from: PREVIOUS_FROZEN_RUNTIME_SCHEMA,
+      to: PREVIOUS_FROZEN_RUNTIME_SCHEMA + 1,
+      reversible: false,
+    }
+    : undefined;
+
   return {
     schema_version: 2,
     product: "herdr-mcp",
     version,
     tag,
     state_schema: stateSchema,
+    ...(stateSchemaMigration ? { state_schema_migration: stateSchemaMigration } : {}),
     release_identity: {
       tag,
       source_commit: sourceCommit,

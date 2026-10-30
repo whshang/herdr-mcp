@@ -45,7 +45,7 @@ use std::os::unix::process::CommandExt;
 
 mod release_plan;
 
-use release_plan::{ReleaseAsset, ReleasePlan, fetch_release_plan};
+use release_plan::{ReleaseAsset, ReleasePlan, StateSchemaMigration, fetch_release_plan};
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod scheduled_tests;
@@ -207,6 +207,10 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
         .get("update_required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let migration_warning = plan
+        .state_schema_migration
+        .as_ref()
+        .map(StateSchemaMigration::warning);
     let next_action = if available {
         Some("herdr-mcp update apply")
     } else if worker_update_required {
@@ -229,6 +233,12 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
         "asset": plan.asset.name,
         "sha256": plan.asset.sha256,
         "size": plan.asset.size,
+        "state_schema_migration": plan.state_schema_migration.as_ref().map(|migration| json!({
+            "from": migration.from,
+            "to": migration.to,
+            "reversible": migration.reversible,
+        })),
+        "warning": migration_warning,
         "worker_update": worker_update,
         "next_action": next_action,
     }))?;
@@ -441,6 +451,14 @@ fn apply_inner(
             channel.as_str()
         ));
         let plan = fetch_release_plan(manifest_override, channel)?;
+        if channel_override.is_some()
+            && let Some(migration) = plan.state_schema_migration.as_ref()
+        {
+            return Err(format!(
+                "scheduled/automatic updates refuse state-schema migrations; run explicit `herdr-mcp update apply` ({})",
+                migration.warning()
+            ));
+        }
         let current = current_version()?;
         progress.phase(format!(
             "Release {} verified; current version is {}.",
@@ -470,6 +488,7 @@ fn apply_inner(
                     "tag": plan.tag,
                     "provenance_verified": true,
                     "network_checked": true,
+                    "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
                     "update_queued": false,
                     "worker_update": worker_update,
                     "next_action": if worker_update_required {
@@ -499,6 +518,7 @@ fn apply_inner(
                 "tag": plan.tag,
                 "provenance_verified": true,
                 "runtime_changed": false,
+                "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
                 "worker_update": worker_update,
                 "next_action": if worker_ok {
                     None
@@ -514,6 +534,10 @@ fn apply_inner(
         }
         let store = UpdateStore::open(&paths)?;
         recover_or_reject_active_update(&store, &paths)?;
+        if let Some(migration) = plan.state_schema_migration.as_ref() {
+            progress.phase(migration.warning());
+            prepare_state_schema_migration_record(&paths, migration)?;
+        }
         progress.phase("Preparing a rollback-safe update job...");
         let (job_id, binary_path) = stage_release(&paths, &plan, &mut progress)?;
         progress.phase("Download verified. Probing candidate runtime identity...");
@@ -584,6 +608,12 @@ fn apply_inner(
                     "worker_pid": child.id(),
                     "worker_pid_persisted": worker_pid_persisted,
                     "job": public_job_view(&job),
+                    "state_schema_migration": plan.state_schema_migration.as_ref().map(|migration| json!({
+                        "from": migration.from,
+                        "to": migration.to,
+                        "reversible": migration.reversible,
+                    })),
+                    "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
                     "worker_update": worker_update,
                     "next_action": if worker_ok {
                         None
@@ -609,6 +639,12 @@ fn apply_inner(
             "version": plan.version.to_string(),
             "target": plan.asset.target,
             "asset": plan.asset.name,
+            "state_schema_migration": plan.state_schema_migration.as_ref().map(|migration| json!({
+                "from": migration.from,
+                "to": migration.to,
+                "reversible": migration.reversible,
+            })),
+            "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
             "worker_pid": child.id(),
             "worker_pid_persisted": worker_pid_persisted,
             "worker_update": {
@@ -793,8 +829,17 @@ fn major_upgrade_record_path(paths: &RuntimePaths) -> PathBuf {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn major_upgrade_backup_path(paths: &RuntimePaths) -> PathBuf {
+    schema_upgrade_backup_path(paths, MAJOR_SOURCE_SCHEMA, SCHEMA_VERSION)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn schema_upgrade_backup_path(
+    paths: &RuntimePaths,
+    source_schema: i64,
+    target_schema: i64,
+) -> PathBuf {
     major_upgrade_dir(paths).join(format!(
-        "state-schema-{MAJOR_SOURCE_SCHEMA}-before-{SCHEMA_VERSION}.db"
+        "state-schema-{source_schema}-before-{target_schema}.db"
     ))
 }
 
@@ -842,9 +887,46 @@ fn prepare_major_upgrade_record(
     paths: &RuntimePaths,
     state_path: &Path,
 ) -> Result<MajorUpgradeRecord, String> {
+    prepare_schema_upgrade_record(
+        paths,
+        state_path,
+        MAJOR_SOURCE_SCHEMA,
+        SCHEMA_VERSION,
+        "major-upgrade",
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_state_schema_migration_record(
+    paths: &RuntimePaths,
+    migration: &StateSchemaMigration,
+) -> Result<MajorUpgradeRecord, String> {
+    if migration.reversible || migration.to != migration.from.saturating_add(1) {
+        return Err(
+            "state-schema migration declaration is not a single irreversible forward step"
+                .to_owned(),
+        );
+    }
+    prepare_schema_upgrade_record(
+        paths,
+        &paths.config_dir.join("state.db"),
+        migration.from,
+        migration.to,
+        "state-schema migration",
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_schema_upgrade_record(
+    paths: &RuntimePaths,
+    state_path: &Path,
+    source_schema: i64,
+    target_schema: i64,
+    label: &str,
+) -> Result<MajorUpgradeRecord, String> {
     let active_source_binary = active_runtime_binary(paths)?;
     let dir = major_upgrade_dir(paths);
-    if major_upgrade_backup_path(paths).exists()
+    if schema_upgrade_backup_path(paths, source_schema, target_schema).exists()
         || major_upgrade_source_binary_path(paths).exists()
         || major_upgrade_record_path(paths).exists()
     {
@@ -855,17 +937,23 @@ fn prepare_major_upgrade_record(
     }
     // The final snapshot must include writes committed while the old service stops.
     run_service_command(&active_source_binary, paths, &["service", "stop"])
-        .map_err(|error| format!("cannot stop service before major state migration: {error}"))?;
-    match snapshot_major_upgrade_record(paths, state_path, &active_source_binary) {
+        .map_err(|error| format!("cannot stop service before {label}: {error}"))?;
+    match snapshot_schema_upgrade_record(
+        paths,
+        state_path,
+        &active_source_binary,
+        source_schema,
+        target_schema,
+    ) {
         Ok(record) => Ok(record),
         Err(error) => {
             let restart = run_service_command(&active_source_binary, paths, &["service", "start"]);
             Err(match restart {
                 Ok(()) => {
-                    format!("major-upgrade backup failed ({error}); previous service restarted")
+                    format!("{label} backup failed ({error}); previous service restarted")
                 }
                 Err(restart_error) => format!(
-                    "major-upgrade backup failed ({error}); previous service restart failed: {restart_error}"
+                    "{label} backup failed ({error}); previous service restart failed: {restart_error}"
                 ),
             })
         }
@@ -873,17 +961,19 @@ fn prepare_major_upgrade_record(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn snapshot_major_upgrade_record(
+fn snapshot_schema_upgrade_record(
     paths: &RuntimePaths,
     state_path: &Path,
     active_source_binary: &Path,
+    source_schema: i64,
+    target_schema: i64,
 ) -> Result<MajorUpgradeRecord, String> {
     let dir = major_upgrade_dir(paths);
     fs::create_dir_all(&dir)
         .map_err(|error| format!("cannot create major-upgrade backup directory: {error}"))?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("cannot secure major-upgrade backup directory: {error}"))?;
-    let backup = major_upgrade_backup_path(paths);
+    let backup = schema_upgrade_backup_path(paths, source_schema, target_schema);
     let source_binary = major_upgrade_source_binary_path(paths);
     if backup.exists() || source_binary.exists() || major_upgrade_record_path(paths).exists() {
         return Err(format!(
@@ -904,10 +994,10 @@ fn snapshot_major_upgrade_record(
             return Err(error);
         }
     };
-    if backup_schema != MAJOR_SOURCE_SCHEMA {
+    if backup_schema != source_schema {
         let _ = fs::remove_file(&backup);
         return Err(format!(
-            "major-upgrade backup schema changed during snapshot: expected {MAJOR_SOURCE_SCHEMA}, got {backup_schema}"
+            "state backup schema changed during snapshot: expected {source_schema}, got {backup_schema}"
         ));
     }
     let state_backup_sha256 = match sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES) {
@@ -937,8 +1027,8 @@ fn snapshot_major_upgrade_record(
     };
     let record = MajorUpgradeRecord {
         record_version: MAJOR_UPGRADE_RECORD_VERSION,
-        source_state_schema: MAJOR_SOURCE_SCHEMA,
-        target_state_schema: SCHEMA_VERSION,
+        source_state_schema: source_schema,
+        target_state_schema: target_schema,
         source_binary: source_binary.to_string_lossy().into_owned(),
         source_binary_sha256,
         state_backup: backup.to_string_lossy().into_owned(),
@@ -959,13 +1049,19 @@ fn validate_major_upgrade_record(
     record: &MajorUpgradeRecord,
 ) -> Result<(), String> {
     if record.record_version != MAJOR_UPGRADE_RECORD_VERSION
-        || record.source_state_schema != MAJOR_SOURCE_SCHEMA
         || record.target_state_schema != SCHEMA_VERSION
+        || (record.source_state_schema != MAJOR_SOURCE_SCHEMA
+            && record.target_state_schema != record.source_state_schema.saturating_add(1))
     {
         return Err("major-upgrade rollback record is incompatible with this binary".to_owned());
     }
     if Path::new(&record.source_binary) != major_upgrade_source_binary_path(paths)
-        || Path::new(&record.state_backup) != major_upgrade_backup_path(paths)
+        || Path::new(&record.state_backup)
+            != schema_upgrade_backup_path(
+                paths,
+                record.source_state_schema,
+                record.target_state_schema,
+            )
     {
         return Err(
             "major-upgrade rollback record points outside its private backup set".to_owned(),
