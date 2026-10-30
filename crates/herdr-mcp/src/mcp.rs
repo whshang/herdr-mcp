@@ -303,36 +303,65 @@ fn source_turn_unbound_diagnostic(
         context.caller_browser_session,
     ) {
         (Some(authorization), Some(caller_session)) => {
-            let Ok(mut store) = context.state_store.lock() else {
-                return Some(json!({
-                    "canonical_prefix": canonical.chars().take(24).collect::<String>(),
-                    "canonical_sha256_prefix": digest[..12].to_owned(),
-                    "latest_source_turn_sha256_prefix": Value::Null,
-                }));
-            };
-            match store
-                .resolve_browser_caller_session(
-                    &authorization.principal_ref,
-                    &caller_session.provider,
-                    &caller_session.opaque_session_id,
-                )
-                .ok()
-                .flatten()
-            {
-                Some(session_ref) => store
-                    .latest_browser_source_turn_sha256(&session_ref, browser_epoch_ms())
+            let store = context.state_store.lock();
+            match store {
+                Ok(mut store) => store
+                    .resolve_browser_caller_session(
+                        &authorization.principal_ref,
+                        &caller_session.provider,
+                        &caller_session.opaque_session_id,
+                    )
                     .ok()
-                    .flatten(),
-                None => None,
+                    .flatten()
+                    .and_then(|session_ref| {
+                        store
+                            .latest_browser_source_turn_sha256(&session_ref, browser_epoch_ms())
+                            .ok()
+                            .flatten()
+                    }),
+                Err(_) => None,
             }
         }
         _ => None,
     };
+    // The model does not reliably surface the diagnostic it receives in the
+    // tool result, so the workstation log keeps the same non-secret facts
+    // (#777). Message text is never logged.
+    eprintln!(
+        "{}",
+        source_turn_unbound_log_line(
+            reason,
+            &digest,
+            canonical.chars().count(),
+            latest.as_deref()
+        )
+    );
     Some(json!({
         "canonical_prefix": canonical.chars().take(24).collect::<String>(),
         "canonical_sha256_prefix": digest[..12].to_owned(),
         "latest_source_turn_sha256_prefix": latest.map(|value| value[..12].to_owned()),
     }))
+}
+
+/// One durable, non-secret `server.log` line for an unbound source-turn
+/// binding. It carries the reason, the canonical digest prefix, and the
+/// canonical length: enough to reconstruct a digest miss without storing user
+/// text (#777).
+fn source_turn_unbound_log_line(
+    reason: &str,
+    canonical_sha256: &str,
+    canonical_chars: usize,
+    latest_sha256: Option<&str>,
+) -> String {
+    format!(
+        "herdr-mcp: agent.task.dispatch parent_session unbound reason={reason} canonical_sha256_prefix={} canonical_chars={canonical_chars} latest_source_turn_sha256_prefix={}",
+        sha256_prefix_12(canonical_sha256),
+        latest_sha256.map_or("none", sha256_prefix_12),
+    )
+}
+
+fn sha256_prefix_12(digest: &str) -> &str {
+    digest.get(..12).unwrap_or(digest)
 }
 
 /// Map one fail-closed store error from the source-turn evidence path onto the
@@ -6310,7 +6339,23 @@ pub(crate) fn browser_sha256(value: &str) -> String {
 /// App-name tokens ChatGPT renders for a Herdr app mention are recognized at
 /// the leading edge with an optional `@` or
 /// `$` prefix, while whole `@name` tokens remain recognized anywhere in text.
+///
+/// The list is ordered longest-first: a longer token that matches at the
+/// leading edge must be tested before its shorter prefix (see
+/// [`leading_source_turn_mention_end`]).
 const SOURCE_TURN_APP_MENTION_TOKENS: &[&str] = &["herdr-mcp", "herdr_mcp", "herdr"];
+
+/// How the composer bubble renders the app chip when it is not a token:
+/// `Herdr MCP`, with one plain space.
+const SOURCE_TURN_APP_DISPLAY_LABEL: &str = "Herdr MCP";
+
+/// Quote pairs a bubble or the model may wrap the whole turn in.
+const SOURCE_TURN_QUOTE_PAIRS: &[(char, char)] = &[
+    ('\u{201c}', '\u{201d}'),
+    ('"', '"'),
+    ('\u{300c}', '\u{300d}'),
+    ('\u{300e}', '\u{300f}'),
+];
 
 /// Domain separator for source-turn digests. Digests written before canonical
 /// source-turn text (#741), including raw-text archive intents and rows an
@@ -6330,39 +6375,30 @@ const SOURCE_TURN_DIGEST_DOMAIN: &[u8] = b"\xffherdr-mcp/source-turn/v2\n";
 /// turn, the WebChat `agent.task.dispatch` binding, and the archive
 /// current-turn path must hash the same text, but each surface renders the
 /// same turn slightly differently. Canonicalization therefore applies Unicode
-/// NFC, treats NBSP/BOM as whitespace, strips one or more leading app-mention
-/// renderings (`@name`, `$name`, or bare `name`) with an optional separator,
-/// unwraps one outer single- or triple-backtick fence, drops whole `@name`
-/// tokens anywhere, collapses whitespace runs to one space, and trims.
+/// NFC, removes invisible format/bidi controls, treats NBSP/BOM as whitespace,
+/// strips one or more leading app-mention renderings (`@name`, `$name`, bare
+/// `name`, `Herdr MCP`, `[name](target)`, or `<@name>`) with an optional
+/// separator, unwraps outer quote pairs and one single- or triple-backtick
+/// fence, drops whole `@name` tokens anywhere, collapses whitespace runs to
+/// one space, and trims.
+///
+/// The transform is deterministic and idempotent: `canonical(canonical(x)) ==
+/// canonical(x)`.
 pub(crate) fn canonical_source_turn_text(text: &str) -> String {
     let composed = icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(text);
-    let normalized = composed.replace(['\u{00a0}', '\u{feff}'], " ");
-    let mut leading = normalized.as_str();
-    loop {
-        let candidate = leading.trim_start();
-        let Some(token_end) = leading_source_turn_mention_end(candidate) else {
-            leading = candidate;
-            break;
-        };
-        let mut remainder = &candidate[token_end..];
-        remainder = remainder.trim_start();
-        if let Some(separator) = remainder.chars().next()
-            && source_turn_mention_separator(separator)
-        {
-            remainder = remainder[separator.len_utf8()..].trim_start();
-        }
-        leading = remainder;
-    }
-    let leading = leading.trim();
-    let unwrapped = if leading.len() >= 6 && leading.starts_with("```") && leading.ends_with("```")
-    {
-        leading[3..leading.len() - 3].trim()
-    } else if leading.len() >= 2 && leading.starts_with('`') && leading.ends_with('`') {
-        leading[1..leading.len() - 1].trim()
-    } else {
-        leading
-    };
-    unwrapped
+    let normalized: String = composed
+        .chars()
+        .filter(|character| !source_turn_invisible_format(*character))
+        .map(|character| match character {
+            '\u{00a0}' | '\u{feff}' => ' ',
+            other => other,
+        })
+        .collect();
+    // A `@name` token anywhere is presentation noise, so the mid-text filter
+    // runs between two leading-edge passes: the filter can expose a leading
+    // mention (and the second pass keeps the result a fixed point).
+    let leading = source_turn_normalize_leading(&normalized);
+    let filtered = leading
         .split_whitespace()
         .filter(|token| {
             let Some(name) = token.strip_prefix('@') else {
@@ -6373,30 +6409,208 @@ pub(crate) fn canonical_source_turn_text(text: &str) -> String {
                 .any(|mention| name.eq_ignore_ascii_case(mention))
         })
         .collect::<Vec<_>>()
+        .join(" ");
+    source_turn_normalize_leading(&filtered)
+        .split_whitespace()
+        .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Invisible controls a chat bubble or model can insert inside a rendered
+/// mention: ZWSP, ZWNJ, ZWJ, word joiner, and the bidi embed/isolate ranges.
+fn source_turn_invisible_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Apply every leading-edge normalization to a fixed point: outer quote pairs,
+/// one backtick fence, one app mention, and the stray bubble backtick.
+fn source_turn_normalize_leading(text: &str) -> String {
+    let mut current = text.trim();
+    loop {
+        let next = source_turn_strip_leading_mention(source_turn_unwrap_backtick_fence(
+            source_turn_unwrap_outer_quotes(current).trim(),
+        ))
+        .trim();
+        if next == current {
+            return next.to_owned();
+        }
+        current = next;
+    }
+}
+
+/// Unwrap matching quote pairs that enclose the whole text, repeatedly, so the
+/// result stays a canonical fixed point.
+fn source_turn_unwrap_outer_quotes(text: &str) -> &str {
+    let mut current = text.trim();
+    loop {
+        let Some(first) = current.chars().next() else {
+            return current;
+        };
+        // Two characters are the minimum enclosing pair; a lone quote is text.
+        if current.len() == first.len_utf8() {
+            return current;
+        }
+        let Some(last) = current.chars().next_back() else {
+            return current;
+        };
+        let Some((_, close)) = SOURCE_TURN_QUOTE_PAIRS
+            .iter()
+            .find(|(open, _)| *open == first)
+        else {
+            return current;
+        };
+        if last != *close {
+            return current;
+        }
+        current = current[first.len_utf8()..current.len() - last.len_utf8()].trim();
+    }
+}
+
+/// Unwrap one outer single- or triple-backtick fence around the whole text.
+fn source_turn_unwrap_backtick_fence(text: &str) -> &str {
+    if text.len() >= 6 && text.starts_with("```") && text.ends_with("```") {
+        text[3..text.len() - 3].trim()
+    } else if text.len() >= 2 && text.starts_with('`') && text.ends_with('`') {
+        text[1..text.len() - 1].trim()
+    } else {
+        text
+    }
+}
+
+fn source_turn_strip_leading_mention(text: &str) -> &str {
+    let candidate = text.trim_start();
+    let Some(token_end) = leading_source_turn_mention_end(candidate) else {
+        return candidate;
+    };
+    let mut remainder = &candidate[token_end..];
+    remainder = remainder.trim_start();
+    if let Some(separator) = remainder.chars().next()
+        && source_turn_mention_separator(separator)
+    {
+        remainder = remainder[separator.len_utf8()..].trim_start();
+    }
+    source_turn_strip_bubble_backtick(remainder)
+}
+
+/// Drop the single stray backtick a bubble can leave immediately after a
+/// stripped mention. Only a leading backtick with no partner qualifies.
+fn source_turn_strip_bubble_backtick(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix('`') else {
+        return text;
+    };
+    if rest.contains('`') {
+        return text;
+    }
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return text;
+    }
+    rest
 }
 
 fn source_turn_mention_separator(character: char) -> bool {
     character.is_whitespace() || matches!(character, ':' | '：' | ',' | '，' | '-' | '—')
 }
 
+/// A mention token may be followed by nothing, a separator, or a non-ASCII
+/// character: CJK text glued to the chip (`@herdr-mcp用…`) is still a mention.
+/// ASCII continuation means a longer word (`herdr-mcpx`), never a mention.
+fn source_turn_mention_boundary(character: char) -> bool {
+    source_turn_mention_separator(character) || !character.is_ascii()
+}
+
 fn leading_source_turn_mention_end(text: &str) -> Option<usize> {
+    if let Some(end) = source_turn_markdown_mention_end(text) {
+        return Some(end);
+    }
+    if let Some(end) = source_turn_angle_mention_end(text) {
+        return Some(end);
+    }
     let (prefix_len, candidate) = match text.chars().next() {
         Some('@' | '$') => (1, &text[1..]),
         _ => (0, text),
     };
-    SOURCE_TURN_APP_MENTION_TOKENS.iter().find_map(|name| {
-        let name_len = name.len();
-        let candidate_name = candidate.get(..name_len)?;
-        if !candidate_name.eq_ignore_ascii_case(name) {
+    if let Some(label_len) = source_turn_display_label_end(candidate) {
+        return Some(prefix_len + label_len);
+    }
+    for token in SOURCE_TURN_APP_MENTION_TOKENS {
+        let Some(candidate_token) = candidate.get(..token.len()) else {
+            continue;
+        };
+        if !candidate_token.eq_ignore_ascii_case(token) {
+            continue;
+        }
+        // A longer Herdr token that matched but failed the boundary check must
+        // never fall back to a shorter prefix: `herdr` would eat the `-`/`_`
+        // and turn `@herdr-mcp用…` into `mcp用…`.
+        let next = candidate[token.len()..].chars().next();
+        if next.is_some_and(|character| !source_turn_mention_boundary(character)) {
             return None;
         }
-        let next = candidate[name_len..].chars().next();
-        if next.is_some_and(|character| !source_turn_mention_separator(character)) {
-            return None;
-        }
-        Some(prefix_len + name_len)
-    })
+        return Some(prefix_len + token.len());
+    }
+    None
+}
+
+/// Leading markdown / prompt link for a Herdr chip, e.g.
+/// `[$herdr-mcp](app://asdk_app_…)`.
+fn source_turn_markdown_mention_end(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix('[')?;
+    let label_end = rest.find(']')?;
+    let label = &rest[..label_end];
+    let name = match label.strip_prefix(['@', '$']) {
+        Some(name) => name,
+        None => label,
+    };
+    if !SOURCE_TURN_APP_MENTION_TOKENS
+        .iter()
+        .any(|token| name.eq_ignore_ascii_case(token))
+    {
+        return None;
+    }
+    let target = rest[label_end + 1..].strip_prefix('(')?;
+    let target_end = target.find(')')?;
+    let target_text = &target[..target_end];
+    if target_text.is_empty() || target_text.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(1 + label_end + 1 + 1 + target_end + 1)
+}
+
+/// Leading `<@name>` / `<$name>` for a Herdr chip.
+fn source_turn_angle_mention_end(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix('<')?;
+    let (prefix_len, candidate) = match rest.chars().next() {
+        Some('@' | '$') => (1, &rest[1..]),
+        _ => return None,
+    };
+    let token_len = SOURCE_TURN_APP_MENTION_TOKENS.iter().find_map(|token| {
+        let candidate_token = candidate.get(..token.len())?;
+        candidate_token
+            .eq_ignore_ascii_case(token)
+            .then_some(token.len())
+    })?;
+    if !candidate[token_len..].starts_with('>') {
+        return None;
+    }
+    Some(1 + prefix_len + token_len + 1)
+}
+
+/// Leading `Herdr MCP` display label, with an optional `@`/`$` already removed
+/// by the caller.
+fn source_turn_display_label_end(candidate: &str) -> Option<usize> {
+    let label_len = SOURCE_TURN_APP_DISPLAY_LABEL.len();
+    let label = candidate.get(..label_len)?;
+    if !label.eq_ignore_ascii_case(SOURCE_TURN_APP_DISPLAY_LABEL) {
+        return None;
+    }
+    let next = candidate[label_len..].chars().next();
+    if next.is_some_and(|character| !source_turn_mention_boundary(character)) {
+        return None;
+    }
+    Some(label_len)
 }
 
 /// Domain-separated SHA-256 of [`canonical_source_turn_text`]: the durable
@@ -12556,6 +12770,158 @@ mod tests {
                 Err(()),
                 "{message:?}"
             );
+        }
+    }
+
+    #[test]
+    fn canonical_source_turn_text_matches_every_model_chip_rendering() {
+        // #777: the digest the extension stored for the observed bubble in the
+        // WebChat dispatch UAT. Every model rendering of the same chip must
+        // canonicalize to this same source turn.
+        const OBSERVED_SHA_PREFIX: &str = "0131a3e87a63";
+        const BODY: &str = "用 herdr_call 调 herdr_mcp.agent.task.dispatch，device 指定 MacBook Pro（dev_01M204VTSQXCASA2SP51STWT58），派给 MBP 上的 pi：列出当前项目。带上 current_user_message。";
+        const LINK: &str = "app://asdk_app_6acf8e6a3620819185cc77a5bc35faed";
+        let observed = source_turn_sha256(BODY);
+        assert!(
+            observed.starts_with(OBSERVED_SHA_PREFIX),
+            "canonicalizer changed the observed digest: {observed}"
+        );
+        assert_eq!(canonical_source_turn_text(BODY), BODY);
+        let same_turn = [
+            // Renderings that already bound before #777.
+            format!("@herdr-mcp {BODY}"),
+            format!("$herdr-mcp {BODY}"),
+            format!("herdr-mcp {BODY}"),
+            format!("@herdr {BODY}"),
+            format!("HERDR-MCP {BODY}"),
+            format!("@herdr-mcp：{BODY}"),
+            format!("@herdr-mcp, {BODY}"),
+            format!("@herdr-mcp\n{BODY}"),
+            format!("@herdr-mcp\u{3000}{BODY}"),
+            format!("`@herdr-mcp {BODY}`"),
+            format!("{BODY}\n"),
+            BODY.to_owned(),
+            // Renderings added in #777.
+            format!("[$herdr-mcp]({LINK}) {BODY}"),
+            format!("[@herdr-mcp]({LINK}) {BODY}"),
+            format!("[herdr-mcp]({LINK}) {BODY}"),
+            format!("@Herdr MCP {BODY}"),
+            format!("Herdr MCP {BODY}"),
+            format!("<@herdr-mcp> {BODY}"),
+            format!("“@herdr-mcp {BODY}”"),
+            format!("\"@herdr-mcp {BODY}\""),
+            format!("「@herdr-mcp {BODY}」"),
+            format!("@herdr-mcp\u{200b} {BODY}"),
+            format!("\u{2068}@herdr-mcp\u{2069} {BODY}"),
+            format!("$herdr-mcp ` {BODY}"),
+            format!("@herdr-mcp{BODY}"),
+        ];
+        for variant in &same_turn {
+            assert_eq!(
+                source_turn_sha256(variant),
+                observed,
+                "variant {variant:?} canonicalized to {:?}",
+                canonical_source_turn_text(variant)
+            );
+            let once = canonical_source_turn_text(variant);
+            assert_eq!(canonical_source_turn_text(&once), once, "{variant:?}");
+        }
+        // Genuine text changes keep their own identity.
+        let ascii_punctuation = BODY
+            .replace('，', ",")
+            .replace('（', "(")
+            .replace('）', ")")
+            .replace('：', ":")
+            .replace('。', ".");
+        let distinct_turns = [
+            ascii_punctuation,
+            BODY.trim_end_matches('。').to_owned(),
+            format!("[@github](connectors/github) {BODY}"),
+            format!("herdr-mcpx {BODY}"),
+        ];
+        for variant in &distinct_turns {
+            assert_ne!(source_turn_sha256(variant), observed, "{variant:?}");
+            let once = canonical_source_turn_text(variant);
+            assert_eq!(canonical_source_turn_text(&once), once, "{variant:?}");
+        }
+        assert_eq!(
+            canonical_source_turn_text(&format!("[@github](connectors/github) {BODY}")),
+            format!("[@github](connectors/github) {BODY}"),
+            "a non-Herdr app link is user text"
+        );
+        assert!(
+            canonical_source_turn_text(&format!("herdr-mcpx {BODY}")).starts_with("herdr-mcpx "),
+            "an ASCII continuation is a longer word, not a chip"
+        );
+        // A glued chip still yields the whole token, never `mcp用…`.
+        assert_eq!(
+            canonical_source_turn_text(&format!("@herdr-mcp{BODY}")),
+            BODY,
+            "a CJK boundary ends the mention token"
+        );
+        // The display label is leading-only mention noise.
+        assert_eq!(
+            canonical_source_turn_text("派发 Herdr MCP 任务"),
+            "派发 Herdr MCP 任务"
+        );
+        // Mention-only renderings are still not evidence.
+        for mention_only in [
+            format!("[$herdr-mcp]({LINK})"),
+            "<@herdr-mcp>".to_owned(),
+            "“@herdr-mcp”".to_owned(),
+            "@Herdr MCP".to_owned(),
+            "Herdr MCP".to_owned(),
+            "@herdr-mcp\u{200b}".to_owned(),
+            "@herdr-mcp `".to_owned(),
+        ] {
+            assert_eq!(canonical_source_turn_text(&mention_only), "");
+            assert_eq!(
+                current_user_message_param(&json!({ "current_user_message": mention_only })),
+                Err(()),
+                "{mention_only:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_turn_unbound_log_line_carries_no_message_text() {
+        const MESSAGE: &str = "用 herdr_call 调 herdr_mcp.agent.task.dispatch，device 指定 MacBook Pro（dev_01M204VTSQXCASA2SP51STWT58），派给 MBP 上的 pi：列出当前项目。";
+        let canonical = canonical_source_turn_text(MESSAGE);
+        let digest = source_turn_sha256(MESSAGE);
+        let line = source_turn_unbound_log_line(
+            "source_turn_not_found",
+            &digest,
+            canonical.chars().count(),
+            Some(&digest),
+        );
+        assert_eq!(
+            line,
+            format!(
+                "herdr-mcp: agent.task.dispatch parent_session unbound reason=source_turn_not_found canonical_sha256_prefix={} canonical_chars={} latest_source_turn_sha256_prefix={}",
+                &digest[..12],
+                canonical.chars().count(),
+                &digest[..12]
+            )
+        );
+        let without_latest = source_turn_unbound_log_line(
+            "source_turn_stale",
+            &digest,
+            canonical.chars().count(),
+            None,
+        );
+        assert!(without_latest.ends_with(" latest_source_turn_sha256_prefix=none"));
+        assert!(without_latest.contains("reason=source_turn_stale canonical_sha256_prefix="));
+        for line in [&line, &without_latest] {
+            for forbidden in [
+                "herdr_call",
+                "MacBook",
+                "dev_01M204",
+                "列出当前项目",
+                "派给",
+                &canonical,
+            ] {
+                assert!(!line.contains(forbidden), "{line}");
+            }
         }
     }
 
