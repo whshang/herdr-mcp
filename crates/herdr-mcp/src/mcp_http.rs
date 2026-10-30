@@ -3275,6 +3275,41 @@ mod tests {
         ))
     }
 
+    fn assert_dispatch_diagnostic(diagnostic: &Value, message: &str, latest: Option<&str>) {
+        let object = diagnostic.as_object().expect("diagnostic object");
+        assert_eq!(object.len(), 3);
+        let canonical = mcp::canonical_source_turn_text(message);
+        assert_eq!(
+            object["canonical_prefix"],
+            canonical.chars().take(24).collect::<String>()
+        );
+        assert_eq!(
+            object["canonical_sha256_prefix"],
+            &mcp::source_turn_sha256(message)[..12]
+        );
+        assert_eq!(
+            object["latest_source_turn_sha256_prefix"],
+            latest
+                .map(|value| Value::String(mcp::source_turn_sha256(value)[..12].to_owned()))
+                .unwrap_or(Value::Null)
+        );
+        let encoded = diagnostic.to_string();
+        assert!(
+            object["canonical_prefix"]
+                .as_str()
+                .is_some_and(|value| value.chars().count() <= 24)
+        );
+        if canonical.chars().count() > 24 {
+            assert!(!encoded.contains(&canonical));
+        }
+        for forbidden in ["session_ref", "opaque_session_id", "token", "locator"] {
+            assert!(
+                !encoded.contains(forbidden),
+                "diagnostic leaked {forbidden}"
+            );
+        }
+    }
+
     #[test]
     fn runtime_generation_header_reflects_service_process_identity() {
         let _guard = crate::test_env::lock();
@@ -7514,9 +7549,12 @@ mod tests {
         .await;
         assert_eq!(miss["ok"], true);
         assert!(miss["task"]["parent_session_ref"].is_null());
-        assert_eq!(
-            miss["parent_session"],
-            json!({"bound": false, "reason": "source_turn_not_found"})
+        assert_eq!(miss["parent_session"]["bound"], false);
+        assert_eq!(miss["parent_session"]["reason"], "source_turn_not_found");
+        assert_dispatch_diagnostic(
+            &miss["parent_session"]["diagnostic"],
+            "不存在的消息",
+            Some("第二条消息"),
         );
 
         // A conflicting durable mapping wins: dispatch stays unstamped and the
@@ -7535,9 +7573,15 @@ mod tests {
         .await;
         assert_eq!(conflict["ok"], true);
         assert!(conflict["task"]["parent_session_ref"].is_null());
+        assert_eq!(conflict["parent_session"]["bound"], false);
         assert_eq!(
-            conflict["parent_session"],
-            json!({"bound": false, "reason": "caller_session_conflict"})
+            conflict["parent_session"]["reason"],
+            "caller_session_conflict"
+        );
+        assert_dispatch_diagnostic(
+            &conflict["parent_session"]["diagnostic"],
+            "第一条消息",
+            Some("第二条消息"),
         );
         assert_eq!(
             store
@@ -7616,9 +7660,15 @@ mod tests {
         )
         .await;
         assert_eq!(unbound_miss["ok"], true);
+        assert_eq!(unbound_miss["parent_session"]["bound"], false);
         assert_eq!(
-            unbound_miss["parent_session"],
-            json!({"bound": false, "reason": "source_turn_not_found"})
+            unbound_miss["parent_session"]["reason"],
+            "source_turn_not_found"
+        );
+        assert_dispatch_diagnostic(
+            &unbound_miss["parent_session"]["diagnostic"],
+            "稍后观察的消息",
+            None,
         );
         assert_eq!(
             store
@@ -7704,9 +7754,12 @@ mod tests {
         .await;
         assert_eq!(ungranted["ok"], true);
         assert!(ungranted["task"]["parent_session_ref"].is_null());
-        assert_eq!(
-            ungranted["parent_session"],
-            json!({"bound": false, "reason": "grant_missing"})
+        assert_eq!(ungranted["parent_session"]["bound"], false);
+        assert_eq!(ungranted["parent_session"]["reason"], "grant_missing");
+        assert_dispatch_diagnostic(
+            &ungranted["parent_session"]["diagnostic"],
+            "第二条消息",
+            Some("第二条消息"),
         );
 
         // WebChat authorization without the ChatGPT caller session cannot
@@ -7746,9 +7799,15 @@ mod tests {
         .await;
         assert_eq!(ambiguous["ok"], true);
         assert!(ambiguous["task"]["parent_session_ref"].is_null());
+        assert_eq!(ambiguous["parent_session"]["bound"], false);
         assert_eq!(
-            ambiguous["parent_session"],
-            json!({"bound": false, "reason": "source_turn_ambiguous"})
+            ambiguous["parent_session"]["reason"],
+            "source_turn_ambiguous"
+        );
+        assert_dispatch_diagnostic(
+            &ambiguous["parent_session"]["diagnostic"],
+            "重复消息",
+            Some("第二条消息"),
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -7764,7 +7823,7 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let mut script = Vec::new();
-        for index in 0..16 {
+        for index in 0..24 {
             let seq = 4 + index * 2;
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
@@ -7900,17 +7959,38 @@ mod tests {
                 "\n@HERDR_MCP\n用   agent.task.dispatch\t派发一个任务给 report-review：回复 OK  ",
                 json!({"bound": true}),
             ),
-            // Punctuation is identity: an ASCII colon is different text.
+            // Leading punctuation separators are presentation noise.
             (
                 "opaque-mention-a",
-                "@herdr-mcp 用 agent.task.dispatch 派发一个任务给 report-review:回复 OK",
-                json!({"bound": false, "reason": "source_turn_not_found"}),
+                "@herdr-mcp:用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": true}),
             ),
-            // A bare (non-`@`) name is user text, not a dropped mention.
+            // Bare, dollar-prefixed, case-insensitive, and full-width forms
+            // are all leading mention renderings.
             (
                 "opaque-mention-a",
                 "herdr-mcp 用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
-                json!({"bound": false, "reason": "source_turn_not_found"}),
+                json!({"bound": true}),
+            ),
+            (
+                "opaque-mention-a",
+                "$HERDR_MCP：用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": true}),
+            ),
+            (
+                "opaque-mention-a",
+                "herdr-mcp\n用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": true}),
+            ),
+            (
+                "opaque-mention-a",
+                " herdr-mcp `用 agent.task.dispatch 派发一个任务给 report-review：回复 OK` ",
+                json!({"bound": true}),
+            ),
+            (
+                "opaque-mention-a",
+                "```用 agent.task.dispatch 派发一个任务给 report-review：回复 OK```",
+                json!({"bound": true}),
             ),
             (
                 "opaque-mention-bare",
@@ -7928,7 +8008,7 @@ mod tests {
                 "archive this",
                 json!({"bound": false, "reason": "source_turn_not_found"}),
             ),
-            // A mention token is only stripped as a whole token.
+            // A near-match is never treated as a mention.
             (
                 "opaque-mention-a",
                 "herdr-mcpx 用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
@@ -7990,9 +8070,32 @@ mod tests {
             .await;
             assert_eq!(result["ok"], true, "case {index}: {result}");
             assert_eq!(
-                &result["parent_session"], expected,
+                result["parent_session"]["bound"], expected["bound"],
                 "case {index}: {message:?}"
             );
+            if expected["bound"] == false {
+                assert_eq!(
+                    result["parent_session"]["reason"], expected["reason"],
+                    "case {index}: {message:?}"
+                );
+                if expected["reason"] != "current_user_message_invalid" {
+                    let diagnostic = &result["parent_session"]["diagnostic"];
+                    let object = diagnostic.as_object().expect("diagnostic object");
+                    assert_eq!(object.len(), 3);
+                    let canonical = mcp::canonical_source_turn_text(message);
+                    assert!(
+                        object["canonical_prefix"]
+                            .as_str()
+                            .is_some_and(|value| value.chars().count() <= 24)
+                    );
+                    if canonical.chars().count() > 24 {
+                        assert!(!diagnostic.to_string().contains(&canonical));
+                    }
+                    for forbidden in ["session_ref", "opaque_session_id", "token", "locator"] {
+                        assert!(!diagnostic.to_string().contains(forbidden));
+                    }
+                }
+            }
             let expected_ref = match (expected["bound"].as_bool(), *opaque) {
                 (Some(true), "opaque-mention-nfc") => Value::String(nfc_session.clone()),
                 (Some(true), _) => Value::String(mention_session.clone()),
@@ -8099,9 +8202,12 @@ mod tests {
         .await;
         assert_eq!(stale["ok"], true);
         assert!(stale["task"]["parent_session_ref"].is_null());
-        assert_eq!(
-            stale["parent_session"],
-            json!({"bound": false, "reason": "source_turn_stale"})
+        assert_eq!(stale["parent_session"]["bound"], false);
+        assert_eq!(stale["parent_session"]["reason"], "source_turn_stale");
+        assert_dispatch_diagnostic(
+            &stale["parent_session"]["diagnostic"],
+            "过期前观察的消息",
+            None,
         );
         assert_eq!(
             store
@@ -8378,9 +8484,12 @@ mod tests {
         .await;
         assert_eq!(unbound["ok"], true);
         assert!(unbound["task"]["parent_session_ref"].is_null());
-        assert_eq!(
-            unbound["parent_session"],
-            json!({"bound": false, "reason": "source_turn_not_found"})
+        assert_eq!(unbound["parent_session"]["bound"], false);
+        assert_eq!(unbound["parent_session"]["reason"], "source_turn_not_found");
+        assert_dispatch_diagnostic(
+            &unbound["parent_session"]["diagnostic"],
+            "从未提交过的消息",
+            None,
         );
 
         let recorded = herdr_requests.lock().unwrap().clone();

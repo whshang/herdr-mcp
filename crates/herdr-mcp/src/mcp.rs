@@ -244,11 +244,18 @@ enum AgentTaskParentSession {
 fn agent_task_parent_session_fact(
     binding: &AgentTaskParentSession,
     result: &Value,
+    diagnostic: Option<Value>,
 ) -> Option<Value> {
     match binding {
         AgentTaskParentSession::NotAttempted => None,
         AgentTaskParentSession::Bound(_) => Some(json!({"bound": true})),
-        AgentTaskParentSession::Unbound(reason) => Some(json!({"bound": false, "reason": reason})),
+        AgentTaskParentSession::Unbound(reason) => {
+            let mut fact = json!({"bound": false, "reason": reason});
+            if let Some(diagnostic) = diagnostic {
+                fact["diagnostic"] = diagnostic;
+            }
+            Some(fact)
+        }
         AgentTaskParentSession::Replay => result.get("task").map(|task| {
             if task
                 .get("parent_session_ref")
@@ -261,6 +268,71 @@ fn agent_task_parent_session_fact(
             }
         }),
     }
+}
+
+fn source_turn_unbound_diagnostic(
+    context: &RuntimeContext<'_>,
+    binding: &AgentTaskParentSession,
+    params: &Value,
+) -> Option<Value> {
+    let AgentTaskParentSession::Unbound(reason) = binding else {
+        return None;
+    };
+    if !matches!(
+        *reason,
+        "source_turn_not_found"
+            | "source_turn_ambiguous"
+            | "source_turn_stale"
+            | "caller_session_conflict"
+            | "grant_missing"
+            | "provider_generation_unknown"
+            | "session_account_unavailable"
+            | "binding_failed"
+    ) {
+        return None;
+    }
+    let current_user_message = params
+        .get("current_user_message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())?;
+    let canonical = canonical_source_turn_text(current_user_message);
+    let digest = source_turn_sha256(current_user_message);
+    let latest = match (
+        context.caller_webchat_authorization,
+        context.caller_browser_session,
+    ) {
+        (Some(authorization), Some(caller_session)) => {
+            let Ok(mut store) = context.state_store.lock() else {
+                return Some(json!({
+                    "canonical_prefix": canonical.chars().take(24).collect::<String>(),
+                    "canonical_sha256_prefix": digest[..12].to_owned(),
+                    "latest_source_turn_sha256_prefix": Value::Null,
+                }));
+            };
+            match store
+                .resolve_browser_caller_session(
+                    &authorization.principal_ref,
+                    &caller_session.provider,
+                    &caller_session.opaque_session_id,
+                )
+                .ok()
+                .flatten()
+            {
+                Some(session_ref) => store
+                    .latest_browser_source_turn_sha256(&session_ref, browser_epoch_ms())
+                    .ok()
+                    .flatten(),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    Some(json!({
+        "canonical_prefix": canonical.chars().take(24).collect::<String>(),
+        "canonical_sha256_prefix": digest[..12].to_owned(),
+        "latest_source_turn_sha256_prefix": latest.map(|value| value[..12].to_owned()),
+    }))
 }
 
 /// Map one fail-closed store error from the source-turn evidence path onto the
@@ -812,7 +884,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &prompt_params,
                     parent_session_ref.as_deref(),
                 );
-                if let Some(fact) = agent_task_parent_session_fact(&binding, &result)
+                let diagnostic = source_turn_unbound_diagnostic(context, &binding, &params);
+                if let Some(fact) = agent_task_parent_session_fact(&binding, &result, diagnostic)
                     && let Some(object) = result.as_object_mut()
                 {
                     object.insert("parent_session".to_owned(), fact);
@@ -6234,13 +6307,10 @@ pub(crate) fn browser_sha256(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-/// App-name tokens ChatGPT renders for a Herdr app mention. Only an explicit
-/// `@`-prefixed mention (`@herdr`, `@herdr-mcp`, `@herdr_mcp`) is dropped: the
-/// extension emits a mention chip as `@name`, and the model either echoes that
-/// or drops the mention. A bare `herdr` word is ordinary user text and stays
-/// identity, so `archive herdr conversation` never collides with
-/// `archive conversation`.
-const SOURCE_TURN_APP_MENTION_TOKENS: &[&str] = &["herdr", "herdr-mcp", "herdr_mcp"];
+/// App-name tokens ChatGPT renders for a Herdr app mention are recognized at
+/// the leading edge with an optional `@` or
+/// `$` prefix, while whole `@name` tokens remain recognized anywhere in text.
+const SOURCE_TURN_APP_MENTION_TOKENS: &[&str] = &["herdr-mcp", "herdr_mcp", "herdr"];
 
 /// Domain separator for source-turn digests. Digests written before canonical
 /// source-turn text (#741), including raw-text archive intents and rows an
@@ -6259,16 +6329,40 @@ const SOURCE_TURN_DIGEST_DOMAIN: &[u8] = b"\xffherdr-mcp/source-turn/v2\n";
 /// The DOM observation (`source_turn.observe`), the runtime-settled dispatch
 /// turn, the WebChat `agent.task.dispatch` binding, and the archive
 /// current-turn path must hash the same text, but each surface renders the
-/// same turn slightly differently. Canonicalization therefore: applies Unicode
-/// NFC, treats NBSP/BOM as whitespace, drops whole `@herdr` / `@herdr-mcp` /
-/// `@herdr_mcp` app-mention tokens (case-insensitive, `@` required), collapses
-/// whitespace runs to one space, and trims. Every other character, including
-/// full-width punctuation and bare `herdr` words, is preserved, so different
-/// user text still hashes differently.
+/// same turn slightly differently. Canonicalization therefore applies Unicode
+/// NFC, treats NBSP/BOM as whitespace, strips one or more leading app-mention
+/// renderings (`@name`, `$name`, or bare `name`) with an optional separator,
+/// unwraps one outer single- or triple-backtick fence, drops whole `@name`
+/// tokens anywhere, collapses whitespace runs to one space, and trims.
 pub(crate) fn canonical_source_turn_text(text: &str) -> String {
     let composed = icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(text);
-    composed
-        .replace(['\u{00a0}', '\u{feff}'], " ")
+    let normalized = composed.replace(['\u{00a0}', '\u{feff}'], " ");
+    let mut leading = normalized.as_str();
+    loop {
+        let candidate = leading.trim_start();
+        let Some(token_end) = leading_source_turn_mention_end(candidate) else {
+            leading = candidate;
+            break;
+        };
+        let mut remainder = &candidate[token_end..];
+        remainder = remainder.trim_start();
+        if let Some(separator) = remainder.chars().next()
+            && source_turn_mention_separator(separator)
+        {
+            remainder = remainder[separator.len_utf8()..].trim_start();
+        }
+        leading = remainder;
+    }
+    let leading = leading.trim();
+    let unwrapped = if leading.len() >= 6 && leading.starts_with("```") && leading.ends_with("```")
+    {
+        leading[3..leading.len() - 3].trim()
+    } else if leading.len() >= 2 && leading.starts_with('`') && leading.ends_with('`') {
+        leading[1..leading.len() - 1].trim()
+    } else {
+        leading
+    };
+    unwrapped
         .split_whitespace()
         .filter(|token| {
             let Some(name) = token.strip_prefix('@') else {
@@ -6280,6 +6374,29 @@ pub(crate) fn canonical_source_turn_text(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn source_turn_mention_separator(character: char) -> bool {
+    character.is_whitespace() || matches!(character, ':' | '：' | ',' | '，' | '-' | '—')
+}
+
+fn leading_source_turn_mention_end(text: &str) -> Option<usize> {
+    let (prefix_len, candidate) = match text.chars().next() {
+        Some('@' | '$') => (1, &text[1..]),
+        _ => (0, text),
+    };
+    SOURCE_TURN_APP_MENTION_TOKENS.iter().find_map(|name| {
+        let name_len = name.len();
+        let candidate_name = candidate.get(..name_len)?;
+        if !candidate_name.eq_ignore_ascii_case(name) {
+            return None;
+        }
+        let next = candidate[name_len..].chars().next();
+        if next.is_some_and(|character| !source_turn_mention_separator(character)) {
+            return None;
+        }
+        Some(prefix_len + name_len)
+    })
 }
 
 /// Domain-separated SHA-256 of [`canonical_source_turn_text`]: the durable
@@ -12366,19 +12483,37 @@ mod tests {
             canonical_source_turn_text("cafe\u{301}"),
             canonical_source_turn_text("caf\u{e9}")
         );
-        // Only whole `@`-prefixed mention tokens are dropped; bare words and
-        // punctuation are identity.
+        // Leading mention renderings are dropped with their optional separator,
+        // while unrelated words and mid-text bare names remain identity.
         assert_eq!(canonical_source_turn_text("herdrx 看看"), "herdrx 看看");
-        assert_eq!(canonical_source_turn_text("@herdr-mcp:"), "@herdr-mcp:");
+        assert_eq!(canonical_source_turn_text("@herdr-mcp:"), "");
         assert_eq!(
             canonical_source_turn_text("herdr-mcp  用 dispatch"),
-            "herdr-mcp 用 dispatch"
+            "用 dispatch"
         );
         assert_ne!(
             source_turn_sha256("archive herdr conversation"),
             source_turn_sha256("archive conversation"),
-            "a bare herdr word is user text, never a dropped mention"
+            "a bare herdr word in the middle is user text"
         );
+        let leading_variants = [
+            "@herdr-mcp X",
+            "$herdr-mcp X",
+            "herdr-mcp X",
+            "herdr X",
+            "HERDR_MCP X",
+            "herdr-mcp: X",
+            "herdr-mcp：X",
+            "herdr-mcp\nX",
+            " herdr-mcp `X` ",
+            "@herdr $HERDR_MCP: `X`",
+            "@herdr @herdr_mcp X",
+            "`X`",
+            "```X```",
+        ];
+        for variant in leading_variants {
+            assert_eq!(canonical_source_turn_text(variant), "X", "{variant:?}");
+        }
         assert_ne!(
             canonical_source_turn_text("派发：回复"),
             canonical_source_turn_text("派发:回复")
@@ -12409,10 +12544,17 @@ mod tests {
                 "{message:?}"
             );
         }
-        for message in ["@herdr 归档", "herdr", "herdr-mcp"] {
+        for message in ["@herdr 归档", "herdr 归档"] {
             assert_eq!(
                 current_user_message_param(&json!({ "current_user_message": message })),
                 Ok(Some(message))
+            );
+        }
+        for message in ["herdr-mcp", "$HERDR_MCP:"] {
+            assert_eq!(
+                current_user_message_param(&json!({ "current_user_message": message })),
+                Err(()),
+                "{message:?}"
             );
         }
     }

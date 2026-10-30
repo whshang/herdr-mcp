@@ -4021,6 +4021,33 @@ impl StateStore {
         }
     }
 
+    /// Return the latest canonical source-turn digest for one already-resolved
+    /// browser session. The caller must establish ownership of `session_ref`
+    /// through a durable caller-session mapping before using this method.
+    pub fn latest_browser_source_turn_sha256(
+        &mut self,
+        session_ref: &str,
+        now: i64,
+    ) -> Result<Option<String>, String> {
+        validate_browser_resource_ref(session_ref)?;
+        if now < 0 {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+        self.prune_browser_source_turns(now)?;
+        self.conn
+            .query_row(
+                "SELECT CASE WHEN canonical_user_text_sha256 = user_text_sha256
+                        THEN user_text_sha256 ELSE '' END
+                 FROM browser_source_turns
+                 WHERE session_ref = ?1 AND observed_at <= ?2",
+                params![session_ref, now],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|digest| digest.filter(|value| !value.is_empty()))
+            .map_err(|error| format!("cannot read latest browser source turn: {error}"))
+    }
+
     pub fn reserve_browser_session_archive_intent(
         &mut self,
         session_ref: &str,
