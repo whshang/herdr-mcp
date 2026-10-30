@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.228";
+const H2W_CONTENT_VERSION = "0.1.229";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -517,13 +517,34 @@ function normalizeHerdrMentionAlias(value) {
     if (el.value != null && el.tagName !== "DIV") return String(el.value);
     return String(el.innerText || el.textContent || "");
   }
-  function composerModelVisibleText() {
+  function composerModelVisibleSample() {
     const el = ADAPTER.getInputEl();
-    if (!el) return "";
+    if (!el) return { text: "", mentions: [] };
     if (ADAPTER.name === "chatgpt" && BROWSER_PERFORMANCE?.sampleChatGptModelMessageText) {
-      return String(BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el).text || "").trim();
+      const sample = BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el);
+      return {
+        text: String(sample?.text || "").trim(),
+        mentions: Array.isArray(sample?.app_mentions) ? sample.app_mentions : [],
+      };
     }
-    return composerTextRaw().trim();
+    return { text: composerTextRaw().trim(), mentions: [] };
+  }
+  function composerModelVisibleText() {
+    return composerModelVisibleSample().text;
+  }
+  // A Herdr App mention (by provider name or the chip's own label) is dropped
+  // from the source-turn text sent to the Runtime: the Runtime digest drops
+  // `@herdr` / `@herdr-mcp` / `@herdr_mcp` anyway, while a chip rendered under
+  // another name or label would otherwise never match current_user_message
+  // (#754). Other Apps keep their `@name` form.
+  function isHerdrAppMention(mention) {
+    const names = new Set(["herdr", "herdr-mcp", "herdr_mcp"]);
+    let registered = "";
+    try { registered = normalizeHerdrMentionAlias(registeredHerdrAppKeyword || "").toLowerCase(); } catch (_) {}
+    if (registered) names.add(registered);
+    return [mention?.name, mention?.label].some((value) => names.has(
+      normalizeHerdrMentionAlias(value || "").toLowerCase(),
+    ));
   }
   function composerNorm() { return normText(composerTextRaw()); }
   function composerHasSameWake(text) {
@@ -1588,11 +1609,11 @@ function normalizeHerdrMentionAlias(value) {
     return role === "user" ? latestTurns.user : latestTurns.assistant;
   }
 
-  function sampleLatestMessageText(el, { modelVisibleUser = false } = {}) {
+  function sampleLatestMessageText(el, { modelVisibleUser = false, omitAppMention = null } = {}) {
     if (!el) return { text: "", total_chars: 0, truncated: false };
     el = userTurnTextRoot(el);
     if (modelVisibleUser && BROWSER_PERFORMANCE?.sampleChatGptModelMessageText) {
-      return BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el);
+      return BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el, { omitAppMention });
     }
     if (BROWSER_PERFORMANCE?.sampleBoundedMessageText) {
       return BROWSER_PERFORMANCE.sampleBoundedMessageText(el);
@@ -5856,16 +5877,27 @@ function normalizeHerdrMentionAlias(value) {
     let sawGrowth = false;
     let startedAt = 0;
     let userTextAtStart = "";
+    let userMentionsAtStart = [];
     // Module-level latest-turn cache is authoritative while this watcher runs.
     latestTurnCacheActive = true;
     const roleSnapshot = (role) => {
       const el = latestTurnForRole(role);
       const sample = sampleLatestMessageText(el, { modelVisibleUser: role === "user" });
+      const appMentions = Array.isArray(sample.app_mentions) ? sample.app_mentions : [];
+      let sourceTurnText = "";
+      if (role === "user" && appMentions.some(isHerdrAppMention)) {
+        sourceTurnText = String(sampleLatestMessageText(el, {
+          modelVisibleUser: true,
+          omitAppMention: isHerdrAppMention,
+        }).text || "").trim();
+      }
       return {
         count: role === "user" ? latestTurns.userCount : latestTurns.assistantCount,
         text: sample.text,
         totalChars: sample.total_chars,
         truncated: sample.truncated,
+        appMentions,
+        sourceTurnText,
       };
     };
     const initialUser = roleSnapshot("user");
@@ -5898,6 +5930,7 @@ function normalizeHerdrMentionAlias(value) {
         observedSubmitAt = submitAt;
         startedAt = submitAt;
         userTextAtStart = "";
+        userMentionsAtStart = [];
         lastReportedTurnKey = "";
       }
       return submitAt;
@@ -5931,8 +5964,23 @@ function normalizeHerdrMentionAlias(value) {
       return true;
     };
 
+    // Whether the latest user bubble is the message just submitted (#754).
+    // The composer chip and the accepted bubble chip can render one App
+    // mention differently (`@<app-mention-name>` vs the chip label), so the
+    // check also accepts both texts once every App mention seen on either
+    // side is removed. Plain text keeps the exact 160-char containment check.
+    const pendingUserTextMatches = (expectedUser, bubbleText, bubbleMentions = []) => {
+      const mentions = [...userMentionsAtStart, ...(Array.isArray(bubbleMentions) ? bubbleMentions : [])];
+      if (typeof BROWSER_PERFORMANCE?.sourceTurnTextConfirmsPending === "function") {
+        return BROWSER_PERFORMANCE.sourceTurnTextConfirmsPending(expectedUser, bubbleText, mentions);
+      }
+      return Boolean(expectedUser && bubbleText)
+        && (bubbleText.includes(expectedUser.slice(0, 160)) || expectedUser.includes(bubbleText.slice(0, 160)));
+    };
+
     const noteTrustedManualSubmit = () => {
-      const text = composerModelVisibleText();
+      const composerSample = composerModelVisibleSample();
+      const text = composerSample.text;
       if (!text || !CONVERSATION_HEALTH || !conversationHealth) {
         const reason = !text ? "empty composer text"
           : (!CONVERSATION_HEALTH ? "conversation health unavailable" : "empty conversationHealth");
@@ -5944,6 +5992,7 @@ function normalizeHerdrMentionAlias(value) {
       observedSubmitAt = at;
       startedAt = at;
       userTextAtStart = text;
+      userMentionsAtStart = composerSample.mentions.slice(0, 16);
       lastReportedTurnKey = "";
     };
 
@@ -6108,8 +6157,7 @@ function normalizeHerdrMentionAlias(value) {
         const confirmedPendingUser = submitAt > 0
           && Date.now() - submitAt <= 30000
           && expectedUser
-          && (comparableCurrentUser.includes(expectedUser.slice(0, 160))
-            || expectedUser.includes(comparableCurrentUser.slice(0, 160)));
+          && pendingUserTextMatches(expectedUser, comparableCurrentUser, currentUser.appMentions);
         const journalKey = `${submitAt}`;
         if (!confirmedPendingUser && submitAt > 0 && journalKey !== lastStartedJournalKey) {
           const reason = Date.now() - submitAt > 30000 ? "stale submit anchor"
@@ -6122,7 +6170,7 @@ function normalizeHerdrMentionAlias(value) {
             type: "h2w_turn_started",
             convKey: ADAPTER.getConversationKey(),
             startedAt: submitAt,
-            userText: currentUserText,
+            userText: currentUser.sourceTurnText || currentUserText,
           });
         }
         lastUserSignature = currentUserSignature;

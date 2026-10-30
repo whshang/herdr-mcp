@@ -185,7 +185,13 @@ function elementNode(children = [], attrs = {}) {
         const mention = child.getAttribute("data-appearance") === "inline-mention"
           && child.getAttribute("app-mention-name") !== null
           && child.getAttribute("app-mention-path") !== null;
-        if ((wantsLegacyPill && legacy) || (wantsInlineMention && mention)) return child;
+        const promptLink = child.getAttribute("data-appearance") === "inline-mention"
+          && String(child.getAttribute("data-prompt-link-href") || "").startsWith("app://")
+          && child.getAttribute("data-prompt-link-label") !== null;
+        const wantsPromptLink = selector.includes("[data-prompt-link-href");
+        if ((wantsLegacyPill && legacy)
+          || (wantsInlineMention && !wantsPromptLink && mention)
+          || (wantsPromptLink && promptLink)) return child;
         stack.push(...child.childNodes);
       }
       return null;
@@ -215,4 +221,131 @@ test("user App mention in a bubble is observed as the model sees it | Given a us
   });
   const plainRoot = elementNode([lookalike, textNode(" 用 dispatch")]);
   assert.equal(perf.sampleChatGptModelMessageText(plainRoot).text, "herdr-mcp 用 dispatch");
+});
+
+// #754: the composer chip and the accepted bubble chip can render one App
+// mention differently. Before the fix the capture check compared the two
+// raw samples with a 160-char containment test, so a mismatch silently
+// skipped source_turn.observe and dispatch later reported source_turn_not_found.
+const legacyCaptureCheck = (expected, bubble) => {
+  const norm = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const e = norm(expected);
+  const b = norm(bubble);
+  return Boolean(e && b) && (b.includes(e.slice(0, 160)) || e.includes(b.slice(0, 160)));
+};
+const MESSAGE = "用 agent.task.dispatch 派发一个任务给 report-review：回复 OK 即可，不要改任何文件";
+
+test("user manual @herdr-mcp send is captured when composer and bubble chips differ | Given a composer App chip and an accepted bubble chip rendered with different names or labels | When the submit-to-bubble capture check runs | Then the turn is confirmed while different text is still refused", () => {
+  const perf = loadBrowserPerformance();
+  const composerChip = elementNode([textNode("\uFEFFherdr-mcp\uFEFF")], {
+    "data-appearance": "inline-mention",
+    "app-mention-name": "herdr",
+    "app-mention-path": "connectors/herdr",
+  });
+  const composer = perf.sampleChatGptModelMessageText(elementNode([composerChip, textNode(`\u00A0${MESSAGE}`)]));
+  assert.equal(composer.text, `@herdr ${MESSAGE}`);
+  assert.deepEqual(JSON.parse(JSON.stringify(composer.app_mentions)), [{ name: "herdr", label: "herdr-mcp" }]);
+
+  const bubbles = {
+    // Bubble chip without a provider path: sampled as its visible label.
+    pathless: elementNode([elementNode([textNode("herdr-mcp")], {
+      "data-appearance": "inline-mention",
+      "app-mention-name": "herdr-mcp",
+    }), textNode(`  ${MESSAGE}`)]),
+    // Bubble chip carrying a different provider name than the composer chip.
+    renamed: elementNode([elementNode([textNode("herdr-mcp")], {
+      "data-appearance": "inline-mention",
+      "app-mention-name": "herdr-mcp",
+      "app-mention-path": "connectors/herdr-mcp",
+    }), textNode(` ${MESSAGE}`)]),
+  };
+  for (const [kind, root] of Object.entries(bubbles)) {
+    const bubble = perf.sampleChatGptModelMessageText(root);
+    const mentions = [...composer.app_mentions, ...(bubble.app_mentions || [])];
+    assert.equal(legacyCaptureCheck(composer.text, bubble.text), false, `${kind}: the pre-#754 check dropped this turn`);
+    assert.equal(perf.sourceTurnTextConfirmsPending(composer.text, bubble.text, mentions), true, `${kind}: confirmed`);
+  }
+
+  assert.equal(perf.sourceTurnTextConfirmsPending(composer.text, `@herdr-mcp 用 dispatch 派发别的任务`, composer.app_mentions), false);
+  assert.equal(perf.sourceTurnTextConfirmsPending("@herdr_mcp", "@herdr-mcp", composer.app_mentions), false, "mention-only never confirms through the loose form");
+  assert.equal(perf.sourceTurnTextConfirmsPending("你好，请只回复 OK", "你好，请只回复 OK", []), true, "plain text keeps the exact check");
+});
+
+test("user source turn text matches the Runtime digest of current_user_message | Given an accepted bubble with a Herdr App chip under any name and another App chip | When the source-turn text is sampled with Herdr mentions omitted | Then only the Herdr mention is dropped", () => {
+  const perf = loadBrowserPerformance();
+  const herdrChip = elementNode([textNode("herdr-mcp")], {
+    "data-appearance": "inline-mention",
+    "app-mention-name": "connector_68abc",
+    "app-mention-path": "connectors/connector_68abc",
+  });
+  const otherChip = elementNode([textNode("GitHub")], {
+    "data-appearance": "inline-mention",
+    "app-mention-name": "github",
+    "app-mention-path": "connectors/github",
+  });
+  const root = elementNode([herdrChip, textNode(` ${MESSAGE} `), otherChip, textNode(" 看看")]);
+  const isHerdr = ({ name, label }) => [name, label].some((value) => ["herdr", "herdr-mcp", "herdr_mcp"].includes(String(value).toLowerCase()));
+  const sample = perf.sampleChatGptModelMessageText(root, { omitAppMention: isHerdr });
+  assert.equal(sample.text.replace(/\s+/g, " "), `${MESSAGE} @github 看看`);
+  // The Runtime drops "@herdr-mcp" from current_user_message before hashing,
+  // so the model's copy and this observed text canonicalize to one digest.
+  const runtimeCanonical = (text) => text.split(/\s+/).filter((token) => token && !/^@(herdr|herdr-mcp|herdr_mcp)$/i.test(token)).join(" ");
+  assert.equal(runtimeCanonical(sample.text), runtimeCanonical(`@herdr-mcp ${MESSAGE} @github 看看`));
+
+  const wakeSource = readFileSync(new URL("../extension/content/wake.js", import.meta.url), "utf8");
+  assert.match(wakeSource, /BROWSER_PERFORMANCE\.sourceTurnTextConfirmsPending\(expectedUser, bubbleText, mentions\)/);
+  assert.match(wakeSource, /pendingUserTextMatches\(expectedUser, comparableCurrentUser, currentUser\.appMentions\)/);
+  assert.match(wakeSource, /userText: currentUser\.sourceTurnText \|\| currentUserText/);
+});
+
+// #754 live MBP evidence (ego-browser, 2026-10-30): the composer chip carries
+// app-mention-name/app-mention-path, but the accepted user bubble renders the
+// same App only as a prompt link (data-prompt-link-href="app://<id>",
+// data-prompt-link-label="$herdr-mcp") inside an <a>. Before this fix the
+// bubble sampled as "herdr-mcp …" with no app_mentions, so the source-turn
+// text kept a bare "herdr-mcp" token that the Runtime digest does not drop.
+test("user accepted bubble prompt-link chip is a Herdr App mention | Given the live 2026-10 bubble chip without app-mention attributes | When the model-visible sampler reads it | Then it is @herdr-mcp, omitted from the source-turn text and confirms the composer text", () => {
+  const perf = loadBrowserPerformance();
+  const APP = "app://asdk_app_6acf8e6a3620819185cc77a5bc35faed";
+  const label = elementNode([textNode("herdr-mcp")], { class: "Label-arpLwJ" });
+  const icon = elementNode([elementNode([], { alt: "" })], { class: "IconContainer-K62H88" });
+  const bubbleChip = elementNode([icon, label], {
+    "data-prompt-link-href": APP,
+    "data-prompt-link-label": "$herdr-mcp",
+    "data-appearance": "inline-mention",
+    "data-layout": "selection-pill",
+  });
+  const bubbleRoot = elementNode([elementNode([elementNode([
+    elementNode([bubbleChip], { href: "/plugins/plugin_asdk_app_6acf8e6a3620819185cc77a5bc35faed" }),
+    elementNode([textNode(`\` ${MESSAGE}`)]),
+    elementNode([textNode("`")]),
+  ])])]);
+  const bubble = perf.sampleChatGptModelMessageText(bubbleRoot);
+  assert.equal(bubble.text, `@herdr-mcp \` ${MESSAGE}\``);
+  assert.deepEqual(JSON.parse(JSON.stringify(bubble.app_mentions)), [{ name: "herdr-mcp", label: "herdr-mcp" }]);
+
+  const composerChip = elementNode([textNode("herdr-mcp")], {
+    "app-mention-name": "herdr-mcp",
+    "app-mention-path": APP,
+    "data-prompt-link-href": APP,
+    "data-prompt-link-label": "$herdr-mcp",
+    "data-appearance": "inline-mention",
+    "data-layout": "inline-flow",
+  });
+  const composer = perf.sampleChatGptModelMessageText(elementNode([elementNode([composerChip, textNode(`  \` ${MESSAGE}\``)])]));
+  assert.equal(composer.text, `@herdr-mcp \` ${MESSAGE}\``);
+  assert.equal(perf.sourceTurnTextConfirmsPending(composer.text, bubble.text, [...composer.app_mentions, ...bubble.app_mentions]), true);
+
+  const isHerdr = ({ name, label }) => [name, label].some((value) => ["herdr", "herdr-mcp", "herdr_mcp"].includes(String(value).toLowerCase()));
+  const sourceTurn = perf.sampleChatGptModelMessageText(bubbleRoot, { omitAppMention: isHerdr }).text;
+  const runtimeCanonical = (text) => text.split(/\s+/).filter((token) => token && !/^@(herdr|herdr-mcp|herdr_mcp)$/i.test(token)).join(" ");
+  assert.equal(runtimeCanonical(sourceTurn), runtimeCanonical(`@herdr-mcp \` ${MESSAGE}\``));
+
+  // Without a provider app:// href the prompt-link span stays plain text.
+  const lookalike = elementNode([textNode("herdr-mcp")], {
+    "data-appearance": "inline-mention",
+    "data-prompt-link-href": "https://example.com",
+    "data-prompt-link-label": "$herdr-mcp",
+  });
+  assert.equal(perf.sampleChatGptModelMessageText(elementNode([lookalike, textNode(" 用 dispatch")])).text, "herdr-mcp 用 dispatch");
 });

@@ -3741,7 +3741,7 @@ test("user records a fast-settled ChatGPT turn | Given a fresh submit anchor and
     "markLatestTurnsDirty", "settleTimer", "clearInterval", "syncPendingSubmitAnchor",
     "isComposerGenerating", "wasStopping", "roleSnapshot", "assistantSignature", "lastUserSignature",
     "lastUserCount", "normText", "pendingUserTextHint", "hasPendingReply", "lastStartedJournalKey",
-    "sendBg", "ADAPTER", "Date",
+    "sendBg", "ADAPTER", "Date", "pendingUserTextMatches",
     onTickSource,
   )(
     { hidden: false }, null, () => "conversation", false, false, 0, () => {}, null, () => {},
@@ -3750,6 +3750,7 @@ test("user records a fast-settled ChatGPT turn | Given a fresh submit anchor and
     (value) => String(value ?? "").trim().toLowerCase(), "previous user turn", 1,
     (value) => String(value ?? "").trim().toLowerCase(), () => "accepted prompt", () => false, "",
     (message) => { sent.push(message); }, { getConversationKey: () => conversationUrl }, Date,
+    (expected, bubble) => bubble.includes(expected.slice(0, 160)) || expected.includes(bubble.slice(0, 160)),
   );
 
   onTick();

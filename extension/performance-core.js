@@ -267,6 +267,7 @@
     maxChars = DEFAULT_MESSAGE_SAMPLE_CHARS,
     tailChars = DEFAULT_MESSAGE_TAIL_CHARS,
     ignoredSelector = DEFAULT_IGNORED_MESSAGE_TEXT_SELECTOR,
+    omitAppMention = null,
   } = {}) {
     if (!root) return sampleBoundedMessageText(root, { maxChars, tailChars, ignoredSelector });
 
@@ -282,6 +283,15 @@
       if (element.getAttribute("data-appearance") === "inline-mention"
         && String(element.getAttribute("app-mention-path") || "").trim() !== "") {
         const name = String(element.getAttribute("app-mention-name") || "").trim();
+        if (name) return name;
+      }
+      // Accepted user bubbles (2026-10) render the same App chip without the
+      // app-mention-* attributes, only as a prompt link: data-prompt-link-href
+      // "app://<id>" plus data-prompt-link-label "$<name>" (#754). The app://
+      // href is provider-owned, so plain text still never qualifies.
+      if (element.getAttribute("data-appearance") === "inline-mention"
+        && /^app:\/\/\S/.test(String(element.getAttribute("data-prompt-link-href") || "").trim())) {
+        const name = String(element.getAttribute("data-prompt-link-label") || "").trim().replace(/^[$@]+/, "").trim();
         return name || null;
       }
       return null;
@@ -295,6 +305,13 @@
         hasInlinePill = Boolean(root.querySelector(
           '[data-appearance="inline-mention"][app-mention-name][app-mention-path]',
         ));
+      } catch (_) {}
+    }
+    if (!hasInlinePill && typeof root.querySelector === "function") {
+      try {
+        hasInlinePill = Boolean(inlinePillKeyword(root.querySelector(
+          '[data-appearance="inline-mention"][data-prompt-link-href^="app://"][data-prompt-link-label]',
+        )));
       } catch (_) {}
     }
     if (!hasInlinePill) {
@@ -350,6 +367,23 @@
       emit(`@${keyword}`);
       afterInlinePill = true;
     };
+    // Every App mention seen (name + the chip's own visible label) is
+    // reported so callers can compare two renderings of one message (#754).
+    // `omitAppMention({ name, label })` drops a mention from the text.
+    const appMentions = [];
+    const mentionLabel = (element) => {
+      const parts = [];
+      const pending = [element];
+      while (pending.length > 0 && parts.length < 64) {
+        const current = pending.pop();
+        if (!current) continue;
+        if (current.nodeType === 3) { parts.push(String(current.nodeValue || "")); continue; }
+        const kids = current.childNodes;
+        if (!kids) continue;
+        for (let index = kids.length - 1; index >= 0; index -= 1) pending.push(kids[index]);
+      }
+      return parts.join("").replace(/\s+/g, " ").trim().slice(0, 120);
+    };
 
     while (stack.length > 0) {
       const node = stack.pop();
@@ -374,6 +408,17 @@
       }
       const keyword = inlinePillKeyword(element);
       if (keyword) {
+        const mention = { name: keyword, label: mentionLabel(element) };
+        if (appMentions.length < 16) appMentions.push(mention);
+        let omit = false;
+        if (typeof omitAppMention === "function") {
+          try { omit = Boolean(omitAppMention(mention)); } catch (_) { omit = false; }
+        }
+        if (omit) {
+          // Leave a separator so the neighbouring words never fuse.
+          if (totalChars > 0 || pendingWhitespace) pendingWhitespace = pendingWhitespace || " ";
+          continue;
+        }
         emitInlinePill(keyword);
         continue;
       }
@@ -390,6 +435,7 @@
         truncated: false,
         text_nodes: textNodes,
         skipped_subtrees: skippedSubtrees,
+        app_mentions: appMentions,
       };
     }
     const headLimit = Math.max(0, limit - tailLimit - marker.length);
@@ -399,7 +445,69 @@
       truncated: true,
       text_nodes: textNodes,
       skipped_subtrees: skippedSubtrees,
+      app_mentions: appMentions,
     };
+  }
+
+  // App mention tokens the Runtime drops from source-turn digests
+  // (mcp::canonical_source_turn_text, which requires the leading "@").
+  const SOURCE_TURN_APP_MENTION_TOKENS = ["herdr", "herdr-mcp", "herdr_mcp"];
+
+  /**
+   * Mention-insensitive comparison form of one user message (#754). The
+   * composer and the accepted bubble may render the same App chip
+   * differently (`@<app-mention-name>`, the chip's visible label, or a plain
+   * span), so both sides drop Herdr mention tokens and every label/name in
+   * `mentions` (with or without "@"), apply NFC, drop zero-width characters
+   * and collapse whitespace. Only used to confirm that a bubble is the message
+   * the user just submitted; it is never sent anywhere.
+   */
+  function sourceTurnComparableText(text, mentions = []) {
+    let value = String(text || "");
+    try { value = value.normalize("NFC"); } catch (_) {}
+    value = ` ${value.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").replace(/\s+/g, " ").trim()} `;
+    const words = new Set(SOURCE_TURN_APP_MENTION_TOKENS);
+    const phrases = [];
+    for (const mention of Array.isArray(mentions) ? mentions : []) {
+      for (const raw of [mention?.name, mention?.label]) {
+        const phrase = String(raw || "").replace(/\s+/g, " ").trim().replace(/^@+/, "").toLowerCase();
+        if (!phrase) continue;
+        if (phrase.includes(" ")) phrases.push(phrase);
+        else words.add(phrase);
+      }
+    }
+    phrases.sort((a, b) => b.length - a.length);
+    let lower = value.toLowerCase();
+    for (const phrase of phrases) {
+      for (const candidate of [` @${phrase} `, ` ${phrase} `]) {
+        let at = lower.indexOf(candidate);
+        while (at >= 0) {
+          value = `${value.slice(0, at)} ${value.slice(at + candidate.length - 1)}`;
+          lower = value.toLowerCase();
+          at = lower.indexOf(candidate);
+        }
+      }
+    }
+    return value
+      .split(" ")
+      .filter((token) => token && !words.has(token.replace(/^@+/, "").toLowerCase()))
+      .join(" ");
+  }
+
+  /**
+   * Whether the latest user bubble is the message just submitted from the
+   * composer. Keeps the original exact 160-char containment check and adds
+   * the same check on the mention-insensitive form of both sides (#754).
+   */
+  function sourceTurnTextConfirmsPending(expectedText, bubbleText, mentions = []) {
+    const contains = (expected, bubble) => Boolean(expected && bubble)
+      && (bubble.includes(expected.slice(0, 160)) || expected.includes(bubble.slice(0, 160)));
+    const norm = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    if (contains(norm(expectedText), norm(bubbleText))) return true;
+    return contains(
+      sourceTurnComparableText(expectedText, mentions),
+      sourceTurnComparableText(bubbleText, mentions),
+    );
   }
 
   /**
@@ -661,6 +769,8 @@
     mutationTouchesConversationTurns,
     sampleBoundedMessageText,
     sampleChatGptModelMessageText,
+    sourceTurnComparableText,
+    sourceTurnTextConfirmsPending,
     createUiPressureMeter,
     classifyUiPressure,
     classifyMemoryPressure,
