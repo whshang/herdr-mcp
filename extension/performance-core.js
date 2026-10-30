@@ -283,6 +283,15 @@
       if (element.getAttribute("data-appearance") === "inline-mention"
         && String(element.getAttribute("app-mention-path") || "").trim() !== "") {
         const name = String(element.getAttribute("app-mention-name") || "").trim();
+        if (name) return name;
+      }
+      // Accepted user bubbles (2026-10) render the same App chip without the
+      // app-mention-* attributes, only as a prompt link: data-prompt-link-href
+      // "app://<id>" plus data-prompt-link-label "$<name>" (#754). The app://
+      // href is provider-owned, so plain text still never qualifies.
+      if (element.getAttribute("data-appearance") === "inline-mention"
+        && /^app:\/\/\S/.test(String(element.getAttribute("data-prompt-link-href") || "").trim())) {
+        const name = String(element.getAttribute("data-prompt-link-label") || "").trim().replace(/^[$@]+/, "").trim();
         return name || null;
       }
       return null;
@@ -296,6 +305,13 @@
         hasInlinePill = Boolean(root.querySelector(
           '[data-appearance="inline-mention"][app-mention-name][app-mention-path]',
         ));
+      } catch (_) {}
+    }
+    if (!hasInlinePill && typeof root.querySelector === "function") {
+      try {
+        hasInlinePill = Boolean(inlinePillKeyword(root.querySelector(
+          '[data-appearance="inline-mention"][data-prompt-link-href^="app://"][data-prompt-link-label]',
+        )));
       } catch (_) {}
     }
     if (!hasInlinePill) {

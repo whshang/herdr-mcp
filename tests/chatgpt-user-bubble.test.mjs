@@ -185,7 +185,13 @@ function elementNode(children = [], attrs = {}) {
         const mention = child.getAttribute("data-appearance") === "inline-mention"
           && child.getAttribute("app-mention-name") !== null
           && child.getAttribute("app-mention-path") !== null;
-        if ((wantsLegacyPill && legacy) || (wantsInlineMention && mention)) return child;
+        const promptLink = child.getAttribute("data-appearance") === "inline-mention"
+          && String(child.getAttribute("data-prompt-link-href") || "").startsWith("app://")
+          && child.getAttribute("data-prompt-link-label") !== null;
+        const wantsPromptLink = selector.includes("[data-prompt-link-href");
+        if ((wantsLegacyPill && legacy)
+          || (wantsInlineMention && !wantsPromptLink && mention)
+          || (wantsPromptLink && promptLink)) return child;
         stack.push(...child.childNodes);
       }
       return null;
@@ -290,4 +296,56 @@ test("user source turn text matches the Runtime digest of current_user_message |
   assert.match(wakeSource, /BROWSER_PERFORMANCE\.sourceTurnTextConfirmsPending\(expectedUser, bubbleText, mentions\)/);
   assert.match(wakeSource, /pendingUserTextMatches\(expectedUser, comparableCurrentUser, currentUser\.appMentions\)/);
   assert.match(wakeSource, /userText: currentUser\.sourceTurnText \|\| currentUserText/);
+});
+
+// #754 live MBP evidence (ego-browser, 2026-10-30): the composer chip carries
+// app-mention-name/app-mention-path, but the accepted user bubble renders the
+// same App only as a prompt link (data-prompt-link-href="app://<id>",
+// data-prompt-link-label="$herdr-mcp") inside an <a>. Before this fix the
+// bubble sampled as "herdr-mcp …" with no app_mentions, so the source-turn
+// text kept a bare "herdr-mcp" token that the Runtime digest does not drop.
+test("user accepted bubble prompt-link chip is a Herdr App mention | Given the live 2026-10 bubble chip without app-mention attributes | When the model-visible sampler reads it | Then it is @herdr-mcp, omitted from the source-turn text and confirms the composer text", () => {
+  const perf = loadBrowserPerformance();
+  const APP = "app://asdk_app_6acf8e6a3620819185cc77a5bc35faed";
+  const label = elementNode([textNode("herdr-mcp")], { class: "Label-arpLwJ" });
+  const icon = elementNode([elementNode([], { alt: "" })], { class: "IconContainer-K62H88" });
+  const bubbleChip = elementNode([icon, label], {
+    "data-prompt-link-href": APP,
+    "data-prompt-link-label": "$herdr-mcp",
+    "data-appearance": "inline-mention",
+    "data-layout": "selection-pill",
+  });
+  const bubbleRoot = elementNode([elementNode([elementNode([
+    elementNode([bubbleChip], { href: "/plugins/plugin_asdk_app_6acf8e6a3620819185cc77a5bc35faed" }),
+    elementNode([textNode(`\` ${MESSAGE}`)]),
+    elementNode([textNode("`")]),
+  ])])]);
+  const bubble = perf.sampleChatGptModelMessageText(bubbleRoot);
+  assert.equal(bubble.text, `@herdr-mcp \` ${MESSAGE}\``);
+  assert.deepEqual(JSON.parse(JSON.stringify(bubble.app_mentions)), [{ name: "herdr-mcp", label: "herdr-mcp" }]);
+
+  const composerChip = elementNode([textNode("herdr-mcp")], {
+    "app-mention-name": "herdr-mcp",
+    "app-mention-path": APP,
+    "data-prompt-link-href": APP,
+    "data-prompt-link-label": "$herdr-mcp",
+    "data-appearance": "inline-mention",
+    "data-layout": "inline-flow",
+  });
+  const composer = perf.sampleChatGptModelMessageText(elementNode([elementNode([composerChip, textNode(`  \` ${MESSAGE}\``)])]));
+  assert.equal(composer.text, `@herdr-mcp \` ${MESSAGE}\``);
+  assert.equal(perf.sourceTurnTextConfirmsPending(composer.text, bubble.text, [...composer.app_mentions, ...bubble.app_mentions]), true);
+
+  const isHerdr = ({ name, label }) => [name, label].some((value) => ["herdr", "herdr-mcp", "herdr_mcp"].includes(String(value).toLowerCase()));
+  const sourceTurn = perf.sampleChatGptModelMessageText(bubbleRoot, { omitAppMention: isHerdr }).text;
+  const runtimeCanonical = (text) => text.split(/\s+/).filter((token) => token && !/^@(herdr|herdr-mcp|herdr_mcp)$/i.test(token)).join(" ");
+  assert.equal(runtimeCanonical(sourceTurn), runtimeCanonical(`@herdr-mcp \` ${MESSAGE}\``));
+
+  // Without a provider app:// href the prompt-link span stays plain text.
+  const lookalike = elementNode([textNode("herdr-mcp")], {
+    "data-appearance": "inline-mention",
+    "data-prompt-link-href": "https://example.com",
+    "data-prompt-link-label": "$herdr-mcp",
+  });
+  assert.equal(perf.sampleChatGptModelMessageText(elementNode([lookalike, textNode(" 用 dispatch")])).text, "herdr-mcp 用 dispatch");
 });
