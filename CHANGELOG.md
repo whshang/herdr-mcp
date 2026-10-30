@@ -3,6 +3,9 @@
 ## Unreleased
 
 - **文档：明确只支持 Herdr TUI。** herdr-mcp 只驱动 Herdr TUI（`herdr` CLI 与 `herdr server`；CI 固定 `0.8.2`，上游当前 TUI 为 `0.9.5`）。新的 Herdr app 与 herdr-core（`hc`）是独立运行时、与 TUI 不共享 Agent，v1.1 不支持。Herdr 文档链接更新为 `https://herdr.dev/tui/docs/`；平台支持矩阵新增「Herdr 运行时支持」一节。仅文档变更，Runtime、contract 与扩展不变。
+- **Skill 指引：WebChat 绑定派发走 `agent.task.dispatch`。** 随附 Skill（`assets/herdr-mcp-SKILL.md`、`assets/herdr/AGENTS.md`、`agent-dispatch`）说明：需要绑定 WebChat 会话的派发使用 `herdr_call` → `herdr_mcp.agent.task.dispatch` 并传 `current_user_message`；`herdr_prompt` 从不绑定。 [PR #769](https://github.com/whshang/herdr-mcp/pull/769)
+- **Skill 指引：绑定只在承载聊天的设备上生效。** 来源轮次只写入承载该聊天浏览器的设备的 Runtime，派发到其他设备时绑定不会成功；Skill 要求派发到该设备。跨设备绑定跟踪见 #774 / #775。 [PR #773](https://github.com/whshang/herdr-mcp/pull/773)
+- **v1.1.0 发布说明草稿核对：** `docs/releases/v1.1.0.md` 补充 rc.3 – rc.6 的合入内容，state schema 更正为 16 并写明迁移不可降级、rc.1 – rc.5 需手动安装、v1.0.4 bridge 的 updater 不接纳 schema 16，移除已关闭的已知问题（#615 / #622 / #623 / #624），列出仍开放的 1.1 阻塞项。仅文档变更。
 
 ## v1.1.0-rc.6 — 2026-10-30
 
