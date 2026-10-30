@@ -4082,6 +4082,12 @@ impl StateStore {
 
     /// #771: whether this exact turn was recently delivered for a conversation
     /// that had no registered session. Only the dispatch diagnostic reads it.
+    ///
+    /// The key is provider plus canonical turn digest — the rejected observe
+    /// payload carries no endpoint or conversation, and Edge's session id is not
+    /// a `browser_resources` key — so another conversation's rejected turn with
+    /// the same canonical text also matches inside the TTL. That alias can only
+    /// change a `parent_session.reason`; it can never stamp or bind a task.
     pub fn browser_source_turn_unregistered(
         &mut self,
         provider: &str,

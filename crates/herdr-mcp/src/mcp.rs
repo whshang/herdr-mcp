@@ -389,10 +389,16 @@ fn source_turn_unbound_reason(error: &str) -> &'static str {
 /// runtime already received this exact turn and no session row existed for its
 /// conversation (the first message of a brand-new chat registers its
 /// `/c/<id>` session only after the send), the caller's source session is not
-/// registered yet and the model can act on that. Every other miss — a
-/// registered session whose turn digest differs, a stale generation, or a
-/// conversation whose session row exists but fails a fence — stays the generic
-/// `source_turn_not_found`.
+/// registered yet and the model can act on that.
+///
+/// The record is keyed by provider plus canonical turn digest, not by
+/// conversation or caller, so within its 10-minute window one rejected observe
+/// also relabels another conversation's miss of the same canonical text. That
+/// alias only ever changes this reason string: binding still needs an exact
+/// source turn, so the fact stays `bound:false` and no task is stamped. Every
+/// miss without a matching record — a registered session whose turn digest
+/// differs, a stale generation, a row that fails a fence, or expired evidence —
+/// stays the generic `source_turn_not_found`.
 fn source_turn_unbound_reason_for_caller(
     store: &mut StateStore,
     error: &str,
@@ -433,8 +439,14 @@ fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
 /// the dispatch is bound to its conversation and never switches to the
 /// evidence-based `agent.task.dispatch` path. Local/trusted callers have no
 /// WebChat conversation to bind, so they keep the unchanged result shape.
+///
+/// A returned task is authoritative: an idempotent replay reports the task that
+/// was actually stored, so the fact must not claim the mapping this call would
+/// have reused. Only a result without a `task` object (a validation or dispatch
+/// error) falls back to the live mapping.
 fn herdr_prompt_parent_session_fact(
     context: &RuntimeContext<'_>,
+    result: &Value,
     parent_session_ref: Option<&str>,
 ) -> Option<Value> {
     context.caller_webchat_authorization?;
@@ -442,15 +454,23 @@ fn herdr_prompt_parent_session_fact(
     if !webchat_adapter_binds_parent_session(&caller_session.provider) {
         return None;
     }
-    Some(match parent_session_ref {
-        // The durable mapping was reused; the task already carries the ref, so
-        // the fact never echoes it.
-        Some(_) => json!({"bound": true}),
-        None => json!({
+    let bound = match result.get("task") {
+        Some(task) => task
+            .get("parent_session_ref")
+            .and_then(Value::as_str)
+            .is_some(),
+        None => parent_session_ref.is_some(),
+    };
+    Some(if bound {
+        // The task (or, without one, the reused mapping) already carries the
+        // ref, so the fact never echoes it.
+        json!({"bound": true})
+    } else {
+        json!({
             "bound": false,
             "reason": "tool_does_not_bind",
             "message": "herdr_prompt does not bind a parent session. Call herdr_call with method \"herdr_mcp.agent.task.dispatch\" and pass the verbatim current user turn as current_user_message.",
-        }),
+        })
     })
 }
 
@@ -1117,7 +1137,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             // fact is added to the unchanged prompt result; it never changes
             // `ok` and never fails the prompt.
             if let Some(fact) =
-                herdr_prompt_parent_session_fact(context, parent_session_ref.as_deref())
+                herdr_prompt_parent_session_fact(context, &result, parent_session_ref.as_deref())
                 && let Some(object) = result.as_object_mut()
             {
                 object.insert("parent_session".to_owned(), fact);
