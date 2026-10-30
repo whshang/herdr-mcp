@@ -173,5 +173,7 @@ test("user gets conversation-bound WebChat dispatch guidance | Given the served 
     assert.match(doc, /`current_user_message`/);
     assert.match(doc, /`herdr_prompt`[^\n]*never (performs source-turn binding|binds|does)/);
     assert.match(doc, /reason/);
+    assert.match(doc, /device whose browser hosts this chat/);
+    assert.match(doc, /unsure which (device|one)[^\n]*(say so|guessing)/);
   }
 });
