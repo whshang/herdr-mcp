@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **doctor/status 显示 herdr-core 检测警告与 WebChat 授权状态（#765、#772）。** `herdr-mcp doctor`（以及 `status --verbose`）只读探测 herdr-core / Herdr app（`hc` / `herdr-core`：PATH、`~/.local/bin`、Homebrew 稳定路径、`~/.config/herdr-app`；仅执行 `--version`，2 秒超时，从不启动/连接其 server）。检测到时输出非致命 WARN `herdr_core_unsupported`（提示 v1.1 仅支持 Herdr TUI），Result 不会因此变 FAIL；`doctor --json` 新增稳定键 `herdr_core` 与 `warnings`。同时 doctor / status 只读读取本地 state DB，显示 Edge `webchat_control` grant 证据状态（`present` / `absent` / `unknown`，按 connector 汇总 last seen、grant generation、绑定的 caller session 数，证据来自 `browser_dispatches.authorization_*` 与 `browser_caller_sessions`）以及各 browser endpoint 的扩展 consent 标志（`webchat_control_allowed` / `tool_bridge_*`）与 `consent_revision`，并给出区分两者的提示：缺少 Edge grant 会使绑定报 `grant_missing`，扩展 consent 决定浏览器控制。DB 或表缺失时报 `unknown`，不会失败；绝不输出 token、凭据或完整 grant payload。`doctor --json` 新增 `webchat_grants` 键。Runtime contract、schema 与扩展不变，无迁移。
 - **文档：明确只支持 Herdr TUI。** herdr-mcp 只驱动 Herdr TUI（`herdr` CLI 与 `herdr server`；CI 固定 `0.8.2`，上游当前 TUI 为 `0.9.5`）。新的 Herdr app 与 herdr-core（`hc`）是独立运行时、与 TUI 不共享 Agent，v1.1 不支持。Herdr 文档链接更新为 `https://herdr.dev/tui/docs/`；平台支持矩阵新增「Herdr 运行时支持」一节。仅文档变更，Runtime、contract 与扩展不变。
 
 ## v1.1.0-rc.6 — 2026-10-30
