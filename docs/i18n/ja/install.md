@@ -17,7 +17,7 @@ herdr --version
 herdr api schema >/dev/null
 ```
 
-ただし、これは初回インストールの前提条件ではありません。通常の `herdr-mcp install` は `HERDR_BIN`、ユーザーの安定インストール先、Homebrew/`/usr/local`、現在の PATH の順で Herdr を解決します。既存 Herdr は CLI/API を検証してから自動更新を試み、Server が動作中なら live handoff を使います。Herdr が見つからない場合は <https://herdr.dev/> の公式 installer を取得して実行します。herdr-mcp service のインストール後には Herdr Server/API が実際に到達可能かも確認します。macOS は管理対象 Supervisor/TCC broker、Linux/Windows は必要に応じて現在のユーザーの Herdr Server を起動します。
+ただし、これは初回インストールの前提条件ではありません。通常の `herdr-mcp install` は `HERDR_BIN`、ユーザーの安定インストール先、Homebrew/`/usr/local`、現在の PATH の順で Herdr を解決します。既存 Herdr は CLI/API を検証してから自動更新を試み、Server が動作中なら live handoff を使います。Herdr が見つからない場合は <https://herdr.dev/tui/> の公式 installer を取得して実行します。herdr-mcp service のインストール後には Herdr Server/API が実際に到達可能かも確認します。macOS は管理対象 Supervisor/TCC broker、Linux/Windows は必要に応じて現在のユーザーの Herdr Server を起動します。
 
 公式 installer はトラブルシューティング用の手動フォールバックとして引き続き利用できます。
 
@@ -30,6 +30,8 @@ curl -fsSL https://herdr.dev/install.sh | sh
 # Windows
 powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 ```
+
+これらは Herdr TUI の installer です。herdr-mcp がサポートするのは Herdr TUI だけです。herdr-mcp のために Herdr app や herdr-core（`hc`）をインストールしないでください。herdr-mcp v1.1 はこの別 runtime をサポートしません。[プラットフォームサポートマトリクス](platform-support-matrix.md) を参照してください。
 
 ### 2. 必要なクライアント経路を決める
 

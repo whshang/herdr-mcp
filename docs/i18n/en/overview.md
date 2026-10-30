@@ -31,7 +31,9 @@ This is not another Coding Agent. Herdr is the persistent workplace; herdr-mcp i
 
 ## Herdr and herdr-mcp responsibilities
 
-**Herdr** owns workspace / tab / pane / agent / session concepts, PTYs, the native CLI, Socket API, and local agent lifecycle. Treat the [Herdr documentation](https://herdr.dev/docs/) as authoritative for those behaviors.
+**Herdr** owns workspace / tab / pane / agent / session concepts, PTYs, the native CLI, Socket API, and local agent lifecycle. Treat the [Herdr documentation](https://herdr.dev/tui/docs/) as authoritative for those behaviors.
+
+In herdr-mcp, “Herdr” always means the **Herdr TUI** (the `herdr` CLI and `herdr server`). The newer Herdr app and its herdr-core runtime (`hc`) are a separate runtime that does not share agents with the TUI; herdr-mcp v1.1 does not support them. See the [platform support matrix](platform-support-matrix.md).
 
 **herdr-mcp** owns:
 

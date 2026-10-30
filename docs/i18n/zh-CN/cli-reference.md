@@ -2,7 +2,7 @@
 
 *herdr-mcp 本机管理与运维命令。*
 
-本页只记录 **herdr-mcp** 自己的命令面。Herdr 本体的 workspace、pane、agent、session CLI 请看官方 [Herdr CLI Reference](https://herdr.dev/docs/cli-reference/)。
+本页只记录 **herdr-mcp** 自己的命令面。Herdr 本体的 workspace、pane、agent、session CLI 请看官方 [Herdr CLI Reference](https://herdr.dev/tui/docs/cli-reference/)。
 
 herdr-mcp 的命令可以按用途理解，而不是按 `bin/` 文件名死记。
 

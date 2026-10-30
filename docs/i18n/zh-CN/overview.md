@@ -31,7 +31,9 @@ herdr-mcp + Herdr workstation
 
 ## Herdr 与 herdr-mcp 的职责
 
-**Herdr** 负责 workspace / tab / pane / agent / session、PTY、原生 CLI、Socket API 和本地 Agent 生命周期。相关行为以 [Herdr 官方文档](https://herdr.dev/docs/) 为准。
+**Herdr** 负责 workspace / tab / pane / agent / session、PTY、原生 CLI、Socket API 和本地 Agent 生命周期。相关行为以 [Herdr 官方文档](https://herdr.dev/tui/docs/) 为准。
+
+在 herdr-mcp 中，“Herdr” 始终指 **Herdr TUI**（`herdr` CLI 与 `herdr server`）。新的 Herdr app 及其 herdr-core 运行时（`hc`）是独立的运行时，与 TUI 不共享 Agent；herdr-mcp v1.1 不支持它们。详见[平台支持矩阵](platform-support-matrix.md)。
 
 **herdr-mcp** 负责：
 
