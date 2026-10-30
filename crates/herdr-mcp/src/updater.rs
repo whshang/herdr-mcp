@@ -543,7 +543,13 @@ fn apply_inner(
         progress.phase("Preparing a rollback-safe update job...");
         let (job_id, binary_path) = stage_release(&paths, &plan, &mut progress)?;
         progress.phase("Download verified. Probing candidate runtime identity...");
-        if let Err(error) = probe_candidate_binary(&binary_path, &plan.version, &plan.contract) {
+        let expected_schema = plan
+            .state_schema_migration
+            .as_ref()
+            .map_or(SCHEMA_VERSION, |migration| migration.to);
+        if let Err(error) =
+            probe_candidate_binary(&binary_path, &plan.version, &plan.contract, expected_schema)
+        {
             cleanup_staging(&binary_path);
             return Err(error);
         }
@@ -557,6 +563,7 @@ fn apply_inner(
             asset_name: plan.asset.name.clone(),
             sha256: plan.asset.sha256.clone(),
             binary_path: binary_path.to_string_lossy().into_owned(),
+            state_schema_target: expected_schema,
             state: "queued".to_owned(),
             detail: Some("verified candidate staged".to_owned()),
             worker_pid: None,
@@ -975,6 +982,24 @@ fn discard_state_schema_migration_record(
             .map_err(|error| format!("cannot remove migration rollback directory: {error}"))?;
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn recover_failed_state_schema_migration(paths: &RuntimePaths) -> Result<(), String> {
+    let Some(record) = load_major_upgrade_record(paths)? else {
+        return Ok(());
+    };
+    let state_path = paths.config_dir.join("state.db");
+    let live_schema = read_raw_state_schema(&state_path)?;
+    if live_schema == Some(record.source_state_schema) {
+        discard_state_schema_migration_record(paths, &record)
+    } else {
+        // A failed install may have migrated the live database before the
+        // service manager rolled the binary back. Restore the backup first;
+        // recover_major_upgrade starts the source binary only after this
+        // restore succeeds.
+        recover_major_upgrade(paths, &record)
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1653,6 +1678,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
             &Version::parse(&job.version)
                 .map_err(|_| "durable update job contains an invalid version".to_owned())?,
             &crate::contract::identity()?,
+            job.state_schema_target,
         )?;
         store.update_update_job(
             job_id,
@@ -1694,7 +1720,18 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
             };
             store.update_update_job(job_id, "failed", Some(detail), None, now_ms_i64())?;
             cleanup_staging(&binary);
-            install
+            let migration_recovery = recover_failed_state_schema_migration(&paths);
+            match migration_recovery {
+                Ok(()) => install,
+                Err(recovery_error) => Err(match install {
+                    Ok(code) => format!(
+                        "service install returned {code:?}; state-schema migration recovery failed: {recovery_error}"
+                    ),
+                    Err(error) => {
+                        format!("{error}; state-schema migration recovery failed: {recovery_error}")
+                    }
+                }),
+            }
         }
     }
 }
@@ -1955,6 +1992,7 @@ fn probe_candidate_binary(
     path: &Path,
     expected: &Version,
     expected_contract: &crate::contract::ContractIdentity,
+    expected_schema: i64,
 ) -> Result<(), String> {
     let output = Command::new(path)
         .arg("version")
@@ -1965,7 +2003,7 @@ fn probe_candidate_binary(
         return Err("staged update binary version probe failed".to_owned());
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    verify_candidate_identity(&text, expected, expected_contract)
+    verify_candidate_identity(&text, expected, expected_contract, expected_schema)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1973,6 +2011,7 @@ fn verify_candidate_identity(
     text: &str,
     expected: &Version,
     expected_contract: &crate::contract::ContractIdentity,
+    expected_schema: i64,
 ) -> Result<(), String> {
     let expected_first = format!("herdr-mcp {expected}");
     let expected_contract_line = format!(
@@ -1980,7 +2019,7 @@ fn verify_candidate_identity(
         expected_contract.epoch, expected_contract.tool_count
     );
     let expected_hash = format!("contract hash {}", expected_contract.hash);
-    let expected_schema = format!("state schema {SCHEMA_VERSION}");
+    let expected_schema = format!("state schema {expected_schema}");
     // Older same-contract releases did not print their hash. A new epoch must
     // report it; the detached worker is already the attested target binary.
     let hash_matches = match text.lines().find(|line| line.starts_with("contract hash ")) {
@@ -2365,8 +2404,9 @@ mod tests {
             target.epoch, target.tool_count, target.hash
         );
         write_test_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{output}'\n"));
-        assert!(probe_candidate_binary(&binary, &version, &target).is_ok());
-        assert!(probe_candidate_binary(&binary, &version, &local).is_err());
+        assert!(probe_candidate_binary(&binary, &version, &target, SCHEMA_VERSION).is_ok());
+        assert!(probe_candidate_binary(&binary, &version, &target, MAJOR_SOURCE_SCHEMA).is_err());
+        assert!(probe_candidate_binary(&binary, &version, &local, SCHEMA_VERSION).is_err());
         for bad in [
             output.replace(&target.hash, &local.hash),
             output.replace(
@@ -2385,14 +2425,14 @@ mod tests {
             output.replace("herdr-mcp 9.9.9", "herdr-mcp 9.9.8"),
         ] {
             write_test_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{bad}'\n"));
-            assert!(probe_candidate_binary(&binary, &version, &target).is_err());
+            assert!(probe_candidate_binary(&binary, &version, &target, SCHEMA_VERSION).is_err());
         }
         let legacy = format!(
             "herdr-mcp {version}\ncontract epoch {} / {} tools\nstate schema {SCHEMA_VERSION}\n",
             local.epoch, local.tool_count
         );
         write_test_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{legacy}'\n"));
-        assert!(probe_candidate_binary(&binary, &version, &local).is_ok());
+        assert!(probe_candidate_binary(&binary, &version, &local, SCHEMA_VERSION).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2743,6 +2783,65 @@ mod tests {
             fs::read_to_string(root.join("old-binary-schema")).unwrap(),
             "15"
         );
+        assert!(!dir.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn install_failure_after_migration_restores_backup_before_old_binary_and_clears_material() {
+        let root = env::temp_dir().join(format!(
+            "herdr-state-migration-install-failure-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        let source_script = concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1 $2\" = \"service install\" ]; then\n",
+            "/usr/bin/python3 - <<'PY'\n",
+            "import os, sqlite3\n",
+            "root = os.environ['HERDR_MCP_CONFIG_DIR']\n",
+            "conn = sqlite3.connect(os.path.join(root, 'state.db'))\n",
+            "schema = conn.execute(\"SELECT value FROM meta WHERE key='schema_version'\").fetchone()[0]\n",
+            "open(os.path.join(root, 'old-binary-schema'), 'w').write(schema)\n",
+            "PY\n",
+            "fi\n",
+            "exit 0\n",
+        );
+        write_test_executable(&source_binary, source_script);
+        let state = root.join("state.db");
+        write_test_state(&state, SCHEMA_VERSION, "after-migration");
+        let backup = schema_upgrade_backup_path(&paths, 15, 16);
+        write_test_state(&backup, 15, "before-migration");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            source_state_schema: 15,
+            target_state_schema: 16,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        recover_failed_state_schema_migration(&paths).unwrap();
+
+        assert_eq!(read_raw_state_schema(&state).unwrap(), Some(15));
+        assert_eq!(
+            fs::read_to_string(root.join("old-binary-schema")).unwrap(),
+            "15"
+        );
+        assert!(!major_upgrade_record_path(&paths).exists());
+        assert!(!backup.exists());
+        assert!(!source_binary.exists());
         assert!(!dir.exists());
         fs::remove_dir_all(root).ok();
     }
@@ -3263,6 +3362,7 @@ mod tests {
             asset_name: "candidate".to_owned(),
             sha256: "a".repeat(64),
             binary_path: "/tmp/candidate".to_owned(),
+            state_schema_target: SCHEMA_VERSION,
             state: "queued".to_owned(),
             detail: Some("verified candidate staged".to_owned()),
             worker_pid: Some(std::process::id()),
@@ -3359,6 +3459,7 @@ mod tests {
                 asset_name: "candidate".to_owned(),
                 sha256: "a".repeat(64),
                 binary_path: live_binary.to_string_lossy().into_owned(),
+                state_schema_target: SCHEMA_VERSION,
                 state: "queued".to_owned(),
                 detail: None,
                 worker_pid: Some(std::process::id()),
@@ -3389,6 +3490,7 @@ mod tests {
                 asset_name: "candidate".to_owned(),
                 sha256: "b".repeat(64),
                 binary_path: stale_binary.to_string_lossy().into_owned(),
+                state_schema_target: SCHEMA_VERSION,
                 state: "queued".to_owned(),
                 detail: None,
                 worker_pid: None,
