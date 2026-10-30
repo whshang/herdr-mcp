@@ -53,7 +53,11 @@ pub(super) struct StateSchemaMigration {
 impl StateSchemaMigration {
     pub(super) fn warning(&self) -> String {
         format!(
-            "⚠️ This update migrates local state schema {} → {} and cannot be downgraded; older versions will refuse the migrated database. A state backup is taken before migration; rolling back requires restoring that backup.",
+            concat!(
+                "⚠️ This update migrates local state schema {} → {} and cannot be downgraded; ",
+                "older versions will refuse the migrated database. ",
+                "A state backup is taken before migration; rolling back requires restoring that backup."
+            ),
             self.from, self.to
         )
     }
@@ -371,12 +375,20 @@ fn admit_state_schema_migration(
     }
     if target_schema < local_schema {
         return Err(refuse(&format!(
-            "release state schema {target_schema} is older than local schema {local_schema}; refusing downgrade"
+            concat!(
+                "release state schema {} is older than local schema {}; ",
+                "refusing downgrade"
+            ),
+            target_schema, local_schema
         )));
     }
     if target_schema > local_schema.saturating_add(1) {
         return Err(refuse(&format!(
-            "release state schema {target_schema} is more than one step ahead of local schema {local_schema}"
+            concat!(
+                "release state schema {} is more than one step ahead of local schema ",
+                "{}"
+            ),
+            target_schema, local_schema
         )));
     }
 
@@ -386,7 +398,11 @@ fn admit_state_schema_migration(
         .filter(|object| object.len() == 3)
         .ok_or_else(|| {
             refuse(&format!(
-                "release state schema is not rollback-compatible with local schema {local_schema}: missing or malformed state_schema_migration declaration"
+                concat!(
+                    "release state schema is not rollback-compatible with local schema {}: ",
+                    "missing or malformed state_schema_migration declaration"
+                ),
+                local_schema
             ))
         })?;
     let from = declaration
