@@ -332,7 +332,9 @@ fn print_status_verbose(paths: &RuntimePaths, config: &Config, language: crate::
         crate::webchat_grants::summary_line(&webchat_grants, language)
     );
     let grants_hint = crate::webchat_grants::binding_hint(language);
-    for line in webchat_grants.concise_lines() {
+    // `concise_lines()` starts with the `state=` rollup line, already printed
+    // above as `summary_line`; skip it so detail lines are not duplicated.
+    for line in webchat_grants.concise_lines().iter().skip(1) {
         println!("{line}");
     }
     println!("{grants_hint}");

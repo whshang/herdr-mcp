@@ -178,6 +178,25 @@ fn default_doctor_and_status_verbose_show_grant_state_and_consent_revision() {
         status.contains("consent_revision=4"),
         "status --verbose missing consent_revision line:\n{status}"
     );
+    // No line may print twice: the `state=` rollup must not be repeated by
+    // the detail iteration, and each consent line appears exactly once.
+    let status_lines: Vec<&str> = status.lines().collect();
+    let state_lines = status_lines
+        .iter()
+        .filter(|line| line.contains("WebChat grants: state="))
+        .count();
+    assert_eq!(
+        state_lines, 1,
+        "state= rollup printed {state_lines} times:\n{status}"
+    );
+    let consent_lines = status_lines
+        .iter()
+        .filter(|line| line.contains("consent_revision=4"))
+        .count();
+    assert_eq!(
+        consent_lines, 1,
+        "consent detail line printed {consent_lines} times:\n{status}"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
