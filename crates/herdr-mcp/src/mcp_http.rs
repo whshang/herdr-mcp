@@ -3275,6 +3275,41 @@ mod tests {
         ))
     }
 
+    fn assert_dispatch_diagnostic(diagnostic: &Value, message: &str, latest: Option<&str>) {
+        let object = diagnostic.as_object().expect("diagnostic object");
+        assert_eq!(object.len(), 3);
+        let canonical = mcp::canonical_source_turn_text(message);
+        assert_eq!(
+            object["canonical_prefix"],
+            canonical.chars().take(24).collect::<String>()
+        );
+        assert_eq!(
+            object["canonical_sha256_prefix"],
+            &mcp::source_turn_sha256(message)[..12]
+        );
+        assert_eq!(
+            object["latest_source_turn_sha256_prefix"],
+            latest
+                .map(|value| Value::String(mcp::source_turn_sha256(value)[..12].to_owned()))
+                .unwrap_or(Value::Null)
+        );
+        let encoded = diagnostic.to_string();
+        assert!(
+            object["canonical_prefix"]
+                .as_str()
+                .is_some_and(|value| value.chars().count() <= 24)
+        );
+        if canonical.chars().count() > 24 {
+            assert!(!encoded.contains(&canonical));
+        }
+        for forbidden in ["session_ref", "opaque_session_id", "token", "locator"] {
+            assert!(
+                !encoded.contains(forbidden),
+                "diagnostic leaked {forbidden}"
+            );
+        }
+    }
+
     #[test]
     fn runtime_generation_header_reflects_service_process_identity() {
         let _guard = crate::test_env::lock();
@@ -6692,6 +6727,517 @@ mod tests {
         serde_json::from_str(text).unwrap()
     }
 
+    /// user worker | Given a running durable task | When WebChat or TCP
+    /// callers report completion | Then access is refused without mutation;
+    /// trusted local IPC can report it exactly once.
+    #[tokio::test]
+    async fn worker_report_rejects_webchat_and_tcp_before_mutation() {
+        let root = test_root("worker-report-boundary");
+        let (socket, _) = spawn_scripted_herdr_socket(vec![
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
+        ]);
+        let mut state = dispatch_test_state(&root, &socket);
+        let tcp = candidate_router(state.clone());
+        state.trusted_extension_ipc = true;
+        let app = candidate_router(state);
+        let dispatch = webchat_tool_call(app.clone(), &[], "herdr_mcp.agent.task.dispatch", json!({"target": "w1:p1", "text": "worker report boundary", "idempotency_key": "report-boundary"})).await;
+        assert_eq!(dispatch["ok"], true, "{dispatch}");
+        let params = json!({"task_id": dispatch["task_id"], "dispatch_id": dispatch["dispatch_id"], "kind": "worker_done"});
+        let status_params = json!({"task_id": dispatch["task_id"]});
+        let before = webchat_tool_call(
+            app.clone(),
+            &[],
+            "herdr_mcp.agent.task.status",
+            status_params.clone(),
+        )
+        .await;
+        assert_eq!(
+            webchat_tool_call(tcp, &[], "herdr_mcp.agent.task.report", params.clone()).await["code"],
+            "worker_report_requires_trusted_local"
+        );
+        for mut headers in [
+            vec![("x-herdr-edge-browser-caller-session", json!({"provider": "chatgpt", "opaque_session_id": "report-caller"}).to_string())],
+            vec![("x-herdr-edge-webchat-authorization", json!({"principal_ref": "connector:conn_WorkerReport123", "connector_id": "conn_WorkerReport123", "grant_generation": 1}).to_string())],
+            vec![("x-herdr-edge-webchat-control-grants", json!([{"endpoint_ref": "bep_report", "provider": "chatgpt", "account_ref": "br_report"}]).to_string())],
+            vec![("x-herdr-edge-page-assist-grants", json!([{"endpoint_ref": "bep_report"}]).to_string())],
+        ] {
+            headers.push(("x-herdr-edge-expected-runtime-generation", "rust-caller-grant-proof".to_owned()));
+            let result = webchat_tool_call(app.clone(), &headers, "herdr_mcp.agent.task.report", params.clone()).await;
+            assert_eq!(result["code"], "worker_report_requires_trusted_local", "{result}");
+            assert_eq!(webchat_tool_call(app.clone(), &[], "herdr_mcp.agent.task.status", status_params.clone()).await, before);
+        }
+        let accepted = webchat_tool_call(
+            app.clone(),
+            &[],
+            "herdr_mcp.agent.task.report",
+            params.clone(),
+        )
+        .await;
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert_eq!(accepted["task"]["terminal_status"], "worker_done");
+        assert_eq!(
+            webchat_tool_call(app, &[], "herdr_mcp.agent.task.report", params).await["code"],
+            "worker_done_already_reported"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(socket);
+    }
+
+    /// user owner | Given an open decision gate | When any MCP caller class
+    /// claims human approval | Then resolution is rejected with no mutation;
+    /// unmapped WebChat callers also cannot create or cancel gates.
+    #[tokio::test]
+    async fn decision_gate_resolution_rejects_all_mcp_callers_without_mutation() {
+        let root = test_root("gate-boundary");
+        let (socket, _) = spawn_scripted_herdr_socket(vec![
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
+        ]);
+        let mut state = dispatch_test_state(&root, &socket);
+        let tcp = candidate_router(state.clone());
+        state.trusted_extension_ipc = true;
+        let app = candidate_router(state);
+        let dispatch = webchat_tool_call(app.clone(), &[], "herdr_mcp.agent.task.dispatch", json!({"target": "w1:p1", "text": "decision gate boundary", "idempotency_key": "gate-boundary"})).await;
+        assert_eq!(dispatch["ok"], true, "{dispatch}");
+        let create = json!({"task_id": dispatch["task_id"], "question": "Continue?", "options": ["continue", "stop"]});
+        let opened = webchat_tool_call(
+            app.clone(),
+            &[],
+            crate::prompt::decision_gates::CREATE,
+            create.clone(),
+        )
+        .await;
+        assert_eq!(opened["ok"], true, "{opened}");
+        let gate = json!({"gate_id": opened["gate"]["gate_id"]});
+        let resolve = json!({"gate_id": opened["gate"]["gate_id"], "resolution": "continue", "human": true, "resolved_by": {"class": "local_cli_interactive"}});
+        let before = webchat_tool_call(
+            app.clone(),
+            &[],
+            crate::prompt::decision_gates::STATUS,
+            gate.clone(),
+        )
+        .await;
+        for router in [tcp, app.clone()] {
+            assert_eq!(
+                webchat_tool_call(
+                    router,
+                    &[],
+                    crate::prompt::decision_gates::RESOLVE,
+                    resolve.clone()
+                )
+                .await["code"],
+                "gate_resolution_requires_human"
+            );
+        }
+        for mut headers in [
+            vec![("x-herdr-edge-browser-caller-session", json!({"provider": "chatgpt", "opaque_session_id": "gate-caller"}).to_string())],
+            vec![("x-herdr-edge-webchat-authorization", json!({"principal_ref": "connector:conn_GateReport123", "connector_id": "conn_GateReport123", "grant_generation": 1}).to_string())],
+            vec![("x-herdr-edge-webchat-control-grants", json!([{"endpoint_ref": "bep_gate", "provider": "chatgpt", "account_ref": "br_gate"}]).to_string())],
+            vec![("x-herdr-edge-page-assist-grants", json!([{"endpoint_ref": "bep_gate"}]).to_string())],
+        ] {
+            headers.push(("x-herdr-edge-expected-runtime-generation", "rust-caller-grant-proof".to_owned()));
+            let denied = webchat_tool_call(app.clone(), &headers, crate::prompt::decision_gates::RESOLVE, resolve.clone()).await;
+            assert_eq!(denied["code"], "gate_resolution_requires_human", "{denied}");
+            for (method, params) in [
+                (crate::prompt::decision_gates::CREATE, create.clone()),
+                (crate::prompt::decision_gates::STATUS, gate.clone()),
+                (crate::prompt::decision_gates::CANCEL, gate.clone()),
+            ] {
+                let denied = webchat_tool_call(app.clone(), &headers, method, params).await;
+                assert_eq!(denied["code"], "agent_task_parent_unbound", "{denied}");
+            }
+        }
+        assert_eq!(
+            webchat_tool_call(app, &[], crate::prompt::decision_gates::STATUS, gate).await,
+            before
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(socket);
+    }
+
+    /// user cannot claim another conversation | Given an unmapped WebChat caller with a covering grant | When an explicit second-session ref accompanies its own source turn | Then dispatch stays unstamped and the mapping remains absent
+    #[tokio::test]
+    async fn webchat_dispatch_explicit_parent_cannot_claim_an_unmapped_session() {
+        let root = test_root("dispatch-explicit-unmapped");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let (socket, _requests) = spawn_scripted_herdr_socket(vec![
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
+        ]);
+        let mut state = dispatch_test_state(&root, &socket);
+        state.trusted_extension_ipc = true;
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let (app, seed, endpoint, account) = register_chatgpt_endpoint(app, "unmapped", now).await;
+        let user_text = "the caller's own observed source turn";
+        let (app, own_session) = observe_chatgpt_session_source_turn(
+            app,
+            &seed,
+            &endpoint,
+            &account,
+            "unmapped-own",
+            user_text,
+            now,
+        )
+        .await;
+        let (app, other_session) = observe_chatgpt_session_source_turn(
+            app,
+            &seed,
+            &endpoint,
+            &account,
+            "unmapped-other",
+            "another conversation's turn",
+            now,
+        )
+        .await;
+        assert_ne!(own_session, other_session);
+        let principal = "connector:conn_ExplicitUnmapped1";
+        let opaque = "opaque-explicit-unmapped";
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_caller_session(principal, "chatgpt", opaque,)
+                .unwrap(),
+            None
+        );
+        let headers = vec![
+            ("x-herdr-edge-expected-runtime-generation", "rust-caller-grant-proof".to_owned()),
+            ("x-herdr-edge-webchat-authorization", json!({
+                "principal_ref": principal, "connector_id": "conn_ExplicitUnmapped1", "grant_generation": 1,
+            }).to_string()),
+            ("x-herdr-edge-browser-caller-session", json!({"provider": "chatgpt", "opaque_session_id": opaque}).to_string()),
+            ("x-herdr-edge-webchat-control-grants", json!([{"endpoint_ref": endpoint, "provider": "chatgpt"}]).to_string()),
+        ];
+        let result = webchat_tool_call(
+            app,
+            &headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1", "text": "dispatch without claiming another conversation",
+                "idempotency_key": "explicit-unmapped", "parent_session_ref": other_session,
+                "current_user_message": user_text,
+            }),
+        )
+        .await;
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["submitted"], true);
+        assert_eq!(
+            result["parent_session"],
+            json!({
+                "bound": false, "reason": "explicit_parent_session_caller_session_unmapped",
+            })
+        );
+        assert!(result["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_caller_session(principal, "chatgpt", opaque,)
+                .unwrap(),
+            None,
+            "neither the explicit ref nor the valid source turn may create a mapping"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// user chooses an explicit parent | Given registered sessions and real durable mappings | When dispatch validates explicit evidence | Then only that evidence can stamp the task
+    #[tokio::test]
+    async fn webchat_dispatch_explicit_parent_is_authoritative_and_fail_closed() {
+        let root = test_root("dispatch-explicit-parent");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let responses = (0..13).flat_map(|_| [
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
+        ]).collect();
+        let (socket, requests) = spawn_scripted_herdr_socket(responses);
+        let mut state = dispatch_test_state(&root, &socket);
+        state.trusted_extension_ipc = true;
+        let store = state.state_store.clone();
+        let mut untrusted_state = state.clone();
+        untrusted_state.trusted_extension_ipc = false;
+        let untrusted_app = candidate_router(untrusted_state);
+        let app = candidate_router(state);
+        let (app, seed, endpoint, account) = register_chatgpt_endpoint(app, "explicit", now).await;
+        let user_text = "observed fallback turn must never override explicit evidence";
+        let (app, session) = observe_chatgpt_session_source_turn(
+            app,
+            &seed,
+            &endpoint,
+            &account,
+            "explicit-a",
+            user_text,
+            now,
+        )
+        .await;
+        let (app, other) = observe_chatgpt_session_source_turn(
+            app,
+            &seed,
+            &endpoint,
+            &account,
+            "explicit-b",
+            "other turn",
+            now,
+        )
+        .await;
+        let headers = |opaque: &str, granted: bool| {
+            vec![
+            ("x-herdr-edge-expected-runtime-generation", "rust-caller-grant-proof".to_owned()),
+            ("x-herdr-edge-webchat-authorization", json!({
+                "principal_ref": "connector:conn_ExplicitParent1", "connector_id": "conn_ExplicitParent1", "grant_generation": 1,
+            }).to_string()),
+            ("x-herdr-edge-browser-caller-session", json!({"provider": "chatgpt", "opaque_session_id": opaque}).to_string()),
+            ("x-herdr-edge-webchat-control-grants", if granted {
+                json!([{"endpoint_ref": endpoint, "provider": "chatgpt"}]).to_string()
+            } else { "[]".to_owned() }),
+        ]
+        };
+        // Explicit refs may only confirm an existing durable caller mapping.
+        store
+            .lock()
+            .unwrap()
+            .bind_browser_caller_session(
+                "connector:conn_ExplicitParent1",
+                "chatgpt",
+                "opaque-explicit",
+                &session,
+                now,
+            )
+            .unwrap();
+        let bound_headers = headers("opaque-explicit", true);
+        let valid = webchat_tool_call(
+            app.clone(),
+            &bound_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1", "text": "explicit worker", "idempotency_key": "explicit-valid",
+                "parent_session_ref": session,
+                // Invalid turn evidence is ignored when an exact ref is supplied.
+                "current_user_message": 42, "inject_task_identity": true,
+            }),
+        )
+        .await;
+        assert_eq!(valid["ok"], true, "{valid}");
+        assert_eq!(valid["parent_session"], json!({"bound": true}));
+        assert_eq!(valid["task"]["parent_session_ref"], session);
+        let task_id = valid["task_id"].as_str().unwrap();
+        let status = webchat_tool_call(
+            app.clone(),
+            &bound_headers,
+            "herdr_mcp.agent.task.status",
+            json!({"task_id": task_id}),
+        )
+        .await;
+        assert_eq!(status["task"]["parent_session_ref"], session);
+        assert_eq!(status["task"]["dispatch_id"], valid["dispatch_id"]);
+        let inbox = webchat_tool_call(
+            app.clone(),
+            &bound_headers,
+            "herdr_mcp.agent.task.inbox",
+            json!({}),
+        )
+        .await;
+        assert_eq!(inbox["summary"]["running"], 1, "{inbox}");
+
+        for (scope, expected_count) in [(&session, 1), (&other, 0)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/extension/agent/tasks?parent_session_ref={scope}&include_running=1"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let running: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(running["tasks"].as_array().unwrap().len(), expected_count);
+            if expected_count == 1 {
+                assert_eq!(running["tasks"][0]["task_id"], valid["task_id"]);
+                assert_eq!(running["tasks"][0]["dispatch_id"], valid["dispatch_id"]);
+            }
+        }
+
+        let before_replay = requests.lock().unwrap().len();
+        let replay = webchat_tool_call(
+            app.clone(),
+            &headers("opaque-replay-unmapped", true),
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1", "text": "explicit worker", "idempotency_key": "explicit-valid",
+                "parent_session_ref": other, "current_user_message": user_text,
+            }),
+        )
+        .await;
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["parent_session"], json!({"bound": true}));
+        assert_eq!(replay["task"]["parent_session_ref"], session);
+        assert_eq!(requests.lock().unwrap().len(), before_replay);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_caller_session(
+                    "connector:conn_ExplicitParent1",
+                    "chatgpt",
+                    "opaque-replay-unmapped",
+                )
+                .unwrap(),
+            None
+        );
+
+        // All these callers already map to `session`, and carry its exact
+        // source turn. Both old fallback paths would bind, so a null stamp
+        // proves the explicit failure never falls through to either path.
+        let unknown = format!("br_{}", "0".repeat(64));
+        for (index, explicit, granted, reason) in [
+            (0, json!(unknown), true, "unknown_ref"),
+            (1, json!(account), true, "wrong_kind"),
+            (2, json!(session), false, "grant_missing"),
+            (3, json!(other), true, "caller_session_conflict"),
+            (4, Value::Null, true, "invalid"),
+        ] {
+            let result = webchat_tool_call(app.clone(), &headers("opaque-explicit", granted), "herdr_mcp.agent.task.dispatch", json!({
+                "target": "w1:p1", "text": format!("explicit miss {index}"), "idempotency_key": format!("explicit-miss-{index}"),
+                "parent_session_ref": explicit, "current_user_message": user_text,
+            })).await;
+            assert_eq!(result["ok"], true, "{result}");
+            assert!(result["task"]["parent_session_ref"].is_null());
+            assert_eq!(
+                result["parent_session"],
+                json!({"bound": false, "reason": format!("explicit_parent_session_{reason}")})
+            );
+            let fact = result["parent_session"].to_string();
+            assert!(!fact.contains("opaque-explicit"));
+            assert!(!fact.contains(user_text));
+            assert!(!fact.contains(&session));
+        }
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_caller_session(
+                    "connector:conn_ExplicitParent1",
+                    "chatgpt",
+                    "opaque-explicit",
+                )
+                .unwrap(),
+            Some(session.clone())
+        );
+
+        // Partial WebChat identity is never treated as a caller-less local
+        // dispatch. A bearer-only TCP caller is not trusted local IPC either.
+        for (index, router, partial_headers) in [
+            (
+                0,
+                app.clone(),
+                vec![bound_headers[0].clone(), bound_headers[2].clone()],
+            ),
+            (
+                1,
+                app.clone(),
+                vec![bound_headers[0].clone(), bound_headers[1].clone()],
+            ),
+            (2, untrusted_app, vec![]),
+        ] {
+            let rejected = webchat_tool_call(router, &partial_headers, "herdr_mcp.agent.task.dispatch", json!({
+                "target": "w1:p1", "text": format!("partial identity {index}"), "idempotency_key": format!("explicit-partial-{index}"),
+                "parent_session_ref": session, "current_user_message": user_text,
+            })).await;
+            assert_eq!(rejected["ok"], true, "{rejected}");
+            assert!(rejected["task"]["parent_session_ref"].is_null());
+            assert_eq!(
+                rejected["parent_session"],
+                json!({
+                    "bound": false, "reason": "explicit_parent_session_caller_session_absent",
+                })
+            );
+        }
+
+        // Advance only the provider generation; the session row stays stale.
+        let response = app.clone().oneshot(registry_request(json!({
+            "operation": "provider.observe", "profile_seed": seed, "endpoint_ref": endpoint,
+            "provider": "chatgpt", "adapter_protocol_version": 1, "observation_generation": 2,
+            "capabilities": {"operations": ["identity.inspect", "space.list"]}, "observed_at": now + 1,
+        }))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stale = webchat_tool_call(
+            app.clone(),
+            &bound_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1", "text": "stale explicit", "idempotency_key": "explicit-stale",
+                "parent_session_ref": session, "current_user_message": user_text,
+            }),
+        )
+        .await;
+        assert_eq!(stale["ok"], true);
+        assert!(stale["task"]["parent_session_ref"].is_null());
+        assert_eq!(
+            stale["parent_session"],
+            json!({"bound": false, "reason": "explicit_parent_session_stale_generation"})
+        );
+
+        // Local IPC needs a registered session only; no WebChat grant/mapping.
+        for (index, explicit, reason) in [
+            (0, session.clone(), None),
+            (1, unknown, Some("explicit_parent_session_unknown_ref")),
+            (2, account, Some("explicit_parent_session_wrong_kind")),
+        ] {
+            let local = webchat_tool_call(app.clone(), &[], "herdr_mcp.agent.task.dispatch", json!({
+                "target": "w1:p1", "text": format!("local explicit {index}"), "idempotency_key": format!("local-explicit-{index}"),
+                "parent_session_ref": explicit,
+            })).await;
+            assert_eq!(local["ok"], true, "{local}");
+            match reason {
+                None => {
+                    assert_eq!(local["parent_session"], json!({"bound": true}));
+                    assert_eq!(local["task"]["parent_session_ref"], session);
+                }
+                Some(reason) => {
+                    assert_eq!(
+                        local["parent_session"],
+                        json!({"bound": false, "reason": reason})
+                    );
+                    assert!(local["task"]["parent_session_ref"].is_null());
+                }
+            }
+        }
+        for request in requests.lock().unwrap().iter() {
+            let encoded = request.to_string();
+            assert!(!encoded.contains("parent_session_ref"));
+            assert!(!encoded.contains("current_user_message"));
+            assert!(!encoded.contains(&session));
+            assert!(!encoded.contains("connector:conn_ExplicitParent1"));
+            assert!(!encoded.contains("opaque-explicit"));
+            assert!(!encoded.contains(user_text));
+        }
+        let prompt = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request["method"] == "agent.prompt")
+            .unwrap()["params"]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(prompt.matches("[herdr-task ").count(), 1);
+        assert!(prompt.contains(task_id));
+        assert!(prompt.contains(valid["dispatch_id"].as_str().unwrap()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn webchat_dispatch_binds_parent_session_from_current_user_message() {
         let root = test_root("webchat-dispatch-bind");
@@ -7003,9 +7549,12 @@ mod tests {
         .await;
         assert_eq!(miss["ok"], true);
         assert!(miss["task"]["parent_session_ref"].is_null());
-        assert_eq!(
-            miss["parent_session"],
-            json!({"bound": false, "reason": "source_turn_not_found"})
+        assert_eq!(miss["parent_session"]["bound"], false);
+        assert_eq!(miss["parent_session"]["reason"], "source_turn_not_found");
+        assert_dispatch_diagnostic(
+            &miss["parent_session"]["diagnostic"],
+            "不存在的消息",
+            Some("第二条消息"),
         );
 
         // A conflicting durable mapping wins: dispatch stays unstamped and the
@@ -7024,9 +7573,15 @@ mod tests {
         .await;
         assert_eq!(conflict["ok"], true);
         assert!(conflict["task"]["parent_session_ref"].is_null());
+        assert_eq!(conflict["parent_session"]["bound"], false);
         assert_eq!(
-            conflict["parent_session"],
-            json!({"bound": false, "reason": "caller_session_conflict"})
+            conflict["parent_session"]["reason"],
+            "caller_session_conflict"
+        );
+        assert_dispatch_diagnostic(
+            &conflict["parent_session"]["diagnostic"],
+            "第一条消息",
+            Some("第二条消息"),
         );
         assert_eq!(
             store
@@ -7105,9 +7660,15 @@ mod tests {
         )
         .await;
         assert_eq!(unbound_miss["ok"], true);
+        assert_eq!(unbound_miss["parent_session"]["bound"], false);
         assert_eq!(
-            unbound_miss["parent_session"],
-            json!({"bound": false, "reason": "source_turn_not_found"})
+            unbound_miss["parent_session"]["reason"],
+            "source_turn_not_found"
+        );
+        assert_dispatch_diagnostic(
+            &unbound_miss["parent_session"]["diagnostic"],
+            "稍后观察的消息",
+            None,
         );
         assert_eq!(
             store
@@ -7193,9 +7754,12 @@ mod tests {
         .await;
         assert_eq!(ungranted["ok"], true);
         assert!(ungranted["task"]["parent_session_ref"].is_null());
-        assert_eq!(
-            ungranted["parent_session"],
-            json!({"bound": false, "reason": "grant_missing"})
+        assert_eq!(ungranted["parent_session"]["bound"], false);
+        assert_eq!(ungranted["parent_session"]["reason"], "grant_missing");
+        assert_dispatch_diagnostic(
+            &ungranted["parent_session"]["diagnostic"],
+            "第二条消息",
+            Some("第二条消息"),
         );
 
         // WebChat authorization without the ChatGPT caller session cannot
@@ -7235,9 +7799,15 @@ mod tests {
         .await;
         assert_eq!(ambiguous["ok"], true);
         assert!(ambiguous["task"]["parent_session_ref"].is_null());
+        assert_eq!(ambiguous["parent_session"]["bound"], false);
         assert_eq!(
-            ambiguous["parent_session"],
-            json!({"bound": false, "reason": "source_turn_ambiguous"})
+            ambiguous["parent_session"]["reason"],
+            "source_turn_ambiguous"
+        );
+        assert_dispatch_diagnostic(
+            &ambiguous["parent_session"]["diagnostic"],
+            "重复消息",
+            Some("第二条消息"),
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -7253,7 +7823,7 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let mut script = Vec::new();
-        for index in 0..16 {
+        for index in 0..24 {
             let seq = 4 + index * 2;
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
@@ -7389,17 +7959,38 @@ mod tests {
                 "\n@HERDR_MCP\n用   agent.task.dispatch\t派发一个任务给 report-review：回复 OK  ",
                 json!({"bound": true}),
             ),
-            // Punctuation is identity: an ASCII colon is different text.
+            // Leading punctuation separators are presentation noise.
             (
                 "opaque-mention-a",
-                "@herdr-mcp 用 agent.task.dispatch 派发一个任务给 report-review:回复 OK",
-                json!({"bound": false, "reason": "source_turn_not_found"}),
+                "@herdr-mcp:用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": true}),
             ),
-            // A bare (non-`@`) name is user text, not a dropped mention.
+            // Bare, dollar-prefixed, case-insensitive, and full-width forms
+            // are all leading mention renderings.
             (
                 "opaque-mention-a",
                 "herdr-mcp 用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
-                json!({"bound": false, "reason": "source_turn_not_found"}),
+                json!({"bound": true}),
+            ),
+            (
+                "opaque-mention-a",
+                "$HERDR_MCP：用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": true}),
+            ),
+            (
+                "opaque-mention-a",
+                "herdr-mcp\n用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
+                json!({"bound": true}),
+            ),
+            (
+                "opaque-mention-a",
+                " herdr-mcp `用 agent.task.dispatch 派发一个任务给 report-review：回复 OK` ",
+                json!({"bound": true}),
+            ),
+            (
+                "opaque-mention-a",
+                "```用 agent.task.dispatch 派发一个任务给 report-review：回复 OK```",
+                json!({"bound": true}),
             ),
             (
                 "opaque-mention-bare",
@@ -7417,7 +8008,7 @@ mod tests {
                 "archive this",
                 json!({"bound": false, "reason": "source_turn_not_found"}),
             ),
-            // A mention token is only stripped as a whole token.
+            // A near-match is never treated as a mention.
             (
                 "opaque-mention-a",
                 "herdr-mcpx 用 agent.task.dispatch 派发一个任务给 report-review：回复 OK",
@@ -7479,9 +8070,32 @@ mod tests {
             .await;
             assert_eq!(result["ok"], true, "case {index}: {result}");
             assert_eq!(
-                &result["parent_session"], expected,
+                result["parent_session"]["bound"], expected["bound"],
                 "case {index}: {message:?}"
             );
+            if expected["bound"] == false {
+                assert_eq!(
+                    result["parent_session"]["reason"], expected["reason"],
+                    "case {index}: {message:?}"
+                );
+                if expected["reason"] != "current_user_message_invalid" {
+                    let diagnostic = &result["parent_session"]["diagnostic"];
+                    let object = diagnostic.as_object().expect("diagnostic object");
+                    assert_eq!(object.len(), 3);
+                    let canonical = mcp::canonical_source_turn_text(message);
+                    assert!(
+                        object["canonical_prefix"]
+                            .as_str()
+                            .is_some_and(|value| value.chars().count() <= 24)
+                    );
+                    if canonical.chars().count() > 24 {
+                        assert!(!diagnostic.to_string().contains(&canonical));
+                    }
+                    for forbidden in ["session_ref", "opaque_session_id", "token", "locator"] {
+                        assert!(!diagnostic.to_string().contains(forbidden));
+                    }
+                }
+            }
             let expected_ref = match (expected["bound"].as_bool(), *opaque) {
                 (Some(true), "opaque-mention-nfc") => Value::String(nfc_session.clone()),
                 (Some(true), _) => Value::String(mention_session.clone()),
@@ -7588,9 +8202,12 @@ mod tests {
         .await;
         assert_eq!(stale["ok"], true);
         assert!(stale["task"]["parent_session_ref"].is_null());
-        assert_eq!(
-            stale["parent_session"],
-            json!({"bound": false, "reason": "source_turn_stale"})
+        assert_eq!(stale["parent_session"]["bound"], false);
+        assert_eq!(stale["parent_session"]["reason"], "source_turn_stale");
+        assert_dispatch_diagnostic(
+            &stale["parent_session"]["diagnostic"],
+            "过期前观察的消息",
+            None,
         );
         assert_eq!(
             store
@@ -7867,9 +8484,12 @@ mod tests {
         .await;
         assert_eq!(unbound["ok"], true);
         assert!(unbound["task"]["parent_session_ref"].is_null());
-        assert_eq!(
-            unbound["parent_session"],
-            json!({"bound": false, "reason": "source_turn_not_found"})
+        assert_eq!(unbound["parent_session"]["bound"], false);
+        assert_eq!(unbound["parent_session"]["reason"], "source_turn_not_found");
+        assert_dispatch_diagnostic(
+            &unbound["parent_session"]["diagnostic"],
+            "从未提交过的消息",
+            None,
         );
 
         let recorded = herdr_requests.lock().unwrap().clone();

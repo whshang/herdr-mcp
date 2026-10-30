@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **文档：明确只支持 Herdr TUI。** herdr-mcp 只驱动 Herdr TUI（`herdr` CLI 与 `herdr server`；CI 固定 `0.8.2`，上游当前 TUI 为 `0.9.5`）。新的 Herdr app 与 herdr-core（`hc`）是独立运行时、与 TUI 不共享 Agent，v1.1 不支持。Herdr 文档链接更新为 `https://herdr.dev/tui/docs/`；平台支持矩阵新增「Herdr 运行时支持」一节。仅文档变更，Runtime、contract 与扩展不变。
+
+## v1.1.0-rc.6 — 2026-10-30
+
+- **1.1 第六个预发布（仅 preview 通道）：** 加入多 Agent 编排：显式任务身份与父会话绑定（调用方必须已持有该会话映射，#748）、worker 心跳/完成报告/卡住检测与 wait checkpoint（#749）、人类专属决策闸门（仅本地交互 CLI 可解决；state schema 迁移 16，rc.5 及更早版本无法打开迁移后的数据库，回退需恢复 state 备份，#750）、`@idle` / `@<kind>` 角色目标与 `max_concurrent`（#751）；来源轮次规范化覆盖 `@` / `$` / 裸名前导提及与反引号包裹，并在未绑定时返回不含敏感信息的诊断（#759）；扩展 0.1.229（#754）。stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.6.md](docs/releases/v1.1.0-rc.6.md)。 [PR #752](https://github.com/whshang/herdr-mcp/pull/752) [PR #753](https://github.com/whshang/herdr-mcp/pull/753) [PR #756](https://github.com/whshang/herdr-mcp/pull/756) [PR #757](https://github.com/whshang/herdr-mcp/pull/757) [PR #760](https://github.com/whshang/herdr-mcp/pull/760) [PR #755](https://github.com/whshang/herdr-mcp/pull/755)
+- **ChatGPT 手动 @herdr-mcp 发送重新记录来源轮次（扩展 0.1.228 → 0.1.229，#754）：** 0.1.228 起采样器把 inline-mention 芯片输出为 `@<app-mention-name>`，而 composer 与已接受气泡的芯片渲染不一致（缺 `app-mention-path`、名称与标签不同）时，`wake.js` 的提交-气泡 160 字符包含校验失败，`source_turn.observe` 从未发出，dispatch 报 `source_turn_not_found`。现在校验同时比较去除 App 提及后的规范文本（NFC、去零宽字符、合并空白），发送给 Runtime 的来源文本省略 Herdr 提及，与 Runtime 规范化后的 `current_user_message` 摘要一致。Runtime 版本与 contract 不变。
+## v1.1.0-rc.5 — 2026-10-29
+
+- **1.1 第五个预发布（仅 preview 通道）：** 修复 MacBook Pro PROD 验收（#728）中 `@herdr-mcp` 提及时 `agent.task.dispatch` 父会话绑定失败：Runtime 规范化来源轮次文本后再计算哈希（NFC、去掉整词 App 提及、折叠空白），使 @提及的 dispatch 能绑定来源轮次（#741）；同一 ChatGPT 会话被重新归属父级时只保留一个当前 locator、扩展只按精确 project id 推断 Project，消除 `browser_canonical_url_ambiguous`（#740）；退役被重新归属的 locator 时把来源轮次证据迁移到存活会话，避免 `source_turn_ambiguous`；扩展 0.1.228。stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.5.md](docs/releases/v1.1.0-rc.5.md)。 [PR #742](https://github.com/whshang/herdr-mcp/pull/742) [PR #743](https://github.com/whshang/herdr-mcp/pull/743) [PR #744](https://github.com/whshang/herdr-mcp/pull/744) [PR #745](https://github.com/whshang/herdr-mcp/pull/745)
 - **ChatGPT inline-mention 采样与精确 Project 推断随扩展发布（扩展 0.1.227 → 0.1.228）：** #742 让 `performance-core.js` 把 ChatGPT 新的 `span[data-appearance="inline-mention"][app-mention-name][app-mention-path]` 提及芯片按旧 `data-inline-selection-pill` 同样处理，用户气泡文本采样为 `@herdr-mcp …`，配合 Runtime 端规范化使 @提及的 dispatch 能绑定来源轮次；#743 让 `wake.js` 的 `currentChatGptProjectFromCatalog` 只从精确 project id（页面路由 `/g/g-p-<id>…` 或当前会话锚点自身 href）取 Project，移除按 aria-label/名称子串推断，账号级 `/c/<id>` 会话不再因标题被归入 Project。本次只提升扩展版本，使这两项修复随扩展发布。Runtime 版本与 contract 不变。
 ## v1.1.0-rc.4 — 2026-10-29
 
