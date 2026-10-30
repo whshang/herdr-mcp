@@ -67,3 +67,9 @@ Template:
 - Fix: none yet. Move those two additions out of `docs/releases/v1.1.0.md`.
 - Done right: the same squash also added the historical RC3 block to `docs/releases/1.1-feature-list.md`, which is where post-tag qualification belongs.
 - Seen 1× (2026-10-27).
+
+**When retiring a persisted locator, migrate or delete dependent evidence in the same transaction.**
+- #743 / 46e4d1b5 (2026-10-29) retired the old-parent ChatGPT locator on reparent but left its `browser_source_turns` row behind. A turn observed before the reparent and re-observed after sat on two sessions with the same digest; resolution stayed `source_turn_ambiguous` until expiry. Codex review after merge called this BLOCKING: the new test only recorded the turn *after* reparenting, so the prior-evidence path was unproven. Same-day follow-up #744 / a0f6ea4f moved the retired session's latest source turn onto the surviving session (newer observation wins) and deleted the old row in one transaction.
+- Fix: a0f6ea4f (#744).
+- Done right: #744 / a0f6ea4f carries source-turn evidence with locator retirement; `reparented_conversation_with_prior_source_turn_stays_unambiguous` fails on main without that change, and the merge body states the Codex #743 gap.
+- Seen 1× (2026-10-29).
