@@ -33,7 +33,7 @@ herdr-mcp install
 herdr-mcp doctor
 ```
 
-`herdr-mcp install` 自己负责 Herdr 依赖恢复：按 `HERDR_BIN`、用户稳定路径、Homebrew/`/usr/local`、PATH 查找；已有 Herdr 会验证并自动尝试更新；完全缺失时调用 <https://herdr.dev/> 官方安装器；最后确认 Herdr Server/API 真正可达。除非命令明确报告 dependency-recovery 失败，否则 Agent 不要再另起一套手工 Herdr 安装流程。Windows Candidate UAT 仍必须使用正在验收的精确 herdr-mcp candidate artifact，不得用旧 binary 或临时源码构建替代。
+`herdr-mcp install` 自己负责 Herdr 依赖恢复：按 `HERDR_BIN`、用户稳定路径、Homebrew/`/usr/local`、PATH 查找；已有 Herdr 会验证并自动尝试更新；完全缺失时调用 <https://herdr.dev/tui/> 官方安装器；最后确认 Herdr Server/API 真正可达。除非命令明确报告 dependency-recovery 失败，否则 Agent 不要再另起一套手工 Herdr 安装流程。这里的 “Herdr” 指 Herdr TUI（`herdr`）；不要为 herdr-mcp 安装 Herdr app 或 herdr-core（`hc`），herdr-mcp v1.1 不支持这个独立的运行时。Windows Candidate UAT 仍必须使用正在验收的精确 herdr-mcp candidate artifact，不得用旧 binary 或临时源码构建替代。
 
 如果 `~/.local/bin/herdr-mcp` 已存在但交互 shell 找不到它，记为 `installed_but_not_on_shell_path`，修复用户 PATH 后用新 shell 验证。不要重复安装，也不要创建第二个 PATH owner。只有实际需要修 PATH 时再打开[故障排查](troubleshooting.md)。
 

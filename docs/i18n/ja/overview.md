@@ -31,7 +31,9 @@ herdr-mcp + Herdr workstation
 
 ## Herdr と herdr-mcp の責務
 
-**Herdr** は workspace / tab / pane / agent / session の概念、PTY、ネイティブ CLI、Socket API、ローカル Agent のライフサイクルを所有します。これらの挙動については [Herdr のドキュメント](https://herdr.dev/docs/) を権威として扱ってください。
+**Herdr** は workspace / tab / pane / agent / session の概念、PTY、ネイティブ CLI、Socket API、ローカル Agent のライフサイクルを所有します。これらの挙動については [Herdr のドキュメント](https://herdr.dev/tui/docs/) を権威として扱ってください。
+
+herdr-mcp における「Herdr」は常に **Herdr TUI**（`herdr` CLI と `herdr server`）を指します。新しい Herdr app とその herdr-core runtime（`hc`）は TUI と Agent を共有しない別の runtime であり、herdr-mcp v1.1 はこれらをサポートしません。[プラットフォームサポートマトリクス](platform-support-matrix.md) を参照してください。
 
 **herdr-mcp** が所有するもの:
 

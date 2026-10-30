@@ -18,6 +18,15 @@ Herdr-MCP 有多层彼此独立的协议，它们不会共用一个版本号。
 
 当前 ChatGPT 路径按无状态 Streamable HTTP 客户端验证：`openai-mcp` 的 `initialize` 与 `tools/list` 使用所需 SSE framing，`notifications/initialized` 可正常处理，Connector 重连不依赖保留过期的 `Mcp-Session-Id`。Workstation reconnect、Durable Object rehydration、heartbeat hibernation 与 reconnect grace 分别有回归测试，因此浏览器重新连上并不等于 workstation mutation 可以安全重放。
 
+## Herdr 运行时支持
+
+herdr-mcp 只驱动一种 Herdr 运行时：**Herdr TUI**。下表版本核对于 2026-10-30。
+
+| Herdr 运行时 | herdr-mcp v1.1 状态 | 说明 |
+| --- | --- | --- |
+| Herdr TUI（`herdr` CLI + `herdr server`） | **支持** | herdr-mcp 唯一驱动的运行时：通过 Herdr TUI socket API 操作 workspace、tab、pane 和 agent。CI 与 release gate 固定使用 Herdr TUI `0.8.2`；上游当前 TUI 版本为 `0.9.5`，尚未成为 CI 固定版本。文档：[Herdr TUI 文档](https://herdr.dev/tui/docs/)。 |
+| Herdr app（`0.1.9`）及 herdr-core（`hc` `0.1.14`） | **不支持** | 独立的运行时，使用自己的 JSON-RPC/OpenRPC socket；以 terminal 而非 workspace/tab 为模型，Agent 状态只通过 OSC 7501 上报，且与 Herdr TUI 不共享 Agent。在其中启动的 Agent 对 herdr-mcp 不可见。 |
+
 ## N、N-1 与 N+1 规则
 
 `N` 表示当前部署的 Edge 契约和当前已验证的 runtime generation。

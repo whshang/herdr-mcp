@@ -2,7 +2,7 @@
 
 *herdr-mcp のローカル管理と運用。*
 
-本ページが扱うのは **herdr-mcp** のコマンドだけです。Herdr 本体の workspace、ペイン、agent、session のコマンドについては公式の [Herdr CLI reference](https://herdr.dev/docs/cli-reference/) を参照してください。
+本ページが扱うのは **herdr-mcp** のコマンドだけです。Herdr 本体の workspace、ペイン、agent、session のコマンドについては公式の [Herdr CLI reference](https://herdr.dev/tui/docs/cli-reference/) を参照してください。
 
 ## 日常の runtime 管理
 

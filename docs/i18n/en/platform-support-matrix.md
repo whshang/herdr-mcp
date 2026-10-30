@@ -18,6 +18,15 @@ Herdr-MCP has several independent protocol layers. They intentionally do not sha
 
 The current ChatGPT path is tested as a stateless Streamable HTTP client: `openai-mcp` `initialize` and `tools/list` responses use the required SSE framing, `notifications/initialized` is accepted, and Connector reconnect does not depend on preserving an obsolete `Mcp-Session-Id`. Workstation reconnect, Durable Object rehydration, heartbeat hibernation, and reconnect grace are covered independently so a browser reconnect is not treated as proof that a workstation mutation is safe to replay.
 
+## Herdr runtime support
+
+herdr-mcp drives exactly one Herdr runtime: the **Herdr TUI**. Versions below were checked on 2026-10-30.
+
+| Herdr runtime | herdr-mcp v1.1 status | Notes |
+| --- | --- | --- |
+| Herdr TUI (`herdr` CLI + `herdr server`) | **Supported** | The only runtime herdr-mcp drives: workspaces, tabs, panes and agents through the Herdr TUI socket API. CI and the release gate pin Herdr TUI `0.8.2`; the current upstream TUI release is `0.9.5` and is not yet the CI pin. Documentation: [Herdr TUI docs](https://herdr.dev/tui/docs/). |
+| Herdr app (`0.1.9`) on herdr-core (`hc` `0.1.14`) | **Unsupported** | A separate runtime with its own JSON-RPC/OpenRPC socket. It models terminals instead of workspaces/tabs, reports agent status only through OSC 7501, and does not share agents with the Herdr TUI. Agents started there are invisible to herdr-mcp. |
+
 ## N, N-1 and N+1 policy
 
 `N` means the currently deployed Edge contract and the currently qualified runtime generation.

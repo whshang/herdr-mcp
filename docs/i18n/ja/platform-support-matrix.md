@@ -18,6 +18,15 @@ Herdr-MCP には互いに独立した複数のプロトコル層があります�
 
 現在の ChatGPT 経路はステートレスな Streamable HTTP クライアントとしてテストされています。`openai-mcp` の `initialize` と `tools/list` の応答は必須の SSE framing を使用し、`notifications/initialized` が受け入れられ、Connector の再接続は古い `Mcp-Session-Id` の保持に依存しません。ワークステーションの再接続、Durable Object の rehydration、heartbeat hibernation、reconnect grace はそれぞれ独立にカバーされているため、ブラウザが再接続できたことはワークステーションの mutation を安全に再生してよい証明とは扱われません。
 
+## Herdr runtime のサポート
+
+herdr-mcp が操作する Herdr runtime は **Herdr TUI** の一つだけです。以下のバージョンは 2026-10-30 に確認しました。
+
+| Herdr runtime | herdr-mcp v1.1 での状態 | 備考 |
+| --- | --- | --- |
+| Herdr TUI（`herdr` CLI + `herdr server`） | **サポート** | herdr-mcp が操作する唯一の runtime です。Herdr TUI socket API を通じて workspace、tab、pane、agent を扱います。CI と release gate は Herdr TUI `0.8.2` に固定しています。上流の現行 TUI リリースは `0.9.5` で、まだ CI の固定バージョンではありません。ドキュメント: [Herdr TUI docs](https://herdr.dev/tui/docs/)。 |
+| Herdr app（`0.1.9`）と herdr-core（`hc` `0.1.14`） | **非サポート** | 独自の JSON-RPC/OpenRPC socket を持つ別の runtime です。workspace/tab ではなく terminal を単位とし、Agent の状態は OSC 7501 でのみ報告され、Herdr TUI と Agent を共有しません。そこで起動した Agent は herdr-mcp から見えません。 |
+
 ## N、N-1、N+1 ポリシー
 
 `N` は、現在デプロイされている Edge 契約と、現在 qualified な runtime generation を意味します。

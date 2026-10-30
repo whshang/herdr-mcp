@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **文档：明确只支持 Herdr TUI。** herdr-mcp 只驱动 Herdr TUI（`herdr` CLI 与 `herdr server`；CI 固定 `0.8.2`，上游当前 TUI 为 `0.9.5`）。新的 Herdr app 与 herdr-core（`hc`）是独立运行时、与 TUI 不共享 Agent，v1.1 不支持。Herdr 文档链接更新为 `https://herdr.dev/tui/docs/`；平台支持矩阵新增「Herdr 运行时支持」一节。仅文档变更，Runtime、contract 与扩展不变。
+
 ## v1.1.0-rc.6 — 2026-10-30
 
 - **1.1 第六个预发布（仅 preview 通道）：** 加入多 Agent 编排：显式任务身份与父会话绑定（调用方必须已持有该会话映射，#748）、worker 心跳/完成报告/卡住检测与 wait checkpoint（#749）、人类专属决策闸门（仅本地交互 CLI 可解决；state schema 迁移 16，rc.5 及更早版本无法打开迁移后的数据库，回退需恢复 state 备份，#750）、`@idle` / `@<kind>` 角色目标与 `max_concurrent`（#751）；来源轮次规范化覆盖 `@` / `$` / 裸名前导提及与反引号包裹，并在未绑定时返回不含敏感信息的诊断（#759）；扩展 0.1.229（#754）。stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.6.md](docs/releases/v1.1.0-rc.6.md)。 [PR #752](https://github.com/whshang/herdr-mcp/pull/752) [PR #753](https://github.com/whshang/herdr-mcp/pull/753) [PR #756](https://github.com/whshang/herdr-mcp/pull/756) [PR #757](https://github.com/whshang/herdr-mcp/pull/757) [PR #760](https://github.com/whshang/herdr-mcp/pull/760) [PR #755](https://github.com/whshang/herdr-mcp/pull/755)
