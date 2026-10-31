@@ -207,6 +207,10 @@ pub struct RuntimeContext<'a> {
     pub caller_webchat_authorization: Option<&'a BrowserCallerAuthorization>,
     pub caller_browser_session: Option<&'a BrowserCallerSessionIdentity>,
     pub caller_page_assist_grants: &'a [PageAssistCallerGrant],
+    /// #774: the Edge said the caller browser is on another enrolled device, so
+    /// the source-turn evidence for this dispatch cannot exist in this runtime.
+    /// Never used to fail a dispatch; only to skip a futile lookup.
+    pub caller_browser_on_other_device: bool,
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
@@ -257,6 +261,14 @@ fn agent_task_parent_session_fact(
                 // `hint` and `*_hint` keys are stripped there.
                 fact["message"] = json!(
                     "The browser session for this turn is not registered yet. Resend from the conversation once it is registered, or retry."
+                );
+            }
+            if *reason == "caller_browser_on_other_device" {
+                // #774: the caller browser is not on this device, so the exact
+                // source turn can never be found here. The remedy is the device
+                // flag, not a retry or a different message text.
+                fact["message"] = json!(
+                    "This dispatch cannot bind because the caller browser is on another device. Redispatch with device set to the device flagged hosts_caller_browser in herdr_devices."
                 );
             }
             if let Some(diagnostic) = diagnostic {
@@ -574,6 +586,14 @@ fn agent_task_dispatch_parent_session(
         Ok(None) => return AgentTaskParentSession::NotAttempted,
         Err(()) => return AgentTaskParentSession::Unbound("current_user_message_invalid"),
     };
+    // #774: the Edge knows which enrolled device hosts the caller's browser. When
+    // it says another device, the source turn was written to that device's
+    // runtime only, so the lookup below cannot succeed here. Report the
+    // actionable reason before touching the store instead of a misleading
+    // `source_turn_not_found`; absent or same-device keeps today's behavior.
+    if context.caller_browser_on_other_device {
+        return AgentTaskParentSession::Unbound("caller_browser_on_other_device");
+    }
     // A local/trusted IPC caller has no WebChat identity to bind, so the
     // parameter changes nothing for it.
     let Some(authorization) = context.caller_webchat_authorization else {

@@ -685,6 +685,21 @@ export async function handleMcp(
       });
     }
 
+    // #774: Edge already knows the device behind each of the caller's own
+    // WebChat control / Page Assist grants, so it can say which enrolled device
+    // hosts the caller's browser. Derived from the caller's raw grants (not the
+    // routed device's projection) and carries no identifier beyond the
+    // device_id the inventory already lists. Empty means unknown: never guess.
+    const callerBrowserDeviceIds = () => {
+      const deviceIds = new Set<string>();
+      const add = (deviceId: unknown) => {
+        if (typeof deviceId === "string" && deviceId !== "") deviceIds.add(deviceId);
+      };
+      for (const grant of deps.client?.webchatControlGrants ?? []) add(grant.device_id);
+      for (const grant of deps.client?.pageAssistGrants ?? []) add(grant.device_id);
+      return deviceIds;
+    };
+
     if (name === "herdr_methods") {
       if (typeof args.query === "string" && /work_chain|planner_lease|execution_lane|fleet/i.test(args.query)) {
         const methods = discoverFleetControlMethods(args.query);
@@ -711,9 +726,22 @@ export async function handleMcp(
         const devices = boundDeviceId && Array.isArray(allDevices)
           ? allDevices.filter((device) => isRecord(device) && device.device_id === boundDeviceId)
           : allDevices;
+        // Output-only flag (#774): `hosts_caller_browser: true` marks the
+        // enrolled device(s) the caller's browser is on. It is absent — never
+        // false — when the caller holds no grant, and every other entry is
+        // returned untouched.
+        const callerBrowserDevices = callerBrowserDeviceIds();
+        const annotatedDevices = callerBrowserDevices.size === 0 || !Array.isArray(devices)
+          ? devices
+          : devices.map((device) =>
+              isRecord(device)
+                && typeof device.device_id === "string"
+                && callerBrowserDevices.has(device.device_id)
+                ? { ...device, hosts_caller_browser: true }
+                : device);
         return rpcResult(id, callToolResult({
           ok: true,
-          devices,
+          devices: annotatedDevices,
           ...(boundDeviceId
             ? {
                 scope: "bound_device",
@@ -1407,8 +1435,19 @@ export async function handleMcp(
         .filter((grant) => grant.device_id === deviceId)
         .map((grant) => ({ endpoint_ref: grant.endpoint_ref }))
       : [];
+    // #774: only `herdr_mcp.agent.task.dispatch` runs the caller's source-turn
+    // binder, so only it needs the non-secret fact that the caller browser is on
+    // another enrolled device. Absent means same-device or unknown and leaves
+    // the runtime on its current behavior; no device or account identifier
+    // travels, and legacy `herdr_prompt` keeps its trace shape.
+    const callerBrowserOnOtherDevice = (deviceId: string | null | undefined) => {
+      if (!isWebchatControlGrantCaller || !deviceId) return false;
+      const callerBrowserDevices = callerBrowserDeviceIds();
+      return callerBrowserDevices.size > 0 && !callerBrowserDevices.has(deviceId);
+    };
     const webchatControlGrants = projectWebchatControlGrants(initialRouteDeviceId);
     const pageAssistGrants = projectPageAssistGrants(initialRouteDeviceId);
+    const callerBrowserOnOtherRouteDevice = callerBrowserOnOtherDevice(initialRouteDeviceId);
     const webchatAuthorization = (isBrowserPrivateMethod || isAgentTaskCaller)
       && deps.client?.connectorId
       && Number.isSafeInteger(deps.client.grantGeneration)
@@ -1487,9 +1526,10 @@ export async function handleMcp(
       readDedupeKey,
       ...(route.device_id ? { routeDeviceId: route.device_id } : {}),
       ...(route.execution_fence ? { executionFence: route.execution_fence } : {}),
-      ...(webchatControlGrants.length > 0 || pageAssistGrants.length > 0 || webchatAuthorization || browserCallerSession
+      ...(webchatControlGrants.length > 0 || pageAssistGrants.length > 0 || webchatAuthorization || browserCallerSession || callerBrowserOnOtherRouteDevice
         ? {
           trace: {
+            ...(callerBrowserOnOtherRouteDevice ? { caller_browser_on_other_device: true } : {}),
             ...(webchatControlGrants.length > 0 ? { webchat_control_grants: webchatControlGrants } : {}),
             ...(pageAssistGrants.length > 0 ? { page_assist_grants: pageAssistGrants } : {}),
             ...(webchatAuthorization ? { webchat_authorization: webchatAuthorization } : {}),
@@ -1619,7 +1659,9 @@ export async function handleMcp(
         // session are device-independent and are carried over unchanged.
         const authoritativeWebchatControlGrants = projectWebchatControlGrants(route.device_id);
         const authoritativePageAssistGrants = projectPageAssistGrants(route.device_id);
+        const authoritativeCallerBrowserOnOtherDevice = callerBrowserOnOtherDevice(route.device_id);
         const authoritativeTrace: InternalForwardRequest["trace"] = {
+          ...(authoritativeCallerBrowserOnOtherDevice ? { caller_browser_on_other_device: true } : {}),
           ...(authoritativeWebchatControlGrants.length > 0 ? { webchat_control_grants: authoritativeWebchatControlGrants } : {}),
           ...(authoritativePageAssistGrants.length > 0 ? { page_assist_grants: authoritativePageAssistGrants } : {}),
           ...(webchatAuthorization ? { webchat_authorization: webchatAuthorization } : {}),

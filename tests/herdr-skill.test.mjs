@@ -175,5 +175,10 @@ test("user gets conversation-bound WebChat dispatch guidance | Given the served 
     assert.match(doc, /reason/);
     assert.match(doc, /device whose browser hosts this chat/);
     assert.match(doc, /unsure which (device|one)[^\n]*(say so|guessing)/);
+    // #774: the hosting device is discoverable, and a cross-device dispatch has
+    // its own actionable reason instead of a misleading digest miss.
+    assert.match(doc, /hosts_caller_browser/);
+    assert.match(doc, /`herdr_devices`/);
+    assert.match(doc, /caller_browser_on_other_device/);
   }
 });

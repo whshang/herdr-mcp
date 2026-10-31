@@ -540,6 +540,138 @@ test("user gets device facts without advisory prose | Given Edge-local device in
   assert.equal(d.calls.length, 0);
 });
 
+const CALLER_BROWSER_DEVICE_A = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const CALLER_BROWSER_DEVICE_B = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+const CALLER_BROWSER_DEVICE_C = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAX";
+const CALLER_BROWSER_ENDPOINT_A = `be_${"a".repeat(64)}`;
+const CALLER_BROWSER_ACCOUNT_A = `br_${"b".repeat(64)}`;
+const CALLER_BROWSER_PAGE_B = `be_${"f".repeat(64)}`;
+
+function callerBrowserDeps(over = {}) {
+  return deps({
+    devices: [
+      { device_id: CALLER_BROWSER_DEVICE_A, name: "macbook", workstation_id: "w-a" },
+      { device_id: CALLER_BROWSER_DEVICE_B, name: "macbook-air", workstation_id: "w-b" },
+      { device_id: CALLER_BROWSER_DEVICE_C, name: "linux", workstation_id: "w-c" },
+    ],
+    client: {
+      connectorId: "conn_callerbrowser123",
+      grantGeneration: 2,
+      webchatControlGrants: [{
+        device_id: CALLER_BROWSER_DEVICE_A,
+        endpoint_ref: CALLER_BROWSER_ENDPOINT_A,
+        provider: "chatgpt",
+        account_ref: CALLER_BROWSER_ACCOUNT_A,
+      }],
+      pageAssistGrants: [{ device_id: CALLER_BROWSER_DEVICE_B, endpoint_ref: CALLER_BROWSER_PAGE_B }],
+    },
+    resolveDevice: async (selector) => [CALLER_BROWSER_DEVICE_A, CALLER_BROWSER_DEVICE_B].includes(selector)
+      ? { ok: true, device_id: selector, workstation_id: selector === CALLER_BROWSER_DEVICE_A ? "w-a" : "w-b", routing_reason: "explicit_device_selector" }
+      : { ok: false, code: "device_not_found" },
+    ...over,
+  });
+}
+
+test("user finds the device hosting their browser | Given the caller's own WebChat control grant on one device and Page Assist grant on another | When herdr_devices is called | Then exactly those devices carry hosts_caller_browser and no grant identifier is echoed", async () => {
+  const d = callerBrowserDeps();
+  const listResp = await handleMcp(req(81, "tools/list", {}), "legacy-default", d.value);
+  assert.equal(
+    listResp.body.result._meta.herdr.contract_hash,
+    EPOCH3_CONTRACT.contract_hash,
+    "an output-only device flag never changes the Edge contract identity",
+  );
+
+  const r = await handleMcp(req(82, "tools/call", { name: "herdr_devices", arguments: {} }), "legacy-default", d.value);
+  assert.equal(r.body.result.isError, undefined);
+  const devices = r.body.result.structuredContent.devices;
+  assert.equal(devices.length, 3, "the flag never adds or drops a device");
+  assert.deepEqual(devices[0], {
+    device_id: CALLER_BROWSER_DEVICE_A,
+    name: "macbook",
+    workstation_id: "w-a",
+    hosts_caller_browser: true,
+  });
+  assert.deepEqual(devices[1], {
+    device_id: CALLER_BROWSER_DEVICE_B,
+    name: "macbook-air",
+    workstation_id: "w-b",
+    hosts_caller_browser: true,
+  });
+  assert.deepEqual(devices[2], {
+    device_id: CALLER_BROWSER_DEVICE_C,
+    name: "linux",
+    workstation_id: "w-c",
+  }, "a device with no caller grant never carries the flag");
+  const serialized = JSON.stringify(devices);
+  assert.equal(serialized.includes(CALLER_BROWSER_ENDPOINT_A), false, "no endpoint ref is leaked");
+  assert.equal(serialized.includes(CALLER_BROWSER_ACCOUNT_A), false, "no account ref is leaked");
+  assert.equal(serialized.includes(CALLER_BROWSER_PAGE_B), false, "no Page Assist endpoint is leaked");
+  assert.equal(serialized.includes("chatgpt"), false, "no provider is leaked");
+});
+
+test("user sees no guessed browser device | Given a caller with no WebChat control or Page Assist grant | When herdr_devices is called | Then no device carries hosts_caller_browser", async () => {
+  const devices = [
+    { device_id: CALLER_BROWSER_DEVICE_A, name: "macbook" },
+    { device_id: CALLER_BROWSER_DEVICE_B, name: "macbook-air" },
+  ];
+  const d = deps({ devices });
+  const r = await handleMcp(req(83, "tools/call", { name: "herdr_devices", arguments: {} }), "legacy-default", d.value);
+  const listed = r.body.result.structuredContent.devices;
+  assert.deepEqual(listed, devices, "unknown browser host leaves the inventory untouched");
+  for (const device of listed) {
+    assert.equal("hosts_caller_browser" in device, false, "never guess and never emit false");
+  }
+});
+
+test("user learns the caller browser is on another device | Given the caller's WebChat grant only on device A | When agent.task.dispatch is routed to device B and then to device A | Then only the other-device dispatch carries a non-secret marker", async () => {
+  const d = callerBrowserDeps({
+    client: {
+      connectorId: "conn_callerbrowser123",
+      grantGeneration: 2,
+      webchatControlGrants: [{
+        device_id: CALLER_BROWSER_DEVICE_A,
+        endpoint_ref: CALLER_BROWSER_ENDPOINT_A,
+        provider: "chatgpt",
+        account_ref: CALLER_BROWSER_ACCOUNT_A,
+      }],
+    },
+  });
+  const dispatchParams = JSON.stringify({
+    target: "pi",
+    text: "do durable child work",
+    current_user_message: "bind this dispatch",
+    idempotency_key: "caller-browser-other-device",
+  });
+  const elsewhere = await handleMcp(
+    req(84, "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "herdr_mcp.agent.task.dispatch", device: CALLER_BROWSER_DEVICE_B, params: dispatchParams },
+    }),
+    "w-b",
+    d.value,
+  );
+  assert.equal(elsewhere.body.result.isError, undefined, JSON.stringify(elsewhere.body.result));
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].trace?.caller_browser_on_other_device, true);
+  assert.equal(d.calls[0].trace?.webchat_control_grants, undefined, "another device's grant never travels");
+  const elsewhereTrace = JSON.stringify(d.calls[0].trace ?? {});
+  assert.equal(elsewhereTrace.includes(CALLER_BROWSER_ENDPOINT_A), false);
+  assert.equal(elsewhereTrace.includes(CALLER_BROWSER_DEVICE_A), false, "the marker is a boolean, not a device id");
+  assert.equal(elsewhereTrace.includes(CALLER_BROWSER_ACCOUNT_A), false);
+
+  const here = await handleMcp(
+    req(85, "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "herdr_mcp.agent.task.dispatch", device: CALLER_BROWSER_DEVICE_A, params: dispatchParams },
+    }),
+    "w-a",
+    d.value,
+  );
+  assert.equal(here.body.result.isError, undefined, JSON.stringify(here.body.result));
+  assert.equal(d.calls.length, 2);
+  assert.equal("caller_browser_on_other_device" in (d.calls[1].trace ?? {}), false, "same-device dispatch keeps today's trace shape");
+});
+
 test("herdr_call herdr_mcp.device.pair executes at Edge and creates pairing without workstation", async () => {
   let pairingInput = null;
   const d = deps({
