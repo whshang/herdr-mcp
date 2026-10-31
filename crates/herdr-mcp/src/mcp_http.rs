@@ -50,11 +50,14 @@ const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-g
 const EDGE_WEBCHAT_AUTHORIZATION_HEADER: &str = "x-herdr-edge-webchat-authorization";
 const EDGE_BROWSER_CALLER_SESSION_HEADER: &str = "x-herdr-edge-browser-caller-session";
 const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
+const EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER: &str =
+    "x-herdr-edge-caller-browser-on-other-device";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_EDGE_WEBCHAT_AUTHORIZATION_HEADER_BYTES: usize = 1024;
 const MAX_EDGE_BROWSER_CALLER_SESSION_HEADER_BYTES: usize = 1024;
 const MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES: usize = 8 * 1024;
+const MAX_EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER_BYTES: usize = 16;
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
@@ -2723,6 +2726,21 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             );
         }
     };
+    let caller_browser_on_other_device = match trusted_edge_caller_browser_on_other_device(
+        &state, &headers,
+    ) {
+        Ok(flag) => flag,
+        Err(()) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid trusted caller dispatch context"},
+                    "id": null
+                }),
+            );
+        }
+    };
     let request: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if !value.is_array() => value,
         Ok(_) => {
@@ -2779,6 +2797,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             caller_webchat_authorization: caller_webchat_authorization.as_ref(),
             caller_browser_session: caller_browser_session.as_ref(),
             caller_page_assist_grants: &caller_page_assist_grants,
+            caller_browser_on_other_device,
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
@@ -3113,11 +3132,38 @@ fn trusted_edge_browser_caller_session(
     }))
 }
 
+fn trusted_edge_caller_browser_on_other_device(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<bool, ()> {
+    // #774: an Edge-side, non-secret dispatch marker. It is ignored on TCP even
+    // if a bearer-authenticated client attempts to spoof it, and only the 0600
+    // Unix IPC listener can elevate it. Absent means same-device or unknown, so
+    // the dispatch keeps its current behavior.
+    if !state.trusted_extension_ipc {
+        return Ok(false);
+    }
+    let Some(raw) = headers.get(EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER) else {
+        return Ok(false);
+    };
+    let text = raw.to_str().map_err(|_| ())?;
+    if text.len() > MAX_EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER_BYTES {
+        return Err(());
+    }
+    // Exactly `true`. No device id, account ref, or endpoint may ride this
+    // marker; anything else is a malformed trusted caller context.
+    if text != "true" {
+        return Err(());
+    }
+    Ok(true)
+}
+
 fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
     if !state.trusted_extension_ipc
         || (!headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER)
             && !headers.contains_key(EDGE_WEBCHAT_AUTHORIZATION_HEADER)
             && !headers.contains_key(EDGE_BROWSER_CALLER_SESSION_HEADER)
+            && !headers.contains_key(EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER)
             && !headers.contains_key(EDGE_PAGE_ASSIST_GRANTS_HEADER))
     {
         return Ok(());
@@ -8989,6 +9035,232 @@ mod tests {
         assert!(miss["parent_session"].get("message").is_none());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// user WebChat caller | Given the Edge marker says the caller browser is on another device | When agent.task.dispatch carries current_user_message | Then the dispatch still succeeds but reports caller_browser_on_other_device without a source-turn lookup
+    #[tokio::test]
+    async fn webchat_dispatch_reports_a_caller_browser_on_another_device() {
+        // #774: the source turn exists only in the runtime of the device whose
+        // browser hosts the chat. When the Edge says the routed device is not
+        // that device, the lookup can never succeed here, so the fact names the
+        // device flag instead of the misleading `source_turn_not_found`.
+        fn edge_headers(
+            marker: Option<&str>,
+            opaque: &str,
+            endpoint_ref: &str,
+        ) -> Vec<(&'static str, String)> {
+            let mut headers = vec![
+                (
+                    "x-herdr-edge-expected-runtime-generation",
+                    "rust-caller-grant-proof".to_owned(),
+                ),
+                (
+                    "x-herdr-edge-webchat-authorization",
+                    json!({
+                        "principal_ref": "connector:conn_CallerBrowser1",
+                        "connector_id": "conn_CallerBrowser1",
+                        "grant_generation": 1,
+                    })
+                    .to_string(),
+                ),
+                (
+                    "x-herdr-edge-browser-caller-session",
+                    json!({"provider": "chatgpt", "opaque_session_id": opaque}).to_string(),
+                ),
+                (
+                    "x-herdr-edge-webchat-control-grants",
+                    json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+                ),
+            ];
+            if let Some(value) = marker {
+                headers.push((
+                    "x-herdr-edge-caller-browser-on-other-device",
+                    value.to_owned(),
+                ));
+            }
+            headers
+        }
+
+        let root = test_root("webchat-dispatch-caller-browser-other-device");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut script = Vec::new();
+        for index in 0..4 {
+            let seq = 8 + index * 2;
+            script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
+            script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
+        }
+        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let mut state = dispatch_test_state(&root, &socket);
+        // The same state over the bearer TCP listener: the reserved handoff
+        // headers are admitted only from the 0600 Unix IPC listener. Built
+        // before the trusted-IPC bit is set, so this router is the TCP surface.
+        let tcp = candidate_router(state.clone());
+        state.trusted_extension_ipc = true;
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let (app, profile_seed, endpoint_ref, account_ref) =
+            register_chatgpt_endpoint(app, "caller-browser", now).await;
+        let turn = "这条消息来自另一个设备上的浏览器";
+        let (app, session_ref) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "caller-browser",
+            turn,
+            now,
+        )
+        .await;
+
+        // The exact turn is observed in this runtime, so the only reason not to
+        // bind is the Edge marker. The dispatch itself must still succeed and
+        // the fact must name the remedy, not a digest miss.
+        let elsewhere = webchat_tool_call(
+            app.clone(),
+            &edge_headers(Some("true"), "opaque-caller-browser-other", &endpoint_ref),
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "dispatch to the wrong device",
+                "idempotency_key": "caller-browser-other-device-1",
+                "current_user_message": turn,
+            }),
+        )
+        .await;
+        assert_eq!(elsewhere["ok"], true, "{elsewhere}");
+        assert!(
+            elsewhere["task_id"].is_string(),
+            "the dispatch is never failed"
+        );
+        assert!(elsewhere["task"]["parent_session_ref"].is_null());
+        assert_eq!(elsewhere["parent_session"]["bound"], false, "{elsewhere}");
+        assert_eq!(
+            elsewhere["parent_session"]["reason"],
+            "caller_browser_on_other_device"
+        );
+        let message = elsewhere["parent_session"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(message.contains("hosts_caller_browser"), "{elsewhere}");
+        assert!(message.contains("herdr_devices"), "{elsewhere}");
+        assert!(
+            elsewhere["parent_session"].get("diagnostic").is_none(),
+            "no source-turn lookup means no digest diagnostic: {elsewhere}"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_caller_session(
+                    "connector:conn_CallerBrowser1",
+                    "chatgpt",
+                    "opaque-caller-browser-other"
+                )
+                .unwrap(),
+            None,
+            "the other-device path must not write or retarget a caller mapping"
+        );
+
+        // Absent marker keeps today's behavior: the same turn binds normally.
+        let here = webchat_tool_call(
+            app.clone(),
+            &edge_headers(None, "opaque-caller-browser-here", &endpoint_ref),
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "dispatch to the hosting device",
+                "idempotency_key": "caller-browser-same-device-2",
+                "current_user_message": turn,
+            }),
+        )
+        .await;
+        assert_eq!(here["ok"], true, "{here}");
+        assert_eq!(here["parent_session"], json!({"bound": true}));
+        assert_eq!(here["task"]["parent_session_ref"], session_ref);
+
+        // The marker only means something for turn evidence: without
+        // current_user_message the dispatch keeps its previous fact shape.
+        let no_turn = webchat_tool_call(
+            app.clone(),
+            &edge_headers(Some("true"), "opaque-caller-browser-no-turn", &endpoint_ref),
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "dispatch without turn evidence",
+                "idempotency_key": "caller-browser-no-turn-3",
+            }),
+        )
+        .await;
+        assert_eq!(no_turn["ok"], true, "{no_turn}");
+        assert!(no_turn.get("parent_session").is_none(), "{no_turn}");
+
+        // The marker is a boolean, never an identifier: anything else is a
+        // malformed trusted caller context and is refused before dispatch.
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(AUTHORIZATION, "Bearer test-token")
+            .header(CONTENT_TYPE, "application/json")
+            .header("user-agent", "openai-mcp/1.0.0");
+        for (name, value) in edge_headers(
+            Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            "opaque-caller-browser-invalid",
+            &endpoint_ref,
+        ) {
+            builder = builder.header(name, value);
+        }
+        // A bearer TCP caller cannot elevate the reserved handoff headers, so the
+        // marker is ignored there and the dispatch keeps its previous fact shape.
+        let over_tcp = webchat_tool_call(
+            tcp,
+            &edge_headers(Some("true"), "opaque-caller-browser-tcp", &endpoint_ref),
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "dispatch over bearer TCP",
+                "idempotency_key": "caller-browser-tcp-marker-5",
+                "current_user_message": turn,
+            }),
+        )
+        .await;
+        assert_eq!(over_tcp["ok"], true, "{over_tcp}");
+        assert!(
+            over_tcp.get("parent_session").is_none(),
+            "TCP ignores the reserved caller headers, so the marker must not produce a binding fact: {over_tcp}"
+        );
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 9,
+                            "method": "tools/call",
+                            "params": {"name": "herdr_call", "arguments": {
+                                "method": "herdr_mcp.agent.task.dispatch",
+                                "params": json!({
+                                    "target": "w1:p1",
+                                    "text": "dispatch with a device id marker",
+                                    "idempotency_key": "caller-browser-invalid-marker-4",
+                                    "current_user_message": turn,
+                                }).to_string(),
+                            }}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(socket);
     }
 
     #[tokio::test]

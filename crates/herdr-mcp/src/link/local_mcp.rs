@@ -48,6 +48,8 @@ const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-g
 const EDGE_WEBCHAT_AUTHORIZATION_HEADER: &str = "x-herdr-edge-webchat-authorization";
 const EDGE_BROWSER_CALLER_SESSION_HEADER: &str = "x-herdr-edge-browser-caller-session";
 const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
+const EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER: &str =
+    "x-herdr-edge-caller-browser-on-other-device";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const LOCAL_MCP_MIN_FRAME_BYTES: usize = 64;
 const LOCAL_MCP_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -199,6 +201,7 @@ struct RoutedDispatchContext {
     page_assist_grants_header: Option<String>,
     authorization_header: Option<String>,
     browser_caller_session_header: Option<String>,
+    caller_browser_on_other_device_header: Option<String>,
 }
 
 pub struct LocalMcpTransport {
@@ -424,6 +427,22 @@ impl LocalMcpTransport {
         serde_json::to_string(&normalized).map(Some).map_err(|_| ())
     }
 
+    /// #774: the Edge forwards one non-secret marker, and only when the caller
+    /// browser is on another enrolled device. A present-but-not-`true` value is
+    /// invalid: the marker never carries a device id or any other identifier.
+    fn caller_browser_on_other_device_header(
+        trace: Option<&Map<String, Value>>,
+    ) -> Result<Option<String>, ()> {
+        let Some(value) = trace.and_then(|trace| trace.get("caller_browser_on_other_device"))
+        else {
+            return Ok(None);
+        };
+        if value != &Value::Bool(true) {
+            return Err(());
+        }
+        Ok(Some("true".to_owned()))
+    }
+
     fn webchat_authorization_header(
         trace: Option<&Map<String, Value>>,
     ) -> Result<Option<String>, ()> {
@@ -577,11 +596,14 @@ impl LocalMcpTransport {
         &self,
         body: String,
         rpc_id: String,
-        webchat_grants_header: Option<&str>,
-        page_assist_grants_header: Option<&str>,
-        authorization_header: Option<&str>,
-        browser_caller_session_header: Option<&str>,
+        context: &RoutedDispatchContext,
     ) -> RuntimeToolResult {
+        let webchat_grants_header = context.webchat_grants_header.as_deref();
+        let page_assist_grants_header = context.page_assist_grants_header.as_deref();
+        let authorization_header = context.authorization_header.as_deref();
+        let browser_caller_session_header = context.browser_caller_session_header.as_deref();
+        let caller_browser_on_other_device_header =
+            context.caller_browser_on_other_device_header.as_deref();
         let Some(expected_generation) = self.runtime_generation.as_deref() else {
             return self.failure(
                 code::RUNTIME_GENERATION_MISMATCH,
@@ -642,6 +664,10 @@ impl LocalMcpTransport {
         if let Some(value) = browser_caller_session_header {
             request_builder = request_builder.header(EDGE_BROWSER_CALLER_SESSION_HEADER, value);
         }
+        if let Some(value) = caller_browser_on_other_device_header {
+            request_builder =
+                request_builder.header(EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER, value);
+        }
         let request = match request_builder
             .header(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER, expected_generation)
             .body(Full::new(Bytes::from(body)))
@@ -697,10 +723,7 @@ impl LocalMcpTransport {
         &self,
         _body: String,
         _rpc_id: String,
-        _webchat_grants_header: Option<&str>,
-        _page_assist_grants_header: Option<&str>,
-        _authorization_header: Option<&str>,
-        _browser_caller_session_header: Option<&str>,
+        _context: &RoutedDispatchContext,
     ) -> RuntimeToolResult {
         self.failure(
             code::UNREACHABLE,
@@ -798,16 +821,9 @@ impl LocalMcpTransport {
             || context.page_assist_grants_header.is_some()
             || context.authorization_header.is_some()
             || context.browser_caller_session_header.is_some()
+            || context.caller_browser_on_other_device_header.is_some()
         {
-            self.dispatch_trusted_ipc(
-                body,
-                rpc_id,
-                context.webchat_grants_header.as_deref(),
-                context.page_assist_grants_header.as_deref(),
-                context.authorization_header.as_deref(),
-                context.browser_caller_session_header.as_deref(),
-            )
-            .await
+            self.dispatch_trusted_ipc(body, rpc_id, &context).await
         } else {
             self.dispatch_http(body, rpc_id).await
         }
@@ -918,6 +934,18 @@ impl LocalMcpTransport {
                     );
                 }
             };
+        let caller_browser_on_other_device_header =
+            match Self::caller_browser_on_other_device_header(request.trace.as_ref()) {
+                Ok(value) => value,
+                Err(()) => {
+                    return self.failure(
+                        code::BAD_REQUEST,
+                        false,
+                        "invalid trusted caller dispatch context",
+                        None,
+                    );
+                }
+            };
         let body = match serde_json::to_string(&json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -990,6 +1018,7 @@ impl LocalMcpTransport {
                     page_assist_grants_header,
                     authorization_header,
                     browser_caller_session_header,
+                    caller_browser_on_other_device_header,
                 },
             ) => result,
         };
@@ -2059,5 +2088,45 @@ mod webchat_any_provider_link_tests {
             {"endpoint_ref": "bep_a", "provider": "Bad*", "account_ref": "*"}
         ]});
         assert!(LocalMcpTransport::webchat_control_grants_header(trace.as_object()).is_err());
+    }
+
+    /// user WebChat caller | Given the Edge marker says the caller browser is on another device | When the link builds the trusted dispatch header | Then it forwards exactly `true`, and it forwards nothing for the same-device/absent case
+    #[test]
+    fn user_webchat_caller_given_other_device_marker_when_link_builds_header_then_boolean_only() {
+        let trace = json!({"caller_browser_on_other_device": true});
+        let header = LocalMcpTransport::caller_browser_on_other_device_header(trace.as_object())
+            .expect("boolean marker accepted");
+        assert_eq!(header.as_deref(), Some("true"));
+
+        let same_device = json!({"webchat_control_grants": [
+            {"endpoint_ref": "bep_a", "provider": "chatgpt", "account_ref": "br_a"}
+        ]});
+        assert_eq!(
+            LocalMcpTransport::caller_browser_on_other_device_header(same_device.as_object()),
+            Ok(None),
+            "absent means same-device or unknown"
+        );
+        assert_eq!(
+            LocalMcpTransport::caller_browser_on_other_device_header(None),
+            Ok(None)
+        );
+    }
+
+    /// user remote connector | Given the marker carries anything but the boolean `true` | When the link builds the trusted dispatch header | Then the request fails closed instead of forwarding an identifier
+    #[test]
+    fn user_connector_given_non_boolean_marker_when_link_builds_header_then_rejected() {
+        for marker in [
+            json!("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            json!(false),
+            json!(1),
+            json!(null),
+        ] {
+            let trace = json!({"caller_browser_on_other_device": marker});
+            assert!(
+                LocalMcpTransport::caller_browser_on_other_device_header(trace.as_object())
+                    .is_err(),
+                "{marker} must be rejected"
+            );
+        }
     }
 }
