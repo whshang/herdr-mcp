@@ -2700,6 +2700,86 @@ test("user dispatches through a cold execution fence | Given a canonical seed de
   }
 });
 
+function rerouteCallerBrowserDeps(grantsOn) {
+  const grantsOnSeed = grantsOn === "A";
+  let registryReads = 0;
+  let attempts = 0;
+  const d = deps({
+    client: {
+      connectorId: "conn_reroutecallerbrowser1",
+      grantGeneration: 3,
+      webchatControlGrants: [{
+        device_id: grantsOnSeed ? REROUTE_DEVICE_A : REROUTE_DEVICE_B,
+        endpoint_ref: grantsOnSeed ? REROUTE_ENDPOINT_A : REROUTE_ENDPOINT_B,
+        provider: "chatgpt",
+        account_ref: `br_${"3".repeat(64)}`,
+      }],
+    },
+    resolveDevice: async (selector) => {
+      registryReads += 1;
+      assert.equal(selector, REROUTE_DEVICE_A, "the authoritative re-resolution uses the caller's selector");
+      return { ok: true, device_id: REROUTE_DEVICE_B, workstation_id: "ws-b", routing_reason: "explicit_device" };
+    },
+    forward: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response(JSON.stringify({
+          status: "error",
+          error: { ok: false, code: "device_route_unverified", retryable: false, delivery_state: "not_delivered" },
+        }), { status: 428, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { served: true } },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  return { ...d, registryReads: () => registryReads };
+}
+
+// #774: the caller-browser marker is a function of the routed device too. A
+// `device_route_unverified` retry must recompute it, otherwise the seed device's
+// answer would travel with a call the workstation executes for another device.
+test("user keeps the caller-browser marker on the executed device | Given grants only on one device and an authoritative re-resolution to the other | When the first forward reports device_route_unverified | Then the marker is added or dropped for the device that actually runs the call", async () => {
+  // Seed device A carries the caller browser, authoritative device B does not:
+  // the seed forward has no marker, the retry must add it.
+  const grantsOnSeed = rerouteCallerBrowserDeps("A");
+  const added = await handleMcp(rerouteDispatchRequest(), "w1", grantsOnSeed.value);
+  assert.equal(added.body.result.isError, undefined, "the retried dispatch settles on the authoritative route");
+  assert.equal(grantsOnSeed.calls.length, 2);
+  assert.equal(grantsOnSeed.registryReads(), 1);
+  assert.equal(
+    "caller_browser_on_other_device" in (grantsOnSeed.calls[0].trace ?? {}),
+    false,
+    "the seed device hosts the caller browser, so the seed forward carries no marker",
+  );
+  assert.equal(grantsOnSeed.calls[1].trace?.caller_browser_on_other_device, true, "the retry runs on another device, so the marker appears");
+  assert.equal(grantsOnSeed.calls[1].trace?.webchat_control_grants, undefined, "the retry never carries the seed device's grant");
+  assert.equal(
+    JSON.stringify(grantsOnSeed.calls[1].trace ?? {}).includes(REROUTE_ENDPOINT_A),
+    false,
+    "the retry must not carry the seed device's endpoint",
+  );
+
+  // Mirror: the seed device does not host the caller browser, the authoritative
+  // device does. The seed forward must not keep a marker the retry has to drop.
+  const grantsOnAuthoritative = rerouteCallerBrowserDeps("B");
+  const dropped = await handleMcp(rerouteDispatchRequest(2), "w1", grantsOnAuthoritative.value);
+  assert.equal(dropped.body.result.isError, undefined);
+  assert.equal(grantsOnAuthoritative.calls.length, 2);
+  assert.equal(grantsOnAuthoritative.calls[0].trace?.caller_browser_on_other_device, true, "the seed device does not host the caller browser");
+  assert.equal(
+    "caller_browser_on_other_device" in (grantsOnAuthoritative.calls[1].trace ?? {}),
+    false,
+    "the authoritative device hosts the caller browser, so the retry drops the marker",
+  );
+  assert.deepEqual(grantsOnAuthoritative.calls[1].trace?.webchat_control_grants, [{
+    endpoint_ref: REROUTE_ENDPOINT_B,
+    provider: "chatgpt",
+    account_ref: `br_${"3".repeat(64)}`,
+  }], "the retry carries the authoritative device's grant");
+});
+
 // The short-window read dedupe key is a device-scoped identity: the
 // WorkstationDO replays an in-flight/recent read completion keyed by it and
 // wraps the reply with the current `routeDeviceId`. Reusing a seed-device key

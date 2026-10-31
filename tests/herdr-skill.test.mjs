@@ -180,5 +180,24 @@ test("user gets conversation-bound WebChat dispatch guidance | Given the served 
     assert.match(doc, /hosts_caller_browser/);
     assert.match(doc, /`herdr_devices`/);
     assert.match(doc, /caller_browser_on_other_device/);
+    // #774 review: the redispatch rule must be qualified, never "always
+    // redispatch" and never a blanket "report instead of redispatching".
+    // Exactly one redispatch, only for the other-device reason, only to the
+    // device flagged hosts_caller_browser; every other reason is reported.
+    assert.match(
+      doc,
+      /redispatch (exactly )?once[^.]{0,120}`hosts_caller_browser`/i,
+      "the only permitted redispatch is a single one to the device flagged hosts_caller_browser",
+    );
+    assert.match(
+      doc,
+      /for every other `bound:false` reason[\s\S]{0,200}do not (re)?dispatch|do not (re)?dispatch[\s\S]{0,200}for every other `bound:false` reason/i,
+      "every other bound:false reason must be reported without redispatching",
+    );
+  }
+  // The two documents that describe the redispatch in full must also say the
+  // flag has to exist before it is used: the planner may never invent a device.
+  for (const doc of [globalAgents, dispatchSkill]) {
+    assert.match(doc, /that flag exists|actually flags such a device/);
   }
 });

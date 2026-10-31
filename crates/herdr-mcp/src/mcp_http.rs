@@ -9087,13 +9087,17 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let mut script = Vec::new();
-        for index in 0..3 {
+        for index in 0..4 {
             let seq = 8 + index * 2;
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
         let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
+        // The same state over the bearer TCP listener: the reserved handoff
+        // headers are admitted only from the 0600 Unix IPC listener. Built
+        // before the trusted-IPC bit is set, so this router is the TCP surface.
+        let tcp = candidate_router(state.clone());
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
         let app = candidate_router(state);
@@ -9208,6 +9212,26 @@ mod tests {
         ) {
             builder = builder.header(name, value);
         }
+        // A bearer TCP caller cannot elevate the reserved handoff headers, so the
+        // marker is ignored there and the dispatch keeps its previous fact shape.
+        let over_tcp = webchat_tool_call(
+            tcp,
+            &edge_headers(Some("true"), "opaque-caller-browser-tcp", &endpoint_ref),
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "dispatch over bearer TCP",
+                "idempotency_key": "caller-browser-tcp-marker-5",
+                "current_user_message": turn,
+            }),
+        )
+        .await;
+        assert_eq!(over_tcp["ok"], true, "{over_tcp}");
+        assert!(
+            over_tcp.get("parent_session").is_none(),
+            "TCP ignores the reserved caller headers, so the marker must not produce a binding fact: {over_tcp}"
+        );
+
         let rejected = app
             .clone()
             .oneshot(

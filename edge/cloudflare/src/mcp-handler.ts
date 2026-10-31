@@ -1435,13 +1435,15 @@ export async function handleMcp(
         .filter((grant) => grant.device_id === deviceId)
         .map((grant) => ({ endpoint_ref: grant.endpoint_ref }))
       : [];
-    // #774: only `herdr_mcp.agent.task.dispatch` runs the caller's source-turn
-    // binder, so only it needs the non-secret fact that the caller browser is on
-    // another enrolled device. Absent means same-device or unknown and leaves
-    // the runtime on its current behavior; no device or account identifier
-    // travels, and legacy `herdr_prompt` keeps its trace shape.
+    // #774: only a routed `herdr_mcp.agent.task.dispatch` runs the caller's
+    // source-turn binder, so only it needs the non-secret fact that the caller
+    // browser is on another enrolled device. Absent means same-device or
+    // unknown and leaves the runtime on its current behavior; no device or
+    // account identifier travels, and browser methods and legacy `herdr_prompt`
+    // keep their trace shape.
     const callerBrowserOnOtherDevice = (deviceId: string | null | undefined) => {
-      if (!isWebchatControlGrantCaller || !deviceId) return false;
+      if (name !== "herdr_call" || localMethod !== "herdr_mcp.agent.task.dispatch") return false;
+      if (!deviceId) return false;
       const callerBrowserDevices = callerBrowserDeviceIds();
       return callerBrowserDevices.size > 0 && !callerBrowserDevices.has(deviceId);
     };
