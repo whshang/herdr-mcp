@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## v1.1.0-rc.9 — 2026-11-01
 
-- **`update apply` 只更新 Runtime，绝不再串联 Worker 更新（#796）：** 同 contract 的 Runtime 更新成功提交后不再自动执行 Cloudflare Worker reconcile（也不再启动 wrangler、Cloudflare device login 或浏览器弹窗），因此 detached、`nohup`、CI 等无人值守升级不会再因为等待交互授权而阻塞数分钟，也不会再以 `update_succeeded_worker_update_required` 结束。Worker 落后时改为非致命提示：Runtime 更新成功时 `code` 恒为 `update_succeeded` 且退出码为成功，另有 `worker_update_required: true`、`notices[].code: worker_update_required`（`severity: notice`、`fatal: false`）与 `next_action: herdr-mcp worker update` 指明独立命令。新增显式开关 `update apply --with-worker`：仅当 stdin 与 stdout 都是交互式终端时才串联 Worker 更新，否则在任何更新动作之前以 `code: with_worker_requires_interactive_tty` 拒绝。`update check|status|auto` 同样只报告 Worker drift，不再有隐式 Worker mutation。
+- **1.1 第九个预发布（仅 preview 通道）：** `update apply` 只更新 Runtime，Runtime 更新成功后不再串联 Cloudflare Worker 更新（也不再启动 wrangler、Cloudflare device login 或浏览器），因此 detached / `nohup` / CI 等无人值守升级不再因等待交互授权而阻塞数分钟；Worker 落后时改为非致命提示（`code` 仍为 `update_succeeded`、`worker_update_required: true`、`notices[].code: worker_update_required`、`next_action: herdr-mcp worker update`），`herdr-mcp worker update` 是独立操作员步骤，显式 `update apply --with-worker` 仅在交互式 TTY 下串联、否则以 `with_worker_requires_interactive_tty` 拒绝（#796）。仅 Runtime 变更；无新 state 迁移（schema 16），contract 与扩展 0.1.229 不变。v1.0.x 路径为 v1.0.4 → v1.0.5 → v1.1.0；stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.9.md](docs/releases/v1.1.0-rc.9.md)。 [PR #797](https://github.com/whshang/herdr-mcp/pull/797)
 
 ## v1.1.0-rc.8 — 2026-11-01
 
