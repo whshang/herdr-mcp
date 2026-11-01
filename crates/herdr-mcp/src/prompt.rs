@@ -3315,9 +3315,19 @@ pub fn run_with_parent_session(
         && let Some(parent_target) = parent_target
         && let Some(mut rejection) = delegation_guard(client, registry, "", None, parent_target)
     {
-        insert_dispatch_id(&mut rejection, task_id);
-        insert_task_id(&mut rejection, task_id);
-        return rejection;
+        if spawn_resume.is_some() {
+            // A resumed chain already owns a persisted pane/agent outcome: this
+            // refusal is a live observation about the parent chain, so it must
+            // not overwrite the checkpoint this key replays from.
+            insert_dispatch_id(&mut rejection, task_id);
+            insert_task_id(&mut rejection, task_id);
+            return rejection;
+        }
+        // This call reserved the key above and created nothing, so the refusal
+        // is this key's outcome: persist it like every other pre-pane failure.
+        // Otherwise the reservation stays pending and a same-key retry inside
+        // the TTL observes `idempotency_in_flight` instead of the refusal.
+        return finish_spawn_failure(registry, idempotency_key, &fingerprint, task_id, rejection);
     }
 
     // Two concurrent replays of one checkpoint must not both prompt.
@@ -6364,6 +6374,74 @@ mod tests {
             "only the caller probe runs; no pane, agent or prompt is created"
         );
         assert_eq!(registry.list_tasks(10).unwrap().len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a spawn dispatch refused by the delegation guard
+    /// before any pane existed | When the same idempotency key is replayed
+    /// inside the TTL | Then the stored refusal returns instead of an in-flight
+    /// reservation, and nothing is probed, created or prompted again.
+    #[test]
+    fn spawn_dispatch_delegation_refusal_replays_under_the_same_key() {
+        let root = spawn_project_root("delegation-replay");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![json!({"agent": {"pane_id": "w1:p2", "agent_status": "working"}})],
+            requests.clone(),
+        );
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store.clone(), &root, 80);
+        register_running_task(
+            &registry,
+            "supervisor-task",
+            "supervisor",
+            "w1:p1",
+            Some("planner"),
+            None,
+            0,
+        );
+        register_running_task(
+            &registry,
+            "worker-task",
+            "worker",
+            "w1:p2",
+            Some("supervisor"),
+            None,
+            0,
+        );
+        let args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1"},
+            "text": "work",
+            "idempotency_key": "spawn-delegation-replay",
+            "parent_target": "worker",
+        });
+        let client = HerdrClient::new(&socket);
+        let first = run(&client, &registry, &args);
+        server.join().unwrap();
+        assert_eq!(first["ok"], false, "{first}");
+        assert_eq!(first["code"], "delegation_depth_exceeded", "{first}");
+        assert!(
+            first.get("idempotent_replay").is_none(),
+            "the first refusal is an outcome, not a replay: {first}"
+        );
+
+        // A fresh registry over the same durable store proves the refusal was
+        // persisted for the key rather than remembered inside one process.
+        let reloaded = spawn_registry_with(store, &root, 80);
+        let replay = run(&client, &reloaded, &args);
+        assert_eq!(replay["ok"], false, "{replay}");
+        assert_eq!(replay["code"], "delegation_depth_exceeded", "{replay}");
+        assert_eq!(replay["message"], first["message"], "{replay}");
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["dispatch_id"], first["dispatch_id"], "{replay}");
+        assert_eq!(
+            spawn_requested_methods(&requests),
+            vec!["agent.get"],
+            "the replay is a pure observation: no second caller probe, pane, agent or prompt"
+        );
+        assert_eq!(reloaded.list_tasks(10).unwrap().len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 
