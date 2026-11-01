@@ -474,6 +474,7 @@ fn runtime_update_succeeded_result(outcome: RuntimeUpdateOutcome<'_>) -> (Value,
     (payload, ExitCode::SUCCESS)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn reconcile_worker_with_active_runtime(paths: &RuntimePaths) -> Value {
     let binary = match active_runtime_binary(paths) {
         Ok(binary) => binary,
