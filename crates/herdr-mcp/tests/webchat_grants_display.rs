@@ -1,8 +1,10 @@
-//! Process-level regression test for the #772 WebChat grant display
-//! (review round 1, BLOCKING item): the **default** `herdr-mcp doctor`
-//! (non-verbose) and `herdr-mcp status --verbose` outputs must contain the
-//! grant state (`state=`) and per-endpoint consent revision
-//! (`consent_revision`) plus the distinguishing hint.
+//! Process-level regression test for the #772/#791 WebChat grant display:
+//! the **default** `herdr-mcp doctor` (non-verbose) and `herdr-mcp status
+//! --verbose` outputs must contain the grant state (`state=`), the
+//! per-endpoint consent revision (`consent_revision`), and the Edge-authority
+//! framing. A legacy `webchat_control_allowed=0` endpoint with no local grant
+//! evidence reports `state=absent_locally` and the owner-device connector
+//! grant command; the retired extension consent toggle is never named.
 //!
 //! Runs the real binary with an isolated config dir, mirroring the
 //! `tcc_broker_process.rs` convention.
@@ -141,9 +143,15 @@ fn default_doctor_and_status_verbose_show_grant_state_and_consent_revision() {
         doctor.contains("state=unknown"),
         "default doctor missing grant state:\n{doctor}"
     );
+    // With no readable local evidence the doctor must not claim an Edge-side
+    // absence; it names the Edge authority and the owner-device grant (#791).
     assert!(
-        doctor.contains("grant_missing"),
-        "default doctor missing grant hint:\n{doctor}"
+        doctor.contains("herdr-mcp connector webchat-control allow"),
+        "default doctor missing the owner-device grant hint:\n{doctor}"
+    );
+    assert!(
+        !doctor.contains("extension consent"),
+        "default doctor still blames extension consent:\n{doctor}"
     );
 
     let status = run_with_config(&["status", "--verbose"], &config, &[0]);
@@ -153,12 +161,15 @@ fn default_doctor_and_status_verbose_show_grant_state_and_consent_revision() {
     );
 
     // With a state DB present, default doctor and status --verbose must show
-    // the per-endpoint consent line including consent_revision.
+    // the per-endpoint line including consent_revision. The seeded endpoint is
+    // a legacy row (`webchat_control_allowed=0`) with no local grant evidence,
+    // so state must be `absent_locally` (never an Edge-side `absent`) and the
+    // hint must point at the owner-device connector grant (#791).
     seed_state_db(&config.join("state.db"));
     let doctor = run_with_config(&["doctor"], &config, &[0, 2]);
     assert!(
-        doctor.contains("state=absent"),
-        "default doctor missing grant state=absent:\n{doctor}"
+        doctor.contains("state=absent_locally"),
+        "default doctor missing grant state=absent_locally:\n{doctor}"
     );
     assert!(
         doctor.contains("consent_revision=4"),
@@ -168,15 +179,35 @@ fn default_doctor_and_status_verbose_show_grant_state_and_consent_revision() {
         doctor.contains("bep_test_endpoint_placeholder"),
         "default doctor missing endpoint ref:\n{doctor}"
     );
+    assert!(
+        doctor.contains("webchat_control=legacy_ignored"),
+        "default doctor still presents the retired WebChat switch as a gate:\n{doctor}"
+    );
+    assert!(
+        doctor.contains("herdr-mcp connector webchat-control allow"),
+        "default doctor missing the connector grant next step:\n{doctor}"
+    );
+    assert!(
+        !doctor.contains("extension consent"),
+        "default doctor still blames extension consent:\n{doctor}"
+    );
 
     let status = run_with_config(&["status", "--verbose"], &config, &[0]);
     assert!(
-        status.contains("state=absent"),
-        "status --verbose missing grant state=absent:\n{status}"
+        status.contains("state=absent_locally"),
+        "status --verbose missing grant state=absent_locally:\n{status}"
     );
     assert!(
         status.contains("consent_revision=4"),
         "status --verbose missing consent_revision line:\n{status}"
+    );
+    assert!(
+        status.contains("herdr-mcp connector webchat-control allow"),
+        "status --verbose missing the connector grant next step:\n{status}"
+    );
+    assert!(
+        !status.contains("extension consent"),
+        "status --verbose still blames extension consent:\n{status}"
     );
     // No line may print twice: the `state=` rollup must not be repeated by
     // the detail iteration, and each consent line appears exactly once.
