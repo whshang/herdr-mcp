@@ -44,8 +44,15 @@ const MAX_GRANT_ROWS: usize = 32;
 /// retired extension WebChat Control switch is not a valid next step.
 pub(crate) const CONNECTOR_GRANT_COMMAND: &str = "herdr-mcp connector webchat-control allow <connector-id> <device-id> <endpoint_ref> <provider> --confirm";
 /// Device-wide variant of [`CONNECTOR_GRANT_COMMAND`] for every endpoint of a
-/// provider on one device.
+/// provider on one device. This is a secondary option, not the default: it
+/// needs an Edge that accepts `scope: "device"` (#713). A Worker without that
+/// support rejects the body with `device_grant_requires_edge_support` and
+/// writes nothing, so the per-endpoint command above always leads.
 pub(crate) const DEVICE_WIDE_GRANT_COMMAND: &str = "herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm";
+/// Why the device-wide form is offered last. Named next to the command in both
+/// text and JSON so an operator on a pre-#713 Edge does not read the failure as
+/// a grant problem.
+pub(crate) const DEVICE_WIDE_GRANT_REQUIRES: &str = "#713 / Edge device-scope (scope=device) support; otherwise device_grant_requires_edge_support and no grant is written";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GrantState {
@@ -218,7 +225,9 @@ impl WebChatGrantSnapshot {
             GrantState::AbsentLocally => json!({
                 "action": "grant_on_owner_device",
                 "command": CONNECTOR_GRANT_COMMAND,
+                // Secondary: needs an Edge that accepts `scope: "device"` (#713).
                 "device_wide_command": DEVICE_WIDE_GRANT_COMMAND,
+                "device_wide_requires": DEVICE_WIDE_GRANT_REQUIRES,
             }),
             GrantState::Present | GrantState::Unknown => Value::Null,
         }
@@ -251,8 +260,12 @@ impl WebChatGrantSnapshot {
                     )
                 };
                 format!(
-                    "{lead} {CONNECTOR_GRANT_COMMAND} ({} {DEVICE_WIDE_GRANT_COMMAND})",
-                    language.text("device-wide", "整设备范围", "デバイス全体"),
+                    "{lead} {CONNECTOR_GRANT_COMMAND} ({} {DEVICE_WIDE_GRANT_COMMAND} — {DEVICE_WIDE_GRANT_REQUIRES})",
+                    language.text(
+                        "device-wide alternative, not the default:",
+                        "整设备范围的替代命令（非默认）：",
+                        "デバイス全体の代替（既定ではない）:",
+                    ),
                 )
             }
         }
@@ -344,17 +357,20 @@ pub(crate) fn summary_line(
                 "ローカル証拠のみ。権威は Edge の grant",
             ),
         ),
+        // Non-prediction: this runtime cannot see the Edge grant, so empty
+        // local evidence says nothing about whether binding will fail. Only a
+        // real `grant_missing` refusal is the trigger for the grant (#791).
         GrantState::AbsentLocally => format!(
             "{label}: state=absent_locally · {} · {}",
             language.text(
-                "binding would fail with grant_missing",
-                "绑定将报 grant_missing",
-                "バインディングは grant_missing で失敗する",
+                "no local grant evidence, Edge is authoritative",
+                "本地没有授权证据，以 Edge 为准",
+                "ローカルに grant 証拠なし。権威は Edge",
             ),
             language.text(
-                "not authoritative, grants live on Edge",
-                "非权威，授权在 Edge 上",
-                "非権威。grant は Edge 側",
+                "if binding is actually refused with grant_missing, grant from the owner device",
+                "若绑定确实报 grant_missing，请在属主设备上授权",
+                "実際にバインディングが grant_missing で拒否された場合はオーナーデバイスで許可する",
             ),
         ),
         GrantState::Unknown => format!(
@@ -757,15 +773,46 @@ mod tests {
         // The retired switch is labelled, never rendered as a gate value.
         assert!(line.contains("webchat_control=legacy_ignored"), "{line}");
         assert!(line.contains("stored_webchat_control=false"), "{line}");
-        // The real next step is the Edge connector grant.
+        // The real next step is the per-endpoint Edge connector grant, and it
+        // leads the device-wide alternative.
         assert!(
             line.contains(CONNECTOR_GRANT_COMMAND),
             "missing connector grant hint:\n{line}"
         );
-        // The status rollup keeps the binding consequence visible.
         assert!(
-            summary_line(&snapshot, crate::locale::Locale::En).contains("grant_missing"),
-            "state rollup must name the binding consequence"
+            line.find(CONNECTOR_GRANT_COMMAND) < line.find(DEVICE_WIDE_GRANT_COMMAND),
+            "per-endpoint command must lead the device-wide form:\n{line}"
+        );
+        // The device-wide form is never offered unconditionally: a pre-#713
+        // Edge rejects `scope=device` and writes no grant.
+        assert!(
+            line.contains("device_grant_requires_edge_support"),
+            "device-wide form must name its Edge requirement:\n{line}"
+        );
+        assert!(
+            line.contains("#713"),
+            "device-wide form must name the #713 dependency:\n{line}"
+        );
+        // The status rollup must not predict an Edge-side failure from empty
+        // local evidence; `grant_missing` appears only as the real refusal
+        // condition, never as "binding would fail" (#791 review).
+        for language in [
+            crate::locale::Locale::En,
+            crate::locale::Locale::ZhCn,
+            crate::locale::Locale::Ja,
+        ] {
+            let summary = summary_line(&snapshot, language);
+            assert!(summary.contains("state=absent_locally"), "{summary}");
+            assert!(!summary.contains("would fail"), "{summary}");
+            assert!(!summary.contains("将报"), "{summary}");
+            assert!(!summary.contains("で失敗する"), "{summary}");
+        }
+        let summary = summary_line(&snapshot, crate::locale::Locale::En);
+        assert!(summary.contains("no local grant evidence"), "{summary}");
+        assert!(summary.contains("Edge is authoritative"), "{summary}");
+        assert!(
+            summary.contains("if binding is actually refused with grant_missing"),
+            "{summary}"
         );
         // No extension-consent guidance anywhere in the output.
         for rendered in [line.clone(), snapshot.hint(crate::locale::Locale::En)] {
@@ -779,6 +826,14 @@ mod tests {
         assert_eq!(json["source"], "local_evidence");
         assert_eq!(json["next_step"]["action"], "grant_on_owner_device");
         assert_eq!(json["next_step"]["command"], CONNECTOR_GRANT_COMMAND);
+        assert_eq!(
+            json["next_step"]["device_wide_command"],
+            DEVICE_WIDE_GRANT_COMMAND
+        );
+        assert_eq!(
+            json["next_step"]["device_wide_requires"],
+            DEVICE_WIDE_GRANT_REQUIRES
+        );
         assert_eq!(
             json["endpoints"][0]["consent"]["webchat_control"],
             "legacy_ignored"
@@ -858,17 +913,37 @@ mod tests {
         assert!(!hint.contains(CONNECTOR_GRANT_COMMAND), "{hint}");
         let _ = std::fs::remove_file(&path);
 
-        // No local evidence: the connector grant command, in every locale.
-        let missing = snapshot_at_db_path(&temp_db_path());
-        assert_eq!(missing.state, GrantState::Unknown);
-        for language in [
-            crate::locale::Locale::En,
-            crate::locale::Locale::ZhCn,
-            crate::locale::Locale::Ja,
-        ] {
-            let hint = missing.hint(language);
-            assert!(hint.contains(CONNECTOR_GRANT_COMMAND), "{hint}");
-            assert!(!hint.contains("extension consent"), "{hint}");
+        // No local evidence: the connector grant command, in every locale, for
+        // both non-evidence states. The device-wide form is secondary and
+        // carries its Edge requirement.
+        for state in [GrantState::AbsentLocally, GrantState::Unknown] {
+            let no_evidence = match state {
+                GrantState::AbsentLocally => {
+                    let path = temp_db_path();
+                    let mut store = crate::state_store::StateStore::open(&path).unwrap();
+                    register_endpoint(&mut store);
+                    drop(store);
+                    let snapshot = snapshot_at_db_path(&path);
+                    let _ = std::fs::remove_file(&path);
+                    snapshot
+                }
+                _ => snapshot_at_db_path(&temp_db_path()),
+            };
+            assert_eq!(no_evidence.state, state);
+            for language in [
+                crate::locale::Locale::En,
+                crate::locale::Locale::ZhCn,
+                crate::locale::Locale::Ja,
+            ] {
+                let hint = no_evidence.hint(language);
+                assert!(hint.contains(CONNECTOR_GRANT_COMMAND), "{hint}");
+                assert!(
+                    hint.find(CONNECTOR_GRANT_COMMAND) < hint.find(DEVICE_WIDE_GRANT_COMMAND),
+                    "per-endpoint command must lead:\n{hint}"
+                );
+                assert!(hint.contains("#713"), "{hint}");
+                assert!(!hint.contains("extension consent"), "{hint}");
+            }
         }
     }
 

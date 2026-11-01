@@ -117,13 +117,18 @@ fn seed_state_db(db_path: &Path) {
             authorization_connector_id TEXT,
             authorization_grant_generation INTEGER
         );
+        -- `webchat_control_allowed = 0` is the stale legacy value the #728 MBP
+        -- state DB carries from the extension build that still had the retired
+        -- WebChat Control switch. It must never gate anything, and with no
+        -- connector-attributed dispatch rows the grant state must be
+        -- `absent_locally`, not an Edge-side `absent`.
         INSERT INTO browser_endpoints(
             endpoint_ref, device_id, browser_family, extension_version,
             webchat_control_allowed, tool_bridge_allowed,
             tool_bridge_mutation_allowed, consent_revision,
             first_observed_at, last_observed_at
         ) VALUES ('bep_test_endpoint_placeholder', 'dev_test', 'chrome', '0.0.0-test',
-                  1, 0, 0, 4, 1, 2);
+                  0, 0, 0, 4, 1, 2);
         "#,
     )
     .expect("seed grant tables");
@@ -184,6 +189,15 @@ fn default_doctor_and_status_verbose_show_grant_state_and_consent_revision() {
         "default doctor still presents the retired WebChat switch as a gate:\n{doctor}"
     );
     assert!(
+        doctor.contains("stored_webchat_control=false"),
+        "default doctor hides the stale legacy value:\n{doctor}"
+    );
+    // Empty local evidence is not a failure prediction (#791 review).
+    assert!(
+        !doctor.contains("would fail"),
+        "default doctor predicts an Edge-side failure it cannot see:\n{doctor}"
+    );
+    assert!(
         doctor.contains("herdr-mcp connector webchat-control allow"),
         "default doctor missing the connector grant next step:\n{doctor}"
     );
@@ -204,6 +218,14 @@ fn default_doctor_and_status_verbose_show_grant_state_and_consent_revision() {
     assert!(
         status.contains("herdr-mcp connector webchat-control allow"),
         "status --verbose missing the connector grant next step:\n{status}"
+    );
+    assert!(
+        status.contains("stored_webchat_control=false"),
+        "status --verbose hides the stale legacy value:\n{status}"
+    );
+    assert!(
+        !status.contains("would fail"),
+        "status --verbose predicts an Edge-side failure it cannot see:\n{status}"
     );
     assert!(
         !status.contains("extension consent"),
