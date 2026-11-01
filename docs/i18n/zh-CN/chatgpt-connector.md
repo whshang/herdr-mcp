@@ -128,7 +128,7 @@ Herdr 从 0.4.3 起明确区分两层 contract：
 
 升级 runtime 后：
 
-1. 确认 Edge / runtime 暴露的是当前版本。当前 Release 会通过 `herdr-mcp update check|status` 暴露 Worker drift；交互式 `herdr-mcp update` 会在 Runtime 激活后 reconcile 安全的同-contract 已有 Worker，`herdr-mcp worker update` 是直接修复入口；
+1. 确认 Edge / runtime 暴露的是当前版本。当前 Release 会通过 `herdr-mcp update check|status` 暴露 Worker drift；`herdr-mcp update` 只更新 Runtime，遇到落后的同-contract 已有 Worker 时报告 `worker_update_required`（Runtime 更新绝不会自行启动 Worker 授权），`herdr-mcp worker update` 是操作者直接修复入口；
 2. **不要**仅因为 Runtime 或已有 Worker 做了原地升级就断开、删除或重新添加 Connector；Worker reconcile 会保留 public OAuth origin 与 Connector credentials；
 3. Herdr public action catalog 发生变化时，通过当前账户可用的 Workspace App 管理入口刷新、审核并发布 actions；新增 action 如需显式启用则同时启用；
 4. action snapshot 更新后，用新会话重新验证。更新 Worker 代码是获得新版 Edge 工具描述的必要条件，但已经审核过的 ChatGPT action snapshot 仍可能保持冻结，直到 App actions 被刷新。

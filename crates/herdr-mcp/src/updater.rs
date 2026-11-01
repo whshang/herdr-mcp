@@ -187,7 +187,10 @@ fn auto_update_policy(
 pub fn run(command: UpdateCommand) -> Result<ExitCode, String> {
     match command {
         UpdateCommand::Check { manifest_url } => check(manifest_url.as_deref()),
-        UpdateCommand::Apply { manifest_url } => apply(manifest_url.as_deref()),
+        UpdateCommand::Apply {
+            manifest_url,
+            with_worker,
+        } => apply(manifest_url.as_deref(), with_worker),
         UpdateCommand::MajorApply => major_apply(),
         UpdateCommand::MajorRollback => major_rollback(),
         UpdateCommand::Auto => auto(),
@@ -205,10 +208,7 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
     let paths = RuntimePaths::discover()?;
     let release_version = plan.version.to_string();
     let worker_update = worker_update_status_view(&paths, &release_version);
-    let worker_update_required = worker_update
-        .get("update_required")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let worker_update_required = worker_update_required(&worker_update);
     let migration_warning = plan
         .state_schema_migration
         .as_ref()
@@ -219,7 +219,7 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
     let next_action = if available {
         Some("herdr-mcp update apply")
     } else if worker_update_required {
-        Some("herdr-mcp worker update")
+        Some(WORKER_UPDATE_NEXT_ACTION)
     } else {
         None
     };
@@ -244,7 +244,9 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
             "reversible": migration.reversible,
         })),
         "warning": migration_warning,
+        "worker_update_required": worker_update_required,
         "worker_update": worker_update,
+        "notices": worker_update_notices(&worker_update),
         "next_action": next_action,
     }))?;
     Ok(ExitCode::SUCCESS)
@@ -274,46 +276,202 @@ fn worker_update_status_view(paths: &RuntimePaths, target_version: &str) -> Valu
     }
 }
 
-fn reconcile_worker_for_release(
-    paths: &RuntimePaths,
-    source_commit: &str,
-    target_version: &str,
-) -> Value {
-    match crate::worker_bootstrap::existing_worker_status(paths, target_version) {
-        Ok(None) => json!({
-            "ok": true,
-            "code": "worker_update_skipped",
-            "changed": false,
-            "reason": "edge_not_configured",
-        }),
-        Ok(Some(status)) if !status.update_required() => json!({
-            "ok": true,
-            "code": "worker_update_current",
-            "changed": false,
-            "worker": status.worker_name,
-            "edge_origin": status.edge_origin,
-            "version": target_version,
-        }),
-        Ok(Some(_)) => match crate::worker_bootstrap::update_existing_worker_for_release(
-            paths,
-            source_commit,
-            target_version,
-        ) {
-            Ok(result) => result,
-            Err(error) => json!({
-                "ok": false,
-                "code": "worker_update_required",
-                "error": error,
-                "next_action": "herdr-mcp worker update",
-            }),
-        },
-        Err(error) => json!({
-            "ok": false,
-            "code": "worker_update_status_unknown",
-            "error": error,
-            "next_action": "herdr-mcp worker update",
-        }),
+/// The separate operator command for the fleet Worker release plane.
+const WORKER_UPDATE_NEXT_ACTION: &str = "herdr-mcp worker update";
+
+fn worker_update_required(worker_update: &Value) -> bool {
+    worker_update
+        .get("update_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// A non-fatal `worker_update_required` notice for a Runtime update whose
+/// separate fleet Worker is behind the installed release. The Runtime update
+/// already succeeded, so this never changes its exit status.
+fn worker_update_notice(worker_update: &Value) -> Option<Value> {
+    worker_update_required(worker_update).then(|| {
+        json!({
+            "code": "worker_update_required",
+            "severity": "notice",
+            "fatal": false,
+            "message": "the Runtime update succeeded; this computer's fleet Worker is behind the installed release and Worker updates are a separate operator-run release step",
+            "edge_version": worker_update.get("edge_version").cloned().unwrap_or(Value::Null),
+            "target_version": worker_update.get("target_version").cloned().unwrap_or(Value::Null),
+            "next_action": WORKER_UPDATE_NEXT_ACTION,
+        })
+    })
+}
+
+fn worker_update_notices(worker_update: &Value) -> Value {
+    worker_update_notice(worker_update)
+        .map(|notice| json!([notice]))
+        .unwrap_or_else(|| json!([]))
+}
+
+/// Notices for a committed Runtime update. Drift is a notice; a failed
+/// `--with-worker` attempt is a warning. Neither is fatal, because the Runtime
+/// update itself succeeded.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn runtime_update_notices(worker_update: &Value, chain: WorkerChain) -> Value {
+    if chain == WorkerChain::WithWorker
+        && worker_update.get("ok").and_then(Value::as_bool) == Some(false)
+    {
+        return json!([{
+            "code": "worker_update_failed",
+            "severity": "warning",
+            "fatal": false,
+            "message": "the Runtime update succeeded, but the requested --with-worker Worker update did not complete; run `herdr-mcp worker update` to retry that separate step",
+            "next_action": WORKER_UPDATE_NEXT_ACTION,
+        }]);
     }
+    worker_update_notices(worker_update)
+}
+
+/// Human-visible counterpart of `runtime_update_notices`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn report_worker_update_notice(worker_update: &Value, chain: WorkerChain) {
+    if chain == WorkerChain::WithWorker {
+        if worker_update.get("ok").and_then(Value::as_bool) == Some(false) {
+            eprintln!(
+                "[herdr-mcp update] Runtime update succeeded, but the requested Worker update did not complete; run `{WORKER_UPDATE_NEXT_ACTION}`."
+            );
+        }
+        return;
+    }
+    if !worker_update_required(worker_update) {
+        return;
+    }
+    let edge_version = worker_update
+        .get("edge_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    eprintln!(
+        "[herdr-mcp update] Runtime update succeeded. The fleet Worker is behind the installed release (Worker {edge_version}); Worker updates are a separate step, run `{WORKER_UPDATE_NEXT_ACTION}`."
+    );
+}
+
+/// Whether this invocation may run the separate fleet Worker update.
+///
+/// `update apply` is runtime-only by default: the Worker is its own release
+/// plane, so the Runtime updater must never start `worker update`, a wrangler
+/// invocation, or an interactive Cloudflare device authorization on its own.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerChain {
+    /// Default. Report Worker drift as a notice and exit with the runtime result.
+    RuntimeOnly,
+    /// Explicit `--with-worker` opt-in, admitted only from an interactive TTY.
+    WithWorker,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const WITH_WORKER_REQUIRES_TTY: &str = "with_worker_requires_interactive_tty";
+
+/// `--with-worker` starts the Worker authorization flow, which prints a device
+/// code and may open a browser. A detached, nohup or CI invocation has no way
+/// to complete it, so refuse it before any update work instead of blocking.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn with_worker_refusal_code(
+    requested: bool,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Option<&'static str> {
+    if !requested {
+        return None;
+    }
+    if stdin_is_tty && stdout_is_tty {
+        None
+    } else {
+        Some(WITH_WORKER_REQUIRES_TTY)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn with_worker_refusal_payload(code: &str) -> Value {
+    json!({
+        "ok": false,
+        "code": code,
+        "runtime_updated": false,
+        "update_queued": false,
+        "worker_update_requested": true,
+        "worker_update_started": false,
+        "message": "`--with-worker` needs an interactive stdin and stdout terminal because the Cloudflare authorization it starts asks for approval; run `herdr-mcp update apply` for the runtime-only update and run `herdr-mcp worker update` yourself afterwards",
+        "next_action": "herdr-mcp update apply",
+    })
+}
+
+/// Resolve the fleet Worker outcome after a Runtime commit.
+///
+/// Without an explicit opt-in the Worker is only *reported* from the read-only
+/// status view; `run_worker_update` is never called, so no detached or
+/// unattended `update apply` can start (or block on) Worker authorization.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_worker_update_after_runtime_commit<F>(
+    paths: &RuntimePaths,
+    target_version: &str,
+    chain: WorkerChain,
+    run_worker_update: F,
+) -> Value
+where
+    F: FnOnce() -> Value,
+{
+    match chain {
+        WorkerChain::WithWorker => run_worker_update(),
+        WorkerChain::RuntimeOnly => worker_update_status_view(paths, target_version),
+    }
+}
+
+/// Everything a committed Runtime update reports, so the runtime-only outcome
+/// (successful Runtime + optional non-fatal Worker notice) is inspectable
+/// without running an update.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct RuntimeUpdateOutcome<'a> {
+    job_id: String,
+    target_version: String,
+    target: String,
+    asset: String,
+    worker_pid: u32,
+    worker_pid_persisted: bool,
+    job: Value,
+    migration: Option<&'a StateSchemaMigration>,
+    worker_update: Value,
+    worker_chain: WorkerChain,
+}
+
+/// The Runtime update is what `update apply` guarantees. Worker drift is
+/// reported as a non-fatal notice with the separate operator command, so it
+/// never changes this result to a failure.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn runtime_update_succeeded_result(outcome: RuntimeUpdateOutcome<'_>) -> (Value, ExitCode) {
+    let worker_update_required = worker_update_required(&outcome.worker_update);
+    let payload = json!({
+        "ok": true,
+        "code": "update_succeeded",
+        "job_id": outcome.job_id,
+        "version": outcome.target_version,
+        "target": outcome.target,
+        "asset": outcome.asset,
+        "worker_pid": outcome.worker_pid,
+        "worker_pid_persisted": outcome.worker_pid_persisted,
+        "job": outcome.job,
+        "state_schema_migration": outcome.migration.map(|migration| json!({
+            "from": migration.from,
+            "to": migration.to,
+            "reversible": migration.reversible,
+        })),
+        "warning": outcome.migration.map(StateSchemaMigration::warning),
+        "worker_update_chained": outcome.worker_chain == WorkerChain::WithWorker,
+        "worker_update_required": worker_update_required,
+        "worker_update": outcome.worker_update,
+        "notices": runtime_update_notices(&outcome.worker_update, outcome.worker_chain),
+        "next_action": if worker_update_required {
+            Some(WORKER_UPDATE_NEXT_ACTION)
+        } else {
+            None
+        },
+    });
+    (payload, ExitCode::SUCCESS)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -380,8 +538,8 @@ fn reconcile_worker_with_active_runtime(paths: &RuntimePaths) -> Value {
     }
 }
 
-fn apply(manifest_override: Option<&str>) -> Result<ExitCode, String> {
-    apply_inner(manifest_override, false, None, true)
+fn apply(manifest_override: Option<&str>, with_worker: bool) -> Result<ExitCode, String> {
+    apply_inner(manifest_override, false, None, true, with_worker)
 }
 
 fn auto() -> Result<ExitCode, String> {
@@ -419,7 +577,9 @@ fn auto() -> Result<ExitCode, String> {
     // Freeze the trust decision made above. Do not re-read the mutable config
     // inside the apply path and accidentally widen a scheduled Stable update
     // into Preview if the config changes concurrently.
-    apply_inner(None, true, Some(UpdateChannel::Stable), false)
+    // Scheduled/automatic updates are runtime-only and never opt into the
+    // separate fleet Worker update.
+    apply_inner(None, true, Some(UpdateChannel::Stable), false, false)
 }
 
 fn apply_inner(
@@ -427,6 +587,7 @@ fn apply_inner(
     allow_current: bool,
     channel_override: Option<UpdateChannel>,
     progress_enabled: bool,
+    with_worker: bool,
 ) -> Result<ExitCode, String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -435,6 +596,7 @@ fn apply_inner(
             allow_current,
             channel_override,
             progress_enabled,
+            with_worker,
         );
         Err(
             "native update apply is currently supported on macOS and Linux service managers"
@@ -444,6 +606,23 @@ fn apply_inner(
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
+        // `update apply` is runtime-only. The separate Worker update is only
+        // ever run on an explicit `--with-worker` opt-in, and that opt-in is
+        // refused before any network/service work when this process cannot
+        // show or answer the Cloudflare authorization it starts.
+        let worker_chain = {
+            use std::io::IsTerminal;
+            let stdin_is_tty = std::io::stdin().is_terminal();
+            let stdout_is_tty = std::io::stdout().is_terminal();
+            match with_worker_refusal_code(with_worker, stdin_is_tty, stdout_is_tty) {
+                Some(code) => {
+                    print_json(&with_worker_refusal_payload(code))?;
+                    return Ok(ExitCode::FAILURE);
+                }
+                None if with_worker => WorkerChain::WithWorker,
+                None => WorkerChain::RuntimeOnly,
+            }
+        };
         crate::update_scheduler::ensure_updates_allowed()?;
         let channel = match channel_override {
             Some(channel) => channel,
@@ -480,10 +659,7 @@ fn apply_inner(
             let target_version = plan.version.to_string();
             if allow_current {
                 let worker_update = worker_update_status_view(&paths, &target_version);
-                let worker_update_required = worker_update
-                    .get("update_required")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                let worker_update_required = worker_update_required(&worker_update);
                 print_json(&json!({
                     "ok": true,
                     "code": "auto_update_current",
@@ -495,47 +671,49 @@ fn apply_inner(
                     "network_checked": true,
                     "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
                     "update_queued": false,
+                    "worker_update_required": worker_update_required,
                     "worker_update": worker_update,
+                    "notices": worker_update_notices(&worker_update),
                     "next_action": if worker_update_required {
-                        Some("herdr-mcp worker update")
+                        Some(WORKER_UPDATE_NEXT_ACTION)
                     } else {
                         None
                     },
                 }))?;
                 return Ok(ExitCode::SUCCESS);
             }
-            // Runtime is already on the target release. This is the recovery
-            // path for users who upgraded with an older updater that did not
-            // yet reconcile their user-owned Edge Worker.
-            let worker_update =
-                reconcile_worker_for_release(&paths, &plan.identity.source_commit, &target_version);
-            let worker_ok = worker_update.get("ok").and_then(Value::as_bool) != Some(false);
+            // Runtime is already on the target release. `update apply` stays
+            // runtime-only: Worker drift is reported as a separate operator
+            // step instead of starting Worker authorization from an update.
+            let worker_update = resolve_worker_update_after_runtime_commit(
+                &paths,
+                &target_version,
+                worker_chain,
+                || reconcile_worker_with_active_runtime(&paths),
+            );
+            let worker_update_required = worker_update_required(&worker_update);
+            report_worker_update_notice(&worker_update, worker_chain);
             print_json(&json!({
-                "ok": worker_ok,
-                "code": if worker_ok {
-                    "update_current"
-                } else {
-                    "update_current_worker_update_required"
-                },
+                "ok": true,
+                "code": "update_current",
                 "update_channel": channel.as_str(),
                 "current_version": current.to_string(),
                 "release_version": target_version,
                 "tag": plan.tag,
                 "provenance_verified": true,
                 "runtime_changed": false,
+                "worker_update_chained": worker_chain == WorkerChain::WithWorker,
+                "worker_update_required": worker_update_required,
                 "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
                 "worker_update": worker_update,
-                "next_action": if worker_ok {
-                    None
+                "notices": runtime_update_notices(&worker_update, worker_chain),
+                "next_action": if worker_update_required {
+                    Some(WORKER_UPDATE_NEXT_ACTION)
                 } else {
-                    Some("herdr-mcp worker update")
+                    None
                 },
             }))?;
-            return Ok(if worker_ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            });
+            return Ok(ExitCode::SUCCESS);
         }
         let store = UpdateStore::open(&paths)?;
         recover_or_reject_active_update(&store, &paths)?;
@@ -628,45 +806,41 @@ fn apply_inner(
 
         if progress.enabled {
             if let Some(job) = watch_update_job(&store, &job_id, &mut child, &mut progress)? {
-                progress.phase("Runtime update succeeded. Checking the fleet Worker release...");
-                // The foreground updater may be the old release. Delegate Edge
-                // reconciliation to the just-activated runtime/current binary
-                // so future same-contract releases can evolve their Worker
-                // metadata rules without an older updater guessing them.
-                let worker_update = reconcile_worker_with_active_runtime(&paths);
-                let worker_ok = worker_update.get("ok").and_then(Value::as_bool) != Some(false);
-                print_json(&json!({
-                    "ok": worker_ok,
-                    "code": if worker_ok {
-                        "update_succeeded"
-                    } else {
-                        "update_succeeded_worker_update_required"
-                    },
-                    "job_id": job_id,
-                    "version": plan.version.to_string(),
-                    "target": plan.asset.target,
-                    "asset": plan.asset.name,
-                    "worker_pid": child.id(),
-                    "worker_pid_persisted": worker_pid_persisted,
-                    "job": public_job_view(&job),
-                    "state_schema_migration": plan.state_schema_migration.as_ref().map(|migration| json!({
-                        "from": migration.from,
-                        "to": migration.to,
-                        "reversible": migration.reversible,
-                    })),
-                    "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
-                    "worker_update": worker_update,
-                    "next_action": if worker_ok {
-                        None
-                    } else {
-                        Some("herdr-mcp worker update")
-                    },
-                }))?;
-                return Ok(if worker_ok {
-                    ExitCode::SUCCESS
+                let target_version = plan.version.to_string();
+                if worker_chain == WorkerChain::WithWorker {
+                    progress.phase(
+                        "Runtime update succeeded. Reconciling the fleet Worker because --with-worker was given...",
+                    );
                 } else {
-                    ExitCode::FAILURE
+                    progress
+                        .phase("Runtime update succeeded. Checking the fleet Worker release...");
+                }
+                // Runtime-only by default: this only reads the Worker status
+                // and reports drift. `worker update` runs solely for the
+                // explicit `--with-worker` opt-in, and then against the
+                // just-activated runtime/current binary so future
+                // same-contract releases can evolve their Worker metadata.
+                let worker_update = resolve_worker_update_after_runtime_commit(
+                    &paths,
+                    &target_version,
+                    worker_chain,
+                    || reconcile_worker_with_active_runtime(&paths),
+                );
+                report_worker_update_notice(&worker_update, worker_chain);
+                let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+                    target_version,
+                    target: plan.asset.target.clone(),
+                    asset: plan.asset.name.clone(),
+                    job_id: job_id.clone(),
+                    worker_pid: child.id(),
+                    worker_pid_persisted,
+                    job: public_job_view(&job),
+                    migration: plan.state_schema_migration.as_ref(),
+                    worker_update,
+                    worker_chain,
                 });
+                print_json(&payload)?;
+                return Ok(code);
             }
             progress.phase(
                 "Installer is still running in the background; use `herdr-mcp update status` for the final state.",
@@ -689,8 +863,9 @@ fn apply_inner(
             "worker_pid": child.id(),
             "worker_pid_persisted": worker_pid_persisted,
             "worker_update": {
-                "state": "deferred_until_runtime_update_finishes",
-                "next_action": "herdr-mcp update status",
+                "state": "not_attempted",
+                "reason": "worker_update_is_a_separate_operator_step",
+                "next_action": WORKER_UPDATE_NEXT_ACTION,
             },
             "next_action": "herdr-mcp update status",
         }))?;
@@ -1630,34 +1805,33 @@ fn status() -> Result<ExitCode, String> {
     let latest = store.latest_update_job()?;
     let current_version = current_version()?.to_string();
     let worker_update = worker_update_status_view(&paths, &current_version);
-    let worker_update_required = worker_update
-        .get("update_required")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let worker_update_required = worker_update_required(&worker_update);
+    let notices = worker_update_notices(&worker_update);
+    let next_action = if worker_update_required {
+        Some(WORKER_UPDATE_NEXT_ACTION)
+    } else {
+        None
+    };
     let payload = match latest {
         Some(job) => json!({
             "ok": true,
             "code": "update_status",
             "job": public_job_view(&job),
             "current_version": current_version,
+            "worker_update_required": worker_update_required,
             "worker_update": worker_update,
-            "next_action": if worker_update_required {
-                Some("herdr-mcp worker update")
-            } else {
-                None
-            },
+            "notices": notices,
+            "next_action": next_action,
         }),
         None => json!({
             "ok": true,
             "code": "update_status",
             "job": null,
             "current_version": current_version,
+            "worker_update_required": worker_update_required,
             "worker_update": worker_update,
-            "next_action": if worker_update_required {
-                Some("herdr-mcp worker update")
-            } else {
-                None
-            },
+            "notices": notices,
+            "next_action": next_action,
         }),
     };
     print_json(&payload)?;
@@ -3667,5 +3841,155 @@ mod tests {
             "failed"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Given a Runtime update that already committed
+    /// When it reports a fleet Worker that is behind the installed release
+    /// Then the Runtime result stays successful and Worker drift is a notice.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn runtime_update_reports_worker_drift_as_a_non_fatal_notice() {
+        let behind = json!({
+            "configured": true,
+            "edge_origin": "https://edge.example.test",
+            "worker": "herdr-edge",
+            "edge_version": "1.0.0",
+            "target_version": "9.9.9",
+            "update_required": true,
+        });
+        let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+            job_id: "upd-test".to_owned(),
+            target_version: "9.9.9".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            asset: "herdr-mcp".to_owned(),
+            worker_pid: 42,
+            worker_pid_persisted: true,
+            job: json!({ "job_id": "upd-test", "state": "succeeded" }),
+            migration: None,
+            worker_update: behind,
+            worker_chain: WorkerChain::RuntimeOnly,
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["code"], "update_succeeded");
+        assert_eq!(payload["worker_update_required"], true);
+        assert_eq!(payload["worker_update_chained"], false);
+        assert_eq!(payload["next_action"], "herdr-mcp worker update");
+        let notices = payload["notices"].as_array().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["code"], "worker_update_required");
+        assert_eq!(notices[0]["severity"], "notice");
+        assert_eq!(notices[0]["fatal"], false);
+        assert_eq!(notices[0]["next_action"], "herdr-mcp worker update");
+
+        // A current (or unconfigured) Worker is never a notice.
+        let current = json!({ "configured": true, "update_required": false });
+        assert!(worker_update_notice(&current).is_none());
+        assert!(
+            worker_update_notice(&json!({ "configured": false, "update_required": false }))
+                .is_none()
+        );
+        assert!(!worker_update_required(
+            &json!({ "configured": true, "update_required": null })
+        ));
+
+        // A failed explicit `--with-worker` attempt is reported as a warning on
+        // a Runtime update that still succeeded.
+        let failed_worker = json!({ "ok": false, "code": "worker_update_failed" });
+        let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+            job_id: "upd-test".to_owned(),
+            target_version: "9.9.9".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            asset: "herdr-mcp".to_owned(),
+            worker_pid: 42,
+            worker_pid_persisted: true,
+            job: json!({ "job_id": "upd-test", "state": "succeeded" }),
+            migration: None,
+            worker_update: failed_worker,
+            worker_chain: WorkerChain::WithWorker,
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["code"], "update_succeeded");
+        assert_eq!(payload["worker_update_chained"], true);
+        assert_eq!(payload["notices"][0]["code"], "worker_update_failed");
+        assert_eq!(payload["notices"][0]["severity"], "warning");
+        assert_eq!(payload["notices"][0]["fatal"], false);
+        assert_eq!(
+            payload["notices"][0]["next_action"],
+            "herdr-mcp worker update"
+        );
+    }
+
+    /// Given a Worker status that is behind
+    /// When the update resolves the Worker outcome without `--with-worker`
+    /// Then it only reports that status and never runs the Worker update.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn update_apply_never_runs_worker_update_without_opt_in() {
+        let root = env::temp_dir().join(format!(
+            "herdr-worker-notice-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        let paths = test_runtime_paths(&root);
+        let mut worker_update_invocations = 0;
+        let reported = resolve_worker_update_after_runtime_commit(
+            &paths,
+            "9.9.9",
+            WorkerChain::RuntimeOnly,
+            || {
+                worker_update_invocations += 1;
+                json!({ "ok": true, "code": "worker_update_succeeded" })
+            },
+        );
+        assert_eq!(
+            worker_update_invocations, 0,
+            "runtime-only update apply must never run worker update"
+        );
+        assert_eq!(reported["configured"], false);
+        assert_eq!(reported["update_required"], false);
+
+        // The same seam does chain the Worker update when it is opted into.
+        let chained = resolve_worker_update_after_runtime_commit(
+            &paths,
+            "9.9.9",
+            WorkerChain::WithWorker,
+            || {
+                worker_update_invocations += 1;
+                json!({ "ok": true, "code": "worker_update_succeeded" })
+            },
+        );
+        assert_eq!(worker_update_invocations, 1);
+        assert_eq!(chained["code"], "worker_update_succeeded");
+    }
+
+    /// Given a `--with-worker` request in a detached or CI invocation
+    /// When update apply admits the Worker chain
+    /// Then it is refused with a clear machine-readable code before any work.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn with_worker_is_refused_without_an_interactive_terminal() {
+        assert_eq!(
+            with_worker_refusal_code(true, false, false),
+            Some(WITH_WORKER_REQUIRES_TTY)
+        );
+        assert_eq!(
+            with_worker_refusal_code(true, true, false),
+            Some(WITH_WORKER_REQUIRES_TTY)
+        );
+        assert_eq!(
+            with_worker_refusal_code(true, false, true),
+            Some(WITH_WORKER_REQUIRES_TTY)
+        );
+        assert_eq!(with_worker_refusal_code(true, true, true), None);
+        assert_eq!(with_worker_refusal_code(false, false, false), None);
+
+        let payload = with_worker_refusal_payload(WITH_WORKER_REQUIRES_TTY);
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["code"], "with_worker_requires_interactive_tty");
+        assert_eq!(payload["runtime_updated"], false);
+        assert_eq!(payload["worker_update_requested"], true);
+        assert_eq!(payload["worker_update_started"], false);
+        assert_eq!(payload["next_action"], "herdr-mcp update apply");
     }
 }
