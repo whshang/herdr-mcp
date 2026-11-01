@@ -45,7 +45,7 @@ use std::os::unix::process::CommandExt;
 
 mod release_plan;
 
-use release_plan::{ReleaseAsset, ReleasePlan, fetch_release_plan};
+use release_plan::{ReleaseAsset, ReleasePlan, StateSchemaMigration, fetch_release_plan};
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod scheduled_tests;
@@ -81,6 +81,8 @@ enum AutoUpdatePolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct MajorUpgradeRecord {
     record_version: u64,
+    #[serde(default)]
+    job_id: Option<String>,
     source_state_schema: i64,
     target_state_schema: i64,
     source_binary: String,
@@ -185,7 +187,10 @@ fn auto_update_policy(
 pub fn run(command: UpdateCommand) -> Result<ExitCode, String> {
     match command {
         UpdateCommand::Check { manifest_url } => check(manifest_url.as_deref()),
-        UpdateCommand::Apply { manifest_url } => apply(manifest_url.as_deref()),
+        UpdateCommand::Apply {
+            manifest_url,
+            with_worker,
+        } => apply(manifest_url.as_deref(), with_worker),
         UpdateCommand::MajorApply => major_apply(),
         UpdateCommand::MajorRollback => major_rollback(),
         UpdateCommand::Auto => auto(),
@@ -203,14 +208,18 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
     let paths = RuntimePaths::discover()?;
     let release_version = plan.version.to_string();
     let worker_update = worker_update_status_view(&paths, &release_version);
-    let worker_update_required = worker_update
-        .get("update_required")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let worker_update_required = worker_update_required(&worker_update);
+    let migration_warning = plan
+        .state_schema_migration
+        .as_ref()
+        .map(StateSchemaMigration::warning);
+    if let Some(warning) = migration_warning.as_deref() {
+        eprintln!("[herdr-mcp update] {warning}");
+    }
     let next_action = if available {
         Some("herdr-mcp update apply")
     } else if worker_update_required {
-        Some("herdr-mcp worker update")
+        Some(WORKER_UPDATE_NEXT_ACTION)
     } else {
         None
     };
@@ -229,7 +238,15 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
         "asset": plan.asset.name,
         "sha256": plan.asset.sha256,
         "size": plan.asset.size,
+        "state_schema_migration": plan.state_schema_migration.as_ref().map(|migration| json!({
+            "from": migration.from,
+            "to": migration.to,
+            "reversible": migration.reversible,
+        })),
+        "warning": migration_warning,
+        "worker_update_required": worker_update_required,
         "worker_update": worker_update,
+        "notices": worker_update_notices(&worker_update),
         "next_action": next_action,
     }))?;
     Ok(ExitCode::SUCCESS)
@@ -259,46 +276,281 @@ fn worker_update_status_view(paths: &RuntimePaths, target_version: &str) -> Valu
     }
 }
 
-fn reconcile_worker_for_release(
-    paths: &RuntimePaths,
-    source_commit: &str,
-    target_version: &str,
-) -> Value {
-    match crate::worker_bootstrap::existing_worker_status(paths, target_version) {
-        Ok(None) => json!({
-            "ok": true,
-            "code": "worker_update_skipped",
-            "changed": false,
-            "reason": "edge_not_configured",
-        }),
-        Ok(Some(status)) if !status.update_required() => json!({
-            "ok": true,
-            "code": "worker_update_current",
-            "changed": false,
-            "worker": status.worker_name,
-            "edge_origin": status.edge_origin,
-            "version": target_version,
-        }),
-        Ok(Some(_)) => match crate::worker_bootstrap::update_existing_worker_for_release(
-            paths,
-            source_commit,
-            target_version,
-        ) {
-            Ok(result) => result,
-            Err(error) => json!({
-                "ok": false,
-                "code": "worker_update_required",
-                "error": error,
-                "next_action": "herdr-mcp worker update",
-            }),
-        },
-        Err(error) => json!({
-            "ok": false,
-            "code": "worker_update_status_unknown",
-            "error": error,
-            "next_action": "herdr-mcp worker update",
-        }),
+/// The separate operator command for the fleet Worker release plane.
+const WORKER_UPDATE_NEXT_ACTION: &str = "herdr-mcp worker update";
+
+fn worker_update_required(worker_update: &Value) -> bool {
+    worker_update
+        .get("update_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// A non-fatal `worker_update_required` notice for a Runtime update whose
+/// separate fleet Worker is behind the installed release. The Runtime update
+/// already succeeded, so this never changes its exit status.
+fn worker_update_notice(worker_update: &Value) -> Option<Value> {
+    worker_update_required(worker_update).then(|| {
+        json!({
+            "code": "worker_update_required",
+            "severity": "notice",
+            "fatal": false,
+            "message": "the Runtime update succeeded; this computer's fleet Worker is behind the installed release and Worker updates are a separate operator-run release step",
+            "edge_version": worker_update.get("edge_version").cloned().unwrap_or(Value::Null),
+            "target_version": worker_update.get("target_version").cloned().unwrap_or(Value::Null),
+            "next_action": WORKER_UPDATE_NEXT_ACTION,
+        })
+    })
+}
+
+fn worker_update_notices(worker_update: &Value) -> Value {
+    worker_update_notice(worker_update)
+        .map(|notice| json!([notice]))
+        .unwrap_or_else(|| json!([]))
+}
+
+/// Notices for a committed Runtime update. Drift is a notice; a failed
+/// `--with-worker` attempt is a warning. Neither is fatal, because the Runtime
+/// update itself succeeded.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn runtime_update_notices(worker_update: &Value, chain: WorkerChain) -> Value {
+    if chain == WorkerChain::WithWorker
+        && worker_update.get("ok").and_then(Value::as_bool) == Some(false)
+    {
+        return json!([{
+            "code": "worker_update_failed",
+            "severity": "warning",
+            "fatal": false,
+            "message": "the Runtime update succeeded, but the requested --with-worker Worker update did not complete; run `herdr-mcp worker update` to retry that separate step",
+            "next_action": WORKER_UPDATE_NEXT_ACTION,
+        }]);
     }
+    worker_update_notices(worker_update)
+}
+
+/// Notice for the one-time macOS consent prompt a newly activated generation may
+/// trigger.
+///
+/// Every update installs a *new* `runtime/generations/rust-<sha256>/` binary, and
+/// an unsigned binary is a new TCC identity: the first Documents/Desktop/
+/// Downloads access of a new generation asks for permission once. A pending
+/// prompt blocks that access until a human answers it, so an unattended update
+/// must say so in its own result instead of looking like a control-plane
+/// failure. This is a notice: the Runtime update already succeeded.
+#[cfg(target_os = "macos")]
+fn macos_tcc_prompt_notice() -> Option<Value> {
+    Some(json!({
+        "code": "macos_documents_tcc_prompt",
+        "severity": "notice",
+        "fatal": false,
+        "message": "macOS may show a one-time Documents access prompt for the newly installed runtime generation; click Allow. Protected-folder control requests can stall until it is answered.",
+        "next_action": "click Allow on the macOS Documents prompt, then `herdr-mcp doctor`",
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_tcc_prompt_notice() -> Option<Value> {
+    None
+}
+
+/// Append the macOS consent notice to a result that activates a new generation.
+///
+/// `update_current` does not activate one, so it never carries this notice.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn with_macos_tcc_prompt_notice(notices: Value) -> Value {
+    let mut notices = notices.as_array().cloned().unwrap_or_default();
+    notices.extend(macos_tcc_prompt_notice());
+    Value::Array(notices)
+}
+
+/// Human-visible counterpart of `runtime_update_notices`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn report_worker_update_notice(worker_update: &Value, chain: WorkerChain) {
+    if chain == WorkerChain::WithWorker {
+        if worker_update.get("ok").and_then(Value::as_bool) == Some(false) {
+            eprintln!(
+                "[herdr-mcp update] Runtime update succeeded, but the requested Worker update did not complete; run `{WORKER_UPDATE_NEXT_ACTION}`."
+            );
+        }
+        return;
+    }
+    if !worker_update_required(worker_update) {
+        return;
+    }
+    let edge_version = worker_update
+        .get("edge_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    eprintln!(
+        "[herdr-mcp update] Runtime update succeeded. The fleet Worker is behind the installed release (Worker {edge_version}); Worker updates are a separate step, run `{WORKER_UPDATE_NEXT_ACTION}`."
+    );
+}
+
+/// Whether this invocation may run the separate fleet Worker update.
+///
+/// `update apply` is runtime-only by default: the Worker is its own release
+/// plane, so the Runtime updater must never start `worker update`, a wrangler
+/// invocation, or an interactive Cloudflare device authorization on its own.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerChain {
+    /// Default. Report Worker drift as a notice and exit with the runtime result.
+    RuntimeOnly,
+    /// Explicit `--with-worker` opt-in, admitted only from an interactive TTY.
+    WithWorker,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const WITH_WORKER_REQUIRES_TTY: &str = "with_worker_requires_interactive_tty";
+
+/// `--with-worker` starts the Worker authorization flow, which prints a device
+/// code and may open a browser. A detached, nohup or CI invocation has no way
+/// to complete it, so refuse it before any update work instead of blocking.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn with_worker_refusal_code(
+    requested: bool,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Option<&'static str> {
+    if !requested {
+        return None;
+    }
+    if stdin_is_tty && stdout_is_tty {
+        None
+    } else {
+        Some(WITH_WORKER_REQUIRES_TTY)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn with_worker_refusal_payload(code: &str) -> Value {
+    json!({
+        "ok": false,
+        "code": code,
+        "runtime_updated": false,
+        "update_queued": false,
+        "worker_update_requested": true,
+        "worker_update_started": false,
+        "message": "`--with-worker` needs an interactive stdin and stdout terminal because the Cloudflare authorization it starts asks for approval; run `herdr-mcp update apply` for the runtime-only update and run `herdr-mcp worker update` yourself afterwards",
+        "next_action": "herdr-mcp update apply",
+    })
+}
+
+/// Resolve the fleet Worker outcome after a Runtime commit.
+///
+/// Without an explicit opt-in the Worker is only *reported* from the read-only
+/// status view; `run_worker_update` is never called, so no detached or
+/// unattended `update apply` can start (or block on) Worker authorization.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_worker_update_after_runtime_commit<F>(
+    paths: &RuntimePaths,
+    target_version: &str,
+    chain: WorkerChain,
+    run_worker_update: F,
+) -> Value
+where
+    F: FnOnce() -> Value,
+{
+    match chain {
+        WorkerChain::WithWorker => run_worker_update(),
+        WorkerChain::RuntimeOnly => worker_update_status_view(paths, target_version),
+    }
+}
+
+/// Everything a committed Runtime update reports, so the runtime-only outcome
+/// (successful Runtime + optional non-fatal Worker notice) is inspectable
+/// without running an update.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct RuntimeUpdateOutcome<'a> {
+    job_id: String,
+    target_version: String,
+    target: String,
+    asset: String,
+    worker_pid: u32,
+    worker_pid_persisted: bool,
+    job: Value,
+    migration: Option<&'a StateSchemaMigration>,
+    worker_update: Value,
+    worker_chain: WorkerChain,
+}
+
+/// The Runtime update is what `update apply` guarantees. Worker drift is
+/// reported as a non-fatal notice with the separate operator command, so it
+/// never changes this result to a failure.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn runtime_update_succeeded_result(outcome: RuntimeUpdateOutcome<'_>) -> (Value, ExitCode) {
+    let worker_update_required = worker_update_required(&outcome.worker_update);
+    let payload = json!({
+        "ok": true,
+        "code": "update_succeeded",
+        "job_id": outcome.job_id,
+        "version": outcome.target_version,
+        "target": outcome.target,
+        "asset": outcome.asset,
+        "worker_pid": outcome.worker_pid,
+        "worker_pid_persisted": outcome.worker_pid_persisted,
+        "job": outcome.job,
+        "state_schema_migration": outcome.migration.map(|migration| json!({
+            "from": migration.from,
+            "to": migration.to,
+            "reversible": migration.reversible,
+        })),
+        "warning": outcome.migration.map(StateSchemaMigration::warning),
+        "worker_update_chained": outcome.worker_chain == WorkerChain::WithWorker,
+        "worker_update_required": worker_update_required,
+        "worker_update": outcome.worker_update,
+        "notices": with_macos_tcc_prompt_notice(runtime_update_notices(
+            &outcome.worker_update,
+            outcome.worker_chain,
+        )),
+        "next_action": if worker_update_required {
+            Some(WORKER_UPDATE_NEXT_ACTION)
+        } else {
+            None
+        },
+    });
+    (payload, ExitCode::SUCCESS)
+}
+
+/// Result of an `update apply` that found the Runtime already on the target
+/// release.
+///
+/// The Runtime did not change, so there is no newly activated generation and no
+/// macOS consent prompt to announce. A Worker problem — including a failed
+/// explicit `--with-worker` reconcile — is only a notice; `ok` and the exit code
+/// stay with the Runtime outcome.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn update_current_result(
+    channel: UpdateChannel,
+    current_version: &str,
+    target_version: &str,
+    tag: &str,
+    migration: Option<&StateSchemaMigration>,
+    worker_update: Value,
+    worker_chain: WorkerChain,
+) -> (Value, ExitCode) {
+    let worker_update_required = worker_update_required(&worker_update);
+    let payload = json!({
+        "ok": true,
+        "code": "update_current",
+        "update_channel": channel.as_str(),
+        "current_version": current_version,
+        "release_version": target_version,
+        "tag": tag,
+        "provenance_verified": true,
+        "runtime_changed": false,
+        "worker_update_chained": worker_chain == WorkerChain::WithWorker,
+        "worker_update_required": worker_update_required,
+        "warning": migration.map(StateSchemaMigration::warning),
+        "worker_update": worker_update,
+        "notices": runtime_update_notices(&worker_update, worker_chain),
+        "next_action": if worker_update_required {
+            Some(WORKER_UPDATE_NEXT_ACTION)
+        } else {
+            None
+        },
+    });
+    (payload, ExitCode::SUCCESS)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -365,8 +617,8 @@ fn reconcile_worker_with_active_runtime(paths: &RuntimePaths) -> Value {
     }
 }
 
-fn apply(manifest_override: Option<&str>) -> Result<ExitCode, String> {
-    apply_inner(manifest_override, false, None, true)
+fn apply(manifest_override: Option<&str>, with_worker: bool) -> Result<ExitCode, String> {
+    apply_inner(manifest_override, false, None, true, with_worker)
 }
 
 fn auto() -> Result<ExitCode, String> {
@@ -404,7 +656,9 @@ fn auto() -> Result<ExitCode, String> {
     // Freeze the trust decision made above. Do not re-read the mutable config
     // inside the apply path and accidentally widen a scheduled Stable update
     // into Preview if the config changes concurrently.
-    apply_inner(None, true, Some(UpdateChannel::Stable), false)
+    // Scheduled/automatic updates are runtime-only and never opt into the
+    // separate fleet Worker update.
+    apply_inner(None, true, Some(UpdateChannel::Stable), false, false)
 }
 
 fn apply_inner(
@@ -412,6 +666,7 @@ fn apply_inner(
     allow_current: bool,
     channel_override: Option<UpdateChannel>,
     progress_enabled: bool,
+    with_worker: bool,
 ) -> Result<ExitCode, String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -420,6 +675,7 @@ fn apply_inner(
             allow_current,
             channel_override,
             progress_enabled,
+            with_worker,
         );
         Err(
             "native update apply is currently supported on macOS and Linux service managers"
@@ -429,6 +685,23 @@ fn apply_inner(
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
+        // `update apply` is runtime-only. The separate Worker update is only
+        // ever run on an explicit `--with-worker` opt-in, and that opt-in is
+        // refused before any network/service work when this process cannot
+        // show or answer the Cloudflare authorization it starts.
+        let worker_chain = {
+            use std::io::IsTerminal;
+            let stdin_is_tty = std::io::stdin().is_terminal();
+            let stdout_is_tty = std::io::stdout().is_terminal();
+            match with_worker_refusal_code(with_worker, stdin_is_tty, stdout_is_tty) {
+                Some(code) => {
+                    print_json(&with_worker_refusal_payload(code))?;
+                    return Ok(ExitCode::FAILURE);
+                }
+                None if with_worker => WorkerChain::WithWorker,
+                None => WorkerChain::RuntimeOnly,
+            }
+        };
         crate::update_scheduler::ensure_updates_allowed()?;
         let channel = match channel_override {
             Some(channel) => channel,
@@ -441,6 +714,14 @@ fn apply_inner(
             channel.as_str()
         ));
         let plan = fetch_release_plan(manifest_override, channel)?;
+        if channel_override.is_some()
+            && let Some(migration) = plan.state_schema_migration.as_ref()
+        {
+            return Err(format!(
+                "scheduled/automatic updates refuse state-schema migrations; run explicit `herdr-mcp update apply` ({})",
+                migration.warning()
+            ));
+        }
         let current = current_version()?;
         progress.phase(format!(
             "Release {} verified; current version is {}.",
@@ -457,10 +738,7 @@ fn apply_inner(
             let target_version = plan.version.to_string();
             if allow_current {
                 let worker_update = worker_update_status_view(&paths, &target_version);
-                let worker_update_required = worker_update
-                    .get("update_required")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                let worker_update_required = worker_update_required(&worker_update);
                 print_json(&json!({
                     "ok": true,
                     "code": "auto_update_current",
@@ -470,54 +748,58 @@ fn apply_inner(
                     "tag": plan.tag,
                     "provenance_verified": true,
                     "network_checked": true,
+                    "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
                     "update_queued": false,
+                    "worker_update_required": worker_update_required,
                     "worker_update": worker_update,
+                    "notices": worker_update_notices(&worker_update),
                     "next_action": if worker_update_required {
-                        Some("herdr-mcp worker update")
+                        Some(WORKER_UPDATE_NEXT_ACTION)
                     } else {
                         None
                     },
                 }))?;
                 return Ok(ExitCode::SUCCESS);
             }
-            // Runtime is already on the target release. This is the recovery
-            // path for users who upgraded with an older updater that did not
-            // yet reconcile their user-owned Edge Worker.
-            let worker_update =
-                reconcile_worker_for_release(&paths, &plan.identity.source_commit, &target_version);
-            let worker_ok = worker_update.get("ok").and_then(Value::as_bool) != Some(false);
-            print_json(&json!({
-                "ok": worker_ok,
-                "code": if worker_ok {
-                    "update_current"
-                } else {
-                    "update_current_worker_update_required"
-                },
-                "update_channel": channel.as_str(),
-                "current_version": current.to_string(),
-                "release_version": target_version,
-                "tag": plan.tag,
-                "provenance_verified": true,
-                "runtime_changed": false,
-                "worker_update": worker_update,
-                "next_action": if worker_ok {
-                    None
-                } else {
-                    Some("herdr-mcp worker update")
-                },
-            }))?;
-            return Ok(if worker_ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            });
+            // Runtime is already on the target release. `update apply` stays
+            // runtime-only: Worker drift is reported as a separate operator
+            // step instead of starting Worker authorization from an update.
+            let worker_update = resolve_worker_update_after_runtime_commit(
+                &paths,
+                &target_version,
+                worker_chain,
+                || reconcile_worker_with_active_runtime(&paths),
+            );
+            report_worker_update_notice(&worker_update, worker_chain);
+            let (payload, code) = update_current_result(
+                channel,
+                &current.to_string(),
+                &target_version,
+                &plan.tag,
+                plan.state_schema_migration.as_ref(),
+                worker_update,
+                worker_chain,
+            );
+            print_json(&payload)?;
+            return Ok(code);
         }
         let store = UpdateStore::open(&paths)?;
         recover_or_reject_active_update(&store, &paths)?;
+        if let Some(migration) = plan.state_schema_migration.as_ref() {
+            progress.phase(migration.warning());
+        }
         progress.phase("Preparing a rollback-safe update job...");
         let (job_id, binary_path) = stage_release(&paths, &plan, &mut progress)?;
         progress.phase("Download verified. Probing candidate runtime identity...");
-        if let Err(error) = probe_candidate_binary(&binary_path, &plan.version, &plan.contract) {
+        let (expected_source_schema, expected_schema) = plan
+            .state_schema_migration
+            .as_ref()
+            .map_or((SCHEMA_VERSION, SCHEMA_VERSION), |migration| {
+                (migration.from, migration.to)
+            });
+        if let Err(error) =
+            probe_candidate_binary(&binary_path, &plan.version, &plan.contract, expected_schema)
+        {
             cleanup_staging(&binary_path);
             return Err(error);
         }
@@ -531,6 +813,8 @@ fn apply_inner(
             asset_name: plan.asset.name.clone(),
             sha256: plan.asset.sha256.clone(),
             binary_path: binary_path.to_string_lossy().into_owned(),
+            state_schema_source: expected_source_schema,
+            state_schema_target: expected_schema,
             state: "queued".to_owned(),
             detail: Some("verified candidate staged".to_owned()),
             worker_pid: None,
@@ -542,6 +826,25 @@ fn apply_inner(
             return Err(error);
         }
 
+        let migration_record = match plan.state_schema_migration.as_ref() {
+            Some(migration) => {
+                match prepare_state_schema_migration_record(&paths, &job_id, migration) {
+                    Ok(record) => Some(record),
+                    Err(error) => {
+                        let _ = store.update_update_job(
+                            &job_id,
+                            "failed",
+                            Some("state-schema migration backup failed"),
+                            None,
+                            now_ms_i64(),
+                        );
+                        cleanup_staging(&binary_path);
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
         let child = spawn_worker(&paths, &binary_path, &job_id);
         let mut child = match child {
             Ok(child) => child,
@@ -554,7 +857,15 @@ fn apply_inner(
                     now_ms_i64(),
                 );
                 cleanup_staging(&binary_path);
-                return Err(error);
+                let cleanup = migration_record
+                    .as_ref()
+                    .map(|record| discard_state_schema_migration_record(&paths, record));
+                return Err(match cleanup {
+                    Some(Ok(())) | None => error,
+                    Some(Err(cleanup_error)) => {
+                        format!("{error}; migration backup cleanup failed: {cleanup_error}")
+                    }
+                });
             }
         };
         let worker_pid_persisted = store
@@ -563,39 +874,41 @@ fn apply_inner(
 
         if progress.enabled {
             if let Some(job) = watch_update_job(&store, &job_id, &mut child, &mut progress)? {
-                progress.phase("Runtime update succeeded. Checking the fleet Worker release...");
-                // The foreground updater may be the old release. Delegate Edge
-                // reconciliation to the just-activated runtime/current binary
-                // so future same-contract releases can evolve their Worker
-                // metadata rules without an older updater guessing them.
-                let worker_update = reconcile_worker_with_active_runtime(&paths);
-                let worker_ok = worker_update.get("ok").and_then(Value::as_bool) != Some(false);
-                print_json(&json!({
-                    "ok": worker_ok,
-                    "code": if worker_ok {
-                        "update_succeeded"
-                    } else {
-                        "update_succeeded_worker_update_required"
-                    },
-                    "job_id": job_id,
-                    "version": plan.version.to_string(),
-                    "target": plan.asset.target,
-                    "asset": plan.asset.name,
-                    "worker_pid": child.id(),
-                    "worker_pid_persisted": worker_pid_persisted,
-                    "job": public_job_view(&job),
-                    "worker_update": worker_update,
-                    "next_action": if worker_ok {
-                        None
-                    } else {
-                        Some("herdr-mcp worker update")
-                    },
-                }))?;
-                return Ok(if worker_ok {
-                    ExitCode::SUCCESS
+                let target_version = plan.version.to_string();
+                if worker_chain == WorkerChain::WithWorker {
+                    progress.phase(
+                        "Runtime update succeeded. Reconciling the fleet Worker because --with-worker was given...",
+                    );
                 } else {
-                    ExitCode::FAILURE
+                    progress
+                        .phase("Runtime update succeeded. Checking the fleet Worker release...");
+                }
+                // Runtime-only by default: this only reads the Worker status
+                // and reports drift. `worker update` runs solely for the
+                // explicit `--with-worker` opt-in, and then against the
+                // just-activated runtime/current binary so future
+                // same-contract releases can evolve their Worker metadata.
+                let worker_update = resolve_worker_update_after_runtime_commit(
+                    &paths,
+                    &target_version,
+                    worker_chain,
+                    || reconcile_worker_with_active_runtime(&paths),
+                );
+                report_worker_update_notice(&worker_update, worker_chain);
+                let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+                    target_version,
+                    target: plan.asset.target.clone(),
+                    asset: plan.asset.name.clone(),
+                    job_id: job_id.clone(),
+                    worker_pid: child.id(),
+                    worker_pid_persisted,
+                    job: public_job_view(&job),
+                    migration: plan.state_schema_migration.as_ref(),
+                    worker_update,
+                    worker_chain,
                 });
+                print_json(&payload)?;
+                return Ok(code);
             }
             progress.phase(
                 "Installer is still running in the background; use `herdr-mcp update status` for the final state.",
@@ -609,12 +922,20 @@ fn apply_inner(
             "version": plan.version.to_string(),
             "target": plan.asset.target,
             "asset": plan.asset.name,
+            "state_schema_migration": plan.state_schema_migration.as_ref().map(|migration| json!({
+                "from": migration.from,
+                "to": migration.to,
+                "reversible": migration.reversible,
+            })),
+            "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
             "worker_pid": child.id(),
             "worker_pid_persisted": worker_pid_persisted,
             "worker_update": {
-                "state": "deferred_until_runtime_update_finishes",
-                "next_action": "herdr-mcp update status",
+                "state": "not_attempted",
+                "reason": "worker_update_is_a_separate_operator_step",
+                "next_action": WORKER_UPDATE_NEXT_ACTION,
             },
+            "notices": with_macos_tcc_prompt_notice(json!([])),
             "next_action": "herdr-mcp update status",
         }))?;
         Ok(ExitCode::SUCCESS)
@@ -791,10 +1112,19 @@ fn major_upgrade_record_path(paths: &RuntimePaths) -> PathBuf {
     major_upgrade_dir(paths).join("rollback.json")
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn major_upgrade_backup_path(paths: &RuntimePaths) -> PathBuf {
+    schema_upgrade_backup_path(paths, MAJOR_SOURCE_SCHEMA, SCHEMA_VERSION)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn schema_upgrade_backup_path(
+    paths: &RuntimePaths,
+    source_schema: i64,
+    target_schema: i64,
+) -> PathBuf {
     major_upgrade_dir(paths).join(format!(
-        "state-schema-{MAJOR_SOURCE_SCHEMA}-before-{SCHEMA_VERSION}.db"
+        "state-schema-{source_schema}-before-{target_schema}.db"
     ))
 }
 
@@ -842,9 +1172,117 @@ fn prepare_major_upgrade_record(
     paths: &RuntimePaths,
     state_path: &Path,
 ) -> Result<MajorUpgradeRecord, String> {
+    prepare_schema_upgrade_record(
+        paths,
+        state_path,
+        MAJOR_SOURCE_SCHEMA,
+        SCHEMA_VERSION,
+        "major state migration",
+        None,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_state_schema_migration_record(
+    paths: &RuntimePaths,
+    job_id: &str,
+    migration: &StateSchemaMigration,
+) -> Result<MajorUpgradeRecord, String> {
+    if migration.reversible || migration.to != migration.from.saturating_add(1) {
+        return Err(
+            "state-schema migration declaration is not a single irreversible forward step"
+                .to_owned(),
+        );
+    }
+    prepare_schema_upgrade_record(
+        paths,
+        &paths.config_dir.join("state.db"),
+        migration.from,
+        migration.to,
+        "state-schema migration",
+        Some(job_id),
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn discard_state_schema_migration_record(
+    paths: &RuntimePaths,
+    record: &MajorUpgradeRecord,
+) -> Result<(), String> {
+    run_service_command(
+        Path::new(&record.source_binary),
+        paths,
+        &["service", "start"],
+    )
+    .map_err(|error| {
+        format!("cannot restart previous service after migration staging failure: {error}")
+    })?;
+
+    fs::remove_file(major_upgrade_record_path(paths))
+        .map_err(|error| format!("cannot remove migration rollback record: {error}"))?;
+    let backup = Path::new(&record.state_backup);
+    if backup.is_file() {
+        fs::remove_file(backup)
+            .map_err(|error| format!("cannot remove migration state backup: {error}"))?;
+    }
+    let source_binary = Path::new(&record.source_binary);
+    if source_binary.is_file() {
+        fs::remove_file(source_binary)
+            .map_err(|error| format!("cannot remove migration source binary: {error}"))?;
+    }
+    let dir = major_upgrade_dir(paths);
+    if dir.is_dir() {
+        fs::remove_dir(&dir)
+            .map_err(|error| format!("cannot remove migration rollback directory: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn recover_failed_state_schema_migration(
+    paths: &RuntimePaths,
+    job: &UpdateJobRecord,
+) -> Result<(), String> {
+    // A schema migration is represented by a distinct source/target pair in
+    // the durable job. Ordinary jobs must never consume an unrelated major
+    // rollback record left by an earlier update.
+    if job.state_schema_source == job.state_schema_target {
+        return Ok(());
+    }
+    let Some(record) = load_major_upgrade_record(paths)? else {
+        return Ok(());
+    };
+    if record.job_id.as_deref() != Some(job.job_id.as_str())
+        || record.source_state_schema != job.state_schema_source
+        || record.target_state_schema != job.state_schema_target
+    {
+        return Ok(());
+    }
+    let state_path = paths.config_dir.join("state.db");
+    let live_schema = read_raw_state_schema(&state_path)?;
+    if live_schema == Some(record.source_state_schema) {
+        discard_state_schema_migration_record(paths, &record)
+    } else {
+        // A failed install may have migrated the live database before the
+        // service manager rolled the binary back. Restore the backup first;
+        // recover_major_upgrade starts the source binary only after this
+        // restore succeeds.
+        recover_major_upgrade(paths, &record)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_schema_upgrade_record(
+    paths: &RuntimePaths,
+    state_path: &Path,
+    source_schema: i64,
+    target_schema: i64,
+    label: &str,
+    job_id: Option<&str>,
+) -> Result<MajorUpgradeRecord, String> {
     let active_source_binary = active_runtime_binary(paths)?;
     let dir = major_upgrade_dir(paths);
-    if major_upgrade_backup_path(paths).exists()
+    if schema_upgrade_backup_path(paths, source_schema, target_schema).exists()
         || major_upgrade_source_binary_path(paths).exists()
         || major_upgrade_record_path(paths).exists()
     {
@@ -855,17 +1293,24 @@ fn prepare_major_upgrade_record(
     }
     // The final snapshot must include writes committed while the old service stops.
     run_service_command(&active_source_binary, paths, &["service", "stop"])
-        .map_err(|error| format!("cannot stop service before major state migration: {error}"))?;
-    match snapshot_major_upgrade_record(paths, state_path, &active_source_binary) {
+        .map_err(|error| format!("cannot stop service before {label}: {error}"))?;
+    match snapshot_schema_upgrade_record(
+        paths,
+        state_path,
+        &active_source_binary,
+        source_schema,
+        target_schema,
+        job_id,
+    ) {
         Ok(record) => Ok(record),
         Err(error) => {
             let restart = run_service_command(&active_source_binary, paths, &["service", "start"]);
             Err(match restart {
                 Ok(()) => {
-                    format!("major-upgrade backup failed ({error}); previous service restarted")
+                    format!("{label} backup failed ({error}); previous service restarted")
                 }
                 Err(restart_error) => format!(
-                    "major-upgrade backup failed ({error}); previous service restart failed: {restart_error}"
+                    "{label} backup failed ({error}); previous service restart failed: {restart_error}"
                 ),
             })
         }
@@ -873,17 +1318,20 @@ fn prepare_major_upgrade_record(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn snapshot_major_upgrade_record(
+fn snapshot_schema_upgrade_record(
     paths: &RuntimePaths,
     state_path: &Path,
     active_source_binary: &Path,
+    source_schema: i64,
+    target_schema: i64,
+    job_id: Option<&str>,
 ) -> Result<MajorUpgradeRecord, String> {
     let dir = major_upgrade_dir(paths);
     fs::create_dir_all(&dir)
         .map_err(|error| format!("cannot create major-upgrade backup directory: {error}"))?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("cannot secure major-upgrade backup directory: {error}"))?;
-    let backup = major_upgrade_backup_path(paths);
+    let backup = schema_upgrade_backup_path(paths, source_schema, target_schema);
     let source_binary = major_upgrade_source_binary_path(paths);
     if backup.exists() || source_binary.exists() || major_upgrade_record_path(paths).exists() {
         return Err(format!(
@@ -904,10 +1352,10 @@ fn snapshot_major_upgrade_record(
             return Err(error);
         }
     };
-    if backup_schema != MAJOR_SOURCE_SCHEMA {
+    if backup_schema != source_schema {
         let _ = fs::remove_file(&backup);
         return Err(format!(
-            "major-upgrade backup schema changed during snapshot: expected {MAJOR_SOURCE_SCHEMA}, got {backup_schema}"
+            "state backup schema changed during snapshot: expected {source_schema}, got {backup_schema}"
         ));
     }
     let state_backup_sha256 = match sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES) {
@@ -937,8 +1385,9 @@ fn snapshot_major_upgrade_record(
     };
     let record = MajorUpgradeRecord {
         record_version: MAJOR_UPGRADE_RECORD_VERSION,
-        source_state_schema: MAJOR_SOURCE_SCHEMA,
-        target_state_schema: SCHEMA_VERSION,
+        job_id: job_id.map(str::to_owned),
+        source_state_schema: source_schema,
+        target_state_schema: target_schema,
         source_binary: source_binary.to_string_lossy().into_owned(),
         source_binary_sha256,
         state_backup: backup.to_string_lossy().into_owned(),
@@ -959,13 +1408,19 @@ fn validate_major_upgrade_record(
     record: &MajorUpgradeRecord,
 ) -> Result<(), String> {
     if record.record_version != MAJOR_UPGRADE_RECORD_VERSION
-        || record.source_state_schema != MAJOR_SOURCE_SCHEMA
         || record.target_state_schema != SCHEMA_VERSION
+        || (record.source_state_schema != MAJOR_SOURCE_SCHEMA
+            && record.target_state_schema != record.source_state_schema.saturating_add(1))
     {
         return Err("major-upgrade rollback record is incompatible with this binary".to_owned());
     }
     if Path::new(&record.source_binary) != major_upgrade_source_binary_path(paths)
-        || Path::new(&record.state_backup) != major_upgrade_backup_path(paths)
+        || Path::new(&record.state_backup)
+            != schema_upgrade_backup_path(
+                paths,
+                record.source_state_schema,
+                record.target_state_schema,
+            )
     {
         return Err(
             "major-upgrade rollback record points outside its private backup set".to_owned(),
@@ -1413,43 +1868,102 @@ fn recover_major_upgrade(paths: &RuntimePaths, record: &MajorUpgradeRecord) -> R
     Ok(())
 }
 
+/// Runtime outcome recorded by a durable update job.
+///
+/// The Runtime is what `update apply` guarantees; the fleet Worker is a separate
+/// release plane with its own operator command. `update status` classifies the
+/// Runtime job only, so a Worker problem recorded alongside a committed Runtime
+/// never turns the update into a failure.
+fn runtime_job_outcome(state: &str) -> &'static str {
+    match state {
+        "succeeded" => "succeeded",
+        "failed" => "failed",
+        "queued" | "installing" => "in_progress",
+        _ => "unknown",
+    }
+}
+
+/// Whether a job's detail is the legacy `<= v1.1.0-rc.8` chained-Worker text.
+///
+/// Updaters up to v1.1.0-rc.8 chained `worker update` into the Runtime result and
+/// recorded codes such as `update_succeeded_worker_update_required` there. The
+/// Runtime had already committed, so such a job is a success plus a Worker
+/// notice, not a failed update.
+fn legacy_worker_update_detail(detail: Option<&str>) -> bool {
+    let Some(detail) = detail else {
+        return false;
+    };
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("update_succeeded_worker_update_required")
+        || lower.contains("worker_update_failed")
+}
+
+fn legacy_worker_update_notice() -> Value {
+    json!({
+        "code": "worker_update_failed_legacy",
+        "severity": "notice",
+        "fatal": false,
+        "message": "this update job was recorded by an updater <= v1.1.0-rc.8, which chained the separate fleet Worker update into the Runtime result; the Runtime update itself succeeded",
+        "next_action": WORKER_UPDATE_NEXT_ACTION,
+    })
+}
+
+/// Read-only `update status` view.
+///
+/// `ok` and `runtime_outcome` describe the recorded Runtime job; Worker drift or
+/// a legacy Worker failure is only a notice. Verification commands for an
+/// operator are `herdr-mcp --version`, `herdr-mcp update status` and
+/// `herdr-mcp doctor`.
+fn update_status_view(
+    job: Option<&UpdateJobRecord>,
+    current_version: &str,
+    worker_update: Value,
+) -> Value {
+    let worker_update_required = worker_update_required(&worker_update);
+    let outcome = job.map_or("none", |job| runtime_job_outcome(&job.state));
+    let mut notices = worker_update_notices(&worker_update)
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if job.is_some_and(|job| {
+        runtime_job_outcome(&job.state) == "succeeded"
+            && legacy_worker_update_detail(job.detail.as_deref())
+    }) {
+        notices.push(legacy_worker_update_notice());
+    }
+    let next_action = if worker_update_required {
+        Some(WORKER_UPDATE_NEXT_ACTION)
+    } else {
+        match outcome {
+            "failed" => Some("herdr-mcp update apply"),
+            "in_progress" => Some("herdr-mcp update status"),
+            _ => None,
+        }
+    };
+    json!({
+        "ok": outcome != "failed",
+        "code": "update_status",
+        "runtime_outcome": outcome,
+        "job": job.map(public_job_view),
+        "current_version": current_version,
+        "worker_update_required": worker_update_required,
+        "worker_update": worker_update,
+        "notices": notices,
+        "next_action": next_action,
+    })
+}
+
 fn status() -> Result<ExitCode, String> {
     let paths = RuntimePaths::discover()?;
     let store = UpdateStore::open(&paths)?;
     let latest = store.latest_update_job()?;
     let current_version = current_version()?.to_string();
     let worker_update = worker_update_status_view(&paths, &current_version);
-    let worker_update_required = worker_update
-        .get("update_required")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let payload = match latest {
-        Some(job) => json!({
-            "ok": true,
-            "code": "update_status",
-            "job": public_job_view(&job),
-            "current_version": current_version,
-            "worker_update": worker_update,
-            "next_action": if worker_update_required {
-                Some("herdr-mcp worker update")
-            } else {
-                None
-            },
-        }),
-        None => json!({
-            "ok": true,
-            "code": "update_status",
-            "job": null,
-            "current_version": current_version,
-            "worker_update": worker_update,
-            "next_action": if worker_update_required {
-                Some("herdr-mcp worker update")
-            } else {
-                None
-            },
-        }),
-    };
-    print_json(&payload)?;
+    print_json(&update_status_view(
+        latest.as_ref(),
+        &current_version,
+        worker_update,
+    ))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1496,6 +2010,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
             &Version::parse(&job.version)
                 .map_err(|_| "durable update job contains an invalid version".to_owned())?,
             &crate::contract::identity()?,
+            job.state_schema_target,
         )?;
         store.update_update_job(
             job_id,
@@ -1514,7 +2029,12 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
                 now_ms_i64(),
             )?;
             cleanup_staging(&binary);
-            return Err(error);
+            return match recover_failed_state_schema_migration(&paths, &job) {
+                Ok(()) => Err(error),
+                Err(recovery_error) => Err(format!(
+                    "{error}; state-schema migration cleanup failed: {recovery_error}"
+                )),
+            };
         }
 
         let install = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false });
@@ -1537,7 +2057,18 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
             };
             store.update_update_job(job_id, "failed", Some(detail), None, now_ms_i64())?;
             cleanup_staging(&binary);
-            install
+            let migration_recovery = recover_failed_state_schema_migration(&paths, &job);
+            match migration_recovery {
+                Ok(()) => install,
+                Err(recovery_error) => Err(match install {
+                    Ok(code) => format!(
+                        "service install returned {code:?}; state-schema migration recovery failed: {recovery_error}"
+                    ),
+                    Err(error) => {
+                        format!("{error}; state-schema migration recovery failed: {recovery_error}")
+                    }
+                }),
+            }
         }
     }
 }
@@ -1798,6 +2329,7 @@ fn probe_candidate_binary(
     path: &Path,
     expected: &Version,
     expected_contract: &crate::contract::ContractIdentity,
+    expected_schema: i64,
 ) -> Result<(), String> {
     let output = Command::new(path)
         .arg("version")
@@ -1808,7 +2340,7 @@ fn probe_candidate_binary(
         return Err("staged update binary version probe failed".to_owned());
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    verify_candidate_identity(&text, expected, expected_contract)
+    verify_candidate_identity(&text, expected, expected_contract, expected_schema)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1816,6 +2348,7 @@ fn verify_candidate_identity(
     text: &str,
     expected: &Version,
     expected_contract: &crate::contract::ContractIdentity,
+    expected_schema: i64,
 ) -> Result<(), String> {
     let expected_first = format!("herdr-mcp {expected}");
     let expected_contract_line = format!(
@@ -1823,7 +2356,7 @@ fn verify_candidate_identity(
         expected_contract.epoch, expected_contract.tool_count
     );
     let expected_hash = format!("contract hash {}", expected_contract.hash);
-    let expected_schema = format!("state schema {SCHEMA_VERSION}");
+    let expected_schema = format!("state schema {expected_schema}");
     // Older same-contract releases did not print their hash. A new epoch must
     // report it; the detached worker is already the attested target binary.
     let hash_matches = match text.lines().find(|line| line.starts_with("contract hash ")) {
@@ -2208,8 +2741,9 @@ mod tests {
             target.epoch, target.tool_count, target.hash
         );
         write_test_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{output}'\n"));
-        assert!(probe_candidate_binary(&binary, &version, &target).is_ok());
-        assert!(probe_candidate_binary(&binary, &version, &local).is_err());
+        assert!(probe_candidate_binary(&binary, &version, &target, SCHEMA_VERSION).is_ok());
+        assert!(probe_candidate_binary(&binary, &version, &target, MAJOR_SOURCE_SCHEMA).is_err());
+        assert!(probe_candidate_binary(&binary, &version, &local, SCHEMA_VERSION).is_err());
         for bad in [
             output.replace(&target.hash, &local.hash),
             output.replace(
@@ -2228,14 +2762,14 @@ mod tests {
             output.replace("herdr-mcp 9.9.9", "herdr-mcp 9.9.8"),
         ] {
             write_test_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{bad}'\n"));
-            assert!(probe_candidate_binary(&binary, &version, &target).is_err());
+            assert!(probe_candidate_binary(&binary, &version, &target, SCHEMA_VERSION).is_err());
         }
         let legacy = format!(
             "herdr-mcp {version}\ncontract epoch {} / {} tools\nstate schema {SCHEMA_VERSION}\n",
             local.epoch, local.tool_count
         );
         write_test_executable(&binary, &format!("#!/bin/sh\nprintf '%s' '{legacy}'\n"));
-        assert!(probe_candidate_binary(&binary, &version, &local).is_ok());
+        assert!(probe_candidate_binary(&binary, &version, &local, SCHEMA_VERSION).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2276,6 +2810,26 @@ mod tests {
         .unwrap();
         conn.execute("INSERT INTO sentinel(value) VALUES (?1)", [sentinel])
             .unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn ordinary_update_job(job_id: &str) -> UpdateJobRecord {
+        let now = now_ms_i64();
+        UpdateJobRecord {
+            job_id: job_id.to_owned(),
+            version: "9.9.9".to_owned(),
+            target: current_target().unwrap().to_owned(),
+            asset_name: "candidate".to_owned(),
+            sha256: "a".repeat(64),
+            binary_path: "/tmp/candidate".to_owned(),
+            state_schema_source: SCHEMA_VERSION,
+            state_schema_target: SCHEMA_VERSION,
+            state: "installing".to_owned(),
+            detail: None,
+            worker_pid: None,
+            created_at: now,
+            updated_at: now,
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2413,6 +2967,7 @@ mod tests {
 
         let record = MajorUpgradeRecord {
             record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: None,
             source_state_schema: MAJOR_SOURCE_SCHEMA,
             target_state_schema: SCHEMA_VERSION,
             source_binary: "/unused/source".to_owned(),
@@ -2491,6 +3046,295 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
+    fn migration_snapshot_failure_restarts_service_and_removes_rollback_material() {
+        let root = env::temp_dir().join(format!(
+            "herdr-state-migration-cleanup-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        write_test_executable(
+            &source_binary,
+            "#!/bin/sh\nif [ \"$1 $2\" = \"service start\" ]; then : > \"$HERDR_MCP_CONFIG_DIR/restarted\"; fi\nexit 0\n",
+        );
+        let state = root.join("state.db");
+        write_test_state(&state, 15, "before-migration");
+        let backup = schema_upgrade_backup_path(&paths, 15, 16);
+        write_test_state(&backup, 15, "before-migration");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: None,
+            source_state_schema: 15,
+            target_state_schema: 16,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        discard_state_schema_migration_record(&paths, &record).unwrap();
+
+        assert!(root.join("restarted").is_file());
+        assert!(!major_upgrade_record_path(&paths).exists());
+        assert!(!backup.exists());
+        assert!(!source_binary.exists());
+        assert!(!dir.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn rollback_restores_schema_fifteen_before_starting_the_old_binary() {
+        let root = env::temp_dir().join(format!(
+            "herdr-state-migration-rollback-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        let source_script = concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1 $2\" = \"service install\" ]; then\n",
+            "/usr/bin/python3 - <<'PY'\n",
+            "import os, sqlite3\n",
+            "root = os.environ['HERDR_MCP_CONFIG_DIR']\n",
+            "conn = sqlite3.connect(os.path.join(root, 'state.db'))\n",
+            "schema = conn.execute(\n",
+            "    \"SELECT value FROM meta WHERE key='schema_version'\"\n",
+            ").fetchone()[0]\n",
+            "open(os.path.join(root, 'old-binary-schema'), 'w').write(schema)\n",
+            "PY\n",
+            "fi\n",
+            "exit 0\n",
+        );
+        write_test_executable(&source_binary, source_script);
+        let state = root.join("state.db");
+        write_test_state(&state, 16, "after-migration");
+        let backup = schema_upgrade_backup_path(&paths, 15, 16);
+        write_test_state(&backup, 15, "before-migration");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: None,
+            source_state_schema: 15,
+            target_state_schema: 16,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        recover_major_upgrade(&paths, &record).unwrap();
+
+        assert_eq!(read_raw_state_schema(&state).unwrap(), Some(15));
+        assert_eq!(
+            fs::read_to_string(root.join("old-binary-schema")).unwrap(),
+            "15"
+        );
+        assert!(!dir.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn install_failure_after_migration_restores_backup_before_old_binary_and_clears_material() {
+        let root = env::temp_dir().join(format!(
+            "herdr-state-migration-install-failure-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        let source_script = concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1 $2\" = \"service install\" ]; then\n",
+            "/usr/bin/python3 - <<'PY'\n",
+            "import os, sqlite3\n",
+            "root = os.environ['HERDR_MCP_CONFIG_DIR']\n",
+            "conn = sqlite3.connect(os.path.join(root, 'state.db'))\n",
+            "schema = conn.execute(\"SELECT value FROM meta WHERE key='schema_version'\").fetchone()[0]\n",
+            "open(os.path.join(root, 'old-binary-schema'), 'w').write(schema)\n",
+            "PY\n",
+            "fi\n",
+            "exit 0\n",
+        );
+        write_test_executable(&source_binary, source_script);
+        let state = root.join("state.db");
+        write_test_state(&state, SCHEMA_VERSION, "after-migration");
+        let backup = schema_upgrade_backup_path(&paths, 15, 16);
+        write_test_state(&backup, 15, "before-migration");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: Some("upd-migrating-12345678".to_owned()),
+            source_state_schema: 15,
+            target_state_schema: 16,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        let job = UpdateJobRecord {
+            job_id: "upd-migrating-12345678".to_owned(),
+            version: "9.9.9".to_owned(),
+            target: current_target().unwrap().to_owned(),
+            asset_name: "candidate".to_owned(),
+            sha256: "a".repeat(64),
+            binary_path: "/tmp/candidate".to_owned(),
+            state_schema_source: 15,
+            state_schema_target: 16,
+            state: "installing".to_owned(),
+            detail: None,
+            worker_pid: None,
+            created_at: now_ms_i64(),
+            updated_at: now_ms_i64(),
+        };
+        recover_failed_state_schema_migration(&paths, &job).unwrap();
+
+        assert_eq!(read_raw_state_schema(&state).unwrap(), Some(15));
+        assert_eq!(
+            fs::read_to_string(root.join("old-binary-schema")).unwrap(),
+            "15"
+        );
+        assert!(!major_upgrade_record_path(&paths).exists());
+        assert!(!backup.exists());
+        assert!(!source_binary.exists());
+        assert!(!dir.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn failed_ordinary_update_does_not_consume_leftover_major_upgrade_record() {
+        let root = env::temp_dir().join(format!(
+            "herdr-state-migration-leftover-major-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        let state = root.join("state.db");
+        write_test_state(&state, SCHEMA_VERSION, "ordinary-state");
+        let backup = schema_upgrade_backup_path(&paths, 5, SCHEMA_VERSION);
+        write_test_state(&backup, 5, "major-backup");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: None,
+            source_state_schema: 5,
+            target_state_schema: SCHEMA_VERSION,
+            source_binary: dir.join("source-herdr-mcp").to_string_lossy().into_owned(),
+            source_binary_sha256: "0".repeat(64),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        recover_failed_state_schema_migration(&paths, &ordinary_update_job("upd-ordinary-major"))
+            .unwrap();
+
+        assert_eq!(read_raw_state_schema(&state).unwrap(), Some(SCHEMA_VERSION));
+        assert!(major_upgrade_record_path(&paths).exists());
+        assert!(backup.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn failed_later_ordinary_update_does_not_consume_leftover_migration_record() {
+        let root = env::temp_dir().join(format!(
+            "herdr-state-migration-leftover-forward-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        let state = root.join("state.db");
+        write_test_state(&state, SCHEMA_VERSION, "migrated-state");
+        let backup = schema_upgrade_backup_path(&paths, 15, SCHEMA_VERSION);
+        write_test_state(&backup, 15, "migration-backup");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: Some("upd-earlier-migration".to_owned()),
+            source_state_schema: 15,
+            target_state_schema: SCHEMA_VERSION,
+            source_binary: dir.join("source-herdr-mcp").to_string_lossy().into_owned(),
+            source_binary_sha256: "0".repeat(64),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        recover_failed_state_schema_migration(&paths, &ordinary_update_job("upd-later-ordinary"))
+            .unwrap();
+
+        assert_eq!(read_raw_state_schema(&state).unwrap(), Some(SCHEMA_VERSION));
+        assert!(major_upgrade_record_path(&paths).exists());
+        assert!(backup.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn migration_rollback_record_validation_accepts_only_schema_fifteen_to_sixteen() {
+        let root = env::temp_dir().join(format!(
+            "herdr-state-migration-record-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let valid = |source_state_schema, target_state_schema| MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: None,
+            source_state_schema,
+            target_state_schema,
+            source_binary: major_upgrade_source_binary_path(&paths)
+                .to_string_lossy()
+                .into_owned(),
+            source_binary_sha256: "0".repeat(64),
+            state_backup: schema_upgrade_backup_path(
+                &paths,
+                source_state_schema,
+                target_state_schema,
+            )
+            .to_string_lossy()
+            .into_owned(),
+            state_backup_sha256: "0".repeat(64),
+            created_at_ms: now_ms_i64(),
+        };
+        validate_major_upgrade_record(&paths, &valid(15, 16)).unwrap();
+        assert!(validate_major_upgrade_record(&paths, &valid(14, 16)).is_err());
+        assert!(validate_major_upgrade_record(&paths, &valid(15, 17)).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
     fn major_rollback_stop_failure_preserves_live_current_schema_state() {
         let root = env::temp_dir().join(format!(
             "herdr-major-stop-failure-{}-{}",
@@ -2513,6 +3357,7 @@ mod tests {
         write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
         let record = MajorUpgradeRecord {
             record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: None,
             source_state_schema: MAJOR_SOURCE_SCHEMA,
             target_state_schema: SCHEMA_VERSION,
             source_binary: source_binary.to_string_lossy().into_owned(),
@@ -2561,6 +3406,7 @@ mod tests {
         write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
         let record = MajorUpgradeRecord {
             record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: None,
             source_state_schema: MAJOR_SOURCE_SCHEMA,
             target_state_schema: SCHEMA_VERSION,
             source_binary: source_binary.to_string_lossy().into_owned(),
@@ -2620,6 +3466,7 @@ mod tests {
         write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
         let record = MajorUpgradeRecord {
             record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: None,
             source_state_schema: MAJOR_SOURCE_SCHEMA,
             target_state_schema: SCHEMA_VERSION,
             source_binary: source_binary.to_string_lossy().into_owned(),
@@ -2667,6 +3514,7 @@ mod tests {
         write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
         let record = MajorUpgradeRecord {
             record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            job_id: None,
             source_state_schema: MAJOR_SOURCE_SCHEMA,
             target_state_schema: SCHEMA_VERSION,
             source_binary: source_binary.to_string_lossy().into_owned(),
@@ -2778,6 +3626,7 @@ mod tests {
             write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
             let record = MajorUpgradeRecord {
                 record_version: MAJOR_UPGRADE_RECORD_VERSION,
+                job_id: None,
                 source_state_schema: MAJOR_SOURCE_SCHEMA,
                 target_state_schema: SCHEMA_VERSION,
                 source_binary: source_binary.to_string_lossy().into_owned(),
@@ -2971,6 +3820,8 @@ mod tests {
             asset_name: "candidate".to_owned(),
             sha256: "a".repeat(64),
             binary_path: "/tmp/candidate".to_owned(),
+            state_schema_source: SCHEMA_VERSION,
+            state_schema_target: SCHEMA_VERSION,
             state: "queued".to_owned(),
             detail: Some("verified candidate staged".to_owned()),
             worker_pid: Some(std::process::id()),
@@ -3067,6 +3918,8 @@ mod tests {
                 asset_name: "candidate".to_owned(),
                 sha256: "a".repeat(64),
                 binary_path: live_binary.to_string_lossy().into_owned(),
+                state_schema_source: SCHEMA_VERSION,
+                state_schema_target: SCHEMA_VERSION,
                 state: "queued".to_owned(),
                 detail: None,
                 worker_pid: Some(std::process::id()),
@@ -3097,6 +3950,8 @@ mod tests {
                 asset_name: "candidate".to_owned(),
                 sha256: "b".repeat(64),
                 binary_path: stale_binary.to_string_lossy().into_owned(),
+                state_schema_source: SCHEMA_VERSION,
+                state_schema_target: SCHEMA_VERSION,
                 state: "queued".to_owned(),
                 detail: None,
                 worker_pid: None,
@@ -3115,5 +3970,321 @@ mod tests {
             "failed"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Given a Runtime update that already committed
+    /// When it reports a fleet Worker that is behind the installed release
+    /// Then the Runtime result stays successful and Worker drift is a notice.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn runtime_update_reports_worker_drift_as_a_non_fatal_notice() {
+        let behind = json!({
+            "configured": true,
+            "edge_origin": "https://edge.example.test",
+            "worker": "herdr-edge",
+            "edge_version": "1.0.0",
+            "target_version": "9.9.9",
+            "update_required": true,
+        });
+        let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+            job_id: "upd-test".to_owned(),
+            target_version: "9.9.9".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            asset: "herdr-mcp".to_owned(),
+            worker_pid: 42,
+            worker_pid_persisted: true,
+            job: json!({ "job_id": "upd-test", "state": "succeeded" }),
+            migration: None,
+            worker_update: behind,
+            worker_chain: WorkerChain::RuntimeOnly,
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["code"], "update_succeeded");
+        assert_eq!(payload["worker_update_required"], true);
+        assert_eq!(payload["worker_update_chained"], false);
+        assert_eq!(payload["next_action"], "herdr-mcp worker update");
+        let notices = payload["notices"].as_array().unwrap();
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice["code"] == "worker_update_required")
+                .count(),
+            1
+        );
+        let notice = notices
+            .iter()
+            .find(|notice| notice["code"] == "worker_update_required")
+            .unwrap();
+        assert_eq!(notice["severity"], "notice");
+        assert_eq!(notice["fatal"], false);
+        assert_eq!(notice["next_action"], "herdr-mcp worker update");
+
+        // A current (or unconfigured) Worker is never a notice.
+        let current = json!({ "configured": true, "update_required": false });
+        assert!(worker_update_notice(&current).is_none());
+        assert!(
+            worker_update_notice(&json!({ "configured": false, "update_required": false }))
+                .is_none()
+        );
+        assert!(!worker_update_required(
+            &json!({ "configured": true, "update_required": null })
+        ));
+
+        // A failed explicit `--with-worker` attempt is reported as a warning on
+        // a Runtime update that still succeeded.
+        let failed_worker = json!({ "ok": false, "code": "worker_update_failed" });
+        let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+            job_id: "upd-test".to_owned(),
+            target_version: "9.9.9".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            asset: "herdr-mcp".to_owned(),
+            worker_pid: 42,
+            worker_pid_persisted: true,
+            job: json!({ "job_id": "upd-test", "state": "succeeded" }),
+            migration: None,
+            worker_update: failed_worker,
+            worker_chain: WorkerChain::WithWorker,
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["code"], "update_succeeded");
+        assert_eq!(payload["worker_update_chained"], true);
+        assert_eq!(payload["notices"][0]["code"], "worker_update_failed");
+        assert_eq!(payload["notices"][0]["severity"], "warning");
+        assert_eq!(payload["notices"][0]["fatal"], false);
+        assert_eq!(
+            payload["notices"][0]["next_action"],
+            "herdr-mcp worker update"
+        );
+    }
+
+    /// Given a Worker status that is behind
+    /// When the update resolves the Worker outcome without `--with-worker`
+    /// Then it only reports that status and never runs the Worker update.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn update_apply_never_runs_worker_update_without_opt_in() {
+        let root = env::temp_dir().join(format!(
+            "herdr-worker-notice-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        let paths = test_runtime_paths(&root);
+        let mut worker_update_invocations = 0;
+        let reported = resolve_worker_update_after_runtime_commit(
+            &paths,
+            "9.9.9",
+            WorkerChain::RuntimeOnly,
+            || {
+                worker_update_invocations += 1;
+                json!({ "ok": true, "code": "worker_update_succeeded" })
+            },
+        );
+        assert_eq!(
+            worker_update_invocations, 0,
+            "runtime-only update apply must never run worker update"
+        );
+        assert_eq!(reported["configured"], false);
+        assert_eq!(reported["update_required"], false);
+
+        // The same seam does chain the Worker update when it is opted into.
+        let chained = resolve_worker_update_after_runtime_commit(
+            &paths,
+            "9.9.9",
+            WorkerChain::WithWorker,
+            || {
+                worker_update_invocations += 1;
+                json!({ "ok": true, "code": "worker_update_succeeded" })
+            },
+        );
+        assert_eq!(worker_update_invocations, 1);
+        assert_eq!(chained["code"], "worker_update_succeeded");
+    }
+
+    /// Given a `--with-worker` request in a detached or CI invocation
+    /// When update apply admits the Worker chain
+    /// Then it is refused with a clear machine-readable code before any work.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn with_worker_is_refused_without_an_interactive_terminal() {
+        assert_eq!(
+            with_worker_refusal_code(true, false, false),
+            Some(WITH_WORKER_REQUIRES_TTY)
+        );
+        assert_eq!(
+            with_worker_refusal_code(true, true, false),
+            Some(WITH_WORKER_REQUIRES_TTY)
+        );
+        assert_eq!(
+            with_worker_refusal_code(true, false, true),
+            Some(WITH_WORKER_REQUIRES_TTY)
+        );
+        assert_eq!(with_worker_refusal_code(true, true, true), None);
+        assert_eq!(with_worker_refusal_code(false, false, false), None);
+
+        let payload = with_worker_refusal_payload(WITH_WORKER_REQUIRES_TTY);
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["code"], "with_worker_requires_interactive_tty");
+        assert_eq!(payload["runtime_updated"], false);
+        assert_eq!(payload["worker_update_requested"], true);
+        assert_eq!(payload["worker_update_started"], false);
+        assert_eq!(payload["next_action"], "herdr-mcp update apply");
+    }
+
+    /// Given a Runtime update that already committed
+    /// When `update status` classifies a job recorded by an updater <= v1.1.0-rc.8
+    /// Then the succeeded Runtime job is a success and the chained Worker failure
+    /// is only a notice with the separate operator command.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn update_status_reports_a_succeeded_runtime_job_as_success() {
+        let mut job = ordinary_update_job("upd-legacy-worker");
+        job.state = "succeeded".to_owned();
+        job.detail =
+            Some("update_succeeded_worker_update_required worker_update_failed".to_owned());
+        let view = update_status_view(
+            Some(&job),
+            "1.1.0-rc.9",
+            json!({ "configured": true, "update_required": false }),
+        );
+        assert_eq!(view["ok"], true);
+        assert_eq!(view["runtime_outcome"], "succeeded");
+        assert_eq!(view["job"]["state"], "succeeded");
+        assert_eq!(view["next_action"], Value::Null);
+        let legacy = view["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "worker_update_failed_legacy")
+            .expect("the legacy chained-Worker text must be a notice");
+        assert_eq!(legacy["severity"], "notice");
+        assert_eq!(legacy["fatal"], false);
+        assert_eq!(legacy["next_action"], "herdr-mcp worker update");
+
+        // A plain success carries no legacy notice.
+        job.detail = Some("service install committed and health gate passed".to_owned());
+        let clean = update_status_view(
+            Some(&job),
+            "1.1.0-rc.9",
+            json!({ "configured": false, "update_required": false }),
+        );
+        assert_eq!(clean["ok"], true);
+        assert!(clean["notices"].as_array().unwrap().is_empty());
+        assert_eq!(
+            clean["job"]["detail"],
+            "service install committed and health gate passed"
+        );
+    }
+
+    /// Given each durable job state
+    /// When `update status` classifies it
+    /// Then only a failed Runtime job is unsuccessful, and Worker text never decides.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn update_status_runtime_outcome_ignores_worker_text() {
+        assert_eq!(runtime_job_outcome("succeeded"), "succeeded");
+        assert_eq!(runtime_job_outcome("failed"), "failed");
+        assert_eq!(runtime_job_outcome("queued"), "in_progress");
+        assert_eq!(runtime_job_outcome("installing"), "in_progress");
+        assert_eq!(runtime_job_outcome("something-else"), "unknown");
+        assert!(legacy_worker_update_detail(Some(
+            "update_succeeded_worker_update_required"
+        )));
+        assert!(legacy_worker_update_detail(Some("worker_update_failed")));
+        assert!(!legacy_worker_update_detail(None));
+        assert!(!legacy_worker_update_detail(Some("health gate passed")));
+
+        let mut failed = ordinary_update_job("upd-failed");
+        failed.state = "failed".to_owned();
+        failed.detail = Some("service install failed".to_owned());
+        let view = update_status_view(
+            Some(&failed),
+            "1.1.0-rc.9",
+            json!({ "configured": false, "update_required": false }),
+        );
+        assert_eq!(view["ok"], false);
+        assert_eq!(view["runtime_outcome"], "failed");
+        assert_eq!(view["next_action"], "herdr-mcp update apply");
+
+        let empty = update_status_view(
+            None,
+            "1.1.0-rc.9",
+            json!({ "configured": false, "update_required": false }),
+        );
+        assert_eq!(empty["ok"], true);
+        assert_eq!(empty["runtime_outcome"], "none");
+        assert_eq!(empty["job"], Value::Null);
+    }
+
+    /// Given the Runtime already on the target release
+    /// When the resolved Worker step fails
+    /// Then `update_current` still reports success and the Worker problem is a notice.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn update_current_stays_successful_when_the_worker_step_fails() {
+        let (payload, code) = update_current_result(
+            UpdateChannel::Stable,
+            "1.1.0-rc.9",
+            "1.1.0-rc.9",
+            "v1.1.0-rc.9",
+            None,
+            json!({ "ok": false, "code": "worker_update_failed", "error": "reconciliation did not complete" }),
+            WorkerChain::WithWorker,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["code"], "update_current");
+        assert_eq!(payload["runtime_changed"], false);
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "worker_update_failed")
+            .expect("the failed Worker step must stay a notice");
+        assert_eq!(notice["fatal"], false);
+        assert_eq!(notice["next_action"], "herdr-mcp worker update");
+
+        // The default runtime-only path never chains the Worker at all.
+        let (payload, code) = update_current_result(
+            UpdateChannel::Stable,
+            "1.1.0-rc.9",
+            "1.1.0-rc.9",
+            "v1.1.0-rc.9",
+            None,
+            json!({ "configured": false, "update_required": false }),
+            WorkerChain::RuntimeOnly,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["worker_update_chained"], false);
+    }
+
+    /// Given a Runtime update that activated a new generation
+    /// When its result carries notices
+    /// Then the one-time macOS Documents prompt is announced, without replacing
+    /// the Worker notice.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_update_announces_the_macos_documents_prompt() {
+        let notice = macos_tcc_prompt_notice().expect("macOS must announce the prompt");
+        assert_eq!(notice["code"], "macos_documents_tcc_prompt");
+        assert_eq!(notice["severity"], "notice");
+        assert_eq!(notice["fatal"], false);
+        assert!(notice["message"].as_str().unwrap().contains("Documents"));
+
+        let merged = with_macos_tcc_prompt_notice(json!([{ "code": "worker_update_required" }]));
+        let codes = merged
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|notice| notice["code"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            vec![
+                json!("worker_update_required"),
+                json!("macos_documents_tcc_prompt")
+            ]
+        );
     }
 }

@@ -229,8 +229,11 @@ function collectIssues(findingsDoc, rulesDoc) {
   return issues;
 }
 
+// Machine-facing summary line: always the plural noun, so the wording stays stable
+// regardless of how many entries a log holds and callers (tests, CI logs) can match
+// it unconditionally. Prose that describes a single entry keeps its own grammar.
 function summary(findingsDoc, rulesDoc) {
-  const count = (doc) => doc.entries.length + (doc.entries.length === 1 ? " entry" : " entries");
+  const count = (doc) => doc.entries.length + " entries";
   return findingsDoc.label + " " + count(findingsDoc) + ", " + rulesDoc.label + " " + count(rulesDoc);
 }
 

@@ -233,6 +233,11 @@ pub enum WorkerCommand {
         from: String,
         to: String,
         idempotency_key: Option<String>,
+        /// A digest from an earlier dry run. When present the write path skips
+        /// re-planning and applies that digest, so a retry with the same
+        /// idempotency key replays the stored result instead of failing on an
+        /// empty plan.
+        plan_digest: Option<String>,
     },
     ConnectorPageAssist {
         connector_id: String,
@@ -305,13 +310,29 @@ pub enum MemoryCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgentCommand {
+    Gate(AgentGateCommand),
     Dispatch {
-        target: String,
+        /// Existing agent/pane/role target; absent for a spawn dispatch.
+        target: Option<String>,
         text: String,
-        parent_target: String,
+        /// One-shot spawn facts (`--spawn-*`): create the pane, start the
+        /// agent, wait for readiness and prompt it in one call.
+        spawn: Option<Box<AgentDispatchSpawn>>,
+        parent_target: Option<String>,
         idempotency_key: String,
+        inject_task_identity: bool,
+        stall_after_ms: Option<u64>,
+        max_concurrent: Option<u64>,
+        workspace_id: Option<String>,
+        parent_session_ref: Option<String>,
         wait: bool,
         timeout_ms: u64,
+    },
+    Report {
+        task_id: String,
+        dispatch_id: String,
+        kind: String,
+        summary: Option<String>,
     },
     Status {
         task_id: String,
@@ -324,6 +345,39 @@ pub enum AgentCommand {
     },
     Ack {
         task_id: String,
+    },
+}
+
+/// Local CLI parity for one-shot `spawn` dispatch facts. The runtime method
+/// stays `herdr_mcp.agent.task.dispatch`; these fields become its `spawn` object.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgentDispatchSpawn {
+    pub kind: String,
+    pub workspace: Option<String>,
+    pub cwd: Option<String>,
+    pub name: Option<String>,
+    pub tab_label: Option<String>,
+    pub split_from: Option<String>,
+    pub direction: Option<String>,
+    pub startup_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgentGateCommand {
+    Create {
+        task_id: String,
+        question: String,
+        options: Vec<String>,
+    },
+    Status {
+        gate_id: String,
+    },
+    Cancel {
+        gate_id: String,
+    },
+    Resolve {
+        gate_id: String,
+        resolution: String,
     },
 }
 
@@ -476,13 +530,22 @@ pub enum ServiceCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateCommand {
-    Check { manifest_url: Option<String> },
-    Apply { manifest_url: Option<String> },
+    Check {
+        manifest_url: Option<String>,
+    },
+    /// `with_worker` opts into the separate fleet Worker update; it is only
+    /// admitted from an interactive TTY, so runtime-only stays the default.
+    Apply {
+        manifest_url: Option<String>,
+        with_worker: bool,
+    },
     MajorApply,
     MajorRollback,
     Auto,
     Status,
-    Worker { job_id: String },
+    Worker {
+        job_id: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -814,39 +877,156 @@ fn parse_memory(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_agent_gate(args: &[String]) -> Result<Command, String> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("agent gate requires create, status, cancel or resolve")?;
+    let mut task_id = None;
+    let mut gate_id = None;
+    let mut question = None;
+    let mut resolution = None;
+    let mut options = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{flag} requires a value"))?
+            .clone();
+        let slot = match (action, flag) {
+            ("create", "--task-id") => &mut task_id,
+            ("create", "--question") => &mut question,
+            ("create", "--option") => {
+                options.push(value);
+                index += 2;
+                continue;
+            }
+            ("status" | "cancel" | "resolve", "--gate-id") => &mut gate_id,
+            ("resolve", "--resolution") => &mut resolution,
+            _ => return Err(format!("unknown agent gate {action} option '{flag}'")),
+        };
+        if slot.replace(value).is_some() {
+            return Err(format!("duplicate {flag}"));
+        }
+        index += 2;
+    }
+    let command = match action {
+        "create" if (2..=8).contains(&options.len()) => AgentGateCommand::Create {
+            task_id: task_id.ok_or("--task-id is required")?,
+            question: question.ok_or("--question is required")?,
+            options,
+        },
+        "status" => AgentGateCommand::Status {
+            gate_id: gate_id.ok_or("--gate-id is required")?,
+        },
+        "cancel" => AgentGateCommand::Cancel {
+            gate_id: gate_id.ok_or("--gate-id is required")?,
+        },
+        "resolve" => AgentGateCommand::Resolve {
+            gate_id: gate_id.ok_or("--gate-id is required")?,
+            resolution: resolution.ok_or("--resolution is required")?,
+        },
+        _ => {
+            return Err(
+                "agent gate requires create (2-8 --option values), status, cancel or resolve"
+                    .to_owned(),
+            );
+        }
+    };
+    Ok(Command::Agent(AgentCommand::Gate(command)))
+}
+
+/// Value of one `--flag value` pair; an empty or missing value is an error
+/// instead of silently becoming an empty spawn/target field.
+fn dispatch_flag_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
+    args.get(index + 1)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
 fn parse_agent(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
+        Some("gate") => parse_agent_gate(&args[1..]),
         Some("dispatch") => {
-            if args.len() < 3 {
-                return Err(
-                    "agent dispatch requires <target> <text> --parent <target> --idempotency-key <key> [--wait] [--timeout-ms N]"
-                        .to_owned(),
-                );
-            }
-            let target = args[1].clone();
-            let text = args[2].clone();
-            if target.is_empty() || text.is_empty() {
-                return Err("agent dispatch target/text must not be empty".to_owned());
-            }
+            // Two call shapes share one method name: reuse an existing agent
+            // (`target`) or spawn one from `--spawn-*` facts. A spawn dispatch
+            // has no target, so the first positional is the task text.
+            const USAGE: &str = "agent dispatch (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N] | agent dispatch --spawn-kind KIND [--spawn-workspace W] [--spawn-cwd P] [--spawn-name N] [--spawn-tab-label L] [--spawn-split-from PANE] [--spawn-direction right|down] [--spawn-startup-timeout-ms N] <text> --idempotency-key <key> [--parent <target>] [--inject-task-identity] [--stall-after-ms N] [--wait] [--timeout-ms N]";
+            let mut target = None;
+            let mut positionals: Vec<String> = Vec::new();
+            let mut inject_task_identity = false;
+            let mut stall_after_ms = None;
+            let mut max_concurrent = None;
+            let mut workspace_id = None;
+            let mut parent_session_ref = None;
             let mut parent_target = None;
             let mut idempotency_key = None;
             let mut wait = false;
             let mut timeout_ms = 25_000_u64;
-            let mut index = 3;
+            let mut spawn_kind = None;
+            let mut spawn_workspace = None;
+            let mut spawn_cwd = None;
+            let mut spawn_name = None;
+            let mut spawn_tab_label = None;
+            let mut spawn_split_from = None;
+            let mut spawn_direction = None;
+            let mut spawn_startup_timeout_ms = None;
+            let mut index = 1;
             while index < args.len() {
-                match args[index].as_str() {
+                let flag = args[index].as_str();
+                if !flag.starts_with("--") {
+                    positionals.push(flag.to_owned());
+                    index += 1;
+                    continue;
+                }
+                match flag {
+                    "--target" => {
+                        target = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--max-concurrent" => {
+                        max_concurrent = Some(
+                            args.get(index + 1)
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .filter(|value| (1..=16).contains(value))
+                                .ok_or("--max-concurrent must be an integer in 1..=16")?,
+                        );
+                        index += 2;
+                    }
+                    "--workspace-id" => {
+                        workspace_id = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--stall-after-ms" => {
+                        let value = dispatch_flag_value(args, index, flag)?;
+                        stall_after_ms = Some(
+                            value
+                                .parse::<u64>()
+                                .ok()
+                                .filter(|value| (60_000..=7_200_000).contains(value))
+                                .ok_or_else(|| {
+                                    "--stall-after-ms must be in 60000..=7200000".to_owned()
+                                })?,
+                        );
+                        index += 2;
+                    }
+                    "--inject-task-identity" => {
+                        inject_task_identity = true;
+                        index += 1;
+                    }
+                    "--parent-session-ref" => {
+                        parent_session_ref = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
                     "--parent" => {
-                        let Some(value) = args.get(index + 1) else {
-                            return Err("--parent requires a target".to_owned());
-                        };
-                        parent_target = Some(value.clone());
+                        parent_target = Some(dispatch_flag_value(args, index, flag)?);
                         index += 2;
                     }
                     "--idempotency-key" => {
-                        let Some(value) = args.get(index + 1) else {
-                            return Err("--idempotency-key requires a value".to_owned());
-                        };
-                        idempotency_key = Some(value.clone());
+                        idempotency_key = Some(dispatch_flag_value(args, index, flag)?);
                         index += 2;
                     }
                     "--wait" => {
@@ -854,9 +1034,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                         index += 1;
                     }
                     "--timeout-ms" => {
-                        let Some(value) = args.get(index + 1) else {
-                            return Err("--timeout-ms requires a value".to_owned());
-                        };
+                        let value = dispatch_flag_value(args, index, flag)?;
                         timeout_ms = value
                             .parse::<u64>()
                             .ok()
@@ -866,20 +1044,182 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                             })?;
                         index += 2;
                     }
+                    "--spawn-kind" => {
+                        spawn_kind = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-workspace" => {
+                        spawn_workspace = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-cwd" => {
+                        spawn_cwd = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-name" => {
+                        spawn_name = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-tab-label" => {
+                        spawn_tab_label = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-split-from" => {
+                        spawn_split_from = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
+                    "--spawn-direction" => {
+                        let value = dispatch_flag_value(args, index, flag)?;
+                        if value != "right" && value != "down" {
+                            return Err("--spawn-direction must be right or down".to_owned());
+                        }
+                        spawn_direction = Some(value);
+                        index += 2;
+                    }
+                    "--spawn-startup-timeout-ms" => {
+                        let value = dispatch_flag_value(args, index, flag)?;
+                        spawn_startup_timeout_ms = Some(
+                            value
+                                .parse::<u64>()
+                                .ok()
+                                .filter(|value| (1..=100_000).contains(value))
+                                .ok_or_else(|| {
+                                    "--spawn-startup-timeout-ms must be an integer in 1..=100000"
+                                        .to_owned()
+                                })?,
+                        );
+                        index += 2;
+                    }
                     flag => return Err(format!("unknown agent dispatch option '{flag}'")),
                 }
             }
+            let spawn = match spawn_kind {
+                Some(kind) => Some(Box::new(AgentDispatchSpawn {
+                    kind,
+                    workspace: spawn_workspace,
+                    cwd: spawn_cwd,
+                    name: spawn_name,
+                    tab_label: spawn_tab_label,
+                    split_from: spawn_split_from,
+                    direction: spawn_direction,
+                    startup_timeout_ms: spawn_startup_timeout_ms,
+                })),
+                None => {
+                    if spawn_workspace.is_some()
+                        || spawn_cwd.is_some()
+                        || spawn_name.is_some()
+                        || spawn_tab_label.is_some()
+                        || spawn_split_from.is_some()
+                        || spawn_direction.is_some()
+                        || spawn_startup_timeout_ms.is_some()
+                    {
+                        return Err(
+                            "agent dispatch --spawn-* options require --spawn-kind KIND".to_owned()
+                        );
+                    }
+                    None
+                }
+            };
+            let (target, text) = match &spawn {
+                Some(_) => {
+                    if target.is_some() {
+                        return Err(
+                            "agent dispatch --target cannot be combined with --spawn-kind"
+                                .to_owned(),
+                        );
+                    }
+                    match positionals.as_slice() {
+                        [text] => (None, text.clone()),
+                        _ => {
+                            return Err(format!(
+                                "agent dispatch --spawn-kind requires exactly one <text> positional ({USAGE})"
+                            ));
+                        }
+                    }
+                }
+                None => match (target, positionals.as_slice()) {
+                    (Some(target), [text]) => (Some(target), text.clone()),
+                    (None, [target, text]) => (Some(target.clone()), text.clone()),
+                    _ => {
+                        return Err(format!(
+                            "agent dispatch requires (<target> | --target <target>) <text> ({USAGE})"
+                        ));
+                    }
+                },
+            };
+            if text.is_empty() || target.as_deref() == Some("") {
+                return Err("agent dispatch target/text must not be empty".to_owned());
+            }
+            let parent_target = match &spawn {
+                Some(_) => parent_target,
+                None => Some(
+                    parent_target
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| "--parent is required".to_owned())?,
+                ),
+            };
             Ok(Command::Agent(AgentCommand::Dispatch {
                 target,
                 text,
-                parent_target: parent_target
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| "--parent is required".to_owned())?,
+                spawn,
+                parent_target,
                 idempotency_key: idempotency_key
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| "--idempotency-key is required".to_owned())?,
+                inject_task_identity,
+                stall_after_ms,
+                max_concurrent,
+                workspace_id,
+                parent_session_ref,
                 wait,
                 timeout_ms,
+            }))
+        }
+        Some("report") => {
+            let mut task_id = None;
+            let mut dispatch_id = None;
+            let mut kind = None;
+            let mut summary = None;
+            let mut index = 1;
+            while index < args.len() {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("{} requires a value", args[index]))?;
+                match args[index].as_str() {
+                    "--task-id" => task_id = Some(value.clone()),
+                    "--dispatch-id" => dispatch_id = Some(value.clone()),
+                    "--kind" => kind = Some(value.clone()),
+                    "--summary" => summary = Some(value.clone()),
+                    flag => return Err(format!("unknown agent report option '{flag}'")),
+                }
+                index += 2;
+            }
+            let valid_id = |value: Option<String>, flag: &str| {
+                value
+                    .filter(|value| !value.is_empty() && value.len() <= 128)
+                    .ok_or_else(|| format!("{flag} requires a non-empty id up to 128 bytes"))
+            };
+            let kind = kind
+                .filter(|value| matches!(value.as_str(), "heartbeat" | "worker_done"))
+                .ok_or_else(|| "--kind requires heartbeat or worker_done".to_owned())?;
+            if summary.as_ref().is_some_and(|value| {
+                value
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .map(char::len_utf8)
+                    .sum::<usize>()
+                    > 2048
+            }) {
+                return Err(
+                    "--summary must be at most 2048 bytes after stripping control characters"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::Agent(AgentCommand::Report {
+                task_id: valid_id(task_id, "--task-id")?,
+                dispatch_id: valid_id(dispatch_id, "--dispatch-id")?,
+                kind,
+                summary,
             }))
         }
         Some("status") => {
@@ -942,9 +1282,9 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
             }))
         }
         Some(value) => Err(format!(
-            "unknown agent command '{value}' (expected dispatch, status, inbox, or ack)"
+            "unknown agent command '{value}' (expected dispatch, report, status, inbox, or ack)"
         )),
-        None => Err("agent requires dispatch, status, inbox, or ack".to_owned()),
+        None => Err("agent requires dispatch, report, status, inbox, or ack".to_owned()),
     }
 }
 
@@ -1443,11 +1783,12 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 // #626/#630: orphans list and migrate dry run are read-only Edge
                 // reads; --confirm runs the device-scoped write path.
                 return match parsed? {
-                    crate::grant_migration::MigrateCli::Migrate { from, to, confirm: true, idempotency_key } => {
+                    crate::grant_migration::MigrateCli::Migrate { from, to, confirm: true, idempotency_key, plan_digest } => {
                         Ok(Command::Worker(WorkerCommand::ConnectorPageAssistMigrate {
                             from,
                             to,
                             idempotency_key,
+                            plan_digest,
                         }))
                     }
                     crate::grant_migration::MigrateCli::Migrate { from, to, .. } => {
@@ -2372,13 +2713,11 @@ fn parse_update(args: &[String]) -> Result<Command, String> {
                 manifest_url: Some(value.clone()),
             }))
         }
-        [subcommand] if subcommand == "apply" => {
-            Ok(Command::Update(UpdateCommand::Apply { manifest_url: None }))
-        }
-        [subcommand, flag, value] if subcommand == "apply" && flag == "--manifest" => {
-            Ok(Command::Update(UpdateCommand::Apply {
-                manifest_url: Some(value.clone()),
-            }))
+        [subcommand, rest @ ..] if subcommand == "apply" => parse_update_apply(rest),
+        [flag, rest @ ..] if flag == "--with-worker" || flag == "--manifest" => {
+            let mut flags = vec![flag.clone()];
+            flags.extend(rest.iter().cloned());
+            parse_update_apply(&flags)
         }
         [subcommand] if subcommand == "major-apply" => {
             Ok(Command::Update(UpdateCommand::MajorApply))
@@ -2393,11 +2732,46 @@ fn parse_update(args: &[String]) -> Result<Command, String> {
                 job_id: value.clone(),
             }))
         }
-        [] => Ok(Command::Update(UpdateCommand::Apply { manifest_url: None })),
+        [] => Ok(Command::Update(UpdateCommand::Apply {
+            manifest_url: None,
+            with_worker: false,
+        })),
         [subcommand, ..] => Err(format!(
             "invalid update command or arguments for '{subcommand}'"
         )),
     }
+}
+
+fn parse_update_apply(args: &[String]) -> Result<Command, String> {
+    let mut manifest_url = None;
+    let mut with_worker = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--with-worker" => {
+                if with_worker {
+                    return Err("duplicate --with-worker flag".to_owned());
+                }
+                with_worker = true;
+                index += 1;
+            }
+            "--manifest" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--manifest requires a URL".to_owned())?;
+                if manifest_url.is_some() {
+                    return Err("duplicate --manifest flag".to_owned());
+                }
+                manifest_url = Some(value.clone());
+                index += 2;
+            }
+            flag => return Err(format!("invalid update apply argument '{flag}'")),
+        }
+    }
+    Ok(Command::Update(UpdateCommand::Apply {
+        manifest_url,
+        with_worker,
+    }))
 }
 
 fn parse_native_host(args: &[String]) -> Result<Command, String> {
@@ -2585,6 +2959,14 @@ User path:\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp agent-skill <status|sync>  (repo-fetched user-global local-agent Skill; exact runtime source identity)\n\
   herdr-mcp continuity <search|resume> ...  (durable prior-work discovery for local coding agents)\n\
+  herdr-mcp agent dispatch (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N]\n\
+  herdr-mcp agent dispatch --spawn-kind KIND [--spawn-workspace W] [--spawn-cwd P] [--spawn-name N] [--spawn-tab-label L] [--spawn-split-from PANE] [--spawn-direction right|down] [--spawn-startup-timeout-ms N] <text> --idempotency-key <key> [--parent <target>] [--inject-task-identity]\n\
+      Roles: @idle, @kind, @kind:idle; first idle pane only, @all rejected. --max-concurrent caps role tasks in the parent scope.\n\
+      Wait timeout returns ok:true + wait.outcome:checkpoint; re-check status/inbox.\n\
+  herdr-mcp agent gate create --task-id ID --question TEXT --option TEXT --option TEXT [--option TEXT ...]\n\
+  herdr-mcp agent gate status|cancel --gate-id ID\n\
+  herdr-mcp agent gate resolve --gate-id ID --resolution TEXT  (independent interactive TTY only; retype option)\n\
+  herdr-mcp agent report --task-id ID --dispatch-id ID --kind heartbeat|worker_done [--summary TEXT]  (trusted local IPC only)\n\
   herdr-mcp memory <resume|search> ...  (bounded Work Memory access for local coding agents)\n\
   herdr-mcp webchat <endpoints|resources|inspect|create|send|dispatch-status|open|archive|archive-status|handoff> ...  (supported local WebChat control)\n\
   herdr-mcp profile check --file <profile.json>  (read-only desired-vs-actual workstation drift)\n\
@@ -2606,12 +2988,14 @@ User path:\n\
   herdr-mcp connector webchat-control <allow-device|deny-device> <connector-id-or-platform-account> <device-id> --confirm  (owner device; requires Edge device-grant support, otherwise fails device_grant_requires_edge_support)\n\
   herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device; the endpoint ref must be concrete)\n\
   herdr-mcp connector page-assist orphans [list] [--device-id <device-id>]  (read-only: grant rows left under a previous connector; always scoped server-side to the authenticated owner device; --device-id is only an assertion and must match it, else 403 orphans_device_mismatch)\n\
-  herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id> [--idempotency-key <key>] [--confirm]  (dry run without --confirm; with --confirm fetches the device-scoped plan, prints it plus the idempotency key, and applies it by plan_digest)\n\
+  herdr-mcp connector page-assist migrate --from <connector-id> --to <connector-id> [--idempotency-key <key>] [--plan-digest <digest>] [--confirm]  (dry run without --confirm; with --confirm fetches the device-scoped plan, prints it plus the idempotency key, and applies it by plan_digest; --plan-digest applies a digest from an earlier dry run instead of re-planning, so a retry with the same --idempotency-key replays the stored result)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
   herdr-mcp automation list\n\
   herdr-mcp automation rotate <client-id> --confirm\n\
   herdr-mcp automation revoke <client-id> --confirm\n\
-  herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|major-apply|major-rollback|auto|status]\n\
+  herdr-mcp update [check [--manifest URL]|apply [--manifest URL] [--with-worker]|major-apply|major-rollback|auto|status]\n\
+      apply updates the Runtime only; Worker updates stay a separate operator-run `herdr-mcp worker update`.\n\
+      --with-worker chains that Worker update, but only from an interactive terminal.\n\
   herdr-mcp extension standalone <install [--ref REF] [--path PATH]|status>\n\
   herdr-mcp rollback  (macOS product rollback; Linux service rollback is not exposed)\n\
   herdr-mcp reinstall  (macOS product lifecycle; Linux repair uses herdr-mcp install)\n\
@@ -2728,6 +3112,9 @@ commands require an enrolled-device credential.\n\n\
       temporary Cloudflare authorization. It preserves Worker identity, Durable\n\
       Objects, secrets, optional artifact R2, public OAuth origin, devices and\n\
       Connectors; it never changes DNS.\n\
+      This is a separate operator-run step: `herdr-mcp update apply` updates the\n\
+      Runtime only and reports worker_update_required instead of starting it.\n\
+      Pass `update apply --with-worker` to chain it from an interactive terminal.\n\
 \n\
   herdr-mcp device list\n      Lists the non-secret enrolled-device inventory and local Link/runtime\n      alignment. herdr-mcp worker list is a compatibility alias.\n\n\
   herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]\n      Creates a pairing address for another computer to enroll. --recover-device\n      binds a one-time recovery pairing to an existing active device and preserves\n      its immutable device_id.\n\n  herdr-mcp worker credential-repair prepare\n      Advanced headless recovery on the broken device: generates/stages a new\n      local device secret and prints only its SHA-256 verifier, never the secret.\n\n  herdr-mcp worker credential-repair apply <device-id> <sha256-verifier> --confirm\n      Run from another enrolled fleet-admin device. Rebinds only the target\n      device verifier; the target device secret never crosses machines.\n\n  herdr-mcp worker credential-repair finalize --confirm\n      Run back on the repaired device. Commits the staged local secret, explicitly\n      switches the owned production Link to the device-specific credential service,\n      verifies launchd convergence, then deletes staging.\n\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n      Enrolls this machine on macOS, Linux, or Windows; uses the platform credential store and reads the 6-digit code from an\n      interactive or stdin prompt, never argv.\n\n  herdr-mcp device rename <name>\n      Renames the current enrolled device.\n\n  herdr-mcp device revoke <device-id> --confirm\n      Revokes the given enrolled device id.\n"
@@ -2765,6 +3152,407 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// user parent | Given gate CLI commands | When choices or resolution
+    /// are supplied | Then required fields parse and ambiguous flags fail.
+    #[test]
+    fn agent_gate_commands_parse_and_reject_ambiguous_arguments() {
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "gate",
+                "create",
+                "--task-id",
+                "task",
+                "--question",
+                "Choose",
+                "--option",
+                "yes",
+                "--option",
+                "no"
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Gate(AgentGateCommand::Create {
+                task_id: "task".to_owned(),
+                question: "Choose".to_owned(),
+                options: vec!["yes".to_owned(), "no".to_owned()]
+            }))
+        );
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "gate",
+                "resolve",
+                "--gate-id",
+                "gate",
+                "--resolution",
+                "yes"
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Gate(AgentGateCommand::Resolve {
+                gate_id: "gate".to_owned(),
+                resolution: "yes".to_owned()
+            }))
+        );
+        for action in ["status", "cancel"] {
+            assert!(parse(args(&["agent", "gate", action, "--gate-id", "gate"])).is_ok());
+        }
+        for input in [
+            vec!["agent", "gate", "resolve", "--gate-id", "gate"],
+            vec![
+                "agent",
+                "gate",
+                "resolve",
+                "--gate-id",
+                "gate",
+                "--resolution",
+                "yes",
+                "--human",
+                "true",
+            ],
+            vec![
+                "agent",
+                "gate",
+                "resolve",
+                "--gate-id",
+                "gate",
+                "--gate-id",
+                "other",
+                "--resolution",
+                "yes",
+            ],
+            vec![
+                "agent",
+                "gate",
+                "create",
+                "--task-id",
+                "task",
+                "--question",
+                "Choose",
+                "--option",
+                "yes",
+            ],
+        ] {
+            assert!(parse(args(&input)).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_worker_report_and_bounded_stall_threshold() {
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--dispatch-id",
+                "dispatch",
+                "--kind",
+                "worker_done",
+                "--summary",
+                "done"
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Report {
+                task_id: "task".to_owned(),
+                dispatch_id: "dispatch".to_owned(),
+                kind: "worker_done".to_owned(),
+                summary: Some("done".to_owned())
+            })
+        );
+        for input in [
+            vec![
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--kind",
+                "heartbeat",
+            ],
+            vec![
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--dispatch-id",
+                "dispatch",
+                "--kind",
+                "ask",
+            ],
+            vec![
+                "agent",
+                "report",
+                "--task-id",
+                "task",
+                "--dispatch-id",
+                "dispatch",
+                "--kind",
+            ],
+        ] {
+            assert!(parse(args(&input)).is_err());
+        }
+        let base = [
+            "agent",
+            "dispatch",
+            "child",
+            "work",
+            "--parent",
+            "parent",
+            "--idempotency-key",
+            "key",
+            "--stall-after-ms",
+        ];
+        for (value, valid) in [
+            ("60000", true),
+            ("7200000", true),
+            ("59999", false),
+            ("7200001", false),
+            ("x", false),
+        ] {
+            let mut input = base.to_vec();
+            input.push(value);
+            assert_eq!(parse(args(&input)).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn parses_dispatch_identity_and_explicit_parent_flags() {
+        let base = [
+            "agent",
+            "dispatch",
+            "pi",
+            "work",
+            "--parent",
+            "w1:p2",
+            "--idempotency-key",
+            "key",
+        ];
+        for enabled in [false, true] {
+            let mut input = base.to_vec();
+            if enabled {
+                input.extend([
+                    "--inject-task-identity",
+                    "--parent-session-ref",
+                    "br_session",
+                ]);
+            }
+            assert_eq!(
+                parse(args(&input)).unwrap().command,
+                Command::Agent(AgentCommand::Dispatch {
+                    target: Some("pi".to_owned()),
+                    text: "work".to_owned(),
+                    spawn: None,
+                    parent_target: Some("w1:p2".to_owned()),
+                    idempotency_key: "key".to_owned(),
+                    inject_task_identity: enabled,
+                    stall_after_ms: None,
+                    max_concurrent: None,
+                    workspace_id: None,
+                    parent_session_ref: enabled.then(|| "br_session".to_owned()),
+                    wait: false,
+                    timeout_ms: 25_000,
+                })
+            );
+        }
+        let mut missing = base.to_vec();
+        missing.push("--parent-session-ref");
+        assert!(parse(args(&missing)).is_err());
+    }
+
+    #[test]
+    fn agent_dispatch_role_cli_accepts_named_target_and_bounded_cap() {
+        for prefix in [vec!["@codex", "work"], vec!["--target", "@codex", "work"]] {
+            let mut input = vec!["agent", "dispatch"];
+            input.extend(prefix);
+            input.extend([
+                "--parent",
+                "w1:p1",
+                "--idempotency-key",
+                "key",
+                "--max-concurrent",
+                "2",
+                "--workspace-id",
+                "w1",
+            ]);
+            let command = parse(args(&input)).unwrap().command;
+            assert!(matches!(command, Command::Agent(AgentCommand::Dispatch {
+                target, max_concurrent: Some(2), workspace_id: Some(workspace), ..
+            }) if target.as_deref() == Some("@codex") && workspace == "w1"));
+        }
+        for value in ["0", "17", "1.5", "invalid"] {
+            assert!(
+                parse(args(&[
+                    "agent",
+                    "dispatch",
+                    "@codex",
+                    "work",
+                    "--max-concurrent",
+                    value
+                ]))
+                .is_err()
+            );
+        }
+        assert!(parse(args(&["agent", "dispatch", "--target", "@codex"])).is_err());
+    }
+
+    /// user operator | Given spawn flags instead of a target | When parsing
+    /// `agent dispatch` | Then the single positional is the task text and the
+    /// spawn facts travel as one object under the same method name.
+    #[test]
+    fn agent_dispatch_spawn_cli_accepts_one_text_positional() {
+        assert_eq!(
+            parse(args(&[
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "--spawn-workspace",
+                "wVE",
+                "--spawn-cwd",
+                "/tmp/project",
+                "--spawn-name",
+                "feat-x",
+                "--spawn-tab-label",
+                "feat-x",
+                "--spawn-split-from",
+                "wVE:p1",
+                "--spawn-direction",
+                "down",
+                "--spawn-startup-timeout-ms",
+                "90000",
+                "implement the task",
+                "--idempotency-key",
+                "spawn-key",
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Dispatch {
+                target: None,
+                text: "implement the task".to_owned(),
+                spawn: Some(Box::new(AgentDispatchSpawn {
+                    kind: "pi".to_owned(),
+                    workspace: Some("wVE".to_owned()),
+                    cwd: Some("/tmp/project".to_owned()),
+                    name: Some("feat-x".to_owned()),
+                    tab_label: Some("feat-x".to_owned()),
+                    split_from: Some("wVE:p1".to_owned()),
+                    direction: Some("down".to_owned()),
+                    startup_timeout_ms: Some(90_000),
+                })),
+                parent_target: None,
+                idempotency_key: "spawn-key".to_owned(),
+                inject_task_identity: false,
+                stall_after_ms: None,
+                max_concurrent: None,
+                workspace_id: None,
+                parent_session_ref: None,
+                wait: false,
+                timeout_ms: 25_000,
+            })
+        );
+        // A supervised spawn may still name its parent.
+        assert!(matches!(
+            parse(args(&[
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "work",
+                "--idempotency-key",
+                "k",
+                "--parent",
+                "w1:p1",
+            ]))
+            .unwrap()
+            .command,
+            Command::Agent(AgentCommand::Dispatch {
+                spawn: Some(_),
+                parent_target: Some(parent),
+                ..
+            }) if parent == "w1:p1"
+        ));
+        for invalid in [
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "--target",
+                "w1:p1",
+                "work",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "work",
+                "--index",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-workspace",
+                "wVE",
+                "work",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "work",
+                "second",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "work",
+                "--idempotency-key",
+                "k",
+                "--spawn-direction",
+                "sideways",
+            ],
+            vec![
+                "agent",
+                "dispatch",
+                "--spawn-kind",
+                "pi",
+                "work",
+                "--idempotency-key",
+                "k",
+                "--spawn-startup-timeout-ms",
+                "0",
+            ],
+        ] {
+            assert!(parse(args(&invalid)).is_err(), "{invalid:?}");
+        }
+        // The reuse-existing-agent form still requires its parent.
+        assert!(
+            parse(args(&[
+                "agent",
+                "dispatch",
+                "pi",
+                "work",
+                "--idempotency-key",
+                "k"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -4154,9 +4942,46 @@ mod tests {
         assert!(parse(args(&["install", "--adopt-node"])).is_err());
         assert_eq!(
             parse(args(&["update"])).unwrap().command,
-            Command::Update(UpdateCommand::Apply { manifest_url: None })
+            Command::Update(UpdateCommand::Apply {
+                manifest_url: None,
+                with_worker: false,
+            })
+        );
+        assert_eq!(
+            parse(args(&["update", "apply", "--with-worker"]))
+                .unwrap()
+                .command,
+            Command::Update(UpdateCommand::Apply {
+                manifest_url: None,
+                with_worker: true,
+            })
+        );
+        assert_eq!(
+            parse(args(&["update", "--with-worker"])).unwrap().command,
+            Command::Update(UpdateCommand::Apply {
+                manifest_url: None,
+                with_worker: true,
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "update",
+                "apply",
+                "--manifest",
+                "https://example.test/runtime-manifest.json",
+                "--with-worker",
+            ]))
+            .unwrap()
+            .command,
+            Command::Update(UpdateCommand::Apply {
+                manifest_url: Some("https://example.test/runtime-manifest.json".to_owned()),
+                with_worker: true,
+            })
         );
         assert!(parse(args(&["update", "apply", "--force"])).is_err());
+        assert!(parse(args(&["update", "apply", "--with-worker", "--with-worker"])).is_err());
+        assert!(parse(args(&["update", "apply", "--manifest"])).is_err());
+        assert!(parse(args(&["update", "check", "--with-worker"])).is_err());
         assert!(parse(args(&["native-host"])).is_err());
         assert!(parse(args(&["native-host", "legacy"])).is_err());
         assert!(parse(args(&["native-host", "dev", "disable", "extra"])).is_err());
@@ -4514,6 +5339,7 @@ mod tests {
                 from: "conn_old000000001".to_owned(),
                 to: "conn_new000000001".to_owned(),
                 idempotency_key: None,
+                plan_digest: None,
             })
         );
         assert_eq!(
@@ -4535,6 +5361,7 @@ mod tests {
                 from: "conn_old000000001".to_owned(),
                 to: "conn_new000000001".to_owned(),
                 idempotency_key: Some("cli-key-000000000001".to_owned()),
+                plan_digest: None,
             })
         );
         // Missing selectors or a malformed idempotency key fail closed.

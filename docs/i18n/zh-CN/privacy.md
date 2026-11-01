@@ -52,6 +52,7 @@
 - `scripting` — 在受支持的 Web AI 标签页因 MV3/页面刷新丢失脚本后恢复或重新注入**扩展包内自带**的 content script，并执行有界的浏览器连续性动作；
 - `alarms` — 周期性唤醒 MV3 service worker，使 Chrome 挂起 worker 后能够恢复本地 Herdr 状态流和 timer；
 - `nativeMessaging` — 连接本机安装的 herdr-mcp native host；
+- `debugger` — 附着到 Herdr 所拥有的网页上的 Chrome DevTools Protocol，用于读取该网页的导航历史、在已知元素上移动指针并截取该网页的截图，以执行并校验用户请求的浏览器操作。附着范围限定为 Herdr 所拥有的网页与一组固定的 DevTools 命令；读取到的导航条目不会被存储或发送到任何地方，该权限也不会超出这些命令去读取或改写页面内容；
 - `sidePanel` — 承载 Herdr Browser Control Center；
 - host access — 扩展在安装/加载时要求 `<all_urls>`，使 BrowserPage 可以控制用户明确选择的任意 http/https 网页，不再逐站弹出权限请求。Generic Page Assist 仍只针对明确的 BrowserPage 目标按需执行，并在访问页面前检查 Chrome 对该精确 origin 的实时权限。用户若在 Chrome 扩展设置里限制某个站点，BrowserPage 会对该 origin 失败关闭。语义 Provider 由 Runtime/Edge 访问，扩展不直接连接这些 Provider，因此 Provider route 不需要额外的 Chrome host permission。
 

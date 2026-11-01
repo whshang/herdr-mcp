@@ -160,3 +160,44 @@ test("fetchHerdrSkill appends release-matched native Herdr reference with remote
     else process.env.HERDR_SKILL_NETWORK = prev;
   }
 });
+
+test("user gets conversation-bound WebChat dispatch guidance | Given the served planner policy | When a WebChat caller dispatches | Then it uses herdr_call with current_user_message, knows herdr_prompt never binds, and reports parent_session reason", () => {
+  const globalAgents = readFileSync(new URL("../assets/herdr/AGENTS.md", import.meta.url), "utf8");
+  const dispatchSkill = readFileSync(
+    new URL("../assets/herdr/skills/agent-dispatch/SKILL.md", import.meta.url),
+    "utf8",
+  );
+  for (const doc of [globalAgents, dispatchSkill, plannerSkillSource]) {
+    assert.match(doc, /`herdr_call`[^\n]*`method: "herdr_mcp\.agent\.task\.dispatch"`/);
+    assert.match(doc, /verbatim current user turn|current user turn, verbatim/);
+    assert.match(doc, /`current_user_message`/);
+    assert.match(doc, /`herdr_prompt`[^\n]*never (performs source-turn binding|binds|does)/);
+    assert.match(doc, /reason/);
+    assert.match(doc, /device whose browser hosts this chat/);
+    assert.match(doc, /unsure which (device|one)[^\n]*(say so|guessing)/);
+    // #774: the hosting device is discoverable, and a cross-device dispatch has
+    // its own actionable reason instead of a misleading digest miss.
+    assert.match(doc, /hosts_caller_browser/);
+    assert.match(doc, /`herdr_devices`/);
+    assert.match(doc, /caller_browser_on_other_device/);
+    // #774 review: the redispatch rule must be qualified, never "always
+    // redispatch" and never a blanket "report instead of redispatching".
+    // Exactly one redispatch, only for the other-device reason, only to the
+    // device flagged hosts_caller_browser; every other reason is reported.
+    assert.match(
+      doc,
+      /redispatch (exactly )?once[^.]{0,120}`hosts_caller_browser`/i,
+      "the only permitted redispatch is a single one to the device flagged hosts_caller_browser",
+    );
+    assert.match(
+      doc,
+      /for every other `bound:false` reason[\s\S]{0,200}do not (re)?dispatch|do not (re)?dispatch[\s\S]{0,200}for every other `bound:false` reason/i,
+      "every other bound:false reason must be reported without redispatching",
+    );
+  }
+  // The two documents that describe the redispatch in full must also say the
+  // flag has to exist before it is used: the planner may never invent a device.
+  for (const doc of [globalAgents, dispatchSkill]) {
+    assert.match(doc, /that flag exists|actually flags such a device/);
+  }
+});

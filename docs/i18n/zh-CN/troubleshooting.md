@@ -229,7 +229,7 @@ HUD 手动继续仍保留为显式兜底。详见 [浏览器连续工作](browse
 herdr-mcp doctor
 ```
 
-如果默认 `doctor` 摘要提示 standalone 扩展加载路径漂移，运行 `herdr-mcp doctor --verbose` 查看 `expected` 与 `actual` 路径；机器读取可用 `herdr-mcp doctor --json`，其中 `standalone_extension` 提供同样的证据，包括 Chrome profile 和 `drift_count`。打开 `chrome://extensions`，找到 Herdr，按 `expected_path`（通常是 `~/.config/herdr-mcp/extensions/standalone/current`）重新 Load unpacked/Reload，然后再次运行 `doctor`。除非另有证据证明 Native Host identity 也有问题，否则不要顺手切换 Native Host ownership 或删除扩展数据。这个 doctor 探针是只读的，只检查 Chrome preferences 中 Herdr 固定 extension ID 的精确条目。
+如果默认 `doctor` 摘要提示 standalone 扩展加载路径漂移，运行 `herdr-mcp doctor --verbose` 查看 `expected` 与 `actual` 路径；机器读取可用 `herdr-mcp doctor --json`，其中 `standalone_extension` 提供同样的证据，包括来源 `browser`/`profile` 和 `drift_count`。打开 `chrome://extensions`，找到 Herdr，按 `expected_path`（通常是 `~/.config/herdr-mcp/extensions/standalone/current`）重新 Load unpacked/Reload，然后再次运行 `doctor`。除非另有证据证明 Native Host identity 也有问题，否则不要顺手切换 Native Host ownership 或删除扩展数据。这个 doctor 探针是只读的，只检查它所扫描的 Chromium 浏览器（Google Chrome、Chrome Beta/Canary、Chromium、Brave、Edge、Arc、Helium 与 ego lite）preferences 中 Herdr 固定 extension ID 的精确条目。
 
 ## 症状：浏览器控制中心打不开、没有 workspace，或一直显示本机运行时不可用
 

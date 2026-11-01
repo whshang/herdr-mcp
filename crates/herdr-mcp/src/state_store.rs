@@ -23,14 +23,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod decision_gates;
 mod schema;
 pub(crate) mod work_journal;
 use work_journal::ensure_work_journal_auxiliary_schema;
 
 use schema::{
     META_SCHEMA_VERSION, db_file_name, ensure_browser_archive_auxiliary_schema,
-    ensure_browser_dispatch_auxiliary_schema, ensure_parent_dirs, migrate, open_connection,
-    prepare_db_file, reject_symlink,
+    ensure_browser_dispatch_auxiliary_schema, ensure_browser_source_turn_auxiliary_schema,
+    ensure_parent_dirs, migrate, open_connection, prepare_db_file, reject_symlink,
 };
 #[cfg(unix)]
 use schema::{secure_dir, set_mode};
@@ -43,11 +44,19 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// next observe/resolve.
 pub const BROWSER_SOURCE_TURN_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 const BROWSER_ARCHIVE_CLAIM_LEASE_MS: i64 = 30_000;
+/// #771: how long one rejected `source_turn.observe` keeps classifying a later
+/// dispatch of the same turn as `source_session_not_registered`. A brand-new
+/// chat registers its `/c/<id>` session after the first send, which the UAT
+/// measured in minutes, so the window must outlive the extension's 4.5s retry
+/// schedule without turning into durable state.
+const BROWSER_UNREGISTERED_SOURCE_TURN_TTL_MS: i64 = 10 * 60 * 1000;
+/// Bounded capacity of the same in-memory record; oldest evidence is evicted.
+const BROWSER_UNREGISTERED_SOURCE_TURN_CAPACITY: usize = 32;
 
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 // ---------------------------------------------------------------------------
 // Durable-state schema policy
@@ -683,6 +692,18 @@ pub struct BrowserDispatchResultRecord {
 pub struct StateStore {
     path: Option<PathBuf>,
     conn: Connection,
+    /// #771: turns the extension delivered while their conversation had no
+    /// session row yet (a brand-new chat). Memory only: it is diagnostic
+    /// evidence for one `parent_session.reason`, never binding authority, and
+    /// it resets with the process.
+    unregistered_source_turns: Vec<UnregisteredSourceTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnregisteredSourceTurn {
+    provider: String,
+    user_text_sha256: String,
+    recorded_at: i64,
 }
 
 impl StateStore {
@@ -698,11 +719,16 @@ impl StateStore {
             migrate(&mut conn)?;
             ensure_browser_archive_auxiliary_schema(&conn)?;
             ensure_browser_dispatch_auxiliary_schema(&conn)?;
+            ensure_browser_source_turn_auxiliary_schema(&conn)?;
             ensure_work_journal_auxiliary_schema(&conn)?;
             // Durable residue from an account identity change is cleaned before
             // this process serves any canonical-URL lookup.
             retire_stale_browser_session_locators_in(&conn)?;
-            return Ok(Self { path: None, conn });
+            return Ok(Self {
+                path: None,
+                conn,
+                unregistered_source_turns: Vec::new(),
+            });
         }
 
         ensure_parent_dirs(path)?;
@@ -713,11 +739,13 @@ impl StateStore {
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
+        ensure_browser_source_turn_auxiliary_schema(&conn)?;
         ensure_work_journal_auxiliary_schema(&conn)?;
         retire_stale_browser_session_locators_in(&conn)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
             conn,
+            unregistered_source_turns: Vec::new(),
         })
     }
 
@@ -740,11 +768,13 @@ impl StateStore {
         migrate(&mut conn)?;
         ensure_browser_archive_auxiliary_schema(&conn)?;
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
+        ensure_browser_source_turn_auxiliary_schema(&conn)?;
         ensure_work_journal_auxiliary_schema(&conn)?;
         retire_stale_browser_session_locators_in(&conn)?;
         Ok(Self {
             path: Some(path),
             conn,
+            unregistered_source_turns: Vec::new(),
         })
     }
 
@@ -912,7 +942,9 @@ impl StateStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("cannot begin operation reservation: {error}"))?;
         tx.execute(
-            "DELETE FROM operations WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            "DELETE FROM operations WHERE expires_at IS NOT NULL AND expires_at <= ?1
+             AND NOT EXISTS (SELECT 1 FROM task_decision_gates
+                             WHERE task_id = operations.op_id AND status = 'open')",
             params![now_ms],
         )
         .map_err(|error| format!("cannot prune expired operations: {error}"))?;
@@ -1121,6 +1153,40 @@ impl StateStore {
             .map_err(|error| format!("cannot query task lookup: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot read task lookup: {error}"))
+    }
+
+    /// Count every live role task, without the bounded inbox/list window.
+    /// Session scope takes precedence; unstamped parents and caller-less work
+    /// never count tasks belonging to a browser session. Open gates stay live.
+    pub fn active_role_task_count(
+        &self,
+        requested_target: &str,
+        parent_session_ref: Option<&str>,
+        parent_target: Option<&str>,
+        now_ms: u64,
+    ) -> Result<u64, String> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM operations AS task
+             WHERE kind = 'herdr_prompt_task'
+               AND (expires_at IS NULL OR expires_at > ?4)
+               AND json_extract(result_json, '$.requested_target') = ?1
+               AND json_extract(result_json, '$.parent_session_ref') IS ?2
+               AND (?2 IS NOT NULL OR json_extract(result_json, '$.parent_target') IS ?3)
+               AND (json_extract(result_json, '$.lifecycle') NOT IN
+                    ('completed', 'blocked', 'failed', 'delivery_uncertain')
+                    OR EXISTS (SELECT 1 FROM task_decision_gates AS gate
+                               WHERE gate.task_id = task.op_id AND gate.status = 'open'))",
+                params![
+                    requested_target,
+                    parent_session_ref,
+                    parent_target,
+                    i64::try_from(now_ms).unwrap_or(i64::MAX)
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as u64)
+            .map_err(|error| format!("cannot count active role tasks: {error}"))
     }
 
     pub fn operation_ledgers(
@@ -3332,6 +3398,28 @@ impl StateStore {
             .ok_or_else(|| "browser_resource_not_found".to_owned())
     }
 
+    /// The account resource a browser resource belongs to (itself for an
+    /// account), following at most a few parent links.
+    fn browser_account_ancestor(
+        &self,
+        resource: &BrowserResourceRecord,
+    ) -> Result<Option<String>, String> {
+        let mut current = resource.clone();
+        for _ in 0..4 {
+            if current.kind == "account" {
+                return Ok(Some(current.resource_ref));
+            }
+            let Some(parent_ref) = current.parent_ref.as_deref() else {
+                return Ok(None);
+            };
+            let Some(parent) = self.browser_resource(parent_ref)? else {
+                return Ok(None);
+            };
+            current = parent;
+        }
+        Ok(None)
+    }
+
     pub fn upsert_browser_resource_locator(
         &mut self,
         resource_ref: &str,
@@ -3392,6 +3480,99 @@ impl StateStore {
         // front of the user. The just-written locator is current and is never a
         // retirement candidate.
         retire_stale_browser_session_locators_in(&self.conn)?;
+        if resource.kind == "session" {
+            // #740: one conversation (same endpoint, provider and native
+            // identity) can be observed under two parents inside one
+            // generation, e.g. first under a Project space inferred from a
+            // transient sidebar label, then under the account. Both rows are
+            // current, so the URL lookup would be ambiguous for a single
+            // conversation. This newer observation supersedes the other
+            // parent's locator; a sibling observed later than this write is
+            // left alone (it will retire this one on its next observation).
+            // Different conversations never share a native identity, so they
+            // stay ambiguous as before.
+            let candidates = {
+                let mut statement = self
+                    .conn
+                    .prepare(REPARENTED_BROWSER_SESSION_LOCATOR_CANDIDATES_SQL)
+                    .map_err(|error| {
+                        format!("cannot prepare reparented browser session locators: {error}")
+                    })?;
+                statement
+                    .query_map(
+                        params![
+                            resource_ref,
+                            resource.endpoint_ref,
+                            resource.provider,
+                            resource.native_identity_sha256,
+                            resource.parent_ref.as_deref().unwrap_or(""),
+                            observation_generation,
+                            observed_at,
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+                    .map_err(|error| {
+                        format!("cannot read reparented browser session locators: {error}")
+                    })?
+            };
+            if !candidates.is_empty() {
+                // Only a sibling under the same account is the same
+                // conversation; two accounts in one profile stay ambiguous.
+                let account = self.browser_account_ancestor(&resource)?;
+                for candidate in candidates {
+                    let Some(sibling) = self.browser_resource(&candidate)? else {
+                        continue;
+                    };
+                    if account.is_none() || self.browser_account_ancestor(&sibling)? != account {
+                        continue;
+                    }
+                    let tx = self.conn.transaction().map_err(|error| {
+                        format!("cannot begin reparented browser session retirement: {error}")
+                    })?;
+                    tx.execute(
+                        "DELETE FROM browser_resource_locators WHERE resource_ref = ?1",
+                        params![candidate],
+                    )
+                    .map_err(|error| {
+                        format!("cannot retire reparented browser session locator: {error}")
+                    })?;
+                    // The retired row is the same conversation, so its latest
+                    // source-turn evidence moves to the current session instead
+                    // of lingering as a second row with the same digest, which
+                    // would keep resolution ambiguous until it expired (#740).
+                    // The newer observation wins; nothing crosses accounts,
+                    // since the candidate passed the account-ancestor check.
+                    tx.execute(
+                        "INSERT INTO browser_source_turns(
+                             session_ref, expected_generation, user_text_sha256, observed_at
+                         )
+                         SELECT ?1, expected_generation, user_text_sha256, observed_at
+                         FROM browser_source_turns
+                         WHERE session_ref = ?2
+                         ON CONFLICT(session_ref) DO UPDATE SET
+                             expected_generation = excluded.expected_generation,
+                             user_text_sha256 = excluded.user_text_sha256,
+                             observed_at = excluded.observed_at
+                         WHERE excluded.observed_at > browser_source_turns.observed_at",
+                        params![resource_ref, candidate],
+                    )
+                    .map_err(|error| {
+                        format!("cannot carry reparented browser source turn: {error}")
+                    })?;
+                    tx.execute(
+                        "DELETE FROM browser_source_turns WHERE session_ref = ?1",
+                        params![candidate],
+                    )
+                    .map_err(|error| {
+                        format!("cannot retire reparented browser source turn: {error}")
+                    })?;
+                    tx.commit().map_err(|error| {
+                        format!("cannot commit reparented browser session retirement: {error}")
+                    })?;
+                }
+            }
+        }
         self.browser_resource_locator(resource_ref)?
             .ok_or_else(|| "browser_resource_locator_not_found".to_owned())
     }
@@ -3710,7 +3891,10 @@ impl StateStore {
         let evidence = tx
             .query_row(
                 "SELECT r.kind, r.provider, r.observation_generation,
-                        s.expected_generation, s.user_text_sha256, s.observed_at
+                        s.expected_generation,
+                        CASE WHEN s.canonical_user_text_sha256 = s.user_text_sha256
+                             THEN s.user_text_sha256 ELSE '' END,
+                        s.observed_at
                  FROM browser_resources r
                  JOIN browser_source_turns s ON s.session_ref = r.resource_ref
                  WHERE r.resource_ref = ?1",
@@ -3798,7 +3982,7 @@ impl StateStore {
 
     /// Persist the latest observed user turn for one browser session.
     ///
-    /// Only the caller-computed SHA-256 of the trimmed user text is accepted;
+    /// Only the caller-computed SHA-256 of the canonical user text is accepted;
     /// plaintext never reaches the database. One row is kept per session, and a
     /// late-arriving older observation must not overwrite a newer one. The
     /// retention window is enforced by deleting expired rows first.
@@ -3843,7 +4027,8 @@ impl StateStore {
             .prepare(
                 "SELECT session_ref, expected_generation
                  FROM browser_source_turns
-                 WHERE user_text_sha256 = ?1 AND observed_at <= ?2
+                 WHERE user_text_sha256 = ?1 AND canonical_user_text_sha256 = ?1
+                   AND observed_at <= ?2
                  ORDER BY session_ref
                  LIMIT 2",
             )
@@ -3860,6 +4045,95 @@ impl StateStore {
             1 => Ok(matches.pop().unwrap()),
             _ => Err("browser_current_turn_ambiguous".to_owned()),
         }
+    }
+
+    /// #771: remember that one exact user turn was delivered while no session
+    /// row existed for its conversation, so a later dispatch of the same turn
+    /// can report `source_session_not_registered` instead of the generic
+    /// `source_turn_not_found`.
+    ///
+    /// This is bounded, in-memory diagnostic evidence: it never stamps a task,
+    /// never writes a binding, and expires after
+    /// `BROWSER_UNREGISTERED_SOURCE_TURN_TTL_MS`. Expired or evicted evidence
+    /// simply falls back to the generic reason.
+    pub fn record_unregistered_browser_source_turn(
+        &mut self,
+        provider: &str,
+        user_text_sha256: &str,
+        recorded_at: i64,
+    ) -> Result<(), String> {
+        validate_browser_token(provider, 32, "provider")?;
+        if recorded_at < 0 || !is_browser_digest(user_text_sha256) {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+        self.prune_unregistered_browser_source_turns(recorded_at);
+        self.unregistered_source_turns
+            .retain(|turn| turn.provider != provider || turn.user_text_sha256 != user_text_sha256);
+        self.unregistered_source_turns.push(UnregisteredSourceTurn {
+            provider: provider.to_owned(),
+            user_text_sha256: user_text_sha256.to_owned(),
+            recorded_at,
+        });
+        while self.unregistered_source_turns.len() > BROWSER_UNREGISTERED_SOURCE_TURN_CAPACITY {
+            self.unregistered_source_turns.remove(0);
+        }
+        Ok(())
+    }
+
+    /// #771: whether this exact turn was recently delivered for a conversation
+    /// that had no registered session. Only the dispatch diagnostic reads it.
+    ///
+    /// The key is provider plus canonical turn digest — the rejected observe
+    /// payload carries no endpoint or conversation, and Edge's session id is not
+    /// a `browser_resources` key — so another conversation's rejected turn with
+    /// the same canonical text also matches inside the TTL. That alias can only
+    /// change a `parent_session.reason`; it can never stamp or bind a task.
+    pub fn browser_source_turn_unregistered(
+        &mut self,
+        provider: &str,
+        user_text_sha256: &str,
+        now: i64,
+    ) -> bool {
+        if now < 0 || !is_browser_digest(user_text_sha256) {
+            return false;
+        }
+        self.prune_unregistered_browser_source_turns(now);
+        self.unregistered_source_turns
+            .iter()
+            .any(|turn| turn.provider == provider && turn.user_text_sha256 == user_text_sha256)
+    }
+
+    fn prune_unregistered_browser_source_turns(&mut self, now: i64) {
+        let oldest = now.saturating_sub(BROWSER_UNREGISTERED_SOURCE_TURN_TTL_MS);
+        self.unregistered_source_turns
+            .retain(|turn| turn.recorded_at >= oldest);
+    }
+
+    /// Return the latest canonical source-turn digest for one already-resolved
+    /// browser session. The caller must establish ownership of `session_ref`
+    /// through a durable caller-session mapping before using this method.
+    pub fn latest_browser_source_turn_sha256(
+        &mut self,
+        session_ref: &str,
+        now: i64,
+    ) -> Result<Option<String>, String> {
+        validate_browser_resource_ref(session_ref)?;
+        if now < 0 {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+        self.prune_browser_source_turns(now)?;
+        self.conn
+            .query_row(
+                "SELECT CASE WHEN canonical_user_text_sha256 = user_text_sha256
+                        THEN user_text_sha256 ELSE '' END
+                 FROM browser_source_turns
+                 WHERE session_ref = ?1 AND observed_at <= ?2",
+                params![session_ref, now],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|digest| digest.filter(|value| !value.is_empty()))
+            .map_err(|error| format!("cannot read latest browser source turn: {error}"))
     }
 
     pub fn reserve_browser_session_archive_intent(
@@ -3909,7 +4183,9 @@ impl StateStore {
         require_current_browser_generation(&tx, &endpoint_ref, &provider, requested_generation)?;
         let source_digest = tx
             .query_row(
-                "SELECT user_text_sha256 FROM browser_source_turns WHERE session_ref = ?1",
+                "SELECT CASE WHEN canonical_user_text_sha256 = user_text_sha256
+                        THEN user_text_sha256 ELSE '' END
+                 FROM browser_source_turns WHERE session_ref = ?1",
                 params![session_ref],
                 |row| row.get::<_, String>(0),
             )
@@ -4042,7 +4318,9 @@ impl StateStore {
         .map_err(|error| format!("cannot reclaim stale browser archive claim: {error}"))?;
         let source_digest = tx
             .query_row(
-                "SELECT user_text_sha256 FROM browser_source_turns WHERE session_ref = ?1",
+                "SELECT CASE WHEN canonical_user_text_sha256 = user_text_sha256
+                        THEN user_text_sha256 ELSE '' END
+                 FROM browser_source_turns WHERE session_ref = ?1",
                 params![session_ref],
                 |row| row.get::<_, String>(0),
             )
@@ -5798,6 +6076,28 @@ WHERE EXISTS (
 )
 "#;
 
+/// Retire same-generation locators of the *same* conversation observed under a
+/// different parent (#740). Parameters: `?1` the just-written session ref,
+/// `?2` endpoint, `?3` provider, `?4` native identity digest, `?5` the new
+/// parent ref, `?6` the current generation, `?7` this observation time. The
+/// caller additionally requires the same account ancestor, and only deletes
+/// locator rows; `browser_resources` rows stay for history.
+const REPARENTED_BROWSER_SESSION_LOCATOR_CANDIDATES_SQL: &str = r#"
+    SELECT sibling.resource_ref
+    FROM browser_resources sibling
+    JOIN browser_resource_locators sibling_locator
+      ON sibling_locator.resource_ref = sibling.resource_ref
+    WHERE sibling.resource_ref <> ?1
+      AND sibling.kind = 'session'
+      AND sibling.endpoint_ref = ?2
+      AND sibling.provider = ?3
+      AND sibling.native_identity_sha256 = ?4
+      AND sibling.parent_ref <> ?5
+      AND sibling.observation_generation = ?6
+      AND sibling_locator.observation_generation = ?6
+      AND sibling_locator.observed_at <= ?7
+"#;
+
 fn retire_stale_browser_session_locators_in(conn: &Connection) -> Result<usize, String> {
     conn.execute(RETIRE_STALE_BROWSER_SESSION_LOCATORS_SQL, [])
         .map_err(|error| format!("cannot retire stale browser session locators: {error}"))
@@ -6224,11 +6524,13 @@ fn write_browser_source_turn(
 ) -> Result<(), String> {
     conn.execute(
         "INSERT INTO browser_source_turns(
-             session_ref, expected_generation, user_text_sha256, observed_at
-         ) VALUES (?1, ?2, ?3, ?4)
+             session_ref, expected_generation, user_text_sha256, observed_at,
+             canonical_user_text_sha256
+         ) VALUES (?1, ?2, ?3, ?4, ?3)
          ON CONFLICT(session_ref) DO UPDATE SET
              expected_generation = excluded.expected_generation,
              user_text_sha256 = excluded.user_text_sha256,
+             canonical_user_text_sha256 = excluded.canonical_user_text_sha256,
              observed_at = excluded.observed_at
          WHERE excluded.observed_at >= browser_source_turns.observed_at",
         params![
@@ -7735,7 +8037,7 @@ fn list_names(conn: &Connection, sql: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::schema::{MIGRATION_V1, MIGRATION_V2, MIGRATIONS, i64_schema_version, migrate_to};
+    use super::schema::{MIGRATION_V1, MIGRATION_V2, MIGRATIONS, migrate_to};
     use super::*;
     use std::env;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -9763,7 +10065,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v15_adds_durable_archive_intents_without_breaking_old_binary_reopen() {
+    fn schema_v15_migrates_gates_and_refuses_pre_gate_binary_reopen() {
         let path = temp_db_path();
         {
             let conn = Connection::open(&path).unwrap();
@@ -9777,6 +10079,7 @@ mod tests {
                 [META_SCHEMA_VERSION],
             )
             .unwrap();
+            conn.execute("INSERT INTO operations (op_id, kind, phase, state, result_json, created_at, updated_at) VALUES ('pre-gate-task', 'herdr_prompt_task', 'active', 'running', '{}', 1, 1)", []).unwrap();
             assert!(
                 !list_names(
                     &conn,
@@ -9788,21 +10091,36 @@ mod tests {
         }
 
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store
+                .operation_ledger("pre-gate-task")
+                .unwrap()
+                .unwrap()
+                .state
+                .as_deref(),
+            Some("running")
+        );
+
         assert!(
             store
                 .table_names()
                 .unwrap()
                 .contains(&"browser_session_archive_intents".to_owned())
         );
+        assert!(
+            store
+                .table_names()
+                .unwrap()
+                .contains(&"task_decision_gates".to_owned())
+        );
         drop(store);
 
-        // Simulate the pinned pre-feature PROD binary: it understands the same
-        // numbered schema 15, sees the additive table, and must still open the
-        // database without a downgrade or backup restore.
+        // An old reader would ignore blocking gates. Rollback must fail closed
+        // and use a pre-migration backup rather than silently bypass a gate.
         let mut old_binary_conn = open_connection(Some(&path)).unwrap();
-        migrate_to(&mut old_binary_conn, 15, MIGRATIONS).unwrap();
-        assert_eq!(i64_schema_version(&old_binary_conn).unwrap(), 15);
+        let error = migrate_to(&mut old_binary_conn, 15, &MIGRATIONS[..15]).unwrap_err();
+        assert!(error.contains("newer"), "{error}");
         drop(old_binary_conn);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
@@ -9891,6 +10209,7 @@ mod tests {
                 "browser_session_archive_intents",
                 "browser_session_reservations",
                 "browser_source_turns",
+                "task_decision_gates",
                 "work_events",
                 "work_state"
             ]
@@ -10107,13 +10426,14 @@ mod tests {
             store
                 .scalar_i64("SELECT COUNT(*) FROM pragma_table_info('browser_source_turns')")
                 .unwrap(),
-            Some(4)
+            Some(5)
         );
         for column in [
             "session_ref",
             "expected_generation",
             "user_text_sha256",
             "observed_at",
+            "canonical_user_text_sha256",
         ] {
             assert_eq!(
                 store
@@ -10290,6 +10610,137 @@ mod tests {
             Some(session_ref.as_str())
         );
         drop(reopened);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn unregistered_source_turn_evidence_is_bounded_per_provider_and_digest() {
+        // #771: the record classifies one diagnostic reason and must never
+        // become a second binding or ambiguity source, so it is scoped to one
+        // exact digest, bounded, and expires.
+        let path = temp_db_path();
+        let mut store = StateStore::open(&path).unwrap();
+        let digest = "a".repeat(64);
+        let other_digest = "b".repeat(64);
+        let now = 1_000_000_i64;
+        store
+            .record_unregistered_browser_source_turn("chatgpt", &digest, now)
+            .unwrap();
+        assert!(store.browser_source_turn_unregistered("chatgpt", &digest, now + 1));
+        assert!(!store.browser_source_turn_unregistered("chatgpt", &other_digest, now + 1));
+        assert!(!store.browser_source_turn_unregistered("other", &digest, now + 1));
+        // A repeat refreshes the entry instead of duplicating it.
+        store
+            .record_unregistered_browser_source_turn("chatgpt", &digest, now + 2)
+            .unwrap();
+        assert_eq!(store.unregistered_source_turns.len(), 1);
+        assert!(store.browser_source_turn_unregistered(
+            "chatgpt",
+            &digest,
+            now + 2 + BROWSER_UNREGISTERED_SOURCE_TURN_TTL_MS
+        ));
+        // Past the window the evidence is gone: the generic reason returns.
+        assert!(!store.browser_source_turn_unregistered(
+            "chatgpt",
+            &digest,
+            now + 3 + BROWSER_UNREGISTERED_SOURCE_TURN_TTL_MS
+        ));
+        // Over capacity the oldest entry is evicted, never unbounded.
+        for index in 0..BROWSER_UNREGISTERED_SOURCE_TURN_CAPACITY {
+            let digest = format!("{:064x}", index);
+            store
+                .record_unregistered_browser_source_turn("chatgpt", &digest, now + 10)
+                .unwrap();
+        }
+        assert_eq!(
+            store.unregistered_source_turns.len(),
+            BROWSER_UNREGISTERED_SOURCE_TURN_CAPACITY
+        );
+        // The oldest entry is the one recorded before the cap was reached.
+        assert!(!store.browser_source_turn_unregistered("chatgpt", &digest, now + 11));
+        let oldest = format!("{:064x}", 0);
+        assert!(store.browser_source_turn_unregistered("chatgpt", &oldest, now + 11));
+        let newest = format!("{:064x}", BROWSER_UNREGISTERED_SOURCE_TURN_CAPACITY - 1);
+        assert!(store.browser_source_turn_unregistered("chatgpt", &newest, now + 11));
+        // Malformed evidence is rejected instead of widening the record.
+        assert!(
+            store
+                .record_unregistered_browser_source_turn("chatgpt", "not-a-digest", now)
+                .is_err()
+        );
+        assert!(
+            store
+                .record_unregistered_browser_source_turn("chatgpt", &digest, -1)
+                .is_err()
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn legacy_and_rollback_written_source_turns_are_never_evidence() {
+        let path = temp_db_path();
+        let legacy_session = format!("br_{}", "a".repeat(64));
+        let rolled_back_session = format!("br_{}", "b".repeat(64));
+        let legacy_digest = "c".repeat(64);
+        let rolled_back_digest = "d".repeat(64);
+        let current_digest = "e".repeat(64);
+        let now = 100_000_i64;
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            // A row exactly as a pre-#741 binary wrote it: no canonical column.
+            store
+                .conn
+                .execute(
+                    "INSERT INTO browser_source_turns(
+                         session_ref, expected_generation, user_text_sha256, observed_at
+                     ) VALUES (?1, 1, ?2, ?3)",
+                    params![legacy_session, legacy_digest, now],
+                )
+                .unwrap();
+            // A current row later overwritten by an older binary after rollback:
+            // only user_text_sha256 changes, the canonical column goes stale.
+            store
+                .observe_browser_source_turn(&rolled_back_session, 1, &current_digest, now)
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO browser_source_turns(
+                         session_ref, expected_generation, user_text_sha256, observed_at
+                     ) VALUES (?1, 1, ?2, ?3)
+                     ON CONFLICT(session_ref) DO UPDATE SET
+                         user_text_sha256 = excluded.user_text_sha256,
+                         observed_at = excluded.observed_at",
+                    params![rolled_back_session, rolled_back_digest, now + 1],
+                )
+                .unwrap();
+        }
+        let mut store = StateStore::open(&path).unwrap();
+        for digest in [&legacy_digest, &rolled_back_digest, &current_digest] {
+            assert_eq!(
+                store
+                    .resolve_browser_source_turn(digest, now + 10)
+                    .unwrap_err(),
+                "browser_current_turn_not_found",
+                "{digest}"
+            );
+        }
+        // Re-observing through the current writer restores the evidence.
+        store
+            .observe_browser_source_turn(&legacy_session, 1, &legacy_digest, now + 20)
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_browser_source_turn(&legacy_digest, now + 30)
+                .unwrap(),
+            (legacy_session.clone(), 1)
+        );
+        drop(store);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
@@ -11041,7 +11492,7 @@ mod tests {
             Some(canonical_digest.as_str())
         );
         assert_eq!(after_rollback.updated_at, 10);
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
@@ -11082,7 +11533,7 @@ mod tests {
         assert_eq!(op_id, "epoch5-op");
         assert_eq!(state, "pending");
         assert_eq!(expiry, None);
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

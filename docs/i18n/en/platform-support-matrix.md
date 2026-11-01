@@ -14,9 +14,18 @@ Herdr-MCP has several independent protocol layers. They intentionally do not sha
 | Public Edge tool contract | epoch **7**, **19** actions | A client conversation may retain an older tool snapshot, but Edge publishes the current DEV/PROD public catalog; the epoch-3 identity remains only as the conservative non-DEV/PROD fallback and rollback baseline | Tools outside the current public contract are rejected |
 | Workstation Runtime Execution Contract | epoch **4**, **18** tools | The immediately previous frozen epoch **3**, **18** tools is accepted as the bounded rollback baseline, together with the frozen epoch **2**, **18** tool catalog | Any other epoch/hash pair is rejected before workstation execution |
 | Relay wire protocol | numeric `protocol_version = 1` | None | Missing, string-valued, or unknown protocol versions are rejected before relay state is written |
-| Durable runtime state | Current binary schema; releases must declare the same rollback-compatible state schema for automatic activation | Older stores migrate forward transactionally through append-only migrations | A store newer than the running binary is refused; the automatic updater rejects a release whose state schema or runtime contract identity does not exactly match its rollback-safe activation requirements |
+| Durable runtime state | Current binary schema; exactly one declared, irreversible forward step (N→N+1) is admitted through explicit `herdr-mcp update` with a state backup | Older stores migrate forward transactionally through append-only migrations | Downgrade, multi-step, or undeclared schema changes are refused; scheduled updates refuse migrations and a store newer than the running binary is fail-closed |
 
 The current ChatGPT path is tested as a stateless Streamable HTTP client: `openai-mcp` `initialize` and `tools/list` responses use the required SSE framing, `notifications/initialized` is accepted, and Connector reconnect does not depend on preserving an obsolete `Mcp-Session-Id`. Workstation reconnect, Durable Object rehydration, heartbeat hibernation, and reconnect grace are covered independently so a browser reconnect is not treated as proof that a workstation mutation is safe to replay.
+
+## Herdr runtime support
+
+herdr-mcp drives exactly one Herdr runtime: the **Herdr TUI**. Versions below were checked on 2026-10-30.
+
+| Herdr runtime | herdr-mcp v1.1 status | Notes |
+| --- | --- | --- |
+| Herdr TUI (`herdr` CLI + `herdr server`) | **Supported** | The only runtime herdr-mcp drives: workspaces, tabs, panes and agents through the Herdr TUI socket API. CI and the release gate pin Herdr TUI `0.8.2`; the current upstream TUI release is `0.9.5` and is not yet the CI pin. Documentation: [Herdr TUI docs](https://herdr.dev/tui/docs/). |
+| Herdr app (`0.1.9`) on herdr-core (`hc` `0.1.14`) | **Unsupported** | A separate runtime with its own JSON-RPC/OpenRPC socket. It models terminals instead of workspaces/tabs, reports agent status only through OSC 7501, and does not share agents with the Herdr TUI. Agents started there are invisible to herdr-mcp. |
 
 ## N, N-1 and N+1 policy
 
@@ -25,7 +34,7 @@ The current ChatGPT path is tested as a stateless Streamable HTTP client: `opena
 - **N → N** is the normal production path. Candidate activation checks health plus the exact runtime execution contract before traffic moves. Release update activation additionally requires the release manifest to match the local durable-state schema.
 - **N-1 runtime execution** is a bounded rollback path, not a general compatibility promise. Today that means the immediately previous frozen epoch-4 runtime contract, plus the frozen epoch-2 catalog still present in the field, remain accepted beside current epoch 5. The pair is validated by epoch and hash; arbitrary older catalogs are not accepted.
 - **N+1 runtime or control plane** is not guessed. A future epoch, relay protocol, or durable-state schema remains incompatible until the corresponding Edge/runtime migration is explicitly shipped and qualified. Current code rejects unknown contract pairs and future durable-state schemas instead of attempting a best-effort downgrade.
-- **Durable state migration is one-way during upgrade.** Each SQLite migration is append-only and transactional. Rollback is safe only while the prior binary can still read the resulting state; this is why automatic release activation requires the declared state schema to remain rollback-compatible. Runtime rollback changes execution ownership; it does not undo Git/files/service side effects already performed by a tool call.
+- **Durable state migration is one-way during upgrade.** Exactly one declared, irreversible forward state-schema step (N→N+1) is admitted through explicit `herdr-mcp update` with a state backup. Downgrade, multi-step, and undeclared changes are refused; scheduled updates refuse migrations. Rollback restores the backup before an older binary is started. Runtime rollback changes execution ownership; it does not undo Git/files/service side effects already performed by a tool call.
 
 A contract migration and an implementation update are separate operations. A patch may change runtime implementation without changing `tools/list`; adding/removing a model-visible tool requires an explicit contract epoch migration and client/tool-snapshot qualification.
 

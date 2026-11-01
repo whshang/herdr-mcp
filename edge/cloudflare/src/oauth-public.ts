@@ -131,6 +131,18 @@ export type RefreshExchangeInput = TokenIssueInput & {
  * recommended harness wraps a real `OAuthStoreDO` instance over a StorageMock
  * so the internal HTTP API itself is exercised.
  */
+/**
+ * #721: the outcome of a Page Assist grant update. `code` carries the
+ * Durable Object's precise reason so the route can map it to a specific
+ * response code instead of a single catch-all.
+ */
+export interface PageAssistGrantUpdate {
+  ok: boolean;
+  status: number;
+  code?: string;
+  record?: OAuthConnectorGrantRecord;
+}
+
 export interface OAuthPublicStore {
   getClient(clientId: string): Promise<OAuthClientRecord | null>;
   putClient(clientId: string, record: OAuthClientRecord, nowMs: number): Promise<PutClientResult>;
@@ -160,7 +172,7 @@ export interface OAuthPublicStore {
     endpoint_ref: string;
     allowed: boolean;
     changed_by: string;
-  }): Promise<OAuthConnectorGrantRecord | null>;
+  }): Promise<PageAssistGrantUpdate>;
   revokeGrant(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   getConnector(connectorId: string): Promise<OAuthConnectorRecord | null>;
   findActiveConnectorByClient(clientId: string): Promise<OAuthConnectorRecord | null>;
@@ -1791,9 +1803,23 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
     },
     async setPageAssistGrant(input) {
       const resp = await internal("/internal/oauth/grant/page-assist", input);
-      if (!resp.ok) return null;
-      const data = (await resp.json()) as { ok?: boolean; record?: OAuthConnectorGrantRecord };
-      return data.record ?? null;
+      // #721: the DO answers with a precise reason (not_found / revoked /
+      // capacity / invalid_record). Collapsing every non-2xx into null made a
+      // mistyped connector id indistinguishable from a revoked grant or a full
+      // grant record, so keep the status and the code.
+      const body = (await resp.json().catch(() => ({ ok: false, code: "invalid_response" }))) as Record<string, unknown>;
+      if (!resp.ok) {
+        return {
+          ok: false,
+          status: resp.status,
+          code: typeof body.code === "string" ? body.code : "page_assist_grant_update_failed",
+        };
+      }
+      const record = (body as { record?: OAuthConnectorGrantRecord }).record;
+      if (!record) {
+        return { ok: false, status: 502, code: "page_assist_grant_update_failed" };
+      }
+      return { ok: true, status: resp.status, record };
     },
     async revokeGrant(clientId, revokedBy, nowMs) {
       const resp = await internal("/internal/oauth/grant/revoke", {

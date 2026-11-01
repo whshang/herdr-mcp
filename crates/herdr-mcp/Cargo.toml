@@ -1,6 +1,6 @@
 [package]
 name = "herdr-mcp"
-version = "1.1.0-rc.3"
+version = "1.1.0-rc.9"
 edition = "2024"
 license = "MIT"
 description = "Native Herdr MCP runtime and supervisor"
@@ -13,6 +13,7 @@ path = "src/main.rs"
 libc = "0.2"
 base64 = "0.22"
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 axum = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
@@ -50,3 +51,4 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }

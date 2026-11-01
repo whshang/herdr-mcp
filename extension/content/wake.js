@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.224";
+const H2W_CONTENT_VERSION = "0.1.229";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -295,13 +295,48 @@ function normalizeHerdrMentionAlias(value) {
     } catch (_) {}
   }
 
+  // ---- ChatGPT user-turn selectors ----
+  // ChatGPT (2026-10) stopped rendering [data-message-author-role="user"]; a
+  // user turn is now div[data-user-message-bubble="true"] whose text lives in
+  // an inner .whitespace-pre-wrap node. The legacy attribute stays the primary
+  // selector; a bubble only counts as a user turn when no legacy author-role
+  // node already covers it, so mixed DOMs never double-count a turn.
+  const LEGACY_USER_TURN_SELECTOR = '[data-message-author-role="user"]';
+  const USER_BUBBLE_SELECTOR = '[data-user-message-bubble="true"]';
+  const USER_BUBBLE_TEXT_SELECTOR = ".whitespace-pre-wrap";
+  function userBubbleCoveredByLegacyRole(el) {
+    try {
+      return Boolean(el?.closest?.("[data-message-author-role]") || el?.querySelector?.(LEGACY_USER_TURN_SELECTOR));
+    } catch (_) {
+      return false;
+    }
+  }
+  function conversationTurnRole(el) {
+    const authored = el?.getAttribute?.("data-message-author-role");
+    if (authored) return authored;
+    if (el?.matches?.(USER_BUBBLE_SELECTOR) && !userBubbleCoveredByLegacyRole(el)) return "user";
+    return null;
+  }
+  function userTurnTextRoot(el) {
+    if (!el?.matches?.(USER_BUBBLE_SELECTOR)) return el;
+    return el.querySelector?.(USER_BUBBLE_TEXT_SELECTOR) || el;
+  }
+  function conversationTurnNodesForRole(role) {
+    if (role !== "user") return [...document.querySelectorAll(`[data-message-author-role="${role}"]`)];
+    return [...document.querySelectorAll(`${LEGACY_USER_TURN_SELECTOR}, ${USER_BUBBLE_SELECTOR}`)]
+      .filter((el) => conversationTurnRole(el) === "user");
+  }
+
   function observedConversationTurns() {
     if (!CONTEXT_PRESSURE) return [];
     const observations = [];
-    const nodes = [...document.querySelectorAll('[data-message-author-role="user"], [data-message-author-role="assistant"]')];
+    const nodes = [...document.querySelectorAll(
+      `[data-message-author-role="user"], [data-message-author-role="assistant"], ${USER_BUBBLE_SELECTOR}`,
+    )];
     for (const el of nodes) {
-      const role = el.getAttribute("data-message-author-role");
-      const text = String(el.innerText || el.textContent || "").trim();
+      const role = conversationTurnRole(el);
+      const textRoot = userTurnTextRoot(el);
+      const text = String(textRoot?.innerText || textRoot?.textContent || "").trim();
       if (!text || (role !== "user" && role !== "assistant")) continue;
       const turn = el.closest("[data-turn-id]");
       const message = el.closest("[data-message-id]");
@@ -482,13 +517,34 @@ function normalizeHerdrMentionAlias(value) {
     if (el.value != null && el.tagName !== "DIV") return String(el.value);
     return String(el.innerText || el.textContent || "");
   }
-  function composerModelVisibleText() {
+  function composerModelVisibleSample() {
     const el = ADAPTER.getInputEl();
-    if (!el) return "";
+    if (!el) return { text: "", mentions: [] };
     if (ADAPTER.name === "chatgpt" && BROWSER_PERFORMANCE?.sampleChatGptModelMessageText) {
-      return String(BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el).text || "").trim();
+      const sample = BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el);
+      return {
+        text: String(sample?.text || "").trim(),
+        mentions: Array.isArray(sample?.app_mentions) ? sample.app_mentions : [],
+      };
     }
-    return composerTextRaw().trim();
+    return { text: composerTextRaw().trim(), mentions: [] };
+  }
+  function composerModelVisibleText() {
+    return composerModelVisibleSample().text;
+  }
+  // A Herdr App mention (by provider name or the chip's own label) is dropped
+  // from the source-turn text sent to the Runtime: the Runtime digest drops
+  // `@herdr` / `@herdr-mcp` / `@herdr_mcp` anyway, while a chip rendered under
+  // another name or label would otherwise never match current_user_message
+  // (#754). Other Apps keep their `@name` form.
+  function isHerdrAppMention(mention) {
+    const names = new Set(["herdr", "herdr-mcp", "herdr_mcp"]);
+    let registered = "";
+    try { registered = normalizeHerdrMentionAlias(registeredHerdrAppKeyword || "").toLowerCase(); } catch (_) {}
+    if (registered) names.add(registered);
+    return [mention?.name, mention?.label].some((value) => names.has(
+      normalizeHerdrMentionAlias(value || "").toLowerCase(),
+    ));
   }
   function composerNorm() { return normText(composerTextRaw()); }
   function composerHasSameWake(text) {
@@ -1525,14 +1581,15 @@ function normalizeHerdrMentionAlias(value) {
   function markLatestTurnsDirty() { latestTurnsDirty = true; }
   function rediscoverLatestTurns() {
     const nodes = document.querySelectorAll(
-      '[data-message-author-role="user"], [data-message-author-role="assistant"]',
+      '[data-message-author-role="user"], [data-message-author-role="assistant"], '
+        + USER_BUBBLE_SELECTOR,
     );
     let user = null;
     let assistant = null;
     let userCount = 0;
     let assistantCount = 0;
     for (const node of nodes) {
-      const role = node.getAttribute("data-message-author-role");
+      const role = conversationTurnRole(node);
       if (role === "user") { user = node; userCount += 1; }
       else if (role === "assistant") { assistant = node; assistantCount += 1; }
     }
@@ -1545,17 +1602,18 @@ function normalizeHerdrMentionAlias(value) {
   }
   function latestTurnForRole(role) {
     if (!latestTurnCacheActive) {
-      const nodes = document.querySelectorAll(`[data-message-author-role="${role}"]`);
+      const nodes = conversationTurnNodesForRole(role);
       return nodes[nodes.length - 1] || null;
     }
     if (latestTurnsDirty) rediscoverLatestTurns();
     return role === "user" ? latestTurns.user : latestTurns.assistant;
   }
 
-  function sampleLatestMessageText(el, { modelVisibleUser = false } = {}) {
+  function sampleLatestMessageText(el, { modelVisibleUser = false, omitAppMention = null } = {}) {
     if (!el) return { text: "", total_chars: 0, truncated: false };
+    el = userTurnTextRoot(el);
     if (modelVisibleUser && BROWSER_PERFORMANCE?.sampleChatGptModelMessageText) {
-      return BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el);
+      return BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el, { omitAppMention });
     }
     if (BROWSER_PERFORMANCE?.sampleBoundedMessageText) {
       return BROWSER_PERFORMANCE.sampleBoundedMessageText(el);
@@ -1825,7 +1883,7 @@ function normalizeHerdrMentionAlias(value) {
     const snapshot = latestDomMessageSnapshot(role);
     return {
       ...snapshot,
-      count: document.querySelectorAll(`[data-message-author-role="${role}"]`).length,
+      count: conversationTurnNodesForRole(role).length,
     };
   }
 
@@ -2842,8 +2900,13 @@ function normalizeHerdrMentionAlias(value) {
           && (!creatingSession || (evidence.stable_resource_ref_observed && evidence.canonical_url_observed))) {
         evidence.generation_owner = expectedGeneration;
         if (creatingSession) {
+          // A re-applied projection (after the first assistant turn settled)
+          // is the final state: report it instead of projecting again.
+          const priorProjection = typeof chatGptTitleProjectionResult === "undefined"
+            ? null
+            : chatGptTitleProjectionResult;
           const titleProjection = adapterSupports("titleProjection")
-            ? await projectChatGptConversationTitle(params.display_label)
+            ? (priorProjection ?? await projectChatGptConversationTitle(params.display_label))
             : {
                 status: "unsupported",
                 changed: null,
@@ -2851,6 +2914,15 @@ function normalizeHerdrMentionAlias(value) {
                 readback_verified: false,
                 reason: "title_projection_unsupported",
               };
+          if (typeof chatGptTitleProjectionTarget !== "undefined") {
+            chatGptTitleProjectionTarget = {
+              title: String(params.display_label ?? "").trim(),
+              conversationId: null,
+            };
+          }
+          if (typeof chatGptTitleProjectionResult !== "undefined") {
+            chatGptTitleProjectionResult = titleProjection;
+          }
           evidence.result = {
             ...(evidence.result && typeof evidence.result === "object" && !Array.isArray(evidence.result)
               ? evidence.result
@@ -2905,6 +2977,11 @@ function normalizeHerdrMentionAlias(value) {
       assistant_text: assistantText,
     });
     if (response?.ok === true) {
+      // The provider auto-title lands with the first assistant reply, so the
+      // projected title is re-applied once after that turn settled.
+      if (typeof reapplyChatGptConversationTitleAfterSettlement === "function") {
+        void reapplyChatGptConversationTitleAfterSettlement().catch(() => {});
+      }
       const current = acceptedDispatchAssignments.get(sessionRef);
       // A newer accepted assignment may arrive while the previous ACK is in
       // flight. Preserve it so its result still gets observed on the next tick.
@@ -3097,6 +3174,13 @@ function normalizeHerdrMentionAlias(value) {
   // never the provider account's raw native identity.
   let registeredConvKey = null;
   let registeredBrowserSessionRef = null;
+  // #624: ChatGPT generates its auto-title after the first assistant reply, so
+  // the title projected during session creation gets overwritten. Keep the
+  // projected target and the outcome of the single bounded reapply so the
+  // final state can be reported with the session evidence.
+  let chatGptTitleProjectionTarget = null;
+  let chatGptTitleProjectionResult = null;
+  let chatGptTitleProjectionReapplied = false;
   let registeredBrowserGeneration = null;
   let registeredHerdrAppKeyword = null;
   let registeredConversationBound = false;
@@ -3635,14 +3719,36 @@ function normalizeHerdrMentionAlias(value) {
     return projects;
   }
 
+  // #740: the current conversation's Project is only ever taken from an exact
+  // project id: the page route (/g/g-p-<id>[-slug]/c/<conv>) or the sidebar
+  // anchor's own href for this conversation. The sidebar label (aria-label)
+  // is never substring-matched against project names: a Project named e.g.
+  // "herdr-mcp" would otherwise claim any account-level /c/<id> chat whose
+  // title or label happens to contain that text, and the same conversation
+  // would be observed under two parents in one generation.
   function currentChatGptProjectFromCatalog(projects) {
+    const projectSegmentFromPath = (pathname) => {
+      const match = String(pathname || "").match(/^\/g\/(g-p-[^/]+)(?:\/|$)/i);
+      return match ? match[1] : null;
+    };
+    const projectForSegment = (segment) => {
+      if (!segment) return null;
+      return (projects || []).find((project) => {
+        const id = typeof project?.id === "string" ? project.id : "";
+        return /^g-p-[A-Za-z0-9_-]+$/.test(id)
+          && (segment === id || segment.startsWith(`${id}-`));
+      }) || null;
+    };
+    let routeSegment = null;
+    try { routeSegment = projectSegmentFromPath(new URL(location.href).pathname); } catch (_) {}
+    if (routeSegment) return projectForSegment(routeSegment);
     const anchor = chatGptCurrentConversationAnchor();
-    const aria = normText(anchor?.getAttribute?.("aria-label") || "");
-    if (!aria) return null;
-    const matches = (projects || []).filter((project) => project?.name && aria.includes(project.name));
-    if (!matches.length) return null;
-    matches.sort((a, b) => b.name.length - a.name.length);
-    return matches[0];
+    if (!anchor) return null;
+    let anchorSegment = null;
+    try {
+      anchorSegment = projectSegmentFromPath(new URL(anchor.getAttribute?.("href") || anchor.href, location.href).pathname);
+    } catch (_) {}
+    return projectForSegment(anchorSegment);
   }
 
   function currentHerdrRequiredApps() {
@@ -3790,7 +3896,20 @@ function normalizeHerdrMentionAlias(value) {
     // provider session before publishing any account/session association.
     if (ADAPTER.name === "chatgpt" && chatGptConversationId()) {
       const proof = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+      // #623: an archived conversation exposes no user turn any more, so a
+      // `userMessageId`-only proof rejects it and the session can never be
+      // registered again. Accept a provider readback that proves the same
+      // conversation is archived as an equally valid ownership proof.
+      let proofArchived = false;
       if (!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim()) {
+        const archivedProof = await fetchChatGptConversation({
+          conversationId: chatGptConversationId(),
+          timeoutMs: 4000,
+        }).catch(() => ({ ok: false }));
+        proofArchived = archivedProof?.ok === true && archivedProof?.body?.is_archived === true;
+      }
+      if ((!proof?.ok || typeof proof.userMessageId !== "string" || !proof.userMessageId.trim())
+          && !proofArchived) {
         lastBrowserRegistrationStatus = "provider_readback_unavailable";
         if (registeredConvKey === convKey) {
           registeredConvKey = null;
@@ -4097,6 +4216,8 @@ function normalizeHerdrMentionAlias(value) {
     }
     const authored = (el.matches?.(`[data-message-author-role="${role}"]`) ? el : null)
       || el.querySelector?.(`[data-message-author-role="${role}"]`)
+      || (role === "user" && conversationTurnRole(el) === "user" ? el : null)
+      || (role === "user" ? el.querySelector?.(USER_BUBBLE_SELECTOR) : null)
       || null;
     const exactMessageId = authored?.getAttribute?.("data-message-id")
       || authored?.closest?.("[data-message-id]")?.getAttribute?.("data-message-id")
@@ -4110,7 +4231,7 @@ function normalizeHerdrMentionAlias(value) {
     // a user turn-id is usable only because the candidate path later requires it
     // to equal the already accepted provider user-message identity.
     const messageId = exactMessageId || (role === "user" ? turnId : null);
-    const textRoot = authored
+    const textRoot = userTurnTextRoot(authored)
       || (role === "assistant"
         ? (el.querySelector?.("[data-message-content]") || el.querySelector?.(".markdown") || null)
         : el);
@@ -4129,12 +4250,13 @@ function normalizeHerdrMentionAlias(value) {
   function chatGptDomTurnSequence() {
     const nodes = [...document.querySelectorAll(
       '[data-message-author-role="user"], section[data-turn="user"], '
-        + '[data-message-author-role="assistant"], section[data-turn="assistant"]',
+        + '[data-message-author-role="assistant"], section[data-turn="assistant"], '
+        + USER_BUBBLE_SELECTOR,
     )];
     const seen = new Set();
     const turns = [];
     for (const el of nodes) {
-      const role = el.getAttribute?.("data-message-author-role") || el.getAttribute?.("data-turn") || null;
+      const role = conversationTurnRole(el) || el.getAttribute?.("data-turn") || null;
       if (role !== "user" && role !== "assistant") continue;
       const snapshot = domMessageSnapshotFromElement(el, role);
       const structuralId = snapshot.messageId || snapshot.turnId;
@@ -4462,6 +4584,46 @@ function normalizeHerdrMentionAlias(value) {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  // #624: after the first assistant turn settles, ChatGPT may already have
+  // written its own auto-title. Wait for that title to land, then re-apply the
+  // projected title exactly once and report the final state. The reapply never
+  // blocks the settlement ACK: it runs after the ACK was already accepted.
+  async function reapplyChatGptConversationTitleAfterSettlement() {
+    if (typeof chatGptTitleProjectionReapplied !== "undefined"
+      && chatGptTitleProjectionReapplied) {
+      return typeof chatGptTitleProjectionResult === "undefined"
+        ? null
+        : chatGptTitleProjectionResult;
+    }
+    const target = typeof chatGptTitleProjectionTarget === "undefined"
+      ? null
+      : chatGptTitleProjectionTarget;
+    if (!target || !target.title) return null;
+    if (ADAPTER.name !== "chatgpt" || !adapterSupports("titleProjection")) return null;
+    if (typeof chatGptTitleProjectionReapplied !== "undefined") {
+      chatGptTitleProjectionReapplied = true;
+    }
+    const conversationId = target.conversationId || chatGptConversationId();
+    if (!conversationId) return null;
+    // Give the provider auto-title a bounded window to land. Only a title that
+    // differs from the projected one is treated as the auto-title.
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      const observed = await fetchChatGptConversation({
+        conversationId,
+        timeoutMs: 1000,
+        authTimeoutMs: 1000,
+      });
+      if (observed?.ok && observed.body?.title && observed.body.title !== target.title) break;
+      if (Date.now() < deadline) await wait(250);
+    }
+    const reapplied = await projectChatGptConversationTitle(target.title);
+    if (typeof chatGptTitleProjectionResult !== "undefined") {
+      chatGptTitleProjectionResult = reapplied;
+    }
+    return reapplied;
   }
 
   async function projectChatGptConversationTitle(rawTitle) {
@@ -5715,16 +5877,27 @@ function normalizeHerdrMentionAlias(value) {
     let sawGrowth = false;
     let startedAt = 0;
     let userTextAtStart = "";
+    let userMentionsAtStart = [];
     // Module-level latest-turn cache is authoritative while this watcher runs.
     latestTurnCacheActive = true;
     const roleSnapshot = (role) => {
       const el = latestTurnForRole(role);
       const sample = sampleLatestMessageText(el, { modelVisibleUser: role === "user" });
+      const appMentions = Array.isArray(sample.app_mentions) ? sample.app_mentions : [];
+      let sourceTurnText = "";
+      if (role === "user" && appMentions.some(isHerdrAppMention)) {
+        sourceTurnText = String(sampleLatestMessageText(el, {
+          modelVisibleUser: true,
+          omitAppMention: isHerdrAppMention,
+        }).text || "").trim();
+      }
       return {
         count: role === "user" ? latestTurns.userCount : latestTurns.assistantCount,
         text: sample.text,
         totalChars: sample.total_chars,
         truncated: sample.truncated,
+        appMentions,
+        sourceTurnText,
       };
     };
     const initialUser = roleSnapshot("user");
@@ -5736,6 +5909,7 @@ function normalizeHerdrMentionAlias(value) {
     let lastReportedTurnKey = "";
     const artifactCaptureTurnKeys = new Set();
     let lastStartedJournalKey = "";
+    let lastNoBubbleLoggedSubmitAt = 0;
     let lastAsstLen = initialAssistant.totalChars;
     let lastAsstSignature = assistantSignature(initialAssistant.text);
     let lastAsstCount = initialAssistant.count;
@@ -5756,6 +5930,7 @@ function normalizeHerdrMentionAlias(value) {
         observedSubmitAt = submitAt;
         startedAt = submitAt;
         userTextAtStart = "";
+        userMentionsAtStart = [];
         lastReportedTurnKey = "";
       }
       return submitAt;
@@ -5789,14 +5964,35 @@ function normalizeHerdrMentionAlias(value) {
       return true;
     };
 
+    // Whether the latest user bubble is the message just submitted (#754).
+    // The composer chip and the accepted bubble chip can render one App
+    // mention differently (`@<app-mention-name>` vs the chip label), so the
+    // check also accepts both texts once every App mention seen on either
+    // side is removed. Plain text keeps the exact 160-char containment check.
+    const pendingUserTextMatches = (expectedUser, bubbleText, bubbleMentions = []) => {
+      const mentions = [...userMentionsAtStart, ...(Array.isArray(bubbleMentions) ? bubbleMentions : [])];
+      if (typeof BROWSER_PERFORMANCE?.sourceTurnTextConfirmsPending === "function") {
+        return BROWSER_PERFORMANCE.sourceTurnTextConfirmsPending(expectedUser, bubbleText, mentions);
+      }
+      return Boolean(expectedUser && bubbleText)
+        && (bubbleText.includes(expectedUser.slice(0, 160)) || expectedUser.includes(bubbleText.slice(0, 160)));
+    };
+
     const noteTrustedManualSubmit = () => {
-      const text = composerModelVisibleText();
-      if (!text || !CONVERSATION_HEALTH || !conversationHealth) return;
+      const composerSample = composerModelVisibleSample();
+      const text = composerSample.text;
+      if (!text || !CONVERSATION_HEALTH || !conversationHealth) {
+        const reason = !text ? "empty composer text"
+          : (!CONVERSATION_HEALTH ? "conversation health unavailable" : "empty conversationHealth");
+        console.debug(`[h2w] source turn capture skipped: ${reason}`);
+        return;
+      }
       const at = Date.now();
       markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth, at));
       observedSubmitAt = at;
       startedAt = at;
       userTextAtStart = text;
+      userMentionsAtStart = composerSample.mentions.slice(0, 16);
       lastReportedTurnKey = "";
     };
 
@@ -5808,7 +6004,10 @@ function normalizeHerdrMentionAlias(value) {
     document.addEventListener("keydown", (event) => {
       if (!event.isTrusted || event.key !== "Enter" || event.shiftKey || event.isComposing) return;
       const input = ADAPTER.getInputEl();
-      if (!input) return;
+      if (!input) {
+        console.debug("[h2w] source turn capture skipped: no input el");
+        return;
+      }
       const target = event.target;
       if (target !== input && !input.contains?.(target)) return;
       noteTrustedManualSubmit();
@@ -5936,6 +6135,14 @@ function normalizeHerdrMentionAlias(value) {
       const currentUserText = currentUser.text;
       const currentUserSignature = assistantSignature(currentUserText);
       const currentUserCount = currentUser.count;
+      if (!currentUserText) {
+        const pendingSubmitAt = Number(conversationHealth?.last_user_submit_at || 0);
+        if (pendingSubmitAt > 0 && Date.now() - pendingSubmitAt <= 30000
+          && pendingSubmitAt !== lastNoBubbleLoggedSubmitAt) {
+          lastNoBubbleLoggedSubmitAt = pendingSubmitAt;
+          console.debug(`[h2w] source turn capture skipped: no user bubble (count=${currentUserCount})`);
+        }
+      }
       const userChanged = currentUserText && (currentUserSignature !== lastUserSignature || currentUserCount > lastUserCount);
       if (userChanged) {
         // ChatGPT virtualizes old turns while scrolling. A mounted user node
@@ -5950,16 +6157,20 @@ function normalizeHerdrMentionAlias(value) {
         const confirmedPendingUser = submitAt > 0
           && Date.now() - submitAt <= 30000
           && expectedUser
-          && (comparableCurrentUser.includes(expectedUser.slice(0, 160))
-            || expectedUser.includes(comparableCurrentUser.slice(0, 160)));
+          && pendingUserTextMatches(expectedUser, comparableCurrentUser, currentUser.appMentions);
         const journalKey = `${submitAt}`;
+        if (!confirmedPendingUser && submitAt > 0 && journalKey !== lastStartedJournalKey) {
+          const reason = Date.now() - submitAt > 30000 ? "stale submit anchor"
+            : (!expectedUser ? "no expected user text" : "text mismatch");
+          console.debug(`[h2w] source turn capture skipped: ${reason} (expected_len=${expectedUser.length}, bubble_len=${comparableCurrentUser.length})`);
+        }
         if (confirmedPendingUser && journalKey !== lastStartedJournalKey) {
           lastStartedJournalKey = journalKey;
           void sendBg({
             type: "h2w_turn_started",
             convKey: ADAPTER.getConversationKey(),
             startedAt: submitAt,
-            userText: currentUserText,
+            userText: currentUser.sourceTurnText || currentUserText,
           });
         }
         lastUserSignature = currentUserSignature;

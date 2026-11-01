@@ -23,7 +23,7 @@ use super::{
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
-    AGENT_TASK_STATUS_METHOD,
+    AGENT_TASK_REPORT_METHOD, AGENT_TASK_STATUS_METHOD,
 };
 use serde_json::{Value, json};
 
@@ -131,31 +131,108 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "method": AGENT_TASK_DISPATCH_METHOD,
             "source": "herdr_mcp_local",
             "access": "mutation",
+            "description": "Dispatch one task card to an existing agent (target) or to a NEW agent in one call (spawn): create the pane, start the agent, wait for interactive readiness and prompt it without separate pane.split/agent.start calls. spawn and target are mutually exclusive and spawn requires idempotency_key; a replayed key never creates a second pane, tab or agent.",
             "params": {
                 "properties": {
-                    "target": {"type": "string", "maxLength": 256},
+                    "target": {"type": "string", "maxLength": 256, "description": "Exact agent/pane or explicit @idle, @kind, @kind:idle selector. Roles choose the first idle, delegation-safe pane in live snapshot order; never broadcast (@all is rejected). Replays retain the original resolved_target and candidate evidence. Omit when spawn is present."},
+                    "spawn": {
+                        "type": "object",
+                        "description": "One-shot spawn-and-dispatch. Validated before any side effect; the whole chain is pane create -> agent.start -> bounded readiness -> normal dispatch, all sharing ONE caller-visible deadline. status/failed_step values are validate, pane_create, agent_start, agent_ready and prompt. A chain that runs out of budget before the prompt returns a resumable checkpoint (resumable:true with phase agent_start or agent_ready and the persisted pane facts); replaying the SAME idempotency_key continues from that pane/agent and prompts once, never creating a second pane, tab or agent. Other failures keep delivery_state not_delivered when the prompt was never sent and report the created pane/agent for reclaim.",
+                        "properties": {
+                            "kind": {"type": "string", "maxLength": 64, "description": "Required agent kind passed to agent.start (e.g. pi, codex, claude, grok). An unsupported kind fails at failed_step agent_start with the native code."},
+                            "name": {"type": "string", "maxLength": 32, "description": "Optional agent name matching [a-z][a-z0-9_-]{0,31}; defaults to kind plus a short stable suffix derived from the idempotency_key."},
+                            "workspace_id": {"type": "string", "maxLength": 256, "description": "Target workspace id or unique label. Required unless cwd is inside exactly one live workspace."},
+                            "cwd": {"type": "string", "maxLength": 1024, "description": "Absolute cwd inside a managed project root from the live topology; defaults to the workspace checkout path. Validated lexically, never by canonicalizing or running git."},
+                            "tab_label": {"type": "string", "maxLength": 64, "description": "Label for the new tab (default path only); defaults to the agent name."},
+                            "split_from": {"type": "string", "maxLength": 256, "description": "Optional parent pane id for pane.split. Without it the pane is created as a new tab so the agent gets the full tab width. A horizontal split still respects the readable-width floor and fails with pane_split_too_narrow."},
+                            "direction": {"type": "string", "enum": ["right", "down"], "description": "Split direction; requires split_from and defaults to right."},
+                            "startup_timeout_ms": {"type": "integer", "minimum": 1, "maximum": 100000, "description": "Budget for the WHOLE one-call chain (pane create + agent.start + readiness + prompt submission), not just readiness. Defaults to 25000 so it fits a WebChat herdr_call without timeout_ms (Edge cuts at 30s; the link never exceeds 60s); the local CLI waits chain + 10s and never exceeds 120s. Every step gets only what is left, and a chain that cannot reach the prompt pauses in a resumable checkpoint instead of holding an in-flight key."}
+                        },
+                        "required": ["kind"],
+                    },
+                    "workspace_id": {"type": "string", "maxLength": 256, "description": "Optional workspace scope for role resolution. Not applicable with spawn (use spawn.workspace_id)."},
+                    "max_concurrent": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Role selectors only: cap non-terminal tasks for this exact requested_target in the bound parent session, else parent_target, else caller-less global scope. Limit rejection is not_delivered."},
                     "text": {"type": "string", "maxLength": 65536},
                     "parent_target": {"type": "string", "maxLength": 256},
                     "idempotency_key": {"type": "string", "maxLength": 256},
+                    "stall_after_ms": {"type": "integer", "minimum": 60000, "maximum": 7200000, "description": "Liveness stall threshold; defaults to 20 minutes. Stalled is non-terminal and never redispatched automatically."},
+                    "inject_task_identity": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Append a bounded task_id/dispatch_id identity line and completion hint after fingerprinting. Replays never resubmit. Both ids are separate fields; callers must not assume their values are equal.",
+                    },
+                    "parent_session_ref": {
+                        "type": "string",
+                        "maxLength": 96,
+                        "description": "Exact registered browser session ref. Takes precedence over current_user_message. WebChat requires an already-existing caller-session mapping equal to this ref; never creates a mapping. An unmapped caller gets explicit_parent_session_caller_session_unmapped. Any failed identity, generation, grant or mapping check leaves the task unstamped with no fallback; first-time binding uses the source-turn path without an explicit ref.",
+                    },
                     "current_user_message": {
                         "type": "string",
                         "maxLength": 262144,
-                        "description": "WebChat callers: the exact current user turn text (trimmed, non-empty). When it matches the observed source turn of your ChatGPT conversation, the task is stamped with that conversation's session as parent_session_ref so its session-scoped inbox and wake can see it; binding failure never fails the dispatch and is reported as parent_session {bound:false, reason}.",
+                        "description": "Ignored for binding when parent_session_ref is supplied. WebChat callers: the exact current user turn text (trimmed, non-empty). When it matches the observed source turn of your ChatGPT conversation, the task is stamped with that conversation's session as parent_session_ref so its session-scoped inbox and wake can see it; binding failure never fails the dispatch and is reported as parent_session {bound:false, reason}. Pass the user's turn text verbatim, omitting the app chip or keeping it as plain @herdr-mcp (never a markdown link or quoted); on bound:false report parent_session.reason and parent_session.diagnostic to the user.",
                     },
                     "wait": {
                         "type": "object",
+                        "description": "A task wait timeout is a successful checkpoint: ok:true, wait.completed:false, wait.outcome:checkpoint, with the current lifecycle/liveness snapshot. Delivery failures remain failures. Re-check status/inbox rather than redispatching.",
                         "properties": {
                             "until": {"type": "array", "items": {"type": "string"}},
                             "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 60000}
                         }
                     }
                 },
-                "required": ["target", "text", "parent_target", "idempotency_key"],
+                "required": ["text", "idempotency_key"],
                 "empty": false,
             },
         }),
         json!({
+            "method": crate::prompt::decision_gates::CREATE,
+            "source": "herdr_mcp_local", "access": "mutation",
+            "description": "Create one blocking decision gate on a visible non-terminal task. Bounds are UTF-8 bytes; control characters and duplicate options are rejected. Open gates block ack and completion, including worker_done.",
+            "params": {"properties": {
+                "task_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "question": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "options": {"type": "array", "minItems": 2, "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}}
+            }, "required": ["task_id", "question", "options"], "empty": false}
+        }),
+        json!({
+            "method": crate::prompt::decision_gates::STATUS,
+            "source": "herdr_mcp_local", "access": "read_only",
+            "params": {"properties": {"gate_id": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["gate_id"], "empty": false}
+        }),
+        json!({
+            "method": crate::prompt::decision_gates::CANCEL,
+            "source": "herdr_mcp_local", "access": "mutation",
+            "description": "Cancel an open gate only from its creating parent scope. Bot approvals never count as owner approval.",
+            "params": {"properties": {"gate_id": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["gate_id"], "empty": false}
+        }),
+        json!({
+            "method": crate::prompt::decision_gates::RESOLVE,
+            "source": "herdr_mcp_local", "access": "mutation",
+            "description": "Always rejected from MCP, WebChat, browser and agent paths with gate_resolution_requires_human. Only independent local CLI agent gate resolve with a controlling interactive TTY and exact retyped option may resolve. Best-effort local attestation, not cryptographic proof.",
+            "params": {"properties": {
+                "gate_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "resolution": {"type": "string", "minLength": 1, "maxLength": 128}
+            }, "required": ["gate_id", "resolution"], "empty": false}
+        }),
+        json!({
+            "method": AGENT_TASK_REPORT_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "mutation",
+            "description": "Trusted local IPC only; never available to WebChat callers. Matching task_id and dispatch_id are required. worker_done is durable and accepted exactly once; a late report preserves settled lifecycle and never re-notifies the parent. Heartbeats only refresh timestamps of non-terminal tasks. Summary is capped at 2048 UTF-8 bytes after control characters are stripped.",
+            "params": {
+                "properties": {
+                    "task_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "dispatch_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "kind": {"type": "string", "enum": ["heartbeat", "worker_done"]},
+                    "summary": {"type": "string", "maxLength": 2048}
+                },
+                "required": ["task_id", "dispatch_id", "kind"],
+                "empty": false
+            }
+        }),
+        json!({
             "method": AGENT_TASK_STATUS_METHOD,
+            "description": "Durable lifecycle and derived liveness (active or stalled). Stalled is non-terminal; no automatic redispatch.",
             "source": "herdr_mcp_local",
             "access": "read_only",
             "params": {
@@ -189,7 +266,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "view": {
                         "type": "string",
                         "enum": ["full", "compact"],
-                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured. final_excerpt is omitted, not degraded, when the child pane is narrower than 40 columns: a TUI agent hard-wraps its own layout there, so the only readable options are reading the pane or giving the agent a wider pane (a new tab, a reused wide pane, or a down split)."
+                        "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, liveness, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured. final_excerpt is omitted, not degraded, when the child pane is narrower than 40 columns: a TUI agent hard-wraps its own layout there, so the only readable options are reading the pane or giving the agent a wider pane (a new tab, a reused wide pane, or a down split)."
                     },
                 },
                 "required": [],

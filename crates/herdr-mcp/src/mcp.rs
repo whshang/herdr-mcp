@@ -207,27 +207,31 @@ pub struct RuntimeContext<'a> {
     pub caller_webchat_authorization: Option<&'a BrowserCallerAuthorization>,
     pub caller_browser_session: Option<&'a BrowserCallerSessionIdentity>,
     pub caller_page_assist_grants: &'a [PageAssistCallerGrant],
+    /// #774: the Edge said the caller browser is on another enrolled device, so
+    /// the source-turn evidence for this dispatch cannot exist in this runtime.
+    /// Never used to fail a dispatch; only to skip a futile lookup.
+    pub caller_browser_on_other_device: bool,
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
     pub trusted_local_ipc: bool,
 }
 
-/// The parent-session binding decision for one WebChat `agent.task.dispatch`
-/// carrying `current_user_message`.
+/// The parent-session binding decision for one `agent.task.dispatch`.
+/// An explicit ref takes precedence over source-turn evidence.
 ///
 /// The message resolves the caller's browser session through the same durable
-/// source-turn evidence model as the archive path: the exact trimmed user text
-/// observed for one registered session, never recency, tab, or URL guesses.
+/// source-turn evidence model as the archive path: the canonical user text
+/// (`canonical_source_turn_text`) observed for one registered session, never
+/// recency, tab, or URL guesses.
 /// Binding is best-effort and fail-closed — any missing, stale, ambiguous, or
 /// conflicting evidence leaves the dispatch unstamped and reports only a
 /// compact non-secret reason. The opaque session id, the user text, and its
 /// hash are never echoed.
 enum AgentTaskParentSession {
-    /// Nothing was attempted: the caller passed no `current_user_message`
-    /// (or has no WebChat identity to bind), so dispatch behaves as before.
+    /// Nothing was attempted: no explicit ref or applicable turn evidence.
     NotAttempted,
-    /// The source-turn evidence resolved and the caller mapping was bound.
+    /// Explicit or source-turn evidence resolved to a registered session.
     Bound(String),
     /// Binding was attempted but must not stamp; the fact reports the reason.
     Unbound(&'static str),
@@ -244,11 +248,34 @@ enum AgentTaskParentSession {
 fn agent_task_parent_session_fact(
     binding: &AgentTaskParentSession,
     result: &Value,
+    diagnostic: Option<Value>,
 ) -> Option<Value> {
     match binding {
         AgentTaskParentSession::NotAttempted => None,
         AgentTaskParentSession::Bound(_) => Some(json!({"bound": true})),
-        AgentTaskParentSession::Unbound(reason) => Some(json!({"bound": false, "reason": reason})),
+        AgentTaskParentSession::Unbound(reason) => {
+            let mut fact = json!({"bound": false, "reason": reason});
+            if *reason == "source_session_not_registered" {
+                // The model acts on this fact, so the remedy travels with it
+                // (#771). `message` survives `model_visible_tool_output`;
+                // `hint` and `*_hint` keys are stripped there.
+                fact["message"] = json!(
+                    "The browser session for this turn is not registered yet. Resend from the conversation once it is registered, or retry."
+                );
+            }
+            if *reason == "caller_browser_on_other_device" {
+                // #774: the caller browser is not on this device, so the exact
+                // source turn can never be found here. The remedy is the device
+                // flag, not a retry or a different message text.
+                fact["message"] = json!(
+                    "This dispatch cannot bind because the caller browser is on another device. Redispatch with device set to the device flagged hosts_caller_browser in herdr_devices."
+                );
+            }
+            if let Some(diagnostic) = diagnostic {
+                fact["diagnostic"] = diagnostic;
+            }
+            Some(fact)
+        }
         AgentTaskParentSession::Replay => result.get("task").map(|task| {
             if task
                 .get("parent_session_ref")
@@ -263,6 +290,101 @@ fn agent_task_parent_session_fact(
     }
 }
 
+fn source_turn_unbound_diagnostic(
+    context: &RuntimeContext<'_>,
+    binding: &AgentTaskParentSession,
+    params: &Value,
+) -> Option<Value> {
+    let AgentTaskParentSession::Unbound(reason) = binding else {
+        return None;
+    };
+    if !matches!(
+        *reason,
+        "source_turn_not_found"
+            | "source_session_not_registered"
+            | "source_turn_ambiguous"
+            | "source_turn_stale"
+            | "caller_session_conflict"
+            | "grant_missing"
+            | "provider_generation_unknown"
+            | "session_account_unavailable"
+            | "binding_failed"
+    ) {
+        return None;
+    }
+    let current_user_message = params
+        .get("current_user_message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())?;
+    let canonical = canonical_source_turn_text(current_user_message);
+    let digest = source_turn_sha256(current_user_message);
+    let latest = match (
+        context.caller_webchat_authorization,
+        context.caller_browser_session,
+    ) {
+        (Some(authorization), Some(caller_session)) => {
+            let store = context.state_store.lock();
+            match store {
+                Ok(mut store) => store
+                    .resolve_browser_caller_session(
+                        &authorization.principal_ref,
+                        &caller_session.provider,
+                        &caller_session.opaque_session_id,
+                    )
+                    .ok()
+                    .flatten()
+                    .and_then(|session_ref| {
+                        store
+                            .latest_browser_source_turn_sha256(&session_ref, browser_epoch_ms())
+                            .ok()
+                            .flatten()
+                    }),
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+    // The model does not reliably surface the diagnostic it receives in the
+    // tool result, so the workstation log keeps the same non-secret facts
+    // (#777). Message text is never logged.
+    eprintln!(
+        "{}",
+        source_turn_unbound_log_line(
+            reason,
+            &digest,
+            canonical.chars().count(),
+            latest.as_deref()
+        )
+    );
+    Some(json!({
+        "canonical_prefix": canonical.chars().take(24).collect::<String>(),
+        "canonical_sha256_prefix": digest[..12].to_owned(),
+        "latest_source_turn_sha256_prefix": latest.map(|value| value[..12].to_owned()),
+    }))
+}
+
+/// One durable, non-secret `server.log` line for an unbound source-turn
+/// binding. It carries the reason, the canonical digest prefix, and the
+/// canonical length: enough to reconstruct a digest miss without storing user
+/// text (#777).
+fn source_turn_unbound_log_line(
+    reason: &str,
+    canonical_sha256: &str,
+    canonical_chars: usize,
+    latest_sha256: Option<&str>,
+) -> String {
+    format!(
+        "herdr-mcp: agent.task.dispatch parent_session unbound reason={reason} canonical_sha256_prefix={} canonical_chars={canonical_chars} latest_source_turn_sha256_prefix={}",
+        sha256_prefix_12(canonical_sha256),
+        latest_sha256.map_or("none", sha256_prefix_12),
+    )
+}
+
+fn sha256_prefix_12(digest: &str) -> &str {
+    digest.get(..12).unwrap_or(digest)
+}
+
 /// Map one fail-closed store error from the source-turn evidence path onto the
 /// compact dispatch fact reason. Unknown diagnostic strings stay generic.
 fn source_turn_unbound_reason(error: &str) -> &'static str {
@@ -273,6 +395,36 @@ fn source_turn_unbound_reason(error: &str) -> &'static str {
         "browser_caller_session_conflict" => "caller_session_conflict",
         _ => "binding_failed",
     }
+}
+
+/// #771: one `not_found` digest miss covers two different causes. When the
+/// runtime already received this exact turn and no session row existed for its
+/// conversation (the first message of a brand-new chat registers its
+/// `/c/<id>` session only after the send), the caller's source session is not
+/// registered yet and the model can act on that.
+///
+/// The record is keyed by provider plus canonical turn digest, not by
+/// conversation or caller, so within its 10-minute window one rejected observe
+/// also relabels another conversation's miss of the same canonical text. That
+/// alias only ever changes this reason string: binding still needs an exact
+/// source turn, so the fact stays `bound:false` and no task is stamped. Every
+/// miss without a matching record — a registered session whose turn digest
+/// differs, a stale generation, a row that fails a fence, or expired evidence —
+/// stays the generic `source_turn_not_found`.
+fn source_turn_unbound_reason_for_caller(
+    store: &mut StateStore,
+    error: &str,
+    provider: &str,
+    user_text_sha256: &str,
+    now: i64,
+) -> &'static str {
+    if error == "browser_current_turn_not_found"
+        && webchat_adapter_binds_parent_session(provider)
+        && store.browser_source_turn_unregistered(provider, user_text_sha256, now)
+    {
+        return "source_session_not_registered";
+    }
+    source_turn_unbound_reason(error)
 }
 
 fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
@@ -291,6 +443,129 @@ fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
         .flatten()
 }
 
+/// The `parent_session` fact for one public `herdr_prompt` call (#770).
+///
+/// `herdr_prompt` cannot bind: it only reuses an existing caller-session
+/// mapping, and its epoch-5 schema carries no turn evidence. A WebChat caller
+/// must still be told which of the two happened, otherwise the model believes
+/// the dispatch is bound to its conversation and never switches to the
+/// evidence-based `agent.task.dispatch` path. Local/trusted callers have no
+/// WebChat conversation to bind, so they keep the unchanged result shape.
+///
+/// A returned task is authoritative: an idempotent replay reports the task that
+/// was actually stored, so the fact must not claim the mapping this call would
+/// have reused. Only a result without a `task` object (a validation or dispatch
+/// error) falls back to the live mapping.
+fn herdr_prompt_parent_session_fact(
+    context: &RuntimeContext<'_>,
+    result: &Value,
+    parent_session_ref: Option<&str>,
+) -> Option<Value> {
+    context.caller_webchat_authorization?;
+    let caller_session = context.caller_browser_session?;
+    if !webchat_adapter_binds_parent_session(&caller_session.provider) {
+        return None;
+    }
+    let bound = match result.get("task") {
+        Some(task) => task
+            .get("parent_session_ref")
+            .and_then(Value::as_str)
+            .is_some(),
+        None => parent_session_ref.is_some(),
+    };
+    Some(if bound {
+        // The task (or, without one, the reused mapping) already carries the
+        // ref, so the fact never echoes it.
+        json!({"bound": true})
+    } else {
+        json!({
+            "bound": false,
+            "reason": "tool_does_not_bind",
+            "message": "herdr_prompt does not bind a parent session. Call herdr_call with method \"herdr_mcp.agent.task.dispatch\" and pass the verbatim current user turn as current_user_message.",
+        })
+    })
+}
+
+/// Explicit evidence is authoritative: every miss stops binding without fallback.
+fn explicit_agent_task_parent_session(
+    context: &RuntimeContext<'_>,
+    value: &Value,
+) -> AgentTaskParentSession {
+    let Some(session_ref) = value.as_str().filter(|value| {
+        !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control)
+    }) else {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_invalid");
+    };
+    let Ok(store) = context.state_store.lock() else {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_state_store_unavailable");
+    };
+    let session = match store.browser_resource(session_ref) {
+        Ok(Some(session)) => session,
+        Ok(None) => return AgentTaskParentSession::Unbound("explicit_parent_session_unknown_ref"),
+        Err(_) => return AgentTaskParentSession::Unbound("explicit_parent_session_binding_failed"),
+    };
+    if session.kind != "session" {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_wrong_kind");
+    }
+    let Some(authorization) = context.caller_webchat_authorization else {
+        return if context.trusted_local_ipc && context.caller_browser_session.is_none() {
+            AgentTaskParentSession::Bound(session_ref.to_owned())
+        } else {
+            AgentTaskParentSession::Unbound("explicit_parent_session_caller_session_absent")
+        };
+    };
+    let Some(caller_session) = context.caller_browser_session else {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_caller_session_absent");
+    };
+    if !webchat_adapter_binds_parent_session(&session.provider)
+        || caller_session.provider != session.provider
+    {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_provider_mismatch");
+    }
+    let generation = match store.browser_provider_state(&session.endpoint_ref, &session.provider) {
+        Ok(Some(state)) => state.observation_generation,
+        Ok(None) => {
+            return AgentTaskParentSession::Unbound(
+                "explicit_parent_session_provider_generation_unknown",
+            );
+        }
+        Err(_) => return AgentTaskParentSession::Unbound("explicit_parent_session_binding_failed"),
+    };
+    if generation != session.observation_generation {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_stale_generation");
+    }
+    if !context
+        .caller_webchat_control_grants
+        .iter()
+        .any(|grant| webchat_control_grant_covers(grant, &session.endpoint_ref, &session.provider))
+    {
+        return AgentTaskParentSession::Unbound("explicit_parent_session_grant_missing");
+    }
+    if browser_resource_account_ref(&store, &session).is_err() {
+        return AgentTaskParentSession::Unbound(
+            "explicit_parent_session_session_account_unavailable",
+        );
+    }
+    // An endpoint grant does not prove conversation ownership. An explicit ref
+    // may only confirm an existing mapping; first-time binding needs a source turn.
+    match store.resolve_browser_caller_session(
+        &authorization.principal_ref,
+        &caller_session.provider,
+        &caller_session.opaque_session_id,
+    ) {
+        Ok(Some(existing)) if existing == session_ref => {
+            AgentTaskParentSession::Bound(session_ref.to_owned())
+        }
+        Ok(Some(_)) => {
+            AgentTaskParentSession::Unbound("explicit_parent_session_caller_session_conflict")
+        }
+        Ok(None) => {
+            AgentTaskParentSession::Unbound("explicit_parent_session_caller_session_unmapped")
+        }
+        Err(_) => AgentTaskParentSession::Unbound("explicit_parent_session_binding_failed"),
+    }
+}
+
 /// Resolve the `parent_session_ref` for one WebChat task dispatch.
 ///
 /// `current_user_message` is optional evidence: without it the dispatch keeps
@@ -303,11 +578,22 @@ fn agent_task_dispatch_parent_session(
     context: &RuntimeContext<'_>,
     params: &Value,
 ) -> AgentTaskParentSession {
+    if let Some(value) = params.get("parent_session_ref") {
+        return explicit_agent_task_parent_session(context, value);
+    }
     let current_user_message = match current_user_message_param(params) {
         Ok(Some(message)) => message,
         Ok(None) => return AgentTaskParentSession::NotAttempted,
         Err(()) => return AgentTaskParentSession::Unbound("current_user_message_invalid"),
     };
+    // #774: the Edge knows which enrolled device hosts the caller's browser. When
+    // it says another device, the source turn was written to that device's
+    // runtime only, so the lookup below cannot succeed here. Report the
+    // actionable reason before touching the store instead of a misleading
+    // `source_turn_not_found`; absent or same-device keeps today's behavior.
+    if context.caller_browser_on_other_device {
+        return AgentTaskParentSession::Unbound("caller_browser_on_other_device");
+    }
     // A local/trusted IPC caller has no WebChat identity to bind, so the
     // parameter changes nothing for it.
     let Some(authorization) = context.caller_webchat_authorization else {
@@ -322,14 +608,21 @@ fn agent_task_dispatch_parent_session(
     let Ok(mut store) = context.state_store.lock() else {
         return AgentTaskParentSession::Unbound("state_store_unavailable");
     };
-    let source_user_text_sha256 = browser_sha256(current_user_message);
+    let source_user_text_sha256 = source_turn_sha256(current_user_message);
     let observed_at = browser_epoch_ms();
-    let (session_ref, expected_generation) = match store
-        .resolve_browser_source_turn(&source_user_text_sha256, observed_at)
-    {
-        Ok(value) => value,
-        Err(error) => return AgentTaskParentSession::Unbound(source_turn_unbound_reason(&error)),
-    };
+    let (session_ref, expected_generation) =
+        match store.resolve_browser_source_turn(&source_user_text_sha256, observed_at) {
+            Ok(value) => value,
+            Err(error) => {
+                return AgentTaskParentSession::Unbound(source_turn_unbound_reason_for_caller(
+                    &mut store,
+                    &error,
+                    &caller_session.provider,
+                    &source_user_text_sha256,
+                    observed_at,
+                ));
+            }
+        };
     let session = match store.browser_resource(&session_ref) {
         Ok(Some(value)) => value,
         Ok(None) => return AgentTaskParentSession::Unbound("source_turn_not_found"),
@@ -721,6 +1014,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 let mut prompt_params = params.clone();
                 if let Some(object) = prompt_params.as_object_mut() {
                     object.remove("current_user_message");
+                    object.remove("parent_session_ref");
                 }
                 let mut result = prompt::run_with_parent_session(
                     context.client,
@@ -728,20 +1022,46 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &prompt_params,
                     parent_session_ref.as_deref(),
                 );
-                if let Some(fact) = agent_task_parent_session_fact(&binding, &result)
+                let diagnostic = source_turn_unbound_diagnostic(context, &binding, &params);
+                if let Some(fact) = agent_task_parent_session_fact(&binding, &result, diagnostic)
                     && let Some(object) = result.as_object_mut()
                 {
                     object.insert("parent_session".to_owned(), fact);
                 }
                 result
+            } else if method == prompt::AGENT_TASK_REPORT_METHOD {
+                if !context.trusted_local_ipc
+                    || context.caller_browser_session.is_some()
+                    || context.caller_webchat_authorization.is_some()
+                    || !context.caller_webchat_control_grants.is_empty()
+                    || !context.caller_page_assist_grants.is_empty()
+                {
+                    json!({"ok": false, "code": "worker_report_requires_trusted_local"})
+                } else {
+                    prompt::task_call_with_parent_session(context.prompt, method, &params, None)
+                }
+            } else if method == prompt::decision_gates::RESOLVE {
+                // No MCP principal, including trusted IPC and browser actuation,
+                // can assert that it is a human. Only the independent CLI may resolve.
+                json!({"ok": false, "code": "gate_resolution_requires_human"})
             } else if method.starts_with("herdr_mcp.agent.task.") {
                 let parent_session_ref = prompt_parent_session_ref(context);
-                prompt::task_call_with_parent_session(
-                    context.prompt,
-                    method,
-                    &params,
-                    parent_session_ref.as_deref(),
-                )
+                if method.starts_with("herdr_mcp.agent.task.gate.")
+                    && parent_session_ref.is_none()
+                    && (context.caller_browser_session.is_some()
+                        || context.caller_webchat_authorization.is_some()
+                        || !context.caller_webchat_control_grants.is_empty()
+                        || !context.caller_page_assist_grants.is_empty())
+                {
+                    json!({"ok": false, "code": "agent_task_parent_unbound"})
+                } else {
+                    prompt::task_call_with_parent_session(
+                        context.prompt,
+                        method,
+                        &params,
+                        parent_session_ref.as_deref(),
+                    )
+                }
             } else if method == pane_width::SPLIT_METHOD {
                 // A horizontal split must not create a pane whose agent output
                 // can only be captured as wrapping noise (#684).
@@ -827,12 +1147,22 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         ),
         "herdr_prompt" => {
             let parent_session_ref = prompt_parent_session_ref(context);
-            prompt::run_with_parent_session(
+            let mut result = prompt::run_with_parent_session(
                 context.client,
                 context.prompt,
                 &arguments,
                 parent_session_ref.as_deref(),
-            )
+            );
+            // #770: a WebChat caller must never be left silently unbound. The
+            // fact is added to the unchanged prompt result; it never changes
+            // `ok` and never fails the prompt.
+            if let Some(fact) =
+                herdr_prompt_parent_session_fact(context, &result, parent_session_ref.as_deref())
+                && let Some(object) = result.as_object_mut()
+            {
+                object.insert("parent_session".to_owned(), fact);
+            }
+            result
         }
         "herdr_skill" => context
             .skill
@@ -3518,10 +3848,10 @@ fn browser_dispatch_submit(
                 // dispatch uncertain and the evidence unwritten (fail closed).
                 //
                 // The provider renders composer line breaks as blank lines, so
-                // the durable turn identity is the whitespace-trimmed submitted
-                // text, exactly like `source_turn.observe` and the WebChat
-                // binding path.
-                let turn_digest = browser_sha256(message.trim());
+                // the durable turn identity is the canonical submitted text
+                // (`canonical_source_turn_text`), exactly like
+                // `source_turn.observe` and the WebChat binding path.
+                let turn_digest = source_turn_sha256(message);
                 store.settle_browser_dispatch_with_source_turn(
                     settlement,
                     crate::state_store::BrowserDispatchSourceTurn {
@@ -4740,9 +5070,36 @@ fn browser_session_create_reconcile_uncertain_inner(
     }
     let (app_refusal_reason, app_selection_probe) =
         browser_session_create_app_refusal_fields(delivery_state, &evidence);
+    // A refused create must name its fixed extension reason; without it a
+    // composer/readiness refusal is indistinguishable from an unknown failure.
+    // A rejection found by reconciliation reports the same shape as the first
+    // attempt, so a caller reading `delivery_evidence.error` is never left with
+    // an empty object.
+    let failure = BrowserCreateFailureProjection::project(
+        delivery_state,
+        &evidence,
+        app_refusal_reason.as_deref(),
+        None,
+    );
+    if delivery_state == BrowserDeliveryState::Rejected
+        && let Some(reason) = failure.reason.as_deref()
+    {
+        eprintln!(
+            "browser session.create rejected: reason={reason} reservation={}",
+            settled.reservation_ref
+        );
+    }
+    let delivery_evidence = browser_session_create_public_delivery_evidence(
+        evidence.result.as_ref(),
+        failure.evidence_error.as_deref(),
+        app_selection_probe.as_ref(),
+        failure.composer_busy_probe.as_ref(),
+        failure.hint,
+    );
     let mut value = json!({
         "ok": false,
         "code": delivery_state.as_str(),
+        "reason": failure.reason,
         "reservation_ref": settled.reservation_ref,
         "reservation_state": settled.state,
         "delivery_state": settled.delivery_state,
@@ -4750,9 +5107,169 @@ fn browser_session_create_reconcile_uncertain_inner(
         "app_selection_probe": app_selection_probe,
         "replayed": replayed,
         "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
+        "delivery_evidence": delivery_evidence,
     });
+    if let Some(probe) = failure.composer_busy_probe {
+        value["composer_busy_probe"] = probe;
+    }
+    if let Some(hint) = failure.hint {
+        value["hint"] = json!(hint);
+    }
     browser_session_apply_classification_reason(&mut value, classification_reason);
     value
+}
+
+/// Fixed vocabulary of extension rejection codes for `browser_session.create`.
+/// The extension observes untrusted provider state and can report arbitrary
+/// strings, so only these machine codes cross the runtime boundary. An
+/// unrecognized string is dropped, never echoed.
+///
+/// Membership does not imply the code is reachable on today's emission shape.
+/// `browser_create_content_dispatch_failed` and
+/// `browser_create_dispatch_setup_failed` are posted from the background with
+/// `rejected: false` + `command_accepted: true`, so they classify as uncertain
+/// (missing stable resource ref) and never reach this rejection projection;
+/// they are listed so a rejected emission of the same code is already covered.
+/// `browser_operation_unavailable` is emitted for operations other than
+/// `session.create` / `dispatch.submit`; it is listed because a create content
+/// script can still report it. Uncertain classification is deliberately
+/// unchanged — this list only decides how an already-rejected create is named.
+const BROWSER_CREATE_REJECTION_REASONS: &[&str] = &[
+    "browser_create_composer_unavailable",
+    "browser_create_composer_busy",
+    "browser_create_params_invalid",
+    "browser_create_submit_failed",
+    "browser_adapter_not_ready",
+    "chat_mode_ambiguous",
+    "chat_mode_switch_failed",
+    "chat_mode_switch_timeout",
+    "browser_operation_unavailable",
+    "browser_actuation_protocol_mismatch",
+    "browser_create_content_reason_missing",
+    "browser_create_content_response_missing",
+    "browser_create_content_dispatch_failed",
+    "browser_create_dispatch_setup_failed",
+];
+
+/// Actionable hint attached to a busy composer rejection. Fixed strings only:
+/// the probe booleans select between them, their contents are never quoted.
+const BROWSER_CREATE_COMPOSER_BUSY_HINT_DRAFT: &str =
+    "composer has existing content (possibly a restored ChatGPT draft); clear it and retry";
+const BROWSER_CREATE_COMPOSER_BUSY_HINT_GENERIC: &str =
+    "composer is busy; wait until it is idle and retry";
+
+/// The rejected-create reason after the fixed allowlist, if any.
+fn browser_create_rejection_reason(
+    evidence: &BrowserPostconditionEvidence,
+) -> Option<&'static str> {
+    let reason = evidence
+        .result
+        .as_ref()
+        .and_then(|result| result.get("error"))
+        .and_then(Value::as_str)?;
+    BROWSER_CREATE_REJECTION_REASONS
+        .iter()
+        .copied()
+        .find(|known| *known == reason)
+}
+
+/// Composer busy probe for a create rejection, reduced to the busy/idle
+/// booleans and small counts the create surface promises. Provider strings
+/// (including `busy_reason` free text) never cross this boundary.
+fn browser_session_create_composer_busy_probe(
+    evidence: &BrowserPostconditionEvidence,
+) -> Option<Value> {
+    const KEYS: &[&str] = &[
+        "input_mounted",
+        "input_has_content",
+        "input_text_length",
+        "input_text_equals_placeholder",
+        "input_has_placeholder_node",
+        "app_pill_count",
+        "stop_control",
+        "assistant_streaming",
+        "assistant_tools_in_progress",
+        "stop_candidate_raw_count",
+        "busy_reason",
+    ];
+    // `browser_composer_busy_probe` already allowlists types, caps counts and
+    // closes the `busy_reason` enum; this narrows it to the create vocabulary.
+    let probe = browser_composer_busy_probe(evidence);
+    let object = probe.as_object()?;
+    let mut out = serde_json::Map::new();
+    for key in KEYS {
+        if let Some(value) = object.get(*key) {
+            out.insert((*key).to_owned(), value.clone());
+        }
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
+}
+
+fn browser_create_composer_busy_hint(probe: Option<&Value>) -> &'static str {
+    let flag = |key: &str| {
+        probe
+            .and_then(|probe| probe.get(key))
+            .and_then(Value::as_bool)
+            == Some(true)
+    };
+    if flag("input_has_content")
+        && !flag("stop_control")
+        && !flag("assistant_streaming")
+        && !flag("assistant_tools_in_progress")
+    {
+        BROWSER_CREATE_COMPOSER_BUSY_HINT_DRAFT
+    } else {
+        BROWSER_CREATE_COMPOSER_BUSY_HINT_GENERIC
+    }
+}
+
+/// How a refused `browser_session.create` names its failure.
+struct BrowserCreateFailureProjection {
+    /// Top-level `reason`. The bounded resource-unavailable reason keeps its
+    /// existing precedence, then the fixed App-refusal and rejection codes.
+    reason: Option<String>,
+    /// `delivery_evidence.error`: fixed vocabularies only.
+    evidence_error: Option<String>,
+    composer_busy_probe: Option<Value>,
+    hint: Option<&'static str>,
+}
+
+impl BrowserCreateFailureProjection {
+    fn project(
+        delivery_state: BrowserDeliveryState,
+        evidence: &BrowserPostconditionEvidence,
+        app_refusal_reason: Option<&str>,
+        resource_unavailable_reason: Option<&str>,
+    ) -> Self {
+        let rejection_reason = browser_create_rejection_reason(evidence);
+        let reason = resource_unavailable_reason
+            .map(str::to_owned)
+            .or_else(|| match delivery_state {
+                BrowserDeliveryState::Rejected => app_refusal_reason.map(str::to_owned),
+                _ => None,
+            })
+            .or_else(|| rejection_reason.map(str::to_owned));
+        // Never copy the generic resource-unavailable reason into the public
+        // evidence: only the fixed App-refusal tokens and the rejection
+        // allowlist are stable enough to publish there.
+        let evidence_error = app_refusal_reason
+            .map(str::to_owned)
+            .or_else(|| rejection_reason.map(str::to_owned));
+        let busy_composer = evidence_error.as_deref() == Some("browser_create_composer_busy");
+        let composer_busy_probe = if busy_composer {
+            browser_session_create_composer_busy_probe(evidence)
+        } else {
+            None
+        };
+        let hint =
+            busy_composer.then(|| browser_create_composer_busy_hint(composer_busy_probe.as_ref()));
+        Self {
+            reason,
+            evidence_error,
+            composer_busy_probe,
+            hint,
+        }
+    }
 }
 
 fn browser_session_create_app_refusal_fields(
@@ -4825,8 +5342,10 @@ fn browser_session_create_app_refusal_fields(
 
 fn browser_session_create_public_delivery_evidence(
     result: Option<&Value>,
-    app_refusal_reason: Option<&str>,
+    error_reason: Option<&str>,
     app_selection_probe: Option<&Value>,
+    composer_busy_probe: Option<&Value>,
+    hint: Option<&str>,
 ) -> Value {
     // The extension observes untrusted provider content. Never echo arbitrary
     // objects, page text, account profile JSON, cookies or token-shaped data.
@@ -4932,11 +5451,17 @@ fn browser_session_create_public_delivery_evidence(
             }
         }
     }
-    if let Some(reason) = app_refusal_reason {
+    if let Some(reason) = error_reason {
         public.insert("error".to_owned(), Value::String(reason.to_owned()));
     }
     if let Some(probe) = app_selection_probe {
         public.insert("app_selection_probe".to_owned(), probe.clone());
+    }
+    if let Some(probe) = composer_busy_probe {
+        public.insert("composer_busy_probe".to_owned(), probe.clone());
+    }
+    if let Some(hint) = hint {
+        public.insert("hint".to_owned(), Value::String(hint.to_owned()));
     }
     Value::Object(public)
 }
@@ -5453,6 +5978,12 @@ fn current_user_message_param(params: &Value) -> Result<Option<&str>, ()> {
     if message.len() > 262_144 {
         return Err(());
     }
+    // A message made only of App-mention tokens canonicalizes to the empty
+    // string, which every other mention-only turn shares: it carries no
+    // identity and must never resolve a source turn (#741).
+    if canonical_source_turn_text(message).is_empty() {
+        return Err(());
+    }
     Ok(Some(message))
 }
 
@@ -5476,7 +6007,7 @@ fn browser_session_archive_params_from_current_turn(
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
     }
     let idempotency_key = browser_required_idempotency_key(params)?;
-    let source_user_text_sha256 = browser_sha256(current_user_message);
+    let source_user_text_sha256 = source_turn_sha256(current_user_message);
     let observed_at = browser_epoch_ms();
     let (session_ref, expected_generation) =
         match store.resolve_browser_source_turn(&source_user_text_sha256, observed_at) {
@@ -5880,15 +6411,31 @@ fn browser_session_create(
     }
     let (app_refusal_reason, app_selection_probe) =
         browser_session_create_app_refusal_fields(delivery_state, &evidence);
+    let failure = BrowserCreateFailureProjection::project(
+        delivery_state,
+        &evidence,
+        app_refusal_reason.as_deref(),
+        unavailable_reason.as_deref(),
+    );
+    if delivery_state == BrowserDeliveryState::Rejected
+        && let Some(reason) = failure.reason.as_deref()
+    {
+        eprintln!(
+            "browser session.create rejected: reason={reason} reservation={}",
+            updated.reservation_ref
+        );
+    }
     let delivery_evidence = browser_session_create_public_delivery_evidence(
         evidence.result.as_ref(),
-        app_refusal_reason.as_deref(),
+        failure.evidence_error.as_deref(),
         app_selection_probe.as_ref(),
+        failure.composer_busy_probe.as_ref(),
+        failure.hint,
     );
-    json!({
+    let mut response = json!({
         "ok": false,
         "code": unavailable_reason.as_deref().unwrap_or_else(|| observed_delivery_state.as_str()),
-        "reason": unavailable_reason,
+        "reason": failure.reason,
         "operation": BrowserOperation::SessionCreate.method(),
         "reservation_ref": updated.reservation_ref,
         "reservation_state": updated.state,
@@ -5898,7 +6445,14 @@ fn browser_session_create(
         "app_refusal_reason": app_refusal_reason,
         "app_selection_probe": app_selection_probe,
         "delivery_evidence": delivery_evidence,
-    })
+    });
+    if let Some(probe) = failure.composer_busy_probe {
+        response["composer_busy_probe"] = probe;
+    }
+    if let Some(hint) = failure.hint {
+        response["hint"] = json!(hint);
+    }
+    response
 }
 
 fn browser_session_open(
@@ -6119,7 +6673,294 @@ pub(crate) fn browser_sha256(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-fn browser_epoch_ms() -> i64 {
+/// App-name tokens ChatGPT renders for a Herdr app mention are recognized at
+/// the leading edge with an optional `@` or
+/// `$` prefix, while whole `@name` tokens remain recognized anywhere in text.
+///
+/// The list is ordered longest-first: a longer token that matches at the
+/// leading edge must be tested before its shorter prefix (see
+/// [`leading_source_turn_mention_end`]).
+const SOURCE_TURN_APP_MENTION_TOKENS: &[&str] = &["herdr-mcp", "herdr_mcp", "herdr"];
+
+/// How the composer bubble renders the app chip when it is not a token:
+/// `Herdr MCP`, with one plain space.
+const SOURCE_TURN_APP_DISPLAY_LABEL: &str = "Herdr MCP";
+
+/// Quote pairs a bubble or the model may wrap the whole turn in.
+const SOURCE_TURN_QUOTE_PAIRS: &[(char, char)] = &[
+    ('\u{201c}', '\u{201d}'),
+    ('"', '"'),
+    ('\u{300c}', '\u{300d}'),
+    ('\u{300e}', '\u{300f}'),
+];
+
+/// Domain separator for source-turn digests. Digests written before canonical
+/// source-turn text (#741), including raw-text archive intents and rows an
+/// older binary writes after a rollback, are SHA-256 of a UTF-8 string. They
+/// must never equal a canonical digest: an old `@herdr archive this` row would
+/// otherwise be indistinguishable from a new `archive this` turn. A printable
+/// prefix is not enough, because legacy raw text can spell out that prefix. The
+/// separator therefore starts with `0xFF`, a byte that never occurs in valid
+/// UTF-8, so no legacy raw-text digest can share a preimage with a canonical
+/// digest. Every pre-#741 row fails closed until it is re-observed or expires
+/// with the 24h retention window.
+const SOURCE_TURN_DIGEST_DOMAIN: &[u8] = b"\xffherdr-mcp/source-turn/v2\n";
+
+/// The one canonical form of a user turn used for every source-turn digest.
+///
+/// The DOM observation (`source_turn.observe`), the runtime-settled dispatch
+/// turn, the WebChat `agent.task.dispatch` binding, and the archive
+/// current-turn path must hash the same text, but each surface renders the
+/// same turn slightly differently. Canonicalization therefore applies Unicode
+/// NFC, removes invisible format/bidi controls, treats NBSP/BOM as whitespace,
+/// strips one or more leading app-mention renderings (`@name`, `$name`, bare
+/// `name`, `Herdr MCP`, `[name](target)`, or `<@name>`) with an optional
+/// separator, unwraps outer quote pairs and one single- or triple-backtick
+/// fence, drops whole `@name` tokens anywhere, collapses whitespace runs to
+/// one space, and trims.
+///
+/// The transform is deterministic and idempotent: `canonical(canonical(x)) ==
+/// canonical(x)`.
+pub(crate) fn canonical_source_turn_text(text: &str) -> String {
+    let composed = icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(text);
+    let normalized: String = composed
+        .chars()
+        .filter(|character| !source_turn_invisible_format(*character))
+        .map(|character| match character {
+            '\u{00a0}' | '\u{feff}' => ' ',
+            other => other,
+        })
+        .collect();
+    // A `@name` token anywhere is presentation noise, so the mid-text filter
+    // runs between two leading-edge passes: the filter can expose a leading
+    // mention (and the second pass keeps the result a fixed point).
+    let leading = source_turn_normalize_leading(&normalized);
+    let filtered = leading
+        .split_whitespace()
+        .filter(|token| {
+            let Some(name) = token.strip_prefix('@') else {
+                return true;
+            };
+            !SOURCE_TURN_APP_MENTION_TOKENS
+                .iter()
+                .any(|mention| name.eq_ignore_ascii_case(mention))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    source_turn_normalize_leading(&filtered)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Invisible controls a chat bubble or model can insert inside a rendered
+/// mention: ZWSP, ZWNJ, ZWJ, word joiner, and the bidi embed/isolate ranges.
+fn source_turn_invisible_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Apply every leading-edge normalization to a fixed point: outer quote pairs,
+/// one backtick fence, one app mention, and the stray bubble backtick.
+fn source_turn_normalize_leading(text: &str) -> String {
+    let mut current = text.trim();
+    loop {
+        let next = source_turn_strip_leading_mention(source_turn_unwrap_backtick_fence(
+            source_turn_unwrap_outer_quotes(current).trim(),
+        ))
+        .trim();
+        if next == current {
+            return next.to_owned();
+        }
+        current = next;
+    }
+}
+
+/// Unwrap matching quote pairs that enclose the whole text, repeatedly, so the
+/// result stays a canonical fixed point.
+fn source_turn_unwrap_outer_quotes(text: &str) -> &str {
+    let mut current = text.trim();
+    loop {
+        let Some(first) = current.chars().next() else {
+            return current;
+        };
+        // Two characters are the minimum enclosing pair; a lone quote is text.
+        if current.len() == first.len_utf8() {
+            return current;
+        }
+        let Some(last) = current.chars().next_back() else {
+            return current;
+        };
+        let Some((_, close)) = SOURCE_TURN_QUOTE_PAIRS
+            .iter()
+            .find(|(open, _)| *open == first)
+        else {
+            return current;
+        };
+        if last != *close {
+            return current;
+        }
+        current = current[first.len_utf8()..current.len() - last.len_utf8()].trim();
+    }
+}
+
+/// Unwrap one outer single- or triple-backtick fence around the whole text.
+fn source_turn_unwrap_backtick_fence(text: &str) -> &str {
+    if text.len() >= 6 && text.starts_with("```") && text.ends_with("```") {
+        text[3..text.len() - 3].trim()
+    } else if text.len() >= 2 && text.starts_with('`') && text.ends_with('`') {
+        text[1..text.len() - 1].trim()
+    } else {
+        text
+    }
+}
+
+fn source_turn_strip_leading_mention(text: &str) -> &str {
+    let candidate = text.trim_start();
+    let Some(token_end) = leading_source_turn_mention_end(candidate) else {
+        return candidate;
+    };
+    let mut remainder = &candidate[token_end..];
+    remainder = remainder.trim_start();
+    if let Some(separator) = remainder.chars().next()
+        && source_turn_mention_separator(separator)
+    {
+        remainder = remainder[separator.len_utf8()..].trim_start();
+    }
+    source_turn_strip_bubble_backtick(remainder)
+}
+
+/// Drop the single stray backtick a bubble can leave immediately after a
+/// stripped mention. Only a leading backtick with no partner qualifies.
+fn source_turn_strip_bubble_backtick(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix('`') else {
+        return text;
+    };
+    if rest.contains('`') {
+        return text;
+    }
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return text;
+    }
+    rest
+}
+
+fn source_turn_mention_separator(character: char) -> bool {
+    character.is_whitespace() || matches!(character, ':' | '：' | ',' | '，' | '-' | '—')
+}
+
+/// A mention token may be followed by nothing, a separator, or a non-ASCII
+/// character: CJK text glued to the chip (`@herdr-mcp用…`) is still a mention.
+/// ASCII continuation means a longer word (`herdr-mcpx`), never a mention.
+fn source_turn_mention_boundary(character: char) -> bool {
+    source_turn_mention_separator(character) || !character.is_ascii()
+}
+
+fn leading_source_turn_mention_end(text: &str) -> Option<usize> {
+    if let Some(end) = source_turn_markdown_mention_end(text) {
+        return Some(end);
+    }
+    if let Some(end) = source_turn_angle_mention_end(text) {
+        return Some(end);
+    }
+    let (prefix_len, candidate) = match text.chars().next() {
+        Some('@' | '$') => (1, &text[1..]),
+        _ => (0, text),
+    };
+    if let Some(label_len) = source_turn_display_label_end(candidate) {
+        return Some(prefix_len + label_len);
+    }
+    for token in SOURCE_TURN_APP_MENTION_TOKENS {
+        let Some(candidate_token) = candidate.get(..token.len()) else {
+            continue;
+        };
+        if !candidate_token.eq_ignore_ascii_case(token) {
+            continue;
+        }
+        // A longer Herdr token that matched but failed the boundary check must
+        // never fall back to a shorter prefix: `herdr` would eat the `-`/`_`
+        // and turn `@herdr-mcp用…` into `mcp用…`.
+        let next = candidate[token.len()..].chars().next();
+        if next.is_some_and(|character| !source_turn_mention_boundary(character)) {
+            return None;
+        }
+        return Some(prefix_len + token.len());
+    }
+    None
+}
+
+/// Leading markdown / prompt link for a Herdr chip, e.g.
+/// `[$herdr-mcp](app://asdk_app_…)`.
+fn source_turn_markdown_mention_end(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix('[')?;
+    let label_end = rest.find(']')?;
+    let label = &rest[..label_end];
+    let name = match label.strip_prefix(['@', '$']) {
+        Some(name) => name,
+        None => label,
+    };
+    if !SOURCE_TURN_APP_MENTION_TOKENS
+        .iter()
+        .any(|token| name.eq_ignore_ascii_case(token))
+    {
+        return None;
+    }
+    let target = rest[label_end + 1..].strip_prefix('(')?;
+    let target_end = target.find(')')?;
+    let target_text = &target[..target_end];
+    if target_text.is_empty() || target_text.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(1 + label_end + 1 + 1 + target_end + 1)
+}
+
+/// Leading `<@name>` / `<$name>` for a Herdr chip.
+fn source_turn_angle_mention_end(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix('<')?;
+    let (prefix_len, candidate) = match rest.chars().next() {
+        Some('@' | '$') => (1, &rest[1..]),
+        _ => return None,
+    };
+    let token_len = SOURCE_TURN_APP_MENTION_TOKENS.iter().find_map(|token| {
+        let candidate_token = candidate.get(..token.len())?;
+        candidate_token
+            .eq_ignore_ascii_case(token)
+            .then_some(token.len())
+    })?;
+    if !candidate[token_len..].starts_with('>') {
+        return None;
+    }
+    Some(1 + prefix_len + token_len + 1)
+}
+
+/// Leading `Herdr MCP` display label, with an optional `@`/`$` already removed
+/// by the caller.
+fn source_turn_display_label_end(candidate: &str) -> Option<usize> {
+    let label_len = SOURCE_TURN_APP_DISPLAY_LABEL.len();
+    let label = candidate.get(..label_len)?;
+    if !label.eq_ignore_ascii_case(SOURCE_TURN_APP_DISPLAY_LABEL) {
+        return None;
+    }
+    let next = candidate[label_len..].chars().next();
+    if next.is_some_and(|character| !source_turn_mention_boundary(character)) {
+        return None;
+    }
+    Some(label_len)
+}
+
+/// Domain-separated SHA-256 of [`canonical_source_turn_text`]: the durable
+/// source-turn identity.
+pub(crate) fn source_turn_sha256(text: &str) -> String {
+    let canonical = canonical_source_turn_text(text);
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_TURN_DIGEST_DOMAIN);
+    hasher.update(canonical.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn browser_epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
@@ -6249,7 +7090,7 @@ fn browser_operation_call_with_controls(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(browser_sha256)
+            .map(source_turn_sha256)
     } else {
         None
     };
@@ -12151,6 +12992,277 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 mod tests {
 
     #[test]
+    fn source_turn_digest_never_equals_any_legacy_raw_text_digest() {
+        // Codex counterexample: legacy raw text that spells out a printable
+        // domain prefix must not reproduce a canonical digest.
+        for (legacy_raw, current) in [
+            (
+                "herdr-mcp/source-turn/v2\narchive this",
+                "@herdr archive this",
+            ),
+            ("herdr-mcp/source-turn/v2\narchive this", "archive this"),
+            (
+                "\u{ff}herdr-mcp/source-turn/v2\narchive this",
+                "archive this",
+            ),
+            ("archive this", "archive this"),
+        ] {
+            assert_ne!(browser_sha256(legacy_raw), source_turn_sha256(current));
+        }
+        assert_eq!(
+            source_turn_sha256("@herdr archive this"),
+            source_turn_sha256("archive this")
+        );
+    }
+
+    #[test]
+    fn canonical_source_turn_text_reduces_app_mention_renderings_only() {
+        let canonical = "用 dispatch 派发：回复 OK";
+        for variant in [
+            "@herdr-mcp 用 dispatch 派发：回复 OK",
+            "@Herdr\n用\u{00a0}dispatch 派发：回复 OK ",
+            "\u{feff}用 dispatch @herdr_mcp 派发：回复 OK",
+            "用 dispatch 派发：回复 OK",
+        ] {
+            assert_eq!(
+                canonical_source_turn_text(variant),
+                canonical,
+                "{variant:?}"
+            );
+        }
+        assert_eq!(
+            canonical_source_turn_text("cafe\u{301}"),
+            canonical_source_turn_text("caf\u{e9}")
+        );
+        // Leading mention renderings are dropped with their optional separator,
+        // while unrelated words and mid-text bare names remain identity.
+        assert_eq!(canonical_source_turn_text("herdrx 看看"), "herdrx 看看");
+        assert_eq!(canonical_source_turn_text("@herdr-mcp:"), "");
+        assert_eq!(
+            canonical_source_turn_text("herdr-mcp  用 dispatch"),
+            "用 dispatch"
+        );
+        assert_ne!(
+            source_turn_sha256("archive herdr conversation"),
+            source_turn_sha256("archive conversation"),
+            "a bare herdr word in the middle is user text"
+        );
+        let leading_variants = [
+            "@herdr-mcp X",
+            "$herdr-mcp X",
+            "herdr-mcp X",
+            "herdr X",
+            "HERDR_MCP X",
+            "herdr-mcp: X",
+            "herdr-mcp：X",
+            "herdr-mcp\nX",
+            " herdr-mcp `X` ",
+            "@herdr $HERDR_MCP: `X`",
+            "@herdr @herdr_mcp X",
+            "`X`",
+            "```X```",
+        ];
+        for variant in leading_variants {
+            assert_eq!(canonical_source_turn_text(variant), "X", "{variant:?}");
+        }
+        assert_ne!(
+            canonical_source_turn_text("派发：回复"),
+            canonical_source_turn_text("派发:回复")
+        );
+        // Pre-#741 rows hashed the raw trimmed text; no canonical digest may
+        // equal any of them, so an old `@herdr archive this` row can never be
+        // confused with a new `archive this` turn.
+        for legacy in ["回复 OK", "archive this", "@herdr archive this", ""] {
+            assert_ne!(source_turn_sha256(legacy), browser_sha256(legacy.trim()));
+            assert_ne!(
+                source_turn_sha256("@herdr archive this"),
+                browser_sha256(legacy)
+            );
+        }
+        assert_eq!(
+            source_turn_sha256(" 回复 OK "),
+            source_turn_sha256("回复 OK")
+        );
+        // Mention-only text has no identity: it is rejected as evidence.
+        assert_eq!(
+            canonical_source_turn_text(" @herdr  @herdr-mcp\u{00a0}"),
+            ""
+        );
+        for message in ["@herdr", "@herdr-mcp", "@HERDR_MCP @herdr"] {
+            assert_eq!(
+                current_user_message_param(&json!({ "current_user_message": message })),
+                Err(()),
+                "{message:?}"
+            );
+        }
+        for message in ["@herdr 归档", "herdr 归档"] {
+            assert_eq!(
+                current_user_message_param(&json!({ "current_user_message": message })),
+                Ok(Some(message))
+            );
+        }
+        for message in ["herdr-mcp", "$HERDR_MCP:"] {
+            assert_eq!(
+                current_user_message_param(&json!({ "current_user_message": message })),
+                Err(()),
+                "{message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_source_turn_text_matches_every_model_chip_rendering() {
+        // #777: the digest the extension stored for the observed bubble in the
+        // WebChat dispatch UAT. Every model rendering of the same chip must
+        // canonicalize to this same source turn.
+        const OBSERVED_SHA_PREFIX: &str = "0131a3e87a63";
+        const BODY: &str = "用 herdr_call 调 herdr_mcp.agent.task.dispatch，device 指定 MacBook Pro（dev_01M204VTSQXCASA2SP51STWT58），派给 MBP 上的 pi：列出当前项目。带上 current_user_message。";
+        const LINK: &str = "app://asdk_app_6acf8e6a3620819185cc77a5bc35faed";
+        let observed = source_turn_sha256(BODY);
+        assert!(
+            observed.starts_with(OBSERVED_SHA_PREFIX),
+            "canonicalizer changed the observed digest: {observed}"
+        );
+        assert_eq!(canonical_source_turn_text(BODY), BODY);
+        let same_turn = [
+            // Renderings that already bound before #777.
+            format!("@herdr-mcp {BODY}"),
+            format!("$herdr-mcp {BODY}"),
+            format!("herdr-mcp {BODY}"),
+            format!("@herdr {BODY}"),
+            format!("HERDR-MCP {BODY}"),
+            format!("@herdr-mcp：{BODY}"),
+            format!("@herdr-mcp, {BODY}"),
+            format!("@herdr-mcp\n{BODY}"),
+            format!("@herdr-mcp\u{3000}{BODY}"),
+            format!("`@herdr-mcp {BODY}`"),
+            format!("{BODY}\n"),
+            BODY.to_owned(),
+            // Renderings added in #777.
+            format!("[$herdr-mcp]({LINK}) {BODY}"),
+            format!("[@herdr-mcp]({LINK}) {BODY}"),
+            format!("[herdr-mcp]({LINK}) {BODY}"),
+            format!("@Herdr MCP {BODY}"),
+            format!("Herdr MCP {BODY}"),
+            format!("<@herdr-mcp> {BODY}"),
+            format!("“@herdr-mcp {BODY}”"),
+            format!("\"@herdr-mcp {BODY}\""),
+            format!("「@herdr-mcp {BODY}」"),
+            format!("@herdr-mcp\u{200b} {BODY}"),
+            format!("\u{2068}@herdr-mcp\u{2069} {BODY}"),
+            format!("$herdr-mcp ` {BODY}"),
+            format!("@herdr-mcp{BODY}"),
+        ];
+        for variant in &same_turn {
+            assert_eq!(
+                source_turn_sha256(variant),
+                observed,
+                "variant {variant:?} canonicalized to {:?}",
+                canonical_source_turn_text(variant)
+            );
+            let once = canonical_source_turn_text(variant);
+            assert_eq!(canonical_source_turn_text(&once), once, "{variant:?}");
+        }
+        // Genuine text changes keep their own identity.
+        let ascii_punctuation = BODY
+            .replace('，', ",")
+            .replace('（', "(")
+            .replace('）', ")")
+            .replace('：', ":")
+            .replace('。', ".");
+        let distinct_turns = [
+            ascii_punctuation,
+            BODY.trim_end_matches('。').to_owned(),
+            format!("[@github](connectors/github) {BODY}"),
+            format!("herdr-mcpx {BODY}"),
+        ];
+        for variant in &distinct_turns {
+            assert_ne!(source_turn_sha256(variant), observed, "{variant:?}");
+            let once = canonical_source_turn_text(variant);
+            assert_eq!(canonical_source_turn_text(&once), once, "{variant:?}");
+        }
+        assert_eq!(
+            canonical_source_turn_text(&format!("[@github](connectors/github) {BODY}")),
+            format!("[@github](connectors/github) {BODY}"),
+            "a non-Herdr app link is user text"
+        );
+        assert!(
+            canonical_source_turn_text(&format!("herdr-mcpx {BODY}")).starts_with("herdr-mcpx "),
+            "an ASCII continuation is a longer word, not a chip"
+        );
+        // A glued chip still yields the whole token, never `mcp用…`.
+        assert_eq!(
+            canonical_source_turn_text(&format!("@herdr-mcp{BODY}")),
+            BODY,
+            "a CJK boundary ends the mention token"
+        );
+        // The display label is leading-only mention noise.
+        assert_eq!(
+            canonical_source_turn_text("派发 Herdr MCP 任务"),
+            "派发 Herdr MCP 任务"
+        );
+        // Mention-only renderings are still not evidence.
+        for mention_only in [
+            format!("[$herdr-mcp]({LINK})"),
+            "<@herdr-mcp>".to_owned(),
+            "“@herdr-mcp”".to_owned(),
+            "@Herdr MCP".to_owned(),
+            "Herdr MCP".to_owned(),
+            "@herdr-mcp\u{200b}".to_owned(),
+            "@herdr-mcp `".to_owned(),
+        ] {
+            assert_eq!(canonical_source_turn_text(&mention_only), "");
+            assert_eq!(
+                current_user_message_param(&json!({ "current_user_message": mention_only })),
+                Err(()),
+                "{mention_only:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_turn_unbound_log_line_carries_no_message_text() {
+        const MESSAGE: &str = "用 herdr_call 调 herdr_mcp.agent.task.dispatch，device 指定 MacBook Pro（dev_01M204VTSQXCASA2SP51STWT58），派给 MBP 上的 pi：列出当前项目。";
+        let canonical = canonical_source_turn_text(MESSAGE);
+        let digest = source_turn_sha256(MESSAGE);
+        let line = source_turn_unbound_log_line(
+            "source_turn_not_found",
+            &digest,
+            canonical.chars().count(),
+            Some(&digest),
+        );
+        assert_eq!(
+            line,
+            format!(
+                "herdr-mcp: agent.task.dispatch parent_session unbound reason=source_turn_not_found canonical_sha256_prefix={} canonical_chars={} latest_source_turn_sha256_prefix={}",
+                &digest[..12],
+                canonical.chars().count(),
+                &digest[..12]
+            )
+        );
+        let without_latest = source_turn_unbound_log_line(
+            "source_turn_stale",
+            &digest,
+            canonical.chars().count(),
+            None,
+        );
+        assert!(without_latest.ends_with(" latest_source_turn_sha256_prefix=none"));
+        assert!(without_latest.contains("reason=source_turn_stale canonical_sha256_prefix="));
+        for line in [&line, &without_latest] {
+            for forbidden in [
+                "herdr_call",
+                "MacBook",
+                "dev_01M204",
+                "列出当前项目",
+                "派给",
+                &canonical,
+            ] {
+                assert!(!line.contains(forbidden), "{line}");
+            }
+        }
+    }
+
+    #[test]
     fn browser_readback_text_canonical_ignores_composer_line_break_rendering() {
         let created = "Line one\nLine two\n\n- item";
         let stored = "Line one\n\nLine two\n\n\u{00a0}- item ";
@@ -12578,7 +13690,7 @@ mod tests {
                 .observe_browser_source_turn(
                     &session.resource_ref,
                     7,
-                    &browser_sha256("归档当前对话"),
+                    &source_turn_sha256("归档当前对话"),
                     observed_at,
                 )
                 .unwrap();
@@ -12724,7 +13836,7 @@ mod tests {
             .observe_browser_source_turn(
                 &second_session.resource_ref,
                 7,
-                &browser_sha256("归档第二个对话"),
+                &source_turn_sha256("归档第二个对话"),
                 observed_at + 1,
             )
             .unwrap();
@@ -12847,7 +13959,7 @@ mod tests {
         assert_eq!(
             reopened
                 .resolve_browser_source_turn(
-                    &browser_sha256("归档当前对话"),
+                    &source_turn_sha256("归档当前对话"),
                     observed_at + 24 * 60 * 60 * 1000 + 5_000,
                 )
                 .unwrap_err(),
@@ -14839,7 +15951,7 @@ mod tests {
         }
     }
 
-    fn app_activation_refusal_fixture()
+    fn browser_create_refusal_fixture()
     -> (std::sync::Arc<std::sync::Mutex<StateStore>>, String, String) {
         use crate::state_store::{
             BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
@@ -14929,7 +16041,7 @@ mod tests {
     fn webchat_create_refuses_unverified_app_activation_before_submitting() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let (store, endpoint_ref, account_ref) = app_activation_refusal_fixture();
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
         let actuator = RefusedAppActuator {
             calls: AtomicUsize::new(0),
         };
@@ -14963,7 +16075,7 @@ mod tests {
     fn browser_create_rejection_should_project_only_allowlisted_app_probe_keys() {
         use std::sync::atomic::AtomicUsize;
 
-        let (store, endpoint_ref, account_ref) = app_activation_refusal_fixture();
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
         let actuator = RefusedAppActuator {
             calls: AtomicUsize::new(0),
         };
@@ -14975,6 +16087,460 @@ mod tests {
         assert!(
             !result.to_string().contains("secret composer draft"),
             "only the allowlisted App probe keys may be projected: {result}"
+        );
+        // The App refusal keeps its own vocabulary: it is now also named as the
+        // failure reason, and it must not borrow the composer-busy hint.
+        assert_eq!(result["reason"], "required-app-not-found", "{result}");
+        assert!(result.get("hint").is_none(), "{result}");
+        assert!(
+            result.get("composer_busy_probe").is_none(),
+            "an App refusal is not a busy composer: {result}"
+        );
+    }
+
+    /// The extension's create evidence for one attempt, as a test script.
+    #[derive(Clone)]
+    struct ScriptedCreateEvidence {
+        result: Value,
+        resource_available: bool,
+        rejected: bool,
+        command_accepted: bool,
+    }
+
+    impl ScriptedCreateEvidence {
+        fn rejected(result: Value) -> Self {
+            Self {
+                result,
+                resource_available: true,
+                rejected: true,
+                command_accepted: false,
+            }
+        }
+
+        fn resource_unavailable(result: Value) -> Self {
+            Self {
+                result,
+                resource_available: false,
+                rejected: false,
+                command_accepted: false,
+            }
+        }
+
+        fn uncertain(result: Value) -> Self {
+            Self {
+                result,
+                resource_available: true,
+                rejected: false,
+                command_accepted: true,
+            }
+        }
+
+        fn into_evidence(self, expected_generation: i64) -> BrowserPostconditionEvidence {
+            let mut evidence =
+                BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+            evidence.browser_online = true;
+            evidence.resource_available = self.resource_available;
+            evidence.rejected = self.rejected;
+            evidence.command_accepted = self.command_accepted;
+            evidence.result = Some(self.result);
+            evidence
+        }
+    }
+
+    /// Stands in for the extension answering `session.create`: the actuation
+    /// evidence is scripted per call so refusal projection can be checked end
+    /// to end, and `reconcile_dispatch` scripts the polled evidence.
+    struct ScriptedCreateActuator {
+        calls: std::sync::atomic::AtomicUsize,
+        actuation: Vec<ScriptedCreateEvidence>,
+        reconcile: Option<ScriptedCreateEvidence>,
+    }
+
+    impl ScriptedCreateActuator {
+        fn new(actuation: ScriptedCreateEvidence) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                actuation: vec![actuation],
+                reconcile: None,
+            }
+        }
+
+        fn with_reconcile(mut self, evidence: ScriptedCreateEvidence) -> Self {
+            self.reconcile = Some(evidence);
+            self
+        }
+    }
+
+    impl BrowserActuator for ScriptedCreateActuator {
+        fn actuate(
+            &self,
+            _operation: &str,
+            _params: &Value,
+            expected_generation: i64,
+            _dispatch_id: Option<&str>,
+        ) -> Result<BrowserPostconditionEvidence, String> {
+            let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let scripted = self
+                .actuation
+                .get(index)
+                .or_else(|| self.actuation.last())
+                .expect("scripted create evidence")
+                .clone();
+            Ok(scripted.into_evidence(expected_generation))
+        }
+
+        fn reconcile_dispatch(
+            &self,
+            _reservation_ref: &str,
+            expected_generation: i64,
+        ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+            Ok(self
+                .reconcile
+                .clone()
+                .map(|scripted| scripted.into_evidence(expected_generation)))
+        }
+    }
+
+    fn create_session_with_scripted_actuator(
+        store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+        endpoint_ref: &str,
+        account_ref: &str,
+        actuator: &ScriptedCreateActuator,
+        idempotency_key: &str,
+    ) -> Value {
+        browser_operation_call_with_grant(
+            store,
+            "herdr_mcp.browser_session.create",
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "account_ref": account_ref,
+                "display_label": "Scripted create",
+                "message": "send the scripted message",
+                "expected_generation": 7,
+                "idempotency_key": idempotency_key,
+            }),
+            true,
+            Some(actuator),
+        )
+    }
+
+    /// user webchat create | Given a restored draft made the composer busy | When the extension refuses the create | Then the fixed code, the safe probe and an actionable hint reach the caller
+    #[test]
+    fn user_webchat_create_given_busy_composer_when_rejected_then_code_probe_and_draft_hint_are_surfaced()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::rejected(json!({
+            "error": "browser_create_composer_busy",
+            "message_submitted": false,
+            "retry_safe": true,
+            "composer_busy_probe": {
+                "input_mounted": true,
+                "input_has_content": true,
+                "input_text_length": 42,
+                "input_text_equals_placeholder": false,
+                "input_has_placeholder_node": true,
+                "app_pill_count": 0,
+                "stop_control": false,
+                "assistant_streaming": false,
+                "assistant_tools_in_progress": false,
+                "stop_candidate_raw_count": 0,
+            }
+        })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-busy-1",
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "rejected", "{result}");
+        assert_eq!(result["delivery_state"], "rejected", "{result}");
+        assert_eq!(
+            result["reason"], "browser_create_composer_busy",
+            "the extension's fixed code is the diagnosis: {result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["error"], "browser_create_composer_busy",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["hint"],
+            "composer has existing content (possibly a restored ChatGPT draft); clear it and retry",
+            "{result}"
+        );
+        assert_eq!(
+            result["hint"], result["delivery_evidence"]["hint"],
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"]["input_has_content"], true,
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"]["input_mounted"], true,
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"]["stop_control"], false,
+            "{result}"
+        );
+        assert_eq!(
+            result["composer_busy_probe"], result["delivery_evidence"]["composer_busy_probe"],
+            "{result}"
+        );
+        assert!(
+            result["app_refusal_reason"].is_null(),
+            "a busy composer is not an App refusal: {result}"
+        );
+    }
+
+    /// user webchat create | Given a busy rejection whose probe carries page text and a generating turn | When projected | Then only the safe booleans and capped counts survive and the hint is the generic one
+    #[test]
+    fn user_webchat_create_given_generating_turn_when_probe_projected_then_strings_dropped_and_counts_capped()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::rejected(json!({
+            "error": "browser_create_composer_busy",
+            "composer_busy_probe": {
+                "input_mounted": true,
+                "input_has_content": false,
+                "input_text_length": 999999,
+                "stop_control": true,
+                "assistant_streaming": true,
+                "assistant_tools_in_progress": true,
+                "app_pill_count": 999999,
+                "stop_candidate_raw_count": 999999,
+                "busy_reason": "hello world",
+                "claude_latest_row_role": "assistant",
+                "page_text": "secret draft 继续 https://example.com/c/1",
+                "input_text": "secret draft 继续 https://example.com/c/1"
+            }
+        })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-busy-2",
+        );
+        let probe = &result["delivery_evidence"]["composer_busy_probe"];
+        assert_eq!(probe["stop_control"], true, "{result}");
+        assert_eq!(probe["assistant_streaming"], true, "{result}");
+        assert_eq!(probe["input_text_length"], 10_000, "{result}");
+        assert_eq!(probe["app_pill_count"], 10_000, "{result}");
+        assert_eq!(probe["stop_candidate_raw_count"], 10_000, "{result}");
+        assert!(probe.get("page_text").is_none(), "{result}");
+        assert!(probe.get("input_text").is_none(), "{result}");
+        assert!(probe.get("busy_reason").is_none(), "{result}");
+        assert!(probe.get("claude_latest_row_role").is_none(), "{result}");
+        assert!(!result.to_string().contains("secret draft"), "{result}");
+        assert!(!result.to_string().contains("继续"), "{result}");
+        assert_eq!(
+            result["delivery_evidence"]["hint"],
+            "composer is busy; wait until it is idle and retry",
+            "a generating turn is not a restored draft: {result}"
+        );
+    }
+
+    /// user webchat create | Given the extension reports a rejection code the runtime does not know | When the create is rejected | Then nothing is echoed and no hint is attached
+    #[test]
+    fn user_webchat_create_given_unknown_rejection_code_when_rejected_then_reason_stays_empty() {
+        for (index, unknown) in [
+            "browser_create_tab_open_failed",
+            "browser_create_scope_unavailable",
+            "secret draft !!!",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+            let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::rejected(json!({
+                "error": unknown,
+                "composer_busy_probe": {"input_has_content": true},
+            })));
+            let result = create_session_with_scripted_actuator(
+                &store,
+                &endpoint_ref,
+                &account_ref,
+                &actuator,
+                &format!("scripted-create-unknown-{index}"),
+            );
+            assert_eq!(result["code"], "rejected", "{result}");
+            assert!(
+                result["reason"].is_null(),
+                "{unknown} must stay dropped: {result}"
+            );
+            assert!(
+                result["delivery_evidence"].get("error").is_none(),
+                "{unknown} must not reach the public evidence: {result}"
+            );
+            assert!(
+                result.get("hint").is_none(),
+                "no hint for an unknown refusal: {result}"
+            );
+            assert!(!result.to_string().contains(unknown), "{result}");
+            assert!(!result.to_string().contains("secret draft"), "{result}");
+        }
+    }
+
+    /// user webchat create | Given the browser could not actuate at all | When the create fails | Then the bounded resource-unavailable reason keeps its place and the App-evidence error stays reserved for fixed codes
+    #[test]
+    fn user_webchat_create_given_resource_unavailable_when_reason_bounded_then_evidence_error_is_not_filled()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::resource_unavailable(
+            json!({"error": "browser_create_runtime_unavailable"}),
+        ));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-unavailable-1",
+        );
+        assert_eq!(
+            result["code"], "browser_create_runtime_unavailable",
+            "{result}"
+        );
+        assert_eq!(
+            result["reason"], "browser_create_runtime_unavailable",
+            "{result}"
+        );
+        assert_eq!(result["delivery_state"], "resource_unavailable", "{result}");
+        assert!(
+            result["delivery_evidence"].get("error").is_none(),
+            "the generic resource-unavailable reason is not a fixed evidence code: {result}"
+        );
+        assert!(result.get("hint").is_none(), "{result}");
+    }
+
+    /// user webchat create | Given a fresh tab whose composer never mounted | When the extension refuses with its live rejected shape | Then the fixed code is surfaced as the reason without a busy hint
+    #[test]
+    fn user_webchat_create_given_composer_unavailable_when_rejected_then_code_surfaced_without_hint()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        // `browserRejectedEvidence` in the content script keeps the resource
+        // available and only refuses the actuation, so the live shape is a
+        // rejected create, not a resource-unavailable one.
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::rejected(json!({
+            "error": "browser_create_composer_unavailable",
+            "message_submitted": false,
+            "retry_safe": true,
+        })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-composer-unavailable-1",
+        );
+        assert_eq!(result["code"], "rejected", "{result}");
+        assert_eq!(result["delivery_state"], "rejected", "{result}");
+        assert_eq!(
+            result["reason"], "browser_create_composer_unavailable",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["error"], "browser_create_composer_unavailable",
+            "{result}"
+        );
+        assert!(
+            result.get("hint").is_none(),
+            "an unmounted composer is not a busy composer: {result}"
+        );
+        assert!(result.get("composer_busy_probe").is_none(), "{result}");
+    }
+
+    /// user webchat create | Given a resource-unavailable create whose token is on the fixed allowlist | When projected | Then the allowlisted token is the one copied into the public evidence
+    #[test]
+    fn user_webchat_create_given_resource_unavailable_allowlisted_code_when_projected_then_evidence_error_is_filled()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::resource_unavailable(
+            json!({"error": "browser_create_content_reason_missing"}),
+        ));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-unavailable-allowlisted-1",
+        );
+        assert_eq!(
+            result["code"], "browser_create_content_reason_missing",
+            "{result}"
+        );
+        assert_eq!(
+            result["reason"], "browser_create_content_reason_missing",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["error"], "browser_create_content_reason_missing",
+            "an allowlisted token may fill the public evidence error: {result}"
+        );
+        assert!(result.get("hint").is_none(), "{result}");
+    }
+
+    /// user webchat create | Given an uncertain first attempt and a polled rejection | When reconciliation settles rejected | Then the reconcile response reports the same reason, hint and public evidence as the first attempt
+    #[test]
+    fn user_webchat_create_given_reconcile_rejection_when_settled_then_reason_and_hint_are_surfaced()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::uncertain(json!({
+            "message_submitted": true,
+            "retry_safe": true,
+        })))
+        .with_reconcile(ScriptedCreateEvidence::rejected(json!({
+            "error": "browser_create_composer_busy",
+            "composer_busy_probe": {
+                "input_mounted": true,
+                "input_has_content": true,
+                "stop_control": false,
+                "assistant_streaming": false,
+                "assistant_tools_in_progress": false,
+            }
+        })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-reconcile-1",
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "rejected", "{result}");
+        assert_eq!(
+            result["reason"], "browser_create_composer_busy",
+            "the reconcile fallthrough must name the polled rejection: {result}"
+        );
+        assert_eq!(
+            result["composer_busy_probe"]["input_has_content"], true,
+            "{result}"
+        );
+        assert_eq!(
+            result["hint"],
+            "composer has existing content (possibly a restored ChatGPT draft); clear it and retry",
+            "{result}"
+        );
+        // The reconcile fallthrough must publish the same delivery evidence as
+        // the first attempt, not just the top-level fields.
+        assert_eq!(
+            result["delivery_evidence"]["error"], "browser_create_composer_busy",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["hint"], result["hint"],
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"], result["composer_busy_probe"],
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"]["input_has_content"], true,
+            "{result}"
         );
     }
 
@@ -17951,7 +19517,7 @@ mod tests {
                 .observe_browser_source_turn(
                     &session.resource_ref,
                     7,
-                    &browser_sha256("archive this conversation"),
+                    &source_turn_sha256("archive this conversation"),
                     browser_epoch_ms(),
                 )
                 .unwrap();
@@ -19602,7 +21168,7 @@ mod tests {
             .observe_browser_source_turn(
                 &source_session_ref,
                 7,
-                &browser_sha256("归档当前对话"),
+                &source_turn_sha256("归档当前对话"),
                 current_turn_now,
             )
             .unwrap();
@@ -24524,7 +26090,7 @@ mod browser_dispatch_source_turn_tests {
         store
             .lock()
             .unwrap()
-            .resolve_browser_source_turn(&browser_sha256(text.trim()), browser_epoch_ms())
+            .resolve_browser_source_turn(&source_turn_sha256(text.trim()), browser_epoch_ms())
     }
 
     /// user sees the trusted turn | Given an applied dispatch submit | When the runtime settles it | Then the exact trimmed turn resolves to that session and generation
@@ -24568,7 +26134,7 @@ mod browser_dispatch_source_turn_tests {
                 .resolve_browser_source_turn(&browser_sha256(message), browser_epoch_ms())
                 .unwrap_err(),
             "browser_current_turn_not_found",
-            "the un-trimmed text is not the observed turn"
+            "a raw (non-canonical) digest is never the observed turn"
         );
         assert!(!applied.to_string().contains(message.trim()));
     }
@@ -24809,7 +26375,7 @@ mod browser_dispatch_source_turn_tests {
             "{applied}"
         );
 
-        let newer = browser_sha256("later typed turn");
+        let newer = source_turn_sha256("later typed turn");
         store
             .lock()
             .unwrap()

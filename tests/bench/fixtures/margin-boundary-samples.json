@@ -1,0 +1,122 @@
+{
+  "description": "Deterministic latency-boundary samples for the per-route x decision-head margin report (issue #622). These are synthetic recorded samples, not provider measurements: they exist so the margin report's boundary handling is covered by an automated test instead of by eyeballing live numbers.",
+  "boundaries": {
+    "typed_attempt_ms": 1800,
+    "typed_pool_ms": 3600,
+    "chat_attempt_ms": 5000,
+    "chat_pool_ms": 12000
+  },
+  "routes": [
+    {
+      "name": "fixture-typed-boundary",
+      "protocol": "decision",
+      "role": "primary",
+      "family": "typed",
+      "model": "fixture-not-a-measurement",
+      "samples": [
+        {
+          "case_id": "typed_margin_just_under_attempt",
+          "run": 1,
+          "ok": true,
+          "latency_ms": 1799,
+          "error": null,
+          "verdict": "correct",
+          "detail": { "has_unfinished_work": { "expect": "true", "actual": "true", "match": true, "noul": 0.96 } }
+        },
+        {
+          "case_id": "typed_margin_exactly_at_attempt",
+          "run": 1,
+          "ok": true,
+          "latency_ms": 1800,
+          "error": null,
+          "verdict": "correct",
+          "detail": { "has_unfinished_work": { "expect": "true", "actual": "true", "match": true, "noul": 0.96 } }
+        },
+        {
+          "case_id": "typed_margin_just_over_attempt",
+          "run": 1,
+          "ok": false,
+          "latency_ms": 1801,
+          "error": "timeout",
+          "verdict": "error",
+          "detail": null
+        },
+        {
+          "case_id": "typed_margin_exactly_at_pool",
+          "run": 1,
+          "ok": false,
+          "latency_ms": 3600,
+          "error": "timeout",
+          "verdict": "error",
+          "detail": null
+        }
+      ]
+    },
+    {
+      "name": "fixture-typed-comfortable",
+      "protocol": "decision",
+      "role": "fallback",
+      "family": "typed",
+      "model": "fixture-not-a-measurement",
+      "samples": [
+        {
+          "case_id": "typed_margin_well_inside_attempt",
+          "run": 1,
+          "ok": true,
+          "latency_ms": 900,
+          "error": null,
+          "verdict": "correct",
+          "detail": { "has_unfinished_work": { "expect": "true", "actual": "true", "match": true, "noul": 0.96 } }
+        },
+        {
+          "case_id": "typed_margin_inside_attempt",
+          "run": 1,
+          "ok": true,
+          "latency_ms": 1200,
+          "error": null,
+          "verdict": "correct",
+          "detail": { "has_unfinished_work": { "expect": "true", "actual": "true", "match": true, "noul": 0.96 } }
+        }
+      ]
+    },
+    {
+      "name": "fixture-chat-boundary",
+      "protocol": "openai-chat",
+      "role": "fallback",
+      "family": "chat",
+      "model": "fixture-not-a-measurement",
+      "samples": [
+        {
+          "case_id": "chat_margin_just_under_attempt",
+          "run": 1,
+          "ok": true,
+          "latency_ms": 4999,
+          "error": null,
+          "verdict": null,
+          "expect": { "judge": "done" },
+          "content": "好的。"
+        },
+        {
+          "case_id": "chat_margin_exactly_at_attempt",
+          "run": 1,
+          "ok": true,
+          "latency_ms": 5000,
+          "error": null,
+          "verdict": null,
+          "expect": { "judge": "done" },
+          "content": "好的。"
+        },
+        {
+          "case_id": "chat_margin_exactly_at_pool",
+          "run": 1,
+          "ok": false,
+          "latency_ms": 12000,
+          "error": "timeout",
+          "verdict": "error",
+          "expect": { "judge": "done" },
+          "content": null
+        }
+      ]
+    }
+  ]
+}

@@ -557,6 +557,21 @@ CREATE INDEX IF NOT EXISTS idx_browser_session_archive_intents_pending
     ON browser_session_archive_intents(session_ref, state, updated_at DESC);
 "#;
 
+/// Decision gates must not be silently ignored by pre-gate readers. Unlike
+/// optional archive metadata, this is a numbered, fail-closed migration.
+const MIGRATION_V16: &str = r#"
+CREATE TABLE IF NOT EXISTS task_decision_gates (
+    gate_id TEXT PRIMARY KEY NOT NULL,
+    task_id TEXT NOT NULL,
+    creator_parent_session_ref TEXT,
+    status TEXT NOT NULL CHECK (status IN ('open', 'resolved', 'cancelled')),
+    record_json TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES operations(op_id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_decision_gates_open
+    ON task_decision_gates(task_id) WHERE status = 'open';
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 pub(super) const MIGRATIONS: &[&str] = &[
@@ -575,6 +590,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     MIGRATION_V13,
     MIGRATION_V14,
     MIGRATION_V15,
+    MIGRATION_V16,
 ];
 
 // ---------------------------------------------------------------------------
@@ -622,6 +638,36 @@ pub(super) fn ensure_browser_archive_auxiliary_schema(conn: &Connection) -> Resu
             [],
         )
         .map_err(|error| format!("cannot extend browser archive auxiliary schema: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Forward-additive source-turn digest versioning (#741).
+///
+/// Source-turn digests changed from SHA-256 of the raw trimmed text to the
+/// domain-separated canonical digest. A raw digest is attacker-shapeable text
+/// away from any canonical digest, so the hash input alone cannot separate the
+/// two. Every row written by this binary therefore stores its digest twice:
+/// `user_text_sha256` and `canonical_user_text_sha256`. Readers only accept a
+/// row whose two columns are equal. A pre-#741 row (or one written or updated
+/// by an older binary after a rollback, which only touches `user_text_sha256`)
+/// fails that check and is never evidence, so it fails closed until it is
+/// re-observed or expires. The column is nullable and additive (not a numbered
+/// migration), so an older binary still opens the database.
+pub(super) fn ensure_browser_source_turn_auxiliary_schema(conn: &Connection) -> Result<(), String> {
+    let has_canonical_digest = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('browser_source_turns') WHERE name = 'canonical_user_text_sha256'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("cannot inspect browser source turn auxiliary schema: {error}"))?;
+    if has_canonical_digest == 0 {
+        conn.execute(
+            "ALTER TABLE browser_source_turns ADD COLUMN canonical_user_text_sha256 TEXT",
+            [],
+        )
+        .map_err(|error| format!("cannot extend browser source turn auxiliary schema: {error}"))?;
     }
     Ok(())
 }

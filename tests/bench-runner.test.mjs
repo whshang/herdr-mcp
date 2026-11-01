@@ -96,3 +96,49 @@ test("user can re-render one sweep without new provider calls | Given an existin
   assert.equal(run.stdout.includes("expect false → got uncertain (noul=0.210) ×1"), true);
   assert.deepEqual(readdirSync(resultsDir).sort(), ["route-solo.json", "samples-merged.json"]);
 });
+
+/**
+ * Materialise the committed latency-boundary fixture as per-route result files, so
+ * the margin report can be rendered from recorded samples with no provider calls.
+ */
+function writeMarginBoundaryFixture(resultsDir) {
+  const fixture = JSON.parse(readFileSync(join(repoRoot, "tests", "bench", "fixtures", "margin-boundary-samples.json"), "utf8"));
+  for (const route of fixture.routes) {
+    writeFileSync(join(resultsDir, `route-${route.name}.json`), routeResult(route));
+  }
+  return fixture;
+}
+
+test("user reads the margin boundary honestly | Given recorded samples just under, exactly at, and just over the typed attempt budget | When the runner renders the margin report | Then the call at the budget is flagged exhausted and the call over it shows a negative margin", () => {
+  const resultsDir = mkdtempSync(join(tmpdir(), "semantic-margin-boundary-"));
+  writeMarginBoundaryFixture(resultsDir);
+
+  const run = spawnSync(process.execPath, [runner, `--merge-only=${resultsDir}`], { cwd: repoRoot, encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+  const table = run.stdout;
+
+  assert.equal(table.includes("Per-route × decision-head margin"), true);
+
+  // Sorted sample latencies are 1799 / 1800 / 1801 / 3600 against a 1800 ms attempt
+  // and 3600 ms pool budget: max sits on the pool boundary, so the attempt margin is
+  // negative and three calls count as exhausting the attempt budget.
+  assert.equal(table.includes("| fixture-typed-boundary | typed fast path | typed | 4 | 2 | 2 | 1800 ms | 3600 ms | 3600 ms | 1800 ms | -1800 ms | 200.0% | 3600 ms | 0 ms | yes — pool ×1 |"), true);
+
+  // A route comfortably inside the budget keeps a positive margin and is not flagged.
+  assert.equal(table.includes("| fixture-typed-comfortable | typed fast path | typed | 2 | 2 | 0 | 900 ms | 1200 ms | 1200 ms | 1800 ms | +600 ms | 66.7% | 3600 ms | +2400 ms | no |"), true);
+});
+
+test("user reads each decision head against its own budget | Given one measured typed route and one measured chat route | When the margin report renders | Then the typed head is read against 1800 ms and the chat head against 5000 ms", () => {
+  const resultsDir = mkdtempSync(join(tmpdir(), "semantic-margin-heads-"));
+  writeMarginBoundaryFixture(resultsDir);
+
+  const run = spawnSync(process.execPath, [runner, `--merge-only=${resultsDir}`], { cwd: repoRoot, encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+  const table = run.stdout;
+
+  // The chat fallback head carries the 5000/12000 budget, not the typed 1800/3600 one:
+  // 12000 ms is inside the chat pool allowance but over its attempt allowance.
+  assert.equal(table.includes("| fixture-chat-boundary | chat fallback | chat | 3 | 2 | 1 | 5000 ms | 12000 ms | 12000 ms | 5000 ms | -7000 ms | 240.0% | 12000 ms | 0 ms | yes — pool ×1 |"), true);
+  assert.equal(table.includes("| chat fallback | chat | 3 |"), true);
+  assert.equal(table.includes("| typed fast path | typed | 4 |"), true);
+});

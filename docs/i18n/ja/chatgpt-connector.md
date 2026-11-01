@@ -121,7 +121,7 @@ Old/frozen action set  → may remain on an older action set
 
 runtime のアップグレード後:
 
-1. Edge / runtime のバージョンを確認します。現在の Release は `herdr-mcp update check|status` を通じて Worker drift を公開します。対話的な `herdr-mcp update` は Runtime の activation 後に安全な同一 contract の既存 Worker を reconcile し、`herdr-mcp worker update` が直接の修復経路です。
+1. Edge / runtime のバージョンを確認します。現在の Release は `herdr-mcp update check|status` を通じて Worker drift を公開します。`herdr-mcp update` は Runtime のみを更新し、同一 contract の既存 Worker が遅れている場合は `worker_update_required` を報告します（Runtime 更新が Worker 認可を開始することはありません）。`herdr-mcp worker update` がオペレーターによる直接の修復経路です。
 2. Runtime または既存 Worker がその場でアップグレードされたというだけで Connector を disconnect / 削除 / 再追加**しないでください**。Worker の reconcile は public OAuth origin と Connector 資格情報を保持します。
 3. Herdr の公開 action catalog が変わった場合は、そのアカウントで利用できる workspace の管理機能から app action を更新・レビュー・公開し、必要に応じて新しい action を明示的に有効にします。
 4. action snapshot が変わった後は新しい会話を使用します。新しい Edge 提供の description を得るには Worker コードの更新が必要ですが、すでにレビュー済みの ChatGPT action snapshot は、app action を更新するまで凍結されたままになり得ます。

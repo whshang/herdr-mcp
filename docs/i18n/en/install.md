@@ -17,7 +17,7 @@ herdr --version
 herdr api schema >/dev/null
 ```
 
-but those commands are diagnostic, not a first-install prerequisite. The normal `herdr-mcp install` path now resolves Herdr from `HERDR_BIN`, the stable per-user location, Homebrew/`/usr/local`, or the current PATH. If Herdr is already installed, herdr-mcp verifies the CLI/API and attempts `herdr update` (using live handoff when a server is already running). If Herdr cannot be found, herdr-mcp downloads and runs the official installer from <https://herdr.dev/>. After the herdr-mcp service is installed it also verifies that the local Herdr Server/API is reachable; macOS uses the owned Supervisor/TCC-broker path, while Linux/Windows start the current-user Herdr server when needed.
+but those commands are diagnostic, not a first-install prerequisite. The normal `herdr-mcp install` path now resolves Herdr from `HERDR_BIN`, the stable per-user location, Homebrew/`/usr/local`, or the current PATH. If Herdr is already installed, herdr-mcp verifies the CLI/API and attempts `herdr update` (using live handoff when a server is already running). If Herdr cannot be found, herdr-mcp downloads and runs the official installer from <https://herdr.dev/tui/>. After the herdr-mcp service is installed it also verifies that the local Herdr Server/API is reachable; macOS uses the owned Supervisor/TCC-broker path, while Linux/Windows start the current-user Herdr server when needed.
 
 The official installer remains the manual fallback for troubleshooting:
 
@@ -30,6 +30,8 @@ curl -fsSL https://herdr.dev/install.sh | sh
 # Windows
 powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 ```
+
+These are the Herdr TUI installers. herdr-mcp supports only the Herdr TUI; do not install the Herdr app or herdr-core (`hc`) for herdr-mcp, because herdr-mcp v1.1 does not support that separate runtime. See the [platform support matrix](platform-support-matrix.md).
 
 ### 2. Decide which client path you need
 

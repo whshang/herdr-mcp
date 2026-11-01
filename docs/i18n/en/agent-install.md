@@ -33,7 +33,7 @@ herdr-mcp install
 herdr-mcp doctor
 ```
 
-`herdr-mcp install` owns Herdr dependency recovery: it resolves `HERDR_BIN`, stable user/Homebrew/`/usr/local` paths and PATH; verifies and updates an installed Herdr; runs the official <https://herdr.dev/> installer when Herdr is absent; and verifies that the Herdr Server/API becomes reachable. Do not duplicate that flow with a second manual Herdr installation unless the command reports an explicit dependency-recovery failure. On Windows Candidate UAT still use the exact candidate herdr-mcp artifact, never an ad-hoc source build.
+`herdr-mcp install` owns Herdr dependency recovery: it resolves `HERDR_BIN`, stable user/Homebrew/`/usr/local` paths and PATH; verifies and updates an installed Herdr; runs the official <https://herdr.dev/tui/> installer when Herdr is absent; and verifies that the Herdr Server/API becomes reachable. Do not duplicate that flow with a second manual Herdr installation unless the command reports an explicit dependency-recovery failure. “Herdr” here is the Herdr TUI (`herdr`); never install the Herdr app or herdr-core (`hc`) for herdr-mcp, because herdr-mcp v1.1 does not support that separate runtime. On Windows Candidate UAT still use the exact candidate herdr-mcp artifact, never an ad-hoc source build.
 
 If `~/.local/bin/herdr-mcp` exists but the shell cannot resolve it, classify `installed_but_not_on_shell_path`, repair PATH, verify a fresh shell, and do not reinstall or create a second PATH owner.
 

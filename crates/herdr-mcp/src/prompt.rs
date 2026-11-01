@@ -1,7 +1,11 @@
+pub(crate) mod decision_gates;
+mod role_targets;
+
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
 use crate::progressive_skills::agent_attention_advice;
 use crate::state_cache::EventCache;
+use crate::state_store::decision_gates::DecisionGate;
 use crate::state_store::{
     OperationLedgerInput, OperationLedgerRecord, OperationReservation, StateStore,
 };
@@ -10,7 +14,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -45,6 +49,30 @@ const ESCALATION_MAX_SIGNALS: usize = 16;
 const ESCALATION_MAX_TASK_IDS: usize = 8;
 static NEXT_DISPATCH_NONCE: AtomicU64 = AtomicU64::new(1);
 
+/// One `spawn` call must fit the whole chain (pane create, `agent.start`,
+/// readiness, prompt submission) inside the budget the caller actually waits.
+/// A WebChat `herdr_call` without `timeout_ms` is cut by Edge at 30s and the
+/// link wire never exceeds 60s, so the default keeps headroom under the
+/// smallest transport instead of reserving work the caller will never see.
+pub(crate) const SPAWN_CHAIN_DEFAULT_MS: u64 = 25_000;
+/// Accepted ceiling for `spawn.startup_timeout_ms`. The local CLI waits the
+/// chain plus slack and never exceeds its own 120s transport cap.
+pub(crate) const SPAWN_CHAIN_MAX_MS: u64 = 100_000;
+/// Headroom kept inside the chain for the prompt submission itself. A quarter
+/// of the chain keeps tiny budgets workable instead of reserving more than the
+/// caller granted.
+const SPAWN_PROMPT_RESERVE_MS: u64 = 5_000;
+/// Native `agent.start` rejects `timeout_ms` at or below its 3s floor.
+const SPAWN_NATIVE_START_FLOOR_MS: u64 = 3_001;
+const SPAWN_READY_POLL: Duration = Duration::from_millis(200);
+/// A readiness window shorter than one poll cannot prove readiness, so the
+/// chain reports a resumable checkpoint instead of an orphan in-flight key.
+const SPAWN_READY_MIN_POLL_MS: u64 = 250;
+const SPAWN_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for one pane mutation, always cut down to the remaining chain.
+const SPAWN_PANE_TIMEOUT_MS: u64 = 10_000;
+const SPAWN_AGENT_NAME_MAX: usize = 32;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct AgentState {
     pane_id: Option<String>,
@@ -55,6 +83,7 @@ struct AgentState {
 struct RegisterTaskInput<'a> {
     task_id: &'a str,
     target: &'a str,
+    requested_target: Option<&'a str>,
     fingerprint: &'a str,
     idempotency_key: Option<&'a str>,
     before: Option<&'a AgentState>,
@@ -63,6 +92,7 @@ struct RegisterTaskInput<'a> {
     start_cursor: u64,
     parent_target: Option<&'a str>,
     parent_session_ref: Option<&'a str>,
+    stall_after_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +134,8 @@ struct PromptTaskRecord {
     task_id: String,
     dispatch_id: String,
     target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_target: Option<String>,
     #[serde(default)]
     idempotency_key_digest: Option<String>,
     pane_id: Option<String>,
@@ -150,14 +182,35 @@ struct PromptTaskRecord {
     acknowledged_at_ms: Option<u64>,
     created_at_ms: u64,
     updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_heartbeat_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_done_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_done_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stall_after_ms: Option<u64>,
+    #[serde(skip)]
+    gate: Option<DecisionGate>,
 }
 
 impl PromptTaskRecord {
     fn is_terminal(&self) -> bool {
-        self.lifecycle.is_terminal()
+        self.gate.is_none() && self.lifecycle.is_terminal()
     }
 
-    fn public_json(&self) -> Value {
+    fn liveness(&self, now: u64) -> &'static str {
+        if !self.is_terminal()
+            && now.saturating_sub(self.updated_at_ms)
+                >= self.stall_after_ms.unwrap_or(ESCALATION_STALL_IDLE_MS)
+        {
+            "stalled"
+        } else {
+            "active"
+        }
+    }
+
+    fn public_json_at(&self, now: u64) -> Value {
         let mut public = json!({
             "task_id": self.task_id,
             "dispatch_id": self.dispatch_id,
@@ -165,6 +218,7 @@ impl PromptTaskRecord {
             "pane_id": self.pane_id,
             "workspace_id": self.workspace_id,
             "lifecycle": self.lifecycle.as_str(),
+            "liveness": self.liveness(now),
             "activity_observed": self.activity_observed,
             "prior_settle_observed": self.prior_settle_observed,
             "turn_id": self.turn_id,
@@ -194,7 +248,26 @@ impl PromptTaskRecord {
             "created_at_ms": self.created_at_ms,
             "updated_at_ms": self.updated_at_ms,
         });
+        if let Some(requested) = &self.requested_target {
+            public["requested_target"] = json!(requested);
+        }
+        if let Some(gate) = &self.gate {
+            public["blocked_on_gate"] = json!(true);
+            public["gate"] = json!(gate);
+        }
         if let Some(object) = public.as_object_mut() {
+            for (key, value) in [
+                ("last_heartbeat_at_ms", self.last_heartbeat_at_ms),
+                ("worker_done_at_ms", self.worker_done_at_ms),
+                ("stall_after_ms", self.stall_after_ms),
+            ] {
+                if let Some(value) = value {
+                    object.insert(key.to_owned(), json!(value));
+                }
+            }
+            if let Some(summary) = &self.worker_done_summary {
+                object.insert("worker_done_summary".to_owned(), json!(summary));
+            }
             if let Some(excerpt) = &self.final_excerpt {
                 object.insert("final_excerpt".to_owned(), json!(excerpt));
             }
@@ -253,6 +326,15 @@ fn dispatch_definitely_not_delivered(result: &Value) -> bool {
 
 #[derive(Default)]
 struct PromptRegistryInner {
+    // Serialize durable task read/modify/write across report, lifecycle, ack and
+    // parent notification so a stale snapshot cannot erase an accepted report.
+    task_mutations: Mutex<()>,
+    role_dispatches: Mutex<()>,
+    /// Idempotency keys whose resumable spawn checkpoint is being continued,
+    /// so two concurrent replays cannot both prompt the same agent.
+    spawn_resumes: Mutex<HashSet<String>>,
+    #[cfg(test)]
+    clock: Option<Arc<AtomicU64>>,
     records: Mutex<HashMap<String, PromptRecord>>,
     handoff_injected_panes: Mutex<HashSet<String>>,
     store: Option<Arc<Mutex<StateStore>>>,
@@ -265,6 +347,20 @@ pub struct PromptRegistry {
     inner: Arc<PromptRegistryInner>,
 }
 
+/// One in-flight spawn resume. Dropping it releases the key for the next replay.
+struct SpawnResumeGuard<'a> {
+    registry: &'a PromptRegistry,
+    key: String,
+}
+
+impl Drop for SpawnResumeGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.registry.inner.spawn_resumes.lock() {
+            active.remove(&self.key);
+        }
+    }
+}
+
 #[derive(Debug)]
 enum BeginPrompt {
     Reserved(Option<String>),
@@ -272,6 +368,14 @@ enum BeginPrompt {
 }
 
 impl PromptRegistry {
+    fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = &self.inner.clock {
+            return clock.load(Ordering::SeqCst);
+        }
+        now_ms()
+    }
+
     #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
@@ -281,6 +385,11 @@ impl PromptRegistry {
     pub fn with_store(store: Arc<Mutex<StateStore>>) -> Self {
         Self {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -297,6 +406,11 @@ impl PromptRegistry {
     ) -> Self {
         let registry = Self {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -309,6 +423,19 @@ impl PromptRegistry {
         registry
     }
 
+    /// Claim the in-flight resume slot for one idempotency key. `None` means
+    /// another replay of the same checkpoint is already continuing it.
+    fn begin_spawn_resume(&self, key: &str) -> Option<SpawnResumeGuard<'_>> {
+        let mut active = self.inner.spawn_resumes.lock().ok()?;
+        if !active.insert(key.to_owned()) {
+            return None;
+        }
+        Some(SpawnResumeGuard {
+            registry: self,
+            key: key.to_owned(),
+        })
+    }
+
     fn begin(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
         if let Some(store) = &self.inner.store {
             return begin_persisted(store, key, fingerprint);
@@ -317,7 +444,7 @@ impl PromptRegistry {
     }
 
     fn begin_memory(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
-        let now = now_ms();
+        let now = self.now_ms();
         let mut records = self
             .inner
             .records
@@ -452,6 +579,7 @@ impl PromptRegistry {
         let RegisterTaskInput {
             task_id,
             target,
+            requested_target,
             fingerprint,
             idempotency_key,
             before,
@@ -460,15 +588,21 @@ impl PromptRegistry {
             start_cursor,
             parent_target,
             parent_session_ref,
+            stall_after_ms,
         } = input;
         if submitted == Some(false) || self.inner.store.is_none() {
             return Ok(None);
         }
+        let guard = self
+            .inner
+            .task_mutations
+            .lock()
+            .map_err(|_| "agent task mutation lock unavailable".to_owned())?;
         if let Some(existing) = self.load_task(task_id)? {
             return Ok(Some(existing));
         }
 
-        let now = now_ms();
+        let now = self.now_ms();
         let pane_id = after
             .and_then(|state| state.pane_id.clone())
             .or_else(|| before.and_then(|state| state.pane_id.clone()));
@@ -510,6 +644,7 @@ impl PromptRegistry {
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
             target: target.to_owned(),
+            requested_target: requested_target.map(str::to_owned),
             idempotency_key_digest: idempotency_key
                 .map(|key| stable_digest(&[b"herdr_prompt/task_key", key.as_bytes()])),
             pane_id,
@@ -526,6 +661,11 @@ impl PromptRegistry {
             terminal_status: None,
             terminal_cursor: None,
             terminal_at_ms: None,
+            last_heartbeat_at_ms: None,
+            worker_done_at_ms: None,
+            worker_done_summary: None,
+            stall_after_ms: None,
+            gate: None,
             final_excerpt: None,
             awaiting_children: None,
             parent_target: parent_target.map(str::to_owned),
@@ -546,14 +686,86 @@ impl PromptRegistry {
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
             mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
         }
+        record.stall_after_ms = stall_after_ms;
         self.save_task(&record, Some(fingerprint))?;
+        drop(guard);
         let reconciled = self.reconcile_task(task_id)?;
         Ok(reconciled.or(Some(record)))
     }
 
+    fn task_report(&self, params: &Value) -> Value {
+        let task_id = match required_str(params, "task_id") {
+            Ok(value) if !value.is_empty() && value.len() <= 128 => value,
+            _ => return invalid("task_id must be a non-empty string up to 128 bytes"),
+        };
+        let dispatch_id = match required_str(params, "dispatch_id") {
+            Ok(value) if !value.is_empty() && value.len() <= 128 => value,
+            _ => return invalid("dispatch_id must be a non-empty string up to 128 bytes"),
+        };
+        let kind = match required_str(params, "kind") {
+            Ok("heartbeat") => "heartbeat",
+            Ok("worker_done") => "worker_done",
+            _ => return invalid("kind must be heartbeat or worker_done"),
+        };
+        let summary = match optional_str(params, "summary") {
+            Ok(value) => value.map(|text| {
+                text.chars()
+                    .filter(|ch| !ch.is_control())
+                    .collect::<String>()
+            }),
+            Err(error) => return error,
+        };
+        if summary.as_ref().is_some_and(|text| text.len() > 2048) {
+            return invalid(
+                "summary must be at most 2048 bytes after stripping control characters",
+            );
+        }
+        let Ok(guard) = self.inner.task_mutations.lock() else {
+            return json!({"ok": false, "code": "agent_task_store_unavailable"});
+        };
+        let mut task = match self.load_task(task_id) {
+            Ok(Some(task)) if task.task_id == task_id && task.dispatch_id == dispatch_id => task,
+            Ok(_) => return json!({"ok": false, "code": "task_identity_mismatch"}),
+            Err(error) => {
+                return json!({"ok": false, "code": "agent_task_store_unavailable", "message": error});
+            }
+        };
+        if kind == "worker_done" && task.worker_done_at_ms.is_some() {
+            return json!({"ok": false, "code": "worker_done_already_reported"});
+        }
+        if kind == "heartbeat" && task.is_terminal() {
+            return json!({"ok": false, "code": "agent_task_terminal"});
+        }
+        let now = self.now_ms();
+        let newly_completed = kind == "worker_done" && !task.is_terminal() && task.gate.is_none();
+        if kind == "heartbeat" {
+            task.last_heartbeat_at_ms = Some(now);
+        } else {
+            task.worker_done_at_ms = Some(now);
+            task.worker_done_summary = summary;
+            if newly_completed {
+                task.lifecycle = PromptTaskLifecycle::Completed;
+                task.terminal_status = Some("worker_done".to_owned());
+                task.terminal_at_ms = Some(now);
+                task.terminal_cursor = None;
+                task.awaiting_children = None;
+                task.notification_state = "pending".to_owned();
+            }
+        }
+        task.updated_at_ms = now;
+        if let Err(error) = self.save_task(&task, None) {
+            return json!({"ok": false, "code": "agent_task_store_unavailable", "message": error});
+        }
+        drop(guard);
+        if newly_completed {
+            self.maybe_notify_parent(&task);
+        }
+        json!({"ok": true, "task": task.public_json_at(now)})
+    }
+
     pub fn task_status(&self, task_id: &str) -> Value {
         match self.reconcile_task(task_id) {
-            Ok(Some(task)) => json!({"ok": true, "task": task.public_json()}),
+            Ok(Some(task)) => json!({"ok": true, "task": task.public_json_at(self.now_ms())}),
             Ok(None) => json!({
                 "ok": false,
                 "code": "agent_task_not_found",
@@ -603,10 +815,11 @@ impl PromptRegistry {
         match self.reconcile_task(task_id) {
             Ok(Some(task))
                 if task.idempotency_key_digest.as_deref() == Some(digest.as_str())
-                    && task.target == target
+                    && (task.target == target
+                        || task.requested_target.as_deref() == Some(target))
                     && task.parent_session_ref.as_deref() == parent_session_ref =>
             {
-                json!({"ok": true, "task": task.public_json()})
+                json!({"ok": true, "task": task.public_json_at(self.now_ms())})
             }
             Ok(_) => json!({"ok": false, "code": "agent_task_not_found"}),
             Err(error) => json!({
@@ -662,7 +875,7 @@ impl PromptRegistry {
     pub fn task_status_for_parent_session(&self, task_id: &str, parent_session_ref: &str) -> Value {
         match self.reconcile_task(task_id) {
             Ok(Some(task)) if task.parent_session_ref.as_deref() == Some(parent_session_ref) => {
-                json!({"ok": true, "task": task.public_json()})
+                json!({"ok": true, "task": task.public_json_at(self.now_ms())})
             }
             Ok(Some(_)) => json!({
                 "ok": false,
@@ -743,6 +956,7 @@ impl PromptRegistry {
             .into_iter()
             .filter(|task| {
                 !task.is_terminal()
+                    && task.gate.is_none()
                     && task.parent_session_ref.as_deref() == Some(parent_session_ref)
                     && workspace_id.is_none_or(|workspace_id| {
                         task.workspace_id.as_deref() == Some(workspace_id)
@@ -754,7 +968,12 @@ impl PromptRegistry {
             return payload;
         };
         let room = limit.saturating_sub(rows.len());
-        rows.extend(running.into_iter().take(room).map(running_task_row));
+        rows.extend(
+            running
+                .into_iter()
+                .take(room)
+                .map(|task| running_task_row(task, self.now_ms())),
+        );
         payload
     }
 
@@ -865,7 +1084,7 @@ impl PromptRegistry {
         let mut terminal = scoped
             .iter()
             .copied()
-            .filter(|task| task.is_terminal())
+            .filter(|task| task.is_terminal() || task.gate.is_some())
             .cloned()
             .collect::<Vec<_>>();
         terminal.sort_by(|left, right| {
@@ -881,6 +1100,10 @@ impl PromptRegistry {
         let mut failed = 0_u64;
         let mut uncertain = 0_u64;
         for task in &scoped {
+            if task.gate.is_some() {
+                blocked += 1;
+                continue;
+            }
             match task.lifecycle {
                 PromptTaskLifecycle::Running
                 | PromptTaskLifecycle::AwaitingActivity
@@ -908,9 +1131,12 @@ impl PromptRegistry {
         // Deterministic escalation facts use the scope filter only
         // (acknowledged rows still count) and are never gated on the
         // semantic `advisory` opt-in.
-        let escalation = task_escalation(tasks.iter().filter(|task| {
-            task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
-        }));
+        let escalation = task_escalation(
+            tasks.iter().filter(|task| {
+                task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
+            }),
+            self.now_ms(),
+        );
 
         Ok(json!({
             "ok": true,
@@ -921,7 +1147,7 @@ impl PromptRegistry {
                 "failed": failed,
                 "uncertain": uncertain,
             },
-            "tasks": terminal.into_iter().map(|task| task.public_json()).collect::<Vec<_>>(),
+            "tasks": terminal.into_iter().map(|task| task.public_json_at(self.now_ms())).collect::<Vec<_>>(),
             "attention": attention,
             "escalation": escalation,
         }))
@@ -946,14 +1172,20 @@ impl PromptRegistry {
     }
 
     pub fn task_ack(&self, task_id: &str) -> Value {
+        let Ok(_guard) = self.inner.task_mutations.lock() else {
+            return json!({"ok": false, "code": "agent_task_store_unavailable"});
+        };
         match self.load_task(task_id) {
             Ok(Some(mut task)) => {
-                let now = now_ms();
+                if task.gate.is_some() {
+                    return json!({"ok": false, "code": "task_blocked_on_gate"});
+                }
+                let now = self.now_ms();
                 task.acknowledged_at_ms = Some(now);
                 task.notification_state = "acknowledged".to_owned();
                 task.updated_at_ms = now;
                 match self.save_task(&task, None) {
-                    Ok(()) => json!({"ok": true, "task": task.public_json()}),
+                    Ok(()) => json!({"ok": true, "task": task.public_json_at(self.now_ms())}),
                     Err(error) => json!({
                         "ok": false,
                         "code": "agent_task_store_unavailable",
@@ -1030,7 +1262,7 @@ impl PromptRegistry {
                             "completed": true,
                             "task_id": task_id,
                             "matched": task.lifecycle.as_str(),
-                            "task": task.public_json(),
+                            "task": task.public_json_at(self.now_ms()),
                         });
                     }
                     if task.is_terminal() {
@@ -1038,7 +1270,15 @@ impl PromptRegistry {
                             "completed": true,
                             "task_id": task_id,
                             "matched": task.lifecycle.as_str(),
-                            "task": task.public_json(),
+                            "task": task.public_json_at(self.now_ms()),
+                        });
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return json!({
+                            "completed": false,
+                            "task_id": task_id,
+                            "outcome": "checkpoint",
+                            "task": task.public_json_at(self.now_ms()),
                         });
                     }
                 }
@@ -1057,20 +1297,6 @@ impl PromptRegistry {
                         "message": error,
                     });
                 }
-            }
-            if std::time::Instant::now() >= deadline {
-                let task = self
-                    .reconcile_task(task_id)
-                    .ok()
-                    .flatten()
-                    .map(|task| task.public_json())
-                    .unwrap_or(Value::Null);
-                return json!({
-                    "completed": false,
-                    "task_id": task_id,
-                    "reason": "agent_task_wait_timeout",
-                    "task": task,
-                });
             }
             thread::sleep(Duration::from_millis(25));
         }
@@ -1138,10 +1364,17 @@ impl PromptRegistry {
     }
 
     fn maybe_notify_parent(&self, trigger: &PromptTaskRecord) {
+        let Ok(_guard) = self.inner.task_mutations.lock() else {
+            return;
+        };
+        self.maybe_notify_parent_locked(trigger);
+    }
+
+    fn maybe_notify_parent_locked(&self, trigger: &PromptTaskRecord) {
         let Some(parent_target) = trigger.parent_target.as_deref() else {
             return;
         };
-        if trigger.notification_state != "pending" {
+        if !trigger.is_terminal() || trigger.notification_state != "pending" {
             return;
         }
         let Some(client) = self.inner.client.as_ref() else {
@@ -1184,7 +1417,7 @@ impl PromptRegistry {
         });
         pending.truncate(32);
 
-        let now = now_ms();
+        let now = self.now_ms();
         for task in &mut pending {
             task.notification_state = "in_flight".to_owned();
             task.notification_attempts = task.notification_attempts.saturating_add(1);
@@ -1259,22 +1492,45 @@ impl PromptRegistry {
     }
 
     fn reconcile_task(&self, task_id: &str) -> Result<Option<PromptTaskRecord>, String> {
+        let _guard = self
+            .inner
+            .task_mutations
+            .lock()
+            .map_err(|_| "agent task mutation lock unavailable".to_owned())?;
+        self.reconcile_task_locked(task_id)
+    }
+
+    fn reconcile_task_locked(&self, task_id: &str) -> Result<Option<PromptTaskRecord>, String> {
         let Some(mut task) = self.load_task(task_id)? else {
             return Ok(None);
         };
-        if task.is_terminal() {
+        if task.gate.is_some() || task.is_terminal() {
             return Ok(Some(task));
+        }
+        // A report received during a gate is durable, but completes only after
+        // the gate is released. This explicit report does not depend on cache cursors.
+        if let Some(done_at) = task.worker_done_at_ms {
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            task.terminal_status = Some("worker_done".to_owned());
+            task.terminal_at_ms = Some(done_at);
+            task.terminal_cursor = None;
+            task.awaiting_children = None;
+            task.notification_state = "pending".to_owned();
+            self.save_task(&task, None)?;
+            self.maybe_notify_parent_locked(&task);
+            return self.load_task(task_id);
         }
         let mut changed = false;
         if task.lifecycle == PromptTaskLifecycle::AwaitingActivity
-            && now_ms().saturating_sub(task.updated_at_ms) >= PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS
+            && self.now_ms().saturating_sub(task.updated_at_ms)
+                >= PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS
         {
-            changed |= mark_delivery_uncertain(&mut task, now_ms(), "activity_start_timeout");
+            changed |= mark_delivery_uncertain(&mut task, self.now_ms(), "activity_start_timeout");
         }
         if task.is_terminal() {
             if changed {
                 self.save_task(&task, None)?;
-                self.maybe_notify_parent(&task);
+                self.maybe_notify_parent_locked(&task);
                 if let Some(reloaded) = self.load_task(task_id)? {
                     task = reloaded;
                 }
@@ -1299,10 +1555,10 @@ impl PromptRegistry {
             } else {
                 "runtime_boot_unknown"
             };
-            changed |= mark_delivery_uncertain(&mut task, now_ms(), reason);
+            changed |= mark_delivery_uncertain(&mut task, self.now_ms(), reason);
             if changed {
                 self.save_task(&task, None)?;
-                self.maybe_notify_parent(&task);
+                self.maybe_notify_parent_locked(&task);
                 if let Some(reloaded) = self.load_task(task_id)? {
                     task = reloaded;
                 }
@@ -1314,7 +1570,7 @@ impl PromptRegistry {
         if changed {
             self.save_task(&task, None)?;
             if task.is_terminal() {
-                self.maybe_notify_parent(&task);
+                self.maybe_notify_parent_locked(&task);
                 if let Some(reloaded) = self.load_task(task_id)? {
                     task = reloaded;
                 }
@@ -1336,6 +1592,9 @@ impl PromptRegistry {
         cursor: u64,
         events: &[Value],
     ) -> Result<bool, String> {
+        if task.gate.is_some() {
+            return Ok(false);
+        }
         let mut changed = if cursor.saturating_sub(task.last_cursor) > 2048 {
             mark_delivery_uncertain(task, now_ms(), "event_history_gap")
         } else {
@@ -1409,7 +1668,9 @@ impl PromptRegistry {
         if record.kind != PROMPT_TASK_OPERATION_KIND {
             return Ok(None);
         }
-        decode_task_record(&record).map(Some)
+        let mut task = decode_task_record(&record)?;
+        task.gate = store.open_decision_gate(task_id)?;
+        Ok(Some(task))
     }
 
     fn list_tasks(&self, limit: usize) -> Result<Vec<PromptTaskRecord>, String> {
@@ -1422,7 +1683,11 @@ impl PromptRegistry {
         store
             .operation_ledgers(PROMPT_TASK_OPERATION_KIND, limit)?
             .into_iter()
-            .map(|record| decode_task_record(&record))
+            .map(|record| {
+                let mut task = decode_task_record(&record)?;
+                task.gate = store.open_decision_gate(&task.task_id)?;
+                Ok(task)
+            })
             .collect()
     }
 
@@ -1493,17 +1758,22 @@ enum InboxView {
 /// `final_excerpt` is present only when captured and spares the planner an
 /// `agent.read` round trip; `awaiting_children` is present only while a
 /// supervisor is held for its own children.
-const COMPACT_TASK_FIELDS: [&str; 10] = [
+const COMPACT_TASK_FIELDS: [&str; 15] = [
     "task_id",
+    "dispatch_id",
+    "requested_target",
     "target",
     "pane_id",
     "lifecycle",
+    "liveness",
     "terminal",
     "acknowledged",
     "terminal_at_ms",
     "updated_at_ms",
     "final_excerpt",
     "awaiting_children",
+    "gate",
+    "blocked_on_gate",
 ];
 
 fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
@@ -1517,13 +1787,19 @@ fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
 /// One non-terminal row for the opt-in extension inbox view: identity, lane
 /// lifecycle, and the supervisor hold fact only. Deliberately no excerpt (the
 /// task has no outcome yet) and no acknowledged state (it cannot be acked).
-fn running_task_row(task: PromptTaskRecord) -> Value {
+fn running_task_row(task: PromptTaskRecord, now: u64) -> Value {
     let mut row = json!({
         "task_id": task.task_id,
+        "dispatch_id": task.dispatch_id,
         "workspace_id": task.workspace_id,
         "lifecycle": task.lifecycle.as_str(),
+        "liveness": task.liveness(now),
         "terminal": false,
     });
+    if let Some(requested) = &task.requested_target {
+        row["target"] = json!(task.target);
+        row["requested_target"] = json!(requested);
+    }
     if let (Some(awaiting_children), Some(object)) = (task.awaiting_children, row.as_object_mut()) {
         object.insert("awaiting_children".to_owned(), json!(awaiting_children));
     }
@@ -1636,8 +1912,7 @@ fn task_notification_priority(task: &PromptTaskRecord) -> u32 {
 /// failure: `delivery_uncertain` neither extends an unsuccessful streak nor
 /// produces a consult hint. The raw `parent_session_ref` value stays private;
 /// callers only learn whether the lane is session scoped.
-fn task_escalation<'a>(tasks: impl IntoIterator<Item = &'a PromptTaskRecord>) -> Value {
-    let now = now_ms();
+fn task_escalation<'a>(tasks: impl IntoIterator<Item = &'a PromptTaskRecord>, now: u64) -> Value {
     let mut lanes: HashMap<(&str, Option<&str>), Vec<&PromptTaskRecord>> = HashMap::new();
     for task in tasks {
         if now.saturating_sub(task.updated_at_ms) > ESCALATION_WINDOW_MS {
@@ -1733,16 +2008,12 @@ fn task_escalation<'a>(tasks: impl IntoIterator<Item = &'a PromptTaskRecord>) ->
             ));
         }
 
-        for task in lane.iter().copied().filter(|task| {
-            matches!(
-                task.lifecycle,
-                PromptTaskLifecycle::Running | PromptTaskLifecycle::AwaitingActivity
-            )
-        }) {
+        for task in lane
+            .iter()
+            .copied()
+            .filter(|task| task.liveness(now) == "stalled")
+        {
             let idle_ms = now.saturating_sub(task.updated_at_ms);
-            if idle_ms < ESCALATION_STALL_IDLE_MS {
-                continue;
-            }
             let mut signal = escalation_signal(
                 "stall_suspected",
                 "verify_progress",
@@ -2684,6 +2955,7 @@ fn annotate_idempotency_persistence(mut result: Value, persistence_error: Value)
 }
 
 pub const AGENT_TASK_DISPATCH_METHOD: &str = "herdr_mcp.agent.task.dispatch";
+pub const AGENT_TASK_REPORT_METHOD: &str = "herdr_mcp.agent.task.report";
 pub const AGENT_TASK_STATUS_METHOD: &str = "herdr_mcp.agent.task.status";
 pub const AGENT_TASK_INBOX_METHOD: &str = "herdr_mcp.agent.task.inbox";
 pub const AGENT_TASK_ACK_METHOD: &str = "herdr_mcp.agent.task.ack";
@@ -2695,6 +2967,16 @@ pub fn task_call_with_parent_session(
     caller_parent_session_ref: Option<&str>,
 ) -> Value {
     match method {
+        decision_gates::RESOLVE => json!({"ok": false, "code": "gate_resolution_requires_human"}),
+        decision_gates::CREATE | decision_gates::STATUS | decision_gates::CANCEL => {
+            registry.gate_call(method, params, caller_parent_session_ref)
+        }
+        AGENT_TASK_REPORT_METHOD => {
+            if caller_parent_session_ref.is_some() {
+                return json!({"ok": false, "code": "worker_report_requires_trusted_local"});
+            }
+            registry.task_report(params)
+        }
         AGENT_TASK_STATUS_METHOD => {
             if let Some(key_value) = params.get("idempotency_key") {
                 let Some(key) = key_value.as_str() else {
@@ -2896,11 +3178,55 @@ pub fn run_with_parent_session(
     if let Err(error) = mutation::check_global("herdr_prompt") {
         return error;
     }
-    let target = match required_str(args, "target") {
-        Ok("") => return invalid("target must not be empty"),
+    // `spawn` is parsed before the target: a spawn dispatch has no target yet,
+    // and every rejection below must land before the runtime reserves a key,
+    // creates a pane, or starts an agent.
+    let spawn = match parse_spawn(args) {
+        Ok(spawn) => spawn,
+        Err(error) => return error,
+    };
+    let target = match &spawn {
+        Some(_) => {
+            if args.get("target").is_some() {
+                return spawn_invalid(
+                    "target and spawn are mutually exclusive: use spawn to create a new agent, or target to reuse an existing one",
+                );
+            }
+            ""
+        }
+        None => match required_str(args, "target") {
+            Ok("") => return invalid("target must not be empty"),
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+    };
+    let role = match role_targets::RoleTarget::parse(target) {
+        Ok(role) => role,
+        Err(error) => return error,
+    };
+    let workspace_id = match optional_str(args, "workspace_id") {
         Ok(value) => value,
         Err(error) => return error,
     };
+    if spawn.is_some() && workspace_id.is_some() {
+        return spawn_invalid(
+            "workspace_id is not applicable with spawn; pass spawn.workspace_id instead",
+        );
+    }
+    let max_concurrent = match args.get("max_concurrent") {
+        None => None,
+        Some(value) => match value.as_u64() {
+            Some(value) if (1..=16).contains(&value) => Some(value),
+            _ => return invalid("max_concurrent must be an integer in 1..=16"),
+        },
+    };
+    if max_concurrent.is_some() && role.is_none() {
+        return if spawn.is_some() {
+            spawn_invalid("max_concurrent is not applicable with spawn")
+        } else {
+            invalid("max_concurrent requires an explicit role selector target")
+        };
+    }
     let text = match required_str(args, "text") {
         Ok(value) => value,
         Err(error) => return error,
@@ -2909,9 +3235,26 @@ pub fn run_with_parent_session(
         Ok(value) => value,
         Err(error) => return error,
     };
+    if spawn.is_some() && idempotency_key.is_none() {
+        return spawn_invalid(
+            "idempotency_key is required with spawn: a replay must never create a second pane, tab or agent",
+        );
+    }
     let parent_target = match optional_str(args, "parent_target") {
         Ok(value) => value,
         Err(error) => return error,
+    };
+    let stall_after_ms = match args.get("stall_after_ms") {
+        None => None,
+        Some(value) => match value.as_u64() {
+            Some(value) if (60_000..=120 * 60_000).contains(&value) => Some(value),
+            _ => return invalid("stall_after_ms must be an integer in 60000..=7200000"),
+        },
+    };
+    let inject_task_identity = match args.get("inject_task_identity") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return invalid("inject_task_identity must be a boolean"),
     };
     let wait = match parse_wait(args.get("wait")) {
         Ok(value) => value,
@@ -2919,15 +3262,110 @@ pub fn run_with_parent_session(
     };
     // Observation preferences such as wait are not part of mutation identity.
     // The same target/text intent must keep the same task under one idempotency key.
-    let fingerprint = request_fingerprint(target, text);
+    // A spawn fingerprints its canonical spawn intent, never the pane it creates.
+    let fingerprint = match &spawn {
+        Some(spawn) => spawn.request_fingerprint(text),
+        None => request_fingerprint(target, text),
+    };
     let dispatch_id = dispatch_id(idempotency_key, &fingerprint);
     let task_id = dispatch_id.as_str();
     let mut operation_id = None;
+    // A spawn reserves its key before resolving or creating anything: a
+    // concurrent call must fail closed as in-flight, and a replay must return
+    // the stored outcome even when the live layout changed since.
+    let mut spawn_resume: Option<SpawnResume> = None;
+    if spawn.is_some()
+        && let Some(key) = idempotency_key
+    {
+        match reserve_dispatch(registry, key, &fingerprint, task_id, wait.as_ref()) {
+            DispatchReservation::Reserved(op_id) => operation_id = op_id,
+            DispatchReservation::Known(result) => match spawn_checkpoint(&result) {
+                // A chain that paused on the caller's budget resumes from its
+                // persisted pane/agent under the same key instead of spawning.
+                Some(checkpoint) => spawn_resume = Some(checkpoint),
+                None => return result,
+            },
+        }
+    }
+    // Resolve the spawn plan (workspace, cwd, agent name) before any mutation:
+    // an invalid plan must never leave a pane or an agent behind, and its
+    // rejection is persisted so the key replays it instead of spawning later.
+    let spawn_dispatch = match (&spawn, idempotency_key) {
+        (Some(spawn), Some(key)) => match resolve_spawn_dispatch(registry, spawn, key) {
+            Ok(dispatch) => Some(dispatch),
+            Err(failure) => {
+                return finish_spawn_failure(
+                    registry,
+                    idempotency_key,
+                    &fingerprint,
+                    task_id,
+                    failure,
+                );
+            }
+        },
+        (Some(_), None) => return spawn_invalid("idempotency_key is required with spawn"),
+        (None, _) => None,
+    };
+
+    // Delegation depth is decidable from the task ledger, so a spawn dispatch
+    // that would create a third-level worker is refused before a pane or agent
+    // exists: nothing to reclaim and no phantom prompt step. The new pane can
+    // never be the caller itself, so only the ledger depth check applies here.
+    if spawn_dispatch.is_some()
+        && let Some(parent_target) = parent_target
+        && let Some(mut rejection) = delegation_guard(client, registry, "", None, parent_target)
+    {
+        if spawn_resume.is_some() {
+            // A resumed chain already owns a persisted pane/agent outcome: this
+            // refusal is a live observation about the parent chain, so it must
+            // not overwrite the checkpoint this key replays from.
+            insert_dispatch_id(&mut rejection, task_id);
+            insert_task_id(&mut rejection, task_id);
+            return rejection;
+        }
+        // This call reserved the key above and created nothing, so the refusal
+        // is this key's outcome: persist it like every other pre-pane failure.
+        // Otherwise the reservation stays pending and a same-key retry inside
+        // the TTL observes `idempotency_in_flight` instead of the refusal.
+        return finish_spawn_failure(registry, idempotency_key, &fingerprint, task_id, rejection);
+    }
+
+    // Two concurrent replays of one checkpoint must not both prompt.
+    let _resume_guard = match (&spawn_resume, idempotency_key) {
+        (Some(checkpoint), Some(key)) => match registry.begin_spawn_resume(key) {
+            Some(guard) => Some(guard),
+            None => {
+                let mut busy = spawn_resume_in_progress(checkpoint);
+                insert_dispatch_id(&mut busy, task_id);
+                insert_task_id(&mut busy, task_id);
+                return busy;
+            }
+        },
+        _ => None,
+    };
 
     // A parented dispatch probes the caller's own agent once for the delegation
     // guards and reuses that observation as the pre-submit baseline below.
-    let guard_observation = parent_target.and_then(|_| agent_state_of(client, target));
-    if let Some(parent_target) = parent_target
+    // Hold admission through durable task registration, including requests with
+    // no cap, so concurrent role calls cannot race a capped caller's count.
+    let role_admission = if role.is_some() {
+        match registry.inner.role_dispatches.lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => return role_targets::not_delivered("agent_task_store_unavailable"),
+        }
+    } else {
+        None
+    };
+    let guard_observation = if role.is_none() && !target.is_empty() {
+        parent_target.and_then(|_| agent_state_of(client, target))
+    } else {
+        None
+    };
+    if role.is_none()
+        // A spawn has no pane yet; its delegation guard runs after the pane
+        // and agent exist (see below).
+        && !target.is_empty()
+        && let Some(parent_target) = parent_target
         && let Some(mut rejection) = delegation_guard(
             client,
             registry,
@@ -2941,28 +3379,75 @@ pub fn run_with_parent_session(
         return rejection;
     }
 
-    if let Some(key) = idempotency_key {
-        match registry.begin(key, &fingerprint) {
-            Ok(BeginPrompt::Reserved(op_id)) => operation_id = op_id,
-            Ok(BeginPrompt::Replay(mut result)) => {
-                insert_dispatch_id(&mut result, task_id);
-                insert_task_id(&mut result, task_id);
-                attach_task_observation(registry, &mut result, task_id, None);
-                if let Some(wait) = wait.as_ref() {
-                    apply_task_wait(registry, &mut result, task_id, wait);
-                }
-                return result;
-            }
-            Err(mut error) => {
-                insert_dispatch_id(&mut error, task_id);
-                insert_task_id(&mut error, task_id);
-                return error;
-            }
+    if spawn.is_none()
+        && let Some(key) = idempotency_key
+    {
+        match reserve_dispatch(registry, key, &fingerprint, task_id, wait.as_ref()) {
+            DispatchReservation::Reserved(op_id) => operation_id = op_id,
+            DispatchReservation::Known(result) => return result,
         }
     }
 
+    let requested_target = role.as_ref().map(|_| target);
+    let resolution = if let Some(role) = role.as_ref() {
+        match role.resolve(
+            client,
+            registry,
+            workspace_id,
+            parent_target,
+            parent_session_ref,
+            max_concurrent,
+        ) {
+            Ok(resolution) => Some(resolution),
+            Err(mut error) => {
+                insert_dispatch_id(&mut error, task_id);
+                insert_task_id(&mut error, task_id);
+                if let Some(key) = idempotency_key
+                    && let Err(persist_error) = registry.complete(key, &fingerprint, &error)
+                {
+                    return annotate_idempotency_persistence(error, persist_error);
+                }
+                return error;
+            }
+        }
+    } else {
+        None
+    };
+    // A spawn resolves its target by creating it, or by resuming the pane a
+    // resumable checkpoint already persisted.
+    let mut spawn_outcome = None;
+    let dispatched_target = match spawn_dispatch.as_ref() {
+        Some(dispatch) => match spawn_chain(client, registry, dispatch, spawn_resume.as_ref()) {
+            Ok(outcome) => {
+                let pane_id = outcome.pane_id.clone();
+                spawn_outcome = Some(outcome);
+                pane_id
+            }
+            Err(failure) => {
+                return finish_spawn_failure(
+                    registry,
+                    idempotency_key,
+                    &fingerprint,
+                    task_id,
+                    failure,
+                );
+            }
+        },
+        None => resolution
+            .as_ref()
+            .map_or(target, |resolved| resolved.target.as_str())
+            .to_owned(),
+    };
+    let target = dispatched_target.as_str();
     let start_cursor = registry.current_task_cursor();
-    let before = guard_observation.or_else(|| agent_state_of(client, target));
+    let before = match &spawn_outcome {
+        Some(outcome) => outcome.before.clone(),
+        None => resolution
+            .as_ref()
+            .map(|resolved| resolved.before.clone())
+            .or(guard_observation),
+    }
+    .or_else(|| agent_state_of(client, target));
     let pane_id = before
         .as_ref()
         .and_then(|state| state.pane_id.as_deref())
@@ -2975,9 +3460,16 @@ pub fn run_with_parent_session(
     let injection = handoff_target
         .as_ref()
         .map(|(pane_id, worktree)| registry.inject_handoff_once(pane_id, worktree, text));
-    let dispatch_text = injection
+    let mut dispatch_text = injection
         .as_ref()
         .map_or_else(|| text.to_owned(), |injection| injection.text.clone());
+    if inject_task_identity {
+        // Runtime-generated ids are bounded and contain no caller/session data.
+        // Keep this after fingerprinting and the replay return above.
+        dispatch_text.push_str(&format!(
+            "\n[herdr-task task_id={task_id} dispatch_id={dispatch_id}]\nReport completion exactly once: herdr-mcp agent report --task-id {task_id} --dispatch-id {dispatch_id} --kind worker_done. For long tasks, report --kind heartbeat periodically."
+        ));
+    }
     // Native Herdr 0.9.x wait is lifecycle/status based and cannot identify the
     // prompt turn. Submit exactly once without native wait, then wait on the
     // Runtime-owned task ledger below.
@@ -2986,11 +3478,13 @@ pub fn run_with_parent_session(
         "text": dispatch_text,
     });
 
-    let mut result = match client.call_with_timeout(
-        "agent.prompt",
-        params,
-        Duration::from_millis(DEFAULT_CALL_TIMEOUT_MS),
-    ) {
+    // A spawn dispatch submits its prompt with only what is left of the chain
+    // the caller is waiting for; every other dispatch keeps the default budget.
+    let prompt_budget = spawn_outcome.as_ref().map_or_else(
+        || Duration::from_millis(DEFAULT_CALL_TIMEOUT_MS),
+        |outcome| outcome.prompt_timeout,
+    );
+    let mut result = match client.call_with_timeout("agent.prompt", params, prompt_budget) {
         Ok(response) => prompt_success(
             client,
             target,
@@ -3003,6 +3497,11 @@ pub fn run_with_parent_session(
         Err(error) => prompt_failure(client, target, before.as_ref(), false, error, task_id),
     };
     insert_task_id(&mut result, task_id);
+    if let Some(resolved) = &resolution {
+        result["requested_target"] = json!(requested_target);
+        result["resolved_target"] = json!(resolved.target);
+        result["candidates"] = json!(resolved.candidates);
+    }
 
     // A dispatch that provably never reached the agent releases the mark it
     // created so the next first dispatch re-attaches the handoff. Success and
@@ -3019,6 +3518,7 @@ pub fn run_with_parent_session(
     match registry.register_task(RegisterTaskInput {
         task_id,
         target,
+        requested_target,
         fingerprint: &fingerprint,
         idempotency_key,
         before: before.as_ref(),
@@ -3027,12 +3527,13 @@ pub fn run_with_parent_session(
         start_cursor,
         parent_target,
         parent_session_ref,
+        stall_after_ms,
     }) {
         Ok(Some(task)) => {
             if let Some(object) = result.as_object_mut() {
                 object.insert("task_tracking".to_owned(), json!(true));
                 object.insert("turn_id".to_owned(), json!(task.turn_id));
-                object.insert("task".to_owned(), task.public_json());
+                object.insert("task".to_owned(), task.public_json_at(registry.now_ms()));
             }
         }
         Ok(None) => {}
@@ -3057,6 +3558,19 @@ pub fn run_with_parent_session(
 
     attach_task_observation(registry, &mut result, task_id, None);
 
+    // Spawn facts belong to the persisted dispatch outcome: a replay reports
+    // the pane/agent this key actually created, including a failed prompt.
+    if let Some(outcome) = &spawn_outcome {
+        let facts = outcome.dispatch_facts(&result);
+        let delivered = result.get("ok").and_then(Value::as_bool) == Some(true);
+        if let Some(object) = result.as_object_mut() {
+            object.insert("spawn".to_owned(), facts);
+            if !delivered {
+                object.insert("failed_step".to_owned(), json!("prompt"));
+            }
+        }
+    }
+
     if let Some(op_id) = operation_id
         && let Some(object) = result.as_object_mut()
     {
@@ -3076,10 +3590,1112 @@ pub fn run_with_parent_session(
         }
     }
 
+    drop(role_admission);
     if let Some(wait) = wait.as_ref() {
         apply_task_wait(registry, &mut result, task_id, wait);
     }
     result
+}
+
+/// Reserve one dispatch key, or return the stored replay/rejection payload.
+///
+/// A replay is a pure observation: it resolves no evidence and submits nothing.
+/// Outcome of reserving one dispatch idempotency key.
+enum DispatchReservation {
+    /// This call owns the key and must persist its outcome.
+    Reserved(Option<String>),
+    /// The key is already known: a completed outcome, a checkpoint, or an error.
+    Known(Value),
+}
+
+fn reserve_dispatch(
+    registry: &PromptRegistry,
+    key: &str,
+    fingerpr: &str,
+    task_id: &str,
+    wait: Option<&Value>,
+) -> DispatchReservation {
+    match registry.begin(key, fingerpr) {
+        Ok(BeginPrompt::Reserved(op_id)) => DispatchReservation::Reserved(op_id),
+        Ok(BeginPrompt::Replay(mut result)) => {
+            insert_dispatch_id(&mut result, task_id);
+            insert_task_id(&mut result, task_id);
+            attach_task_observation(registry, &mut result, task_id, None);
+            if let Some(wait) = wait {
+                apply_task_wait(registry, &mut result, task_id, wait);
+            }
+            DispatchReservation::Known(result)
+        }
+        Err(mut error) => {
+            insert_dispatch_id(&mut error, task_id);
+            insert_task_id(&mut error, task_id);
+            DispatchReservation::Known(error)
+        }
+    }
+}
+
+/// One validated optional `spawn` object of an `agent.task.dispatch` call.
+///
+/// Spawn turns the dispatch into one serial, single-confirmation operation:
+/// create a task-owned pane, start the agent, wait for interactive readiness,
+/// then run the unchanged dispatch path against that pane.
+#[derive(Debug, Clone)]
+struct SpawnRequest {
+    kind: String,
+    name: Option<String>,
+    workspace: Option<String>,
+    cwd: Option<String>,
+    tab_label: Option<String>,
+    split_from: Option<String>,
+    direction: Option<String>,
+    startup_timeout_ms: u64,
+}
+
+impl SpawnRequest {
+    /// Mutation identity for a spawn dispatch: the canonical spawn intent plus
+    /// the text, never the pane the runtime is about to create. The startup
+    /// budget is an execution preference like `wait`, so it cannot fork a key.
+    fn request_fingerprint(&self, text: &str) -> String {
+        let slot = |value: &Option<String>| value.clone().unwrap_or_default();
+        let spec = format!(
+            "spawn/1\nkind={}\nworkspace={}\ncwd={}\ntab_label={}\nsplit_from={}\ndirection={}\nname={}",
+            self.kind,
+            slot(&self.workspace),
+            slot(&self.cwd),
+            slot(&self.tab_label),
+            slot(&self.split_from),
+            slot(&self.direction),
+            slot(&self.name),
+        );
+        request_fingerprint(&spec, text)
+    }
+}
+
+/// A spawn request with its live-snapshot facts resolved and no mutation done.
+#[derive(Debug, Clone)]
+struct SpawnDispatch {
+    request: SpawnRequest,
+    workspace_id: String,
+    cwd: Option<PathBuf>,
+    agent_name: String,
+    tab_label: String,
+}
+
+/// A failure of exactly one spawn step, carrying the native error verbatim.
+#[derive(Debug, Clone)]
+struct SpawnStepError {
+    code: String,
+    message: String,
+    hint: Option<String>,
+}
+
+impl SpawnStepError {
+    fn native(error: HerdrError, hint: Option<&str>) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            hint: hint.map(str::to_owned),
+        }
+    }
+
+    fn runtime(code: &str, message: String, hint: Option<&str>) -> Self {
+        Self {
+            code: code.to_owned(),
+            message,
+            hint: hint.map(str::to_owned),
+        }
+    }
+
+    fn refusal(refusal: &Value, hint: Option<&str>) -> Self {
+        Self {
+            code: refusal
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("spawn_pane_refused")
+                .to_owned(),
+            message: refusal
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("the pane could not be created")
+                .to_owned(),
+            hint: hint.map(str::to_owned),
+        }
+    }
+}
+
+/// Roll-forward facts for a spawn that may have failed or paused part-way.
+#[derive(Default)]
+struct SpawnProgress {
+    pane_id: Option<String>,
+    tab_id: Option<String>,
+    agent_started: bool,
+    steps: Vec<Value>,
+    attempts: u64,
+}
+
+impl SpawnProgress {
+    fn facts(&self, spawn: &SpawnDispatch) -> Value {
+        json!({
+            "pane_id": self.pane_id,
+            "tab_id": self.tab_id,
+            "agent_name": spawn.agent_name,
+            "kind": spawn.request.kind,
+            "workspace_id": spawn.workspace_id,
+            "cwd": spawn.cwd.as_ref().map(|cwd| cwd.to_string_lossy().to_string()),
+            "created": self.pane_id.is_some(),
+            "agent_started": self.agent_started,
+            "steps": self.steps,
+        })
+    }
+
+    fn failure(&self, spawn: &SpawnDispatch, failed_step: &str, error: &SpawnStepError) -> Value {
+        let mut failure = json!({
+            "ok": false,
+            "failed_step": failed_step,
+            "code": error.code,
+            "message": error.message,
+            "delivery_state": "not_delivered",
+            "submitted": false,
+            "requires_human": false,
+            "spawn": self.facts(spawn),
+        });
+        if let Some(hint) = &error.hint {
+            failure["hint"] = json!(hint);
+        }
+        self.insert_reclaim(&mut failure);
+        failure
+    }
+
+    /// A chain that ran out of the caller's budget is not a dead end: the pane
+    /// and any started agent stay persisted under the same idempotency key, and
+    /// replaying that key resumes exactly there instead of spawning again.
+    fn checkpoint(
+        &self,
+        spawn: &SpawnDispatch,
+        phase: &str,
+        code: &str,
+        message: String,
+        hint: &str,
+    ) -> Value {
+        let mut checkpoint = json!({
+            "ok": false,
+            "failed_step": phase,
+            "phase": phase,
+            "resumable": true,
+            "code": code,
+            "message": message,
+            "delivery_state": "not_delivered",
+            "submitted": false,
+            "requires_human": false,
+            "attempts": self.attempts,
+            "spawn": self.facts(spawn),
+            "next": {
+                "action": "replay_same_idempotency_key",
+                "note": "replaying this key with the same spawn re-checks the persisted pane/agent, then prompts it once; it never creates a second pane, tab or agent",
+                "raise": "spawn.startup_timeout_ms if the caller has a larger transport budget",
+            },
+            "hint": hint,
+        });
+        self.insert_reclaim(&mut checkpoint);
+        checkpoint
+    }
+
+    fn insert_reclaim(&self, value: &mut Value) {
+        if self.pane_id.is_some()
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert(
+                "reclaim".to_owned(),
+                json!({
+                    "owner": "this_spawn",
+                    "pane_id": self.pane_id,
+                    "rule": "reclaim only this pane, and only when the agent is terminal or the pane is provably empty",
+                }),
+            );
+        }
+    }
+}
+
+/// A resumable checkpoint read back from the durable idempotency store.
+struct SpawnResume {
+    pane_id: String,
+    tab_id: Option<String>,
+    agent_started: bool,
+    phase: String,
+    steps: Vec<Value>,
+    attempts: u64,
+}
+
+impl SpawnResume {
+    fn progress(&self) -> SpawnProgress {
+        SpawnProgress {
+            pane_id: Some(self.pane_id.clone()),
+            tab_id: self.tab_id.clone(),
+            agent_started: self.agent_started,
+            steps: self.steps.clone(),
+            attempts: self.attempts,
+        }
+    }
+}
+
+/// Read one resumable spawn checkpoint out of a stored replay payload.
+///
+/// Only `agent_start`/`agent_ready` pauses resume: any other stored outcome is
+/// a finished dispatch (or an uncertain prompt) and stays a pure replay.
+fn spawn_checkpoint(result: &Value) -> Option<SpawnResume> {
+    if result.get("resumable").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let phase = result
+        .get("phase")
+        .and_then(Value::as_str)
+        .or_else(|| result.get("failed_step").and_then(Value::as_str))?;
+    if phase != "agent_start" && phase != "agent_ready" {
+        return None;
+    }
+    let spawn = result.get("spawn")?;
+    Some(SpawnResume {
+        pane_id: spawn.get("pane_id").and_then(Value::as_str)?.to_owned(),
+        tab_id: spawn
+            .get("tab_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        agent_started: spawn
+            .get("agent_started")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        phase: phase.to_owned(),
+        steps: spawn
+            .get("steps")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        attempts: result.get("attempts").and_then(Value::as_u64).unwrap_or(0),
+    })
+}
+
+/// A second concurrent replay of the same checkpoint must not prompt twice.
+fn spawn_resume_in_progress(checkpoint: &SpawnResume) -> Value {
+    json!({
+        "ok": false,
+        "failed_step": checkpoint.phase,
+        "phase": checkpoint.phase,
+        "resumable": true,
+        "code": "spawn_resume_in_progress",
+        "message": format!("another replay of this idempotency key is already resuming the spawn in pane {}", checkpoint.pane_id),
+        "delivery_state": "not_delivered",
+        "submitted": false,
+        "requires_human": false,
+        "hint": "wait for that replay to settle, then re-read the dispatch outcome instead of prompting again",
+    })
+}
+
+/// Prompt headroom for one chain: a quarter of the chain, never the full 5s
+/// reserve, so a small caller budget still leaves room for the pane and start.
+fn spawn_prompt_reserve_ms(chain_ms: u64) -> u64 {
+    SPAWN_PROMPT_RESERVE_MS.min(chain_ms / 4)
+}
+
+/// What a chain step may spend: the remaining chain minus the prompt reserve.
+fn spawn_step_budget_ms(chain_ms: u64, remaining_ms: u64) -> u64 {
+    remaining_ms.saturating_sub(spawn_prompt_reserve_ms(chain_ms))
+}
+
+/// A spawn whose pane, agent and readiness evidence all succeeded.
+struct SpawnOutcome {
+    pane_id: String,
+    tab_id: Option<String>,
+    agent_name: String,
+    kind: String,
+    workspace_id: String,
+    cwd: Option<PathBuf>,
+    steps: Vec<Value>,
+    before: Option<AgentState>,
+    /// Prompt submission budget: what is left of this attempt's chain.
+    prompt_timeout: Duration,
+    /// True when this attempt continued a persisted checkpoint.
+    resumed: bool,
+    attempts: u64,
+}
+
+impl SpawnOutcome {
+    /// Public `spawn` facts plus the prompt step taken from the dispatch result.
+    fn dispatch_facts(&self, result: &Value) -> Value {
+        let mut steps = self.steps.clone();
+        steps.push(json!({
+            "step": "prompt",
+            "method": "agent.prompt",
+            "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            "submitted": result.get("submitted").cloned().unwrap_or(Value::Null),
+            "delivery_state": result.get("delivery_state").cloned().unwrap_or(Value::Null),
+        }));
+        json!({
+            "pane_id": self.pane_id,
+            "tab_id": self.tab_id,
+            "agent_name": self.agent_name,
+            "kind": self.kind,
+            "workspace_id": self.workspace_id,
+            "cwd": self.cwd.as_ref().map(|cwd| cwd.to_string_lossy().to_string()),
+            "created": true,
+            "resumed": self.resumed,
+            "attempts": self.attempts,
+            "steps": steps,
+        })
+    }
+}
+
+/// Validation rejection of a spawn dispatch: no pane, agent, or key exists yet.
+fn spawn_invalid(message: &str) -> Value {
+    json!({
+        "ok": false,
+        "failed_step": "validate",
+        "code": "invalid_params",
+        "message": message,
+        "delivery_state": "not_delivered",
+        "submitted": false,
+        "requires_human": false,
+    })
+}
+
+/// Parse and validate the optional `spawn` object without touching Herdr.
+fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
+    let Some(value) = args.get("spawn") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(object) = value.as_object() else {
+        return Err(spawn_invalid("spawn must be an object"));
+    };
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "kind"
+                | "name"
+                | "workspace_id"
+                | "cwd"
+                | "tab_label"
+                | "split_from"
+                | "direction"
+                | "startup_timeout_ms"
+        ) {
+            return Err(spawn_invalid(&format!(
+                "spawn.{key} is not a supported spawn field"
+            )));
+        }
+    }
+    let kind = match object.get("kind").and_then(Value::as_str) {
+        Some(kind) if spawn_kind_is_valid(kind) => kind.to_owned(),
+        Some(_) => {
+            return Err(spawn_invalid(
+                "spawn.kind must match [a-z][a-z0-9_-]{0,63} (as agent.start kind)",
+            ));
+        }
+        None => return Err(spawn_invalid("spawn.kind is required")),
+    };
+    let name = match object.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) if spawn_name_is_valid(name) => Some(name.clone()),
+        Some(_) => {
+            return Err(spawn_invalid("spawn.name must match [a-z][a-z0-9_-]{0,31}"));
+        }
+    };
+    let workspace = spawn_optional_string(object, "workspace_id", 256)?;
+    let cwd = spawn_optional_string(object, "cwd", 1024)?;
+    let tab_label = spawn_optional_string(object, "tab_label", 64)?;
+    let split_from = spawn_optional_string(object, "split_from", 256)?;
+    let direction = match spawn_optional_string(object, "direction", 16)? {
+        None => None,
+        Some(direction) if direction == "right" || direction == "down" => Some(direction),
+        Some(_) => return Err(spawn_invalid("spawn.direction must be right or down")),
+    };
+    if direction.is_some() && split_from.is_none() {
+        return Err(spawn_invalid(
+            "spawn.direction requires spawn.split_from: a new tab needs no split direction",
+        ));
+    }
+    if workspace.is_none() && cwd.is_none() {
+        return Err(spawn_invalid(
+            "spawn requires workspace_id, or a cwd inside exactly one workspace",
+        ));
+    }
+    let startup_timeout_ms = match object.get("startup_timeout_ms") {
+        None | Some(Value::Null) => SPAWN_CHAIN_DEFAULT_MS,
+        Some(value) => match value.as_u64() {
+            Some(value) if (1..=SPAWN_CHAIN_MAX_MS).contains(&value) => value,
+            _ => {
+                return Err(spawn_invalid(
+                    "spawn.startup_timeout_ms must be an integer in 1..=100000",
+                ));
+            }
+        },
+    };
+    Ok(Some(SpawnRequest {
+        kind,
+        name,
+        workspace,
+        cwd,
+        tab_label,
+        split_from,
+        direction,
+        startup_timeout_ms,
+    }))
+}
+
+fn spawn_optional_string(
+    object: &Map<String, Value>,
+    field: &str,
+    max_len: usize,
+) -> Result<Option<String>, Value> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if trimmed.len() > max_len || trimmed.chars().any(char::is_control) {
+                return Err(spawn_invalid(&format!(
+                    "spawn.{field} must be a non-empty string up to {max_len} bytes without control characters"
+                )));
+            }
+            Ok(Some(trimmed.to_owned()))
+        }
+        Some(_) => Err(spawn_invalid(&format!("spawn.{field} must be a string"))),
+    }
+}
+
+fn spawn_kind_is_valid(kind: &str) -> bool {
+    let mut chars = kind.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+        && kind.len() <= 64
+        && chars.all(|value| {
+            value.is_ascii_lowercase() || value.is_ascii_digit() || value == '_' || value == '-'
+        })
+}
+
+fn spawn_name_is_valid(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+        && name.len() <= SPAWN_AGENT_NAME_MAX
+        && chars.all(|value| {
+            value.is_ascii_lowercase() || value.is_ascii_digit() || value == '_' || value == '-'
+        })
+}
+
+fn spawn_snapshot(registry: &PromptRegistry) -> Value {
+    registry
+        .inner
+        .cache
+        .as_ref()
+        .map(|cache| cache.snapshot())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn spawn_workspaces(snapshot: &Value) -> Vec<&Value> {
+    snapshot
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .map(|workspaces| workspaces.iter().collect())
+        .unwrap_or_default()
+}
+
+fn spawn_workspace_id_of(workspace: &Value) -> Option<&str> {
+    workspace
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .or_else(|| workspace.get("id").and_then(Value::as_str))
+}
+
+fn spawn_workspace_root_of(workspace: &Value) -> Option<PathBuf> {
+    let worktree = workspace.get("worktree")?.as_object()?;
+    worktree
+        .get("checkout_path")
+        .and_then(Value::as_str)
+        .or_else(|| worktree.get("path").and_then(Value::as_str))
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+}
+
+/// A workspace created after the last snapshot is still addressable by id; a
+/// label never is, so a typo cannot silently become a workspace id.
+fn spawn_looks_like_workspace_id(value: &str) -> bool {
+    value.len() <= 32
+        && value.starts_with('w')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// Resolve `spawn.workspace_id` (id or label) or, without it, the workspace
+/// whose declared checkout path contains `spawn.cwd`.
+fn resolve_spawn_workspace(snapshot: &Value, spawn: &SpawnRequest) -> Result<String, Value> {
+    let workspaces = spawn_workspaces(snapshot);
+    if let Some(wanted) = spawn.workspace.as_deref() {
+        if workspaces
+            .iter()
+            .any(|workspace| spawn_workspace_id_of(workspace) == Some(wanted))
+        {
+            return Ok(wanted.to_owned());
+        }
+        let by_label = workspaces
+            .iter()
+            .copied()
+            .filter(|workspace| workspace.get("label").and_then(Value::as_str) == Some(wanted))
+            .collect::<Vec<_>>();
+        match by_label.as_slice() {
+            [workspace] => {
+                if let Some(workspace_id) = spawn_workspace_id_of(workspace) {
+                    return Ok(workspace_id.to_owned());
+                }
+            }
+            [] => {
+                if spawn_looks_like_workspace_id(wanted) {
+                    return Ok(wanted.to_owned());
+                }
+                return Err(spawn_invalid(
+                    "spawn.workspace_id did not match a live workspace id or label",
+                ));
+            }
+            _ => {
+                return Err(spawn_invalid(
+                    "spawn.workspace_id matched more than one workspace label; pass the exact workspace id",
+                ));
+            }
+        }
+    }
+    let Some(cwd) = spawn.cwd.as_deref() else {
+        return Err(spawn_invalid(
+            "spawn requires workspace_id, or a cwd inside exactly one workspace",
+        ));
+    };
+    let cwd = Path::new(cwd);
+    let matches = workspaces
+        .iter()
+        .filter(|workspace| {
+            spawn_workspace_root_of(workspace).is_some_and(|root| cwd.starts_with(&root))
+        })
+        .filter_map(|workspace| spawn_workspace_id_of(workspace).map(str::to_owned))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [workspace_id] => Ok(workspace_id.clone()),
+        [] => Err(spawn_invalid(
+            "spawn.cwd is not inside any live workspace; pass spawn.workspace_id explicitly",
+        )),
+        _ => Err(spawn_invalid(
+            "spawn.cwd is inside more than one workspace; pass spawn.workspace_id explicitly",
+        )),
+    }
+}
+
+/// Resolve and validate the spawn cwd. The check is lexical and component-wise
+/// on purpose: a dispatch must never canonicalize a path or run `git`, so a
+/// protected-folder TCC prompt can never appear inside a tool call.
+fn resolve_spawn_cwd(
+    snapshot: &Value,
+    workspace_id: &str,
+    spawn: &SpawnRequest,
+) -> Result<Option<PathBuf>, Value> {
+    let cwd = match spawn.cwd.as_deref() {
+        Some(cwd) => PathBuf::from(cwd),
+        None => spawn_workspaces(snapshot)
+            .iter()
+            .find(|workspace| spawn_workspace_id_of(workspace) == Some(workspace_id))
+            .and_then(|workspace| spawn_workspace_root_of(workspace))
+            .ok_or_else(|| {
+                spawn_invalid(
+                    "spawn.cwd is required: the workspace declares no checkout path to inherit",
+                )
+            })?,
+    };
+    if !cwd.is_absolute() {
+        return Err(spawn_invalid("spawn.cwd must be an absolute path"));
+    }
+    if cwd
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(spawn_invalid("spawn.cwd must not contain '..' components"));
+    }
+    let roots = crate::fs_security::managed_roots(snapshot);
+    if !roots.iter().any(|root| cwd.starts_with(root)) {
+        let mut refusal =
+            spawn_invalid("spawn.cwd must be inside a managed project root from the live topology");
+        refusal["managed_roots"] = json!(
+            roots
+                .iter()
+                .map(|root| root.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        );
+        return Err(refusal);
+    }
+    Ok(Some(cwd))
+}
+
+/// Agent name for the new pane: the caller's name, or a stable kind+key name.
+fn spawn_agent_name(spawn: &SpawnRequest, workspace_id: &str, idempotency_key: &str) -> String {
+    if let Some(name) = &spawn.name {
+        return name.clone();
+    }
+    let digest = stable_digest(&[
+        b"herdr_prompt/spawn/name",
+        spawn.kind.as_bytes(),
+        workspace_id.as_bytes(),
+        idempotency_key.as_bytes(),
+    ]);
+    let suffix = &digest[..8];
+    let budget = SPAWN_AGENT_NAME_MAX.saturating_sub(suffix.len() + 1);
+    let mut kind = spawn.kind.clone();
+    kind.truncate(budget);
+    while kind.ends_with(['-', '_']) {
+        kind.pop();
+    }
+    format!("{kind}-{suffix}")
+}
+
+fn resolve_spawn_dispatch(
+    registry: &PromptRegistry,
+    spawn: &SpawnRequest,
+    idempotency_key: &str,
+) -> Result<SpawnDispatch, Value> {
+    let snapshot = spawn_snapshot(registry);
+    let workspace_id = resolve_spawn_workspace(&snapshot, spawn)?;
+    let cwd = resolve_spawn_cwd(&snapshot, &workspace_id, spawn)?;
+    let agent_name = spawn_agent_name(spawn, &workspace_id, idempotency_key);
+    let tab_label = spawn
+        .tab_label
+        .clone()
+        .unwrap_or_else(|| agent_name.clone());
+    Ok(SpawnDispatch {
+        request: spawn.clone(),
+        workspace_id,
+        cwd,
+        agent_name,
+        tab_label,
+    })
+}
+
+struct SpawnPane {
+    pane_id: String,
+    tab_id: Option<String>,
+    method: &'static str,
+}
+
+/// Create the task-owned pane: a new tab by default so the agent gets the full
+/// tab width, `pane.split` only when the caller names its parent pane.
+fn spawn_create_pane(
+    client: &HerdrClient,
+    registry: &PromptRegistry,
+    spawn: &SpawnDispatch,
+    timeout: Duration,
+) -> Result<SpawnPane, SpawnStepError> {
+    let cwd = spawn
+        .cwd
+        .as_ref()
+        .map(|cwd| cwd.to_string_lossy().to_string());
+    let Some(split_from) = spawn.request.split_from.as_deref() else {
+        let mut params = Map::new();
+        params.insert("workspace_id".to_owned(), json!(spawn.workspace_id));
+        params.insert("label".to_owned(), json!(spawn.tab_label));
+        params.insert("focus".to_owned(), json!(false));
+        if let Some(cwd) = cwd {
+            params.insert("cwd".to_owned(), json!(cwd));
+        }
+        let result = client
+            .call_with_timeout("tab.create", Value::Object(params), timeout)
+            .map_err(|error| {
+                SpawnStepError::native(
+                    error,
+                    Some("verify with herdr_inspect before retrying: the tab may already exist"),
+                )
+            })?;
+        let pane = result
+            .get("root_pane")
+            .or_else(|| result.get("pane"))
+            .unwrap_or(&result);
+        let pane_id = pane
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("pane_id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                SpawnStepError::runtime(
+                    "spawn_pane_unconfirmed",
+                    "tab.create returned no pane id".to_owned(),
+                    Some("the tab may already exist; inspect the workspace and reclaim it instead of spawning again"),
+                )
+            })?;
+        let tab_id = result
+            .get("tab")
+            .and_then(|tab| tab.get("tab_id"))
+            .or_else(|| result.get("tab_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        return Ok(SpawnPane {
+            pane_id,
+            tab_id,
+            method: "tab.create",
+        });
+    };
+    let mut params = json!({
+        "target_pane_id": split_from,
+        "direction": spawn.request.direction.as_deref().unwrap_or("right"),
+        "focus": false,
+    });
+    if let Some(cwd) = cwd {
+        params["cwd"] = json!(cwd);
+    }
+    // The same readable-width guard every other pane.split caller uses: a
+    // narrow tab must fall back to a new tab instead of hosting an agent pane
+    // whose excerpts are wrapping noise.
+    let params = match crate::pane_width::guard_split(&spawn_snapshot(registry), &params) {
+        crate::pane_width::SplitPlan::Forward(params) => params,
+        crate::pane_width::SplitPlan::Refuse(refusal) => {
+            return Err(SpawnStepError::refusal(
+                &refusal,
+                Some(
+                    "drop spawn.split_from to open the agent in a new tab, which gets the full tab width",
+                ),
+            ));
+        }
+    };
+    let result = client
+        .call_with_timeout(crate::pane_width::SPLIT_METHOD, params, timeout)
+        .map_err(|error| {
+            SpawnStepError::native(
+                error,
+                Some("verify with herdr_inspect before retrying: the split may already exist"),
+            )
+        })?;
+    let pane = result.get("pane").unwrap_or(&result);
+    let pane_id = pane
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .or_else(|| result.get("pane_id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            SpawnStepError::runtime(
+                "spawn_pane_unconfirmed",
+                "pane.split returned no pane id".to_owned(),
+                Some("the split may already exist; inspect the workspace and reclaim it instead of spawning again"),
+            )
+        })?;
+    let tab_id = pane
+        .get("tab_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(SpawnPane {
+        pane_id,
+        tab_id,
+        method: crate::pane_width::SPLIT_METHOD,
+    })
+}
+
+struct SpawnAgentReadiness {
+    state: AgentState,
+    ready: bool,
+}
+
+/// Readiness evidence from one agent payload: `interactive_ready` is the
+/// native signal, an `idle` lifecycle is the lifecycle equivalent.
+fn spawn_agent_readiness(value: &Value) -> Option<SpawnAgentReadiness> {
+    let state = agent_state_from_value(value)?;
+    let agent = value.get("agent").unwrap_or(value);
+    let interactive_ready = agent
+        .get("interactive_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ready = interactive_ready || state.agent_status.as_deref() == Some("idle");
+    Some(SpawnAgentReadiness { state, ready })
+}
+
+/// One bounded readiness probe. Returns the agent state only when it is ready.
+fn spawn_probe_ready(client: &HerdrClient, pane_id: &str, timeout: Duration) -> Option<AgentState> {
+    let value = client
+        .call_with_timeout("agent.get", json!({"target": pane_id}), timeout)
+        .ok()?;
+    let readiness = spawn_agent_readiness(&value)?;
+    readiness.ready.then_some(readiness.state)
+}
+
+enum SpawnReadyOutcome {
+    Ready(AgentState),
+    TimedOut(Option<String>),
+}
+
+/// Wait for interactive readiness strictly inside the chain deadline.
+///
+/// A resumed chain always gets one probe even below the poll floor: replaying a
+/// checkpoint must be able to observe that the agent finished starting.
+fn spawn_wait_ready(
+    client: &HerdrClient,
+    registry: &PromptRegistry,
+    pane_id: &str,
+    deadline_ms: u64,
+    mut probe_even_when_exhausted: bool,
+) -> SpawnReadyOutcome {
+    let mut last_status = None;
+    loop {
+        let remaining = deadline_ms.saturating_sub(registry.now_ms());
+        let probe_now = std::mem::take(&mut probe_even_when_exhausted);
+        if !probe_now {
+            if remaining < SPAWN_READY_MIN_POLL_MS {
+                return SpawnReadyOutcome::TimedOut(last_status);
+            }
+            thread::sleep(SPAWN_READY_POLL.min(Duration::from_millis(remaining.max(1))));
+        }
+        let probe_timeout = SPAWN_READY_PROBE_TIMEOUT.min(Duration::from_millis(remaining.max(1)));
+        let value = match client.call_with_timeout(
+            "agent.get",
+            json!({"target": pane_id}),
+            probe_timeout,
+        ) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some(readiness) = spawn_agent_readiness(&value) else {
+            continue;
+        };
+        if readiness.ready {
+            return SpawnReadyOutcome::Ready(readiness.state);
+        }
+        last_status = readiness.state.agent_status.clone();
+    }
+}
+
+/// Create (or resume) the pane, start the agent, and prove interactive
+/// readiness, spending only what is left of one caller-visible chain budget.
+fn spawn_chain(
+    client: &HerdrClient,
+    registry: &PromptRegistry,
+    spawn: &SpawnDispatch,
+    resume: Option<&SpawnResume>,
+) -> Result<SpawnOutcome, Value> {
+    let chain_ms = spawn.request.startup_timeout_ms.min(SPAWN_CHAIN_MAX_MS);
+    let chain_started = registry.now_ms();
+    let deadline = chain_started.saturating_add(chain_ms);
+    let resumed = resume.is_some();
+    let mut progress = match resume {
+        Some(checkpoint) => checkpoint.progress(),
+        None => SpawnProgress::default(),
+    };
+    if let Some(checkpoint) = resume {
+        progress.attempts = progress.attempts.saturating_add(1);
+        progress.steps.push(json!({
+            "step": "resume",
+            "method": "agent.task.dispatch",
+            "ok": true,
+            "phase": checkpoint.phase,
+            "attempt": progress.attempts,
+            "pane_id": checkpoint.pane_id,
+        }));
+    }
+
+    // 1. Pane. A resumed chain reuses the persisted pane and never creates one.
+    if progress.pane_id.is_none() {
+        let step_at = registry.now_ms();
+        let remaining = deadline.saturating_sub(step_at);
+        if remaining == 0 {
+            return Err(progress.checkpoint(
+                spawn,
+                "pane_create",
+                "spawn_budget_exhausted",
+                "the spawn chain had no budget left for creating the pane".to_owned(),
+                "replay the same idempotency key with a larger spawn.startup_timeout_ms",
+            ));
+        }
+        let timeout = Duration::from_millis(remaining.min(SPAWN_PANE_TIMEOUT_MS));
+        let created = match spawn_create_pane(client, registry, spawn, timeout) {
+            Ok(created) => created,
+            Err(error) => return Err(progress.failure(spawn, "pane_create", &error)),
+        };
+        progress.pane_id = Some(created.pane_id.clone());
+        progress.tab_id = created.tab_id.clone();
+        progress.steps.push(json!({
+            "step": "pane_create",
+            "method": created.method,
+            "ok": true,
+            "pane_id": created.pane_id,
+            "tab_id": created.tab_id,
+            "duration_ms": registry.now_ms().saturating_sub(step_at),
+        }));
+    }
+    let pane_id = progress
+        .pane_id
+        .clone()
+        .expect("a spawn chain always has a pane before the agent step");
+
+    // 2. Agent. Every step gets only the remaining budget: the prompt reserve
+    //    is subtracted here, never added on top of the caller's window.
+    let mut before = None;
+    let mut started_method = "agent.start";
+    if !progress.agent_started {
+        // A resumed chain first checks whether the agent already came up, so a
+        // pane whose start completed while paused is reused, not restarted.
+        if resumed {
+            let probe = Duration::from_millis(
+                deadline
+                    .saturating_sub(registry.now_ms())
+                    .clamp(1, SPAWN_READY_PROBE_TIMEOUT.as_millis() as u64),
+            );
+            if let Some(state) = spawn_probe_ready(client, &pane_id, probe) {
+                started_method = "agent.get";
+                progress.agent_started = true;
+                before = Some(state);
+                progress.steps.push(json!({
+                    "step": "agent_start",
+                    "method": "agent.get",
+                    "ok": true,
+                    "already_started": true,
+                    "pane_id": pane_id,
+                }));
+            }
+        }
+        if !progress.agent_started {
+            let step_at = registry.now_ms();
+            let remaining = deadline.saturating_sub(step_at);
+            let start_budget = spawn_step_budget_ms(chain_ms, remaining);
+            if start_budget < SPAWN_NATIVE_START_FLOOR_MS {
+                return Err(progress.checkpoint(
+                    spawn,
+                    "agent_start",
+                    "spawn_budget_exhausted",
+                    format!(
+                        "only {remaining}ms of the spawn chain remained, which cannot start an agent (native floor {SPAWN_NATIVE_START_FLOOR_MS}ms plus the prompt reserve)"
+                    ),
+                    "replay the same idempotency key with a larger spawn.startup_timeout_ms; the pane is reused and the agent is started at most once",
+                ));
+            }
+            let native_timeout = start_budget.min(SPAWN_CHAIN_MAX_MS);
+            let start_params = json!({
+                "name": spawn.agent_name,
+                "kind": spawn.request.kind,
+                "pane_id": pane_id,
+                "timeout_ms": native_timeout,
+            });
+            match client.call_with_timeout(
+                "agent.start",
+                start_params,
+                Duration::from_millis(start_budget),
+            ) {
+                Ok(started) => {
+                    progress.agent_started = true;
+                    progress.steps.push(json!({
+                        "step": "agent_start",
+                        "method": "agent.start",
+                        "ok": true,
+                        "agent_name": spawn.agent_name,
+                        "kind": spawn.request.kind,
+                        "duration_ms": registry.now_ms().saturating_sub(step_at),
+                    }));
+                    if let Some(readiness) = spawn_agent_readiness(&started)
+                        && readiness.ready
+                    {
+                        before = Some(readiness.state);
+                    }
+                }
+                Err(error) if error.code == "timeout" => {
+                    return Err(progress.checkpoint(
+                        spawn,
+                        "agent_start",
+                        "spawn_budget_exhausted",
+                        format!(
+                            "agent.start did not confirm within {start_budget}ms of the spawn chain"
+                        ),
+                        "the pane may already contain a starting agent; replay the same idempotency key to re-check readiness and prompt once instead of spawning again",
+                    ));
+                }
+                Err(error) => {
+                    return Err(progress.failure(
+                        spawn,
+                        "agent_start",
+                        &SpawnStepError::native(
+                            error,
+                            Some("the new pane may already contain a started agent; verify it with herdr_inspect and reclaim it instead of spawning again"),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 3. Readiness, strictly inside what is left of the caller's budget.
+    let before = match before {
+        Some(state) => state,
+        None => {
+            let step_at = registry.now_ms();
+            match spawn_wait_ready(client, registry, &pane_id, deadline, resumed) {
+                SpawnReadyOutcome::Ready(state) => {
+                    progress.steps.push(json!({
+                        "step": "agent_ready",
+                        "method": "agent.get",
+                        "ok": true,
+                        "agent_status": state.agent_status,
+                        "duration_ms": registry.now_ms().saturating_sub(step_at),
+                    }));
+                    state
+                }
+                SpawnReadyOutcome::TimedOut(last_status) => {
+                    return Err(progress.checkpoint(
+                        spawn,
+                        "agent_ready",
+                        "agent_ready_timeout",
+                        format!(
+                            "agent in pane {pane_id} was not interactive-ready within the {}ms spawn chain (last status: {})",
+                            chain_ms,
+                            last_status.as_deref().unwrap_or("unknown")
+                        ),
+                        "replay the same idempotency key to re-check readiness and prompt once; the persisted pane and agent are reused",
+                    ));
+                }
+            }
+        }
+    };
+    if started_method == "agent.start" && before.agent_status.as_deref() == Some("idle") {
+        // The start response itself proved readiness; record that evidence.
+        progress.steps.push(json!({
+            "step": "agent_ready",
+            "method": "agent.start",
+            "ok": true,
+            "agent_status": before.agent_status,
+        }));
+    }
+
+    let remaining = deadline.saturating_sub(registry.now_ms());
+    Ok(SpawnOutcome {
+        pane_id,
+        tab_id: progress.tab_id.clone(),
+        agent_name: spawn.agent_name.clone(),
+        kind: spawn.request.kind.clone(),
+        workspace_id: spawn.workspace_id.clone(),
+        cwd: spawn.cwd.clone(),
+        steps: progress.steps,
+        before: Some(before),
+        // The prompt must land inside the same chain the caller waits for.
+        prompt_timeout: Duration::from_millis(remaining.max(1)),
+        resumed,
+        attempts: progress.attempts,
+    })
+}
+
+/// Persist the spawn outcome for this key and annotate the identities, so the
+/// replay of a partially failed spawn never repeats a mutation.
+fn finish_spawn_failure(
+    registry: &PromptRegistry,
+    idempotency_key: Option<&str>,
+    fingerprint: &str,
+    dispatch_id: &str,
+    mut failure: Value,
+) -> Value {
+    insert_dispatch_id(&mut failure, dispatch_id);
+    insert_task_id(&mut failure, dispatch_id);
+    if let Some(key) = idempotency_key
+        && let Err(persist_error) = registry.complete(key, fingerprint, &failure)
+    {
+        return annotate_idempotency_persistence(failure, persist_error);
+    }
+    failure
 }
 
 fn prompt_success(
@@ -3297,6 +4913,15 @@ fn prompt_failure(
             json!({
                 "action": "start_agent_then_reprompt",
                 "inspect": "herdr_inspect",
+                "one_shot": {
+                    "method": AGENT_TASK_DISPATCH_METHOD,
+                    "params": {
+                        "spawn": {"kind": "<agent kind>", "workspace_id": "<workspace id or label>", "cwd": "<optional project cwd>"},
+                        "text": "<same task card>",
+                        "idempotency_key": "<new key>"
+                    },
+                    "note": "one herdr_call creates the pane, starts the agent, waits for readiness and prompts it with a single confirmation",
+                },
                 "split_method": "pane.split",
                 "start_method": "agent.start",
                 "reuse_existing_pane_only_when": "verified_task_owned_free_shell",
@@ -3307,7 +4932,7 @@ fn prompt_failure(
         result.insert(
             "hint".to_owned(),
             json!(
-                "agent target did not resolve and nothing was submitted. This is a pre-dispatch condition, not a human boundary. Re-read herdr_inspect, select a compatible startable Agent, and use a verified task-owned free shell pane or pane.split a task-owned pane before agent.start. Re-prompt with the same idempotency_key after the Agent is ready; never infer pane ownership from agent:null."
+                "agent target did not resolve and nothing was submitted. This is a pre-dispatch condition, not a human boundary. For a NEW agent, dispatch once with herdr_mcp.agent.task.dispatch and the spawn object (kind/workspace_id/cwd) instead of inspect -> split -> agent.start -> dispatch; otherwise re-read herdr_inspect, select a compatible startable Agent, and use a verified task-owned free shell pane or pane.split a task-owned pane before agent.start. Re-prompt with the same idempotency_key after the Agent is ready; never infer pane ownership from agent:null."
             ),
         );
     } else if !retryable {
@@ -3457,9 +5082,13 @@ fn apply_task_wait(registry: &PromptRegistry, result: &mut Value, task_id: &str,
             object.insert("task".to_owned(), task.clone());
         }
         object.insert("wait".to_owned(), task_wait);
-        if !completed {
+        if !completed && object.get("ok").and_then(Value::as_bool) == Some(true) {
+            if object["wait"]["outcome"] == "checkpoint" {
+                object.insert("hint".to_owned(), json!("Wait checkpoint: the task is still live; re-check agent.task.status or agent.task.inbox with the same task_id. Do not redispatch."));
+                return;
+            }
             object.insert("ok".to_owned(), json!(false));
-            object.insert("failure".to_owned(), json!("agent_task_wait_timeout"));
+            object.insert("failure".to_owned(), object["wait"]["reason"].clone());
             object.insert(
                 "failure_phase".to_owned(),
                 json!("post_submission_task_wait"),
@@ -3467,7 +5096,7 @@ fn apply_task_wait(registry: &PromptRegistry, result: &mut Value, task_id: &str,
             object.insert("retryable".to_owned(), json!(false));
             object.insert(
                 "hint".to_owned(),
-                json!("the prompt was submitted once; task wait timed out, so inspect the returned task_id/inbox before any retry"),
+                json!("The prompt may already be submitted; re-check task status/inbox before retrying."),
             );
         }
     }
@@ -3992,6 +5621,1326 @@ mod tests {
         })
     }
 
+    /// user receives explicit identity | Given opt-in or default dispatch | When replayed after changing the opt-in | Then only one prompt is submitted with the original identity and text
+    #[test]
+    fn dispatch_identity_injection_is_opt_in_and_replay_safe() {
+        for inject in [false, true] {
+            let socket = temp_socket();
+            let listener = UnixListener::bind(&socket).unwrap();
+            let texts = Arc::new(Mutex::new(Vec::new()));
+            let server = scripted_dispatch_server(
+                listener,
+                vec![
+                    json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}}),
+                    json!({"result": {"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}}),
+                ],
+                texts.clone(),
+            );
+            let client = HerdrClient::new(&socket);
+            let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+            let registry = PromptRegistry::with_store(store.clone());
+            let mut args = json!({"target": "w1:p1", "text": "original text\n", "idempotency_key": "identity-test"});
+            if inject {
+                args["inject_task_identity"] = json!(true);
+            }
+            let first = run(&client, &registry, &args);
+            assert_eq!(first["ok"], true, "{first}");
+            server.join().unwrap();
+            let task_id = first["task_id"].as_str().unwrap();
+            let dispatch_id = first["dispatch_id"].as_str().unwrap();
+            let expected = if inject {
+                format!(
+                    "original text\n\n[herdr-task task_id={task_id} dispatch_id={dispatch_id}]\nReport completion exactly once: herdr-mcp agent report --task-id {task_id} --dispatch-id {dispatch_id} --kind worker_done. For long tasks, report --kind heartbeat periodically."
+                )
+            } else {
+                "original text\n".to_owned()
+            };
+            assert_eq!(*texts.lock().unwrap(), vec![expected]);
+            assert_eq!(first["task"]["task_id"], task_id);
+            assert_eq!(first["task"]["dispatch_id"], dispatch_id);
+            // Reload the durable ledger and toggle the option: target/text
+            // still denote the original submission, never a second mutation.
+            let registry = PromptRegistry::with_store(store);
+            args["inject_task_identity"] = json!(!inject);
+            let replay = run(&client, &registry, &args);
+            assert_eq!(replay["idempotent_replay"], true, "{replay}");
+            assert_eq!(replay["task_id"], task_id);
+            assert_eq!(replay["dispatch_id"], dispatch_id);
+            assert_eq!(texts.lock().unwrap().len(), 1);
+            let status = registry.task_status(task_id);
+            assert_eq!(status["task"]["dispatch_id"], dispatch_id);
+            let mut task = registry.load_task(task_id).unwrap().unwrap();
+            // Exercise the same durable terminal event path as runtime reconcile.
+            assert!(apply_task_event(
+                &mut task,
+                &json!({
+                    "type": "pane.agent_status_changed", "pane_id": "w1:p1",
+                    "agent_status": "idle", "cursor": 1,
+                })
+            ));
+            registry.save_task(&task, None).unwrap();
+            for view in [InboxView::Full, InboxView::Compact] {
+                let inbox = apply_inbox_view(
+                    registry.task_inbox(None, None, None, false, false, 10),
+                    view,
+                );
+                assert_eq!(inbox["tasks"][0]["task_id"], task_id, "{inbox}");
+                assert_eq!(inbox["tasks"][0]["dispatch_id"], dispatch_id);
+            }
+            fs::remove_file(socket).unwrap();
+        }
+    }
+
+    fn role_registry(agents: Value) -> PromptRegistry {
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let mut registry = PromptRegistry::with_store(store);
+        Arc::get_mut(&mut registry.inner).unwrap().cache = Some(Arc::new(
+            EventCache::from_snapshot_for_test(json!({"agents": agents, "panes": []})),
+        ));
+        registry
+    }
+
+    fn role_submitted(pane: &str) -> Value {
+        json!({"result": {"prompt": {"status": "submitted", "agent": {
+            "pane_id": pane, "agent_status": "working", "state_change_seq": 2,
+        }}}})
+    }
+
+    fn spawn_project_root(label: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!(
+            "herdr-mcp-spawn-{}-{}-{label}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn spawn_snapshot(root: &Path, pane_columns: u16) -> Value {
+        json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "label": "demo-project",
+                "worktree": {"checkout_path": root.to_string_lossy()},
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.to_string_lossy(),
+                "agent_status": "idle",
+            }],
+            "agents": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "kind": "codex",
+                "agent_status": "idle",
+            }],
+            "layouts": [{
+                "workspace_id": "w1",
+                "focused_pane_id": "w1:p1",
+                "zoomed": false,
+                "panes": [{
+                    "pane_id": "w1:p1",
+                    "focused": true,
+                    "rect": {"x": 0, "y": 0, "width": pane_columns, "height": 30},
+                }],
+            }],
+        })
+    }
+
+    fn spawn_registry_with(
+        store: Arc<Mutex<StateStore>>,
+        root: &Path,
+        pane_columns: u16,
+    ) -> PromptRegistry {
+        let mut registry = PromptRegistry::with_store(store);
+        Arc::get_mut(&mut registry.inner).unwrap().cache = Some(Arc::new(
+            EventCache::from_snapshot_for_test(spawn_snapshot(root, pane_columns)),
+        ));
+        registry
+    }
+
+    fn spawn_registry(root: &Path, pane_columns: u16) -> PromptRegistry {
+        spawn_registry_with(
+            Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())),
+            root,
+            pane_columns,
+        )
+    }
+
+    /// Socket fake that records every request so a test can prove which native
+    /// calls happened (and, for a replay, that none happened again).
+    fn scripted_spawn_server(
+        listener: UnixListener,
+        responses: Vec<Value>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            for mut response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                requests.lock().unwrap().push(request.clone());
+                response["id"] = request["id"].clone();
+                writeln!(stream, "{response}").unwrap();
+            }
+        })
+    }
+
+    /// Fake Herdr socket that answers any number of requests until stopped, so
+    /// a bounded readiness poll loop does not need one scripted reply per poll.
+    fn repeating_spawn_server(
+        listener: UnixListener,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        responses: Vec<(&'static str, Value)>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !stop.load(Ordering::SeqCst) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                requests.lock().unwrap().push(request.clone());
+                let method = request["method"].as_str().unwrap_or_default().to_owned();
+                let response = responses
+                    .iter()
+                    .find(|(name, _)| *name == method)
+                    .map(|(_, response)| response.clone())
+                    .unwrap_or_else(
+                        || json!({"error": {"code": "unscripted_method", "message": method}}),
+                    );
+                let envelope = if let Some(error) = response.get("error") {
+                    json!({"id": request["id"], "error": error})
+                } else {
+                    json!({"id": request["id"], "result": response})
+                };
+                writeln!(stream, "{envelope}").unwrap();
+            }
+        })
+    }
+
+    fn spawn_requested_methods(requests: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request["method"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn spawn_tab_created() -> Value {
+        json!({"result": {
+            "type": "tab_created",
+            "tab": {"tab_id": "w1:t2", "workspace_id": "w1", "label": "feat-x"},
+            "root_pane": {"pane_id": "w1:p9", "tab_id": "w1:t2", "workspace_id": "w1"},
+        }})
+    }
+
+    fn spawn_agent_started(ready: bool) -> Value {
+        json!({"result": {
+            "type": "agent_started",
+            "argv": [],
+            "agent": {
+                "pane_id": "w1:p9",
+                "tab_id": "w1:t2",
+                "workspace_id": "w1",
+                "agent_status": if ready { "idle" } else { "working" },
+                "interactive_ready": ready,
+                "state_change_seq": 1,
+            },
+        }})
+    }
+
+    fn spawn_prompt_submitted() -> Value {
+        json!({"result": {"prompt": {"status": "submitted", "agent": {
+            "pane_id": "w1:p9", "agent_status": "working", "state_change_seq": 2,
+        }}}})
+    }
+
+    fn spawn_step_names(facts: &Value) -> Vec<String> {
+        facts["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|step| step["step"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn refused_spawn_server(socket: &Path) -> UnixListener {
+        let listener = UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        listener
+    }
+
+    /// user planner | Given one spawn dispatch | When the runtime creates the
+    /// pane, starts the agent and prompts it | Then one call replaces
+    /// inspect/split/start/dispatch and records exactly one durable task.
+    #[test]
+    fn spawn_dispatch_creates_one_pane_agent_and_task() {
+        let root = spawn_project_root("happy");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                spawn_tab_created(),
+                spawn_agent_started(true),
+                spawn_prompt_submitted(),
+            ],
+            requests.clone(),
+        );
+        let registry = spawn_registry(&root, 80);
+        let args = json!({
+            "spawn": {
+                "kind": "pi",
+                "workspace_id": "demo-project",
+                "cwd": root.to_string_lossy(),
+                "tab_label": "feat-x",
+            },
+            "text": "implement the task",
+            "idempotency_key": "spawn-happy",
+        });
+        let result = run(&HerdrClient::new(&socket), &registry, &args);
+        server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["target"], "w1:p9");
+        assert_eq!(result["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(result["spawn"]["tab_id"], "w1:t2");
+        assert_eq!(result["spawn"]["kind"], "pi");
+        assert_eq!(result["spawn"]["workspace_id"], "w1");
+        assert_eq!(result["spawn"]["created"], true);
+        assert_eq!(
+            spawn_step_names(&result["spawn"]),
+            vec!["pane_create", "agent_start", "agent_ready", "prompt"]
+        );
+        let recorded = requests.lock().unwrap();
+        let methods = recorded
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, vec!["tab.create", "agent.start", "agent.prompt"]);
+        assert_eq!(recorded[0]["params"]["label"], "feat-x");
+        assert_eq!(recorded[0]["params"]["cwd"], json!(root.to_string_lossy()));
+        assert_eq!(recorded[0]["params"]["focus"], false);
+        assert_eq!(recorded[1]["params"]["kind"], "pi");
+        assert_eq!(recorded[1]["params"]["pane_id"], "w1:p9");
+        assert_eq!(recorded[2]["params"]["target"], "w1:p9");
+        assert_eq!(recorded[2]["params"]["text"], "implement the task");
+        let tasks = registry.list_tasks(10).unwrap();
+        assert_eq!(tasks.len(), 1, "one spawn dispatch owns exactly one task");
+        assert_eq!(tasks[0].target, "w1:p9");
+        assert_eq!(tasks[0].parent_session_ref, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a spawn dispatch already completed | When the same
+    /// idempotency key is replayed | Then the stored spawn facts return and no
+    /// second tab, pane, agent or prompt is created.
+    #[test]
+    fn spawn_dispatch_replay_never_creates_second_pane() {
+        let root = spawn_project_root("replay");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                spawn_tab_created(),
+                spawn_agent_started(true),
+                spawn_prompt_submitted(),
+            ],
+            requests.clone(),
+        );
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store.clone(), &root, 80);
+        let args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1"},
+            "text": "implement the task",
+            "idempotency_key": "spawn-replay",
+        });
+        let client = HerdrClient::new(&socket);
+        let first = run(&client, &registry, &args);
+        server.join().unwrap();
+        assert_eq!(first["ok"], true, "{first}");
+        let reloaded = spawn_registry_with(store, &root, 80);
+        let replay = run(&client, &reloaded, &args);
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(replay["spawn"]["agent_name"], first["spawn"]["agent_name"]);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            3,
+            "a replay must not touch the socket again"
+        );
+        assert_eq!(reloaded.list_tasks(10).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given an explicit split parent | When the spawn runs |
+    /// Then the pane comes from pane.split in that parent, not a new tab.
+    #[test]
+    fn spawn_dispatch_split_from_uses_the_named_parent_pane() {
+        let root = spawn_project_root("split");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                json!({"result": {"pane": {"pane_id": "w1:p9", "tab_id": "w1:t1", "workspace_id": "w1"}}}),
+                spawn_agent_started(true),
+                spawn_prompt_submitted(),
+            ],
+            requests.clone(),
+        );
+        let registry = spawn_registry(&root, 120);
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {
+                    "kind": "codex",
+                    "workspace_id": "w1",
+                    "split_from": "w1:p1",
+                    "direction": "down",
+                },
+                "text": "work",
+                "idempotency_key": "spawn-split",
+            }),
+        );
+        server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["spawn"]["pane_id"], "w1:p9");
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded[0]["method"], "pane.split");
+        assert_eq!(recorded[0]["params"]["target_pane_id"], "w1:p1");
+        assert_eq!(recorded[0]["params"]["direction"], "down");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a tab too narrow for a readable horizontal split |
+    /// When spawning with split_from | Then the pane is refused before any
+    /// native call and the keyed failure replays without creating anything.
+    #[test]
+    fn spawn_dispatch_narrow_split_fails_before_any_mutation() {
+        let root = spawn_project_root("narrow");
+        let socket = temp_socket();
+        let listener = refused_spawn_server(&socket);
+        let registry = spawn_registry(&root, 20);
+        let args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1", "split_from": "w1:p1"},
+            "text": "work",
+            "idempotency_key": "spawn-narrow",
+        });
+        let client = HerdrClient::new(&socket);
+        let first = run(&client, &registry, &args);
+        assert_eq!(first["ok"], false, "{first}");
+        assert_eq!(first["failed_step"], "pane_create");
+        assert_eq!(first["code"], "pane_split_too_narrow");
+        assert_eq!(first["delivery_state"], "not_delivered");
+        assert_eq!(first["spawn"]["created"], false);
+        assert_eq!(first["spawn"]["pane_id"], Value::Null);
+        assert!(first.get("reclaim").is_none(), "{first}");
+        let replay = run(&client, &registry, &args);
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["failed_step"], "pane_create");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(registry.list_tasks(10).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given the agent cannot start in the new pane | When the
+    /// spawn fails | Then the failure names agent_start, keeps the pane for
+    /// reclaim, and a replay does not create another pane.
+    #[test]
+    fn spawn_dispatch_agent_start_failure_reports_the_created_pane() {
+        let root = spawn_project_root("startfail");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                spawn_tab_created(),
+                json!({"error": {"code": "agent_start_failed", "message": "kind pi is not installed"}}),
+            ],
+            requests.clone(),
+        );
+        let registry = spawn_registry(&root, 80);
+        let args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1"},
+            "text": "work",
+            "idempotency_key": "spawn-startfail",
+        });
+        let client = HerdrClient::new(&socket);
+        let first = run(&client, &registry, &args);
+        server.join().unwrap();
+        assert_eq!(first["ok"], false, "{first}");
+        assert_eq!(first["failed_step"], "agent_start");
+        assert_eq!(first["code"], "agent_start_failed");
+        assert_eq!(first["delivery_state"], "not_delivered");
+        assert_eq!(first["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(first["spawn"]["created"], true);
+        assert_eq!(first["spawn"]["agent_started"], false);
+        assert_eq!(first["reclaim"]["pane_id"], "w1:p9");
+        assert_eq!(spawn_step_names(&first["spawn"]), vec!["pane_create"]);
+        let replay = run(&client, &registry, &args);
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["failed_step"], "agent_start");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a chain budget too small to start an agent | When
+    /// the spawn returns | Then it persists a resumable checkpoint (no
+    /// in-flight key, no agent.start) and the same key replays into that pane.
+    #[test]
+    fn spawn_dispatch_budget_pause_replays_into_the_same_pane() {
+        let root = spawn_project_root("budgetpause");
+        let socket = temp_socket();
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![spawn_tab_created()],
+            first_requests.clone(),
+        );
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store.clone(), &root, 80);
+        let client = HerdrClient::new(&socket);
+        let mut args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1", "startup_timeout_ms": 1},
+            "text": "work",
+            "idempotency_key": "spawn-budget-pause",
+        });
+        let paused = run(&client, &registry, &args);
+        server.join().unwrap();
+        assert_eq!(paused["ok"], false, "{paused}");
+        assert_eq!(paused["failed_step"], "agent_start", "{paused}");
+        assert_eq!(paused["phase"], "agent_start", "{paused}");
+        assert_eq!(paused["resumable"], true, "{paused}");
+        assert_eq!(paused["code"], "spawn_budget_exhausted", "{paused}");
+        assert_eq!(paused["delivery_state"], "not_delivered");
+        assert_eq!(paused["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(paused["spawn"]["agent_started"], false);
+        assert_eq!(paused["reclaim"]["pane_id"], "w1:p9");
+        assert_eq!(
+            spawn_requested_methods(&first_requests),
+            vec!["tab.create"],
+            "a budget that cannot start an agent must not call agent.start"
+        );
+
+        // Replaying the SAME key with a larger chain continues in that pane.
+        args["spawn"]["startup_timeout_ms"] = json!(5_000);
+        fs::remove_file(&socket).unwrap();
+        let resume_requests = Arc::new(Mutex::new(Vec::new()));
+        let resume_server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                json!({"error": {"code": "agent_not_found", "message": "no agent yet"}}),
+                spawn_agent_started(true),
+                spawn_prompt_submitted(),
+            ],
+            resume_requests.clone(),
+        );
+        let resumed = run(&client, &registry, &args);
+        resume_server.join().unwrap();
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert_eq!(resumed["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(resumed["spawn"]["resumed"], true, "{resumed}");
+        assert_eq!(
+            spawn_requested_methods(&resume_requests),
+            vec!["agent.get", "agent.start", "agent.prompt"],
+            "a resume reuses the persisted pane and never creates another"
+        );
+        let resume_step = resumed["spawn"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["step"] == "resume")
+            .unwrap_or_else(|| panic!("resume step missing: {resumed}"));
+        assert_eq!(resume_step["phase"], "agent_start");
+        let tasks = registry.list_tasks(10).unwrap();
+        assert_eq!(tasks.len(), 1, "one spawn dispatch owns one durable task");
+        assert_eq!(tasks[0].target, "w1:p9");
+        // A later replay is now a pure replay: nothing more is submitted.
+        let replay = run(&client, &registry, &args);
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(spawn_requested_methods(&resume_requests).len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a chain that runs out of the caller's budget while
+    /// the agent is still starting | When the spawn returns | Then it reports a
+    /// resumable agent_ready checkpoint and the same key later prompts once.
+    #[test]
+    fn spawn_dispatch_readiness_pause_resumes_and_prompts_once() {
+        let root = spawn_project_root("readypause");
+        let socket = temp_socket();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_requests = Arc::new(Mutex::new(Vec::new()));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("tab.create", spawn_tab_created()["result"].clone()),
+                ("agent.start", spawn_agent_started(false)["result"].clone()),
+                (
+                    "agent.get",
+                    json!({"agent": {
+                        "pane_id": "w1:p9", "agent_status": "working",
+                        "interactive_ready": false, "state_change_seq": 1,
+                    }}),
+                ),
+            ],
+            first_requests.clone(),
+        );
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store.clone(), &root, 80);
+        let client = HerdrClient::new(&socket);
+        // 4.2s: enough to create the pane and start the agent, not enough to
+        // finish readiness, so the chain must pause instead of holding the key.
+        let args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1", "startup_timeout_ms": 4_200},
+            "text": "work",
+            "idempotency_key": "spawn-ready-pause",
+        });
+        let paused = run(&client, &registry, &args);
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(paused["ok"], false, "{paused}");
+        assert_eq!(paused["failed_step"], "agent_ready", "{paused}");
+        assert_eq!(paused["resumable"], true, "{paused}");
+        assert_eq!(paused["code"], "agent_ready_timeout", "{paused}");
+        assert_eq!(paused["delivery_state"], "not_delivered");
+        assert_eq!(paused["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(paused["spawn"]["agent_started"], true);
+        assert_eq!(paused["reclaim"]["pane_id"], "w1:p9");
+        let first_methods = spawn_requested_methods(&first_requests);
+        assert_eq!(first_methods[0], "tab.create");
+        assert_eq!(first_methods[1], "agent.start");
+        assert!(
+            first_methods
+                .iter()
+                .filter(|method| *method == "agent.get")
+                .count()
+                >= 1,
+            "the readiness loop must have polled: {first_methods:?}"
+        );
+        assert!(!first_methods.iter().any(|method| method == "agent.prompt"));
+
+        // The replay re-checks readiness and prompts the SAME pane exactly once.
+        fs::remove_file(&socket).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resume_requests = Arc::new(Mutex::new(Vec::new()));
+        let resume_server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                (
+                    "agent.get",
+                    json!({"agent": {
+                        "pane_id": "w1:p9", "agent_status": "idle",
+                        "interactive_ready": true, "state_change_seq": 2,
+                    }}),
+                ),
+                ("agent.prompt", spawn_prompt_submitted()["result"].clone()),
+            ],
+            resume_requests.clone(),
+        );
+        let resumed = run(&client, &registry, &args);
+        stop.store(true, Ordering::SeqCst);
+        resume_server.join().unwrap();
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert_eq!(resumed["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(resumed["spawn"]["resumed"], true, "{resumed}");
+        assert_eq!(
+            spawn_requested_methods(&resume_requests),
+            vec!["agent.get", "agent.prompt"],
+            "a resume must not create a pane or restart the agent"
+        );
+        let tasks = registry.list_tasks(10).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].target, "w1:p9");
+        let replay = run(&client, &registry, &args);
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(spawn_requested_methods(&resume_requests).len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given the spawn chain budget plan | When the steps divide
+    /// the caller's window | Then every step stays inside it, the default fits
+    /// the smallest WebChat transport, and the ceiling stays under the CLI cap.
+    #[test]
+    fn spawn_chain_budget_fits_the_caller_transport() {
+        // WebChat herdr_call without timeout_ms is cut by Edge at 30s.
+        let default_fits_webchat = SPAWN_CHAIN_DEFAULT_MS < 30_000;
+        assert!(default_fits_webchat);
+        // The local CLI waits chain + 10s slack and is capped at 120s.
+        let ceiling_fits_cli_cap = SPAWN_CHAIN_MAX_MS + 10_000 <= 120_000;
+        assert!(ceiling_fits_cli_cap);
+        assert_eq!(spawn_prompt_reserve_ms(SPAWN_CHAIN_DEFAULT_MS), 5_000);
+        assert_eq!(
+            spawn_step_budget_ms(SPAWN_CHAIN_DEFAULT_MS, SPAWN_CHAIN_DEFAULT_MS),
+            SPAWN_CHAIN_DEFAULT_MS - 5_000
+        );
+        // No step may ever exceed what the caller still waits for.
+        for chain in [1_u64, 100, 4_001, 25_000, SPAWN_CHAIN_MAX_MS] {
+            for remaining in [1_u64, 250, 4_001, chain] {
+                let step = spawn_step_budget_ms(chain, remaining);
+                assert!(step <= remaining, "chain {chain} remaining {remaining}");
+                assert!(
+                    spawn_prompt_reserve_ms(chain) <= chain / 4 + 1,
+                    "the prompt reserve stays a quarter of the chain"
+                );
+            }
+        }
+        // A tiny chain cannot host a native agent.start: the chain reports a
+        // resumable checkpoint instead of reserving work the caller drops.
+        assert!(
+            spawn_step_budget_ms(1, 1) < SPAWN_NATIVE_START_FLOOR_MS,
+            "a 1ms chain must pause before agent.start"
+        );
+    }
+
+    /// user worker | Given a two-level delegation chain | When a spawn dispatch
+    /// would add a third level | Then the ledger guard refuses it before any
+    /// pane exists, with no phantom prompt step and nothing to reclaim.
+    #[test]
+    fn spawn_dispatch_delegation_refusal_happens_before_any_pane() {
+        let root = spawn_project_root("delegation");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![json!({"agent": {"pane_id": "w1:p2", "agent_status": "working"}})],
+            requests.clone(),
+        );
+        let registry = spawn_registry(&root, 80);
+        register_running_task(
+            &registry,
+            "supervisor-task",
+            "supervisor",
+            "w1:p1",
+            Some("planner"),
+            None,
+            0,
+        );
+        register_running_task(
+            &registry,
+            "worker-task",
+            "worker",
+            "w1:p2",
+            Some("supervisor"),
+            None,
+            0,
+        );
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1"},
+                "text": "work",
+                "idempotency_key": "spawn-delegation",
+                "parent_target": "worker",
+            }),
+        );
+        server.join().unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "delegation_depth_exceeded", "{result}");
+        assert!(
+            result.get("failed_step").is_none(),
+            "a pre-pane refusal is not a spawn step failure: {result}"
+        );
+        assert!(result.get("spawn").is_none(), "{result}");
+        assert_eq!(
+            spawn_requested_methods(&requests),
+            vec!["agent.get"],
+            "only the caller probe runs; no pane, agent or prompt is created"
+        );
+        assert_eq!(registry.list_tasks(10).unwrap().len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a spawn dispatch refused by the delegation guard
+    /// before any pane existed | When the same idempotency key is replayed
+    /// inside the TTL | Then the stored refusal returns instead of an in-flight
+    /// reservation, and nothing is probed, created or prompted again.
+    #[test]
+    fn spawn_dispatch_delegation_refusal_replays_under_the_same_key() {
+        let root = spawn_project_root("delegation-replay");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![json!({"agent": {"pane_id": "w1:p2", "agent_status": "working"}})],
+            requests.clone(),
+        );
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store.clone(), &root, 80);
+        register_running_task(
+            &registry,
+            "supervisor-task",
+            "supervisor",
+            "w1:p1",
+            Some("planner"),
+            None,
+            0,
+        );
+        register_running_task(
+            &registry,
+            "worker-task",
+            "worker",
+            "w1:p2",
+            Some("supervisor"),
+            None,
+            0,
+        );
+        let args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1"},
+            "text": "work",
+            "idempotency_key": "spawn-delegation-replay",
+            "parent_target": "worker",
+        });
+        let client = HerdrClient::new(&socket);
+        let first = run(&client, &registry, &args);
+        server.join().unwrap();
+        assert_eq!(first["ok"], false, "{first}");
+        assert_eq!(first["code"], "delegation_depth_exceeded", "{first}");
+        assert!(
+            first.get("idempotent_replay").is_none(),
+            "the first refusal is an outcome, not a replay: {first}"
+        );
+
+        // A fresh registry over the same durable store proves the refusal was
+        // persisted for the key rather than remembered inside one process.
+        let reloaded = spawn_registry_with(store, &root, 80);
+        let replay = run(&client, &reloaded, &args);
+        assert_eq!(replay["ok"], false, "{replay}");
+        assert_eq!(replay["code"], "delegation_depth_exceeded", "{replay}");
+        assert_eq!(replay["message"], first["message"], "{replay}");
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["dispatch_id"], first["dispatch_id"], "{replay}");
+        assert_eq!(
+            spawn_requested_methods(&requests),
+            vec!["agent.get"],
+            "the replay is a pure observation: no second caller probe, pane, agent or prompt"
+        );
+        assert_eq!(reloaded.list_tasks(10).unwrap().len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given the prompt step fails after the pane exists | When
+    /// the spawn dispatch returns | Then it reports failed_step prompt and the
+    /// created pane, and never claims delivery.
+    #[test]
+    fn spawn_dispatch_prompt_failure_reports_the_prompt_step() {
+        let root = spawn_project_root("promptfail");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                spawn_tab_created(),
+                spawn_agent_started(true),
+                json!({"error": {"code": "agent_not_ready", "message": "agent refused input"}}),
+            ],
+            requests.clone(),
+        );
+        let registry = spawn_registry(&root, 80);
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1"},
+                "text": "work",
+                "idempotency_key": "spawn-promptfail",
+            }),
+        );
+        server.join().unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["failed_step"], "prompt");
+        assert_eq!(result["code"], "agent_not_ready");
+        // An agent.prompt transport failure is uncertain, never not_delivered:
+        // the spawn facts still name the pane so the caller can verify it.
+        assert_eq!(result["delivery_uncertain"], true);
+        assert!(result.get("delivery_state").is_none(), "{result}");
+        assert!(result.get("submitted").is_none(), "{result}");
+        assert_eq!(result["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(
+            spawn_step_names(&result["spawn"]),
+            vec!["pane_create", "agent_start", "agent_ready", "prompt"]
+        );
+        assert_eq!(result["spawn"]["steps"][3]["ok"], false);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given spawn combined with target, a missing idempotency
+    /// key, or a cwd outside the managed roots | When dispatching | Then the
+    /// validate step fails with no reservation and no native call.
+    #[test]
+    fn spawn_dispatch_validation_failures_have_no_side_effects() {
+        let root = spawn_project_root("validate");
+        let socket = temp_socket();
+        let listener = refused_spawn_server(&socket);
+        let registry = spawn_registry(&root, 80);
+        let client = HerdrClient::new(&socket);
+        for (args, expected) in [
+            (
+                json!({
+                    "spawn": {"kind": "pi", "workspace_id": "w1"},
+                    "target": "w1:p1",
+                    "text": "work",
+                    "idempotency_key": "spawn-conflict",
+                }),
+                "mutually exclusive",
+            ),
+            (
+                json!({
+                    "spawn": {"kind": "pi", "workspace_id": "w1"},
+                    "text": "work",
+                }),
+                "idempotency_key is required with spawn",
+            ),
+            (
+                json!({
+                    "spawn": {"kind": "pi", "workspace_id": "w1", "cwd": "/etc"},
+                    "text": "work",
+                    "idempotency_key": "spawn-outside",
+                }),
+                "managed project root",
+            ),
+            (
+                json!({
+                    "spawn": {"kind": "PI", "workspace_id": "w1"},
+                    "text": "work",
+                    "idempotency_key": "spawn-kind",
+                }),
+                "spawn.kind",
+            ),
+            (
+                json!({
+                    "spawn": {"workspace_id": "w1"},
+                    "text": "work",
+                    "idempotency_key": "spawn-nokind",
+                }),
+                "spawn.kind is required",
+            ),
+            (
+                json!({
+                    "spawn": {"kind": "pi", "workspace_id": "w1"},
+                    "text": "work",
+                    "idempotency_key": "spawn-cap",
+                    "max_concurrent": 2,
+                }),
+                "max_concurrent is not applicable with spawn",
+            ),
+        ] {
+            let result = run(&client, &registry, &args);
+            assert_eq!(result["ok"], false, "{result}");
+            assert_eq!(result["failed_step"], "validate", "{result}");
+            assert_eq!(result["code"], "invalid_params", "{result}");
+            assert!(
+                result["message"].as_str().unwrap().contains(expected),
+                "{result}"
+            );
+            assert!(result.get("spawn").is_none(), "{result}");
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(registry.list_tasks(10).unwrap().is_empty());
+        // A keyed validate rejection is persisted, so the same key replays the
+        // rejection instead of resolving a spawn after the topology changed.
+        let replay = run(
+            &client,
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1", "cwd": "/etc"},
+                "text": "work",
+                "idempotency_key": "spawn-outside",
+            }),
+        );
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["failed_step"], "validate", "{replay}");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given busy and idle codex panes | When selecting a role
+    /// and replaying without a snapshot | Then one concrete pane is delivered,
+    /// durably recorded and retained in every task projection.
+    #[test]
+    fn role_dispatch_records_idle_target_and_replays_without_resolution() {
+        for selector in ["@codex", "@codex:idle"] {
+            let socket = temp_socket();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server = scripted_read_server(
+                UnixListener::bind(&socket).unwrap(),
+                vec![role_submitted("w1:p3")],
+                requests.clone(),
+            );
+            let client = HerdrClient::new(&socket);
+            let registry = role_registry(json!([
+                {"pane_id": "w1:p1", "kind": "codex", "agent_status": "working"},
+                {"pane_id": "w1:p2", "kind": "pi", "agent_status": "idle"},
+                {"pane_id": "w1:p3", "kind": "codex", "agent_status": "idle", "api_key": "secret"},
+                {"pane_id": "w1:p4", "kind": "codex", "agent_status": "idle"},
+            ]));
+            let args = json!({"target": selector, "text": "work", "idempotency_key": "role-key", "max_concurrent": 1});
+            let first = run(&client, &registry, &args);
+            server.join().unwrap();
+            assert_eq!(first["ok"], true, "{first}");
+            assert_eq!(first["resolved_target"], "w1:p3");
+            assert_eq!(first["task"]["target"], "w1:p3");
+            assert_eq!(first["task"]["requested_target"], selector);
+            assert_eq!(first["candidates"].as_array().unwrap().len(), 3);
+            assert!(!first["candidates"].to_string().contains("secret"));
+            assert_eq!(
+                *requests.lock().unwrap(),
+                vec![(
+                    "agent.prompt".to_owned(),
+                    json!({"target": "w1:p3", "text": "work"})
+                )]
+            );
+            let store = registry.inner.store.as_ref().unwrap().clone();
+            let reloaded = PromptRegistry::with_store(store);
+            let replay = run(&client, &reloaded, &args);
+            assert_eq!(replay["idempotent_replay"], true, "{replay}");
+            assert_eq!(replay["resolved_target"], first["resolved_target"]);
+            assert_eq!(replay["candidates"], first["candidates"]);
+            let task_id = first["task_id"].as_str().unwrap();
+            assert_eq!(
+                reloaded.task_status(task_id)["task"]["requested_target"],
+                selector
+            );
+            assert_eq!(
+                reloaded.task_status_by_idempotency("role-key", selector, None)["task"]["target"],
+                "w1:p3"
+            );
+            assert_eq!(
+                reloaded.task_status_by_idempotency("role-key", selector, Some("other-session"))["code"],
+                "agent_task_not_found"
+            );
+            let mut task = reloaded.load_task(task_id).unwrap().unwrap();
+            assert_eq!(
+                running_task_row(task.clone(), now_ms())["requested_target"],
+                selector
+            );
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            reloaded.save_task(&task, None).unwrap();
+            for view in [InboxView::Full, InboxView::Compact] {
+                let inbox = apply_inbox_view(
+                    reloaded.task_inbox(None, None, None, false, false, 10),
+                    view,
+                );
+                assert_eq!(inbox["tasks"][0]["target"], "w1:p3");
+                assert_eq!(inbox["tasks"][0]["requested_target"], selector);
+            }
+            fs::remove_file(socket).unwrap();
+        }
+    }
+
+    /// user planner | Given own, working, blocked, unknown and other-workspace
+    /// panes | When requesting @idle | Then only the scoped idle worker receives it.
+    #[test]
+    fn role_idle_excludes_caller_busy_unknown_and_other_workspace() {
+        let socket = temp_socket();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let parent = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle"}}});
+        let server = scripted_dispatch_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![parent, role_submitted("w1:p5")],
+            texts.clone(),
+        );
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p1", "name": "caller", "kind": "codex", "agent_status": "idle", "workspace_id": "w1"},
+            {"pane_id": "w1:p2", "kind": "codex", "agent_status": "working", "workspace_id": "w1"},
+            {"pane_id": "w1:p3", "kind": "grok", "agent_status": "blocked", "workspace_id": "w1"},
+            {"pane_id": "w1:p4", "kind": "pi", "workspace_id": "w1"},
+            {"pane_id": "w2:p1", "kind": "pi", "agent_status": "idle", "workspace_id": "w2"},
+            {"pane_id": "w1:p5", "kind": "droid", "agent_status": "idle", "workspace_id": "w1"},
+        ]));
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "target": "@idle", "text": "work", "parent_target": "caller", "workspace_id": "w1",
+            }),
+        );
+        server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["resolved_target"], "w1:p5");
+        assert_eq!(result["candidates"][0]["reason"], "parent_target_is_target");
+        assert_eq!(*texts.lock().unwrap(), vec!["work"]);
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given no eligible pane or an unsupported selector | When
+    /// dispatching | Then the socket receives no prompt and the failure is explicit.
+    #[test]
+    fn role_unavailable_broadcast_and_invalid_limits_never_submit() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p1", "kind": "codex", "agent_status": "working"},
+            {"pane_id": "w1:p2", "kind": "codex", "agent_status": "blocked"},
+        ]));
+        let client = HerdrClient::new(&socket);
+        for selector in ["@codex", "@idle", "@grok", "@codex:idle"] {
+            let result = run(
+                &client,
+                &registry,
+                &json!({"target": selector, "text": "work"}),
+            );
+            assert_eq!(result["code"], "role_target_unavailable", "{result}");
+            assert_eq!(result["delivery_state"], "not_delivered");
+            assert_eq!(result["submitted"], false);
+        }
+        for selector in ["@all", "@all:idle", "@worktree:w1", "@codex,grok", "@"] {
+            assert_eq!(
+                run(
+                    &client,
+                    &registry,
+                    &json!({"target": selector, "text": "work"})
+                )["code"],
+                "role_target_unsupported"
+            );
+        }
+        for limit in [json!(0), json!(17), json!(1.5), json!("2"), Value::Null] {
+            assert_eq!(
+                run(
+                    &client,
+                    &registry,
+                    &json!({"target": "@codex", "text": "work", "max_concurrent": limit})
+                )["code"],
+                "invalid_params"
+            );
+        }
+        assert!(registry.list_tasks(100).unwrap().is_empty());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given two live role tasks in each scope | When capping
+    /// that selector | Then the third is rejected; terminal/other-scope work
+    /// is ignored and opening a gate keeps a task counted.
+    #[test]
+    fn role_cap_counts_all_live_tasks_in_the_exact_parent_scope() {
+        for (session, parent) in [
+            (Some("session-a"), Some("parent-a")),
+            (None, Some("parent-a")),
+            (None, None),
+        ] {
+            let registry = role_registry(json!([]));
+            for i in 0..2 {
+                let mut task = escalation_task(
+                    &format!("live-{i}"),
+                    "w1:p1",
+                    PromptTaskLifecycle::Running,
+                    0,
+                );
+                task.requested_target = Some("@codex".to_owned());
+                task.parent_session_ref = session.map(str::to_owned);
+                task.parent_target = parent.map(str::to_owned);
+                registry.save_task(&task, None).unwrap();
+            }
+            // Flood the bounded list window: the admission query must still
+            // see the two live tasks even behind more than 1024 terminal rows.
+            for i in 0..1025 {
+                let mut task = escalation_task(
+                    &format!("terminal-{i}"),
+                    "w1:p1",
+                    PromptTaskLifecycle::Completed,
+                    0,
+                );
+                task.requested_target = Some("@codex".to_owned());
+                task.parent_session_ref = session.map(str::to_owned);
+                task.parent_target = parent.map(str::to_owned);
+                registry.save_task(&task, None).unwrap();
+            }
+            let client = HerdrClient::new(temp_socket());
+            let mut args = json!({"target": "@codex", "text": "work", "max_concurrent": 2});
+            if let Some(parent) = parent {
+                args["parent_target"] = json!(parent);
+            }
+            let result = run_with_parent_session(&client, &registry, &args, session);
+            assert_eq!(result["code"], "concurrency_limit_reached", "{result}");
+            assert_eq!(result["delivery_state"], "not_delivered");
+            assert_eq!(result["submitted"], false);
+            assert_eq!(
+                run_with_parent_session(&client, &registry, &args, Some("other-session"))["code"],
+                "role_target_unavailable"
+            );
+            if session.is_some() {
+                args["parent_target"] = json!("another-pane-same-session");
+                assert_eq!(
+                    run_with_parent_session(&client, &registry, &args, session)["code"],
+                    "concurrency_limit_reached"
+                );
+            } else if parent.is_some() {
+                args["parent_target"] = json!("another-parent");
+                assert_eq!(
+                    run(&client, &registry, &args)["code"],
+                    "role_target_unavailable"
+                );
+            }
+            let gate = registry.gate_call(
+                decision_gates::CREATE,
+                &json!({
+                    "task_id": "live-0", "question": "Choose", "options": ["continue", "stop"],
+                }),
+                session,
+            );
+            assert_eq!(gate["ok"], true, "{gate}");
+            let mut task = registry.load_task("live-0").unwrap().unwrap();
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            registry.save_task(&task, None).unwrap();
+            let mut original = json!({"target": "@codex", "text": "work", "max_concurrent": 2});
+            if let Some(parent) = parent {
+                original["parent_target"] = json!(parent);
+            }
+            assert_eq!(
+                run_with_parent_session(&client, &registry, &original, session)["code"],
+                "concurrency_limit_reached"
+            );
+            assert_eq!(
+                registry.gate_call(
+                    decision_gates::CANCEL,
+                    &json!({"gate_id": gate["gate"]["gate_id"]}),
+                    session
+                )["ok"],
+                true
+            );
+            // No candidate now proves admission passed with one live task.
+            let mut original = json!({"target": "@codex", "text": "work", "max_concurrent": 2});
+            if let Some(parent) = parent {
+                original["parent_target"] = json!(parent);
+            }
+            assert_eq!(
+                run_with_parent_session(&client, &registry, &original, session)["code"],
+                "role_target_unavailable"
+            );
+        }
+    }
+
+    /// user worker | Given a two-level delegation chain | When attempting a
+    /// role sub-worker | Then the existing depth guard refuses every candidate.
+    #[test]
+    fn role_dispatch_preserves_delegation_depth_and_self_exclusion() {
+        let socket = temp_socket();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_dispatch_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![json!({"result": {"agent": {"pane_id": "w1:p2", "agent_status": "idle"}}})],
+            texts.clone(),
+        );
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p2", "name": "worker", "kind": "codex", "agent_status": "idle"},
+            {"pane_id": "w1:p3", "kind": "pi", "agent_status": "idle"},
+        ]));
+        register_running_task(
+            &registry,
+            "supervisor-task",
+            "supervisor",
+            "w1:p1",
+            Some("planner"),
+            None,
+            0,
+        );
+        register_running_task(
+            &registry,
+            "worker-task",
+            "worker",
+            "w1:p2",
+            Some("supervisor"),
+            None,
+            0,
+        );
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({"target": "@idle", "text": "work", "parent_target": "worker"}),
+        );
+        server.join().unwrap();
+        assert_eq!(result["code"], "role_target_unavailable", "{result}");
+        assert_eq!(result["candidates"][0]["reason"], "parent_target_is_target");
+        assert_eq!(
+            result["candidates"][1]["reason"],
+            "delegation_depth_exceeded"
+        );
+        assert!(texts.lock().unwrap().is_empty());
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user planner | Given simultaneous role requests and a cap of one | When
+    /// both dispatch | Then only one native submission crosses the socket.
+    #[test]
+    fn role_cap_serializes_simultaneous_dispatches() {
+        let socket = temp_socket();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_dispatch_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![role_submitted("w1:p1")],
+            texts.clone(),
+        );
+        let registry = role_registry(json!([
+            {"pane_id": "w1:p1", "kind": "codex", "agent_status": "idle"},
+        ]));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2).map(|i| {
+            let registry = registry.clone();
+            let client = HerdrClient::new(&socket);
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                run(&client, &registry, &json!({"target": "@codex", "text": format!("work-{i}"), "max_concurrent": 1}))
+            })
+        }).collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        server.join().unwrap();
+        assert_eq!(
+            results.iter().filter(|result| result["ok"] == true).count(),
+            1,
+            "{results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result["code"] == "concurrency_limit_reached")
+                .count(),
+            1
+        );
+        assert_eq!(texts.lock().unwrap().len(), 1);
+        fs::remove_file(socket).unwrap();
+    }
+
     fn handoff_registry() -> PromptRegistry {
         use crate::state_store::work_journal::WorkState;
 
@@ -4015,6 +6964,11 @@ mod tests {
         })));
         PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -4294,6 +7248,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id,
                 target: "child",
+                requested_target: None,
                 fingerprint: "fingerprint",
                 idempotency_key: Some("review-project-19-sha"),
                 before: Some(&before),
@@ -4302,6 +7257,7 @@ mod tests {
                 start_cursor: 100,
                 parent_target: Some("parent"),
                 parent_session_ref: None,
+                stall_after_ms: None,
             })
             .unwrap()
             .unwrap();
@@ -4487,6 +7443,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id,
                 target: "child",
+                requested_target: None,
                 fingerprint: "fingerprint",
                 idempotency_key: None,
                 before: Some(&idle),
@@ -4495,6 +7452,7 @@ mod tests {
                 start_cursor: 200,
                 parent_target: Some("parent"),
                 parent_session_ref: None,
+                stall_after_ms: None,
             })
             .unwrap()
             .unwrap();
@@ -4579,6 +7537,16 @@ mod tests {
         assert_eq!(result["recovery"]["action"], "start_agent_then_reprompt");
         assert_eq!(result["recovery"]["start_method"], "agent.start");
         assert_eq!(result["recovery"]["split_method"], "pane.split");
+        // The manual chain stays documented, but the one-call form is the
+        // advertised recovery for a NEW agent.
+        assert_eq!(
+            result["recovery"]["one_shot"]["method"],
+            "herdr_mcp.agent.task.dispatch"
+        );
+        assert_eq!(
+            result["recovery"]["one_shot"]["params"]["spawn"]["kind"],
+            "<agent kind>"
+        );
         assert!(result.get("delivery_uncertain").is_none());
     }
 
@@ -4598,6 +7566,11 @@ mod tests {
         let cache = Arc::new(EventCache::from_snapshot_for_test(json!({"panes": []})));
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(Arc::clone(&store)),
@@ -4619,6 +7592,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id: "dispatch:prompt:boot-fence",
                 target: "child",
+                requested_target: None,
                 fingerprint: "fp",
                 idempotency_key: None,
                 before: Some(&before),
@@ -4627,6 +7601,7 @@ mod tests {
                 start_cursor: 100,
                 parent_target: Some("parent"),
                 parent_session_ref: None,
+                stall_after_ms: None,
             })
             .unwrap()
             .unwrap();
@@ -4713,6 +7688,7 @@ mod tests {
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
             target: target.to_owned(),
+            requested_target: None,
             idempotency_key_digest: None,
             pane_id: Some("w1:p1".to_owned()),
             workspace_id: Some("w1".to_owned()),
@@ -4728,6 +7704,11 @@ mod tests {
             terminal_status: terminal.then(|| lifecycle.as_str().to_owned()),
             terminal_cursor: None,
             terminal_at_ms: terminal.then(|| now.saturating_sub(age_ms)),
+            last_heartbeat_at_ms: None,
+            worker_done_at_ms: None,
+            worker_done_summary: None,
+            stall_after_ms: None,
+            gate: None,
             final_excerpt: None,
             awaiting_children: None,
             parent_target: Some("parent".to_owned()),
@@ -4745,6 +7726,484 @@ mod tests {
             created_at_ms: now.saturating_sub(age_ms),
             updated_at_ms: now.saturating_sub(age_ms),
         }
+    }
+
+    fn worker_registry(tag: &str) -> (PathBuf, PromptRegistry, Arc<AtomicU64>) {
+        let (path, mut registry) = task_registry(tag);
+        let clock = Arc::new(AtomicU64::new(now_ms()));
+        Arc::get_mut(&mut registry.inner).unwrap().clock = Some(clock.clone());
+        (path, registry, clock)
+    }
+
+    /// user parent | Given a durable task in one parent scope | When a decision
+    /// gate is opened and a worker reports done | Then ack/completion stay held
+    /// across reopen, other parents cannot access it, and resolution releases it.
+    #[test]
+    fn decision_gate_blocks_ack_completion_and_preserves_scope_across_reopen() {
+        use decision_gates::{CANCEL, CREATE, RESOLVE, STATUS};
+        let (path, registry, clock) = worker_registry("decision-gates");
+        let mut task = escalation_task("gate-task", "child", PromptTaskLifecycle::Running, 0);
+        task.parent_session_ref = Some("parent-session".to_owned());
+        registry.save_task(&task, None).unwrap();
+        let call = |method, params: Value, scope| {
+            task_call_with_parent_session(&registry, method, &params, scope)
+        };
+        let create = json!({"task_id": task.task_id, "question": "Choose a path", "options": ["continue", "stop"]});
+        assert_eq!(
+            call(CREATE, create.clone(), Some("other-parent"))["code"],
+            "agent_task_parent_mismatch"
+        );
+        let opened = call(CREATE, create.clone(), Some("parent-session"));
+        assert_eq!(opened["ok"], true, "{opened}");
+        let gate_id = opened["gate"]["gate_id"].as_str().unwrap();
+        let gate_params = json!({"gate_id": gate_id});
+        assert_eq!(
+            call(CREATE, create, Some("parent-session"))["code"],
+            "task_gate_already_open"
+        );
+        let status = registry.task_status(&task.task_id);
+        assert_eq!(status["task"]["blocked_on_gate"], true);
+        assert_eq!(status["task"]["gate"], opened["gate"]);
+        assert_eq!(status["task"]["terminal"], false);
+        assert_eq!(
+            registry.task_ack(&task.task_id)["code"],
+            "task_blocked_on_gate"
+        );
+        for scope in [Some("other-parent"), None] {
+            assert_eq!(
+                call(CANCEL, gate_params.clone(), scope)["code"],
+                "agent_task_parent_mismatch"
+            );
+        }
+        assert_eq!(
+            call(STATUS, gate_params.clone(), Some("other-parent"))["code"],
+            "agent_task_parent_mismatch"
+        );
+        assert_eq!(
+            call(STATUS, gate_params.clone(), Some("parent-session"))["gate"],
+            opened["gate"]
+        );
+        for scope in [None, Some("parent-session"), Some("other-parent")] {
+            assert_eq!(
+                call(
+                    RESOLVE,
+                    json!({"gate_id": gate_id, "resolution": "continue", "human": true}),
+                    scope
+                )["code"],
+                "gate_resolution_requires_human"
+            );
+        }
+        let inbox = call(
+            AGENT_TASK_INBOX_METHOD,
+            json!({"view": "compact"}),
+            Some("parent-session"),
+        );
+        assert_eq!(inbox["tasks"][0]["gate"], opened["gate"]);
+        assert_eq!(inbox["tasks"][0]["blocked_on_gate"], true);
+        assert_eq!(inbox["summary"]["blocked"], 1);
+        let running = registry.task_inbox_with_running(None, "parent-session", 50);
+        assert_eq!(running["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(running["tasks"][0]["gate"], opened["gate"]);
+        let report = json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "worker_done"});
+        clock.fetch_add(42, Ordering::Relaxed);
+        let reported = call(AGENT_TASK_REPORT_METHOD, report.clone(), None);
+        assert_eq!(reported["ok"], true);
+        assert_eq!(reported["task"]["terminal"], false);
+        assert_eq!(reported["task"]["lifecycle"], "running");
+        assert!(reported["task"]["worker_done_at_ms"].is_u64());
+        assert_eq!(
+            call(AGENT_TASK_REPORT_METHOD, report, None)["code"],
+            "worker_done_already_reported"
+        );
+        let reopened =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(&path).unwrap())));
+        assert_eq!(
+            reopened.task_status(&task.task_id)["task"]["blocked_on_gate"],
+            true
+        );
+        {
+            // Exercise the same durable compare-and-set that the separately
+            // tested terminal boundary uses, through a second SQLite handle.
+            let store = StateStore::open(&path).unwrap();
+            assert_eq!(
+                store
+                    .close_decision_gate(gate_id, Some("invalid"), 100)
+                    .unwrap_err(),
+                "gate_invalid_resolution"
+            );
+            assert_eq!(
+                store.decision_gate(gate_id).unwrap().unwrap().status,
+                "open"
+            );
+            let resolved = store
+                .close_decision_gate(gate_id, Some("continue"), 101)
+                .unwrap();
+            assert_eq!(
+                resolved.resolved_by,
+                Some(json!({"class": "local_cli_interactive"}))
+            );
+            assert_eq!(
+                store
+                    .close_decision_gate(gate_id, Some("continue"), 102)
+                    .unwrap_err(),
+                "gate_not_open"
+            );
+        }
+        let completed = reopened.task_status(&task.task_id);
+        assert_eq!(completed["task"]["terminal"], true);
+        assert_eq!(completed["task"]["terminal_status"], "worker_done");
+        assert_ne!(completed["task"]["blocked_on_gate"], true);
+        assert_eq!(reopened.task_ack(&task.task_id)["ok"], true);
+        drop(reopened);
+        drop(registry);
+        remove_escalation_db(&path);
+    }
+
+    /// user parent | Given tasks and bounded choices | When invalid gates,
+    /// concurrent creates, cancellation and lifecycle settle are attempted |
+    /// Then validation is fail-closed and at most one open gate survives.
+    #[test]
+    fn decision_gate_validates_bounds_cancels_and_holds_lifecycle_settle() {
+        use decision_gates::{CANCEL, CREATE};
+        let (path, registry, _) = worker_registry("gate-bounds");
+        let task = escalation_task("gate-bounds", "child", PromptTaskLifecycle::Running, 0);
+        registry.save_task(&task, None).unwrap();
+        let valid =
+            json!({"task_id": task.task_id, "question": "Choose", "options": ["yes", "no"]});
+        let create = |params| task_call_with_parent_session(&registry, CREATE, &params, None);
+        for (key, value) in [
+            ("question", json!("界".repeat(342))),
+            ("question", json!("")),
+            ("question", json!("escape\u{001b}")),
+            ("options", json!(["one"])),
+            ("options", json!(["same", "same"])),
+            ("options", json!(["", "two"])),
+            ("options", json!(["界".repeat(43), "two"])),
+            (
+                "options",
+                json!(["a", "b", "c", "d", "e", "f", "g", "h", "i"]),
+            ),
+        ] {
+            let mut params = valid.clone();
+            params[key] = value;
+            assert_eq!(create(params)["code"], "invalid_params");
+        }
+        let mut missing = valid.clone();
+        missing["task_id"] = json!("missing");
+        assert_eq!(create(missing)["code"], "agent_task_not_found");
+        let workers = (0..8)
+            .map(|_| {
+                let registry = registry.clone();
+                let params = valid.clone();
+                thread::spawn(move || {
+                    task_call_with_parent_session(&registry, CREATE, &params, None)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|result| result["ok"] == true).count(),
+            1
+        );
+        let gate_id =
+            results.iter().find(|result| result["ok"] == true).unwrap()["gate"]["gate_id"].clone();
+        let mut held = registry.load_task(&task.task_id).unwrap().unwrap();
+        let settle = json!({"cursor": 1, "pane_id": "w1:p1", "agent_status": "done"});
+        assert!(
+            !registry
+                .apply_task_window(&mut held, 1, std::slice::from_ref(&settle))
+                .unwrap()
+        );
+        assert_eq!(held.lifecycle, PromptTaskLifecycle::Running);
+        assert_eq!(held.last_cursor, 0);
+        registry.save_task(&held, None).unwrap();
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["terminal"],
+            false
+        );
+        assert_eq!(
+            registry.task_ack(&task.task_id)["code"],
+            "task_blocked_on_gate"
+        );
+        let cancelled =
+            task_call_with_parent_session(&registry, CANCEL, &json!({"gate_id": gate_id}), None);
+        assert_eq!(cancelled["gate"]["status"], "cancelled");
+        assert_eq!(cancelled["gate"]["resolved_by"], Value::Null);
+        let mut released = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert!(
+            registry
+                .apply_task_window(&mut released, 1, &[settle])
+                .unwrap()
+        );
+        registry.save_task(&released, None).unwrap();
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["terminal"],
+            true
+        );
+        assert_eq!(create(valid)["code"], "agent_task_terminal");
+        drop(registry);
+        remove_escalation_db(&path);
+    }
+
+    /// user worker | Given a durable running task with distinct ids | When
+    /// completion reports race and the runtime reloads | Then exactly one
+    /// succeeds, mismatches fail, and duplicate reports change no stored fact.
+    #[test]
+    fn worker_reports_are_durable_exactly_once_and_identity_bound() {
+        let (path, registry, clock) = worker_registry("reports");
+        let mut task = escalation_task("report-task", "child", PromptTaskLifecycle::Running, 0);
+        task.dispatch_id = "distinct-dispatch".to_owned();
+        registry.save_task(&task, None).unwrap();
+        let report = |params| {
+            task_call_with_parent_session(&registry, AGENT_TASK_REPORT_METHOD, &params, None)
+        };
+        for params in [
+            json!({"task_id": "missing", "dispatch_id": task.dispatch_id, "kind": "worker_done"}),
+            json!({"task_id": task.task_id, "dispatch_id": task.task_id, "kind": "worker_done"}),
+        ] {
+            assert_eq!(report(params)["code"], "task_identity_mismatch");
+            assert_eq!(registry.load_task(&task.task_id).unwrap().unwrap(), task);
+        }
+        assert_eq!(
+            report(
+                json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "worker_done", "summary": "界".repeat(683)})
+            )["code"],
+            "invalid_params"
+        );
+        let params = json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "worker_done", "summary": "done\n\u{001b}\t✓"});
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let registry = registry.clone();
+                let params = params.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    task_call_with_parent_session(
+                        &registry,
+                        AGENT_TASK_REPORT_METHOD,
+                        &params,
+                        None,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|result| result["ok"] == true).count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result["code"] == "worker_done_already_reported")
+                .count(),
+            7
+        );
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(stored.worker_done_at_ms, Some(clock.load(Ordering::SeqCst)));
+        assert_eq!(stored.worker_done_summary.as_deref(), Some("done✓"));
+        let status = registry.task_status(&task.task_id);
+        assert_eq!(status["task"]["lifecycle"], "completed");
+        assert_eq!(status["task"]["terminal_status"], "worker_done");
+        let reopened =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(&path).unwrap())));
+        assert_eq!(
+            task_call_with_parent_session(&reopened, AGENT_TASK_REPORT_METHOD, &params, None)["code"],
+            "worker_done_already_reported"
+        );
+        assert_eq!(
+            report(
+                json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "heartbeat"})
+            )["code"],
+            "agent_task_terminal"
+        );
+        assert_eq!(registry.load_task(&task.task_id).unwrap().unwrap(), stored);
+        drop(reopened);
+        drop(registry);
+        remove_task_db(&path);
+    }
+
+    /// user worker | Given a task already settled by lifecycle | When a late
+    /// worker_done arrives | Then only the report fact is added, with no second
+    /// parent notification and no lifecycle, terminal, excerpt or ack reset.
+    #[test]
+    fn late_worker_done_preserves_lifecycle_and_parent_notification() {
+        let (path, registry, _) = worker_registry("late-report");
+        for lifecycle in [
+            PromptTaskLifecycle::Completed,
+            PromptTaskLifecycle::Blocked,
+            PromptTaskLifecycle::Failed,
+            PromptTaskLifecycle::DeliveryUncertain,
+        ] {
+            let mut task = escalation_task(lifecycle.as_str(), "child", lifecycle.clone(), 1000);
+            task.notification_attempts = 1;
+            task.acknowledged_at_ms = Some(task.updated_at_ms);
+            task.final_excerpt = Some("existing output".to_owned());
+            registry.save_task(&task, None).unwrap();
+            let report = task_call_with_parent_session(
+                &registry,
+                AGENT_TASK_REPORT_METHOD,
+                &json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "worker_done"}),
+                None,
+            );
+            assert_eq!(report["ok"], true, "{report}");
+            let mut expected = task;
+            expected.worker_done_at_ms = Some(registry.now_ms());
+            expected.updated_at_ms = registry.now_ms();
+            assert_eq!(
+                registry.load_task(&expected.task_id).unwrap().unwrap(),
+                expected
+            );
+        }
+        drop(registry);
+        remove_task_db(&path);
+    }
+
+    /// user parent | Given old stored JSON without worker fields and a fake
+    /// clock | When heartbeats and progress stop for the configured interval |
+    /// Then status and both inbox views agree on non-terminal stalled liveness.
+    #[test]
+    fn old_tasks_and_heartbeats_share_stall_liveness_with_inbox() {
+        let (path, registry, clock) = worker_registry("liveness");
+        let old_json = include_str!("../tests/fixtures/prompt-task-pre-worker-report.json");
+        let task: PromptTaskRecord = serde_json::from_str(old_json).unwrap();
+        clock.store(task.updated_at_ms, Ordering::SeqCst);
+        assert!(task.last_heartbeat_at_ms.is_none());
+        assert!(task.worker_done_at_ms.is_none());
+        assert!(task.worker_done_summary.is_none());
+        assert!(task.stall_after_ms.is_none());
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(ESCALATION_STALL_IDLE_MS - 1, Ordering::SeqCst);
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["liveness"],
+            "active"
+        );
+        clock.fetch_add(1, Ordering::SeqCst);
+        let status = registry.task_status(&task.task_id);
+        assert_eq!(status["task"]["liveness"], "stalled");
+        assert_eq!(status["task"]["terminal"], false);
+        let inbox = registry.task_inbox_with_running(None, "session-worker", 10);
+        assert_eq!(inbox["tasks"][0]["liveness"], "stalled");
+        assert_eq!(inbox["escalation"]["signals"][0]["kind"], "stall_suspected");
+        assert_eq!(
+            apply_inbox_view(inbox, InboxView::Compact)["tasks"][0]["liveness"],
+            "stalled"
+        );
+        let before = registry.load_task(&task.task_id).unwrap().unwrap();
+        let heartbeat = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({"task_id": task.task_id, "dispatch_id": task.dispatch_id, "kind": "heartbeat"}),
+            None,
+        );
+        assert_eq!(heartbeat["ok"], true);
+        assert_eq!(heartbeat["task"]["liveness"], "active");
+        let after = registry.load_task(&task.task_id).unwrap().unwrap();
+        let mut expected = before;
+        expected.last_heartbeat_at_ms = Some(registry.now_ms());
+        expected.updated_at_ms = registry.now_ms();
+        assert_eq!(after, expected, "heartbeat only updates its two timestamps");
+        assert!(
+            registry.task_inbox(None, None, None, false, false, 10)["escalation"]["signals"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let mut custom = after;
+        custom.stall_after_ms = Some(60_000);
+        registry.save_task(&custom, None).unwrap();
+        clock.fetch_add(59_999, Ordering::SeqCst);
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["liveness"],
+            "active"
+        );
+        clock.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            registry.task_status(&task.task_id)["task"]["liveness"],
+            "stalled"
+        );
+        drop(registry);
+        remove_task_db(&path);
+    }
+
+    /// user parent | Given a submitted running task | When dispatch wait expires
+    /// and is repeated with the same key | Then both return successful
+    /// checkpoints, preserve task evidence and submit only once.
+    #[test]
+    fn dispatch_wait_timeout_is_a_checkpoint_without_resubmission() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_dispatch_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}}),
+                json!({"result": {"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}}),
+            ],
+            texts.clone(),
+        );
+        let client = HerdrClient::new(&socket);
+        let (path, registry, _) = worker_registry("checkpoint");
+        for value in [json!(59_999), json!(7_200_001), json!("60000")] {
+            assert_eq!(
+                run(
+                    &client,
+                    &registry,
+                    &json!({"target": "w1:p1", "text": "work", "stall_after_ms": value})
+                )["code"],
+                "invalid_params"
+            );
+        }
+        let mut args = json!({"target": "w1:p1", "text": "work", "idempotency_key": "checkpoint", "stall_after_ms": 60_000, "wait": {"timeout_ms": 1}});
+        let first = run(&client, &registry, &args);
+        server.join().unwrap();
+        args["stall_after_ms"] = json!(7_200_000);
+        let replay = run(&client, &registry, &args);
+        for result in [&first, &replay] {
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(result["wait"]["completed"], false);
+            assert_eq!(result["wait"]["outcome"], "checkpoint");
+            assert!(result.get("failure").is_none());
+            assert_eq!(result["task"]["lifecycle"], "running");
+            assert_eq!(result["task"]["liveness"], "active");
+            assert_eq!(
+                result["task"]["stall_after_ms"], 60_000,
+                "replay retains the dispatch threshold"
+            );
+            assert_eq!(result["task_id"], first["task_id"]);
+            assert_eq!(result["dispatch_id"], first["dispatch_id"]);
+        }
+        assert_eq!(texts.lock().unwrap().len(), 1);
+        assert_eq!(replay["idempotent_replay"], true);
+        let mut failure =
+            json!({"ok": false, "failure": "delivery_failed", "delivery_state": "not_delivered"});
+        apply_task_wait(
+            &registry,
+            &mut failure,
+            first["task_id"].as_str().unwrap(),
+            &json!({"timeout_ms": 0}),
+        );
+        assert_eq!(failure["ok"], false);
+        assert_eq!(failure["failure"], "delivery_failed");
+        let mut missing = json!({"ok": true});
+        apply_task_wait(
+            &registry,
+            &mut missing,
+            "unknown-task",
+            &json!({"timeout_ms": 0}),
+        );
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["failure"], "agent_task_not_found");
+        drop(registry);
+        remove_task_db(&path);
+        fs::remove_file(socket).unwrap();
     }
 
     /// user parent | Given one target/parent lane of durable tasks in the
@@ -5162,8 +8621,10 @@ mod tests {
             keys,
             vec![
                 "acknowledged",
+                "dispatch_id",
                 "final_excerpt",
                 "lifecycle",
+                "liveness",
                 "pane_id",
                 "target",
                 "task_id",
@@ -5407,6 +8868,11 @@ mod tests {
         let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -5500,6 +8966,7 @@ mod tests {
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
             target: "child".to_owned(),
+            requested_target: None,
             idempotency_key_digest: None,
             pane_id: Some("w1:p1".to_owned()),
             workspace_id: Some("w1".to_owned()),
@@ -5515,6 +8982,11 @@ mod tests {
             terminal_status: None,
             terminal_cursor: None,
             terminal_at_ms: None,
+            last_heartbeat_at_ms: None,
+            worker_done_at_ms: None,
+            worker_done_summary: None,
+            stall_after_ms: None,
+            gate: None,
             final_excerpt: None,
             awaiting_children: None,
             parent_target: None,
@@ -6507,6 +9979,11 @@ mod tests {
         let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -6676,6 +10153,11 @@ mod tests {
         let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
@@ -6730,6 +10212,7 @@ mod tests {
             .register_task(RegisterTaskInput {
                 task_id,
                 target,
+                requested_target: None,
                 fingerprint: task_id,
                 idempotency_key: None,
                 before: Some(&before),
@@ -6738,6 +10221,7 @@ mod tests {
                 start_cursor,
                 parent_target,
                 parent_session_ref,
+                stall_after_ms: None,
             })
             .unwrap()
             .unwrap();
@@ -6897,7 +10381,7 @@ mod tests {
     fn compact_projection_keeps_the_awaiting_children_fact() {
         let mut task = excerpt_test_task("dispatch:prompt:compact-hold");
         task.awaiting_children = Some(2);
-        let projected = compact_task(task.public_json().as_object().unwrap().clone());
+        let projected = compact_task(task.public_json_at(now_ms()).as_object().unwrap().clone());
         assert_eq!(projected["awaiting_children"], 2);
         assert_eq!(projected["lifecycle"], "running");
     }
@@ -6916,7 +10400,12 @@ mod tests {
         encoded.as_object_mut().unwrap().remove("awaiting_children");
         let decoded: PromptTaskRecord = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.awaiting_children, None);
-        assert!(decoded.public_json().get("awaiting_children").is_none());
+        assert!(
+            decoded
+                .public_json_at(now_ms())
+                .get("awaiting_children")
+                .is_none()
+        );
 
         let mut held = task;
         held.awaiting_children = Some(3);
@@ -7171,6 +10660,11 @@ mod tests {
         })));
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                clock: None,
                 records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),

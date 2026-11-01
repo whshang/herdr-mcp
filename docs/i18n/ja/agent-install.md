@@ -33,7 +33,7 @@ herdr-mcp install
 herdr-mcp doctor
 ```
 
-`herdr-mcp install` が Herdr 依存関係の復旧を担当します。`HERDR_BIN`、ユーザーの安定パス、Homebrew/`/usr/local`、PATH の順で解決し、既存 Herdr を検証して自動更新を試み、完全に見つからない場合は <https://herdr.dev/> の公式 installer を実行し、最後に Herdr Server/API が到達可能であることを確認します。dependency-recovery の明示的な失敗が報告されない限り、Agent は二つ目の手動 Herdr インストール手順を作らないでください。Windows Candidate UAT は引き続き exact herdr-mcp candidate artifact を使用します。
+`herdr-mcp install` が Herdr 依存関係の復旧を担当します。`HERDR_BIN`、ユーザーの安定パス、Homebrew/`/usr/local`、PATH の順で解決し、既存 Herdr を検証して自動更新を試み、完全に見つからない場合は <https://herdr.dev/tui/> の公式 installer を実行し、最後に Herdr Server/API が到達可能であることを確認します。dependency-recovery の明示的な失敗が報告されない限り、Agent は二つ目の手動 Herdr インストール手順を作らないでください。ここでの「Herdr」は Herdr TUI（`herdr`）です。herdr-mcp のために Herdr app や herdr-core（`hc`）をインストールしないでください。herdr-mcp v1.1 はこの別 runtime をサポートしません。Windows Candidate UAT は引き続き exact herdr-mcp candidate artifact を使用します。
 
 `~/.local/bin/herdr-mcp` は存在するのにインタラクティブ shell が解決できない場合は、`installed_but_not_on_shell_path` と分類し、ユーザーの PATH を修復して新しい shell で検証してください。再インストールしたり、二つ目の PATH owner を作ったりしないでください。PATH の修復が必要なときだけ[トラブルシューティング](troubleshooting.md)を使ってください。
 

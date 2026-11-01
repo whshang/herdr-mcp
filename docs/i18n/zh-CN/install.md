@@ -17,7 +17,7 @@ herdr --version
 herdr api schema >/dev/null
 ```
 
-但这不再是首次安装的前置条件。正常执行 `herdr-mcp install` 时，herdr-mcp 会按顺序从 `HERDR_BIN`、用户稳定安装路径、Homebrew/`/usr/local` 和当前 PATH 查找 Herdr。已经安装时会先验证 CLI/API，并自动尝试 `herdr update`；Herdr Server 已运行时使用 live handoff 更新。完全找不到 Herdr 时，会从 <https://herdr.dev/> 下载并执行官方安装器。herdr-mcp 服务安装完成后还会确认本机 Herdr Server/API 已可达：macOS 通过受管 Supervisor/TCC broker 启动，Linux/Windows 在需要时启动当前用户的 Herdr Server。
+但这不再是首次安装的前置条件。正常执行 `herdr-mcp install` 时，herdr-mcp 会按顺序从 `HERDR_BIN`、用户稳定安装路径、Homebrew/`/usr/local` 和当前 PATH 查找 Herdr。已经安装时会先验证 CLI/API，并自动尝试 `herdr update`；Herdr Server 已运行时使用 live handoff 更新。完全找不到 Herdr 时，会从 <https://herdr.dev/tui/> 下载并执行官方安装器。herdr-mcp 服务安装完成后还会确认本机 Herdr Server/API 已可达：macOS 通过受管 Supervisor/TCC broker 启动，Linux/Windows 在需要时启动当前用户的 Herdr Server。
 
 官方安装命令保留为排障时的人工兜底：
 
@@ -30,6 +30,8 @@ curl -fsSL https://herdr.dev/install.sh | sh
 # Windows
 powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 ```
+
+以上是 Herdr TUI 的安装器。herdr-mcp 只支持 Herdr TUI；不要为 herdr-mcp 安装 Herdr app 或 herdr-core（`hc`），herdr-mcp v1.1 不支持这个独立的运行时。详见[平台支持矩阵](platform-support-matrix.md)。
 
 ### 2. 明确要连接的客户端
 

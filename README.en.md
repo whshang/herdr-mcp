@@ -140,6 +140,10 @@ Another transport is a complete substitute only if it also provides a public HTT
 
 Private IPs and Tailscale-only addresses are not directly reachable from ChatGPT's cloud service. Raw port forwarding increases exposure. Cloudflare is the currently supported and qualified path.
 
+### Which Herdr does herdr-mcp support?
+
+Only the **Herdr TUI** (the `herdr` CLI and `herdr server`). CI pins Herdr TUI `0.8.2`; the current upstream TUI release is `0.9.5`. The new Herdr app and its herdr-core runtime (`hc`) are a separate runtime that does not share agents with the TUI, and herdr-mcp v1.1 does not support them. Herdr TUI documentation now lives at <https://herdr.dev/tui/docs/>. Details: [platform support matrix](docs/i18n/en/platform-support-matrix.md).
+
 ### What if the first install cannot find Herdr windows or the Herdr Server?
 
 Starting with **v1.0.1**, `herdr-mcp install` discovers and verifies installed Herdr, attempts a stable Herdr update, invokes the official Herdr installer when Herdr is absent, and requires the local Herdr Server/API to become reachable before installation is considered complete.
