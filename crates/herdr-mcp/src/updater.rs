@@ -328,6 +328,41 @@ fn runtime_update_notices(worker_update: &Value, chain: WorkerChain) -> Value {
     worker_update_notices(worker_update)
 }
 
+/// Notice for the one-time macOS consent prompt a newly activated generation may
+/// trigger.
+///
+/// Every update installs a *new* `runtime/generations/rust-<sha256>/` binary, and
+/// an unsigned binary is a new TCC identity: the first Documents/Desktop/
+/// Downloads access of a new generation asks for permission once. A pending
+/// prompt blocks that access until a human answers it, so an unattended update
+/// must say so in its own result instead of looking like a control-plane
+/// failure. This is a notice: the Runtime update already succeeded.
+#[cfg(target_os = "macos")]
+fn macos_tcc_prompt_notice() -> Option<Value> {
+    Some(json!({
+        "code": "macos_documents_tcc_prompt",
+        "severity": "notice",
+        "fatal": false,
+        "message": "macOS may show a one-time Documents access prompt for the newly installed runtime generation; click Allow. Protected-folder control requests can stall until it is answered.",
+        "next_action": "click Allow on the macOS Documents prompt, then `herdr-mcp doctor`",
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_tcc_prompt_notice() -> Option<Value> {
+    None
+}
+
+/// Append the macOS consent notice to a result that activates a new generation.
+///
+/// `update_current` does not activate one, so it never carries this notice.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn with_macos_tcc_prompt_notice(notices: Value) -> Value {
+    let mut notices = notices.as_array().cloned().unwrap_or_default();
+    notices.extend(macos_tcc_prompt_notice());
+    Value::Array(notices)
+}
+
 /// Human-visible counterpart of `runtime_update_notices`.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn report_worker_update_notice(worker_update: &Value, chain: WorkerChain) {
@@ -464,7 +499,51 @@ fn runtime_update_succeeded_result(outcome: RuntimeUpdateOutcome<'_>) -> (Value,
         "worker_update_chained": outcome.worker_chain == WorkerChain::WithWorker,
         "worker_update_required": worker_update_required,
         "worker_update": outcome.worker_update,
-        "notices": runtime_update_notices(&outcome.worker_update, outcome.worker_chain),
+        "notices": with_macos_tcc_prompt_notice(runtime_update_notices(
+            &outcome.worker_update,
+            outcome.worker_chain,
+        )),
+        "next_action": if worker_update_required {
+            Some(WORKER_UPDATE_NEXT_ACTION)
+        } else {
+            None
+        },
+    });
+    (payload, ExitCode::SUCCESS)
+}
+
+/// Result of an `update apply` that found the Runtime already on the target
+/// release.
+///
+/// The Runtime did not change, so there is no newly activated generation and no
+/// macOS consent prompt to announce. A Worker problem — including a failed
+/// explicit `--with-worker` reconcile — is only a notice; `ok` and the exit code
+/// stay with the Runtime outcome.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn update_current_result(
+    channel: UpdateChannel,
+    current_version: &str,
+    target_version: &str,
+    tag: &str,
+    migration: Option<&StateSchemaMigration>,
+    worker_update: Value,
+    worker_chain: WorkerChain,
+) -> (Value, ExitCode) {
+    let worker_update_required = worker_update_required(&worker_update);
+    let payload = json!({
+        "ok": true,
+        "code": "update_current",
+        "update_channel": channel.as_str(),
+        "current_version": current_version,
+        "release_version": target_version,
+        "tag": tag,
+        "provenance_verified": true,
+        "runtime_changed": false,
+        "worker_update_chained": worker_chain == WorkerChain::WithWorker,
+        "worker_update_required": worker_update_required,
+        "warning": migration.map(StateSchemaMigration::warning),
+        "worker_update": worker_update,
+        "notices": runtime_update_notices(&worker_update, worker_chain),
         "next_action": if worker_update_required {
             Some(WORKER_UPDATE_NEXT_ACTION)
         } else {
@@ -691,29 +770,18 @@ fn apply_inner(
                 worker_chain,
                 || reconcile_worker_with_active_runtime(&paths),
             );
-            let worker_update_required = worker_update_required(&worker_update);
             report_worker_update_notice(&worker_update, worker_chain);
-            print_json(&json!({
-                "ok": true,
-                "code": "update_current",
-                "update_channel": channel.as_str(),
-                "current_version": current.to_string(),
-                "release_version": target_version,
-                "tag": plan.tag,
-                "provenance_verified": true,
-                "runtime_changed": false,
-                "worker_update_chained": worker_chain == WorkerChain::WithWorker,
-                "worker_update_required": worker_update_required,
-                "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
-                "worker_update": worker_update,
-                "notices": runtime_update_notices(&worker_update, worker_chain),
-                "next_action": if worker_update_required {
-                    Some(WORKER_UPDATE_NEXT_ACTION)
-                } else {
-                    None
-                },
-            }))?;
-            return Ok(ExitCode::SUCCESS);
+            let (payload, code) = update_current_result(
+                channel,
+                &current.to_string(),
+                &target_version,
+                &plan.tag,
+                plan.state_schema_migration.as_ref(),
+                worker_update,
+                worker_chain,
+            );
+            print_json(&payload)?;
+            return Ok(code);
         }
         let store = UpdateStore::open(&paths)?;
         recover_or_reject_active_update(&store, &paths)?;
@@ -867,6 +935,7 @@ fn apply_inner(
                 "reason": "worker_update_is_a_separate_operator_step",
                 "next_action": WORKER_UPDATE_NEXT_ACTION,
             },
+            "notices": with_macos_tcc_prompt_notice(json!([])),
             "next_action": "herdr-mcp update status",
         }))?;
         Ok(ExitCode::SUCCESS)
@@ -1799,42 +1868,102 @@ fn recover_major_upgrade(paths: &RuntimePaths, record: &MajorUpgradeRecord) -> R
     Ok(())
 }
 
+/// Runtime outcome recorded by a durable update job.
+///
+/// The Runtime is what `update apply` guarantees; the fleet Worker is a separate
+/// release plane with its own operator command. `update status` classifies the
+/// Runtime job only, so a Worker problem recorded alongside a committed Runtime
+/// never turns the update into a failure.
+fn runtime_job_outcome(state: &str) -> &'static str {
+    match state {
+        "succeeded" => "succeeded",
+        "failed" => "failed",
+        "queued" | "installing" => "in_progress",
+        _ => "unknown",
+    }
+}
+
+/// Whether a job's detail is the legacy `<= v1.1.0-rc.8` chained-Worker text.
+///
+/// Updaters up to v1.1.0-rc.8 chained `worker update` into the Runtime result and
+/// recorded codes such as `update_succeeded_worker_update_required` there. The
+/// Runtime had already committed, so such a job is a success plus a Worker
+/// notice, not a failed update.
+fn legacy_worker_update_detail(detail: Option<&str>) -> bool {
+    let Some(detail) = detail else {
+        return false;
+    };
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("update_succeeded_worker_update_required")
+        || lower.contains("worker_update_failed")
+}
+
+fn legacy_worker_update_notice() -> Value {
+    json!({
+        "code": "worker_update_failed_legacy",
+        "severity": "notice",
+        "fatal": false,
+        "message": "this update job was recorded by an updater <= v1.1.0-rc.8, which chained the separate fleet Worker update into the Runtime result; the Runtime update itself succeeded",
+        "next_action": WORKER_UPDATE_NEXT_ACTION,
+    })
+}
+
+/// Read-only `update status` view.
+///
+/// `ok` and `runtime_outcome` describe the recorded Runtime job; Worker drift or
+/// a legacy Worker failure is only a notice. Verification commands for an
+/// operator are `herdr-mcp --version`, `herdr-mcp update status` and
+/// `herdr-mcp doctor`.
+fn update_status_view(
+    job: Option<&UpdateJobRecord>,
+    current_version: &str,
+    worker_update: Value,
+) -> Value {
+    let worker_update_required = worker_update_required(&worker_update);
+    let outcome = job.map_or("none", |job| runtime_job_outcome(&job.state));
+    let mut notices = worker_update_notices(&worker_update)
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if job.is_some_and(|job| {
+        runtime_job_outcome(&job.state) == "succeeded"
+            && legacy_worker_update_detail(job.detail.as_deref())
+    }) {
+        notices.push(legacy_worker_update_notice());
+    }
+    let next_action = if worker_update_required {
+        Some(WORKER_UPDATE_NEXT_ACTION)
+    } else {
+        match outcome {
+            "failed" => Some("herdr-mcp update apply"),
+            "in_progress" => Some("herdr-mcp update status"),
+            _ => None,
+        }
+    };
+    json!({
+        "ok": outcome != "failed",
+        "code": "update_status",
+        "runtime_outcome": outcome,
+        "job": job.map(public_job_view),
+        "current_version": current_version,
+        "worker_update_required": worker_update_required,
+        "worker_update": worker_update,
+        "notices": notices,
+        "next_action": next_action,
+    })
+}
+
 fn status() -> Result<ExitCode, String> {
     let paths = RuntimePaths::discover()?;
     let store = UpdateStore::open(&paths)?;
     let latest = store.latest_update_job()?;
     let current_version = current_version()?.to_string();
     let worker_update = worker_update_status_view(&paths, &current_version);
-    let worker_update_required = worker_update_required(&worker_update);
-    let notices = worker_update_notices(&worker_update);
-    let next_action = if worker_update_required {
-        Some(WORKER_UPDATE_NEXT_ACTION)
-    } else {
-        None
-    };
-    let payload = match latest {
-        Some(job) => json!({
-            "ok": true,
-            "code": "update_status",
-            "job": public_job_view(&job),
-            "current_version": current_version,
-            "worker_update_required": worker_update_required,
-            "worker_update": worker_update,
-            "notices": notices,
-            "next_action": next_action,
-        }),
-        None => json!({
-            "ok": true,
-            "code": "update_status",
-            "job": null,
-            "current_version": current_version,
-            "worker_update_required": worker_update_required,
-            "worker_update": worker_update,
-            "notices": notices,
-            "next_action": next_action,
-        }),
-    };
-    print_json(&payload)?;
+    print_json(&update_status_view(
+        latest.as_ref(),
+        &current_version,
+        worker_update,
+    ))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -3876,11 +4005,20 @@ mod tests {
         assert_eq!(payload["worker_update_chained"], false);
         assert_eq!(payload["next_action"], "herdr-mcp worker update");
         let notices = payload["notices"].as_array().unwrap();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0]["code"], "worker_update_required");
-        assert_eq!(notices[0]["severity"], "notice");
-        assert_eq!(notices[0]["fatal"], false);
-        assert_eq!(notices[0]["next_action"], "herdr-mcp worker update");
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice["code"] == "worker_update_required")
+                .count(),
+            1
+        );
+        let notice = notices
+            .iter()
+            .find(|notice| notice["code"] == "worker_update_required")
+            .unwrap();
+        assert_eq!(notice["severity"], "notice");
+        assert_eq!(notice["fatal"], false);
+        assert_eq!(notice["next_action"], "herdr-mcp worker update");
 
         // A current (or unconfigured) Worker is never a notice.
         let current = json!({ "configured": true, "update_required": false });
@@ -3991,5 +4129,162 @@ mod tests {
         assert_eq!(payload["worker_update_requested"], true);
         assert_eq!(payload["worker_update_started"], false);
         assert_eq!(payload["next_action"], "herdr-mcp update apply");
+    }
+
+    /// Given a Runtime update that already committed
+    /// When `update status` classifies a job recorded by an updater <= v1.1.0-rc.8
+    /// Then the succeeded Runtime job is a success and the chained Worker failure
+    /// is only a notice with the separate operator command.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn update_status_reports_a_succeeded_runtime_job_as_success() {
+        let mut job = ordinary_update_job("upd-legacy-worker");
+        job.state = "succeeded".to_owned();
+        job.detail =
+            Some("update_succeeded_worker_update_required worker_update_failed".to_owned());
+        let view = update_status_view(
+            Some(&job),
+            "1.1.0-rc.9",
+            json!({ "configured": true, "update_required": false }),
+        );
+        assert_eq!(view["ok"], true);
+        assert_eq!(view["runtime_outcome"], "succeeded");
+        assert_eq!(view["job"]["state"], "succeeded");
+        assert_eq!(view["next_action"], Value::Null);
+        let legacy = view["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "worker_update_failed_legacy")
+            .expect("the legacy chained-Worker text must be a notice");
+        assert_eq!(legacy["severity"], "notice");
+        assert_eq!(legacy["fatal"], false);
+        assert_eq!(legacy["next_action"], "herdr-mcp worker update");
+
+        // A plain success carries no legacy notice.
+        job.detail = Some("service install committed and health gate passed".to_owned());
+        let clean = update_status_view(
+            Some(&job),
+            "1.1.0-rc.9",
+            json!({ "configured": false, "update_required": false }),
+        );
+        assert_eq!(clean["ok"], true);
+        assert!(clean["notices"].as_array().unwrap().is_empty());
+        assert_eq!(
+            clean["job"]["detail"],
+            "service install committed and health gate passed"
+        );
+    }
+
+    /// Given each durable job state
+    /// When `update status` classifies it
+    /// Then only a failed Runtime job is unsuccessful, and Worker text never decides.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn update_status_runtime_outcome_ignores_worker_text() {
+        assert_eq!(runtime_job_outcome("succeeded"), "succeeded");
+        assert_eq!(runtime_job_outcome("failed"), "failed");
+        assert_eq!(runtime_job_outcome("queued"), "in_progress");
+        assert_eq!(runtime_job_outcome("installing"), "in_progress");
+        assert_eq!(runtime_job_outcome("something-else"), "unknown");
+        assert!(legacy_worker_update_detail(Some(
+            "update_succeeded_worker_update_required"
+        )));
+        assert!(legacy_worker_update_detail(Some("worker_update_failed")));
+        assert!(!legacy_worker_update_detail(None));
+        assert!(!legacy_worker_update_detail(Some("health gate passed")));
+
+        let mut failed = ordinary_update_job("upd-failed");
+        failed.state = "failed".to_owned();
+        failed.detail = Some("service install failed".to_owned());
+        let view = update_status_view(
+            Some(&failed),
+            "1.1.0-rc.9",
+            json!({ "configured": false, "update_required": false }),
+        );
+        assert_eq!(view["ok"], false);
+        assert_eq!(view["runtime_outcome"], "failed");
+        assert_eq!(view["next_action"], "herdr-mcp update apply");
+
+        let empty = update_status_view(
+            None,
+            "1.1.0-rc.9",
+            json!({ "configured": false, "update_required": false }),
+        );
+        assert_eq!(empty["ok"], true);
+        assert_eq!(empty["runtime_outcome"], "none");
+        assert_eq!(empty["job"], Value::Null);
+    }
+
+    /// Given the Runtime already on the target release
+    /// When the resolved Worker step fails
+    /// Then `update_current` still reports success and the Worker problem is a notice.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn update_current_stays_successful_when_the_worker_step_fails() {
+        let (payload, code) = update_current_result(
+            UpdateChannel::Stable,
+            "1.1.0-rc.9",
+            "1.1.0-rc.9",
+            "v1.1.0-rc.9",
+            None,
+            json!({ "ok": false, "code": "worker_update_failed", "error": "reconciliation did not complete" }),
+            WorkerChain::WithWorker,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["code"], "update_current");
+        assert_eq!(payload["runtime_changed"], false);
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "worker_update_failed")
+            .expect("the failed Worker step must stay a notice");
+        assert_eq!(notice["fatal"], false);
+        assert_eq!(notice["next_action"], "herdr-mcp worker update");
+
+        // The default runtime-only path never chains the Worker at all.
+        let (payload, code) = update_current_result(
+            UpdateChannel::Stable,
+            "1.1.0-rc.9",
+            "1.1.0-rc.9",
+            "v1.1.0-rc.9",
+            None,
+            json!({ "configured": false, "update_required": false }),
+            WorkerChain::RuntimeOnly,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["worker_update_chained"], false);
+    }
+
+    /// Given a Runtime update that activated a new generation
+    /// When its result carries notices
+    /// Then the one-time macOS Documents prompt is announced, without replacing
+    /// the Worker notice.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_update_announces_the_macos_documents_prompt() {
+        let notice = macos_tcc_prompt_notice().expect("macOS must announce the prompt");
+        assert_eq!(notice["code"], "macos_documents_tcc_prompt");
+        assert_eq!(notice["severity"], "notice");
+        assert_eq!(notice["fatal"], false);
+        assert!(notice["message"].as_str().unwrap().contains("Documents"));
+
+        let merged = with_macos_tcc_prompt_notice(json!([{ "code": "worker_update_required" }]));
+        let codes = merged
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|notice| notice["code"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            vec![
+                json!("worker_update_required"),
+                json!("macos_documents_tcc_prompt")
+            ]
+        );
     }
 }

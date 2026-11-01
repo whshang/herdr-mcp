@@ -61,6 +61,149 @@ pub(crate) fn is_protected_user_path(path: &Path) -> bool {
     }
 }
 
+/// Pure lexical form of [`is_protected_user_path`]: never performs a syscall.
+///
+/// macOS authorizes a privacy-protected folder by *blocking the requesting
+/// thread inside the first protected syscall*, so a guard that resolves a real
+/// path (`canonicalize`/`stat`) to decide "is this protected?" can hang the
+/// caller before it reaches any delegation check. Every implicit runtime path
+/// (project discovery, security gates, background tailers) must decide from
+/// this lexical form first, so a pending consent prompt can never stall it.
+pub(crate) fn is_protected_user_path_lexical(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return false;
+        };
+        is_protected_user_path_lexical_for_home(path, &home)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Whether the rotating runtime must treat `path` as off-limits for direct
+/// filesystem probing.
+///
+/// The stable TCC broker child is the authorized client for these folders, so
+/// it may probe them; every other process in a runtime generation must not.
+/// Callers use this to *avoid* the access entirely (skip the probe and delegate)
+/// rather than to bound it, because avoidance is what keeps a pending consent
+/// prompt from wedging the control path.
+pub(crate) fn runtime_must_not_probe(path: &Path) -> bool {
+    is_protected_user_path_lexical(path) && !crate::tcc_broker::is_authorized_protected_client()
+}
+
+/// Outcome of a bounded real-path resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoundedRealPath {
+    Resolved(PathBuf),
+    /// macOS is showing (or ignoring) a consent prompt; nothing was read.
+    TimedOut,
+    /// The path does not exist or cannot be resolved for another reason.
+    NotFound,
+}
+
+/// Resolve a real path without letting a pending macOS consent prompt block
+/// the caller.
+///
+/// A blocked consent prompt parks the syscall inside the worker thread, which
+/// cannot be cancelled. The caller therefore gets `TimedOut` and must fail
+/// closed; the worker stays parked until the operator answers the prompt. A
+/// sticky latch makes later probes return immediately instead of parking one
+/// more thread behind the same unanswered prompt.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn bounded_real_path(path: &Path) -> BoundedRealPath {
+    #[cfg(test)]
+    REAL_PATH_PROBES.with(|count| count.set(count.get() + 1));
+    if protected_probe_cooling_down() {
+        return BoundedRealPath::TimedOut;
+    }
+    let probe_path = path.to_path_buf();
+    match run_probe_bounded(PROTECTED_REALPATH_BUDGET, move || {
+        std::fs::canonicalize(&probe_path)
+    }) {
+        Some(Ok(resolved)) => BoundedRealPath::Resolved(resolved),
+        Some(Err(_)) => BoundedRealPath::NotFound,
+        None => {
+            PROTECTED_PROBE_RETRY_AFTER_MS.store(
+                now_ms_since_start() + PROTECTED_PROBE_COOLDOWN.as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            BoundedRealPath::TimedOut
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", test)))]
+pub(crate) fn bounded_real_path(path: &Path) -> BoundedRealPath {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => BoundedRealPath::Resolved(resolved),
+        Err(_) => BoundedRealPath::NotFound,
+    }
+}
+
+/// Wall-clock budget for one consent-gated real-path resolution. A granted
+/// path resolves in microseconds; the budget only bounds a pending prompt.
+#[cfg(any(target_os = "macos", test))]
+const PROTECTED_REALPATH_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Cool-down window after one probe timed out on an unanswered consent prompt.
+///
+/// Without it, every later request would park one more worker thread behind the
+/// same prompt. With it, at most one probe is parked per window, and a path
+/// becomes resolvable again on its own once the operator clicks Allow.
+#[cfg(any(target_os = "macos", test))]
+const PROTECTED_PROBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Monotonic "do not probe before" deadline in milliseconds since process start.
+#[cfg(any(target_os = "macos", test))]
+static PROTECTED_PROBE_RETRY_AFTER_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(target_os = "macos", test))]
+fn protected_probe_cooling_down() -> bool {
+    now_ms_since_start() < PROTECTED_PROBE_RETRY_AFTER_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn now_ms_since_start() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+// Test-only count of real-path probes started by the calling thread. It exists
+// so a test can prove that a lexically protected path is decided without any
+// filesystem resolution at all.
+#[cfg(test)]
+thread_local! {
+    static REAL_PATH_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `probe` on a worker thread and give up after `budget`.
+///
+/// The worker is detached on timeout: a consent-blocked syscall has no
+/// cancellation path, so waiting for it would defeat the bound.
+#[cfg(any(target_os = "macos", test))]
+fn run_probe_bounded<T: Send + 'static>(
+    budget: std::time::Duration,
+    probe: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("herdr-tcc-probe".to_owned())
+        .spawn(move || {
+            let _ = sender.send(probe());
+        })
+        .ok()?;
+    receiver.recv_timeout(budget).ok()
+}
+
 /// Whether commands started from a project root need a TCC-authorized
 /// transport because either the checkout itself or a linked worktree's Git
 /// metadata lives under Documents/Desktop/Downloads.
@@ -95,33 +238,56 @@ pub(crate) fn project_path_needs_protected_transport(path: &Path) -> bool {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn is_protected_user_path_for_home(path: &Path, home: &Path) -> bool {
-    let protected_roots = ["Documents", "Desktop", "Downloads"]
-        .into_iter()
-        .map(|name| home.join(name))
-        .collect::<Vec<_>>();
-
-    if protected_roots
+pub(crate) fn is_protected_user_path_lexical_for_home(path: &Path, home: &Path) -> bool {
+    protected_root_spellings(home)
         .iter()
         .any(|protected| path.starts_with(protected))
-    {
+}
+
+/// Every spelling of the three privacy-protected folders: the `$HOME` spelling
+/// and the `/System/Volumes/Data` firmlink spelling that names the same object
+/// on the macOS Data volume. Pure lexical by construction.
+#[cfg(any(target_os = "macos", test))]
+fn protected_root_spellings(home: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(6);
+    let firmlink_home = home
+        .strip_prefix("/")
+        .ok()
+        .map(|rest| Path::new("/System/Volumes/Data").join(rest));
+    for name in ["Documents", "Desktop", "Downloads"] {
+        roots.push(home.join(name));
+        if let Some(firmlink_home) = firmlink_home.as_ref() {
+            roots.push(firmlink_home.join(name));
+        }
+    }
+    roots
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_protected_user_path_for_home(path: &Path, home: &Path) -> bool {
+    // Decision by pure path comparison first. This is the branch that nearly
+    // every runtime path takes, and it cannot block on a consent prompt.
+    if is_protected_user_path_lexical_for_home(path, home) {
         return true;
     }
 
     // A lexical path outside the protected folders may still traverse a
     // symlink whose real target is inside Documents/Desktop/Downloads. Route
     // by the real path before choosing native execution so the rotating Rust
-    // runtime never accidentally becomes the TCC client. If realpath cannot
-    // be established, fail closed to the protected-path transport; managed
-    // project roots are expected to exist, and a false native classification
-    // is the unsafe outcome here.
-    let resolved_path = match std::fs::canonicalize(path) {
-        Ok(path) => path,
-        Err(_) => return true,
+    // runtime never accidentally becomes the TCC client. The resolution is
+    // bounded: a path macOS has to authorize must never park the caller for
+    // the duration of a prompt. Anything unresolved or slow fails closed to
+    // the protected-path transport, because a false native classification is
+    // the unsafe outcome here.
+    let resolved_path = match bounded_real_path(path) {
+        BoundedRealPath::Resolved(path) => path,
+        BoundedRealPath::TimedOut | BoundedRealPath::NotFound => return true,
     };
-    protected_roots.iter().any(|protected| {
-        let resolved_protected =
-            std::fs::canonicalize(protected).unwrap_or_else(|_| protected.clone());
+    protected_root_spellings(home).into_iter().any(|protected| {
+        let resolved_protected = match bounded_real_path(&protected) {
+            BoundedRealPath::Resolved(path) => path,
+            BoundedRealPath::TimedOut | BoundedRealPath::NotFound => protected,
+        };
         resolved_path.starts_with(resolved_protected)
     })
 }
@@ -791,6 +957,27 @@ fn tcc_blocked_value(path: &Path, message: String) -> Value {
     })
 }
 
+/// A gate result for a protected path whose bounded probe gave up because the
+/// macOS consent prompt is still pending.
+///
+/// This is a fail-closed answer, not a failure of the machine: the same request
+/// succeeds once the operator answers the prompt (or once the stable broker
+/// serves it), and every other feature keeps working in the meantime.
+pub(crate) fn tcc_probe_pending_value(path: &Path) -> Value {
+    #[cfg(any(target_os = "macos", test))]
+    let hint = HINT_TIMEOUT;
+    #[cfg(not(any(target_os = "macos", test)))]
+    let hint = HINT_UNKNOWN;
+    json!({
+        "ok": false,
+        "code": "macos_tcc_access_blocked",
+        "reason": "macos_tcc_access_blocked",
+        "path": path.to_string_lossy(),
+        "message": "protected-path probe timed out while the macOS consent prompt is pending",
+        "hint": hint,
+    })
+}
+
 fn broker_update_available(config_dir: &Path) -> bool {
     tcc_broker::upgrade_status(config_dir).update_available
 }
@@ -998,6 +1185,115 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn protected_path_detection_is_lexical_for_home_and_firmlink_spellings() {
+        let home = Path::new("/Users/example");
+        for protected in [
+            "/Users/example/Documents/project",
+            "/Users/example/Desktop/report.md",
+            "/Users/example/Downloads/artifact.zip",
+            "/System/Volumes/Data/Users/example/Documents/project",
+            "/System/Volumes/Data/Users/example/Desktop/report.md",
+            "/System/Volumes/Data/Users/example/Downloads/artifact.zip",
+        ] {
+            assert!(
+                is_protected_user_path_lexical_for_home(Path::new(protected), home),
+                "{protected} must be classified without touching the filesystem"
+            );
+        }
+        for ordinary in [
+            "/Users/example",
+            "/Users/example/code/project",
+            "/Users/example/Documents2/project",
+            "/Users/other/Documents/project",
+            "/System/Volumes/Data/Users/example/code/project",
+        ] {
+            assert!(
+                !is_protected_user_path_lexical_for_home(Path::new(ordinary), home),
+                "{ordinary}"
+            );
+        }
+    }
+
+    /// Given a lexically protected path
+    /// When the transport for it is decided
+    /// Then the decision is made without any filesystem resolution, because a
+    /// pending consent prompt would otherwise park the caller inside it.
+    #[test]
+    fn protected_path_decision_never_resolves_a_real_path() {
+        let home = Path::new("/Users/example");
+        REAL_PATH_PROBES.with(|count| count.set(0));
+        assert!(is_protected_user_path_for_home(
+            Path::new("/Users/example/Documents/project"),
+            home
+        ));
+        assert_eq!(
+            REAL_PATH_PROBES.with(|count| count.get()),
+            0,
+            "a lexically protected path must not be probed at all"
+        );
+    }
+
+    /// Given a probe that cannot finish because macOS is waiting for the user
+    /// When the bounded probe runs
+    /// Then the caller gives up on its own budget instead of waiting for it.
+    #[test]
+    fn bounded_probe_returns_without_waiting_for_a_parked_syscall() {
+        let started = std::time::Instant::now();
+        let parked = run_probe_bounded(std::time::Duration::from_millis(20), || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            7_u8
+        });
+        assert_eq!(parked, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "the caller must not wait for the parked worker"
+        );
+        // A probe that finishes inside the budget still returns its value.
+        assert_eq!(
+            run_probe_bounded(std::time::Duration::from_millis(500), || 7_u8),
+            Some(7)
+        );
+    }
+
+    /// Given the stable broker child that owns macOS protected-folder access
+    /// When the runtime decides whether it may probe directly
+    /// Then only the broker may probe; every rotating runtime generation may not.
+    #[test]
+    fn only_the_stable_broker_may_probe_a_protected_folder() {
+        let _guard = crate::test_env::lock();
+        let previous_home = std::env::var_os("HOME");
+        let previous_child = std::env::var_os("HERDR_MCP_TCC_BROKER_CHILD");
+        unsafe {
+            std::env::set_var("HOME", "/Users/example");
+            std::env::remove_var("HERDR_MCP_TCC_BROKER_CHILD");
+        }
+        let protected = Path::new("/Users/example/Documents/project");
+        assert!(runtime_must_not_probe(protected));
+        assert!(!runtime_must_not_probe(Path::new(
+            "/Users/example/code/project"
+        )));
+
+        unsafe {
+            std::env::set_var("HERDR_MCP_TCC_BROKER_CHILD", "1");
+        }
+        assert!(
+            !runtime_must_not_probe(protected),
+            "the stable broker is the authorized client"
+        );
+
+        unsafe {
+            match previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match previous_child {
+                Some(value) => std::env::set_var("HERDR_MCP_TCC_BROKER_CHILD", value),
+                None => std::env::remove_var("HERDR_MCP_TCC_BROKER_CHILD"),
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]

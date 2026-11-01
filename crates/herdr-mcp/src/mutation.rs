@@ -132,9 +132,22 @@ fn check_with_policy_and_topology(
     }
 
     if !policy.write_roots.is_empty() {
-        let root_real = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        // A protected root is compared lexically: resolving it in-process would
+        // make the security gate the macOS TCC client and could park this
+        // request on a consent prompt. The whitelist is operator-supplied
+        // configuration, so a lexical containment check is the right precision
+        // here and it never widens the root set.
+        let root_real = if crate::macos_permissions::runtime_must_not_probe(root) {
+            root.to_path_buf()
+        } else {
+            fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+        };
         let allowed = policy.write_roots.iter().any(|base| {
-            let base_real = fs::canonicalize(base).unwrap_or_else(|_| base.clone());
+            let base_real = if crate::macos_permissions::runtime_must_not_probe(base) {
+                base.clone()
+            } else {
+                fs::canonicalize(base).unwrap_or_else(|_| base.clone())
+            };
             fs_security::path_within(&base_real, &root_real)
         });
         if !allowed {

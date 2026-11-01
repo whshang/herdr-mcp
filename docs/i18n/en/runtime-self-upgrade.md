@@ -342,6 +342,56 @@ Keeping them separate reduces the blast radius of releases.
 - inspect real Git/Agent/service state before and after rollback;
 - contract migration and domain mutation are not normal self-update operations.
 
+## After the upgrade: macOS prompt and legacy Worker messages
+
+Two things operators meet on the first update to 1.1, and after every update.
+
+**The one-time macOS Documents prompt.** Every runtime update installs a new
+generation binary under `runtime/generations/rust-<sha256>/`. An unsigned binary
+is a new macOS privacy (TCC) identity, so the first `~/Documents`, `~/Desktop` or
+`~/Downloads` access of the new generation asks for permission once:
+
+```text
+"herdr-mcp" would like to access files in your Documents folder.
+```
+
+Click **Allow**. Nothing else is needed, and the grant holds for that generation.
+The updated runtime is not itself the TCC client: protected reads, writes, Git
+metadata and commands go through the stable broker (`HERDR_MCP_TCC_BROKER=1`) or
+through the Herdr pane that already owns the folder, and implicit probes of a
+protected folder are skipped entirely. A probe that does reach the prompt is
+bounded, so one feature returns `macos_tcc_access_blocked` instead of stalling
+the whole control path. Answer the prompt and retry; `herdr-mcp doctor` reports
+the resulting state. The update result also carries a
+`macos_documents_tcc_prompt` notice, so an unattended update is not mistaken for
+a control-plane failure.
+
+**`ok: false` from an updater at or before `v1.1.0-rc.8`.** That updater chained
+the separate fleet Worker release into the runtime result, so a Worker
+credential or reconciliation problem ended the upgrade with `ok: false` and
+`update_succeeded_worker_update_required` — even though the runtime update
+committed and its health gate passed. That is expected and it is not a failed
+upgrade. Confirm the runtime first:
+
+```bash
+herdr-mcp --version
+herdr-mcp update status
+herdr-mcp doctor
+```
+
+`update status` classifies the recorded runtime job as `runtime_outcome`, so a
+succeeded runtime is reported as a success even when the recorded detail still
+carries the legacy Worker text. Updating the fleet Worker is a separate,
+explicit operator step:
+
+```bash
+herdr-mcp worker update
+```
+
+From `v1.1.0-rc.9` onward `update apply` is runtime-only: Worker drift is a
+non-fatal `worker_update_required` notice with `next_action:
+herdr-mcp worker update`, and the top-level result reports `ok: true`.
+
 ## Acceptance criteria
 
 A successful A/B upgrade proves:

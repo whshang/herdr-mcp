@@ -113,6 +113,13 @@ fn root_kind_of(project: &projects::ProjectInfo) -> Option<(PathBuf, RootKind)> 
 /// Rejected: HOME itself or any ancestor of HOME, any unproven sibling, a
 /// secret-like path, and a symlink escape (the canonical real path must still
 /// be a directory that is not HOME or an ancestor of HOME).
+///
+/// A root under macOS Documents/Desktop/Downloads is never probed in-process:
+/// a pending consent prompt blocks the probing thread inside the syscall for as
+/// long as the prompt stays unanswered, and this function runs on the routing
+/// path of nearly every request. The protected case is therefore decided from
+/// live topology metadata plus the exact-cwd proof, exactly like the
+/// pre-existing TCC-delegated case.
 fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path>) -> bool {
     if project.vcs.is_some() || project.cwds.is_empty() {
         return false;
@@ -124,48 +131,117 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
     };
     let guard = HomeGuard::new(home);
     let root = &project.root;
-    if !root.is_absolute() || guard.rejects(root) || denied_secret_path(root) {
+    if !root.is_absolute() || denied_secret_path(root) || guard.rejects_lexical(root) {
+        return false;
+    }
+    // Decide the TCC delegation from the raw lexical root BEFORE any probe.
+    // This is a pure path comparison, so it cannot itself become a protected
+    // filesystem touch.
+    let delegated = crate::macos_permissions::is_protected_user_path_lexical_for_home(root, home);
+    if !delegated && guard.rejects_by_identity(root) {
         return false;
     }
     // "canonical existing directory": the live cwd must resolve to a real
     // directory, and that real directory must itself survive the HOME-ancestry
     // and secret-path guards, so a symlinked cwd cannot escape them.
-    let root_real = match std::fs::canonicalize(root) {
-        Ok(real) => {
-            if !real.is_dir() || guard.rejects(&real) || denied_secret_path(&real) {
-                return false;
+    //
+    // The rotating runtime is deliberately not the macOS TCC client, so
+    // Documents/Desktop/Downloads existence, symlink resolution, and real
+    // paths are verified by the stable broker (`herdr_fs_*`) or the delegated
+    // utility pane (`herdr_exec`) instead — the same route the pre-existing
+    // protected-root command preflight already uses.
+    let root_real = if delegated {
+        None
+    } else {
+        match std::fs::canonicalize(root) {
+            Ok(real) => {
+                if !real.is_dir() || guard.rejects(&real) || denied_secret_path(&real) {
+                    return false;
+                }
+                Some(real)
             }
-            Some(real)
+            Err(_) => return false,
         }
-        // The rotating runtime is deliberately not the macOS TCC client, so
-        // Documents/Desktop/Downloads existence, symlink resolution, and real
-        // paths are verified by the stable broker (`herdr_fs_*`) or the
-        // delegated utility pane (`herdr_exec`) instead — the same route the
-        // pre-existing protected-root command preflight already uses. Every
-        // other unresolvable path is refused.
-        Err(_) if tcc_delegated_root(home, root) => None,
-        Err(_) => return false,
     };
     // Exactly proven by live cwd: every cwd attached to this project resolves
     // to this root's real directory (or, when the real path is delegated to
     // TCC, must be this exact cwd). A sibling outside the group therefore
-    // cannot borrow this root's authority.
+    // cannot borrow this root's authority. Neither branch probes a protected
+    // folder: `direct_canonicalize` returns `None` for those by design.
     project
         .cwds
         .iter()
-        .all(|cwd| match (&root_real, std::fs::canonicalize(cwd)) {
-            (Some(root_real), Ok(cwd_real)) => &cwd_real == root_real,
+        .all(|cwd| match (&root_real, direct_canonicalize(cwd)) {
+            (Some(root_real), Some(cwd_real)) => &cwd_real == root_real,
             _ => cwd == root,
         })
 }
 
-/// macOS Documents/Desktop/Downloads roots are executed/read through the TCC
-/// broker or utility pane, which can verify what this runtime cannot.
-fn tcc_delegated_root(home: &Path, candidate: &Path) -> bool {
-    cfg!(target_os = "macos")
-        && ["Documents", "Desktop", "Downloads"]
-            .iter()
-            .any(|name| candidate.starts_with(home.join(name)))
+/// Resolve a real path in-process, except for a macOS privacy-protected folder.
+///
+/// The rotating runtime must never become the TCC client for
+/// Documents/Desktop/Downloads: the first access can park the calling thread
+/// inside a consent prompt. `None` means "not resolvable here" — callers fall
+/// back to lexical/metadata proof and let the stable broker verify existence.
+fn direct_canonicalize(path: &Path) -> Option<PathBuf> {
+    if crate::macos_permissions::runtime_must_not_probe(path) {
+        return None;
+    }
+    std::fs::canonicalize(path).ok()
+}
+
+/// Resolve the real path a read/write gate needs, without letting a pending
+/// macOS consent prompt park the request until an operator answers it.
+///
+/// A protected path is resolved on a bounded worker thread and a pending prompt
+/// degrades to `macos_tcc_access_blocked` for this one request. Every other
+/// request keeps running, and the same call succeeds after Allow (or through
+/// the stable broker, which is the authorized client in the default service
+/// configuration).
+fn resolve_gate_real_path(path: &Path, fallback_reason: &str) -> Result<PathBuf, Value> {
+    if !crate::macos_permissions::runtime_must_not_probe(path) {
+        return std::fs::canonicalize(path).map_err(|error| {
+            crate::macos_permissions::io_error_to_fs_value(fallback_reason, path, error)
+        });
+    }
+    match crate::macos_permissions::bounded_real_path(path) {
+        crate::macos_permissions::BoundedRealPath::Resolved(real) => Ok(real),
+        crate::macos_permissions::BoundedRealPath::NotFound => {
+            Err(crate::macos_permissions::io_error_to_fs_value(
+                fallback_reason,
+                path,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ))
+        }
+        crate::macos_permissions::BoundedRealPath::TimedOut => {
+            Err(crate::macos_permissions::tcc_probe_pending_value(path))
+        }
+    }
+}
+
+/// Resolve `path` when it already exists, without blocking on a pending macOS
+/// consent prompt. `Ok(None)` means "does not exist (yet)".
+///
+/// Existence is part of the same consent-gated access as a real-path
+/// resolution, so it must never be decided by a direct `stat` on a protected
+/// folder.
+fn resolve_existing_gate_path(
+    path: &Path,
+    fallback_reason: &str,
+) -> Result<Option<PathBuf>, Value> {
+    if !crate::macos_permissions::runtime_must_not_probe(path) {
+        if !path.exists() {
+            return Ok(None);
+        }
+        return resolve_gate_real_path(path, fallback_reason).map(Some);
+    }
+    match crate::macos_permissions::bounded_real_path(path) {
+        crate::macos_permissions::BoundedRealPath::Resolved(real) => Ok(Some(real)),
+        crate::macos_permissions::BoundedRealPath::NotFound => Ok(None),
+        crate::macos_permissions::BoundedRealPath::TimedOut => {
+            Err(crate::macos_permissions::tcc_probe_pending_value(path))
+        }
+    }
 }
 
 /// Stable filesystem identity of an existing path: `(device, inode)` on Unix.
@@ -238,20 +314,38 @@ impl HomeGuard {
     }
 
     fn rejects(&self, candidate: &Path) -> bool {
+        self.rejects_lexical(candidate) || self.rejects_by_identity(candidate)
+    }
+
+    /// The pure lexical half of [`Self::rejects`]: HOME itself or any ancestor
+    /// of HOME under either spelling. Never performs a syscall.
+    fn rejects_lexical(&self, candidate: &Path) -> bool {
         let mut candidates = vec![candidate.to_path_buf()];
         if let Some(primary) = firmlink_primary_spelling(candidate) {
             candidates.push(primary);
         }
-        for candidate in &candidates {
-            if self
-                .spellings
+        candidates.iter().any(|candidate| {
+            self.spellings
                 .iter()
                 .any(|home| home == candidate || home.starts_with(candidate))
-            {
-                return true;
-            }
+        })
+    }
+
+    /// The syscall half of [`Self::rejects`]: stable identity against HOME and
+    /// its ancestors, which catches symlinked and firmlink aliases that the
+    /// lexical check cannot see.
+    ///
+    /// Merge with [`Self::rejects_lexical`] for the full guard. Callers that may
+    /// hand it a macOS privacy-protected path skip this half, because resolving
+    /// that path is what blocks on a consent prompt.
+    fn rejects_by_identity(&self, candidate: &Path) -> bool {
+        let mut candidates = vec![candidate.to_path_buf()];
+        if let Some(primary) = firmlink_primary_spelling(candidate) {
+            candidates.push(primary);
         }
-        path_identity(candidate).is_some_and(|identity| self.identities.contains(&identity))
+        candidates.iter().any(|candidate| {
+            path_identity(candidate).is_some_and(|identity| self.identities.contains(&identity))
+        })
     }
 }
 
@@ -470,10 +564,8 @@ fn validate_existing_with_roots(roots: &[PathBuf], input: &str) -> Result<Manage
             "path": resolved.to_string_lossy(),
         }));
     }
-    let real = std::fs::canonicalize(&resolved).map_err(|error| {
-        crate::macos_permissions::io_error_to_fs_value("not_found", &resolved, error)
-    })?;
-    let root_real = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    let real = resolve_gate_real_path(&resolved, "not_found")?;
+    let root_real = direct_canonicalize(&root).unwrap_or_else(|| root.clone());
     if !path_within(&root_real, &real) {
         return Err(json!({
             "ok": false,
@@ -531,35 +623,32 @@ fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedP
             json!({"ok": false, "reason": "secret_path_denied", "path": resolved.to_string_lossy()}),
         );
     }
-    let root_real = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-    let real = if resolved.exists() {
-        std::fs::canonicalize(&resolved).map_err(|error| {
-            crate::macos_permissions::io_error_to_fs_value("target_unresolvable", &resolved, error)
-        })?
-    } else {
-        let parent = resolved.parent().ok_or_else(|| {
-            json!({
-                "ok": false,
-                "reason": "parent_not_found",
-                "path": resolved.to_string_lossy(),
-            })
-        })?;
-        let parent_real = std::fs::canonicalize(parent).map_err(|error| {
-            crate::macos_permissions::io_error_to_fs_value("parent_not_found", &resolved, error)
-        })?;
-        if !parent_real.is_dir() {
-            return Err(
-                json!({"ok": false, "reason": "parent_not_directory", "path": resolved.to_string_lossy()}),
-            );
+    let root_real = direct_canonicalize(&root).unwrap_or_else(|| root.clone());
+    let real = match resolve_existing_gate_path(&resolved, "target_unresolvable")? {
+        Some(real) => real,
+        None => {
+            let parent = resolved.parent().ok_or_else(|| {
+                json!({
+                    "ok": false,
+                    "reason": "parent_not_found",
+                    "path": resolved.to_string_lossy(),
+                })
+            })?;
+            let parent_real = resolve_gate_real_path(parent, "parent_not_found")?;
+            if !parent_real.is_dir() {
+                return Err(
+                    json!({"ok": false, "reason": "parent_not_directory", "path": resolved.to_string_lossy()}),
+                );
+            }
+            let name = resolved.file_name().ok_or_else(|| {
+                json!({
+                    "ok": false,
+                    "reason": "invalid_target",
+                    "path": resolved.to_string_lossy(),
+                })
+            })?;
+            parent_real.join(name)
         }
-        let name = resolved.file_name().ok_or_else(|| {
-            json!({
-                "ok": false,
-                "reason": "invalid_target",
-                "path": resolved.to_string_lossy(),
-            })
-        })?;
-        parent_real.join(name)
     };
     if !path_within(&root_real, &real) {
         return Err(json!({

@@ -387,6 +387,50 @@ herdr-link / active runtime generation
 - 回滚 runtime 前后都重新观察 Git / Agent / 服务真实状态；
 - contract migration、Edge deployment、Domain/DNS mutation 不混成一次普通 self-update。
 
+## 升级之后：macOS 弹窗与旧版 Worker 信息
+
+首次升级到 1.1 以及之后每次升级，操作员都会遇到两件事。
+
+**一次性的 macOS “文稿” 授权弹窗。** 每次 runtime 更新都会在
+`runtime/generations/rust-<sha256>/` 下安装新一代二进制。未签名的二进制在
+macOS 上是一个新的隐私（TCC）身份，因此新一代第一次访问 `~/Documents`、
+`~/Desktop` 或 `~/Downloads` 时会询问一次权限：
+
+```text
+"herdr-mcp" would like to access files in your Documents folder.
+```
+
+点击 **Allow** 即可，不需要其他操作，该授权对这一代二进制持续有效。更新后的
+runtime 本身不是 TCC 客户端：受保护的读、写、Git 元数据与命令都经过稳定的
+broker（`HERDR_MCP_TCC_BROKER=1`）或已经拥有该目录权限的 Herdr pane，对受保护
+目录的隐式探测会被完整跳过。真正触达弹窗的那次探测是有界的，因此只会让某一个
+功能返回 `macos_tcc_access_blocked`，不会把整条控制链路卡住。回答弹窗后重试即可，
+`herdr-mcp doctor` 会报告最终状态。更新结果里还会带一条
+`macos_documents_tcc_prompt` 提示，避免无人值守的升级被误判为控制面故障。
+
+**`v1.1.0-rc.8` 及更早的 updater 会报 `ok: false`。** 那些 updater 把独立的
+fleet Worker 发布串联进了 runtime 结果，所以只要 Worker 凭据或 reconcile 出问题，
+升级就会以 `ok: false` 和 `update_succeeded_worker_update_required` 结束——即使
+runtime 更新已提交且健康门禁已通过。这是预期行为，不是升级失败。请先确认 runtime：
+
+```bash
+herdr-mcp --version
+herdr-mcp update status
+herdr-mcp doctor
+```
+
+`update status` 用 `runtime_outcome` 归类已记录的 runtime 作业，因此即使记录的
+detail 仍带着旧版 Worker 文本，成功的 runtime 也会被报告为成功。更新 fleet Worker
+是独立的、显式的操作员步骤：
+
+```bash
+herdr-mcp worker update
+```
+
+从 `v1.1.0-rc.9` 起 `update apply` 只更新 runtime：Worker 落后只是一条非致命的
+`worker_update_required` 提示，带 `next_action: herdr-mcp worker update`，顶层结果仍为
+`ok: true`。
+
 ## 验收标准
 
 一次成功 A/B 升级至少证明：
