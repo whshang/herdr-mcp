@@ -5070,9 +5070,36 @@ fn browser_session_create_reconcile_uncertain_inner(
     }
     let (app_refusal_reason, app_selection_probe) =
         browser_session_create_app_refusal_fields(delivery_state, &evidence);
+    // A refused create must name its fixed extension reason; without it a
+    // composer/readiness refusal is indistinguishable from an unknown failure.
+    // A rejection found by reconciliation reports the same shape as the first
+    // attempt, so a caller reading `delivery_evidence.error` is never left with
+    // an empty object.
+    let failure = BrowserCreateFailureProjection::project(
+        delivery_state,
+        &evidence,
+        app_refusal_reason.as_deref(),
+        None,
+    );
+    if delivery_state == BrowserDeliveryState::Rejected
+        && let Some(reason) = failure.reason.as_deref()
+    {
+        eprintln!(
+            "browser session.create rejected: reason={reason} reservation={}",
+            settled.reservation_ref
+        );
+    }
+    let delivery_evidence = browser_session_create_public_delivery_evidence(
+        evidence.result.as_ref(),
+        failure.evidence_error.as_deref(),
+        app_selection_probe.as_ref(),
+        failure.composer_busy_probe.as_ref(),
+        failure.hint,
+    );
     let mut value = json!({
         "ok": false,
         "code": delivery_state.as_str(),
+        "reason": failure.reason,
         "reservation_ref": settled.reservation_ref,
         "reservation_state": settled.state,
         "delivery_state": settled.delivery_state,
@@ -5080,9 +5107,169 @@ fn browser_session_create_reconcile_uncertain_inner(
         "app_selection_probe": app_selection_probe,
         "replayed": replayed,
         "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
+        "delivery_evidence": delivery_evidence,
     });
+    if let Some(probe) = failure.composer_busy_probe {
+        value["composer_busy_probe"] = probe;
+    }
+    if let Some(hint) = failure.hint {
+        value["hint"] = json!(hint);
+    }
     browser_session_apply_classification_reason(&mut value, classification_reason);
     value
+}
+
+/// Fixed vocabulary of extension rejection codes for `browser_session.create`.
+/// The extension observes untrusted provider state and can report arbitrary
+/// strings, so only these machine codes cross the runtime boundary. An
+/// unrecognized string is dropped, never echoed.
+///
+/// Membership does not imply the code is reachable on today's emission shape.
+/// `browser_create_content_dispatch_failed` and
+/// `browser_create_dispatch_setup_failed` are posted from the background with
+/// `rejected: false` + `command_accepted: true`, so they classify as uncertain
+/// (missing stable resource ref) and never reach this rejection projection;
+/// they are listed so a rejected emission of the same code is already covered.
+/// `browser_operation_unavailable` is emitted for operations other than
+/// `session.create` / `dispatch.submit`; it is listed because a create content
+/// script can still report it. Uncertain classification is deliberately
+/// unchanged — this list only decides how an already-rejected create is named.
+const BROWSER_CREATE_REJECTION_REASONS: &[&str] = &[
+    "browser_create_composer_unavailable",
+    "browser_create_composer_busy",
+    "browser_create_params_invalid",
+    "browser_create_submit_failed",
+    "browser_adapter_not_ready",
+    "chat_mode_ambiguous",
+    "chat_mode_switch_failed",
+    "chat_mode_switch_timeout",
+    "browser_operation_unavailable",
+    "browser_actuation_protocol_mismatch",
+    "browser_create_content_reason_missing",
+    "browser_create_content_response_missing",
+    "browser_create_content_dispatch_failed",
+    "browser_create_dispatch_setup_failed",
+];
+
+/// Actionable hint attached to a busy composer rejection. Fixed strings only:
+/// the probe booleans select between them, their contents are never quoted.
+const BROWSER_CREATE_COMPOSER_BUSY_HINT_DRAFT: &str =
+    "composer has existing content (possibly a restored ChatGPT draft); clear it and retry";
+const BROWSER_CREATE_COMPOSER_BUSY_HINT_GENERIC: &str =
+    "composer is busy; wait until it is idle and retry";
+
+/// The rejected-create reason after the fixed allowlist, if any.
+fn browser_create_rejection_reason(
+    evidence: &BrowserPostconditionEvidence,
+) -> Option<&'static str> {
+    let reason = evidence
+        .result
+        .as_ref()
+        .and_then(|result| result.get("error"))
+        .and_then(Value::as_str)?;
+    BROWSER_CREATE_REJECTION_REASONS
+        .iter()
+        .copied()
+        .find(|known| *known == reason)
+}
+
+/// Composer busy probe for a create rejection, reduced to the busy/idle
+/// booleans and small counts the create surface promises. Provider strings
+/// (including `busy_reason` free text) never cross this boundary.
+fn browser_session_create_composer_busy_probe(
+    evidence: &BrowserPostconditionEvidence,
+) -> Option<Value> {
+    const KEYS: &[&str] = &[
+        "input_mounted",
+        "input_has_content",
+        "input_text_length",
+        "input_text_equals_placeholder",
+        "input_has_placeholder_node",
+        "app_pill_count",
+        "stop_control",
+        "assistant_streaming",
+        "assistant_tools_in_progress",
+        "stop_candidate_raw_count",
+        "busy_reason",
+    ];
+    // `browser_composer_busy_probe` already allowlists types, caps counts and
+    // closes the `busy_reason` enum; this narrows it to the create vocabulary.
+    let probe = browser_composer_busy_probe(evidence);
+    let object = probe.as_object()?;
+    let mut out = serde_json::Map::new();
+    for key in KEYS {
+        if let Some(value) = object.get(*key) {
+            out.insert((*key).to_owned(), value.clone());
+        }
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
+}
+
+fn browser_create_composer_busy_hint(probe: Option<&Value>) -> &'static str {
+    let flag = |key: &str| {
+        probe
+            .and_then(|probe| probe.get(key))
+            .and_then(Value::as_bool)
+            == Some(true)
+    };
+    if flag("input_has_content")
+        && !flag("stop_control")
+        && !flag("assistant_streaming")
+        && !flag("assistant_tools_in_progress")
+    {
+        BROWSER_CREATE_COMPOSER_BUSY_HINT_DRAFT
+    } else {
+        BROWSER_CREATE_COMPOSER_BUSY_HINT_GENERIC
+    }
+}
+
+/// How a refused `browser_session.create` names its failure.
+struct BrowserCreateFailureProjection {
+    /// Top-level `reason`. The bounded resource-unavailable reason keeps its
+    /// existing precedence, then the fixed App-refusal and rejection codes.
+    reason: Option<String>,
+    /// `delivery_evidence.error`: fixed vocabularies only.
+    evidence_error: Option<String>,
+    composer_busy_probe: Option<Value>,
+    hint: Option<&'static str>,
+}
+
+impl BrowserCreateFailureProjection {
+    fn project(
+        delivery_state: BrowserDeliveryState,
+        evidence: &BrowserPostconditionEvidence,
+        app_refusal_reason: Option<&str>,
+        resource_unavailable_reason: Option<&str>,
+    ) -> Self {
+        let rejection_reason = browser_create_rejection_reason(evidence);
+        let reason = resource_unavailable_reason
+            .map(str::to_owned)
+            .or_else(|| match delivery_state {
+                BrowserDeliveryState::Rejected => app_refusal_reason.map(str::to_owned),
+                _ => None,
+            })
+            .or_else(|| rejection_reason.map(str::to_owned));
+        // Never copy the generic resource-unavailable reason into the public
+        // evidence: only the fixed App-refusal tokens and the rejection
+        // allowlist are stable enough to publish there.
+        let evidence_error = app_refusal_reason
+            .map(str::to_owned)
+            .or_else(|| rejection_reason.map(str::to_owned));
+        let busy_composer = evidence_error.as_deref() == Some("browser_create_composer_busy");
+        let composer_busy_probe = if busy_composer {
+            browser_session_create_composer_busy_probe(evidence)
+        } else {
+            None
+        };
+        let hint =
+            busy_composer.then(|| browser_create_composer_busy_hint(composer_busy_probe.as_ref()));
+        Self {
+            reason,
+            evidence_error,
+            composer_busy_probe,
+            hint,
+        }
+    }
 }
 
 fn browser_session_create_app_refusal_fields(
@@ -5155,8 +5342,10 @@ fn browser_session_create_app_refusal_fields(
 
 fn browser_session_create_public_delivery_evidence(
     result: Option<&Value>,
-    app_refusal_reason: Option<&str>,
+    error_reason: Option<&str>,
     app_selection_probe: Option<&Value>,
+    composer_busy_probe: Option<&Value>,
+    hint: Option<&str>,
 ) -> Value {
     // The extension observes untrusted provider content. Never echo arbitrary
     // objects, page text, account profile JSON, cookies or token-shaped data.
@@ -5262,11 +5451,17 @@ fn browser_session_create_public_delivery_evidence(
             }
         }
     }
-    if let Some(reason) = app_refusal_reason {
+    if let Some(reason) = error_reason {
         public.insert("error".to_owned(), Value::String(reason.to_owned()));
     }
     if let Some(probe) = app_selection_probe {
         public.insert("app_selection_probe".to_owned(), probe.clone());
+    }
+    if let Some(probe) = composer_busy_probe {
+        public.insert("composer_busy_probe".to_owned(), probe.clone());
+    }
+    if let Some(hint) = hint {
+        public.insert("hint".to_owned(), Value::String(hint.to_owned()));
     }
     Value::Object(public)
 }
@@ -6216,15 +6411,31 @@ fn browser_session_create(
     }
     let (app_refusal_reason, app_selection_probe) =
         browser_session_create_app_refusal_fields(delivery_state, &evidence);
+    let failure = BrowserCreateFailureProjection::project(
+        delivery_state,
+        &evidence,
+        app_refusal_reason.as_deref(),
+        unavailable_reason.as_deref(),
+    );
+    if delivery_state == BrowserDeliveryState::Rejected
+        && let Some(reason) = failure.reason.as_deref()
+    {
+        eprintln!(
+            "browser session.create rejected: reason={reason} reservation={}",
+            updated.reservation_ref
+        );
+    }
     let delivery_evidence = browser_session_create_public_delivery_evidence(
         evidence.result.as_ref(),
-        app_refusal_reason.as_deref(),
+        failure.evidence_error.as_deref(),
         app_selection_probe.as_ref(),
+        failure.composer_busy_probe.as_ref(),
+        failure.hint,
     );
-    json!({
+    let mut response = json!({
         "ok": false,
         "code": unavailable_reason.as_deref().unwrap_or_else(|| observed_delivery_state.as_str()),
-        "reason": unavailable_reason,
+        "reason": failure.reason,
         "operation": BrowserOperation::SessionCreate.method(),
         "reservation_ref": updated.reservation_ref,
         "reservation_state": updated.state,
@@ -6234,7 +6445,14 @@ fn browser_session_create(
         "app_refusal_reason": app_refusal_reason,
         "app_selection_probe": app_selection_probe,
         "delivery_evidence": delivery_evidence,
-    })
+    });
+    if let Some(probe) = failure.composer_busy_probe {
+        response["composer_busy_probe"] = probe;
+    }
+    if let Some(hint) = failure.hint {
+        response["hint"] = json!(hint);
+    }
+    response
 }
 
 fn browser_session_open(
@@ -15733,7 +15951,7 @@ mod tests {
         }
     }
 
-    fn app_activation_refusal_fixture()
+    fn browser_create_refusal_fixture()
     -> (std::sync::Arc<std::sync::Mutex<StateStore>>, String, String) {
         use crate::state_store::{
             BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
@@ -15823,7 +16041,7 @@ mod tests {
     fn webchat_create_refuses_unverified_app_activation_before_submitting() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let (store, endpoint_ref, account_ref) = app_activation_refusal_fixture();
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
         let actuator = RefusedAppActuator {
             calls: AtomicUsize::new(0),
         };
@@ -15857,7 +16075,7 @@ mod tests {
     fn browser_create_rejection_should_project_only_allowlisted_app_probe_keys() {
         use std::sync::atomic::AtomicUsize;
 
-        let (store, endpoint_ref, account_ref) = app_activation_refusal_fixture();
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
         let actuator = RefusedAppActuator {
             calls: AtomicUsize::new(0),
         };
@@ -15869,6 +16087,460 @@ mod tests {
         assert!(
             !result.to_string().contains("secret composer draft"),
             "only the allowlisted App probe keys may be projected: {result}"
+        );
+        // The App refusal keeps its own vocabulary: it is now also named as the
+        // failure reason, and it must not borrow the composer-busy hint.
+        assert_eq!(result["reason"], "required-app-not-found", "{result}");
+        assert!(result.get("hint").is_none(), "{result}");
+        assert!(
+            result.get("composer_busy_probe").is_none(),
+            "an App refusal is not a busy composer: {result}"
+        );
+    }
+
+    /// The extension's create evidence for one attempt, as a test script.
+    #[derive(Clone)]
+    struct ScriptedCreateEvidence {
+        result: Value,
+        resource_available: bool,
+        rejected: bool,
+        command_accepted: bool,
+    }
+
+    impl ScriptedCreateEvidence {
+        fn rejected(result: Value) -> Self {
+            Self {
+                result,
+                resource_available: true,
+                rejected: true,
+                command_accepted: false,
+            }
+        }
+
+        fn resource_unavailable(result: Value) -> Self {
+            Self {
+                result,
+                resource_available: false,
+                rejected: false,
+                command_accepted: false,
+            }
+        }
+
+        fn uncertain(result: Value) -> Self {
+            Self {
+                result,
+                resource_available: true,
+                rejected: false,
+                command_accepted: true,
+            }
+        }
+
+        fn into_evidence(self, expected_generation: i64) -> BrowserPostconditionEvidence {
+            let mut evidence =
+                BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+            evidence.browser_online = true;
+            evidence.resource_available = self.resource_available;
+            evidence.rejected = self.rejected;
+            evidence.command_accepted = self.command_accepted;
+            evidence.result = Some(self.result);
+            evidence
+        }
+    }
+
+    /// Stands in for the extension answering `session.create`: the actuation
+    /// evidence is scripted per call so refusal projection can be checked end
+    /// to end, and `reconcile_dispatch` scripts the polled evidence.
+    struct ScriptedCreateActuator {
+        calls: std::sync::atomic::AtomicUsize,
+        actuation: Vec<ScriptedCreateEvidence>,
+        reconcile: Option<ScriptedCreateEvidence>,
+    }
+
+    impl ScriptedCreateActuator {
+        fn new(actuation: ScriptedCreateEvidence) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                actuation: vec![actuation],
+                reconcile: None,
+            }
+        }
+
+        fn with_reconcile(mut self, evidence: ScriptedCreateEvidence) -> Self {
+            self.reconcile = Some(evidence);
+            self
+        }
+    }
+
+    impl BrowserActuator for ScriptedCreateActuator {
+        fn actuate(
+            &self,
+            _operation: &str,
+            _params: &Value,
+            expected_generation: i64,
+            _dispatch_id: Option<&str>,
+        ) -> Result<BrowserPostconditionEvidence, String> {
+            let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let scripted = self
+                .actuation
+                .get(index)
+                .or_else(|| self.actuation.last())
+                .expect("scripted create evidence")
+                .clone();
+            Ok(scripted.into_evidence(expected_generation))
+        }
+
+        fn reconcile_dispatch(
+            &self,
+            _reservation_ref: &str,
+            expected_generation: i64,
+        ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+            Ok(self
+                .reconcile
+                .clone()
+                .map(|scripted| scripted.into_evidence(expected_generation)))
+        }
+    }
+
+    fn create_session_with_scripted_actuator(
+        store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+        endpoint_ref: &str,
+        account_ref: &str,
+        actuator: &ScriptedCreateActuator,
+        idempotency_key: &str,
+    ) -> Value {
+        browser_operation_call_with_grant(
+            store,
+            "herdr_mcp.browser_session.create",
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "account_ref": account_ref,
+                "display_label": "Scripted create",
+                "message": "send the scripted message",
+                "expected_generation": 7,
+                "idempotency_key": idempotency_key,
+            }),
+            true,
+            Some(actuator),
+        )
+    }
+
+    /// user webchat create | Given a restored draft made the composer busy | When the extension refuses the create | Then the fixed code, the safe probe and an actionable hint reach the caller
+    #[test]
+    fn user_webchat_create_given_busy_composer_when_rejected_then_code_probe_and_draft_hint_are_surfaced()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::rejected(json!({
+            "error": "browser_create_composer_busy",
+            "message_submitted": false,
+            "retry_safe": true,
+            "composer_busy_probe": {
+                "input_mounted": true,
+                "input_has_content": true,
+                "input_text_length": 42,
+                "input_text_equals_placeholder": false,
+                "input_has_placeholder_node": true,
+                "app_pill_count": 0,
+                "stop_control": false,
+                "assistant_streaming": false,
+                "assistant_tools_in_progress": false,
+                "stop_candidate_raw_count": 0,
+            }
+        })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-busy-1",
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "rejected", "{result}");
+        assert_eq!(result["delivery_state"], "rejected", "{result}");
+        assert_eq!(
+            result["reason"], "browser_create_composer_busy",
+            "the extension's fixed code is the diagnosis: {result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["error"], "browser_create_composer_busy",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["hint"],
+            "composer has existing content (possibly a restored ChatGPT draft); clear it and retry",
+            "{result}"
+        );
+        assert_eq!(
+            result["hint"], result["delivery_evidence"]["hint"],
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"]["input_has_content"], true,
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"]["input_mounted"], true,
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"]["stop_control"], false,
+            "{result}"
+        );
+        assert_eq!(
+            result["composer_busy_probe"], result["delivery_evidence"]["composer_busy_probe"],
+            "{result}"
+        );
+        assert!(
+            result["app_refusal_reason"].is_null(),
+            "a busy composer is not an App refusal: {result}"
+        );
+    }
+
+    /// user webchat create | Given a busy rejection whose probe carries page text and a generating turn | When projected | Then only the safe booleans and capped counts survive and the hint is the generic one
+    #[test]
+    fn user_webchat_create_given_generating_turn_when_probe_projected_then_strings_dropped_and_counts_capped()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::rejected(json!({
+            "error": "browser_create_composer_busy",
+            "composer_busy_probe": {
+                "input_mounted": true,
+                "input_has_content": false,
+                "input_text_length": 999999,
+                "stop_control": true,
+                "assistant_streaming": true,
+                "assistant_tools_in_progress": true,
+                "app_pill_count": 999999,
+                "stop_candidate_raw_count": 999999,
+                "busy_reason": "hello world",
+                "claude_latest_row_role": "assistant",
+                "page_text": "secret draft 继续 https://example.com/c/1",
+                "input_text": "secret draft 继续 https://example.com/c/1"
+            }
+        })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-busy-2",
+        );
+        let probe = &result["delivery_evidence"]["composer_busy_probe"];
+        assert_eq!(probe["stop_control"], true, "{result}");
+        assert_eq!(probe["assistant_streaming"], true, "{result}");
+        assert_eq!(probe["input_text_length"], 10_000, "{result}");
+        assert_eq!(probe["app_pill_count"], 10_000, "{result}");
+        assert_eq!(probe["stop_candidate_raw_count"], 10_000, "{result}");
+        assert!(probe.get("page_text").is_none(), "{result}");
+        assert!(probe.get("input_text").is_none(), "{result}");
+        assert!(probe.get("busy_reason").is_none(), "{result}");
+        assert!(probe.get("claude_latest_row_role").is_none(), "{result}");
+        assert!(!result.to_string().contains("secret draft"), "{result}");
+        assert!(!result.to_string().contains("继续"), "{result}");
+        assert_eq!(
+            result["delivery_evidence"]["hint"],
+            "composer is busy; wait until it is idle and retry",
+            "a generating turn is not a restored draft: {result}"
+        );
+    }
+
+    /// user webchat create | Given the extension reports a rejection code the runtime does not know | When the create is rejected | Then nothing is echoed and no hint is attached
+    #[test]
+    fn user_webchat_create_given_unknown_rejection_code_when_rejected_then_reason_stays_empty() {
+        for (index, unknown) in [
+            "browser_create_tab_open_failed",
+            "browser_create_scope_unavailable",
+            "secret draft !!!",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+            let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::rejected(json!({
+                "error": unknown,
+                "composer_busy_probe": {"input_has_content": true},
+            })));
+            let result = create_session_with_scripted_actuator(
+                &store,
+                &endpoint_ref,
+                &account_ref,
+                &actuator,
+                &format!("scripted-create-unknown-{index}"),
+            );
+            assert_eq!(result["code"], "rejected", "{result}");
+            assert!(
+                result["reason"].is_null(),
+                "{unknown} must stay dropped: {result}"
+            );
+            assert!(
+                result["delivery_evidence"].get("error").is_none(),
+                "{unknown} must not reach the public evidence: {result}"
+            );
+            assert!(
+                result.get("hint").is_none(),
+                "no hint for an unknown refusal: {result}"
+            );
+            assert!(!result.to_string().contains(unknown), "{result}");
+            assert!(!result.to_string().contains("secret draft"), "{result}");
+        }
+    }
+
+    /// user webchat create | Given the browser could not actuate at all | When the create fails | Then the bounded resource-unavailable reason keeps its place and the App-evidence error stays reserved for fixed codes
+    #[test]
+    fn user_webchat_create_given_resource_unavailable_when_reason_bounded_then_evidence_error_is_not_filled()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::resource_unavailable(
+            json!({"error": "browser_create_runtime_unavailable"}),
+        ));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-unavailable-1",
+        );
+        assert_eq!(
+            result["code"], "browser_create_runtime_unavailable",
+            "{result}"
+        );
+        assert_eq!(
+            result["reason"], "browser_create_runtime_unavailable",
+            "{result}"
+        );
+        assert_eq!(result["delivery_state"], "resource_unavailable", "{result}");
+        assert!(
+            result["delivery_evidence"].get("error").is_none(),
+            "the generic resource-unavailable reason is not a fixed evidence code: {result}"
+        );
+        assert!(result.get("hint").is_none(), "{result}");
+    }
+
+    /// user webchat create | Given a fresh tab whose composer never mounted | When the extension refuses with its live rejected shape | Then the fixed code is surfaced as the reason without a busy hint
+    #[test]
+    fn user_webchat_create_given_composer_unavailable_when_rejected_then_code_surfaced_without_hint()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        // `browserRejectedEvidence` in the content script keeps the resource
+        // available and only refuses the actuation, so the live shape is a
+        // rejected create, not a resource-unavailable one.
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::rejected(json!({
+            "error": "browser_create_composer_unavailable",
+            "message_submitted": false,
+            "retry_safe": true,
+        })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-composer-unavailable-1",
+        );
+        assert_eq!(result["code"], "rejected", "{result}");
+        assert_eq!(result["delivery_state"], "rejected", "{result}");
+        assert_eq!(
+            result["reason"], "browser_create_composer_unavailable",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["error"], "browser_create_composer_unavailable",
+            "{result}"
+        );
+        assert!(
+            result.get("hint").is_none(),
+            "an unmounted composer is not a busy composer: {result}"
+        );
+        assert!(result.get("composer_busy_probe").is_none(), "{result}");
+    }
+
+    /// user webchat create | Given a resource-unavailable create whose token is on the fixed allowlist | When projected | Then the allowlisted token is the one copied into the public evidence
+    #[test]
+    fn user_webchat_create_given_resource_unavailable_allowlisted_code_when_projected_then_evidence_error_is_filled()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::resource_unavailable(
+            json!({"error": "browser_create_content_reason_missing"}),
+        ));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-unavailable-allowlisted-1",
+        );
+        assert_eq!(
+            result["code"], "browser_create_content_reason_missing",
+            "{result}"
+        );
+        assert_eq!(
+            result["reason"], "browser_create_content_reason_missing",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["error"], "browser_create_content_reason_missing",
+            "an allowlisted token may fill the public evidence error: {result}"
+        );
+        assert!(result.get("hint").is_none(), "{result}");
+    }
+
+    /// user webchat create | Given an uncertain first attempt and a polled rejection | When reconciliation settles rejected | Then the reconcile response reports the same reason, hint and public evidence as the first attempt
+    #[test]
+    fn user_webchat_create_given_reconcile_rejection_when_settled_then_reason_and_hint_are_surfaced()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::uncertain(json!({
+            "message_submitted": true,
+            "retry_safe": true,
+        })))
+        .with_reconcile(ScriptedCreateEvidence::rejected(json!({
+            "error": "browser_create_composer_busy",
+            "composer_busy_probe": {
+                "input_mounted": true,
+                "input_has_content": true,
+                "stop_control": false,
+                "assistant_streaming": false,
+                "assistant_tools_in_progress": false,
+            }
+        })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-reconcile-1",
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "rejected", "{result}");
+        assert_eq!(
+            result["reason"], "browser_create_composer_busy",
+            "the reconcile fallthrough must name the polled rejection: {result}"
+        );
+        assert_eq!(
+            result["composer_busy_probe"]["input_has_content"], true,
+            "{result}"
+        );
+        assert_eq!(
+            result["hint"],
+            "composer has existing content (possibly a restored ChatGPT draft); clear it and retry",
+            "{result}"
+        );
+        // The reconcile fallthrough must publish the same delivery evidence as
+        // the first attempt, not just the top-level fields.
+        assert_eq!(
+            result["delivery_evidence"]["error"], "browser_create_composer_busy",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["hint"], result["hint"],
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"], result["composer_busy_probe"],
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"]["input_has_content"], true,
+            "{result}"
         );
     }
 
