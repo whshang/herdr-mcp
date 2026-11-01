@@ -188,16 +188,16 @@ pub fn print_status(
     );
     println!("TCC: {tcc_summary}");
     println!("{}", semantic_status_line(language));
-    // #772: WebChat grant state is part of the default status view.
+    // #772/#791: WebChat grant evidence is part of the default status view.
     let webchat_grants = crate::webchat_grants::snapshot(paths);
     println!(
         "{}",
         crate::webchat_grants::summary_line(&webchat_grants, language)
     );
-    for line in webchat_grants.concise_lines().iter().skip(1) {
+    for line in webchat_grants.concise_lines(language).iter().skip(1) {
         println!("{line}");
     }
-    println!("{}", crate::webchat_grants::binding_hint(language));
+    println!("{}", webchat_grants.hint(language));
     println!();
     println!(
         "{}: herdr-mcp status --verbose",
@@ -331,10 +331,10 @@ fn print_status_verbose(paths: &RuntimePaths, config: &Config, language: crate::
         "{}",
         crate::webchat_grants::summary_line(&webchat_grants, language)
     );
-    let grants_hint = crate::webchat_grants::binding_hint(language);
+    let grants_hint = webchat_grants.hint(language);
     // `concise_lines()` starts with the `state=` rollup line, already printed
     // above as `summary_line`; skip it so detail lines are not duplicated.
-    for line in webchat_grants.concise_lines().iter().skip(1) {
+    for line in webchat_grants.concise_lines(language).iter().skip(1) {
         println!("{line}");
     }
     println!("{grants_hint}");
@@ -647,10 +647,7 @@ pub fn print_doctor(
         "LAYER webchat-grants-summary {}",
         crate::webchat_grants::summary_line(&webchat_grants, language)
     );
-    println!(
-        "{}",
-        webchat_grants.doctor_line(&crate::webchat_grants::binding_hint(language))
-    );
+    println!("{}", webchat_grants.doctor_line(language));
     let remote = print_layer_ownership(paths, config, &report, verbose);
     println!(
         "LAYER authenticated-local-mcp {}",
@@ -774,13 +771,13 @@ pub fn print_doctor(
             diagnostic_label(authenticated_local_mcp.state)
         );
         std::println!("Edge: {} · {edge_host}", diagnostic_label(remote_summary));
-        // #772: grant state is always visible, even in the concise view.
-        let grants_hint = crate::webchat_grants::binding_hint(language);
+        // #772/#791: grant evidence is always visible, even in the concise view.
+        let grants_hint = webchat_grants.hint(language);
         std::println!(
             "{}",
             crate::webchat_grants::summary_line(&webchat_grants, language)
         );
-        for line in webchat_grants.concise_lines().iter().skip(1) {
+        for line in webchat_grants.concise_lines(language).iter().skip(1) {
             std::println!("{line}");
         }
         std::println!("{grants_hint}");

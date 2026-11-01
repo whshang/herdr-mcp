@@ -1,21 +1,30 @@
-//! Read-only WebChat control-plane snapshot for doctor/status (issue #772).
+//! Read-only WebChat control-plane snapshot for doctor/status (issues #772,
+//! #791).
 //!
-//! Two independent mechanisms gate WebChat work, and diagnosing an unbound
-//! dispatch requires telling them apart:
+//! One mechanism gates WebChat source-turn binding: the **Edge**
+//! `webchat_control` grant (header `x-herdr-edge-webchat-control-grants`, set
+//! via `herdr_mcp.connector.webchat_control.set` / `herdr-mcp connector
+//! webchat-control`). Its absence makes binding fail with `grant_missing`.
 //!
-//! 1. The Edge `webchat_control` grant (header
-//!    `x-herdr-edge-webchat-control-grants`, set via
-//!    `herdr_mcp.connector.webchat_control.set`). Its absence makes binding
-//!    fail with `grant_missing`. The grant itself is Edge-side and is not
-//!    stored locally; the local state DB only records *evidence* that grants
-//!    existed: connector-attributed dispatch rows
-//!    (`browser_dispatches.authorization_*`) and caller session bindings
-//!    (`browser_caller_sessions`). This module surfaces that evidence as
-//!    grant state `present` / `absent` / `unknown`.
-//! 2. The extension control-center consent flags
-//!    (`browser_endpoints.webchat_control_allowed` etc. plus
-//!    `consent_revision`). These gate browser control, not source-turn
-//!    binding.
+//! The grant lives on Edge. This runtime has no read path for it — `POST
+//! /connectors/webchat-control` is write-only and the `GET /connectors`
+//! inventory carries no grant rows — so doctor stays offline and credential
+//! free. What the local state DB holds is only *evidence* that a grant was
+//! once used: connector-attributed dispatch rows
+//! (`browser_dispatches.authorization_*`) and caller session bindings
+//! (`browser_caller_sessions`). The snapshot therefore reports
+//! `present` (local evidence proves a grant existed), `absent_locally` (no
+//! local evidence — Edge may still hold a grant this tool cannot see), or
+//! `unknown` (the DB or its tables cannot be read). Only `present` is ever
+//! rendered as evidence; the other states make the Edge authority explicit and
+//! print the owner-device grant command instead of guessing.
+//!
+//! The per-endpoint `browser_endpoints.webchat_control_allowed` column is a
+//! **retired** local switch (`e44688a0`): registered WebChat endpoints are
+//! controllable by default. It is reported as `webchat_control=legacy_ignored`
+//! and never presented as a gate, so a stale `0`/`consent_revision=0` row can
+//! no longer be mistaken for the reason a binding fails. The Tool Bridge flags
+//! are separate live gates for a different feature and stay visible.
 //!
 //! Read-only contract: only `SELECT`s against the local state DB; if the DB or
 //! the tables are missing the snapshot reports `unknown` and never fails
@@ -30,14 +39,30 @@ use std::path::Path;
 const MAX_ENDPOINTS: usize = 8;
 const MAX_GRANT_ROWS: usize = 32;
 
+/// The owner-device command that creates the Edge grant this runtime cannot
+/// read back (#791). Printed whenever no local evidence exists, because the
+/// retired extension WebChat Control switch is not a valid next step.
+pub(crate) const CONNECTOR_GRANT_COMMAND: &str = "herdr-mcp connector webchat-control allow <connector-id> <device-id> <endpoint_ref> <provider> --confirm";
+/// Device-wide variant of [`CONNECTOR_GRANT_COMMAND`] for every endpoint of a
+/// provider on one device. This is a secondary option, not the default: it
+/// needs an Edge that accepts `scope: "device"` (#713). A Worker without that
+/// support rejects the body with `device_grant_requires_edge_support` and
+/// writes nothing, so the per-endpoint command above always leads.
+pub(crate) const DEVICE_WIDE_GRANT_COMMAND: &str = "herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm";
+/// Why the device-wide form is offered last. Named next to the command in both
+/// text and JSON so an operator on a pre-#713 Edge does not read the failure as
+/// a grant problem.
+pub(crate) const DEVICE_WIDE_GRANT_REQUIRES: &str = "#713 / Edge device-scope (scope=device) support; otherwise device_grant_requires_edge_support and no grant is written";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GrantState {
     /// Local evidence proves at least one Edge webchat_control grant existed
     /// for the connector at some point.
     Present,
     /// The state DB is healthy but carries no connector-attributed grant
-    /// evidence.
-    Absent,
+    /// evidence. This is *not* an Edge-side absence: grants live on Edge and
+    /// this runtime cannot read them back.
+    AbsentLocally,
     /// The DB or its tables could not be read; no claim is made.
     Unknown,
 }
@@ -46,8 +71,17 @@ impl GrantState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Present => "present",
-            Self::Absent => "absent",
+            Self::AbsentLocally => "absent_locally",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// Where the reported evidence came from. Grants themselves are always
+    /// Edge-authoritative; this describes the local projection only.
+    fn source(self) -> &'static str {
+        match self {
+            Self::Present | Self::AbsentLocally => "local_evidence",
+            Self::Unknown => "unavailable",
         }
     }
 }
@@ -74,7 +108,9 @@ pub(crate) struct GrantPrincipal {
 pub(crate) struct EndpointConsent {
     pub endpoint_ref: String,
     pub browser_family: String,
-    pub webchat_control_allowed: bool,
+    /// Retired local WebChat switch (`e44688a0`). Reported only as
+    /// `legacy_ignored`; never a gate.
+    pub legacy_webchat_control_allowed: bool,
     pub tool_bridge_allowed: bool,
     pub tool_bridge_mutation_allowed: bool,
     pub consent_revision: i64,
@@ -101,44 +137,22 @@ impl WebChatGrantSnapshot {
     }
 
     /// Compact lines for the concise doctor / status views. Always starts
-    /// with the `state=` line; when a state DB exists, includes every
-    /// principal and per-endpoint consent line (bounded by the snapshot
-    /// limits), so grant state and `consent_revision` are visible without
+    /// with the `state=` summary; when a state DB exists, includes every
+    /// principal and per-endpoint line (bounded by the snapshot limits), so
+    /// grant evidence and `consent_revision` are visible without
     /// `--verbose`.
-    pub(crate) fn concise_lines(&self) -> Vec<String> {
-        let mut lines = vec![self.doctor_line("")];
+    pub(crate) fn concise_lines(&self, language: crate::locale::Locale) -> Vec<String> {
+        let mut lines = vec![summary_line(self, language)];
         match self.state {
             GrantState::Unknown => {}
-            GrantState::Absent => {
+            GrantState::AbsentLocally => {
                 for endpoint in &self.endpoints {
-                    lines.push(format!(
-                        "LAYER webchat-consent endpoint_ref={} browser={} webchat_control={} tool_bridge={} tool_bridge_mutation={} consent_revision={} last_observed_at={}",
-                        endpoint.endpoint_ref,
-                        endpoint.browser_family,
-                        endpoint.webchat_control_allowed,
-                        endpoint.tool_bridge_allowed,
-                        endpoint.tool_bridge_mutation_allowed,
-                        endpoint.consent_revision,
-                        endpoint.last_observed_at,
-                    ));
+                    lines.push(endpoint_line(endpoint));
                 }
             }
             GrantState::Present => {
                 for principal in &self.principals {
-                    lines.push(format!(
-                        "LAYER webchat-grant principal={} grant_generation={} last_seen={} bound_caller_sessions={} scopes={}",
-                        principal.connector_id,
-                        principal
-                            .grant_generation
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                        principal
-                            .last_seen
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                        principal.bound_caller_sessions,
-                        principal.scopes.len(),
-                    ));
+                    lines.push(principal_line(principal));
                     for scope in &principal.scopes {
                         lines.push(format!(
                             "LAYER webchat-grant-scope principal={} endpoint_ref={} provider={}",
@@ -147,16 +161,7 @@ impl WebChatGrantSnapshot {
                     }
                 }
                 for endpoint in &self.endpoints {
-                    lines.push(format!(
-                        "LAYER webchat-consent endpoint_ref={} browser={} webchat_control={} tool_bridge={} tool_bridge_mutation={} consent_revision={} last_observed_at={}",
-                        endpoint.endpoint_ref,
-                        endpoint.browser_family,
-                        endpoint.webchat_control_allowed,
-                        endpoint.tool_bridge_allowed,
-                        endpoint.tool_bridge_mutation_allowed,
-                        endpoint.consent_revision,
-                        endpoint.last_observed_at,
-                    ));
+                    lines.push(endpoint_line(endpoint));
                 }
             }
         }
@@ -188,10 +193,12 @@ impl WebChatGrantSnapshot {
                     "endpoint_ref": endpoint.endpoint_ref,
                     "browser_family": endpoint.browser_family,
                     "consent": {
-                        "webchat_control": endpoint.webchat_control_allowed,
+                        // Retired local switch: never a gate, reported as such.
+                        "webchat_control": "legacy_ignored",
                         "tool_bridge": endpoint.tool_bridge_allowed,
                         "tool_bridge_mutation": endpoint.tool_bridge_mutation_allowed,
                     },
+                    "legacy_webchat_control_allowed": endpoint.legacy_webchat_control_allowed,
                     "consent_revision": endpoint.consent_revision,
                     "last_observed_at": endpoint.last_observed_at,
                 })
@@ -199,77 +206,138 @@ impl WebChatGrantSnapshot {
             .collect::<Vec<_>>();
         json!({
             "state": self.state.as_str(),
+            // Grants live on Edge; this snapshot is only local evidence and
+            // can therefore only ever be non-authoritative.
+            "authoritative": false,
+            "source": self.state.source(),
             "reason": self.reason,
+            "next_step": self.next_step_json(),
             "principals": principals,
             "endpoints": endpoints,
         })
     }
 
-    pub(crate) fn doctor_line(&self, hint: &str) -> String {
+    /// Machine-readable next step. Only emitted when the local DB holds no
+    /// grant evidence, where the operator action is an Edge connector grant
+    /// from the owner device.
+    fn next_step_json(&self) -> Value {
         match self.state {
-            GrantState::Unknown => format!(
-                "LAYER webchat-grants state=unknown reason={} {hint}",
-                self.reason.as_deref().unwrap_or("unavailable")
-            ),
-            GrantState::Absent => {
-                let mut line = format!("LAYER webchat-grants state=absent principals=0 {hint}");
-                for endpoint in &self.endpoints {
-                    line.push_str(&format!(
-                        "\nLAYER webchat-consent endpoint_ref={} browser={} webchat_control={} tool_bridge={} tool_bridge_mutation={} consent_revision={} last_observed_at={}",
-                        endpoint.endpoint_ref,
-                        endpoint.browser_family,
-                        endpoint.webchat_control_allowed,
-                        endpoint.tool_bridge_allowed,
-                        endpoint.tool_bridge_mutation_allowed,
-                        endpoint.consent_revision,
-                        endpoint.last_observed_at,
-                    ));
-                }
-                line
-            }
-            GrantState::Present => {
-                let mut line = format!(
-                    "LAYER webchat-grants state=present principals={} {hint}",
-                    self.principals.len(),
-                );
-                for principal in &self.principals {
-                    line.push_str(&format!(
-                        "\nLAYER webchat-grant principal={} grant_generation={} last_seen={} bound_caller_sessions={} scopes={}",
-                        principal.connector_id,
-                        principal
-                            .grant_generation
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                        principal
-                            .last_seen
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                        principal.bound_caller_sessions,
-                        principal.scopes.len(),
-                    ));
-                    for scope in &principal.scopes {
-                        line.push_str(&format!(
-                            "\nLAYER webchat-grant-scope principal={} endpoint_ref={} provider={}",
-                            principal.connector_id, scope.endpoint_ref, scope.provider,
-                        ));
-                    }
-                }
-                for endpoint in &self.endpoints {
-                    line.push_str(&format!(
-                        "\nLAYER webchat-consent endpoint_ref={} browser={} webchat_control={} tool_bridge={} tool_bridge_mutation={} consent_revision={} last_observed_at={}",
-                        endpoint.endpoint_ref,
-                        endpoint.browser_family,
-                        endpoint.webchat_control_allowed,
-                        endpoint.tool_bridge_allowed,
-                        endpoint.tool_bridge_mutation_allowed,
-                        endpoint.consent_revision,
-                        endpoint.last_observed_at,
-                    ));
-                }
-                line
+            GrantState::AbsentLocally => json!({
+                "action": "grant_on_owner_device",
+                "command": CONNECTOR_GRANT_COMMAND,
+                // Secondary: needs an Edge that accepts `scope: "device"` (#713).
+                "device_wide_command": DEVICE_WIDE_GRANT_COMMAND,
+                "device_wide_requires": DEVICE_WIDE_GRANT_REQUIRES,
+            }),
+            GrantState::Present | GrantState::Unknown => Value::Null,
+        }
+    }
+
+    /// The state-dependent next step. A missing Edge grant fails source-turn
+    /// binding with `grant_missing`; no local evidence is not an Edge absence,
+    /// so it never points at the retired extension WebChat Control switch.
+    pub(crate) fn hint(&self, language: crate::locale::Locale) -> String {
+        match self.state {
+            GrantState::Present => language
+                .text(
+                    "local dispatch evidence only; Edge grants stay authoritative — if binding still fails with grant_missing, re-check the grant on Edge",
+                    "仅为本地派发证据；Edge 授权才是权威 — 若绑定仍报 grant_missing，请在 Edge 上复核授权",
+                    "ローカルの dispatch 証拠のみ。権威は Edge の grant — それでもバインディングが grant_missing で失敗する場合は Edge 側で再確認する",
+                )
+                .to_owned(),
+            GrantState::AbsentLocally | GrantState::Unknown => {
+                let lead = if self.state == GrantState::AbsentLocally {
+                    language.text(
+                        "not authoritative: WebChat grants live on Edge and no local evidence exists; grant from the owner device:",
+                        "非权威：WebChat 授权在 Edge 上，本地没有证据；请在属主设备上授权：",
+                        "非権威：WebChat の grant は Edge 側にあり、ローカルに証拠はない。オーナーデバイスで許可する:",
+                    )
+                } else {
+                    language.text(
+                        "grant state not proven here; WebChat grants live on Edge — verify or grant from the owner device:",
+                        "本地无法证明授权状态；WebChat 授权在 Edge 上 — 请在属主设备上核对或授权：",
+                        "ローカルでは grant 状態を証明できない。WebChat の grant は Edge 側 — オーナーデバイスで確認または許可する:",
+                    )
+                };
+                format!(
+                    "{lead} {CONNECTOR_GRANT_COMMAND} ({} {DEVICE_WIDE_GRANT_COMMAND} — {DEVICE_WIDE_GRANT_REQUIRES})",
+                    language.text(
+                        "device-wide alternative, not the default:",
+                        "整设备范围的替代命令（非默认）：",
+                        "デバイス全体の代替（既定ではない）:",
+                    ),
+                )
             }
         }
     }
+
+    pub(crate) fn doctor_line(&self, language: crate::locale::Locale) -> String {
+        let hint = self.hint(language);
+        let mut line = match self.state {
+            GrantState::Unknown => format!(
+                "LAYER webchat-grants state=unknown authoritative=false source={} reason={} {hint}",
+                self.state.source(),
+                self.reason.as_deref().unwrap_or("unavailable")
+            ),
+            GrantState::AbsentLocally => format!(
+                "LAYER webchat-grants state=absent_locally principals=0 authoritative=false source={} {hint}",
+                self.state.source(),
+            ),
+            GrantState::Present => format!(
+                "LAYER webchat-grants state=present principals={} authoritative=false source={} {hint}",
+                self.principals.len(),
+                self.state.source(),
+            ),
+        };
+        for principal in &self.principals {
+            line.push('\n');
+            line.push_str(&principal_line(principal));
+            for scope in &principal.scopes {
+                line.push_str(&format!(
+                    "\nLAYER webchat-grant-scope principal={} endpoint_ref={} provider={}",
+                    principal.connector_id, scope.endpoint_ref, scope.provider,
+                ));
+            }
+        }
+        for endpoint in &self.endpoints {
+            line.push('\n');
+            line.push_str(&endpoint_line(endpoint));
+        }
+        line
+    }
+}
+
+fn principal_line(principal: &GrantPrincipal) -> String {
+    format!(
+        "LAYER webchat-grant principal={} grant_generation={} last_seen={} bound_caller_sessions={} scopes={}",
+        principal.connector_id,
+        principal
+            .grant_generation
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        principal
+            .last_seen
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        principal.bound_caller_sessions,
+        principal.scopes.len(),
+    )
+}
+
+/// The per-endpoint row. `webchat_control=legacy_ignored` is fixed text: the
+/// stored column is a retired switch, so its raw value is only ever an
+/// annotation (`stored_webchat_control=`), never a gate.
+fn endpoint_line(endpoint: &EndpointConsent) -> String {
+    format!(
+        "LAYER webchat-endpoint endpoint_ref={} browser={} tool_bridge={} tool_bridge_mutation={} consent_revision={} webchat_control=legacy_ignored stored_webchat_control={} last_observed_at={}",
+        endpoint.endpoint_ref,
+        endpoint.browser_family,
+        endpoint.tool_bridge_allowed,
+        endpoint.tool_bridge_mutation_allowed,
+        endpoint.consent_revision,
+        endpoint.legacy_webchat_control_allowed,
+        endpoint.last_observed_at,
+    )
 }
 
 /// One-line summary used by `status` / `status --verbose` and the doctor
@@ -281,15 +349,28 @@ pub(crate) fn summary_line(
     let label = language.text("WebChat grants", "WebChat 授权", "WebChat 認可");
     match snapshot.state {
         GrantState::Present => format!(
-            "{label}: state=present principals={} · missing Edge grant causes binding grant_missing",
+            "{label}: state=present principals={} · {}",
             snapshot.principals.len(),
-        ),
-        GrantState::Absent => format!(
-            "{label}: state=absent · {} · extension consent gates browser control",
             language.text(
-                "binding would fail with grant_missing",
-                "绑定将报 grant_missing",
-                "バインディングは grant_missing で失敗する",
+                "local evidence only; Edge grants stay authoritative",
+                "仅为本地证据；以 Edge 授权为准",
+                "ローカル証拠のみ。権威は Edge の grant",
+            ),
+        ),
+        // Non-prediction: this runtime cannot see the Edge grant, so empty
+        // local evidence says nothing about whether binding will fail. Only a
+        // real `grant_missing` refusal is the trigger for the grant (#791).
+        GrantState::AbsentLocally => format!(
+            "{label}: state=absent_locally · {} · {}",
+            language.text(
+                "no local grant evidence, Edge is authoritative",
+                "本地没有授权证据，以 Edge 为准",
+                "ローカルに grant 証拠なし。権威は Edge",
+            ),
+            language.text(
+                "if binding is actually refused with grant_missing, grant from the owner device",
+                "若绑定确实报 grant_missing，请在属主设备上授权",
+                "実際にバインディングが grant_missing で拒否された場合はオーナーデバイスで許可する",
             ),
         ),
         GrantState::Unknown => format!(
@@ -297,18 +378,6 @@ pub(crate) fn summary_line(
             snapshot.reason.as_deref().unwrap_or("unavailable"),
         ),
     }
-}
-
-/// The distinguishing hint: a missing Edge grant fails source-turn binding
-/// with `grant_missing`, while extension consent gates browser control.
-pub(crate) fn binding_hint(language: crate::locale::Locale) -> String {
-    language
-        .text(
-            "missing Edge grant causes binding grant_missing; extension consent gates browser control",
-            "缺少 Edge grant 会使绑定报 grant_missing；扩展 consent 决定浏览器控制",
-            "Edge grant の欠落はバインディングの grant_missing を招く。拡張 consent はブラウザー制御をゲートする",
-        )
-        .to_owned()
 }
 
 pub(crate) fn snapshot(paths: &RuntimePaths) -> WebChatGrantSnapshot {
@@ -339,7 +408,9 @@ pub(crate) fn snapshot_at_db_path(db_path: &Path) -> WebChatGrantSnapshot {
         Err(reason) => return WebChatGrantSnapshot::unknown(reason),
     };
     let state = if principals.is_empty() {
-        GrantState::Absent
+        // No local evidence is not an Edge absence (#791): the grant lives on
+        // Edge and this runtime has no read path for it.
+        GrantState::AbsentLocally
     } else {
         GrantState::Present
     };
@@ -454,7 +525,7 @@ fn read_endpoint_consent(conn: &rusqlite::Connection) -> Result<Vec<EndpointCons
             Ok(EndpointConsent {
                 endpoint_ref: row.get(0)?,
                 browser_family: row.get(1)?,
-                webchat_control_allowed: row.get::<_, i64>(2)? != 0,
+                legacy_webchat_control_allowed: row.get::<_, i64>(2)? != 0,
                 tool_bridge_allowed: row.get::<_, i64>(3)? != 0,
                 tool_bridge_mutation_allowed: row.get::<_, i64>(4)? != 0,
                 consent_revision: row.get(5)?,
@@ -620,32 +691,51 @@ mod tests {
         let endpoint = &snapshot.endpoints[0];
         // The per-endpoint WebChat switch was retired in 1.1; consent writes
         // only move Tool Bridge flags. The row still reports its stored flag.
-        assert!(!endpoint.webchat_control_allowed);
+        assert!(!endpoint.legacy_webchat_control_allowed);
         assert!(!endpoint.tool_bridge_allowed);
         assert_eq!(endpoint.consent_revision, 1);
 
         let json = snapshot.as_json();
         assert_eq!(json["state"], "present");
+        assert_eq!(json["authoritative"], false);
+        assert_eq!(json["source"], "local_evidence");
+        assert_eq!(json["next_step"], Value::Null);
         assert_eq!(json["principals"][0]["connector_id"], "conn_webchatGrant01");
         assert_eq!(
             json["principals"][0]["scopes"][0]["endpoint_ref"],
             json!(endpoint_ref)
         );
         assert_eq!(json["principals"][0]["scopes"][0]["provider"], "chatgpt");
-        assert_eq!(json["endpoints"][0]["consent"]["webchat_control"], false);
+        // The retired switch is reported as a label, never as a gate value.
+        assert_eq!(
+            json["endpoints"][0]["consent"]["webchat_control"],
+            "legacy_ignored"
+        );
+        assert_eq!(
+            json["endpoints"][0]["legacy_webchat_control_allowed"],
+            false
+        );
         assert_eq!(json["endpoints"][0]["consent_revision"], 1);
 
-        let line = snapshot.doctor_line("hint");
+        let line = snapshot.doctor_line(crate::locale::Locale::En);
         assert!(line.contains("state=present"));
+        assert!(line.contains("authoritative=false"));
+        assert!(line.contains("source=local_evidence"));
         assert!(line.contains("conn_webchatGrant01"));
         assert!(line.contains("webchat-grant-scope"));
         assert!(line.contains(&endpoint_ref));
-        assert!(line.contains("webchat_control=false"));
+        assert!(line.contains("webchat_control=legacy_ignored"));
+        // `present` is local evidence; the retired extension-consent framing
+        // is gone even here.
+        assert!(!line.contains("extension consent"));
         let _ = std::fs::remove_file(&path);
     }
 
+    /// #791: the stale legacy `webchat_control_allowed=0` row plus no local
+    /// grant evidence must send the operator to the Edge connector grant, and
+    /// must never present the retired extension consent toggle as the gate.
     #[test]
-    fn grant_absent_when_db_has_no_connector_evidence() {
+    fn legacy_endpoint_without_grant_evidence_hints_connector_grant() {
         let path = temp_db_path();
         let mut store = crate::state_store::StateStore::open(&path).unwrap();
         let endpoint_ref = register_endpoint(&mut store);
@@ -660,14 +750,100 @@ mod tests {
             })
             .unwrap();
         drop(store);
+        // Force the stale legacy value the MBP state DB carries (#728): the
+        // consent write above always stores `webchat_control_allowed = 1`.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE browser_endpoints SET webchat_control_allowed = 0 WHERE endpoint_ref = ?1",
+            rusqlite::params![&endpoint_ref],
+        )
+        .unwrap();
+        drop(conn);
 
         let snapshot = snapshot_at_db_path(&path);
-        assert_eq!(snapshot.state, GrantState::Absent);
+        assert_eq!(snapshot.state, GrantState::AbsentLocally);
         assert!(snapshot.principals.is_empty());
         assert_eq!(snapshot.endpoints.len(), 1);
-        assert!(!snapshot.endpoints[0].webchat_control_allowed);
-        assert_eq!(snapshot.as_json()["state"], "absent");
-        assert!(snapshot.doctor_line("hint").contains("state=absent"));
+        assert!(!snapshot.endpoints[0].legacy_webchat_control_allowed);
+
+        let line = snapshot.doctor_line(crate::locale::Locale::En);
+        assert!(line.contains("state=absent_locally"), "{line}");
+        assert!(line.contains("authoritative=false"), "{line}");
+        assert!(line.contains("source=local_evidence"), "{line}");
+        // The retired switch is labelled, never rendered as a gate value.
+        assert!(line.contains("webchat_control=legacy_ignored"), "{line}");
+        assert!(line.contains("stored_webchat_control=false"), "{line}");
+        // The real next step is the per-endpoint Edge connector grant, and it
+        // leads the device-wide alternative.
+        assert!(
+            line.contains(CONNECTOR_GRANT_COMMAND),
+            "missing connector grant hint:\n{line}"
+        );
+        assert!(
+            line.find(CONNECTOR_GRANT_COMMAND) < line.find(DEVICE_WIDE_GRANT_COMMAND),
+            "per-endpoint command must lead the device-wide form:\n{line}"
+        );
+        // The device-wide form is never offered unconditionally: a pre-#713
+        // Edge rejects `scope=device` and writes no grant.
+        assert!(
+            line.contains("device_grant_requires_edge_support"),
+            "device-wide form must name its Edge requirement:\n{line}"
+        );
+        assert!(
+            line.contains("#713"),
+            "device-wide form must name the #713 dependency:\n{line}"
+        );
+        // The status rollup must not predict an Edge-side failure from empty
+        // local evidence; `grant_missing` appears only as the real refusal
+        // condition, never as "binding would fail" (#791 review).
+        for language in [
+            crate::locale::Locale::En,
+            crate::locale::Locale::ZhCn,
+            crate::locale::Locale::Ja,
+        ] {
+            let summary = summary_line(&snapshot, language);
+            assert!(summary.contains("state=absent_locally"), "{summary}");
+            assert!(!summary.contains("would fail"), "{summary}");
+            assert!(!summary.contains("将报"), "{summary}");
+            assert!(!summary.contains("で失敗する"), "{summary}");
+        }
+        let summary = summary_line(&snapshot, crate::locale::Locale::En);
+        assert!(summary.contains("no local grant evidence"), "{summary}");
+        assert!(summary.contains("Edge is authoritative"), "{summary}");
+        assert!(
+            summary.contains("if binding is actually refused with grant_missing"),
+            "{summary}"
+        );
+        // No extension-consent guidance anywhere in the output.
+        for rendered in [line.clone(), snapshot.hint(crate::locale::Locale::En)] {
+            assert!(!rendered.contains("extension consent"), "{rendered}");
+            assert!(!rendered.contains("consent gates"), "{rendered}");
+        }
+
+        let json = snapshot.as_json();
+        assert_eq!(json["state"], "absent_locally");
+        assert_eq!(json["authoritative"], false);
+        assert_eq!(json["source"], "local_evidence");
+        assert_eq!(json["next_step"]["action"], "grant_on_owner_device");
+        assert_eq!(json["next_step"]["command"], CONNECTOR_GRANT_COMMAND);
+        assert_eq!(
+            json["next_step"]["device_wide_command"],
+            DEVICE_WIDE_GRANT_COMMAND
+        );
+        assert_eq!(
+            json["next_step"]["device_wide_requires"],
+            DEVICE_WIDE_GRANT_REQUIRES
+        );
+        assert_eq!(
+            json["endpoints"][0]["consent"]["webchat_control"],
+            "legacy_ignored"
+        );
+        assert_eq!(
+            json["endpoints"][0]["legacy_webchat_control_allowed"],
+            false
+        );
+        assert_eq!(json["principals"], json!([]));
+        assert!(!json.to_string().contains("extension consent"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -678,7 +854,12 @@ mod tests {
         assert_eq!(snapshot.state, GrantState::Unknown);
         assert_eq!(snapshot.reason.as_deref(), Some("state_db_missing"));
         assert_eq!(snapshot.as_json()["state"], "unknown");
-        assert!(snapshot.doctor_line("hint").contains("state=unknown"));
+        assert_eq!(snapshot.as_json()["source"], "unavailable");
+        assert_eq!(snapshot.as_json()["next_step"], Value::Null);
+        let line = snapshot.doctor_line(crate::locale::Locale::En);
+        assert!(line.contains("state=unknown"));
+        assert!(line.contains("authoritative=false"));
+        assert!(!line.contains("extension consent"));
 
         // A DB file without the grant tables (e.g. some other sqlite file)
         // degrades to unknown instead of failing.
@@ -706,7 +887,7 @@ mod tests {
 
         let snapshot = snapshot_at_db_path(&path);
         let json_text = snapshot.as_json().to_string();
-        let line = snapshot.doctor_line("hint");
+        let line = snapshot.doctor_line(crate::locale::Locale::En);
         for rendered in [json_text, line] {
             assert!(!rendered.contains("token"));
             assert!(!rendered.contains("secret"));
@@ -717,10 +898,53 @@ mod tests {
     }
 
     #[test]
-    fn binding_hint_distinguishes_grant_from_consent() {
-        let hint = binding_hint(crate::locale::Locale::En);
-        assert!(hint.contains("grant_missing"));
-        assert!(hint.contains("consent"));
+    fn hint_names_edge_grant_and_never_the_retired_extension_consent() {
+        // `present`: local evidence wording, no allow command needed.
+        let path = temp_db_path();
+        let mut store = crate::state_store::StateStore::open(&path).unwrap();
+        let endpoint_ref = register_endpoint(&mut store);
+        reserve_authorized_dispatch(&mut store, &endpoint_ref, "conn_hintPresent01");
+        drop(store);
+        let present = snapshot_at_db_path(&path);
+        assert_eq!(present.state, GrantState::Present);
+        let hint = present.hint(crate::locale::Locale::En);
+        assert!(hint.contains("Edge"), "{hint}");
+        assert!(hint.contains("grant_missing"), "{hint}");
+        assert!(!hint.contains(CONNECTOR_GRANT_COMMAND), "{hint}");
+        let _ = std::fs::remove_file(&path);
+
+        // No local evidence: the connector grant command, in every locale, for
+        // both non-evidence states. The device-wide form is secondary and
+        // carries its Edge requirement.
+        for state in [GrantState::AbsentLocally, GrantState::Unknown] {
+            let no_evidence = match state {
+                GrantState::AbsentLocally => {
+                    let path = temp_db_path();
+                    let mut store = crate::state_store::StateStore::open(&path).unwrap();
+                    register_endpoint(&mut store);
+                    drop(store);
+                    let snapshot = snapshot_at_db_path(&path);
+                    let _ = std::fs::remove_file(&path);
+                    snapshot
+                }
+                _ => snapshot_at_db_path(&temp_db_path()),
+            };
+            assert_eq!(no_evidence.state, state);
+            for language in [
+                crate::locale::Locale::En,
+                crate::locale::Locale::ZhCn,
+                crate::locale::Locale::Ja,
+            ] {
+                let hint = no_evidence.hint(language);
+                assert!(hint.contains(CONNECTOR_GRANT_COMMAND), "{hint}");
+                assert!(
+                    hint.find(CONNECTOR_GRANT_COMMAND) < hint.find(DEVICE_WIDE_GRANT_COMMAND),
+                    "per-endpoint command must lead:\n{hint}"
+                );
+                assert!(hint.contains("#713"), "{hint}");
+                assert!(!hint.contains("extension consent"), "{hint}");
+            }
+        }
     }
 
     #[test]
@@ -771,7 +995,7 @@ mod tests {
         // A successful count must report the real value; the old code
         // swallowed read errors as 0, so this pins the strict path.
         assert_eq!(snapshot.principals[0].bound_caller_sessions, 1);
-        let line = snapshot.doctor_line("hint");
+        let line = snapshot.doctor_line(crate::locale::Locale::En);
         assert!(line.contains("bound_caller_sessions=1"));
         let _ = std::fs::remove_file(&path);
     }
@@ -795,7 +1019,7 @@ mod tests {
         reserve_authorized_dispatch(&mut store, &endpoint_ref, "conn_conciseView01");
         drop(store);
         let snapshot = snapshot_at_db_path(&path);
-        let lines = snapshot.concise_lines();
+        let lines = snapshot.concise_lines(crate::locale::Locale::En);
         assert!(lines.iter().any(|line| line.contains("state=present")));
         assert!(lines.iter().any(|line| line.contains("consent_revision=")));
         assert!(lines.iter().any(|line| line.contains("conn_conciseView01")));
@@ -804,7 +1028,7 @@ mod tests {
         // Unknown state: only the state line, still carrying `state=`.
         let missing = temp_db_path();
         let unknown = snapshot_at_db_path(&missing);
-        let lines = unknown.concise_lines();
+        let lines = unknown.concise_lines(crate::locale::Locale::En);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("state=unknown"));
         assert!(lines[0].contains("state_db_missing"));
