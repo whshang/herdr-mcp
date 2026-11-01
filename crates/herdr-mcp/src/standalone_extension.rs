@@ -61,10 +61,49 @@ struct PreparedManifest {
 }
 
 #[derive(Debug)]
-struct ChromeExtensionLoad {
+struct ExtensionLoad {
+    browser: String,
     profile: String,
     path: PathBuf,
     location: Option<i64>,
+}
+
+/// One Chromium-family user-data root that `doctor` probes for the managed
+/// standalone extension. Every Chromium browser keeps its own user-data root
+/// with one `Secure Preferences` per profile, so a load can only be evidenced
+/// per root; probing Google Chrome alone misreads a workstation whose only
+/// browser is ego lite (ego-browser).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+struct ChromiumRoot {
+    browser: &'static str,
+    root: PathBuf,
+}
+
+/// Read-only per-root evidence: which browsers were probed, whether the root
+/// exists, and whether its profiles could actually be read.
+#[derive(Debug)]
+struct ScannedRoot {
+    browser: String,
+    root: PathBuf,
+    present: bool,
+    readable: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Default)]
+struct ChromiumScan {
+    loads: Vec<ExtensionLoad>,
+    roots: Vec<ScannedRoot>,
+    unreadable_profiles: usize,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+enum ProfileProbe {
+    Loaded(PathBuf, Option<i64>),
+    Absent,
+    Unreadable(usize),
 }
 
 #[derive(Debug)]
@@ -74,7 +113,8 @@ pub(crate) struct StandaloneBrowserDoctor {
     extension_id: String,
     expected_path: Option<PathBuf>,
     configured_load_path: Option<PathBuf>,
-    loads: Vec<ChromeExtensionLoad>,
+    loads: Vec<ExtensionLoad>,
+    roots: Vec<ScannedRoot>,
     unreadable_profiles: usize,
     reason: Option<String>,
 }
@@ -86,11 +126,23 @@ impl StandaloneBrowserDoctor {
             .iter()
             .map(|load| {
                 json!({
-                    "browser": "Google Chrome",
+                    "browser": load.browser,
                     "profile": load.profile,
                     "path": load.path,
                     "location": load.location,
                     "matches_expected": self.matches(&load.path),
+                })
+            })
+            .collect::<Vec<_>>();
+        let roots = self
+            .roots
+            .iter()
+            .map(|root| {
+                json!({
+                    "browser": root.browser,
+                    "root": root.root,
+                    "present": root.present,
+                    "readable": root.readable,
                 })
             })
             .collect::<Vec<_>>();
@@ -101,6 +153,7 @@ impl StandaloneBrowserDoctor {
             "expected_path": self.expected_path,
             "configured_load_path": self.configured_load_path,
             "loaded": loaded,
+            "browser_roots": roots,
             "drift_count": self.drift_count(),
             "unreadable_profiles": self.unreadable_profiles,
             "reason": self.reason,
@@ -112,32 +165,37 @@ impl StandaloneBrowserDoctor {
             "drift" => {
                 let drift = self.loads.iter().find(|load| !self.matches(&load.path));
                 format!(
-                    "WARN standalone-extension-load state=drift extension_id={} expected={} actual={} browser=\"Google Chrome\" profile={} action=reload-from-managed-path-via-chrome://extensions",
+                    "WARN standalone-extension-load state=drift extension_id={} expected={} actual={} browser={} profile={} action=reload-from-managed-path-via-chrome://extensions",
                     self.extension_id,
                     quote_path(self.expected_path.as_deref()),
                     drift
                         .map(|load| quote_path(Some(&load.path)))
                         .unwrap_or_else(|| "null".to_owned()),
                     drift
+                        .map(|load| json_quote(&load.browser))
+                        .unwrap_or_else(|| "null".to_owned()),
+                    drift
                         .map(|load| json_quote(&load.profile))
                         .unwrap_or_else(|| "null".to_owned()),
                 )
             }
-            "pass" => format!(
-                "INFO standalone-extension-load state=pass extension_id={} expected={} loaded_profiles={}",
+            "loaded" => format!(
+                "INFO standalone-extension-load state=loaded extension_id={} expected={} loaded_profiles={} browsers={}",
                 self.extension_id,
                 quote_path(self.expected_path.as_deref()),
-                self.loads.len()
+                self.loads.len(),
+                json_array(&loaded_browsers(&self.loads)),
             ),
             "not_loaded" => format!(
-                "WARN standalone-extension-load state=not_loaded extension_id={} expected={} action=load-unpacked-via-chrome://extensions",
+                "WARN standalone-extension-load state=not_loaded extension_id={} expected={} browsers={} action=load-unpacked-via-chrome://extensions",
                 self.extension_id,
-                quote_path(self.expected_path.as_deref())
+                quote_path(self.expected_path.as_deref()),
+                json_array(&probed_browsers(&self.roots)),
             ),
             "chrome_not_found" => format!(
-                "INFO standalone-extension-load state=chrome_not_found extension_id={} expected={}",
+                "INFO standalone-extension-load state=chrome_not_found extension_id={} expected={} browsers=[]",
                 self.extension_id,
-                quote_path(self.expected_path.as_deref())
+                quote_path(self.expected_path.as_deref()),
             ),
             "not_installed" => "INFO standalone-extension-load state=not_installed".to_owned(),
             _ => format!(
@@ -197,6 +255,7 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
             expected_path: Some(current),
             configured_load_path: None,
             loads: Vec::new(),
+            roots: Vec::new(),
             unreadable_profiles: 0,
             reason: None,
         };
@@ -213,11 +272,11 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
         let state = read_json(&base_dir_for(&home).join("state.json")).ok();
         let configured_load_path =
             reported_load_path(&home, state.as_ref()).filter(|path| path != &current);
-        diagnose_chrome_load(
+        diagnose_chromium_load(
             &current,
             configured_load_path.as_deref(),
             &identity.extension_id,
-            &home.join("Library/Application Support/Google/Chrome"),
+            &chromium_roots(&home),
         )
     }
 
@@ -231,104 +290,164 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
     }
 }
 
+/// Known Chromium-family user-data roots on macOS, in probe order. A
+/// workstation may run no Google Chrome at all: on the machine this fix comes
+/// from, ego lite (ego-browser) is the only browser and loads the managed
+/// standalone extension unpacked. Keep the list to browsers that store
+/// Chromium `Secure Preferences` at `<root>/<profile>/Secure Preferences`.
 #[cfg(any(target_os = "macos", test))]
-fn diagnose_chrome_load(
+fn chromium_roots(home: &Path) -> Vec<ChromiumRoot> {
+    let support = home.join("Library/Application Support");
+    [
+        ("Google Chrome", "Google/Chrome"),
+        ("Google Chrome Beta", "Google/Chrome Beta"),
+        ("Google Chrome Canary", "Google/Chrome Canary"),
+        ("Chromium", "Chromium"),
+        ("Brave", "BraveSoftware/Brave-Browser"),
+        ("Microsoft Edge", "Microsoft Edge"),
+        ("Arc", "Arc/User Data"),
+        ("Helium", "net.imput.helium"),
+        ("ego lite", "Citro Labs/ego lite"),
+    ]
+    .into_iter()
+    .map(|(browser, relative)| ChromiumRoot {
+        browser,
+        root: support.join(relative),
+    })
+    .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn diagnose_chromium_load(
     expected_path: &Path,
     configured_load_path: Option<&Path>,
     extension_id: &str,
-    chrome_root: &Path,
+    roots: &[ChromiumRoot],
 ) -> StandaloneBrowserDoctor {
-    let matches = |candidate: &Path| {
-        paths_equivalent(expected_path, candidate)
-            || configured_load_path.is_some_and(|configured| lexical_path_eq(configured, candidate))
-    };
-    if !chrome_root.is_dir() {
-        return StandaloneBrowserDoctor {
-            state: "chrome_not_found",
-            installed: true,
-            extension_id: extension_id.to_owned(),
-            expected_path: Some(expected_path.to_path_buf()),
-            configured_load_path: configured_load_path.map(Path::to_path_buf),
-            loads: Vec::new(),
-            unreadable_profiles: 0,
-            reason: None,
-        };
-    }
-
-    let mut loads = Vec::new();
-    let mut unreadable_profiles = 0;
-    let entries = match fs::read_dir(chrome_root) {
-        Ok(entries) => entries,
-        Err(error) => {
-            return doctor_not_probed(
-                Some(expected_path.to_path_buf()),
-                extension_id.to_owned(),
-                format!("cannot read Chrome profile root: {error}"),
-            );
-        }
-    };
-    for entry in entries.flatten() {
-        let profile_dir = entry.path();
-        if !profile_dir.is_dir() {
-            continue;
-        }
-        let profile = entry.file_name().to_string_lossy().to_string();
-        for filename in ["Secure Preferences", "Preferences"] {
-            let path = profile_dir.join(filename);
-            if !path.is_file() {
-                continue;
-            }
-            let prefs = match read_json(&path) {
-                Ok(prefs) => prefs,
-                Err(_) => {
-                    unreadable_profiles += 1;
-                    continue;
-                }
-            };
-            // Read only the Herdr extension's exact settings entry. Doctor must not
-            // enumerate or expose unrelated browser extensions or profile data.
-            let setting = prefs
-                .get("extensions")
-                .and_then(|value| value.get("settings"))
-                .and_then(|value| value.get(extension_id));
-            let Some(load_path) = setting
-                .and_then(|value| value.get("path"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            loads.push(ChromeExtensionLoad {
-                profile: profile.clone(),
-                path: PathBuf::from(load_path),
-                location: setting
-                    .and_then(|value| value.get("location"))
-                    .and_then(Value::as_i64),
-            });
-            break;
-        }
-    }
-
-    let state = if loads.is_empty() && unreadable_profiles > 0 {
-        "not_probed"
-    } else if loads.is_empty() {
-        "not_loaded"
-    } else if loads.iter().any(|load| !matches(&load.path)) {
-        "drift"
-    } else {
-        "pass"
-    };
-    StandaloneBrowserDoctor {
-        state,
+    let scan = scan_chromium_roots(roots, extension_id);
+    let present_roots = scan.roots.iter().filter(|root| root.present).count();
+    // A present but unreadable root is not evidence that the extension is
+    // absent, so it must not produce a confident `not_loaded`.
+    let unreadable_roots = scan
+        .roots
+        .iter()
+        .filter(|root| root.present && !root.readable)
+        .count();
+    let mut report = StandaloneBrowserDoctor {
+        state: "not_loaded",
         installed: true,
         extension_id: extension_id.to_owned(),
         expected_path: Some(expected_path.to_path_buf()),
         configured_load_path: configured_load_path.map(Path::to_path_buf),
-        loads,
-        unreadable_profiles,
-        reason: (state == "not_probed")
-            .then(|| "Chrome profile preferences could not be read".to_owned()),
+        loads: scan.loads,
+        roots: scan.roots,
+        unreadable_profiles: scan.unreadable_profiles,
+        reason: None,
+    };
+    let state = if present_roots == 0 {
+        // No known Chromium user-data root exists; the historical name is kept
+        // so existing JSON consumers do not have to learn a new state.
+        "chrome_not_found"
+    } else if report.loads.is_empty() && (report.unreadable_profiles > 0 || unreadable_roots > 0) {
+        "not_probed"
+    } else if report.loads.is_empty() {
+        "not_loaded"
+    } else if report.loads.iter().any(|load| !report.matches(&load.path)) {
+        "drift"
+    } else {
+        // Any probed Chromium root (Chrome, Chrome Beta/Canary, Chromium,
+        // Brave, Edge, Arc, Helium, ego lite) can satisfy the managed load.
+        "loaded"
+    };
+    report.state = state;
+    if state == "not_probed" {
+        report.reason = Some("Chromium browser profile preferences could not be read".to_owned());
+    }
+    report
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn scan_chromium_roots(roots: &[ChromiumRoot], extension_id: &str) -> ChromiumScan {
+    let mut scan = ChromiumScan::default();
+    for root in roots {
+        let present = root.root.is_dir();
+        let mut readable = false;
+        // A root that exists but cannot be listed is reported through
+        // `readable`; it must not hide a load found in another root, and it
+        // must not be dropped from the per-root evidence either.
+        if present && let Ok(entries) = fs::read_dir(&root.root) {
+            readable = true;
+            for entry in entries.flatten() {
+                let profile_dir = entry.path();
+                if !profile_dir.is_dir() {
+                    continue;
+                }
+                match probe_profile(&profile_dir, extension_id) {
+                    ProfileProbe::Loaded(path, location) => {
+                        scan.loads.push(ExtensionLoad {
+                            browser: root.browser.to_owned(),
+                            profile: entry.file_name().to_string_lossy().to_string(),
+                            path,
+                            location,
+                        });
+                    }
+                    ProfileProbe::Absent => {}
+                    ProfileProbe::Unreadable(files) => {
+                        scan.unreadable_profiles += files;
+                    }
+                }
+            }
+        }
+        scan.roots.push(ScannedRoot {
+            browser: root.browser.to_owned(),
+            root: root.root.clone(),
+            present,
+            readable,
+        });
+    }
+    scan
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn probe_profile(profile_dir: &Path, extension_id: &str) -> ProfileProbe {
+    let mut unreadable = 0;
+    for filename in ["Secure Preferences", "Preferences"] {
+        let path = profile_dir.join(filename);
+        if !path.is_file() {
+            continue;
+        }
+        let prefs = match read_json(&path) {
+            Ok(prefs) => prefs,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        // Read only the Herdr extension's exact settings entry. Doctor must not
+        // enumerate or expose unrelated browser extensions or profile data.
+        let setting = prefs
+            .get("extensions")
+            .and_then(|value| value.get("settings"))
+            .and_then(|value| value.get(extension_id));
+        let Some(load_path) = setting
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        return ProfileProbe::Loaded(
+            PathBuf::from(load_path),
+            setting
+                .and_then(|value| value.get("location"))
+                .and_then(Value::as_i64),
+        );
+    }
+    if unreadable > 0 {
+        ProfileProbe::Unreadable(unreadable)
+    } else {
+        ProfileProbe::Absent
     }
 }
 
@@ -344,9 +463,93 @@ fn doctor_not_probed(
         expected_path,
         configured_load_path: None,
         loads: Vec::new(),
+        roots: Vec::new(),
         unreadable_profiles: 0,
         reason: Some(reason),
     }
+}
+
+fn loaded_browsers(loads: &[ExtensionLoad]) -> Vec<String> {
+    let mut browsers: Vec<String> = Vec::new();
+    for load in loads {
+        if !browsers.contains(&load.browser) {
+            browsers.push(load.browser.clone());
+        }
+    }
+    browsers
+}
+
+fn probed_browsers(roots: &[ScannedRoot]) -> Vec<String> {
+    let mut browsers: Vec<String> = Vec::new();
+    for root in roots.iter().filter(|root| root.present) {
+        if !browsers.contains(&root.browser) {
+            browsers.push(root.browser.clone());
+        }
+    }
+    browsers
+}
+
+fn json_array(values: &[String]) -> String {
+    serde_json::to_string(values).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// Browser that already loads the standalone extension from the managed path or
+/// the recorded load path. A non-Chrome Chromium browser wins so status and
+/// install hints do not insist on Google Chrome when ego lite owns the load.
+#[cfg(any(target_os = "macos", test))]
+fn preferred_loading_browser(
+    loads: &[ExtensionLoad],
+    expected_path: &Path,
+    configured_load_path: Option<&Path>,
+) -> Option<String> {
+    let matching = loads
+        .iter()
+        .filter(|load| {
+            paths_equivalent(expected_path, &load.path)
+                || configured_load_path
+                    .is_some_and(|configured| lexical_path_eq(configured, &load.path))
+        })
+        .collect::<Vec<_>>();
+    matching
+        .iter()
+        .find(|load| load.browser != "Google Chrome")
+        .or_else(|| matching.first())
+        .map(|load| load.browser.clone())
+}
+
+fn loading_browser(
+    home: &Path,
+    extension_id: &str,
+    expected_path: &Path,
+    configured_load_path: Option<&Path>,
+) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let scan = scan_chromium_roots(&chromium_roots(home), extension_id);
+        preferred_loading_browser(&scan.loads, expected_path, configured_load_path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (home, extension_id, expected_path, configured_load_path);
+        None
+    }
+}
+
+/// `chrome://extensions` is the extension page in every Chromium browser, so
+/// the URL stays the same; the action names the browser that already loads the
+/// extension only when it is not Google Chrome.
+fn chrome_hint(loading_browser: Option<&str>, load_unpacked_path: &Path) -> Value {
+    let action = match loading_browser {
+        Some(browser) if browser != "Google Chrome" => {
+            format!("Developer mode -> Load unpacked in {browser}")
+        }
+        _ => "Developer mode -> Load unpacked".to_owned(),
+    };
+    json!({
+        "url": "chrome://extensions",
+        "action": action,
+        "load_unpacked_path": load_unpacked_path,
+    })
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
@@ -390,16 +593,22 @@ pub fn run_status() -> Result<ExitCode, String> {
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
     let installed = current.is_dir() && manifest.is_some() && key_ok;
     let (user_visible_path, load_unpacked_path) = status_load_view(&home, &current, state.as_ref());
+    let chrome = chrome_hint(
+        loading_browser(
+            &home,
+            &identity.extension_id,
+            &current,
+            Some(&load_unpacked_path),
+        )
+        .as_deref(),
+        &load_unpacked_path,
+    );
     let view = json!({
         "ok": installed,
         "installed": installed,
         "path": current,
         "user_visible_path": user_visible_path,
-        "chrome": {
-            "url": "chrome://extensions",
-            "action": "Developer mode -> Load unpacked",
-            "load_unpacked_path": load_unpacked_path,
-        },
+        "chrome": chrome,
         "extension_id": identity.extension_id,
         "manifest_key_matches": key_ok,
         "state": state,
@@ -488,6 +697,16 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         None => ensure_user_visible_alias(&home, &current),
     };
     let load_unpacked_path = preferred_load_unpacked_path(&user_visible_path, &current);
+    let chrome = chrome_hint(
+        loading_browser(
+            &home,
+            &prepared.extension_id,
+            &current,
+            Some(&load_unpacked_path),
+        )
+        .as_deref(),
+        &load_unpacked_path,
+    );
 
     let state = json!({
         "schema_version": 1,
@@ -520,11 +739,7 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         "extension_id": state["extension_id"],
         "path": current,
         "user_visible_path": user_visible_path,
-        "chrome": {
-            "url": "chrome://extensions",
-            "action": "Developer mode -> Load unpacked",
-            "load_unpacked_path": load_unpacked_path,
-        },
+        "chrome": chrome,
         "next_command": "herdr-mcp native-host use standalone",
         "note": "All Git-tracked extension/ files come from the pinned commit; manifest.json differs only by the injected standalone public key.",
     }))
@@ -1140,7 +1355,12 @@ mod tests {
         assert_eq!(installed, expected);
     }
 
-    fn write_chrome_profile(root: &Path, profile: &str, extension_id: &str, extension_path: &Path) {
+    fn write_extension_prefs(
+        root: &Path,
+        profile: &str,
+        extension_id: &str,
+        extension_path: &Path,
+    ) {
         let profile_dir = root.join(profile);
         fs::create_dir_all(&profile_dir).unwrap();
         fs::write(
@@ -1155,6 +1375,13 @@ mod tests {
         .unwrap();
     }
 
+    fn chrome_root(root: &Path) -> ChromiumRoot {
+        ChromiumRoot {
+            browser: "Google Chrome",
+            root: root.to_path_buf(),
+        }
+    }
+
     #[test]
     fn browser_doctor_detects_loaded_path_drift() {
         let root = env::temp_dir().join(format!("herdr-browser-drift-test-{}", now_ms()));
@@ -1163,12 +1390,14 @@ mod tests {
         let stale = root.join("Downloads/herdr-old/unpacked");
         fs::create_dir_all(&expected).unwrap();
         fs::create_dir_all(&stale).unwrap();
-        write_chrome_profile(&chrome, "Default", "abcdefghijklmnop", &stale);
+        write_extension_prefs(&chrome, "Default", "abcdefghijklmnop", &stale);
 
-        let report = diagnose_chrome_load(&expected, None, "abcdefghijklmnop", &chrome);
+        let report =
+            diagnose_chromium_load(&expected, None, "abcdefghijklmnop", &[chrome_root(&chrome)]);
         assert_eq!(report.state, "drift");
         assert_eq!(report.drift_count(), 1);
         assert_eq!(report.loads[0].path, stale);
+        assert_eq!(report.loads[0].browser, "Google Chrome");
         assert!(report.doctor_line().contains("chrome://extensions"));
         assert_eq!(report.as_json()["loaded"][0]["matches_expected"], false);
         let _ = fs::remove_dir_all(root);
@@ -1180,13 +1409,179 @@ mod tests {
         let chrome = root.join("Chrome");
         let expected = root.join("managed/current");
         fs::create_dir_all(&expected).unwrap();
-        write_chrome_profile(&chrome, "Profile 1", "abcdefghijklmnop", &expected);
+        write_extension_prefs(&chrome, "Profile 1", "abcdefghijklmnop", &expected);
 
-        let report = diagnose_chrome_load(&expected, None, "abcdefghijklmnop", &chrome);
-        assert_eq!(report.state, "pass");
+        let report =
+            diagnose_chromium_load(&expected, None, "abcdefghijklmnop", &[chrome_root(&chrome)]);
+        assert_eq!(report.state, "loaded");
         assert_eq!(report.drift_count(), 0);
         assert_eq!(report.as_json()["loaded"][0]["matches_expected"], true);
+        assert_eq!(report.as_json()["loaded"][0]["browser"], "Google Chrome");
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// The reported workstation runs no Google Chrome at all: ego lite is the
+    /// only Chromium browser and loads the managed unpacked extension. A fake
+    /// home that contains only `Citro Labs/ego lite` must therefore read as
+    /// loaded, labelled with that browser, not as `not_loaded`/`chrome_not_found`.
+    #[test]
+    fn browser_doctor_reports_ego_lite_managed_load_as_loaded() {
+        let root = env::temp_dir().join(format!("herdr-browser-egolite-test-{}", now_ms()));
+        let home = root.join("home");
+        let expected = root.join("managed/current");
+        fs::create_dir_all(&expected).unwrap();
+        let ego_lite = home.join("Library/Application Support/Citro Labs/ego lite");
+        write_extension_prefs(&ego_lite, "Default", "abcdefghijklmnop", &expected);
+        let roots = chromium_roots(&home);
+        assert!(
+            roots.iter().any(|root| root.browser == "ego lite"),
+            "ego lite user-data root must be probed"
+        );
+
+        let report = diagnose_chromium_load(&expected, None, "abcdefghijklmnop", &roots);
+        assert_eq!(report.state, "loaded");
+        assert_ne!(report.state, "chrome_not_found");
+        assert_eq!(report.loads.len(), 1);
+        assert_eq!(report.loads[0].browser, "ego lite");
+        assert_eq!(report.loads[0].profile, "Default");
+        assert_eq!(report.drift_count(), 0);
+        let json = report.as_json();
+        assert_eq!(json["state"], "loaded");
+        assert_eq!(json["loaded"][0]["browser"], "ego lite");
+        assert_eq!(json["loaded"][0]["profile"], "Default");
+        assert_eq!(json["loaded"][0]["matches_expected"], true);
+        // JSON stays backward compatible: existing keys and their meanings hold.
+        assert!(json["expected_path"].is_string());
+        assert!(json.get("browser_roots").is_some());
+        let line = report.doctor_line();
+        assert!(line.contains("state=loaded"), "{line}");
+        assert!(line.contains("ego lite"), "{line}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_doctor_probes_other_chromium_roots_instead_of_chrome_only() {
+        let root = env::temp_dir().join(format!("herdr-browser-notloaded-test-{}", now_ms()));
+        let home = root.join("home");
+        let expected = root.join("managed/current");
+        fs::create_dir_all(&expected).unwrap();
+        let brave = home.join("Library/Application Support/BraveSoftware/Brave-Browser");
+        write_extension_prefs(&brave, "Default", "someotherextension", &expected);
+
+        let report =
+            diagnose_chromium_load(&expected, None, "abcdefghijklmnop", &chromium_roots(&home));
+        assert_eq!(report.state, "not_loaded");
+        let line = report.doctor_line();
+        assert!(line.contains("state=not_loaded"), "{line}");
+        assert!(line.contains("Brave"), "{line}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_doctor_keeps_chrome_drift_when_another_root_is_loaded() {
+        // Per-root meaning is preserved: a healthy ego lite load must not hide
+        // drift coming from an older Chrome copy of the same extension ID.
+        let root = env::temp_dir().join(format!("herdr-browser-mixed-test-{}", now_ms()));
+        let home = root.join("home");
+        let expected = root.join("managed/current");
+        let stale = root.join("Downloads/herdr-old/unpacked");
+        fs::create_dir_all(&expected).unwrap();
+        fs::create_dir_all(&stale).unwrap();
+        let chrome = home.join("Library/Application Support/Google/Chrome");
+        let ego_lite = home.join("Library/Application Support/Citro Labs/ego lite");
+        write_extension_prefs(&chrome, "Default", "abcdefghijklmnop", &stale);
+        write_extension_prefs(&ego_lite, "Default", "abcdefghijklmnop", &expected);
+
+        let report =
+            diagnose_chromium_load(&expected, None, "abcdefghijklmnop", &chromium_roots(&home));
+        assert_eq!(report.state, "drift");
+        assert_eq!(report.drift_count(), 1);
+        assert_eq!(report.loads.len(), 2);
+        let line = report.doctor_line();
+        assert!(line.contains("state=drift"), "{line}");
+        assert!(line.contains("Google Chrome"), "{line}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_doctor_does_not_claim_not_loaded_from_an_unreadable_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = env::temp_dir().join(format!("herdr-browser-unreadable-test-{}", now_ms()));
+        let expected = root.join("managed/current");
+        let blocked = root.join("ego lite");
+        fs::create_dir_all(&expected).unwrap();
+        fs::create_dir_all(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = diagnose_chromium_load(
+            &expected,
+            None,
+            "abcdefghijklmnop",
+            &[ChromiumRoot {
+                browser: "ego lite",
+                root: blocked.clone(),
+            }],
+        );
+        assert_eq!(report.state, "not_probed");
+        assert_eq!(report.roots.len(), 1);
+        assert!(report.roots[0].present);
+        assert!(!report.roots[0].readable);
+        assert!(report.doctor_line().contains("state=not_probed"));
+
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_doctor_reports_chrome_not_found_only_without_chromium_roots() {
+        let root = env::temp_dir().join(format!("herdr-browser-absent-test-{}", now_ms()));
+        let home = root.join("home");
+        let expected = root.join("managed/current");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&expected).unwrap();
+
+        let report =
+            diagnose_chromium_load(&expected, None, "abcdefghijklmnop", &chromium_roots(&home));
+        assert_eq!(report.state, "chrome_not_found");
+        assert_eq!(report.roots.iter().filter(|root| root.present).count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standalone_status_hint_names_the_loading_browser() {
+        let load = |browser: &str, path: &Path| ExtensionLoad {
+            browser: browser.to_owned(),
+            profile: "Default".to_owned(),
+            path: path.to_path_buf(),
+            location: Some(4),
+        };
+        let managed = PathBuf::from("/managed/current");
+        let stale = PathBuf::from("/Downloads/herdr-old/unpacked");
+        let loads = vec![load("Google Chrome", &stale), load("ego lite", &managed)];
+
+        let browser = preferred_loading_browser(&loads, &managed, None);
+        assert_eq!(browser.as_deref(), Some("ego lite"));
+        let hint = chrome_hint(browser.as_deref(), &managed);
+        assert_eq!(hint["url"], "chrome://extensions");
+        assert_eq!(
+            hint["action"],
+            "Developer mode -> Load unpacked in ego lite"
+        );
+        assert_eq!(hint["load_unpacked_path"], json!(managed));
+
+        // Google Chrome keeps the historical hint untouched.
+        let chrome_only = vec![load("Google Chrome", &managed)];
+        let browser = preferred_loading_browser(&chrome_only, &managed, None);
+        assert_eq!(browser.as_deref(), Some("Google Chrome"));
+        assert_eq!(
+            chrome_hint(browser.as_deref(), &managed)["action"],
+            "Developer mode -> Load unpacked"
+        );
+        assert_eq!(
+            chrome_hint(None, &managed)["action"],
+            "Developer mode -> Load unpacked"
+        );
     }
 
     #[test]
@@ -1231,10 +1626,14 @@ mod tests {
         let recorded = reported_load_path(&home, state.as_ref());
         assert_eq!(recorded.as_deref(), Some(configured.as_path()));
 
-        write_chrome_profile(&chrome, "Default", "abcdefghijklmnop", &previous);
-        let report =
-            diagnose_chrome_load(&current, recorded.as_deref(), "abcdefghijklmnop", &chrome);
-        assert_eq!(report.state, "pass");
+        write_extension_prefs(&chrome, "Default", "abcdefghijklmnop", &previous);
+        let report = diagnose_chromium_load(
+            &current,
+            recorded.as_deref(),
+            "abcdefghijklmnop",
+            &[chrome_root(&chrome)],
+        );
+        assert_eq!(report.state, "loaded");
         assert_eq!(report.drift_count(), 0);
         let _ = fs::remove_dir_all(root);
     }
@@ -1265,11 +1664,15 @@ mod tests {
         let (_, load_unpacked_path) = status_load_view(&home, &current, state.as_ref());
         assert_eq!(load_unpacked_path, recorded);
 
-        write_chrome_profile(&chrome, "Default", "abcdefghijklmnop", &recorded);
+        write_extension_prefs(&chrome, "Default", "abcdefghijklmnop", &recorded);
         let configured = reported_load_path(&home, state.as_ref()).filter(|path| path != &current);
-        let report =
-            diagnose_chrome_load(&current, configured.as_deref(), "abcdefghijklmnop", &chrome);
-        assert_eq!(report.state, "pass");
+        let report = diagnose_chromium_load(
+            &current,
+            configured.as_deref(),
+            "abcdefghijklmnop",
+            &[chrome_root(&chrome)],
+        );
+        assert_eq!(report.state, "loaded");
         assert_eq!(report.drift_count(), 0);
         assert_eq!(
             report.as_json()["configured_load_path"],

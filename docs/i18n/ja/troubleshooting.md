@@ -241,7 +241,7 @@ ID 自体が誤っている場合は、正しい workspace に binding してく
 herdr-mcp doctor
 ```
 
-デフォルトの `doctor` 要約が standalone 拡張の読み込みパスのずれを報告した場合は、`herdr-mcp doctor --verbose` で `expected` と `actual` のパスを確認してください。機械可読の証拠は `herdr-mcp doctor --json` の `standalone_extension` にあり、Chrome profile と `drift_count` も含まれます。`chrome://extensions` を開き、Herdr を見つけ、`expected_path`（通常は `~/.config/herdr-mcp/extensions/standalone/current`）からロード/再ロードしてください。その後 `doctor` を再実行します。別の identity 問題も証明されていない限り、Native Host ownership を変更したり拡張データを削除したりしないでください。doctor probe は読み取り専用で、Chrome の preferences にある Herdr の正確な extension ID エントリだけを検査します。
+デフォルトの `doctor` 要約が standalone 拡張の読み込みパスのずれを報告した場合は、`herdr-mcp doctor --verbose` で `expected` と `actual` のパスを確認してください。機械可読の証拠は `herdr-mcp doctor --json` の `standalone_extension` にあり、由来の `browser`/`profile` と `drift_count` も含まれます。`chrome://extensions` を開き、Herdr を見つけ、`expected_path`（通常は `~/.config/herdr-mcp/extensions/standalone/current`）からロード/再ロードしてください。その後 `doctor` を再実行します。別の identity 問題も証明されていない限り、Native Host ownership を変更したり拡張データを削除したりしないでください。doctor probe は読み取り専用で、走査対象の Chromium 系ブラウザ（Google Chrome、Chrome Beta/Canary、Chromium、Brave、Edge、Arc、Helium、ego lite）の preferences にある Herdr の正確な extension ID エントリだけを検査します。
 
 ## 症状：Browser Control Center が開かない、workspace が表示されない、または Runtime unavailable のままになる
 

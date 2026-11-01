@@ -857,9 +857,9 @@ pub fn print_doctor(
             attention.push(
                 language
                     .text(
-                        "Chrome standalone extension path has drifted",
-                        "Chrome standalone 扩展加载路径已漂移",
-                        "Chrome standalone 拡張の読み込みパスがずれています",
+                        "standalone extension load path has drifted",
+                        "standalone 扩展加载路径已漂移",
+                        "standalone 拡張の読み込みパスがずれています",
                     )
                     .to_owned(),
             );
