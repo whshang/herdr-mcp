@@ -1256,12 +1256,12 @@ mod tests {
         let started = std::time::Instant::now();
         let parked =
             run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(20), || {
-                std::thread::sleep(std::time::Duration::from_millis(150));
+                std::thread::sleep(std::time::Duration::from_millis(500));
                 7_u8
             });
         assert_eq!(parked, None);
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(120),
+            started.elapsed() < std::time::Duration::from_millis(300),
             "the caller must not wait for the parked worker"
         );
         wait_for_slot(&SLOT);
@@ -1291,15 +1291,17 @@ mod tests {
         assert_eq!(parked, None, "the first call times out");
 
         // The slot is still held by the parked worker, so repeated calls return
-        // immediately instead of parking more threads.
+        // immediately instead of parking more threads. The budget is far larger
+        // than the assertion, so a slow scheduler cannot satisfy the bound by
+        // running out the clock.
         for _ in 0..8 {
             let started = std::time::Instant::now();
             assert_eq!(
-                run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(20), || 2_u8),
+                run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(500), || 2_u8),
                 None
             );
             assert!(
-                started.elapsed() < std::time::Duration::from_millis(15),
+                started.elapsed() < std::time::Duration::from_millis(100),
                 "a held slot must answer without waiting for the budget"
             );
         }
@@ -1351,6 +1353,10 @@ mod tests {
     /// Given the stable broker child that owns macOS protected-folder access
     /// When the runtime decides whether it may probe directly
     /// Then only the broker may probe; every rotating runtime generation may not.
+    ///
+    /// macOS-only: off macOS nothing is privacy-protected, so
+    /// `runtime_must_not_probe` is false for every path by design.
+    #[cfg(target_os = "macos")]
     #[test]
     fn only_the_stable_broker_may_probe_a_protected_folder() {
         let _guard = crate::test_env::lock();
@@ -1384,6 +1390,19 @@ mod tests {
                 None => std::env::remove_var("HERDR_MCP_TCC_BROKER_CHILD"),
             }
         }
+    }
+
+    /// Given a non-macOS target
+    /// When protected-path probing is evaluated
+    /// Then nothing is classified as protected and no folder is reserved, because
+    /// Documents/Desktop/Downloads privacy is a macOS-only concept.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn protected_path_probing_is_macos_only() {
+        let protected = Path::new("/Users/example/Documents/project");
+        assert!(!is_protected_user_path_lexical(protected));
+        assert!(!runtime_must_not_probe(protected));
+        assert!(!is_protected_user_path(protected));
     }
 
     #[cfg(target_os = "macos")]
