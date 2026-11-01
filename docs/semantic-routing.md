@@ -30,6 +30,12 @@ Route fields, cooldown/backoff, rate budgets, model pinning, and the confidence 
 - Unknown keys are rejected (Worker: `semantic_provider_misconfigured`; Rust: `deny_unknown_fields`).
 - Credentials never appear in status JSON, traces, logs, errors, `Debug` output, or handoff/memory files. Only the route name and model are ever reported.
 
+### Vercel AI Gateway (`decision-vercel`) is opt-in
+
+No default or recommended route pool ships a `decision-vercel` route, and the former `jev-vercel` route has been removed from the default pool ([#621](https://github.com/whshang/herdr-mcp/issues/621)). On the Vercel free tier the AI Gateway refuses every `type: "evaluation"` model (including `typesafe-ai/jev` and `liquid/d1`) with HTTP `403` `RestrictedModelsError` before contacting any provider, so such a route can never answer and only spends one attempt plus a 300s credential cooldown per sweep.
+
+The protocol itself stays fully supported in both code paths. Add a `decision-vercel` route explicitly — in `config.json` `semantic.routes` or the `HERDR_SEMANTIC_ROUTES` secret — only when the owning Vercel team has paid AI Gateway credits, verify it with one call first, and keep it after the routes that are known to answer.
+
 ## Load balancing
 
 The two paths select routes differently, on purpose.
