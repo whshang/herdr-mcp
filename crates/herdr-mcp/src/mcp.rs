@@ -5072,6 +5072,9 @@ fn browser_session_create_reconcile_uncertain_inner(
         browser_session_create_app_refusal_fields(delivery_state, &evidence);
     // A refused create must name its fixed extension reason; without it a
     // composer/readiness refusal is indistinguishable from an unknown failure.
+    // A rejection found by reconciliation reports the same shape as the first
+    // attempt, so a caller reading `delivery_evidence.error` is never left with
+    // an empty object.
     let failure = BrowserCreateFailureProjection::project(
         delivery_state,
         &evidence,
@@ -5086,6 +5089,13 @@ fn browser_session_create_reconcile_uncertain_inner(
             settled.reservation_ref
         );
     }
+    let delivery_evidence = browser_session_create_public_delivery_evidence(
+        evidence.result.as_ref(),
+        failure.evidence_error.as_deref(),
+        app_selection_probe.as_ref(),
+        failure.composer_busy_probe.as_ref(),
+        failure.hint,
+    );
     let mut value = json!({
         "ok": false,
         "code": delivery_state.as_str(),
@@ -5097,6 +5107,7 @@ fn browser_session_create_reconcile_uncertain_inner(
         "app_selection_probe": app_selection_probe,
         "replayed": replayed,
         "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
+        "delivery_evidence": delivery_evidence,
     });
     if let Some(probe) = failure.composer_busy_probe {
         value["composer_busy_probe"] = probe;
@@ -5112,6 +5123,17 @@ fn browser_session_create_reconcile_uncertain_inner(
 /// The extension observes untrusted provider state and can report arbitrary
 /// strings, so only these machine codes cross the runtime boundary. An
 /// unrecognized string is dropped, never echoed.
+///
+/// Membership does not imply the code is reachable on today's emission shape.
+/// `browser_create_content_dispatch_failed` and
+/// `browser_create_dispatch_setup_failed` are posted from the background with
+/// `rejected: false` + `command_accepted: true`, so they classify as uncertain
+/// (missing stable resource ref) and never reach this rejection projection;
+/// they are listed so a rejected emission of the same code is already covered.
+/// `browser_operation_unavailable` is emitted for operations other than
+/// `session.create` / `dispatch.submit`; it is listed because a create content
+/// script can still report it. Uncertain classification is deliberately
+/// unchanged — this list only decides how an already-rejected create is named.
 const BROWSER_CREATE_REJECTION_REASONS: &[&str] = &[
     "browser_create_composer_unavailable",
     "browser_create_composer_busy",
@@ -16394,14 +16416,19 @@ mod tests {
         assert!(result.get("hint").is_none(), "{result}");
     }
 
-    /// user webchat create | Given a fresh tab whose composer never mounted | When rejected | Then the allowlisted composer code is surfaced without a busy hint
+    /// user webchat create | Given a fresh tab whose composer never mounted | When the extension refuses with its live rejected shape | Then the fixed code is surfaced as the reason without a busy hint
     #[test]
     fn user_webchat_create_given_composer_unavailable_when_rejected_then_code_surfaced_without_hint()
      {
         let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
-        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::resource_unavailable(
-            json!({"error": "browser_create_composer_unavailable"}),
-        ));
+        // `browserRejectedEvidence` in the content script keeps the resource
+        // available and only refuses the actuation, so the live shape is a
+        // rejected create, not a resource-unavailable one.
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::rejected(json!({
+            "error": "browser_create_composer_unavailable",
+            "message_submitted": false,
+            "retry_safe": true,
+        })));
         let result = create_session_with_scripted_actuator(
             &store,
             &endpoint_ref,
@@ -16409,10 +16436,8 @@ mod tests {
             &actuator,
             "scripted-create-composer-unavailable-1",
         );
-        assert_eq!(
-            result["code"], "browser_create_composer_unavailable",
-            "{result}"
-        );
+        assert_eq!(result["code"], "rejected", "{result}");
+        assert_eq!(result["delivery_state"], "rejected", "{result}");
         assert_eq!(
             result["reason"], "browser_create_composer_unavailable",
             "{result}"
@@ -16428,7 +16453,37 @@ mod tests {
         assert!(result.get("composer_busy_probe").is_none(), "{result}");
     }
 
-    /// user webchat create | Given an uncertain first attempt and a polled rejection | When reconciliation settles rejected | Then the reconcile response names the same fixed code
+    /// user webchat create | Given a resource-unavailable create whose token is on the fixed allowlist | When projected | Then the allowlisted token is the one copied into the public evidence
+    #[test]
+    fn user_webchat_create_given_resource_unavailable_allowlisted_code_when_projected_then_evidence_error_is_filled()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::resource_unavailable(
+            json!({"error": "browser_create_content_reason_missing"}),
+        ));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-unavailable-allowlisted-1",
+        );
+        assert_eq!(
+            result["code"], "browser_create_content_reason_missing",
+            "{result}"
+        );
+        assert_eq!(
+            result["reason"], "browser_create_content_reason_missing",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["error"], "browser_create_content_reason_missing",
+            "an allowlisted token may fill the public evidence error: {result}"
+        );
+        assert!(result.get("hint").is_none(), "{result}");
+    }
+
+    /// user webchat create | Given an uncertain first attempt and a polled rejection | When reconciliation settles rejected | Then the reconcile response reports the same reason, hint and public evidence as the first attempt
     #[test]
     fn user_webchat_create_given_reconcile_rejection_when_settled_then_reason_and_hint_are_surfaced()
      {
@@ -16467,6 +16522,24 @@ mod tests {
         assert_eq!(
             result["hint"],
             "composer has existing content (possibly a restored ChatGPT draft); clear it and retry",
+            "{result}"
+        );
+        // The reconcile fallthrough must publish the same delivery evidence as
+        // the first attempt, not just the top-level fields.
+        assert_eq!(
+            result["delivery_evidence"]["error"], "browser_create_composer_busy",
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["hint"], result["hint"],
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"], result["composer_busy_probe"],
+            "{result}"
+        );
+        assert_eq!(
+            result["delivery_evidence"]["composer_busy_probe"]["input_has_content"], true,
             "{result}"
         );
     }
