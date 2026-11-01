@@ -530,13 +530,22 @@ pub enum ServiceCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateCommand {
-    Check { manifest_url: Option<String> },
-    Apply { manifest_url: Option<String> },
+    Check {
+        manifest_url: Option<String>,
+    },
+    /// `with_worker` opts into the separate fleet Worker update; it is only
+    /// admitted from an interactive TTY, so runtime-only stays the default.
+    Apply {
+        manifest_url: Option<String>,
+        with_worker: bool,
+    },
     MajorApply,
     MajorRollback,
     Auto,
     Status,
-    Worker { job_id: String },
+    Worker {
+        job_id: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2704,13 +2713,11 @@ fn parse_update(args: &[String]) -> Result<Command, String> {
                 manifest_url: Some(value.clone()),
             }))
         }
-        [subcommand] if subcommand == "apply" => {
-            Ok(Command::Update(UpdateCommand::Apply { manifest_url: None }))
-        }
-        [subcommand, flag, value] if subcommand == "apply" && flag == "--manifest" => {
-            Ok(Command::Update(UpdateCommand::Apply {
-                manifest_url: Some(value.clone()),
-            }))
+        [subcommand, rest @ ..] if subcommand == "apply" => parse_update_apply(rest),
+        [flag, rest @ ..] if flag == "--with-worker" || flag == "--manifest" => {
+            let mut flags = vec![flag.clone()];
+            flags.extend(rest.iter().cloned());
+            parse_update_apply(&flags)
         }
         [subcommand] if subcommand == "major-apply" => {
             Ok(Command::Update(UpdateCommand::MajorApply))
@@ -2725,11 +2732,46 @@ fn parse_update(args: &[String]) -> Result<Command, String> {
                 job_id: value.clone(),
             }))
         }
-        [] => Ok(Command::Update(UpdateCommand::Apply { manifest_url: None })),
+        [] => Ok(Command::Update(UpdateCommand::Apply {
+            manifest_url: None,
+            with_worker: false,
+        })),
         [subcommand, ..] => Err(format!(
             "invalid update command or arguments for '{subcommand}'"
         )),
     }
+}
+
+fn parse_update_apply(args: &[String]) -> Result<Command, String> {
+    let mut manifest_url = None;
+    let mut with_worker = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--with-worker" => {
+                if with_worker {
+                    return Err("duplicate --with-worker flag".to_owned());
+                }
+                with_worker = true;
+                index += 1;
+            }
+            "--manifest" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--manifest requires a URL".to_owned())?;
+                if manifest_url.is_some() {
+                    return Err("duplicate --manifest flag".to_owned());
+                }
+                manifest_url = Some(value.clone());
+                index += 2;
+            }
+            flag => return Err(format!("invalid update apply argument '{flag}'")),
+        }
+    }
+    Ok(Command::Update(UpdateCommand::Apply {
+        manifest_url,
+        with_worker,
+    }))
 }
 
 fn parse_native_host(args: &[String]) -> Result<Command, String> {
@@ -2951,7 +2993,9 @@ User path:\n\
   herdr-mcp automation list\n\
   herdr-mcp automation rotate <client-id> --confirm\n\
   herdr-mcp automation revoke <client-id> --confirm\n\
-  herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|major-apply|major-rollback|auto|status]\n\
+  herdr-mcp update [check [--manifest URL]|apply [--manifest URL] [--with-worker]|major-apply|major-rollback|auto|status]\n\
+      apply updates the Runtime only; Worker updates stay a separate operator-run `herdr-mcp worker update`.\n\
+      --with-worker chains that Worker update, but only from an interactive terminal.\n\
   herdr-mcp extension standalone <install [--ref REF] [--path PATH]|status>\n\
   herdr-mcp rollback  (macOS product rollback; Linux service rollback is not exposed)\n\
   herdr-mcp reinstall  (macOS product lifecycle; Linux repair uses herdr-mcp install)\n\
@@ -3068,6 +3112,9 @@ commands require an enrolled-device credential.\n\n\
       temporary Cloudflare authorization. It preserves Worker identity, Durable\n\
       Objects, secrets, optional artifact R2, public OAuth origin, devices and\n\
       Connectors; it never changes DNS.\n\
+      This is a separate operator-run step: `herdr-mcp update apply` updates the\n\
+      Runtime only and reports worker_update_required instead of starting it.\n\
+      Pass `update apply --with-worker` to chain it from an interactive terminal.\n\
 \n\
   herdr-mcp device list\n      Lists the non-secret enrolled-device inventory and local Link/runtime\n      alignment. herdr-mcp worker list is a compatibility alias.\n\n\
   herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]\n      Creates a pairing address for another computer to enroll. --recover-device\n      binds a one-time recovery pairing to an existing active device and preserves\n      its immutable device_id.\n\n  herdr-mcp worker credential-repair prepare\n      Advanced headless recovery on the broken device: generates/stages a new\n      local device secret and prints only its SHA-256 verifier, never the secret.\n\n  herdr-mcp worker credential-repair apply <device-id> <sha256-verifier> --confirm\n      Run from another enrolled fleet-admin device. Rebinds only the target\n      device verifier; the target device secret never crosses machines.\n\n  herdr-mcp worker credential-repair finalize --confirm\n      Run back on the repaired device. Commits the staged local secret, explicitly\n      switches the owned production Link to the device-specific credential service,\n      verifies launchd convergence, then deletes staging.\n\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n      Enrolls this machine on macOS, Linux, or Windows; uses the platform credential store and reads the 6-digit code from an\n      interactive or stdin prompt, never argv.\n\n  herdr-mcp device rename <name>\n      Renames the current enrolled device.\n\n  herdr-mcp device revoke <device-id> --confirm\n      Revokes the given enrolled device id.\n"
@@ -4895,9 +4942,46 @@ mod tests {
         assert!(parse(args(&["install", "--adopt-node"])).is_err());
         assert_eq!(
             parse(args(&["update"])).unwrap().command,
-            Command::Update(UpdateCommand::Apply { manifest_url: None })
+            Command::Update(UpdateCommand::Apply {
+                manifest_url: None,
+                with_worker: false,
+            })
+        );
+        assert_eq!(
+            parse(args(&["update", "apply", "--with-worker"]))
+                .unwrap()
+                .command,
+            Command::Update(UpdateCommand::Apply {
+                manifest_url: None,
+                with_worker: true,
+            })
+        );
+        assert_eq!(
+            parse(args(&["update", "--with-worker"])).unwrap().command,
+            Command::Update(UpdateCommand::Apply {
+                manifest_url: None,
+                with_worker: true,
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "update",
+                "apply",
+                "--manifest",
+                "https://example.test/runtime-manifest.json",
+                "--with-worker",
+            ]))
+            .unwrap()
+            .command,
+            Command::Update(UpdateCommand::Apply {
+                manifest_url: Some("https://example.test/runtime-manifest.json".to_owned()),
+                with_worker: true,
+            })
         );
         assert!(parse(args(&["update", "apply", "--force"])).is_err());
+        assert!(parse(args(&["update", "apply", "--with-worker", "--with-worker"])).is_err());
+        assert!(parse(args(&["update", "apply", "--manifest"])).is_err());
+        assert!(parse(args(&["update", "check", "--with-worker"])).is_err());
         assert!(parse(args(&["native-host"])).is_err());
         assert!(parse(args(&["native-host", "legacy"])).is_err());
         assert!(parse(args(&["native-host", "dev", "disable", "extra"])).is_err());
