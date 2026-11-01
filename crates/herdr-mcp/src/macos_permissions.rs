@@ -97,6 +97,11 @@ pub(crate) fn runtime_must_not_probe(path: &Path) -> bool {
 }
 
 /// Outcome of a bounded real-path resolution.
+///
+/// macOS-only by construction: the rotating runtime only bounds a resolution
+/// that macOS may gate behind a consent prompt, so no other target compiles
+/// this decision path at all.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoundedRealPath {
     Resolved(PathBuf),
@@ -134,16 +139,6 @@ pub(crate) fn bounded_real_path(path: &Path) -> BoundedRealPath {
         }
         Some(Err(_)) => BoundedRealPath::Failed,
         None => BoundedRealPath::TimedOut,
-    }
-}
-
-#[cfg(not(any(target_os = "macos", test)))]
-#[allow(dead_code, reason = "protected-path probing is macOS-only")]
-pub(crate) fn bounded_real_path(path: &Path) -> BoundedRealPath {
-    match std::fs::canonicalize(path) {
-        Ok(resolved) => BoundedRealPath::Resolved(resolved),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BoundedRealPath::NotFound,
-        Err(_) => BoundedRealPath::Failed,
     }
 }
 
