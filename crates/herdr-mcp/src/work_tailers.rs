@@ -324,7 +324,15 @@ fn scopes(roots: &[PathBuf], project_refs: &BTreeMap<PathBuf, String>) -> Vec<Sc
                 .cloned()
                 .unwrap_or_else(|| display.clone()),
             worktree: display,
-            match_root: fs::canonicalize(root).unwrap_or_else(|_| root.clone()),
+            // A pane root under macOS Documents/Desktop/Downloads is never
+            // resolved in-process: a pending consent prompt would park this
+            // tailer behind the prompt. The lexical root is enough for scope
+            // matching, and the stable broker remains the only TCC client.
+            match_root: if crate::macos_permissions::runtime_must_not_probe(root) {
+                root.clone()
+            } else {
+                fs::canonicalize(root).unwrap_or_else(|_| root.clone())
+            },
         });
     }
     result.sort_by_key(|scope| std::cmp::Reverse(scope.match_root.components().count()));

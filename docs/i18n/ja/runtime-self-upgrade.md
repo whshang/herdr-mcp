@@ -342,6 +342,59 @@ herdr-link / runtime generation
 - rollback の前後に実際の Git/Agent/サービスの状態を確認する
 - contract migration と domain の mutation は通常の self-update 操作ではない
 
+## アップグレード後：macOS のプロンプトと旧 Worker のメッセージ
+
+1.1 への最初のアップデート時、およびそれ以降のすべてのアップデートで、運用担当は
+次の 2 つに遭遇します。
+
+**一度だけ表示される macOS「書類」アクセスのプロンプト。** runtime の更新は毎回
+`runtime/generations/rust-<sha256>/` に新しい世代のバイナリを配置します。署名されて
+いないバイナリは macOS 上で新しいプライバシー（TCC）ID になるため、新しい世代の
+ために `~/Documents`、`~/Desktop`、`~/Downloads` へアクセスする最初の機会に一度だけ
+確認されます：
+
+```text
+"herdr-mcp" would like to access files in your Documents folder.
+```
+
+**Allow** をクリックしてください。他に必要な操作はなく、その許可はその世代に対して
+有効です。runtime の暗黙的な経路はこれらのフォルダに一切触れなくなりました。経路の
+分類は純粋な字句比較であり（APFS は大文字小文字を区別しないため、比較も区別しません）、
+プロジェクト探索や work-tailer の scope は保護フォルダを走査せずにスキップし、保護
+された読み書き・Git メタデータ・コマンドは安定した broker
+（`HERDR_MCP_TCC_BROKER=1`）、またはそのフォルダを既に所有している Herdr pane を
+経由します。プロンプトに到達し得るのはシンボリックリンクのフォールバック解決だけで、
+それは有界なので 1 つの応答が劣化するだけで制御経路を塞ぎません。したがって保留中の
+プロンプトが無関係な制御リクエストを止めることはなくなりました。その保護フォルダを
+実際に読む必要があるアクセスは、プロンプトに回答するまで待機し、`herdr-mcp doctor`
+が最終状態を報告します。更新結果には `macos_documents_tcc_prompt` の通知も含まれる
+ため、無人アップデートが制御プレーンの障害と誤認されることはありません。
+
+**`v1.1.0-rc.8` 以前の updater は `ok: false` を返します。** それらの updater は
+独立した fleet Worker のリリースを runtime の結果に連結していたため、Worker の認証
+情報や reconcile に問題があると、runtime の更新がコミットされヘルスゲートも通過して
+いても `ok: false` と `update_succeeded_worker_update_required` で終了しました。これは
+想定された動作であり、アップグレードの失敗ではありません。まず runtime を確認して
+ください：
+
+```bash
+herdr-mcp --version
+herdr-mcp update status
+herdr-mcp doctor
+```
+
+`update status` は記録された runtime ジョブを `runtime_outcome` として分類するため、
+記録された detail に旧 Worker の文言が残っていても、成功した runtime は成功として
+報告されます。fleet Worker の更新は独立した明示的な運用担当の手順です：
+
+```bash
+herdr-mcp worker update
+```
+
+`v1.1.0-rc.9` 以降、`update apply` は runtime のみを更新します。Worker の遅れは致命的
+でない `worker_update_required` 通知（`next_action: herdr-mcp worker update` 付き）と
+なり、トップレベルの結果は `ok: true` のままです。
+
 ## 受け入れ基準
 
 A/B アップグレードの成功が証明するものは次のとおりです。
