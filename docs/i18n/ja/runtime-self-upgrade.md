@@ -349,23 +349,26 @@ herdr-link / runtime generation
 
 **一度だけ表示される macOS「書類」アクセスのプロンプト。** runtime の更新は毎回
 `runtime/generations/rust-<sha256>/` に新しい世代のバイナリを配置します。署名されて
-いないバイナリは macOS 上で新しいプライバシー（TCC）ID になるため、新しい世代が
-最初に `~/Documents`、`~/Desktop`、`~/Downloads` へアクセスしたときに一度だけ確認
-されます：
+いないバイナリは macOS 上で新しいプライバシー（TCC）ID になるため、新しい世代の
+ために `~/Documents`、`~/Desktop`、`~/Downloads` へアクセスする最初の機会に一度だけ
+確認されます：
 
 ```text
 "herdr-mcp" would like to access files in your Documents folder.
 ```
 
 **Allow** をクリックしてください。他に必要な操作はなく、その許可はその世代に対して
-有効です。更新後の runtime 自身は TCC クライアントではありません。保護された読み
-書き、Git メタデータ、コマンドは安定した broker（`HERDR_MCP_TCC_BROKER=1`）、また
-はそのフォルダを既に所有している Herdr pane を経由し、保護フォルダへの暗黙的な
-プローブは完全にスキップされます。実際にプロンプトに到達したプローブは有界なので、
-1 つの機能が `macos_tcc_access_blocked` を返すだけで、制御経路全体が停止することは
-ありません。プロンプトに答えてから再試行してください。`herdr-mcp doctor` が最終状態
-を報告します。更新結果には `macos_documents_tcc_prompt` の通知も含まれるため、無人
-アップデートが制御プレーンの障害と誤認されることはありません。
+有効です。runtime の暗黙的な経路はこれらのフォルダに一切触れなくなりました。経路の
+分類は純粋な字句比較であり（APFS は大文字小文字を区別しないため、比較も区別しません）、
+プロジェクト探索や work-tailer の scope は保護フォルダを走査せずにスキップし、保護
+された読み書き・Git メタデータ・コマンドは安定した broker
+（`HERDR_MCP_TCC_BROKER=1`）、またはそのフォルダを既に所有している Herdr pane を
+経由します。プロンプトに到達し得るのはシンボリックリンクのフォールバック解決だけで、
+それは有界なので 1 つの応答が劣化するだけで制御経路を塞ぎません。したがって保留中の
+プロンプトが無関係な制御リクエストを止めることはなくなりました。その保護フォルダを
+実際に読む必要があるアクセスは、プロンプトに回答するまで待機し、`herdr-mcp doctor`
+が最終状態を報告します。更新結果には `macos_documents_tcc_prompt` の通知も含まれる
+ため、無人アップデートが制御プレーンの障害と誤認されることはありません。
 
 **`v1.1.0-rc.8` 以前の updater は `ok: false` を返します。** それらの updater は
 独立した fleet Worker のリリースを runtime の結果に連結していたため、Worker の認証

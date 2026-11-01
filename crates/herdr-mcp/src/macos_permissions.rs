@@ -87,61 +87,63 @@ pub(crate) fn is_protected_user_path_lexical(path: &Path) -> bool {
 /// Whether the rotating runtime must treat `path` as off-limits for direct
 /// filesystem probing.
 ///
-/// The stable TCC broker child is the authorized client for these folders, so
-/// it may probe them; every other process in a runtime generation must not.
-/// Callers use this to *avoid* the access entirely (skip the probe and delegate)
-/// rather than to bound it, because avoidance is what keeps a pending consent
-/// prompt from wedging the control path.
+/// The stable broker child is the authorized client for these folders, so it
+/// may probe them; every other process in a runtime generation must not.
+/// Callers use this to *avoid* the access entirely (skip the probe and
+/// delegate), because avoidance is what keeps a pending consent prompt from
+/// parking the control path.
 pub(crate) fn runtime_must_not_probe(path: &Path) -> bool {
-    is_protected_user_path_lexical(path) && !crate::tcc_broker::is_authorized_protected_client()
+    is_protected_user_path_lexical(path) && !crate::tcc_broker::is_broker_child_process()
 }
 
 /// Outcome of a bounded real-path resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoundedRealPath {
     Resolved(PathBuf),
+    /// The path does not exist (`ENOENT`).
+    NotFound,
+    /// Resolution failed for a reason other than "not found" (permission
+    /// denied, symlink loop, I/O error). Callers must treat this as a hard
+    /// deny and never as "does not exist".
+    Failed,
     /// macOS is showing (or ignoring) a consent prompt; nothing was read.
     TimedOut,
-    /// The path does not exist or cannot be resolved for another reason.
-    NotFound,
 }
 
-/// Resolve a real path without letting a pending macOS consent prompt block
-/// the caller.
+/// Resolve a real path without letting a pending macOS consent prompt park the
+/// caller.
 ///
-/// A blocked consent prompt parks the syscall inside the worker thread, which
-/// cannot be cancelled. The caller therefore gets `TimedOut` and must fail
-/// closed; the worker stays parked until the operator answers the prompt. A
-/// sticky latch makes later probes return immediately instead of parking one
-/// more thread behind the same unanswered prompt.
+/// At most one worker may be parked behind the prompt at a time: the in-flight
+/// flag is taken before spawning and released by the worker itself, so it stays
+/// held for as long as the syscall stays blocked. Later callers get
+/// [`BoundedRealPath::TimedOut`] immediately instead of parking another thread,
+/// and resolution resumes on its own once the operator answers the prompt.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn bounded_real_path(path: &Path) -> BoundedRealPath {
     #[cfg(test)]
     REAL_PATH_PROBES.with(|count| count.set(count.get() + 1));
-    if protected_probe_cooling_down() {
-        return BoundedRealPath::TimedOut;
-    }
     let probe_path = path.to_path_buf();
-    match run_probe_bounded(PROTECTED_REALPATH_BUDGET, move || {
-        std::fs::canonicalize(&probe_path)
-    }) {
+    match run_exclusive_probe_bounded(
+        &PROTECTED_PROBE_IN_FLIGHT,
+        PROTECTED_REALPATH_BUDGET,
+        move || std::fs::canonicalize(&probe_path),
+    ) {
         Some(Ok(resolved)) => BoundedRealPath::Resolved(resolved),
-        Some(Err(_)) => BoundedRealPath::NotFound,
-        None => {
-            PROTECTED_PROBE_RETRY_AFTER_MS.store(
-                now_ms_since_start() + PROTECTED_PROBE_COOLDOWN.as_millis() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            BoundedRealPath::TimedOut
+        Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            BoundedRealPath::NotFound
         }
+        Some(Err(_)) => BoundedRealPath::Failed,
+        None => BoundedRealPath::TimedOut,
     }
 }
 
 #[cfg(not(any(target_os = "macos", test)))]
+#[allow(dead_code, reason = "protected-path probing is macOS-only")]
 pub(crate) fn bounded_real_path(path: &Path) -> BoundedRealPath {
     match std::fs::canonicalize(path) {
         Ok(resolved) => BoundedRealPath::Resolved(resolved),
-        Err(_) => BoundedRealPath::NotFound,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BoundedRealPath::NotFound,
+        Err(_) => BoundedRealPath::Failed,
     }
 }
 
@@ -150,32 +152,14 @@ pub(crate) fn bounded_real_path(path: &Path) -> BoundedRealPath {
 #[cfg(any(target_os = "macos", test))]
 const PROTECTED_REALPATH_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Cool-down window after one probe timed out on an unanswered consent prompt.
+/// Exactly one consent-gated probe worker may be parked at a time.
 ///
-/// Without it, every later request would park one more worker thread behind the
-/// same prompt. With it, at most one probe is parked per window, and a path
-/// becomes resolvable again on its own once the operator clicks Allow.
+/// It is taken before the worker is spawned and released by the worker when the
+/// syscall returns, so a prompt that stays up for minutes cannot accumulate one
+/// parked thread per request (or per retry window).
 #[cfg(any(target_os = "macos", test))]
-const PROTECTED_PROBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Monotonic "do not probe before" deadline in milliseconds since process start.
-#[cfg(any(target_os = "macos", test))]
-static PROTECTED_PROBE_RETRY_AFTER_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(any(target_os = "macos", test))]
-fn protected_probe_cooling_down() -> bool {
-    now_ms_since_start() < PROTECTED_PROBE_RETRY_AFTER_MS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn now_ms_since_start() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
-}
+static PROTECTED_PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // Test-only count of real-path probes started by the calling thread. It exists
 // so a test can prove that a lexically protected path is decided without any
@@ -187,20 +171,35 @@ thread_local! {
 
 /// Run `probe` on a worker thread and give up after `budget`.
 ///
-/// The worker is detached on timeout: a consent-blocked syscall has no
-/// cancellation path, so waiting for it would defeat the bound.
+/// `in_flight` is the single-worker reservation: when it is already held, a
+/// worker is parked in a consent-gated syscall and no second one is started.
+/// The reservation is released by the worker, never by the caller, so a caller
+/// that times out leaves the slot held until the parked syscall really returns.
+/// The worker is detached on timeout because a consent-blocked syscall has no
+/// cancellation path.
 #[cfg(any(target_os = "macos", test))]
-fn run_probe_bounded<T: Send + 'static>(
+fn run_exclusive_probe_bounded<T: Send + 'static>(
+    in_flight: &'static std::sync::atomic::AtomicBool,
     budget: std::time::Duration,
     probe: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
+    use std::sync::atomic::Ordering;
+
+    if in_flight.swap(true, Ordering::AcqRel) {
+        return None;
+    }
     let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("herdr-tcc-probe".to_owned())
         .spawn(move || {
-            let _ = sender.send(probe());
-        })
-        .ok()?;
+            let value = probe();
+            in_flight.store(false, Ordering::Release);
+            let _ = sender.send(value);
+        });
+    if spawned.is_err() {
+        in_flight.store(false, Ordering::Release);
+        return None;
+    }
     receiver.recv_timeout(budget).ok()
 }
 
@@ -241,7 +240,38 @@ pub(crate) fn project_path_needs_protected_transport(path: &Path) -> bool {
 pub(crate) fn is_protected_user_path_lexical_for_home(path: &Path, home: &Path) -> bool {
     protected_root_spellings(home)
         .iter()
-        .any(|protected| path.starts_with(protected))
+        .any(|protected| starts_with_protected(path, protected))
+}
+
+/// Whether `candidate` starts with `root`, comparing case-insensitively on
+/// macOS.
+///
+/// APFS is case-insensitive by default, so `~/documents/project` names the same
+/// folder as `~/Documents/project`. A case-sensitive miss would send a
+/// protected path down the direct-probe branch, so the comparison here stays
+/// fail-closed instead.
+#[cfg(any(target_os = "macos", test))]
+fn starts_with_protected(candidate: &Path, root: &Path) -> bool {
+    if candidate.starts_with(root) {
+        return true;
+    }
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let mut candidate_components = candidate.components();
+    for root_component in root.components() {
+        let Some(candidate_component) = candidate_components.next() else {
+            return false;
+        };
+        if !candidate_component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&root_component.as_os_str().to_string_lossy())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Every spelling of the three privacy-protected folders: the `$HOME` spelling
@@ -271,25 +301,32 @@ fn is_protected_user_path_for_home(path: &Path, home: &Path) -> bool {
         return true;
     }
 
-    // A lexical path outside the protected folders may still traverse a
-    // symlink whose real target is inside Documents/Desktop/Downloads. Route
-    // by the real path before choosing native execution so the rotating Rust
-    // runtime never accidentally becomes the TCC client. The resolution is
-    // bounded: a path macOS has to authorize must never park the caller for
-    // the duration of a prompt. Anything unresolved or slow fails closed to
-    // the protected-path transport, because a false native classification is
-    // the unsafe outcome here.
-    let resolved_path = match bounded_real_path(path) {
-        BoundedRealPath::Resolved(path) => path,
-        BoundedRealPath::TimedOut | BoundedRealPath::NotFound => return true,
+    // A candidate outside those spellings may still traverse a symlink into
+    // one. Resolve the *candidate* under a bound and compare the result against
+    // the lexical protected spellings only. The protected folders themselves
+    // are never canonicalized: that stat is exactly the access macOS gates
+    // behind the consent prompt, and doing it here is what parked the control
+    // path on every fresh runtime generation.
+    let resolved = match bounded_real_path(path) {
+        BoundedRealPath::Resolved(resolved) => resolved,
+        // Fail closed: a pending prompt, a permission error, a symlink loop or
+        // a missing path all mean "this cannot be proven unprotected".
+        BoundedRealPath::TimedOut | BoundedRealPath::Failed | BoundedRealPath::NotFound => {
+            return true;
+        }
     };
-    protected_root_spellings(home).into_iter().any(|protected| {
-        let resolved_protected = match bounded_real_path(&protected) {
-            BoundedRealPath::Resolved(path) => path,
-            BoundedRealPath::TimedOut | BoundedRealPath::NotFound => protected,
-        };
-        resolved_path.starts_with(resolved_protected)
-    })
+    if is_protected_user_path_lexical_for_home(&resolved, home) {
+        return true;
+    }
+    // The resolved candidate may be spelled through `/private` (temp dirs) or
+    // the Data-volume firmlink while HOME is not, so compare against the
+    // spellings of the canonical HOME too. HOME is never privacy-protected, so
+    // resolving it cannot raise a consent prompt; if it cannot be resolved the
+    // answer stays fail-closed.
+    match std::fs::canonicalize(home) {
+        Ok(canonical_home) => is_protected_user_path_lexical_for_home(&resolved, &canonical_home),
+        Err(_) => true,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -957,27 +994,6 @@ fn tcc_blocked_value(path: &Path, message: String) -> Value {
     })
 }
 
-/// A gate result for a protected path whose bounded probe gave up because the
-/// macOS consent prompt is still pending.
-///
-/// This is a fail-closed answer, not a failure of the machine: the same request
-/// succeeds once the operator answers the prompt (or once the stable broker
-/// serves it), and every other feature keeps working in the meantime.
-pub(crate) fn tcc_probe_pending_value(path: &Path) -> Value {
-    #[cfg(any(target_os = "macos", test))]
-    let hint = HINT_TIMEOUT;
-    #[cfg(not(any(target_os = "macos", test)))]
-    let hint = HINT_UNKNOWN;
-    json!({
-        "ok": false,
-        "code": "macos_tcc_access_blocked",
-        "reason": "macos_tcc_access_blocked",
-        "path": path.to_string_lossy(),
-        "message": "protected-path probe timed out while the macOS consent prompt is pending",
-        "hint": hint,
-    })
-}
-
 fn broker_update_available(config_dir: &Path) -> bool {
     tcc_broker::upgrade_status(config_dir).update_available
 }
@@ -1241,21 +1257,100 @@ mod tests {
     /// Then the caller gives up on its own budget instead of waiting for it.
     #[test]
     fn bounded_probe_returns_without_waiting_for_a_parked_syscall() {
+        static SLOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let started = std::time::Instant::now();
-        let parked = run_probe_bounded(std::time::Duration::from_millis(20), || {
-            std::thread::sleep(std::time::Duration::from_millis(400));
-            7_u8
-        });
+        let parked =
+            run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(20), || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                7_u8
+            });
         assert_eq!(parked, None);
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(300),
+            started.elapsed() < std::time::Duration::from_millis(120),
             "the caller must not wait for the parked worker"
         );
-        // A probe that finishes inside the budget still returns its value.
+        wait_for_slot(&SLOT);
+
+        // A probe that finishes inside the budget still returns its value, and
+        // it releases the slot for the next caller.
         assert_eq!(
-            run_probe_bounded(std::time::Duration::from_millis(500), || 7_u8),
+            run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(500), || 7_u8),
             Some(7)
         );
+        wait_for_slot(&SLOT);
+    }
+
+    /// Given one probe already parked in a consent-gated syscall
+    /// When more probes are requested
+    /// Then no second worker is started and the slot stays held until the parked
+    /// syscall really returns.
+    #[test]
+    fn only_one_probe_worker_is_ever_parked() {
+        static SLOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let parked =
+            run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(20), move || {
+                let _ = released.recv();
+                1_u8
+            });
+        assert_eq!(parked, None, "the first call times out");
+
+        // The slot is still held by the parked worker, so repeated calls return
+        // immediately instead of parking more threads.
+        for _ in 0..8 {
+            let started = std::time::Instant::now();
+            assert_eq!(
+                run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(20), || 2_u8),
+                None
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(15),
+                "a held slot must answer without waiting for the budget"
+            );
+        }
+
+        // Once the parked syscall returns, the slot frees itself.
+        release.send(()).unwrap();
+        wait_for_slot(&SLOT);
+        assert_eq!(
+            run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(500), || 3_u8),
+            Some(3)
+        );
+        wait_for_slot(&SLOT);
+    }
+
+    /// APFS is case-insensitive by default, so a case-variant spelling names the
+    /// same protected folder and must never reach the direct-probe branch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn protected_path_detection_is_case_insensitive_on_macos() {
+        let home = Path::new("/Users/example");
+        for protected in [
+            "/Users/example/documents/project",
+            "/Users/example/DESKTOP/report.md",
+            "/Users/example/downloads/artifact.zip",
+            "/Users/example/DocuMents/project",
+        ] {
+            assert!(
+                is_protected_user_path_lexical_for_home(Path::new(protected), home),
+                "{protected} names a protected folder on a case-insensitive volume"
+            );
+        }
+        assert!(!is_protected_user_path_lexical_for_home(
+            Path::new("/Users/example/code/project"),
+            home
+        ));
+    }
+
+    fn wait_for_slot(slot: &std::sync::atomic::AtomicBool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while slot.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the probe worker never released its slot"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// Given the stable broker child that owns macOS protected-folder access

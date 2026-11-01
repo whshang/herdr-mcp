@@ -393,18 +393,20 @@ herdr-link / active runtime generation
 
 **一次性的 macOS “文稿” 授权弹窗。** 每次 runtime 更新都会在
 `runtime/generations/rust-<sha256>/` 下安装新一代二进制。未签名的二进制在
-macOS 上是一个新的隐私（TCC）身份，因此新一代第一次访问 `~/Documents`、
+macOS 上是一个新的隐私（TCC）身份，因此代表新一代去访问 `~/Documents`、
 `~/Desktop` 或 `~/Downloads` 时会询问一次权限：
 
 ```text
 "herdr-mcp" would like to access files in your Documents folder.
 ```
 
-点击 **Allow** 即可，不需要其他操作，该授权对这一代二进制持续有效。更新后的
-runtime 本身不是 TCC 客户端：受保护的读、写、Git 元数据与命令都经过稳定的
-broker（`HERDR_MCP_TCC_BROKER=1`）或已经拥有该目录权限的 Herdr pane，对受保护
-目录的隐式探测会被完整跳过。真正触达弹窗的那次探测是有界的，因此只会让某一个
-功能返回 `macos_tcc_access_blocked`，不会把整条控制链路卡住。回答弹窗后重试即可，
+点击 **Allow** 即可，不需要其他操作，该授权对这一代二进制持续有效。runtime 的
+隐式路径已经完全不再触碰这些目录：路径归类是纯词法比较（因为 APFS 大小写不敏感，
+所以也不区分大小写），项目发现与 work-tailer scope 会跳过受保护目录而不是去探测它，
+受保护的读、写、Git 元数据与命令都经过稳定的 broker（`HERDR_MCP_TCC_BROKER=1`）
+或已经拥有该目录权限的 Herdr pane。唯一仍可能触达弹窗的是符号链接回退解析，而它是
+有界的，因此只会让那一次判断降级，不会把控制链路卡住。所以待处理的弹窗不再拖住
+无关的控制请求；真正需要读取该受保护目录的访问仍会等到弹窗被回答，
 `herdr-mcp doctor` 会报告最终状态。更新结果里还会带一条
 `macos_documents_tcc_prompt` 提示，避免无人值守的升级被误判为控制面故障。
 
@@ -428,8 +430,8 @@ herdr-mcp worker update
 ```
 
 从 `v1.1.0-rc.9` 起 `update apply` 只更新 runtime：Worker 落后只是一条非致命的
-`worker_update_required` 提示，带 `next_action: herdr-mcp worker update`，顶层结果仍为
-`ok: true`。
+`worker_update_required` 提示，带 `next_action: herdr-mcp worker update`，顶层结果
+仍为 `ok: true`。
 
 ## 验收标准
 

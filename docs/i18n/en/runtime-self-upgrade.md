@@ -349,22 +349,26 @@ Two things operators meet on the first update to 1.1, and after every update.
 **The one-time macOS Documents prompt.** Every runtime update installs a new
 generation binary under `runtime/generations/rust-<sha256>/`. An unsigned binary
 is a new macOS privacy (TCC) identity, so the first `~/Documents`, `~/Desktop` or
-`~/Downloads` access of the new generation asks for permission once:
+`~/Downloads` access made on behalf of the new generation asks for permission
+once:
 
 ```text
 "herdr-mcp" would like to access files in your Documents folder.
 ```
 
 Click **Allow**. Nothing else is needed, and the grant holds for that generation.
-The updated runtime is not itself the TCC client: protected reads, writes, Git
-metadata and commands go through the stable broker (`HERDR_MCP_TCC_BROKER=1`) or
-through the Herdr pane that already owns the folder, and implicit probes of a
-protected folder are skipped entirely. A probe that does reach the prompt is
-bounded, so one feature returns `macos_tcc_access_blocked` instead of stalling
-the whole control path. Answer the prompt and retry; `herdr-mcp doctor` reports
-the resulting state. The update result also carries a
-`macos_documents_tcc_prompt` notice, so an unattended update is not mistaken for
-a control-plane failure.
+Implicit runtime paths no longer touch those folders at all: classifying a path
+is a pure lexical comparison (case-insensitive, because APFS is), project
+discovery and work-tailer scopes skip a protected folder instead of probing it,
+and protected reads, writes, Git metadata and commands go through the stable
+broker (`HERDR_MCP_TCC_BROKER=1`) or through the Herdr pane that already owns the
+folder. The only resolution that can still reach the prompt is the symlink
+fallback, which is bounded, so it degrades one answer instead of parking the
+control path. A pending prompt therefore no longer stalls unrelated control
+requests; an access that must really read that protected folder still waits
+until the prompt is answered, and `herdr-mcp doctor` reports the resulting state.
+The update result also carries a `macos_documents_tcc_prompt` notice, so an
+unattended update is not mistaken for a control-plane failure.
 
 **`ok: false` from an updater at or before `v1.1.0-rc.8`.** That updater chained
 the separate fleet Worker release into the runtime result, so a Worker

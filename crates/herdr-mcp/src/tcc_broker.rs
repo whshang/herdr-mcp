@@ -37,7 +37,6 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Broker protocol version. Bump only on a breaking wire change.
@@ -461,25 +460,7 @@ pub fn doctor_line(config_dir: &Path) -> String {
     )
 }
 
-/// Set while this process is serving a stable-broker entrypoint.
-///
-/// The broker binary is immutable across runtime generations, so it owns the
-/// macOS TCC identity for Documents/Desktop/Downloads. It may therefore probe
-/// those folders directly; a rotating runtime generation may not, and must
-/// avoid the access instead of parking itself on a consent prompt.
-static BROKER_ENTRYPOINT_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// Whether this process is the authorized macOS protected-folder client.
-///
-/// True for the stable broker serving its own entrypoint and for children the
-/// broker explicitly disclaims TCC responsibility from. False for every
-/// ordinary runtime generation.
-pub(crate) fn is_authorized_protected_client() -> bool {
-    is_broker_child_process() || BROKER_ENTRYPOINT_ACTIVE.load(Ordering::Relaxed)
-}
-
 pub fn run_broker_once() -> ExitCode {
-    BROKER_ENTRYPOINT_ACTIVE.store(true, Ordering::Relaxed);
     let request = match read_bounded_stdin(MAX_REQUEST_BYTES) {
         Ok(bytes) => bytes,
         Err(message) => {
@@ -1548,10 +1529,6 @@ pub(crate) fn spawn_herdr_host(
 pub fn run_herdr_host() -> Result<ExitCode, String> {
     use std::process::{Command, Stdio};
 
-    // This process keeps the stable broker identity so pane/Agent descendants
-    // inherit it; it is an authorized protected-folder client like the broker
-    // entrypoint itself.
-    BROKER_ENTRYPOINT_ACTIVE.store(true, Ordering::Relaxed);
     let paths = crate::paths::RuntimePaths::discover()?;
     if paths.instance.is_named() {
         return Err(

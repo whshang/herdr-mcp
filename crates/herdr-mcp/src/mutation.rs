@@ -132,22 +132,9 @@ fn check_with_policy_and_topology(
     }
 
     if !policy.write_roots.is_empty() {
-        // A protected root is compared lexically: resolving it in-process would
-        // make the security gate the macOS TCC client and could park this
-        // request on a consent prompt. The whitelist is operator-supplied
-        // configuration, so a lexical containment check is the right precision
-        // here and it never widens the root set.
-        let root_real = if crate::macos_permissions::runtime_must_not_probe(root) {
-            root.to_path_buf()
-        } else {
-            fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
-        };
+        let root_real = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let allowed = policy.write_roots.iter().any(|base| {
-            let base_real = if crate::macos_permissions::runtime_must_not_probe(base) {
-                base.clone()
-            } else {
-                fs::canonicalize(base).unwrap_or_else(|_| base.clone())
-            };
+            let base_real = fs::canonicalize(base).unwrap_or_else(|_| base.clone());
             fs_security::path_within(&base_real, &root_real)
         });
         if !allowed {
@@ -496,6 +483,55 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Given an `HERDR_MCP_WRITE_ROOTS` whitelist
+    /// When a root reaches it through a symlink or a `..` component
+    /// Then containment is decided on the resolved real path, so neither escape
+    /// inherits the whitelisted base's authority.
+    ///
+    /// This locks the canonical-containment behaviour: a pending macOS consent
+    /// prompt may make this check fail closed, but it must never fall back to a
+    /// raw string-prefix comparison.
+    #[cfg(unix)]
+    #[test]
+    fn write_root_whitelist_denies_symlink_and_dotdot_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let allowed = repo();
+        let outside = allowed.with_file_name(format!(
+            "{}-outside",
+            allowed.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&outside).unwrap();
+        let escape = allowed.join("escape");
+        symlink(&outside, &escape).unwrap();
+        let inside = allowed.join("child");
+        fs::create_dir_all(&inside).unwrap();
+        let policy = MutationPolicy::new(false, vec![allowed.clone()]);
+        let topology = crate::projects::ProjectTopology::default();
+        let check = |root: &Path| {
+            check_with_policy_and_topology(&json!({}), &topology, root, false, &policy)
+        };
+
+        assert_eq!(
+            check(&escape).unwrap_err()["reason"],
+            "root_not_whitelisted",
+            "a symlinked root must not borrow the whitelisted base"
+        );
+
+        let dotted = allowed.join("..").join(outside.file_name().unwrap());
+        assert_eq!(
+            check(&dotted).unwrap_err()["reason"],
+            "root_not_whitelisted",
+            "a `..` spelling must be resolved, not prefix-matched"
+        );
+
+        // The same whitelist still admits a real child of the base.
+        assert!(check(&inside).is_ok());
+
+        fs::remove_dir_all(allowed).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
