@@ -245,6 +245,13 @@ fn pane_cwds(snapshot: &Value) -> BTreeMap<String, PathBuf> {
 fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
     let mut current = absolute_path(cwd)?;
     loop {
+        // Never probe a macOS privacy-protected folder from the rotating
+        // runtime: the first `.git` lookup inside Documents/Desktop/Downloads
+        // can block this thread on a consent prompt. Callers that need a
+        // protected root resolve it through the stable broker instead.
+        if crate::macos_permissions::runtime_must_not_probe(&current) {
+            return None;
+        }
         if current.join(".git").exists() {
             return Some(current);
         }
