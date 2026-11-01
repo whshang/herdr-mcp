@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.1.0-rc.8 — 2026-11-01
+
+- **1.1 第八个预发布（仅 preview 通道）：** doctor 不再把本地无授权证据误报为 WebChat grant 缺失（状态改为 `absent_locally`，标注 `authoritative=false` 并给出 `connector webchat-control allow` 下一步），已退役的每端点 WebChat Control 开关显示为 `legacy_ignored`，删除 “extension consent gates browser control” 提示（#791）；`browser_session.create` 被拒时按白名单返回扩展拒绝码（如 `browser_create_composer_busy`）、`composer_busy_probe` 与 `hint`（#792）。仅 Runtime 变更；无新 state 迁移（schema 16），contract 与扩展 0.1.229 不变。v1.0.x 路径为 v1.0.4 → v1.0.5 → v1.1.0；stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.8.md](docs/releases/v1.1.0-rc.8.md)。 [PR #793](https://github.com/whshang/herdr-mcp/pull/793) [PR #794](https://github.com/whshang/herdr-mcp/pull/794)
+
 ## v1.1.0-rc.7 — 2026-10-31
 
 - **1.1 第七个预发布（仅 preview 通道）：** 来源轮次规范化覆盖更多 App 芯片渲染并记录未绑定诊断（#777）、一次调用 spawn-and-dispatch（#776）、`herdr_prompt` 报告绑定结果与 `source_session_not_registered`（#770 / #771）、标记承载调用方浏览器的设备与 `caller_browser_on_other_device`（#774）、doctor herdr-core 警告与 WebChat 授权状态（#765 / #772），以及只支持 Herdr TUI 的文档与 Skill 绑定指引。无新 state 迁移（schema 16），contract 与扩展 0.1.229 不变。v1.0.x 路径为 v1.0.4 → v1.0.5 → v1.1.0；stable 用户继续留在 1.0.x。详见 [docs/releases/v1.1.0-rc.7.md](docs/releases/v1.1.0-rc.7.md)。 [PR #780](https://github.com/whshang/herdr-mcp/pull/780) [PR #781](https://github.com/whshang/herdr-mcp/pull/781) [PR #785](https://github.com/whshang/herdr-mcp/pull/785) [PR #788](https://github.com/whshang/herdr-mcp/pull/788) [PR #782](https://github.com/whshang/herdr-mcp/pull/782) [PR #764](https://github.com/whshang/herdr-mcp/pull/764) [PR #769](https://github.com/whshang/herdr-mcp/pull/769) [PR #773](https://github.com/whshang/herdr-mcp/pull/773) [PR #778](https://github.com/whshang/herdr-mcp/pull/778)
