@@ -7253,6 +7253,217 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// user keeps 接力 for a dispatched conversation | Given a ChatGPT
+    /// conversation bound to a live Herdr workspace only through
+    /// `agent.task.dispatch` (no explicit HUD/panel bind) | When the same
+    /// conversation is dispatched twice and a journal turn uses the canonical
+    /// conversation URL | Then the Runtime owns exactly one durable continuity
+    /// chain that `/extension/continuity/resolve` finds by provider conversation
+    /// id, and every later turn canonicalizes onto it.
+    #[tokio::test]
+    async fn dispatch_bind_attaches_one_durable_continuity_chain() {
+        let root = test_root("dispatch-auto-continuity");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 7}}}),
+        ]);
+        let mut state = dispatch_test_state_with_snapshot(
+            &root,
+            &socket,
+            json!({
+                "workspaces": [{"workspace_id": "w1", "label": "auto-continuity"}],
+                "panes": [{
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "agent_status": "idle",
+                }],
+                "agents": [],
+            }),
+        );
+        state.trusted_extension_ipc = true;
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let (app, seed, endpoint, account) =
+            register_chatgpt_endpoint(app, "autocontinuity", now).await;
+        let user_text = "把这条任务派给 MBP 上的 pi";
+        let (app, session_ref) = observe_chatgpt_session_source_turn(
+            app,
+            &seed,
+            &endpoint,
+            &account,
+            "autocontinuity",
+            user_text,
+            now,
+        )
+        .await;
+        let headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-authorization",
+                json!({
+                    "principal_ref": "connector:conn_AutoContinuity",
+                    "connector_id": "conn_AutoContinuity",
+                    "grant_generation": 1
+                })
+                .to_string(),
+            ),
+            (
+                "x-herdr-edge-browser-caller-session",
+                json!({"provider": "chatgpt", "opaque_session_id": "opaque-auto-continuity"})
+                    .to_string(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": endpoint, "provider": "chatgpt"}]).to_string(),
+            ),
+        ];
+        let dispatch = |app: axum::Router,
+                        headers: Vec<(&'static str, String)>,
+                        key: &'static str| async move {
+            webchat_tool_call(
+                app,
+                &headers,
+                "herdr_mcp.agent.task.dispatch",
+                json!({
+                    "target": "w1:p1",
+                    "text": "do the work",
+                    "idempotency_key": key,
+                    "current_user_message": "把这条任务派给 MBP 上的 pi",
+                }),
+            )
+            .await
+        };
+        let first = dispatch(app.clone(), headers.clone(), "dispatch-auto-continuity-1").await;
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["parent_session"], json!({"bound": true}), "{first}");
+        assert_eq!(first["task"]["parent_session_ref"], session_ref.as_str());
+        assert_eq!(first["task"]["workspace_id"], "w1");
+
+        let conversation_url = "https://chatgpt.com/c/dispatch-autocontinuity";
+        let conversation_id = "dispatch-autocontinuity";
+        let continuity_id = store
+            .lock()
+            .unwrap()
+            .continuity_for_conversation(conversation_id)
+            .unwrap()
+            .expect("a dispatch bind must own a durable continuity chain");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .continuity_for_conversation(conversation_url)
+                .unwrap(),
+            Some(continuity_id.clone()),
+            "the canonical conversation URL reaches the same chain"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .continuity_for_provider_session("chatgpt", &session_ref)
+                .unwrap(),
+            Some(continuity_id.clone())
+        );
+
+        // The exact endpoint #812 gates 接力 on now answers for this
+        // conversation, which used to be `continuity_not_found`.
+        let resolve = |app: axum::Router| async move {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/extension/continuity/resolve")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"conversation_id": "dispatch-autocontinuity"}).to_string(),
+                ))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<Value>(&body).unwrap())
+        };
+        let (status, resolved) = resolve(app.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{resolved}");
+        assert_eq!(resolved["continuity_id"], continuity_id.as_str());
+
+        // A repeated dispatch of the same conversation must not fork the chain.
+        let second = dispatch(app.clone(), headers, "dispatch-auto-continuity-2").await;
+        assert_eq!(second["ok"], true, "{second}");
+        assert_eq!(second["parent_session"], json!({"bound": true}), "{second}");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .continuity_candidates(20)
+                .unwrap()
+                .len(),
+            1,
+            "a repeat dispatch reuses the same chain"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .continuity_for_conversation(conversation_id)
+                .unwrap(),
+            Some(continuity_id.clone())
+        );
+
+        // The turns the extension journals after the bind land on that chain, so
+        // a handoff has content. The canonical URL identity canonicalizes onto
+        // the same chain instead of creating a second one.
+        let turn_request = Request::builder()
+            .method(Method::POST)
+            .uri("/extension/continuity/turn")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "continuity_id": "hc:localjournal:",
+                    "conversation_id": conversation_url,
+                    "workspace_id": "w1",
+                    "message_id": "journal-turn-1",
+                    "role": "user",
+                    "text": user_text,
+                    "observed_at": now + 10
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(turn_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let journaled: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(journaled["continuity_id"], continuity_id.as_str());
+        assert_eq!(journaled["canonicalized"], true);
+        let resume = store
+            .lock()
+            .unwrap()
+            .continuity_resume(&continuity_id, 8)
+            .unwrap()
+            .expect("chain stays durable");
+        assert_eq!(resume.turns.len(), 1);
+        assert_eq!(resume.turns[0].text, user_text);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .continuity_candidates(20)
+                .unwrap()
+                .len(),
+            1,
+            "journaling must not fork the chain"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn reparented_conversation_with_prior_source_turn_stays_unambiguous() {
         // #740 follow-up (Codex review): the conversation's turn is already

@@ -2750,6 +2750,15 @@ async function journalAppendContinuityTurn(payload) {
   const convKey = String(payload?.conv_key || "").trim();
   const role = String(payload?.role || "").toLowerCase();
   const text = String(payload?.text || "").trim();
+  // #834: the durable turn identity is the provider conversation id. The
+  // canonical conversation URL is only the page identity: journaling turns under
+  // it made `browser_handoff.prepare` refuse a chain whose source conversation
+  // is named by its provider id (`browser_handoff_source_continuity_mismatch`),
+  // so 接力 still failed after the chain existed. Derive the provider id when the
+  // page did not supply one and keep the URL only as a last-resort fallback.
+  const conversationId = String(payload?.conversation_id || "").trim()
+    || String(browserConversationInfoFromSupportedUrl(convKey)?.conversation_id || "").trim()
+    || convKey;
   if (!continuityId || !convKey || !["user", "assistant"].includes(role) || !text) {
     return { ok: false, durable: false, error: "continuity-fields-incomplete" };
   }
@@ -2784,7 +2793,7 @@ async function journalAppendContinuityTurn(payload) {
 
   const ack = await journalPostTurnToRust({
     continuity_id: continuityId,
-    conversation_id: payload?.conversation_id || convKey,
+    conversation_id: conversationId,
     workspace_id: payload?.workspace_id || null,
     project_id: payload?.project_id || null,
     provider: payload?.provider || null,
@@ -2970,6 +2979,66 @@ async function resolveContinuityAvailability(body, timeoutMs = HANDOFF_DURABILIT
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+// ---- #834 ChatGPT continuity journal ownership ----
+// A conversation bound through the normal dispatch path or the #786 late-bind
+// replay has no local extension binding record: the Runtime owns the durable
+// chain and the panel-only `h2w_bind` is not involved. The journal used to
+// answer `continuity_unbound` (the #812 gate) for exactly those conversations,
+// so a handoff-able session accumulated no turns. Ask the Runtime which chain it
+// already owns for this conversation before reporting it unbound; a definitive
+// miss keeps the #812 fail-closed behavior.
+//
+// Only a resolved owner is cached. A miss must be re-probed: the real ordering is
+// `h2w_turn_started` (no chain yet) -> `agent.task.dispatch` attaches the chain ->
+// `h2w_turn_ended`, and caching the miss would drop both sides of that same
+// round, leaving the chain without turns and 接力 still unavailable.
+const JOURNAL_CONTINUITY_TTL_MS = 60_000;
+const JOURNAL_CONTINUITY_CACHE_MAX = 32;
+const journalContinuityCache = new Map(); // conversation identity -> { at, continuity_id }
+
+function rememberJournalContinuity(identity, continuityId) {
+  if (!identity || !continuityId) return;
+  journalContinuityCache.set(identity, { at: Date.now(), continuity_id: continuityId });
+  if (journalContinuityCache.size <= JOURNAL_CONTINUITY_CACHE_MAX) return;
+  const oldest = [...journalContinuityCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+  if (oldest) journalContinuityCache.delete(oldest[0]);
+}
+
+/**
+ * The durable chain the Runtime already owns for one conversation, or null.
+ *
+ * Bounded and fail-safe: one cached resolve per conversation identity, never
+ * more than two identities (provider conversation id, then canonical URL), and
+ * never a Runtime-reachability change — a journal lookup is not a health probe.
+ */
+async function resolveJournalContinuityId(convKeyRaw) {
+  const convKey = String(convKeyRaw || "").trim();
+  if (!convKey) return null;
+  const conversationId = String(
+    browserConversationInfoFromSupportedUrl(convKey)?.conversation_id || "",
+  ).trim();
+  const identities = [conversationId, convKey]
+    .filter((value, index, all) => value && all.indexOf(value) === index);
+  if (!identities.length) return null;
+  const cached = journalContinuityCache.get(identities[0]);
+  if (cached) {
+    const age = Date.now() - Number(cached.at || 0);
+    // A backwards system-clock jump must expire the entry instead of pinning it.
+    if (age >= 0 && age < JOURNAL_CONTINUITY_TTL_MS) return cached.continuity_id;
+  }
+  for (const identity of identities) {
+    const probe = await resolveContinuityAvailability({ conversation_id: identity });
+    if (probe.state === "ready" && probe.continuity_id) {
+      rememberJournalContinuity(identities[0], probe.continuity_id);
+      return probe.continuity_id;
+    }
+    // A transport/5xx/timeout answer is not evidence that the chain is missing,
+    // so it does not spend the second identity on the same failure.
+    if (probe.state === "unknown") return cached?.continuity_id || null;
+  }
+  return null;
 }
 
 /**
@@ -12773,23 +12842,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         session = bindingsForConv(bindings, convKey);
       } catch (_) {}
       const continuityIds = [...new Set(session.map((binding) => binding?.continuity_id).filter(Boolean))];
-      if (continuityIds.length !== 1) {
+      const primary = session[0] || null;
+      // #834: a dispatch/late-bound conversation keeps its durable chain in the
+      // Runtime, not in a local panel binding. Resolve that owner first, so the
+      // #812 `continuity_unbound` answer now describes only a conversation with
+      // no durable chain at all instead of every dispatched conversation.
+      let continuityId = continuityIds.length === 1 ? continuityIds[0] : "";
+      if (!continuityId && !continuityIds.length) {
+        continuityId = String(await resolveJournalContinuityId(convKey) || "").trim();
+      }
+      if (!continuityId) {
         sendResponse({
           ok: false,
           error: continuityIds.length > 1 ? "binding_continuity_conflict" : "continuity_unbound",
         });
         return;
       }
-      const primary = session[0] || null;
+      const pageInfo = browserConversationInfoFromSupportedUrl(convKey) || null;
       const result = await journalAppendContinuityTurn({
-        continuityId: continuityIds[0],
+        continuityId,
         conv_key: convKey,
-        conversation_id: msg?.conversation_id || convKey,
+        conversation_id: msg?.conversation_id || null,
         workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
-        project_id: primary?.project_id || null,
-        provider: primary?.site || browserConversationInfoFromSupportedUrl(convKey)?.site || null,
+        project_id: primary?.project_id || pageInfo?.project_id || null,
+        provider: primary?.site || pageInfo?.site || null,
         account: primary?.browser_account_ref || null,
-        project: primary?.project_id || primary?.browser_space_ref || null,
+        project: primary?.project_id || primary?.browser_space_ref || pageInfo?.project_id || null,
         title: primary?.workspace_label || primary?.workspace_id || null,
         role: "user",
         text: userText,
@@ -12814,7 +12892,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         session = bindingsForConv(bindings, convKey);
       } catch (_) {}
       const continuityIds = [...new Set(session.map((binding) => binding?.continuity_id).filter(Boolean))];
-      if (continuityIds.length !== 1) {
+      const primary = session[0] || null;
+      // #834: a backfill for a dispatch-bound conversation has no local panel
+      // binding; journal it into the chain the Runtime already owns.
+      let continuityId = continuityIds.length === 1 ? continuityIds[0] : "";
+      if (!continuityId && !continuityIds.length) {
+        continuityId = String(await resolveJournalContinuityId(convKey) || "").trim();
+      }
+      if (!continuityId) {
         sendResponse({
           ok: false,
           durable: false,
@@ -12822,16 +12907,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
         return;
       }
-      const primary = session[0] || null;
+      const pageInfo = browserConversationInfoFromSupportedUrl(convKey) || null;
       const result = await journalAppendFinalizedTurn({
-        continuityId: continuityIds[0],
+        continuityId,
         conv_key: convKey,
-        conversation_id: msg?.conversation_id || convKey,
-        project_id: primary?.project_id || null,
+        conversation_id: msg?.conversation_id || null,
+        project_id: primary?.project_id || pageInfo?.project_id || null,
         workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
-        provider: primary?.site || browserConversationInfoFromSupportedUrl(convKey)?.site || null,
+        provider: primary?.site || pageInfo?.site || null,
         account: primary?.browser_account_ref || null,
-        project: primary?.project_id || primary?.browser_space_ref || null,
+        project: primary?.project_id || primary?.browser_space_ref || pageInfo?.project_id || null,
         title: primary?.workspace_label || primary?.workspace_id || null,
         userMessageId: msg?.userMessageId || null,
         userText,
@@ -12903,10 +12988,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // model-written HERDR_HANDOFF_V1. Never blocks turn handling on failure.
       let continuityId = String(msg?.continuity_id || "").trim();
       let primaryBinding = null;
+      let localContinuityCount = 0;
       try {
         const bindings = await loadBindings();
         const session = bindingsForConv(bindings, msg?.convKey || "");
         const continuityIds = [...new Set(session.map((binding) => binding?.continuity_id).filter(Boolean))];
+        localContinuityCount = continuityIds.length;
         if (!continuityId && continuityIds.length === 1) continuityId = continuityIds[0];
         if (continuityIds.length <= 1) {
           primaryBinding = session.find((binding) => !continuityId || binding?.continuity_id === continuityId) || session[0] || null;
@@ -12916,6 +13003,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           continuityId = "";
         }
       } catch (_) {}
+      // #834: the finalized turn of a dispatch-bound conversation belongs to the
+      // chain the Runtime already owns, even though the extension holds no local
+      // panel binding for it. Only a conversation with no local continuity id at
+      // all is resolved: a conflicted one (`localContinuityCount > 1`) keeps the
+      // fail-closed behavior above instead of being journaled into a guess.
+      if (!continuityId && localContinuityCount === 0) {
+        continuityId = String(await resolveJournalContinuityId(msg?.convKey || "") || "").trim();
+      }
       await journalAppendFinalizedTurn({
         continuityId: continuityId || null,
         conv_key: msg?.convKey || null,
