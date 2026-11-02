@@ -3725,7 +3725,7 @@ test("accepted ChatGPT user turns register a current-source identity before cont
   assert.match(segment, /user_text:\s*userText/);
 });
 
-test("user's held first turn replays through the shared source-turn payload | Given a held turn replayed once its conversation session registers | When the replay posts source_turn.observe | Then it uses the same payload builder as the turn handler so a Runtime without endpoint provenance still records the turn", () => {
+test("user replays a held first turn through the shared source-turn payload | Given a held turn replayed once its conversation session registers | When the replay posts source_turn.observe | Then it uses the same payload builder as the turn handler so a Runtime without endpoint provenance still records the turn", () => {
   const start = backgroundSource.indexOf("async function replayHeldSourceTurn");
   const end = backgroundSource.indexOf("\n}\n", start);
   assert.ok(start >= 0 && end > start, "held-turn replay must remain extractable");
