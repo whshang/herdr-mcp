@@ -9,7 +9,7 @@ Lifecycle:
 - reusable current product guidance → promote into `docs/i18n/<locale>/`, an ADR/current architecture document, or another maintained SSOT;
 - one-off local data that may contain credentials or machine-specific state → keep outside the repository.
 
-Current active WIP is limited to unresolved work: the 1.1 Browser Adapter Platform, browser control-plane settlement, DEV/STANDALONE/STORE extension distribution, and modular progressive skills.
+Current active WIP is limited to unresolved work: the 1.1 Browser Adapter Platform, browser control-plane settlement, DEV/STANDALONE/STORE extension distribution, modular progressive skills, and the 1.2 herdr-core runtime probe.
 
 ## Current index
 
@@ -27,4 +27,5 @@ Current active WIP is limited to unresolved work: the 1.1 Browser Adapter Platfo
 - Active browser control-plane work: [`browser-control-plane.md`](browser-control-plane.md).
 - Active WebChat provider-adapter diagnosis (ChatGPT/Claude/Grok decoupling): [`webchat-provider-adapters.md`](webchat-provider-adapters.md).
 - Active progressive-skills work: [`modular-progressive-skills.md`](modular-progressive-skills.md).
+- 1.2 herdr-core (`hc`) adapter probe (#767), input for the runtime-adapter decision (#768): [`herdr-core-probe.md`](herdr-core-probe.md).
 - Active browser-extension package/Store work: [`browser-extension-development-and-store-release.md`](browser-extension-development-and-store-release.md). Historical pre-1.0 Store rollout detail lives under [`../history/architecture/browser-extension-development-and-store-release-20260829.md`](../history/architecture/browser-extension-development-and-store-release-20260829.md).
