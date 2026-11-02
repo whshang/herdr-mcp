@@ -10,6 +10,9 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::process::Command;
 use std::process::ExitCode;
+use std::time::Instant;
+
+use crate::native_host_log::NativeHostLog;
 
 #[cfg(unix)]
 use serde_json::Map;
@@ -178,36 +181,262 @@ fn require_active_owner(config: &HostConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Error codes this module is allowed to write to disk. Anything else — an OS
+/// error tail, a path, or a payload-derived string — collapses to `host_error`,
+/// so a future refactor cannot leak content into the log through an error
+/// string. `completed` and `stream_end` are the success disconnect reasons.
+const NATIVE_HOST_LOG_CODES: &[&str] = &[
+    "completed",
+    "stream_end",
+    "host_error",
+    "invalid_native_message",
+    "native_message_too_large",
+    "unsupported_message",
+    "unsupported_platform",
+    "legacy_session_requires_compat_host",
+    "extension_origin_not_allowed",
+    "extension_origin_unconfigured",
+    "extension_origin_not_active",
+    "extension_ipc_unavailable",
+    "native_request_timeout",
+    "native_request_too_large",
+    "native_request_invalid",
+    "native_request_batch_invalid",
+    "native_request_batch_empty",
+    "native_request_batch_too_large",
+    "native_response_too_large",
+    "native_response_failed",
+    "native_response_encode_failed",
+    "native_stdout_failed",
+    "native_stream_connect_timeout",
+    "native_stream_failed",
+    "stream_path_not_allowed",
+    "proxy_path_not_allowed",
+    "proxy_method_not_allowed",
+    "invalid_proxy_header",
+    "base_url_must_be_loopback_http",
+    "native_browser_registry_body_invalid",
+    "artifact_capture_invalid",
+    "artifact_capture_unknown_field",
+    "artifact_capture_invalid_base64",
+    "artifact_capture_invalid_sha256",
+    "artifact_capture_too_large",
+];
+
+/// Message types this module is allowed to name in the log. Anything else is
+/// recorded as `other`, so a message body can never reach the log through a
+/// `type` value.
+const NATIVE_HOST_MESSAGE_TYPES: &[&str] = &[
+    "identity",
+    "request",
+    "request_batch",
+    "stream",
+    "session",
+    "artifact_capture",
+];
+
+fn log_code(code: &str) -> &'static str {
+    let kind = code.split(':').next().unwrap_or_default().trim();
+    NATIVE_HOST_LOG_CODES
+        .iter()
+        .copied()
+        .find(|known| *known == kind)
+        .unwrap_or("host_error")
+}
+
+fn message_type_code(message: &Value) -> &'static str {
+    let raw = message.get("type").and_then(Value::as_str).unwrap_or("");
+    NATIVE_HOST_MESSAGE_TYPES
+        .iter()
+        .copied()
+        .find(|known| *known == raw)
+        .unwrap_or("other")
+}
+
+/// Only a syntactically valid Chromium extension origin is written; anything
+/// else (an empty argument, a page origin, a stray credential) is recorded as
+/// `-` rather than copied to disk.
+fn log_origin(origin: &str) -> String {
+    #[cfg(unix)]
+    {
+        if validate_extension_origin(origin).is_ok() {
+            return origin.to_owned();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = origin;
+    "-".to_owned()
+}
+
+fn record_connect(
+    log: Option<&NativeHostLog>,
+    caller_origin: &str,
+    read: &Result<(Value, usize), String>,
+) {
+    let Some(log) = log else {
+        return;
+    };
+    let mut fields = vec![
+        ("version", env!("CARGO_PKG_VERSION").to_owned()),
+        ("pid", std::process::id().to_string()),
+        ("extension_origin", log_origin(caller_origin)),
+    ];
+    match read {
+        Ok((message, encoded_size)) => {
+            fields.push(("message_type", message_type_code(message).to_owned()));
+            fields.push(("encoded_bytes", encoded_size.to_string()));
+        }
+        Err(_) => fields.push(("message_type", "-".to_owned())),
+    }
+    log.record("connect", &fields);
+}
+
+fn record_disconnect(
+    log: Option<&NativeHostLog>,
+    reason: &str,
+    message_type: &str,
+    started: Instant,
+) {
+    let Some(log) = log else {
+        return;
+    };
+    log.record(
+        "disconnect",
+        &[
+            ("reason", log_code(reason).to_owned()),
+            ("message_type", message_type.to_owned()),
+            ("duration_ms", started.elapsed().as_millis().to_string()),
+        ],
+    );
+}
+
+/// A port/IO failure is recorded next to the connect/disconnect pair so a log
+/// reader can tell "the socket was gone" from "the extension never polled".
+fn record_io_error(log: Option<&NativeHostLog>, code: &str) {
+    let Some(log) = log else {
+        return;
+    };
+    log.record("io_error", &[("code", log_code(code).to_owned())]);
+}
+
+struct HostOutcome {
+    reason: &'static str,
+    error: Option<String>,
+}
+
+impl HostOutcome {
+    fn completed(reason: &'static str) -> Self {
+        Self {
+            reason,
+            error: None,
+        }
+    }
+
+    fn failed(reason: &'static str, error: String) -> Self {
+        Self {
+            reason,
+            error: Some(error),
+        }
+    }
+}
+
+/// Answer the browser with an error frame and keep the host alive. Only a failed
+/// stdout write is fatal, because the browser would otherwise wait forever.
+fn refuse<W: Write>(writer: &mut W, code: &str) -> HostOutcome {
+    match write_error(writer, code) {
+        Ok(()) => HostOutcome::completed(log_code(code)),
+        Err(error) => HostOutcome::failed("native_stdout_failed", error),
+    }
+}
+
+fn finish(write: Result<(), String>, reason: &'static str) -> HostOutcome {
+    match write {
+        Ok(()) => HostOutcome::completed(reason),
+        Err(error) => HostOutcome::failed("native_stdout_failed", error),
+    }
+}
+
 pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
+    let log = NativeHostLog::discover();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = stdin.lock();
     let mut writer = stdout.lock();
-    let message = match read_native_message(&mut reader) {
-        Ok((message, encoded_size)) => (message, encoded_size),
-        Err(error) => {
-            write_error(&mut writer, &error)?;
-            return Ok(ExitCode::SUCCESS);
-        }
+    #[cfg(unix)]
+    {
+        serve(
+            caller_origin,
+            &mut reader,
+            &mut writer,
+            log.as_ref(),
+            HostConfig::from_env,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        serve(caller_origin, &mut reader, &mut writer, log.as_ref())
+    }
+}
+
+/// One native-host process lifetime: read one framed message, serve it, and
+/// record the content-free connect/disconnect pair around it.
+///
+/// `resolve_config` is the production environment read. Tests inject a config
+/// because they cannot own the installed extension registry.
+fn serve<R: Read, W: Write>(
+    caller_origin: &str,
+    reader: &mut R,
+    writer: &mut W,
+    log: Option<&NativeHostLog>,
+    #[cfg(unix)] resolve_config: impl FnOnce() -> Result<HostConfig, String>,
+) -> Result<ExitCode, String> {
+    let started = Instant::now();
+    let read = read_native_message(reader);
+    record_connect(log, caller_origin, &read);
+    let message_type = match &read {
+        Ok((message, _)) => message_type_code(message),
+        Err(_) => "-",
+    };
+    let outcome = serve_message(
+        caller_origin,
+        read,
+        writer,
+        log,
+        #[cfg(unix)]
+        resolve_config,
+    );
+    record_disconnect(log, outcome.reason, message_type, started);
+    match outcome.error {
+        Some(error) => Err(error),
+        None => Ok(ExitCode::SUCCESS),
+    }
+}
+
+fn serve_message<W: Write>(
+    caller_origin: &str,
+    read: Result<(Value, usize), String>,
+    writer: &mut W,
+    log: Option<&NativeHostLog>,
+    #[cfg(unix)] resolve_config: impl FnOnce() -> Result<HostConfig, String>,
+) -> HostOutcome {
+    let (message, encoded_size) = match read {
+        Ok(parsed) => parsed,
+        Err(error) => return refuse(writer, &error),
     };
 
     #[cfg(not(unix))]
     {
         let _ = caller_origin;
-        let _ = message;
-        write_error(&mut writer, "unsupported_platform")?;
-        return Ok(ExitCode::SUCCESS);
+        let _ = encoded_size;
+        let _ = log;
+        return refuse(writer, "unsupported_platform");
     }
 
     #[cfg(unix)]
     {
-        let (message, encoded_size) = message;
-        let config = match HostConfig::from_env() {
+        let config = match resolve_config() {
             Ok(config) => config,
-            Err(error) => {
-                write_error(&mut writer, &error)?;
-                return Ok(ExitCode::SUCCESS);
-            }
+            Err(error) => return refuse(writer, &error),
         };
         let effective_caller_origin = if caller_origin.is_empty() {
             config.expected_origin.as_str()
@@ -215,8 +444,7 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
             caller_origin
         };
         if effective_caller_origin != config.expected_origin {
-            write_error(&mut writer, "extension_origin_not_allowed")?;
-            return Ok(ExitCode::SUCCESS);
+            return refuse(writer, "extension_origin_not_allowed");
         }
 
         let message_type = message.get("type").and_then(Value::as_str).unwrap_or("");
@@ -224,51 +452,67 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
         // native-message bound. All other messages remain capped at 1 MiB
         // measured against the bytes the host actually read.
         if let Some(error) = enforce_message_size_gate(message_type, encoded_size) {
-            write_error(&mut writer, &error)?;
-            return Ok(ExitCode::SUCCESS);
+            return refuse(writer, &error);
         }
 
         if message_type == "identity" {
             let active = require_active_owner(&config).is_ok();
-            write_native_message(
-                &mut writer,
-                &json!({
-                    "ok": true,
-                    "active": active,
-                    "extension_origin": config.expected_origin,
-                    "browser_family": config.browser_family,
-                    "transport": "native",
-                }),
-            )?;
-            return Ok(ExitCode::SUCCESS);
+            return finish(
+                write_native_message(
+                    writer,
+                    &json!({
+                        "ok": true,
+                        "active": active,
+                        "extension_origin": config.expected_origin,
+                        "browser_family": config.browser_family,
+                        "transport": "native",
+                    }),
+                ),
+                "completed",
+            );
         }
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("cannot build native-host runtime: {error}"))?;
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return HostOutcome::failed(
+                    "host_error",
+                    format!("cannot build native-host runtime: {error}"),
+                );
+            }
+        };
         match message_type {
             "request" => match runtime.block_on(proxy_request(&config, &message)) {
-                Ok(value) => write_native_message(&mut writer, &value)?,
-                Err(error) => write_error(&mut writer, &error)?,
+                Ok(value) => finish(write_native_message(writer, &value), "completed"),
+                Err(error) => {
+                    record_io_error(log, &error);
+                    refuse(writer, &error)
+                }
             },
             "request_batch" => match runtime.block_on(proxy_request_batch(&config, &message)) {
-                Ok(value) => write_native_message(&mut writer, &value)?,
-                Err(error) => write_error(&mut writer, &error)?,
-            },
-            "stream" => {
-                if let Err(error) = runtime.block_on(proxy_stream(&config, &message, &mut writer)) {
-                    write_error(&mut writer, &error)?;
+                Ok(value) => finish(write_native_message(writer, &value), "completed"),
+                Err(error) => {
+                    record_io_error(log, &error);
+                    refuse(writer, &error)
                 }
-            }
-            "session" => write_error(&mut writer, "legacy_session_requires_compat_host")?,
-            "artifact_capture" => match handle_artifact_capture(&config, &message) {
-                Ok(value) => write_native_message(&mut writer, &value)?,
-                Err(error) => write_error(&mut writer, &error)?,
             },
-            _ => write_error(&mut writer, "unsupported_message")?,
+            "stream" => match runtime.block_on(proxy_stream(&config, &message, writer)) {
+                Ok(()) => HostOutcome::completed("stream_end"),
+                Err(error) => {
+                    record_io_error(log, &error);
+                    refuse(writer, &error)
+                }
+            },
+            "session" => refuse(writer, "legacy_session_requires_compat_host"),
+            "artifact_capture" => match handle_artifact_capture(&config, &message) {
+                Ok(value) => finish(write_native_message(writer, &value), "completed"),
+                Err(error) => refuse(writer, &error),
+            },
+            _ => refuse(writer, "unsupported_message"),
         }
-        Ok(ExitCode::SUCCESS)
     }
 }
 
@@ -1218,6 +1462,284 @@ mod tests {
                 .unwrap_err(),
             "native_request_batch_too_large"
         );
+    }
+
+    #[cfg(unix)]
+    fn temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "hmh-host-{label}-{:x}-{:x}-{nonce:x}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// Serve exactly one `GET /push/state` request so a proxied native message
+    /// can complete for real instead of being faked at the proxy boundary.
+    #[cfg(unix)]
+    fn spawn_state_server(path: &Path) -> thread::JoinHandle<()> {
+        fs::remove_file(path).ok();
+        let listener = UnixListener::bind(path).unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let read = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /push/state"));
+            let body = r#"{"ok":true,"transport":"socket"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    fn test_config(socket_path: PathBuf, enforce_owner_fence: bool) -> HostConfig {
+        HostConfig {
+            expected_origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".to_owned(),
+            socket_path,
+            browser_family: "chrome".to_owned(),
+            enforce_owner_fence,
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_log(log: &NativeHostLog) -> String {
+        fs::read_to_string(log.path()).unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_host_log_records_connection_metadata_without_message_content() {
+        const SECRET: &str = "super-secret-token-xyz";
+        let root = temp_dir("connect");
+        let socket = socket_path("connect-log");
+        let server = spawn_state_server(&socket);
+        let log = NativeHostLog::in_config_dir(&root);
+        let config = test_config(socket.clone(), false);
+        let message = json!({
+            "type": "request",
+            "base_url": "http://127.0.0.1:8772",
+            "path": format!("/push/state?workspace={SECRET}"),
+            "method": "GET",
+            "headers": {"Authorization": format!("Bearer {SECRET}")},
+            "body": SECRET,
+        });
+        let mut reader = Cursor::new(frame(&message));
+        let mut writer = Vec::new();
+
+        let outcome = serve(
+            &config.expected_origin,
+            &mut reader,
+            &mut writer,
+            Some(&log),
+            || Ok(config.clone()),
+        );
+        assert!(outcome.is_ok(), "native host must answer the browser");
+        let response = parse_frames(&writer).remove(0);
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["status"], 200);
+        server.join().unwrap();
+
+        let written = read_log(&log);
+        assert!(written.contains("event=connect"), "{written}");
+        assert!(
+            written.contains(&format!("version={}", env!("CARGO_PKG_VERSION"))),
+            "{written}"
+        );
+        assert!(
+            written
+                .contains("extension_origin=chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"),
+            "{written}"
+        );
+        assert!(written.contains("message_type=request"), "{written}");
+        assert!(written.contains("encoded_bytes="), "{written}");
+        assert!(written.contains("event=disconnect"), "{written}");
+        assert!(written.contains("reason=completed"), "{written}");
+        assert!(written.contains("duration_ms="), "{written}");
+        for forbidden in [SECRET, "Bearer", "workspace=", "Authorization"] {
+            assert!(
+                !written.contains(forbidden),
+                "log leaked {forbidden}: {written}"
+            );
+        }
+        fs::remove_file(socket).ok();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_host_log_records_ipc_failure_without_failing_the_host() {
+        let root = temp_dir("ipc-failure");
+        let log = NativeHostLog::in_config_dir(&root);
+        // No listener exists at this path, so the proxy reports a dead IPC
+        // socket the same way it does in production.
+        let missing = root.join("missing.sock");
+        let config = test_config(missing, false);
+        let mut reader = Cursor::new(frame(&json!({
+            "type": "request",
+            "path": "/push/state",
+            "method": "GET",
+        })));
+        let mut writer = Vec::new();
+
+        let outcome = serve(
+            &config.expected_origin,
+            &mut reader,
+            &mut writer,
+            Some(&log),
+            || Ok(config.clone()),
+        );
+        assert!(outcome.is_ok(), "a dead socket must not fail the host");
+        let response = parse_frames(&writer).remove(0);
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"], "extension_ipc_unavailable");
+
+        let written = read_log(&log);
+        assert!(written.contains("event=connect"), "{written}");
+        assert!(written.contains("event=io_error"), "{written}");
+        assert!(
+            written.contains("code=extension_ipc_unavailable"),
+            "{written}"
+        );
+        assert!(
+            written.contains("reason=extension_ipc_unavailable"),
+            "{written}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_host_serves_the_browser_when_the_log_cannot_be_written() {
+        const SECRET: &str = "super-secret-token-xyz";
+        let root = temp_dir("log-failure");
+        // A regular file where the config root must be makes every log write
+        // fail; the browser response must still be served.
+        let unusable = root.join("not-a-directory");
+        fs::write(&unusable, b"not a directory").unwrap();
+        let socket = socket_path("log-failure");
+        let server = spawn_state_server(&socket);
+        let log = NativeHostLog::in_config_dir(&unusable);
+        let config = test_config(socket.clone(), false);
+        let mut reader = Cursor::new(frame(&json!({
+            "type": "request",
+            "path": "/push/state",
+            "method": "GET",
+            "body": SECRET,
+        })));
+        let mut writer = Vec::new();
+
+        let outcome = serve(
+            &config.expected_origin,
+            &mut reader,
+            &mut writer,
+            Some(&log),
+            || Ok(config.clone()),
+        );
+        assert!(outcome.is_ok(), "a log failure must not fail the host");
+        let response = parse_frames(&writer).remove(0);
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["status"], 200);
+        assert!(!read_log(&log).contains(SECRET));
+        server.join().unwrap();
+        fs::remove_file(socket).ok();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_host_log_rejects_a_foreign_origin_before_the_registry_fence() {
+        const SECRET: &str = "super-secret-token-xyz";
+        let root = temp_dir("origin");
+        let log = NativeHostLog::in_config_dir(&root);
+        // `enforce_owner_fence` stays on: this path must refuse before it ever
+        // consults the installed extension registry.
+        let config = test_config(root.join("unused.sock"), true);
+        let foreign = "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/";
+        let mut reader = Cursor::new(frame(&json!({
+            "type": "request",
+            "path": "/push/state",
+            "method": "GET",
+        })));
+        let mut writer = Vec::new();
+
+        let outcome = serve(foreign, &mut reader, &mut writer, Some(&log), || {
+            Ok(config.clone())
+        });
+        assert!(outcome.is_ok());
+        let response = parse_frames(&writer).remove(0);
+        assert_eq!(response["error"], "extension_origin_not_allowed");
+
+        let written = read_log(&log);
+        assert!(
+            written.contains(&format!("extension_origin={foreign}")),
+            "{written}"
+        );
+        assert!(
+            written.contains("reason=extension_origin_not_allowed"),
+            "{written}"
+        );
+        assert!(!written.contains(SECRET));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_host_log_records_unknown_types_and_origins_as_placeholders() {
+        const SECRET: &str = "super-secret-token-xyz";
+        let root = temp_dir("allowlist");
+        let log = NativeHostLog::in_config_dir(&root);
+        let config = test_config(root.join("unused.sock"), false);
+
+        // A non-extension caller origin is exactly the shape an
+        // attacker-controlled value would take, so it is recorded as `-`.
+        let caller = format!("https://example.com/?token={SECRET}");
+        let mut reader = Cursor::new(frame(&json!({
+            "type": "request",
+            "path": "/push/state",
+            "method": "GET",
+        })));
+        let mut writer = Vec::new();
+        let outcome = serve(&caller, &mut reader, &mut writer, Some(&log), || {
+            Ok(config.clone())
+        });
+        assert!(outcome.is_ok());
+        let response = parse_frames(&writer).remove(0);
+        assert_eq!(response["error"], "extension_origin_not_allowed");
+
+        // An unknown message type is recorded as `other`.
+        let mut reader = Cursor::new(frame(&json!({"type": SECRET})));
+        let mut writer = Vec::new();
+        let outcome = serve(
+            &config.expected_origin,
+            &mut reader,
+            &mut writer,
+            Some(&log),
+            || Ok(config.clone()),
+        );
+        assert!(outcome.is_ok());
+        let response = parse_frames(&writer).remove(0);
+        assert_eq!(response["error"], "unsupported_message");
+
+        let written = read_log(&log);
+        assert!(written.contains("extension_origin=- "), "{written}");
+        assert!(
+            written.contains("reason=extension_origin_not_allowed"),
+            "{written}"
+        );
+        assert!(written.contains("message_type=other"), "{written}");
+        assert!(written.contains("reason=unsupported_message"), "{written}");
+        assert!(!written.contains(SECRET), "{written}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
