@@ -4570,5 +4570,182 @@ console.log("\n[Source-turn observe retry covers the fresh-conversation registra
 }
 
 
+console.log("\n[Late registration holds and replays the first source turn (#786)]");
+{
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const observesFor = (conv) => browserRegistryRequests.filter(
+    (request) => request.operation === "source_turn.observe" && request.canonical_url === conv,
+  );
+  const registerConversation = (convKey, tabId, accountNativeIdentity) => dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey,
+    url: convKey,
+    accountNativeIdentity,
+  }, { tab: { id: tabId, url: convKey } });
+
+  // The schedule's three attempts all miss the registration, so the exact turn
+  // is held instead of dropped until that conversation registers.
+  const lateConvId = "source-turn-late-bind";
+  const lateConv = `https://chatgpt.com/c/${lateConvId}`;
+  const lateTabId = 640;
+  const lateStartedAt = Date.now() - 7;
+  pendingSourceTurnObserveFailures = [
+    "browser_source_session_not_found",
+    "browser_source_session_not_found",
+    "browser_source_session_not_found",
+  ];
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: lateConv,
+    userText: "  新会话的第一条消息  ",
+    startedAt: lateStartedAt,
+  }, { tab: { id: lateTabId, url: lateConv } });
+  ok(await waitForTest(() => observesFor(lateConv).length >= 3, 12000),
+    "user's first turn survives a registration that lands after the retry window | Given the initial observe and both bounded retries miss the conversation session | When the bounded schedule is exhausted | Then the exact turn is held in memory instead of dropped",
+    JSON.stringify(observesFor(lateConv)));
+  const heldAttempts = observesFor(lateConv).length;
+  await sleep(3000);
+  ok(observesFor(lateConv).length === heldAttempts,
+    "user does not pay for a held turn | Given a held, still-unregistered source turn | When the retry window has passed | Then the service worker issues no further observe and waits for the registration instead of polling",
+    JSON.stringify(observesFor(lateConv)));
+
+  const lateRegistered = await registerConversation(lateConv, lateTabId, "chatgpt-late-bind-account");
+  ok(lateRegistered?.browser_session_ref === `brs_chatgpt_${lateConvId}`,
+    "user sees the brand-new conversation register | Given a first turn submitted before its `/c/<id>` session existed | When the content script finally registers that route | Then the Runtime confirms the conversation's browser session",
+    JSON.stringify(lateRegistered));
+  ok(observesFor(lateConv).length === heldAttempts + 1,
+    "user's first turn lands once the session registers | Given a held source turn for a conversation that just registered | When registration succeeds | Then the held turn is replayed exactly once",
+    JSON.stringify(observesFor(lateConv)));
+  const replayedTurn = observesFor(lateConv).at(-1);
+  ok(replayedTurn.user_text === "新会话的第一条消息" && replayedTurn.observed_at === lateStartedAt,
+    "user keeps the exact turn identity | Given a replayed held turn | When the Runtime receives it | Then it carries the same trimmed text and original submit time so the upsert is idempotent",
+    JSON.stringify(replayedTurn));
+  ok(!("dispatch_id" in replayedTurn) && !("assistant_text" in replayedTurn)
+      && Object.keys(replayedTurn).sort().join(",") === "canonical_url,observed_at,operation,user_text",
+    "user never gets a replayed provider action | Given the held turn replay | When the service worker builds the payload | Then it re-reports only the already-observed turn fields and nothing that could reach ChatGPT",
+    JSON.stringify(replayedTurn));
+  await sleep(2500);
+  ok(observesFor(lateConv).length === heldAttempts + 1,
+    "user gets no duplicate source turn | Given the held turn was replayed once | When the next registration poll repeats | Then the hold is already cleared and nothing is replayed again",
+    JSON.stringify(observesFor(lateConv)));
+  await registerConversation(lateConv, lateTabId, "chatgpt-late-bind-account");
+  ok(observesFor(lateConv).length === heldAttempts + 1,
+    "user gets no replay on a later registration of the same conversation",
+    JSON.stringify(observesFor(lateConv)));
+
+  // Only the missing-registration code is held: an ambiguous canonical URL is
+  // final, so registering the same conversation afterwards replays nothing.
+  const fencedConv = "https://chatgpt.com/c/source-turn-late-bind-fenced";
+  const fencedTabId = 641;
+  pendingSourceTurnObserveFailures = [
+    "browser_source_session_not_found",
+    "browser_canonical_url_ambiguous",
+  ];
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: fencedConv,
+    userText: "歧义不保留",
+    startedAt: Date.now(),
+  }, { tab: { id: fencedTabId, url: fencedConv } });
+  ok(await waitForTest(() => observesFor(fencedConv).length >= 2, 8000),
+    "user keeps an ambiguous turn fail-closed | Given the first observe misses registration and the retry reports an ambiguous canonical URL | When the retry schedule inspects the failure code | Then the turn is not held",
+    JSON.stringify(observesFor(fencedConv)));
+  await sleep(500);
+  await registerConversation(fencedConv, fencedTabId, "chatgpt-late-bind-fenced");
+  ok(observesFor(fencedConv).length === 2,
+    "user gets no replay after a non-registration failure | Given a turn whose observe failed with browser_canonical_url_ambiguous | When the conversation registers later | Then nothing is replayed because only the missing-session code is ever held",
+    JSON.stringify(observesFor(fencedConv)));
+
+  // A held turn expires after the bounded window instead of replaying minutes
+  // (or hours) later against a conversation the user has since left.
+  const expiredConv = "https://chatgpt.com/c/source-turn-late-bind-expired";
+  const expiredTabId = 642;
+  pendingSourceTurnObserveFailures = [
+    "browser_source_session_not_found",
+    "browser_source_session_not_found",
+    "browser_source_session_not_found",
+  ];
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: expiredConv,
+    userText: "过期的第一回合",
+    startedAt: Date.now(),
+  }, { tab: { id: expiredTabId, url: expiredConv } });
+  ok(await waitForTest(() => observesFor(expiredConv).length >= 3, 12000),
+    "user's held turn is bounded in time | Given a source turn held for a conversation that has not registered yet | When the bounded retry schedule is exhausted | Then the turn is held for the fixed window",
+    JSON.stringify(observesFor(expiredConv)));
+  const expiredHeldAttempts = observesFor(expiredConv).length;
+  const clockBeforeExpiry = testClockOffsetMs;
+  testClockOffsetMs += 5 * 60 * 1000 + 1000;
+  try {
+    await registerConversation(expiredConv, expiredTabId, "chatgpt-late-bind-expired");
+  } finally {
+    testClockOffsetMs = clockBeforeExpiry;
+  }
+  ok(observesFor(expiredConv).length === expiredHeldAttempts,
+    "user loses no evidence to a stale replay | Given a held turn older than the bounded hold window | When its conversation registers afterwards | Then the expired hold is dropped and nothing is replayed",
+    JSON.stringify(observesFor(expiredConv)));
+
+  // At most one pending turn per tab+conversation: a newer genuine submit
+  // replaces the older held evidence instead of growing a queue.
+  const newestConv = "https://chatgpt.com/c/source-turn-late-bind-newest";
+  const newestTabId = 643;
+  const newestStartedAt = Date.now();
+  pendingSourceTurnObserveFailures = [
+    "browser_source_session_not_found",
+    "browser_source_session_not_found",
+    "browser_source_session_not_found",
+  ];
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: newestConv,
+    userText: "第一条",
+    startedAt: newestStartedAt,
+  }, { tab: { id: newestTabId, url: newestConv } });
+  ok(await waitForTest(() => observesFor(newestConv).length >= 3, 12000),
+    "user's first held turn is replaced by a newer submit at most once",
+    JSON.stringify(observesFor(newestConv)));
+  pendingSourceTurnObserveFailures = [
+    "browser_source_session_not_found",
+    "browser_source_session_not_found",
+    "browser_source_session_not_found",
+  ];
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: newestConv,
+    userText: "第二条",
+    startedAt: newestStartedAt + 1,
+  }, { tab: { id: newestTabId, url: newestConv } });
+  ok(await waitForTest(() => observesFor(newestConv).length >= 6, 12000),
+    "user's newer turn is held too while the conversation stays unregistered",
+    JSON.stringify(observesFor(newestConv)));
+  const newestHeldAttempts = observesFor(newestConv).length;
+  await registerConversation(newestConv, newestTabId, "chatgpt-late-bind-newest");
+  ok(observesFor(newestConv).length === newestHeldAttempts + 1,
+    "user gets exactly one replay for a conversation with two held turns | Given two held turns for the same tab+conversation | When the session registers | Then only one observe is replayed",
+    JSON.stringify(observesFor(newestConv)));
+  ok(observesFor(newestConv).at(-1).user_text === "第二条",
+    "user's replay uses the newest held turn | Given the newest submit replaced the older evidence | When the session registers | Then the replay carries the newer text",
+    JSON.stringify(observesFor(newestConv).at(-1)));
+
+  // A provisional ChatGPT identity is not a conversation: it must never
+  // register a session, hold a turn, or become a canonical source/target.
+  for (const provisionalConv of [
+    "https://chatgpt.com/c/local-chatgpt%3Abdf4ff94-c1cd-45f7-b141-e9218f0fdd00",
+    "https://chatgpt.com/c/local-chatgpt:bdf4ff94-c1cd-45f7-b141-e9218f0fdd00",
+  ]) {
+    const beforeProvisional = browserRegistryRequests.length;
+    const provisional = await registerConversation(provisionalConv, 644, "chatgpt-provisional-account");
+    ok(provisional?.ok === false && provisional?.error === "provisional_conversation_identity",
+      "user never registers a provisional ChatGPT identity | Given a route still carrying a `local-chatgpt:` placeholder id | When the content script reports it as a registration | Then the registration is refused as a provisional identity",
+      JSON.stringify(provisional));
+    ok(!browserRegistryRequests.slice(beforeProvisional).some((request) => request.operation === "resource.observe"
+      && request.kind === "session"),
+      "user gets no browser session for a provisional id | Given a refused provisional registration | When the background inspects the registry traffic | Then no session observation was sent",
+      JSON.stringify(browserRegistryRequests.slice(beforeProvisional)));
+  }
+}
+
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);
 process.exit(failures === 0 ? 0 : 1);
