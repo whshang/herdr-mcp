@@ -1999,6 +1999,13 @@ async function postBrowserRegistry(payload) {
   return parsed;
 }
 
+// #734 N-1: a Runtime that predates endpoint-scoped observe rejects the two
+// provenance keys as browser_registry_params_invalid. Once that happens this
+// service worker stops offering them, so later turns do not pay for a rejected
+// attempt. The flag is intentionally in-memory only: a Runtime update is picked
+// up by the next service-worker start.
+let sourceTurnProvenanceUnsupported = false;
+
 // #734: the observing endpoint of a user turn, taken from the endpoint this
 // profile already registered (never from the tab URL or message text). The
 // runtime re-derives the same ref from its own device identity plus the profile
@@ -2008,11 +2015,39 @@ async function postBrowserRegistry(payload) {
 // registered endpoint the payload keeps its previous shape and the runtime keeps
 // its global lookup.
 async function sourceTurnEndpointProvenance() {
+  if (sourceTurnProvenanceUnsupported) return {};
   const endpointRef = String(browserEndpointView(browserEndpoint)?.endpoint_ref || "").trim();
   if (!endpointRef) return {};
   const profileSeed = await getOrCreateBrowserProfileSeed().catch(() => "");
   if (!validBrowserProfileSeed(profileSeed)) return {};
   return { profile_seed: profileSeed, endpoint_ref: endpointRef };
+}
+
+/**
+ * #734: post one source turn. `sourceTurn` is the complete legacy four-field
+ * payload (`operation`, `canonical_url`, `user_text`, `observed_at`) and
+ * `provenance` may add the observing endpoint to it.
+ *
+ * A Runtime that predates endpoint-scoped observe rejects those extra keys as
+ * `browser_registry_params_invalid`. That single rejection is retried with
+ * exactly `sourceTurn`, so the turn evidence and its `observed_at` are replayed
+ * unchanged, and the Runtime is remembered as provenance-free for this service
+ * worker's lifetime so later turns post the legacy payload directly. Any other
+ * rejection is rethrown so the caller keeps its fail-closed behavior.
+ */
+async function postSourceTurnObserve({ sourceTurn, provenance }) {
+  try {
+    return await postBrowserRegistry({ ...sourceTurn, ...provenance });
+  } catch (error) {
+    const code = error?.message || String(error);
+    if (code !== "browser_registry_params_invalid"
+        || (!provenance?.profile_seed && !provenance?.endpoint_ref)) {
+      throw error;
+    }
+    sourceTurnProvenanceUnsupported = true;
+    callLog("current source turn observe has no endpoint provenance support; retrying the legacy payload");
+    return postBrowserRegistry({ ...sourceTurn });
+  }
 }
 
 // Trusted local Extension IPC: report one finalized worker assistant turn so the
@@ -12554,13 +12589,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "continuity-fields-incomplete" });
         return;
       }
-      const observeSourceTurn = async () => postBrowserRegistry({
-        operation: "source_turn.observe",
-        canonical_url: convKey,
-        user_text: userText,
-        ...(await sourceTurnEndpointProvenance()),
-        observed_at: msg?.startedAt || Date.now(),
-      });
+      const observeSourceTurn = async () => {
+        const sourceTurn = {
+          operation: "source_turn.observe",
+          canonical_url: convKey,
+          user_text: userText,
+          observed_at: msg?.startedAt || Date.now(),
+        };
+        return postSourceTurnObserve({
+          sourceTurn,
+          provenance: await sourceTurnEndpointProvenance(),
+        });
+      };
       try {
         await observeSourceTurn();
       } catch (error) {

@@ -185,6 +185,9 @@ const mcpRequestBodies = [];
 const nativeBatchRequests = [];
 let failNextBrowserEndpointRegistration = true;
 let pendingSourceTurnObserveFailures = [];
+// Simulates a Runtime that predates endpoint-scoped observe (#734): its registry
+// allow-list rejects the provenance keys instead of resolving the turn.
+let rejectSourceTurnProvenance = false;
 const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
@@ -547,6 +550,19 @@ globalThis.chrome = {
             status: 200,
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ ok: false, code }),
+          });
+          return;
+        }
+        if (body.operation === "source_turn.observe" && rejectSourceTurnProvenance
+            && (Object.prototype.hasOwnProperty.call(body, "profile_seed")
+              || Object.prototype.hasOwnProperty.call(body, "endpoint_ref"))) {
+          // The pre-#734 runtime allow-list is exactly the legacy four fields.
+          callback({
+            ok: true,
+            transport: "ipc",
+            status: 400,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ok: false, code: "browser_registry_params_invalid" }),
           });
           return;
         }
@@ -4573,6 +4589,64 @@ console.log("\n[Source-turn observe retry covers the fresh-conversation registra
     JSON.stringify(warnings));
 }
 
+
+console.log("\n[Source-turn observe keeps the older Runtime working (N-1)]");
+{
+  const observesFor = (conv) => browserRegistryRequests.filter(
+    (request) => request.operation === "source_turn.observe" && request.canonical_url === conv,
+  );
+  const legacyConv = "https://chatgpt.com/c/source-turn-legacy-runtime";
+  const legacyUserText = "旧 Runtime 只接受四个字段";
+  const legacyStartedAt = Date.now() - 5;
+  rejectSourceTurnProvenance = true;
+  try {
+    await dispatchMessage({
+      type: "h2w_turn_started",
+      convKey: legacyConv,
+      userText: `  ${legacyUserText}  `,
+      startedAt: legacyStartedAt,
+    });
+    ok(await waitForTest(() => observesFor(legacyConv).length >= 2, 8000),
+      "user keeps source-turn binding on an older Runtime | Given a Runtime whose registry allow-list predates endpoint scoping and rejects profile_seed/endpoint_ref as browser_registry_params_invalid | When the turn-started observe runs | Then one rejected provenance attempt is followed by one legacy four-field retry",
+      JSON.stringify(observesFor(legacyConv)));
+  } finally {
+    rejectSourceTurnProvenance = false;
+  }
+  const attempts = observesFor(legacyConv);
+  ok(attempts.length === 2,
+    "the older Runtime costs exactly one rejected attempt and one legacy retry",
+    JSON.stringify(attempts));
+  ok(attempts[0]?.endpoint_ref === "bep_test"
+      && attempts[0]?.profile_seed === storage.herdrBrowserProfileSeedV1,
+    "the first attempt still reports this profile's endpoint provenance",
+    JSON.stringify(attempts[0]));
+  const legacyRetry = attempts[1] || {};
+  ok(Object.keys(legacyRetry).sort().join(",") === "canonical_url,observed_at,operation,user_text",
+    "the retry is the legacy payload with no provenance keys",
+    JSON.stringify(legacyRetry));
+  ok(legacyRetry.user_text === legacyUserText && legacyRetry.observed_at === legacyStartedAt,
+    "the legacy retry replays the exact trimmed turn text and original submit time",
+    JSON.stringify(legacyRetry));
+
+  // The rejection is remembered for this service-worker lifetime, so the next
+  // turn does not spend another rejected round trip on the same Runtime.
+  const laterConv = "https://chatgpt.com/c/source-turn-legacy-runtime-later";
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: laterConv,
+    userText: "旧 Runtime 第二个回合",
+    startedAt: Date.now(),
+  });
+  ok(await waitForTest(() => observesFor(laterConv).length >= 1, 8000),
+    "a later turn is reported on the older Runtime",
+    JSON.stringify(observesFor(laterConv)));
+  const laterAttempts = observesFor(laterConv);
+  ok(laterAttempts.length === 1
+      && !Object.prototype.hasOwnProperty.call(laterAttempts[0], "endpoint_ref")
+      && !Object.prototype.hasOwnProperty.call(laterAttempts[0], "profile_seed"),
+    "user pays no repeated rejected attempt | Given the older Runtime already refused the provenance keys | When another turn starts | Then the first observe already uses the legacy payload",
+    JSON.stringify(laterAttempts));
+}
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);
 process.exit(failures === 0 ? 0 : 1);
