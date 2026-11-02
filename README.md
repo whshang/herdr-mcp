@@ -150,7 +150,7 @@ Cloudflare 同时承担公网 MCP/OAuth 地址、设备路由、重连协调，�
 
 ### 支持哪个 Herdr？
 
-只支持 **Herdr TUI**（`herdr` CLI 与 `herdr server`）。CI 固定使用 Herdr TUI `0.8.2`，上游当前 TUI 版本为 `0.9.5`。新的 Herdr app 及其 herdr-core 运行时（`hc`）是独立的运行时，与 TUI 不共享 Agent，herdr-mcp v1.1 不支持它们。Herdr TUI 文档已迁移到 <https://herdr.dev/tui/docs/>。详见[平台支持矩阵](docs/i18n/zh-CN/platform-support-matrix.md)。
+只支持 **Herdr TUI**（`herdr` CLI 与 `herdr server`）。CI 固定使用 Herdr TUI `0.9.5`。新的 Herdr app 及其 herdr-core 运行时（`hc`）是独立的运行时，与 TUI 不共享 Agent，herdr-mcp v1.1 不支持它们。Herdr TUI 文档已迁移到 <https://herdr.dev/tui/docs/>。详见[平台支持矩阵](docs/i18n/zh-CN/platform-support-matrix.md)。
 
 ### 首次安装后找不到 Herdr 窗口或 Server 怎么办？
 

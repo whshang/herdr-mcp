@@ -24,7 +24,7 @@ herdr-mcp drives exactly one Herdr runtime: the **Herdr TUI**. Versions below we
 
 | Herdr runtime | herdr-mcp v1.1 status | Notes |
 | --- | --- | --- |
-| Herdr TUI (`herdr` CLI + `herdr server`) | **Supported** | The only runtime herdr-mcp drives: workspaces, tabs, panes and agents through the Herdr TUI socket API. CI and the release gate pin Herdr TUI `0.8.2`; the current upstream TUI release is `0.9.5` and is not yet the CI pin. Documentation: [Herdr TUI docs](https://herdr.dev/tui/docs/). |
+| Herdr TUI (`herdr` CLI + `herdr server`) | **Supported** | The only runtime herdr-mcp drives: workspaces, tabs, panes and agents through the Herdr TUI socket API. CI and the release gate pin Herdr TUI `0.9.5`. Documentation: [Herdr TUI docs](https://herdr.dev/tui/docs/). |
 | Herdr app (`0.1.9`) on herdr-core (`hc` `0.1.14`) | **Unsupported** | A separate runtime with its own JSON-RPC/OpenRPC socket. It models terminals instead of workspaces/tabs, reports agent status only through OSC 7501, and does not share agents with the Herdr TUI. Agents started there are invisible to herdr-mcp. |
 
 ## N, N-1 and N+1 policy

@@ -5,10 +5,11 @@
 # The transport tests (tests/transport.test.mjs) connect to a live Herdr over
 # HERDR_SOCKET_PATH (default ~/.config/herdr/herdr.sock) and assert herdr_inspect
 # returns a focused_workspace. The bootstrap workspace is deliberately non-Git:
-# Herdr 0.8.2 can block workspace creation on Git discovery, which must not make
-# the transport test fixture depend on repository metadata.
+# Keep the bootstrap workspace deliberately non-Git so the transport test fixture
+# does not depend on repository metadata (historical Herdr releases could block
+# workspace creation on Git discovery).
 #
-# We pin the exact release (v0.8.2) instead of the rolling `latest` installer for
+# We pin the exact release (v0.9.5) instead of the rolling `latest` installer for
 # reproducibility, and fail fast if the installed version differs.
 #
 # Usage:
@@ -22,7 +23,7 @@
 # its socket. This script never starts a TUI and refuses the developer default state.
 set -euo pipefail
 
-: "${HERDR_VERSION:=0.8.2}"
+: "${HERDR_VERSION:=0.9.5}"
 
 detect_asset() {
   local os arch
