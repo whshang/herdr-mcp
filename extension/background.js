@@ -168,6 +168,19 @@ const archiveTabCloseInFlight = new Set();
 let browserEndpoint = null;
 let browserObservationGeneration = null;
 const browserCapabilitySnapshots = new Map();
+// #786: the first turn of a brand-new ChatGPT conversation can be submitted
+// before the `/c/<id>` browser session exists, so the Runtime rejects the
+// source-turn evidence with `browser_source_session_not_found`. The bounded
+// observe retry in the turn-started handler covers seconds, not the minutes a
+// fresh conversation's registration can lag (#771 live evidence). Hold the
+// newest unrecorded turn per tab+conversation in memory only (never storage,
+// never a provider resend) and replay that exact evidence once the Runtime
+// confirms the same conversation's session. Any other failure stays
+// fail-closed and nothing is held.
+const SOURCE_TURN_REGISTRATION_CODE = "browser_source_session_not_found";
+const SOURCE_TURN_HOLD_TTL_MS = 5 * 60 * 1000;
+const SOURCE_TURN_HOLD_MAX = 32;
+const heldSourceTurns = new Map();
 const AUTOMATION_MODE_MANUAL = "manual";
 const AUTOMATION_MODE_PROJECT = "project_auto";
 const HANDOFF_RETENTION_MS = 7 * 86400000;
@@ -2047,6 +2060,84 @@ async function postSourceTurnObserve({ sourceTurn, provenance }) {
     sourceTurnProvenanceUnsupported = true;
     callLog("current source turn observe has no endpoint provenance support; retrying the legacy payload");
     return postBrowserRegistry({ ...sourceTurn });
+  }
+}
+
+function heldSourceTurnKey(tabId, convKey) {
+  return `${Number.isInteger(tabId) ? tabId : "-"}::${convKey}`;
+}
+
+function pruneExpiredHeldSourceTurns(now = Date.now()) {
+  for (const [key, held] of heldSourceTurns) {
+    if (!held || held.expiresAt <= now) heldSourceTurns.delete(key);
+  }
+}
+
+function dropHeldSourceTurn(tabId, convKey) {
+  heldSourceTurns.delete(heldSourceTurnKey(tabId, convKey));
+}
+
+function holdSourceTurnForLateSession({ tabId, convKey, userText, observedAt }) {
+  const now = Date.now();
+  pruneExpiredHeldSourceTurns(now);
+  const key = heldSourceTurnKey(tabId, convKey);
+  // At most one pending turn per tab+conversation: the newest genuine submit
+  // replaces older evidence instead of growing an in-memory queue.
+  heldSourceTurns.delete(key);
+  heldSourceTurns.set(key, {
+    tabId: Number.isInteger(tabId) ? tabId : null,
+    convKey,
+    userText,
+    observedAt,
+    expiresAt: now + SOURCE_TURN_HOLD_TTL_MS,
+  });
+  while (heldSourceTurns.size > SOURCE_TURN_HOLD_MAX) {
+    heldSourceTurns.delete(heldSourceTurns.keys().next().value);
+  }
+}
+
+// Re-report an already-observed turn to the local Runtime once its conversation
+// session has been registered. The payload is the original evidence unchanged
+// (canonical URL, trimmed text, submit time), so this stays the same idempotent
+// per-session upsert the Runtime dedupes; nothing is ever sent to ChatGPT.
+async function replayHeldSourceTurn({ tabId, convKey }) {
+  if (!convKey) return null;
+  pruneExpiredHeldSourceTurns();
+  const key = heldSourceTurnKey(tabId, convKey);
+  let heldKey = heldSourceTurns.has(key) ? key : null;
+  if (!heldKey) {
+    // A turn can arrive from a tab the service worker cannot attribute; the
+    // canonical conversation URL is then the exact identity to replay against.
+    for (const [candidateKey, candidate] of heldSourceTurns) {
+      if (candidate?.convKey === convKey) { heldKey = candidateKey; break; }
+    }
+  }
+  if (!heldKey) return null;
+  const held = heldSourceTurns.get(heldKey);
+  heldSourceTurns.delete(heldKey);
+  try {
+    // #734: one payload builder for every source turn, including a late replay,
+    // so a Runtime that rejects the endpoint provenance keys still records the
+    // held turn with the legacy four-field payload.
+    await postSourceTurnObserve({
+      sourceTurn: {
+        operation: "source_turn.observe",
+        canonical_url: held.convKey,
+        user_text: held.userText,
+        observed_at: held.observedAt,
+      },
+      provenance: await sourceTurnEndpointProvenance(),
+    });
+    return { replayed: true };
+  } catch (error) {
+    const code = error?.message || String(error);
+    // Only a still-missing registration keeps the turn for a later attempt; it
+    // expires on its own. Every other rejection is final and stays fail-closed.
+    if (code === SOURCE_TURN_REGISTRATION_CODE && held.expiresAt > Date.now()) {
+      heldSourceTurns.set(heldKey, held);
+    }
+    warnLog("held source_turn.observe replay failed:", code);
+    return { replayed: false, code };
   }
 }
 
@@ -11515,6 +11606,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const browserPageInfo = ["chatgpt", "gemini", "claude", "grok"].includes(registeringSite)
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
+      // #786: a provisional `local-chatgpt:<uuid>` route is not a provider
+      // conversation identity. ChatGPT's adapter already refuses to derive a
+      // conversation key from it, so refuse it here too: a provisional id must
+      // never register a browser session, hold a source turn, or become a
+      // canonical source/target for a dispatch.
+      if (registeringSite === "chatgpt"
+          && /^local-chatgpt(?::|%3a)/i.test(String(browserPageInfo?.conversation_id || ""))) {
+        sendResponse({ ok: false, error: "provisional_conversation_identity" });
+        return;
+      }
       const accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
       const accountDisplayLabel = formatPlatformAccountDisplay(
         registeringSite,
@@ -11561,6 +11662,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             callLog("browser observation failed:", code);
           }
         }
+      }
+      // #786: this registration is the Runtime's confirmation that the exact
+      // conversation's browser session exists. A first turn rejected before
+      // that session existed is replayed here, once, with its original evidence
+      // — never a provider resend. Nothing is held in the common case, so this
+      // resolves without a network call.
+      if (browserObservation?.sessionRef && sender.tab?.id) {
+        await replayHeldSourceTurn({
+          tabId: sender.tab.id,
+          convKey: browserPageInfo?.convKey || pageInfo?.convKey || String(msg.convKey || ""),
+        });
       }
       let matched = bindingsForPageInfo(bindings, pageInfo, msg.convKey);
       if (!matched.length && sender.tab?.id) {
@@ -12589,24 +12701,31 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "continuity-fields-incomplete" });
         return;
       }
-      const observeSourceTurn = async () => {
-        const sourceTurn = {
+      // The submit time is captured once so the initial attempt, every retry and
+      // any late replay re-report the identical evidence: the Runtime dedupes a
+      // source turn by canonical URL plus this exact timestamp.
+      const observedAt = msg?.startedAt || Date.now();
+      const holdTabId = Number.isInteger(sender.tab?.id) ? sender.tab.id : null;
+      // #734: the initial attempt, both bounded retries and any late replay go
+      // through one payload builder, so the observing endpoint is offered only
+      // while the Runtime accepts it and the legacy four-field payload is used
+      // otherwise.
+      const observeSourceTurn = async () => postSourceTurnObserve({
+        sourceTurn: {
           operation: "source_turn.observe",
           canonical_url: convKey,
           user_text: userText,
-          observed_at: msg?.startedAt || Date.now(),
-        };
-        return postSourceTurnObserve({
-          sourceTurn,
-          provenance: await sourceTurnEndpointProvenance(),
-        });
-      };
+          observed_at: observedAt,
+        },
+        provenance: await sourceTurnEndpointProvenance(),
+      });
       try {
         await observeSourceTurn();
+        dropHeldSourceTurn(holdTabId, convKey);
       } catch (error) {
         const code = error?.message || String(error);
         callLog("current source turn observe failed:", code);
-        if (code === "browser_source_session_not_found") {
+        if (code === SOURCE_TURN_REGISTRATION_CODE) {
           // The first turn of a brand-new conversation can mount before the
           // 1s route poll registers the session for its canonical URL, so the
           // exact-turn evidence is dropped exactly when a fresh WebChat
@@ -12621,21 +12740,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               await new Promise((resolve) => setTimeout(resolve, delayMs));
               try {
                 await observeSourceTurn();
+                dropHeldSourceTurn(holdTabId, convKey);
                 return;
               } catch (retryError) {
                 const retryCode = retryError?.message || String(retryError);
                 callLog("current source turn observe retry failed:", retryCode);
-                if (retryCode !== "browser_source_session_not_found") {
+                if (retryCode !== SOURCE_TURN_REGISTRATION_CODE) {
                   warnLog("source_turn.observe failed:", retryCode);
+                  dropHeldSourceTurn(holdTabId, convKey);
                   return;
                 }
               }
             }
+            // #786: the schedule above only covers seconds. A brand-new
+            // conversation registers its `/c/<id>` session only once the
+            // content script's provider readback proves the chat, which lags
+            // the first send by minutes in live evidence (#771). Hold the turn
+            // for a bounded window and replay it when registration lands.
+            holdSourceTurnForLateSession({ tabId: holdTabId, convKey, userText, observedAt });
           })();
         } else {
           // A non-registration rejection is never retried, so this is the only
           // record of it. Warn with the typed Runtime code alone: the canonical
           // URL and the captured user turn must never reach the console.
+          dropHeldSourceTurn(holdTabId, convKey);
           warnLog("source_turn.observe failed:", code);
         }
       }
