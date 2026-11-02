@@ -2030,6 +2030,19 @@ fn legacy_worker_update_notice() -> Value {
     })
 }
 
+/// Whether a legacy chained-Worker job provably finished its Runtime swap.
+///
+/// A `<= v1.1.0-rc.8` updater could record the chained-Worker code and a
+/// non-successful job state even though the Runtime had already been activated.
+/// The recorded state alone cannot settle that, so the decisive evidence is the
+/// installed Runtime: when it already reports the job's target version, the swap
+/// committed and only the separate fleet Worker step is outstanding. When the
+/// installed version is still something else the Runtime genuinely did not
+/// commit and the job stays a failure.
+fn legacy_worker_swap_committed(job: &UpdateJobRecord, current_version: &str) -> bool {
+    legacy_worker_update_detail(job.detail.as_deref()) && job.version == current_version
+}
+
 /// Read-only `update status` view.
 ///
 /// `ok` and `runtime_outcome` describe the recorded Runtime job; Worker drift or
@@ -2042,15 +2055,25 @@ fn update_status_view(
     worker_update: Value,
 ) -> Value {
     let worker_update_required = worker_update_required(&worker_update);
-    let outcome = job.map_or("none", |job| runtime_job_outcome(&job.state));
+    let recorded_outcome = job.map_or("none", |job| runtime_job_outcome(&job.state));
+    // An older updater could record the chained-Worker text next to a
+    // non-successful state after the Runtime had in fact been activated. The
+    // installed Runtime is the proof, so a job whose target version is already
+    // installed reports the Runtime success the operator actually got.
+    let legacy_swap_committed =
+        job.is_some_and(|job| legacy_worker_swap_committed(job, current_version));
+    let outcome = if recorded_outcome == "failed" && legacy_swap_committed {
+        "succeeded"
+    } else {
+        recorded_outcome
+    };
     let mut notices = worker_update_notices(&worker_update)
         .as_array()
         .cloned()
         .unwrap_or_default();
-    if job.is_some_and(|job| {
-        runtime_job_outcome(&job.state) == "succeeded"
-            && legacy_worker_update_detail(job.detail.as_deref())
-    }) {
+    if outcome == "succeeded"
+        && job.is_some_and(|job| legacy_worker_update_detail(job.detail.as_deref()))
+    {
         notices.push(legacy_worker_update_notice());
     }
     let next_action = if worker_update_required {
@@ -2066,6 +2089,7 @@ fn update_status_view(
         "ok": outcome != "failed",
         "code": "update_status",
         "runtime_outcome": outcome,
+        "recorded_runtime_state": job.map(|job| job.state.clone()),
         "job": job.map(public_job_view),
         "current_version": current_version,
         "worker_update_required": worker_update_required,
@@ -4640,6 +4664,126 @@ mod tests {
         );
         assert_eq!(worker_update_invocations, 1);
         assert_eq!(chained["code"], "worker_update_succeeded");
+    }
+
+    /// Given a stable-channel `update apply --manifest <newer manifest>` whose
+    /// Runtime update already committed
+    /// When the fleet Worker is behind the installed release
+    /// Then the Worker step is never invoked, the command reports success, and
+    /// the only Worker signal is a non-fatal notice.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn update_apply_with_manifest_on_stable_never_invokes_worker_update() {
+        let root = env::temp_dir().join(format!(
+            "herdr-manifest-stable-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        let paths = test_runtime_paths(&root);
+        let mut worker_update_invocations = 0;
+        // `--manifest` and the update channel only select release metadata; the
+        // post-commit Worker decision is this runtime-only seam, which every
+        // stable and preview apply reaches.
+        let _ = resolve_worker_update_after_runtime_commit(
+            &paths,
+            "1.1.0-rc.11",
+            WorkerChain::RuntimeOnly,
+            || {
+                worker_update_invocations += 1;
+                json!({ "ok": true, "code": "worker_update_succeeded" })
+            },
+        );
+        assert_eq!(
+            worker_update_invocations, 0,
+            "a stable --manifest apply must never run worker update"
+        );
+
+        let outdated_worker = json!({
+            "configured": true,
+            "edge_origin": "https://edge.example.test",
+            "worker": "herdr-edge",
+            "edge_version": "1.1.0-rc.6",
+            "target_version": "1.1.0-rc.11",
+            "update_required": true,
+        });
+        let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+            job_id: "upd-manifest-stable".to_owned(),
+            target_version: "1.1.0-rc.11".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            asset: "herdr-mcp".to_owned(),
+            worker_pid: 7,
+            worker_pid_persisted: true,
+            job: json!({ "job_id": "upd-manifest-stable", "state": "succeeded" }),
+            migration: None,
+            worker_update: outdated_worker,
+            worker_chain: WorkerChain::RuntimeOnly,
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["code"], "update_succeeded");
+        assert_eq!(payload["worker_update_chained"], false);
+        assert_eq!(payload["worker_update_required"], true);
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "worker_update_required")
+            .expect("an outdated Worker must be a non-fatal notice");
+        assert_eq!(notice["severity"], "notice");
+        assert_eq!(notice["fatal"], false);
+        assert_eq!(notice["next_action"], "herdr-mcp worker update");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Given a `<= v1.1.0-rc.8` job whose detail carries the chained-Worker code
+    /// When the installed Runtime already reports that job's target version
+    /// Then `update status` reports the Runtime success the operator got, with a
+    /// non-fatal notice, and a job whose Runtime never committed stays a failure.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn update_status_reports_a_legacy_failed_job_as_success_when_the_swap_committed() {
+        let mut job = ordinary_update_job("upd-legacy-failed");
+        job.version = "1.1.0-rc.11".to_owned();
+        job.state = "failed".to_owned();
+        job.detail =
+            Some("update_succeeded_worker_update_required worker_update_failed".to_owned());
+
+        let committed = update_status_view(
+            Some(&job),
+            "1.1.0-rc.11",
+            json!({ "configured": true, "update_required": false }),
+        );
+        assert_eq!(committed["ok"], true);
+        assert_eq!(committed["runtime_outcome"], "succeeded");
+        assert_eq!(committed["recorded_runtime_state"], "failed");
+        assert_eq!(committed["next_action"], Value::Null);
+        assert!(
+            committed["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|notice| notice["code"] == "worker_update_failed_legacy"),
+            "the legacy chained-Worker text must stay a notice"
+        );
+
+        // Same record while the installed Runtime is still the previous release:
+        // the swap never happened, so it must stay a failure.
+        let not_committed = update_status_view(
+            Some(&job),
+            "1.1.0-rc.6",
+            json!({ "configured": true, "update_required": false }),
+        );
+        assert_eq!(not_committed["ok"], false);
+        assert_eq!(not_committed["runtime_outcome"], "failed");
+        assert_eq!(not_committed["next_action"], "herdr-mcp update apply");
+        assert!(
+            !not_committed["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|notice| notice["code"] == "worker_update_failed_legacy"),
+            "an uncommitted Runtime swap must not be excused as a legacy Worker notice"
+        );
     }
 
     /// Given a `--with-worker` request in a detached or CI invocation

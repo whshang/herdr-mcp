@@ -413,7 +413,11 @@ macOS 上是一个新的隐私（TCC）身份，因此代表新一代去访问 `
 **`v1.1.0-rc.8` 及更早的 updater 会报 `ok: false`。** 那些 updater 把独立的
 fleet Worker 发布串联进了 runtime 结果，所以只要 Worker 凭据或 reconcile 出问题，
 升级就会以 `ok: false` 和 `update_succeeded_worker_update_required` 结束——即使
-runtime 更新已提交且健康门禁已通过。这是预期行为，不是升级失败。请先确认 runtime：
+runtime 更新已提交且健康门禁已通过。这是预期行为，不是升级失败。pre-`v1.1.0-rc.9` 的 updater
+仍可能在只更新 runtime 时尝试那次 Worker 步骤（例如在 stable 或 preview 通道用
+`update apply --manifest <更新的 manifest>`，而本机装的还是旧 runtime）；该尝试对
+runtime 是非致命的，runtime 已经更新完成，只把下面这条独立的 Worker 发布留给你。
+请先确认 runtime：
 
 ```bash
 herdr-mcp --version
