@@ -185,6 +185,9 @@ const mcpRequestBodies = [];
 const nativeBatchRequests = [];
 let failNextBrowserEndpointRegistration = true;
 let pendingSourceTurnObserveFailures = [];
+// Simulates a Runtime that predates endpoint-scoped observe (#734): its registry
+// allow-list rejects the provenance keys instead of resolving the turn.
+let rejectSourceTurnProvenance = false;
 const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
@@ -547,6 +550,19 @@ globalThis.chrome = {
             status: 200,
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ ok: false, code }),
+          });
+          return;
+        }
+        if (body.operation === "source_turn.observe" && rejectSourceTurnProvenance
+            && (Object.prototype.hasOwnProperty.call(body, "profile_seed")
+              || Object.prototype.hasOwnProperty.call(body, "endpoint_ref"))) {
+          // The pre-#734 runtime allow-list is exactly the legacy four fields.
+          callback({
+            ok: true,
+            transport: "ipc",
+            status: 400,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ok: false, code: "browser_registry_params_invalid" }),
           });
           return;
         }
@@ -4490,6 +4506,10 @@ console.log("\n[Source-turn observe retry covers the fresh-conversation registra
   const attempts = observesFor(retryConv);
   ok(attempts.length === 3,
     "the retry schedule makes exactly one initial attempt plus two bounded retries");
+  ok(attempts.every((attempt) => attempt.endpoint_ref === "bep_test"
+      && attempt.profile_seed === storage.herdrBrowserProfileSeedV1),
+    "user turn is reported from the observing endpoint | Given this browser profile already registered its endpoint | When source_turn.observe is posted | Then every attempt carries the registered endpoint_ref plus the stored profile seed so the Runtime resolves the conversation inside the observing endpoint (#734)",
+    JSON.stringify(attempts));
   ok(attempts.every((attempt) => attempt.user_text === "确认当前用户回合"
       && attempt.observed_at === startedAt),
     "every retry replays the same trimmed text and original submit time");
@@ -4570,6 +4590,64 @@ console.log("\n[Source-turn observe retry covers the fresh-conversation registra
 }
 
 
+console.log("\n[Source-turn observe keeps the older Runtime working (N-1)]");
+{
+  const observesFor = (conv) => browserRegistryRequests.filter(
+    (request) => request.operation === "source_turn.observe" && request.canonical_url === conv,
+  );
+  const legacyConv = "https://chatgpt.com/c/source-turn-legacy-runtime";
+  const legacyUserText = "旧 Runtime 只接受四个字段";
+  const legacyStartedAt = Date.now() - 5;
+  rejectSourceTurnProvenance = true;
+  try {
+    await dispatchMessage({
+      type: "h2w_turn_started",
+      convKey: legacyConv,
+      userText: `  ${legacyUserText}  `,
+      startedAt: legacyStartedAt,
+    });
+    ok(await waitForTest(() => observesFor(legacyConv).length >= 2, 8000),
+      "user keeps source-turn binding on an older Runtime | Given a Runtime whose registry allow-list predates endpoint scoping and rejects profile_seed/endpoint_ref as browser_registry_params_invalid | When the turn-started observe runs | Then one rejected provenance attempt is followed by one legacy four-field retry",
+      JSON.stringify(observesFor(legacyConv)));
+  } finally {
+    rejectSourceTurnProvenance = false;
+  }
+  const attempts = observesFor(legacyConv);
+  ok(attempts.length === 2,
+    "the older Runtime costs exactly one rejected attempt and one legacy retry",
+    JSON.stringify(attempts));
+  ok(attempts[0]?.endpoint_ref === "bep_test"
+      && attempts[0]?.profile_seed === storage.herdrBrowserProfileSeedV1,
+    "the first attempt still reports this profile's endpoint provenance",
+    JSON.stringify(attempts[0]));
+  const legacyRetry = attempts[1] || {};
+  ok(Object.keys(legacyRetry).sort().join(",") === "canonical_url,observed_at,operation,user_text",
+    "the retry is the legacy payload with no provenance keys",
+    JSON.stringify(legacyRetry));
+  ok(legacyRetry.user_text === legacyUserText && legacyRetry.observed_at === legacyStartedAt,
+    "the legacy retry replays the exact trimmed turn text and original submit time",
+    JSON.stringify(legacyRetry));
+
+  // The rejection is remembered for this service-worker lifetime, so the next
+  // turn does not spend another rejected round trip on the same Runtime.
+  const laterConv = "https://chatgpt.com/c/source-turn-legacy-runtime-later";
+  await dispatchMessage({
+    type: "h2w_turn_started",
+    convKey: laterConv,
+    userText: "旧 Runtime 第二个回合",
+    startedAt: Date.now(),
+  });
+  ok(await waitForTest(() => observesFor(laterConv).length >= 1, 8000),
+    "a later turn is reported on the older Runtime",
+    JSON.stringify(observesFor(laterConv)));
+  const laterAttempts = observesFor(laterConv);
+  ok(laterAttempts.length === 1
+      && !Object.prototype.hasOwnProperty.call(laterAttempts[0], "endpoint_ref")
+      && !Object.prototype.hasOwnProperty.call(laterAttempts[0], "profile_seed"),
+    "user pays no repeated rejected attempt | Given the older Runtime already refused the provenance keys | When another turn starts | Then the first observe already uses the legacy payload",
+    JSON.stringify(laterAttempts));
+}
+
 console.log("\n[Late registration holds and replays the first source turn (#786)]");
 {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -4622,7 +4700,12 @@ console.log("\n[Late registration holds and replays the first source turn (#786)
     "user keeps the exact turn identity | Given a replayed held turn | When the Runtime receives it | Then it carries the same trimmed text and original submit time so the upsert is idempotent",
     JSON.stringify(replayedTurn));
   ok(!("dispatch_id" in replayedTurn) && !("assistant_text" in replayedTurn)
-      && Object.keys(replayedTurn).sort().join(",") === "canonical_url,observed_at,operation,user_text",
+      && Object.keys(replayedTurn).every((key) => [
+        "operation", "canonical_url", "user_text", "observed_at",
+        // #734: the observing endpoint is request identity, never a provider
+        // action, so it may accompany the replayed turn evidence.
+        "profile_seed", "endpoint_ref",
+      ].includes(key)),
     "user never gets a replayed provider action | Given the held turn replay | When the service worker builds the payload | Then it re-reports only the already-observed turn fields and nothing that could reach ChatGPT",
     JSON.stringify(replayedTurn));
   await sleep(2500);
@@ -4745,6 +4828,72 @@ console.log("\n[Late registration holds and replays the first source turn (#786)
       "user gets no browser session for a provisional id | Given a refused provisional registration | When the background inspects the registry traffic | Then no session observation was sent",
       JSON.stringify(browserRegistryRequests.slice(beforeProvisional)));
   }
+}
+
+console.log("\n[Held source turn replays with the legacy payload on a Runtime without provenance support]");
+{
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const observesFor = (conv) => browserRegistryRequests.filter(
+    (request) => request.operation === "source_turn.observe" && request.canonical_url === conv,
+  );
+  const legacyReplayConvId = "source-turn-late-bind-legacy-runtime";
+  const legacyReplayConv = `https://chatgpt.com/c/${legacyReplayConvId}`;
+  const legacyReplayTabId = 645;
+  const legacyReplayUserText = "旧 Runtime 的迟到第一回合";
+  const legacyReplayStartedAt = Date.now() - 9;
+  // The Runtime both lags the session registration and refuses the endpoint
+  // provenance keys, so the held turn may only land through the legacy payload.
+  rejectSourceTurnProvenance = true;
+  const replayWarnings = [];
+  const realReplayWarn = console.warn;
+  console.warn = (...args) => { replayWarnings.push(args.join(" ")); };
+  try {
+    pendingSourceTurnObserveFailures = [
+      "browser_source_session_not_found",
+      "browser_source_session_not_found",
+      "browser_source_session_not_found",
+    ];
+    await dispatchMessage({
+      type: "h2w_turn_started",
+      convKey: legacyReplayConv,
+      userText: `  ${legacyReplayUserText}  `,
+      startedAt: legacyReplayStartedAt,
+    }, { tab: { id: legacyReplayTabId, url: legacyReplayConv } });
+    ok(await waitForTest(() => observesFor(legacyReplayConv).length >= 3, 12000),
+      "user's first turn is held on a Runtime without endpoint provenance | Given the registration lags and the Runtime rejects the provenance keys | When the bounded observe attempts miss the session | Then the exact turn is held instead of dropped",
+      JSON.stringify(observesFor(legacyReplayConv)));
+    const attemptsBeforeReplay = observesFor(legacyReplayConv).length;
+    const registered = await dispatchMessage({
+      type: "h2w_register",
+      site: "chatgpt",
+      convKey: legacyReplayConv,
+      url: legacyReplayConv,
+      accountNativeIdentity: "chatgpt-late-bind-legacy-account",
+    }, { tab: { id: legacyReplayTabId, url: legacyReplayConv } });
+    ok(registered?.browser_session_ref === `brs_chatgpt_${legacyReplayConvId}`,
+      "user sees the late conversation register",
+      JSON.stringify(registered));
+    ok(await waitForTest(() => observesFor(legacyReplayConv).length > attemptsBeforeReplay, 8000),
+      "user's held turn is replayed once the session registers",
+      JSON.stringify(observesFor(legacyReplayConv)));
+    const replayRequests = observesFor(legacyReplayConv).slice(attemptsBeforeReplay);
+    ok(replayRequests.length > 0
+        && Object.keys(replayRequests.at(-1)).sort().join(",") === "canonical_url,observed_at,operation,user_text",
+      "user's late replay uses the legacy payload | Given a held turn whose Runtime refuses profile_seed/endpoint_ref | When the conversation finally registers | Then the recorded replay carries only the four legacy fields and never the provenance keys",
+      JSON.stringify(replayRequests));
+    ok(replayRequests.every((request) => request.user_text === legacyReplayUserText
+        && request.observed_at === legacyReplayStartedAt),
+      "the late replay keeps the exact turn identity on the legacy payload",
+      JSON.stringify(replayRequests));
+    ok(!replayWarnings.some((line) => line.includes("held source_turn.observe replay failed")),
+      "the held turn is not lost to a provenance rejection | Given the Runtime refuses the provenance keys | When the held turn is replayed | Then the replay is recorded instead of warned as failed",
+      JSON.stringify(replayWarnings));
+  } finally {
+    console.warn = realReplayWarn;
+    rejectSourceTurnProvenance = false;
+    pendingSourceTurnObserveFailures = [];
+  }
+  await sleep(50);
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);

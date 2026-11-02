@@ -3725,6 +3725,18 @@ test("accepted ChatGPT user turns register a current-source identity before cont
   assert.match(segment, /user_text:\s*userText/);
 });
 
+test("user replays a held first turn through the shared source-turn payload | Given a held turn replayed once its conversation session registers | When the replay posts source_turn.observe | Then it uses the same payload builder as the turn handler so a Runtime without endpoint provenance still records the turn", () => {
+  const start = backgroundSource.indexOf("async function replayHeldSourceTurn");
+  const end = backgroundSource.indexOf("\n}\n", start);
+  assert.ok(start >= 0 && end > start, "held-turn replay must remain extractable");
+  const segment = backgroundSource.slice(start, end);
+  assert.match(segment, /postSourceTurnObserve\(/);
+  assert.doesNotMatch(segment, /postBrowserRegistry\(/);
+  assert.match(segment, /operation:\s*"source_turn\.observe"/);
+  assert.match(segment, /observed_at:\s*held\.observedAt/);
+  assert.match(segment, /user_text:\s*held\.userText/);
+});
+
 test("user records a fast-settled ChatGPT turn | Given a fresh submit anchor and matching new user message | When the assistant reply is already settled before the next tick | Then source-turn observation is emitted once with the accepted user text", () => {
   const start = wakeSource.indexOf("const onTick = () => {");
   const end = wakeSource.indexOf('      const currentAssistant = roleSnapshot("assistant");', start);

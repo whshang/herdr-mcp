@@ -53,8 +53,13 @@ export const LOCAL_MCP_DEFAULT_MAX_FRAME_BYTES = 2 * 1024 * 1024;
 export const LOCAL_MCP_DEFAULT_TIMEOUT_MS = 10_000;
 /** Hard cap applied on top of any request timeout hint. */
 export const LOCAL_MCP_MAX_TIMEOUT_MS = 120_000;
-/** Current public contract epoch advertised by this transport. */
-export const LOCAL_MCP_CONTRACT_EPOCH = 2 as const;
+/**
+ * Current runtime execution contract epoch advertised by this transport.
+ * Must stay equal to the daemon's `PUBLIC_CONTRACT_EPOCH` (5), mirroring the
+ * Rust `LOCAL_MCP_CONTRACT_EPOCH`, so the advertised epoch always matches the
+ * advertised contract hash.
+ */
+export const LOCAL_MCP_CONTRACT_EPOCH = 5 as const;
 
 /** Stable failure codes emitted by this transport (RuntimeToolResult.code). */
 export const LOCAL_MCP_CODE = {
@@ -81,7 +86,7 @@ export interface LocalMcpRuntimeTransportOptions {
   bearerToken: string;
   /** Required. Contract hash the link advertises in runtime identity. */
   contractHash: string;
-  /** Contract epoch. This build serves the frozen public epoch-2 contract. */
+  /** Contract epoch. This build serves only the current runtime contract epoch (5). */
   contractEpoch?: number;
   /** Optional configured runtime version (discovery can add a fallback). */
   runtimeVersion?: string;
@@ -123,9 +128,10 @@ type ParsedBody =
 /**
  * Stateless local MCP HTTP transport implementing `LinkRuntimeTransport`.
  *
- * Identity: contract_epoch is frozen at the public epoch and contract_hash is caller-supplied;
- * runtime_version may be configured and is supplemented by a version cached
- * from the optional health/discover probe.
+ * Identity: contract_epoch is frozen at the current runtime execution contract epoch and
+ * contract_hash is caller-supplied (the daemon pairs it with the same epoch); runtime_version
+ * may be configured and is supplemented by a version cached from the optional health/discover
+ * probe.
  */
 export class LocalMcpRuntimeTransport implements LinkRuntimeTransport {
   readonly name = "local-mcp-http";

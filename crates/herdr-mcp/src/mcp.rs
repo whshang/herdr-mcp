@@ -3179,6 +3179,12 @@ pub struct BrowserPostconditionEvidence {
     pub generation_owner: Option<i64>,
     pub generation_status_observed: bool,
     pub generation_stopped: bool,
+    /// #629: milliseconds since this endpoint's last `/push/events` poll when
+    /// the command was refused because the endpoint was offline. `None` when
+    /// the endpoint was never polled in this runtime generation, or when the
+    /// command reached the handoff point and the evidence describes a timeout
+    /// after delivery instead of an offline endpoint.
+    pub endpoint_last_seen_age_ms: Option<u64>,
     pub result: Option<Value>,
 }
 
@@ -3200,6 +3206,7 @@ impl BrowserPostconditionEvidence {
             generation_owner: None,
             generation_status_observed: false,
             generation_stopped: false,
+            endpoint_last_seen_age_ms: None,
             result: None,
         }
     }
@@ -3209,6 +3216,53 @@ impl BrowserPostconditionEvidence {
         evidence.result = Some(json!({"error": reason}));
         evidence
     }
+}
+
+/// #629: caller-visible delivery triage for a browser command that produced no
+/// result, so `browser_page_unavailable` no longer reports an offline endpoint
+/// and a post-handoff timeout identically.
+///
+/// The three no-result cases are disjoint because of where the actuation broker
+/// stops:
+///
+/// * `endpoint_offline` — the endpoint had no `/push/events` poll inside the
+///   liveness window, so the command was refused before it was ever queued.
+/// * `queued_untaken_at_timeout` — the command was queued but no poll removed
+///   it, and the broker removed it atomically at the deadline: it can never be
+///   delivered late.
+/// * `completion_timeout` — `take_next_for_extension` removed the command from
+///   the queue and the SSE body carried it, so the extension may have executed
+///   it; only a readback can settle the outcome, never a blind retry.
+///
+/// The caller keeps its own stable `code`; only the triage fields differ.
+fn browser_unavailable_result(code: &str, evidence: &BrowserPostconditionEvidence) -> Value {
+    // Removal from the broker queue under the actuation mutex is the handoff
+    // point onto the extension SSE stream; `command_accepted` records it.
+    let handed_out = evidence.command_accepted;
+    let (reason, delivery_state) = if handed_out {
+        ("completion_timeout", "delivery_unknown")
+    } else if !evidence.browser_online {
+        ("endpoint_offline", "not_delivered")
+    } else if evidence.result.is_some() {
+        // The extension answered but did not accept the command, so nothing was
+        // applied. This is a refusal, not a timeout.
+        ("command_not_accepted", "not_delivered")
+    } else {
+        ("queued_untaken_at_timeout", "not_delivered")
+    };
+    let retry_safe = !handed_out;
+    let mut result = json!({
+        "ok": false,
+        "code": code,
+        "retryable": retry_safe,
+        "retry_safe": retry_safe,
+        "delivery_state": delivery_state,
+        "reason": reason,
+    });
+    if let Some(last_seen_age_ms) = evidence.endpoint_last_seen_age_ms {
+        result["endpoint_last_seen_age_ms"] = json!(last_seen_age_ms);
+    }
+    result
 }
 
 fn browser_evidence_machine_reason(
@@ -10893,13 +10947,14 @@ fn browser_page_action_call(
                     }
                     result
                 } else {
-                    json!({
-                        "ok": false,
-                        "code": "browser_page_unavailable",
-                        "retryable": true,
-                        "delivery_state": "not_delivered",
-                        "page_ref": page_ref,
-                    })
+                    // #629: an observe/read that timed out after the command was
+                    // handed to the extension must not look like a retryable
+                    // offline refusal. The code stays stable; the delivery
+                    // triage fields carry the distinction.
+                    let mut unavailable =
+                        browser_unavailable_result("browser_page_unavailable", &evidence);
+                    unavailable["page_ref"] = json!(page_ref);
+                    unavailable
                 }
             }
             Err(error) => json!({
@@ -11091,26 +11146,22 @@ fn browser_page_action_call(
     };
 
     if !evidence.browser_online || !evidence.command_accepted {
-        return release_retryable(json!({
-            "ok": false,
-            "code": "browser_page_unavailable",
-            "retryable": true,
-            "retry_safe": true,
-            "delivery_state": "not_delivered",
-            "op_id": op_id,
-            "idempotent_replay": false,
-        }));
+        // #629: distinguish a command that never left the runtime (endpoint
+        // offline, or queued and removed at the deadline) from one handed to
+        // the extension and never completed. Both keep the stable
+        // `browser_page_unavailable` code here; only the triage fields differ.
+        let mut unavailable = browser_unavailable_result("browser_page_unavailable", &evidence);
+        unavailable["op_id"] = json!(op_id);
+        unavailable["idempotent_replay"] = json!(false);
+        return release_retryable(unavailable);
     }
 
-    let mut result = evidence.result.unwrap_or_else(|| {
-        json!({
-            "ok": false,
-            "code": "browser_page_delivery_unknown",
-            "retryable": false,
-            "retry_safe": false,
-            "delivery_state": "delivery_unknown",
-        })
-    });
+    let mut result = match evidence.result {
+        Some(result) => result,
+        // Handed to the extension's SSE stream without a completion inside the
+        // actuation deadline: delivery is uncertain, never blindly retried.
+        None => browser_unavailable_result("browser_page_delivery_unknown", &evidence),
+    };
     if let Some(object) = result.as_object_mut() {
         object
             .entry("page_ref".to_owned())
@@ -12316,20 +12367,14 @@ fn browser_page_lifecycle_call(
             if let Some(result) = evidence.result {
                 return result;
             }
-            if !evidence.browser_online || !evidence.command_accepted {
-                return json!({
-                    "ok": false,
-                    "code": "browser_page_unavailable",
-                    "retryable": true,
-                    "delivery_state": "not_delivered",
-                });
-            }
-            json!({
-                "ok": false,
-                "code": "browser_page_delivery_unknown",
-                "retryable": false,
-                "delivery_state": "delivery_unknown",
-            })
+            // #629: the same triage as browser_page.action, so a lifecycle call
+            // can tell an offline endpoint from a post-handoff timeout.
+            let code = if evidence.command_accepted {
+                "browser_page_delivery_unknown"
+            } else {
+                "browser_page_unavailable"
+            };
+            browser_unavailable_result(code, &evidence)
         }
         Err(error) => json!({
             "ok": false,
@@ -17161,6 +17206,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: Some(accepted_result(
                         "dispatch with delayed evidence",
                         "provider-user-delayed",
@@ -17303,6 +17349,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: Some(accepted_result(
                         params["message"].as_str().unwrap(),
                         "provider-user-applied",
@@ -17428,6 +17475,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: true,
+                    endpoint_last_seen_age_ms: None,
                     result: None,
                 })
             }
@@ -17531,6 +17579,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: None,
                 })
             }
@@ -17559,6 +17608,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: true,
+                    endpoint_last_seen_age_ms: None,
                     result: None,
                 }))
             }
@@ -17741,6 +17791,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: Some(accepted_result(
                         params["message"].as_str().unwrap(),
                         "provider-user-stop-grantless",
@@ -17799,6 +17850,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: true,
+                    endpoint_last_seen_age_ms: None,
                     result: None,
                 })
             }
@@ -17971,6 +18023,7 @@ mod tests {
                 generation_owner: Some(expected_generation),
                 generation_status_observed: true,
                 generation_stopped: false,
+                endpoint_last_seen_age_ms: None,
                 result: Some(accepted_result(self.rendered, "provider-user-canonical")),
             }))
         }
@@ -18628,6 +18681,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: Some(accepted_result(
                         "bounded worker assignment",
                         "provider-user-1",
@@ -18769,6 +18823,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: Some(accepted_result(
                         params["message"].as_str().unwrap(),
                         "provider-user-restart",
@@ -19199,6 +19254,7 @@ mod tests {
                     generation_owner: None,
                     generation_status_observed: false,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: None,
                 })
             }
@@ -19331,6 +19387,7 @@ mod tests {
                     generation_owner: None,
                     generation_status_observed: false,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: None,
                 })
             }
@@ -19384,6 +19441,7 @@ mod tests {
                     generation_owner: None,
                     generation_status_observed: false,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: Some(match self.archived {
                         Some(is_archived) => json!({"is_archived": is_archived}),
                         None => json!({"error": "browser_archive_status_readback_unavailable"}),
@@ -20878,6 +20936,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: Some(result),
                 }
             }
@@ -21875,6 +21934,7 @@ mod tests {
             generation_owner: Some(expected_generation),
             generation_status_observed: true,
             generation_stopped: false,
+            endpoint_last_seen_age_ms: None,
             result: Some(result),
         };
         match defect {
@@ -21916,6 +21976,7 @@ mod tests {
             generation_owner: Some(expected_generation),
             generation_status_observed: true,
             generation_stopped: false,
+            endpoint_last_seen_age_ms: None,
             result: Some(result),
         }
     }
@@ -23309,6 +23370,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: Some(result),
                 }
             }
@@ -23551,6 +23613,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: Some(json!({
                         "ok": true,
                         "url": "https://example.com/app",
@@ -25284,6 +25347,8 @@ mod tests {
         assert_eq!(uncertain["code"], "browser_page_delivery_unknown");
         assert_eq!(uncertain["retryable"], false);
         assert_eq!(uncertain["delivery_state"], "delivery_unknown");
+        assert_eq!(uncertain["reason"], "completion_timeout");
+        assert_eq!(uncertain["retry_safe"], false);
     }
 
     #[test]
@@ -25699,6 +25764,7 @@ mod tests {
                     generation_owner: None,
                     generation_status_observed: false,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: None,
                 })
             }
@@ -25838,6 +25904,148 @@ mod tests {
         assert_ne!(result["delivery_state"], "delivery_unknown", "{result}");
         assert_eq!(result["retry_safe"], true, "{result}");
         assert_eq!(result["retryable"], true, "{result}");
+    }
+
+    /// #629: an endpoint with no `/push/events` poll is refused before the
+    /// command is queued. `browser_page_unavailable` keeps its code; the triage
+    /// fields must say the endpoint was offline and that a retry is safe.
+    #[test]
+    fn browser_page_action_observe_offline_endpoint_is_retryable_not_delivered() {
+        use std::sync::{Arc, Mutex};
+
+        struct OfflineActuator;
+        impl BrowserActuator for OfflineActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.browser_online = false;
+                evidence.endpoint_last_seen_age_ms = Some(45_000);
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let endpoint_ref = format!("bep_{}", "7".repeat(64));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: endpoint_ref.clone(),
+        }];
+        let params = json!({
+            "endpoint_ref": endpoint_ref,
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "observe",
+        });
+
+        let result = browser_page_action_call(&store, &params, &grants, Some(&OfflineActuator));
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "browser_page_unavailable", "{result}");
+        assert_eq!(result["delivery_state"], "not_delivered", "{result}");
+        assert_eq!(result["reason"], "endpoint_offline", "{result}");
+        assert_eq!(result["retryable"], true, "{result}");
+        assert_eq!(result["retry_safe"], true, "{result}");
+        assert_eq!(result["endpoint_last_seen_age_ms"], 45_000, "{result}");
+    }
+
+    /// #629: an observe that timed out after the command was handed to the
+    /// extension must not be reported as a retryable non-delivery: the same
+    /// stable code now carries `delivery_unknown` / `completion_timeout` and no
+    /// blind-retry guidance.
+    #[test]
+    fn browser_page_action_observe_handed_out_timeout_is_delivery_unknown() {
+        use std::sync::{Arc, Mutex};
+
+        struct HandedOutActuator;
+        impl BrowserActuator for HandedOutActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.command_accepted = true;
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let endpoint_ref = format!("bep_{}", "8".repeat(64));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: endpoint_ref.clone(),
+        }];
+        let params = json!({
+            "endpoint_ref": endpoint_ref,
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "observe",
+        });
+
+        let result = browser_page_action_call(&store, &params, &grants, Some(&HandedOutActuator));
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "browser_page_unavailable", "{result}");
+        assert_eq!(result["delivery_state"], "delivery_unknown", "{result}");
+        assert_eq!(result["reason"], "completion_timeout", "{result}");
+        assert_eq!(result["retryable"], false, "{result}");
+        assert_eq!(result["retry_safe"], false, "{result}");
+    }
+
+    /// #629: a browser page mutation that was handed to the extension and never
+    /// completed keeps `browser_page_delivery_unknown` and reports why.
+    #[test]
+    fn browser_page_action_mutation_handed_out_timeout_reports_completion_timeout() {
+        use std::sync::{Arc, Mutex};
+
+        struct HandedOutActuator;
+        impl BrowserActuator for HandedOutActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.command_accepted = true;
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let endpoint_ref = format!("bep_{}", "9".repeat(64));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: endpoint_ref.clone(),
+        }];
+        let params = json!({
+            "endpoint_ref": endpoint_ref,
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "click",
+            "generation": "pa_gen_handed_out",
+            "ref": "ref_pa_gen_handed_out_0",
+            "idempotency_key": "page-action-handed-out-1",
+        });
+
+        let result = browser_page_action_call(&store, &params, &grants, Some(&HandedOutActuator));
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "browser_page_delivery_unknown", "{result}");
+        assert_eq!(result["delivery_state"], "delivery_unknown", "{result}");
+        assert_eq!(result["reason"], "completion_timeout", "{result}");
+        assert_eq!(result["retryable"], false, "{result}");
+        assert_eq!(result["retry_safe"], false, "{result}");
+        assert_eq!(result["idempotent_replay"], false, "{result}");
     }
 
     #[test]
@@ -25988,6 +26196,7 @@ mod browser_dispatch_source_turn_tests {
             generation_owner: Some(expected_generation),
             generation_status_observed: true,
             generation_stopped: false,
+            endpoint_last_seen_age_ms: None,
             result: Some(accepted_text_result(
                 params["message"].as_str().unwrap(),
                 "provider-user-source-turn",
@@ -26662,6 +26871,7 @@ mod claude_composer_busy_probe_tests {
     #[test]
     fn user_connector_given_claude_probe_when_forwarded_then_only_safe_fields_pass() {
         let evidence = BrowserPostconditionEvidence {
+            endpoint_last_seen_age_ms: None,
             result: Some(json!({"composer_busy_probe": {
                 "stop_control": false,
                 "busy_reason": "assistant-streaming",
@@ -26688,6 +26898,7 @@ mod claude_composer_busy_probe_tests {
     #[test]
     fn user_connector_given_unknown_enum_when_forwarded_then_dropped() {
         let evidence = BrowserPostconditionEvidence {
+            endpoint_last_seen_age_ms: None,
             result: Some(
                 json!({"composer_busy_probe": {"stop_control": true, "busy_reason": "hello world"}}),
             ),
