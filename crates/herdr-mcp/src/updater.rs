@@ -623,6 +623,40 @@ fn runtime_update_succeeded_result(outcome: RuntimeUpdateOutcome<'_>) -> (Value,
     (payload, ExitCode::SUCCESS)
 }
 
+/// Attach the post-activation macOS Documents preflight to an update result.
+///
+/// TCC prompts are an operator-visible condition, not an update failure: the
+/// Runtime already committed, so a pending prompt is a non-fatal notice with the
+/// separate recovery step. The raw preflight object is always included so a
+/// caller can tell "no prompt" from "not probed on this platform".
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn attach_tcc_preflight(payload: &mut Value, preflight: Value) {
+    let pending = preflight
+        .get("prompt_pending")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.insert("tcc_preflight".to_owned(), preflight);
+    object.insert("tcc_prompt_pending".to_owned(), json!(pending));
+    if !pending {
+        return;
+    }
+    let notices = object
+        .entry("notices".to_owned())
+        .or_insert_with(|| json!([]));
+    if let Some(list) = notices.as_array_mut() {
+        list.push(json!({
+            "code": "tcc_prompt_pending",
+            "severity": "notice",
+            "fatal": false,
+            "message": "the Runtime update succeeded, but a macOS Documents permission prompt is still unanswered; answer it once and control requests stay responsive",
+            "next_action": "answer the macOS Documents prompt",
+        }));
+    }
+}
+
 /// Result of an `update apply` that found the Runtime already on the target
 /// release.
 ///
@@ -1135,7 +1169,7 @@ fn apply_inner(
                     stage_standalone_extension_after_update(Some(&plan.identity.source_commit));
                 let extension =
                     standalone_extension_report(&paths, Some(&plan.identity.source_commit));
-                let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+                let (mut payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
                     target_version,
                     target: plan.asset.target.clone(),
                     asset: plan.asset.name.clone(),
@@ -1149,6 +1183,13 @@ fn apply_inner(
                     extension,
                     extension_staging: staging.ok(),
                 });
+                // #844: exactly one post-activation Documents preflight. It is
+                // bounded and broker-routed, and its result is persisted so
+                // `update status` never has to probe.
+                attach_tcc_preflight(
+                    &mut payload,
+                    crate::macos_privacy::preflight_after_activation(&paths.config_dir),
+                );
                 print_json(&payload)?;
                 return Ok(code);
             }
@@ -2225,11 +2266,16 @@ fn status() -> Result<ExitCode, String> {
     let latest = store.latest_update_job()?;
     let current_version = current_version()?.to_string();
     let worker_update = worker_update_status_view(&paths, &current_version);
-    print_json(&update_status_view(
-        latest.as_ref(),
-        &current_version,
-        worker_update,
-    ))?;
+    let mut view = update_status_view(latest.as_ref(), &current_version, worker_update);
+    // #844: report the recorded preflight. A status query must never become the
+    // syscall that blocks on a macOS permission dialog.
+    if let Some(object) = view.as_object_mut() {
+        object.insert(
+            "tcc_preflight".to_owned(),
+            crate::macos_privacy::persisted_tcc_preflight(&paths.config_dir),
+        );
+    }
+    print_json(&view)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -4797,6 +4843,49 @@ mod tests {
         );
         assert_eq!(worker_update_invocations, 1);
         assert_eq!(chained["code"], "worker_update_succeeded");
+    }
+
+    /// user keeps a working control path | Given a Runtime update that
+    /// committed while a macOS Documents prompt is still unanswered | When the
+    /// result is reported | Then the prompt is a non-fatal notice and the update
+    /// still succeeds, and an answered probe adds no notice.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn tcc_preflight_pending_is_a_non_fatal_update_notice() {
+        let mut payload = json!({
+            "ok": true,
+            "code": "update_succeeded",
+            "notices": [],
+        });
+        attach_tcc_preflight(
+            &mut payload,
+            json!({"probe": "pending", "prompt_pending": true, "detail": null}),
+        );
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["code"], "update_succeeded");
+        assert_eq!(payload["tcc_prompt_pending"], true);
+        assert_eq!(payload["tcc_preflight"]["probe"], "pending");
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "tcc_prompt_pending")
+            .expect("an unanswered Documents prompt must be reported");
+        assert_eq!(notice["severity"], "notice");
+        assert_eq!(notice["fatal"], false);
+
+        // An answered probe (or one that never needed a prompt) adds no notice
+        // and leaves the update result untouched.
+        let mut answered = json!({"ok": true, "code": "update_succeeded", "notices": []});
+        attach_tcc_preflight(
+            &mut answered,
+            json!({"probe": "available", "prompt_pending": false, "detail": null}),
+        );
+        assert_eq!(answered["tcc_prompt_pending"], false);
+        assert!(
+            answered["notices"].as_array().unwrap().is_empty(),
+            "an answered probe must not add a notice: {answered}"
+        );
     }
 
     /// Given a stable-channel `update apply --manifest <newer manifest>` whose

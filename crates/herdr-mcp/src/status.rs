@@ -537,6 +537,15 @@ pub fn print_doctor(
     );
     let macos_permissions = crate::macos_permissions::collect_status();
     println!("{}", documents_permission.doctor_line());
+    if documents_permission.tcc_prompt_pending() {
+        // #844: a pending macOS Documents prompt is what stalls every control
+        // request. Name the state and the recorded preflight instead of leaving
+        // an unexplained "probe timed out".
+        println!(
+            "WARN tcc_prompt_pending probe=pending — answer the macOS Documents prompt; the post-update preflight record is {}",
+            crate::macos_privacy::tcc_preflight_path(&paths.config_dir).display()
+        );
+    }
     println!(
         "{}",
         crate::macos_permissions::doctor_layer_from(&macos_permissions)

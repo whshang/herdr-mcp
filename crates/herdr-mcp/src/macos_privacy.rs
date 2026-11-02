@@ -1,6 +1,5 @@
-use std::path::Path;
-#[cfg(any(target_os = "macos", test))]
-use std::path::PathBuf;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
@@ -25,6 +24,45 @@ pub(crate) enum DocumentsPermission {
     NotPresent,
     ProbeFailed(String),
     NotApplicable,
+}
+
+impl DocumentsPermission {
+    /// Machine-readable token shared by `doctor`, `update status` and the
+    /// persisted preflight so every surface names the same state.
+    pub(crate) fn state_token(&self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+            Self::TimedOut => "pending",
+            Self::NotPresent => "not_present",
+            Self::ProbeFailed(_) => "probe_failed",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+
+    /// Whether a macOS Documents prompt is outstanding.
+    ///
+    /// `TimedOut` means the bounded probe returned before macOS answered, which
+    /// is exactly the state where an operator still has to allow the prompt.
+    /// Every other state is either answered (`Available`), answered negatively
+    /// (`Unavailable`), not applicable, or a harness error.
+    pub(crate) fn tcc_prompt_pending(&self) -> bool {
+        matches!(self, Self::TimedOut)
+    }
+
+    /// The preflight object persisted after `update apply` activates a Runtime
+    /// and exposed by `doctor` / `update status`.
+    pub(crate) fn preflight_view(&self) -> Value {
+        let detail = match self {
+            Self::ProbeFailed(detail) => Some(detail.clone()),
+            _ => None,
+        };
+        json!({
+            "probe": self.state_token(),
+            "prompt_pending": self.tcc_prompt_pending(),
+            "detail": detail,
+        })
+    }
 }
 
 impl DocumentsPermission {
@@ -280,8 +318,124 @@ fn value_after_prefix(text: &str, prefix: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Where the post-activation Documents preflight is recorded.
+///
+/// It lives next to the other update artifacts so `update status` can report the
+/// prompt state without probing again: a status query must never become the
+/// syscall that blocks on a TCC dialog.
+pub(crate) fn tcc_preflight_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("update").join("tcc-preflight.json")
+}
+
+/// Record one preflight result. Best effort: a failed write never fails an
+/// update that already committed, it only leaves the previous record in place.
+pub(crate) fn persist_tcc_preflight(
+    config_dir: &Path,
+    permission: &DocumentsPermission,
+) -> Result<(), String> {
+    let path = tcc_preflight_path(config_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    let mut view = permission.preflight_view();
+    view["recorded_at_ms"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default()
+    );
+    crate::mutation::atomic_write(&path, view.to_string().as_bytes())
+}
+
+/// Persisted preflight view, or an explicit `unknown` shape when no update has
+/// recorded one yet. Never probes.
+pub(crate) fn persisted_tcc_preflight(config_dir: &Path) -> Value {
+    std::fs::read_to_string(tcc_preflight_path(config_dir))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "probe": "unknown",
+                "prompt_pending": Value::Null,
+                "detail": Value::Null,
+                "recorded_at_ms": Value::Null,
+            })
+        })
+}
+
+/// Exactly one post-activation Documents preflight.
+///
+/// The probe is the same bounded, broker-only probe `doctor` uses, so at most one
+/// macOS dialog can appear per upgrade and it is created by the stable broker
+/// identity rather than the rotating runtime generation. The result is persisted
+/// so later status queries read it instead of probing.
+pub(crate) fn preflight_after_activation(config_dir: &Path) -> Value {
+    let permission = probe_documents_permission(config_dir);
+    let _ = persist_tcc_preflight(config_dir, &permission);
+    permission.preflight_view()
+}
+
 #[cfg(test)]
 mod tests {
+    /// user sees one prompt state everywhere | Given each probe outcome | When
+    /// doctor, update status or the persisted preflight name it | Then only a
+    /// bounded-out probe is `pending` and every other state is answered.
+    #[test]
+    fn tcc_prompt_pending_is_only_the_bounded_out_probe() {
+        use super::DocumentsPermission;
+        assert_eq!(DocumentsPermission::TimedOut.state_token(), "pending");
+        assert!(DocumentsPermission::TimedOut.tcc_prompt_pending());
+        for answered in [
+            DocumentsPermission::Available,
+            DocumentsPermission::Unavailable,
+            DocumentsPermission::NotPresent,
+            DocumentsPermission::NotApplicable,
+        ] {
+            assert!(!answered.tcc_prompt_pending(), "{answered:?}");
+            assert_ne!(answered.state_token(), "pending", "{answered:?}");
+        }
+        let failed = DocumentsPermission::ProbeFailed("boom".to_owned());
+        assert!(!failed.tcc_prompt_pending());
+        assert_eq!(failed.state_token(), "probe_failed");
+        assert_eq!(failed.preflight_view()["detail"], "boom");
+    }
+
+    /// user keeps the recorded preflight across processes | Given one recorded
+    /// probe result | When update status reads it later | Then it reports the same
+    /// state without probing again.
+    #[test]
+    fn tcc_preflight_record_round_trips_without_probing() {
+        use super::DocumentsPermission;
+        use super::{persist_tcc_preflight, persisted_tcc_preflight, tcc_preflight_path};
+        let root = std::env::temp_dir().join(format!(
+            "herdr-tcc-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        // Before any update records one, the view is explicitly unknown and never
+        // claims a prompt state.
+        let empty = persisted_tcc_preflight(&root);
+        assert_eq!(empty["probe"], "unknown");
+        assert_eq!(empty["prompt_pending"], serde_json::Value::Null);
+
+        persist_tcc_preflight(&root, &DocumentsPermission::TimedOut).unwrap();
+        let pending = persisted_tcc_preflight(&root);
+        assert_eq!(pending["probe"], "pending");
+        assert_eq!(pending["prompt_pending"], true);
+        assert!(pending["recorded_at_ms"].as_u64().is_some());
+        assert!(tcc_preflight_path(&root).is_file());
+
+        persist_tcc_preflight(&root, &DocumentsPermission::Available).unwrap();
+        let answered = persisted_tcc_preflight(&root);
+        assert_eq!(answered["probe"], "available");
+        assert_eq!(answered["prompt_pending"], false);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     #[test]
