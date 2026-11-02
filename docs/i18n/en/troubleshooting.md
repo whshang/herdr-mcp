@@ -353,6 +353,10 @@ If the tool catalog/schema changed, this is a contract migration, not an ordinar
 
 See [Runtime A/B](runtime-self-upgrade.md).
 
+## Symptom: update fails with `github_rate_limited`
+
+The updater reads release metadata and attestations from `api.github.com` anonymously, so a shared or exhausted egress IP hits GitHub's unauthenticated quota; that failure is reported as `github_rate_limited` with the quota reset time. Export `GH_TOKEN` or `GITHUB_TOKEN` to raise the limit — that token is sent only to `api.github.com` and is never logged.
+
 ## Useful evidence for an issue
 
 Useful, non-secret diagnostics include:

@@ -336,6 +336,10 @@ bin/herdr-runtime-generation status
 
 如果 tool catalog / contract epoch 改了，这不是普通 A/B 问题，必须按 contract migration 单独处理。不要用 `herdr-self-update` 偷跨 epoch。
 
+## 症状：更新失败并报 `github_rate_limited`
+
+updater 匿名读取 `api.github.com` 的 release 元数据与 attestation，共享或已用尽的出口 IP 会撞上 GitHub 未认证配额，此时失败会以 `github_rate_limited` 报告并给出配额重置时间。设置 `GH_TOKEN` 或 `GITHUB_TOKEN` 可提升上限；该 token 只发送给 `api.github.com`，且不会被写进日志。
+
 ## 日志和 Issue 最有用的信息
 
 比“不能用了”更有价值的是：
