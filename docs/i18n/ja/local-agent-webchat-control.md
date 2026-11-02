@@ -316,8 +316,9 @@ Agent は次の順で進めます。
 
 [#632](https://github.com/whshang/herdr-mcp/issues/632) を参照。
 
-- **生存判定。** browser endpoint がオンラインと見なされるのは、**現在の Runtime generation** のレジストリに登録されている（この Runtime の起動以降に登録または再観測された）うえで、拡張機能が `/push/events` をポーリングしている場合だけです。ポーリングしているだけで未登録の endpoint や、前の generation の古い登録しかない endpoint はオフライン扱いになり、ブラウザ操作はタイムアウトを待たずに再試行可能な `not_delivered`（例: `browser_page_unavailable`）を即座に返します。push の `hello` フレームは `endpoint_registered` を報告します。
-- **タイムアウト時の結果。** actuation のタイムアウト時点でコマンドがまだキューにあり、どの拡張機能にも取り出されていない場合、Runtime はそれをキューから取り除き（後から配送されることはありません）、`retry_safe: true` 付きの `not_delivered` を返します。元の意図を再試行して安全です。実際に拡張機能へ渡されたコマンドだけが `delivery_unknown` のままです。その場合は再観測し、盲目的に再試行しないでください。
+- **生存判定。** browser endpoint がオンラインと見なされるのは、**現在の Runtime generation** のレジストリに登録されている（この Runtime の起動以降に登録または再観測された）うえで、拡張機能が `/push/events` をポーリングしている場合だけです。ポーリングしているだけで未登録の endpoint や、前の generation の古い登録しかない endpoint はオフライン扱いになり、ブラウザ操作はタイムアウトを待たずに再試行可能な `not_delivered`（例: `browser_page_unavailable`）を即座に返します。その `reason` は `endpoint_offline` で、以前にポーリングしていれば `endpoint_last_seen_age_ms` も付きます。push の `hello` フレームは `endpoint_registered` を報告します。
+- **タイムアウト時の結果。** actuation のタイムアウト時点でコマンドがまだキューにあり、どの拡張機能にも取り出されていない場合、Runtime はそれをキューから取り除き（後から配送されることはありません）、`retry_safe: true` 付きの `not_delivered` を返します。その `reason` は `queued_untaken_at_timeout` で、元の意図を再試行して安全です。実際に拡張機能へ渡されたコマンドだけが `delivery_unknown` のままで、その場合は `reason` が `completion_timeout`、`retry_safe: false` です。再観測し、盲目的に再試行しないでください。読み取り専用呼び出し（`observe`、`screenshot`、`expect`）とページ `lifecycle` 呼び出しも同じ `browser_page_unavailable` コードの下で同じフィールドを返すため、タイムアウトした読み取りが再試行可能なオフライン endpoint と取り違えられることはありません。
+- **Endpoint ライフサイクルログ。** 登録、`/push/events` ストリームの開始と終了、オンラインから stale への拒否、待機中コマンドのタイムアウトは、Runtime の通常ログ（stderr、管理サービスでは `server.log`）に、イベントごとに内容を含まない 1 行の `event=` 行として書き出されます。含まれるのは endpoint/actuation の id、ミリ秒単位の経過時間、所要時間だけです。ページ内容、タブタイトル、クエリ文字列付き URL、`profile_seed`、資格情報は決して記録しません。
 - **アップグレード順序。** Runtime を切り替える**前に**、ブラウザ拡張機能を `0.1.203` 以降へ更新してください。拡張機能 `0.1.203` は Runtime の `boot_id` が変わったとき、または `hello` が `endpoint_registered: false` を返したときに endpoint を自動で再登録します。古い拡張機能は Runtime 切り替え後、service worker が再起動するまでオフライン表示になります。回避策: `chrome://extensions` で拡張機能の service worker だけを再読み込みします（Chrome の再起動は不要）。
 
 ## 9. Continuity / Work Memory / Browser session の違い
