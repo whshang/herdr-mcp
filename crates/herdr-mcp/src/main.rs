@@ -367,6 +367,9 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::NativeHost(command) => native_host_install::run(command),
         cli::Command::ExtensionHost { caller_origin } => native_host::run(&caller_origin),
         cli::Command::ArtifactImport(args) => artifact_import::run(args),
+        // Internal clean filter wired into local Git config by write_handoff:
+        // stdin → stdout, always exit 0, nothing else on stdout.
+        cli::Command::GitFilterStripHandoff => Ok(work_compactor::run_git_filter_strip_handoff()),
         cli::Command::Link(command) => match command {
             cli::LinkCommand::Status => {
                 #[cfg(target_os = "windows")]

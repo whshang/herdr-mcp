@@ -83,6 +83,10 @@ Verify:
 
 If an agent times out after it may have mutated the repo, inspect Git before deciding whether to retry.
 
+### The HANDOFF block never belongs in a commit
+
+herdr-mcp maintains `HANDOFF.md` and injects a short `<!-- herdr:handoff:start --> … <!-- herdr:handoff:end -->` block into the project's `AGENTS.md` (and `CLAUDE.md` when Claude Code is used). The block stays in the **working tree** only. Files herdr-mcp creates are listed in the repository's own `info/exclude`; for an `AGENTS.md`/`CLAUDE.md` that is already **tracked**, herdr-mcp instead configures local-only Git state: a root-anchored `/AGENTS.md filter=herdr-handoff` line in `<git-common-dir>/info/attributes` (shared by linked worktrees) plus `filter.herdr-handoff.clean` / `filter.herdr-handoff.smudge` in the repository config. The clean filter (`herdr-mcp git-filter strip-handoff`) removes exactly the managed block and the blank line the injector added, so staged and committed blobs never contain it, `git status` / `git diff` stay clean, and your own edits to the same file remain visible and committable. Nothing here touches a tracked `.gitattributes`, and `required` is deliberately left unset, so a missing binary falls back to unfiltered content instead of failing a commit. Treat this as local convenience, not as a reason to stop verifying Git after an agent mutates a repo.
+
 ## 6. Never blindly retry an uncertain mutation
 
 The dangerous remote failure is:

@@ -1540,10 +1540,12 @@ fn write_handoff(worktree: &Path, handoff: &str, expected: Option<&str>) -> Resu
     // Claude Code does not read AGENTS.md: only touch CLAUDE.md when it
     // already exists or Claude Code worked in this folder.
     let claude_used = handoff.lines().any(|line| line.starts_with("- claude "));
+    let mut existing_docs = Vec::new();
     for name in ["AGENTS.md", "CLAUDE.md"] {
         if name == "CLAUDE.md" && !claude_used && !worktree.join(name).exists() {
             continue;
         }
+        existing_docs.push(name);
         if ensure_handoff_block(&worktree.join(name))? {
             created.push(name);
         }
@@ -1551,19 +1553,23 @@ fn write_handoff(worktree: &Path, handoff: &str, expected: Option<&str>) -> Resu
     let Some(git_common_dir) = resolve_git_common_dir(worktree)? else {
         return Ok(true);
     };
-    // Only files we created (plus HANDOFF.md) are excluded; a pre-existing,
-    // possibly tracked AGENTS.md/CLAUDE.md just carries a local block change.
-    // Never commit anything.
+    // Only files we created (plus HANDOFF.md) are excluded. Never commit
+    // anything.
     let tracked_or_listed = |name: &str| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(worktree)
-            .args(["ls-files", "--error-unmatch", name])
-            .output()
-            .is_ok_and(|output| output.status.success())
+        git_status_output(worktree, &["ls-files", "--error-unmatch", name])
+            .is_some_and(|output| output.status.success())
     };
     created.retain(|name| *name == "HANDOFF.md" || !tracked_or_listed(name));
     add_git_excludes(&git_common_dir, &created)?;
+    // A tracked AGENTS.md/CLAUDE.md keeps its block in the working tree but
+    // must never commit it: a local-only clean filter strips the block from
+    // every blob Git writes, without editing the tracked .gitattributes.
+    for name in existing_docs {
+        if created.contains(&name) || !tracked_or_listed(name) {
+            continue;
+        }
+        ensure_handoff_filter(worktree, &git_common_dir, name)?;
+    }
     Ok(true)
 }
 
@@ -1609,6 +1615,88 @@ fn handoff_block() -> String {
     format!(
         "{HANDOFF_BLOCK_START}\nRead `HANDOFF.md` (rules, task list, past session log paths; auto-maintained by herdr-mcp) before starting, and update it by editing its items in place (`- [id] text`, tasks `- [id] (status) text`) — your edits are merged automatically. Its rules apply to this project only; record preferences there and never edit global agent instruction files (~/.agents/AGENTS.md, ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md).\n{HANDOFF_BLOCK_END}\n"
     )
+}
+
+/// Remove the managed handoff block from `input` byte-for-byte, so a clean
+/// filter can keep the working-tree copy out of every blob Git writes.
+///
+/// Each `START … END` region is removed together with the newline that ends
+/// the block. When the block sits at EOF — the append position used by
+/// [`ensure_handoff_block`] — the separator blank line in front of it is
+/// removed too, which is exactly what the injector added. A block in the
+/// middle of the file (the in-place replacement position) only loses the
+/// block, never surrounding content. Input without a block, or with an
+/// unterminated `START`, passes through unchanged. Works on raw bytes: no
+/// UTF-8 assumption and no panic path.
+///
+/// The injector is not injective — appending normalizes `"abc"` and
+/// `"abc\n"` to the same bytes — so stripping restores the newline-terminated
+/// form for both.
+pub(crate) fn strip_handoff_block(input: &[u8]) -> Vec<u8> {
+    let start_marker = HANDOFF_BLOCK_START.as_bytes();
+    let end_marker = HANDOFF_BLOCK_END.as_bytes();
+    if find_bytes(input, start_marker).is_none() {
+        return input.to_vec();
+    }
+    let mut stripped = Vec::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(offset) = find_bytes(&input[cursor..], start_marker) {
+        let start = cursor + offset;
+        let Some(end_offset) = find_bytes(&input[start + start_marker.len()..], end_marker) else {
+            // Unterminated marker: not a managed block, keep the rest as-is.
+            break;
+        };
+        let mut end = start + start_marker.len() + end_offset + end_marker.len();
+        if input.get(end) == Some(&b'\r') && input.get(end + 1) == Some(&b'\n') {
+            end += 2;
+        } else if input.get(end) == Some(&b'\n') {
+            end += 1;
+        }
+        let mut prefix_end = start;
+        if end == input.len() {
+            // Only the append position owns a separator blank line, and only
+            // the bytes since the previous removal belong to it.
+            let separator = &input[cursor..start];
+            if separator.ends_with(b"\r\n\r\n") {
+                prefix_end -= 2;
+            } else if separator.ends_with(b"\n\n") {
+                prefix_end -= 1;
+            }
+        }
+        stripped.extend_from_slice(&input[cursor..prefix_end]);
+        cursor = end;
+    }
+    stripped.extend_from_slice(&input[cursor..]);
+    stripped
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Clean-filter entrypoint: stdin → stdout, always exit 0. Git treats a
+/// failing clean filter as "use the file as-is" only while `required` is
+/// unset, and any internal error must never corrupt the content Git reads, so
+/// everything falls back to passing the input through unchanged.
+pub(crate) fn run_git_filter_strip_handoff() -> std::process::ExitCode {
+    use std::io::{Read, Write};
+
+    let mut input = Vec::new();
+    if std::io::stdin().read_to_end(&mut input).is_err() {
+        return std::process::ExitCode::SUCCESS;
+    }
+    let stripped =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| strip_handoff_block(&input)))
+            .unwrap_or_else(|_| input.clone());
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(&stripped);
+    let _ = stdout.flush();
+    std::process::ExitCode::SUCCESS
 }
 
 /// Idempotently ensure `path` contains the managed handoff block, touching
@@ -1665,46 +1753,244 @@ fn ensure_handoff_block(path: &Path) -> Result<bool, String> {
 }
 
 fn add_git_excludes(git_common_dir: &Path, names: &[&str]) -> Result<(), String> {
+    let lines = names
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    append_info_lines(git_common_dir, "exclude", "Git exclude", &lines)
+}
+
+const HANDOFF_FILTER: &str = "herdr-handoff";
+
+/// Keep the working-tree handoff block out of every blob Git writes, using
+/// local-only Git state: `<common dir>/info/attributes` (shared by linked
+/// worktrees, never a tracked `.gitattributes`) plus the two
+/// `filter.herdr-handoff.*` keys in the repository config. `required` is
+/// deliberately left unset, so a missing binary makes Git fall back to the
+/// unfiltered content instead of failing the commit.
+fn ensure_handoff_filter(worktree: &Path, git_common_dir: &Path, name: &str) -> Result<(), String> {
+    let attribute = format!("/{name} filter={HANDOFF_FILTER}");
+    append_info_lines(
+        git_common_dir,
+        "attributes",
+        "Git info attributes",
+        std::slice::from_ref(&attribute),
+    )?;
+    let clean = format!(
+        "{} git-filter strip-handoff",
+        shell_quote(&handoff_filter_binary())
+    );
+    set_git_local_config(worktree, &format!("filter.{HANDOFF_FILTER}.clean"), &clean)?;
+    set_git_local_config(worktree, &format!("filter.{HANDOFF_FILTER}.smudge"), "cat")?;
+    refresh_index_stat(worktree, name);
+    Ok(())
+}
+
+/// The binary the clean filter runs. A `cargo` build artifact or temp file is
+/// rejected: `target/*/herdr-mcp` is rebuilt or deleted by ordinary
+/// development, while the installed runtime path and the user CLI are stable.
+fn handoff_filter_binary() -> String {
+    let Ok(executable) = std::env::current_exe() else {
+        return "herdr-mcp".to_owned();
+    };
+    if is_ephemeral_binary(&executable) {
+        return "herdr-mcp".to_owned();
+    }
+    executable.to_string_lossy().into_owned()
+}
+
+fn is_ephemeral_binary(path: &Path) -> bool {
+    if path.starts_with(std::env::temp_dir()) {
+        return true;
+    }
+    // Only the installed `herdr-mcp` name is stable enough to be referenced
+    // from Git config; `cargo test` harness binaries are `herdr_mcp-<hash>`.
+    let stable_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_none_or(|name| name != "herdr-mcp" && name != "herdr-mcp.exe");
+    if stable_name {
+        return true;
+    }
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("target") | Some("deps")
+        )
+    })
+}
+
+/// Git runs filter commands through a shell, so an executable path is quoted
+/// for `sh` when it contains anything a shell would interpret. A plain word
+/// (the `herdr-mcp` PATH fallback, or an ordinary installed path) is kept as
+/// written so `git config --get filter.herdr-handoff.clean` stays readable.
+fn shell_quote(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '-' | '.' | '/' | '@' | '%' | '+' | ':')
+        });
+    if plain {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn git_status_output(worktree: &Path, args: &[&str]) -> Option<std::process::Output> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .ok()
+}
+
+/// Only write the local filter config when it is missing or different, so an
+/// unchanged repository costs one read per key per handoff write.
+fn set_git_local_config(worktree: &Path, key: &str, value: &str) -> Result<(), String> {
+    if let Some(current) = git_status_output(worktree, &["config", "--local", "--get", key])
+        && current.status.success()
+        && String::from_utf8_lossy(&current.stdout).trim() == value
+    {
+        return Ok(());
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["config", "--local", key, value])
+        .output()
+        .map_err(|error| format!("cannot run git config: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "cannot set local Git filter {key}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// `git status` compares cached stat data first, so a size-changing clean
+/// filter alone leaves a tracked agent doc permanently reported as modified
+/// (while `git diff` is already empty, because diffing does run the filter).
+///
+/// Re-syncing the index entry is only safe when the clean-filtered
+/// working-tree content is byte-identical to the stage-0 blob, so the content
+/// check comes first and nothing happens for a real user edit. `git
+/// update-index` (unlike a bare `--refresh`, which also writes the path) then
+/// records the stat data. A concurrent edit that lands between the check and
+/// the update is detected afterwards and the original entry is restored, so a
+/// user edit is never left staged by a handoff tick.
+fn refresh_index_stat(worktree: &Path, name: &str) {
+    let Some((original_mode, original_blob)) = index_entry(worktree, name) else {
+        return;
+    };
+    // `hash-object --path` runs the configured clean filter, so this is what
+    // `git add` would stage for the path right now.
+    let Some(filtered) = filtered_worktree_blob(worktree, name) else {
+        return;
+    };
+    if filtered != original_blob {
+        // The user has a real unstaged edit (or the filter could not run):
+        // leave the index alone so `git status`/`git diff` keep showing it.
+        return;
+    }
+    let _ = git_status_output(worktree, &["update-index", "--", name]);
+    if index_entry(worktree, name)
+        .is_some_and(|(mode, blob)| mode != original_mode || blob != original_blob)
+    {
+        let _ = git_status_output(
+            worktree,
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("{original_mode},{original_blob},{name}"),
+            ],
+        );
+    }
+}
+
+/// Stage-0 `(mode, blob)` of `name`, or `None` when the path is absent or has
+/// unmerged stages (never touch an entry in conflict).
+fn index_entry(worktree: &Path, name: &str) -> Option<(String, String)> {
+    let output = git_status_output(worktree, &["ls-files", "-s", "--", name])?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let line = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    let mut fields = line.split_whitespace();
+    let mode = fields.next()?.to_owned();
+    let blob = fields.next()?.to_owned();
+    if fields.next()? != "0" {
+        return None;
+    }
+    Some((mode, blob))
+}
+
+fn filtered_worktree_blob(worktree: &Path, name: &str) -> Option<String> {
+    let output = git_status_output(
+        worktree,
+        &["hash-object", &format!("--path={name}"), "--", name],
+    )?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_owned()
+    })
+}
+
+/// Append `lines` to `<common dir>/info/<file_name>`, idempotently and without
+/// ever touching tracked `.gitattributes`.
+fn append_info_lines(
+    git_common_dir: &Path,
+    file_name: &str,
+    label: &str,
+    lines: &[String],
+) -> Result<(), String> {
     let info = git_common_dir.join("info");
     if let Ok(metadata) = fs::symlink_metadata(&info)
         && !metadata.file_type().is_dir()
     {
-        return Err(
-            "refusing to write Git exclude: info path is a symlink or not a directory".to_owned(),
-        );
+        return Err(format!(
+            "refusing to write {label}: info path is a symlink or not a directory"
+        ));
     }
     fs::create_dir_all(&info)
         .map_err(|error| format!("cannot create Git info directory: {error}"))?;
-    let exclude = info.join("exclude");
-    let existing = match fs::symlink_metadata(&exclude) {
+    let target = info.join(file_name);
+    let existing = match fs::symlink_metadata(&target) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(
-                    "refusing to overwrite Git exclude: target is a symlink or non-regular file"
-                        .to_owned(),
-                );
+                return Err(format!(
+                    "refusing to overwrite {label}: target is a symlink or non-regular file"
+                ));
             }
-            fs::read_to_string(&exclude)
-                .map_err(|error| format!("cannot read Git exclude file: {error}"))?
+            fs::read_to_string(&target)
+                .map_err(|error| format!("cannot read {label} file: {error}"))?
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("cannot stat Git exclude file: {error}")),
+        Err(error) => return Err(format!("cannot stat {label} file: {error}")),
     };
     let mut updated = existing.clone();
-    for name in names {
-        if updated.lines().any(|line| line.trim() == *name) {
+    for line in lines {
+        if updated.lines().any(|current| current.trim() == line.trim()) {
             continue;
         }
         if !updated.is_empty() && !updated.ends_with('\n') {
             updated.push('\n');
         }
-        updated.push_str(name);
+        updated.push_str(line);
         updated.push('\n');
     }
     if updated == existing {
         return Ok(());
     }
-    write_regular_file(&exclude, &updated, "Git exclude file")
+    write_regular_file(&target, &updated, &format!("{label} file"))
 }
 
 /// Write `content` to `path` atomically (temp file in the same directory +
@@ -2269,6 +2555,482 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    // ---- Managed handoff block vs. committed content (#839) ----
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn git_run(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|error| panic!("cannot run git {args:?}: {error}"))
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let output = git_run(dir, args);
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        let output = git_run(dir, args);
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_owned()
+    }
+
+    fn init_git_repo(dir: &Path) {
+        git_ok(dir, &["init", "-q"]);
+        git_ok(dir, &["config", "user.email", "test@example.com"]);
+        git_ok(dir, &["config", "user.name", "Test"]);
+        git_ok(dir, &["config", "commit.gpgsign", "false"]);
+        git_ok(dir, &["config", "core.autocrlf", "false"]);
+    }
+
+    /// Path of the real CLI binary that `cargo test` builds alongside the test
+    /// harness. This repository sets Cargo `build-dir`, so the test binary does
+    /// not always sit next to the uplifted CLI binary; try every layout and
+    /// fail loudly instead of silently skipping the Git tests.
+    fn cli_binary_path() -> PathBuf {
+        let name = if cfg!(windows) {
+            "herdr-mcp.exe"
+        } else {
+            "herdr-mcp"
+        };
+        let mut candidates = Vec::new();
+        if let Ok(test_binary) = std::env::current_exe()
+            && let Some(profile_dir) = test_binary.parent().and_then(Path::parent)
+        {
+            candidates.push(profile_dir.join(name));
+        }
+        let target_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        for profile in ["debug", "release"] {
+            candidates.push(target_dir.join(profile).join(name));
+            if let Some(explicit) = std::env::var_os("CARGO_TARGET_DIR") {
+                candidates.push(PathBuf::from(explicit).join(profile).join(name));
+            }
+        }
+        candidates
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "cargo test builds the herdr-mcp CLI binary the clean filter runs; none of the expected paths exist"
+                )
+            })
+    }
+
+    fn point_filter_at_cli(dir: &Path, binary: &Path) {
+        git_ok(
+            dir,
+            &[
+                "config",
+                "--local",
+                "filter.herdr-handoff.clean",
+                &format!(
+                    "{} git-filter strip-handoff",
+                    shell_quote(&binary.to_string_lossy())
+                ),
+            ],
+        );
+    }
+
+    fn inject_handoff_block(path: &Path, content: &str) -> Vec<u8> {
+        fs::write(path, content).unwrap();
+        ensure_handoff_block(path).unwrap();
+        fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn user_commits_agent_doc_without_the_block_because_strip_inverts_injection() {
+        let root = temp_dir("strip-roundtrip");
+        let path = root.join("AGENTS.md");
+        // The injector normalizes a missing final newline, so `"abc"` can only
+        // round-trip to `"abc\n"`; every other shape is restored byte-for-byte.
+        for (original, expected) in [
+            ("", ""),
+            ("abc", "abc\n"),
+            ("abc\n", "abc\n"),
+            ("abc\r\n", "abc\r\n"),
+            (
+                "# Rules\n\n- [r1] keep tests green\n",
+                "# Rules\n\n- [r1] keep tests green\n",
+            ),
+        ] {
+            let injected = inject_handoff_block(&path, original);
+            assert!(
+                injected
+                    .windows(HANDOFF_BLOCK_START.len())
+                    .any(|window| window == HANDOFF_BLOCK_START.as_bytes()),
+                "the block must be injected for {original:?}"
+            );
+            assert_eq!(
+                String::from_utf8(strip_handoff_block(&injected)).unwrap(),
+                expected,
+                "round trip for {original:?}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_keeps_agent_doc_bytes_when_no_managed_block_is_present() {
+        for input in [
+            &b""[..],
+            b"plain\n",
+            b"<!-- other comment -->\n",
+            b"\xff\xfe non-utf8\r\n",
+        ] {
+            assert_eq!(strip_handoff_block(input), input.to_vec());
+        }
+    }
+
+    #[test]
+    fn user_keeps_surrounding_lines_when_the_block_sits_mid_file() {
+        let input = format!("top\n\n{HANDOFF_BLOCK_START}\nbody\n{HANDOFF_BLOCK_END}\nbottom\n");
+        assert_eq!(
+            strip_handoff_block(input.as_bytes()),
+            b"top\n\nbottom\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn user_keeps_the_file_when_a_marker_has_no_matching_end() {
+        let input = format!("top\n\n{HANDOFF_BLOCK_START}\ntruncated\n");
+        assert_eq!(strip_handoff_block(input.as_bytes()), input.as_bytes());
+    }
+
+    #[test]
+    fn user_gets_no_managed_block_when_several_were_injected() {
+        let input = format!(
+            "top\n\n{HANDOFF_BLOCK_START}\none\n{HANDOFF_BLOCK_END}\n\n{HANDOFF_BLOCK_START}\ntwo\n{HANDOFF_BLOCK_END}\n"
+        );
+        let stripped = String::from_utf8(strip_handoff_block(input.as_bytes())).unwrap();
+        assert!(!stripped.contains("herdr:handoff"), "{stripped}");
+        assert!(stripped.starts_with("top\n\n"), "{stripped}");
+    }
+
+    #[test]
+    fn user_gets_a_git_filter_that_never_references_a_cargo_build_artifact() {
+        assert_eq!(handoff_filter_binary(), "herdr-mcp");
+        assert!(is_ephemeral_binary(Path::new(
+            "/repo/target/debug/herdr-mcp"
+        )));
+        assert!(is_ephemeral_binary(Path::new(
+            "/repo/target/deps/herdr-mcp"
+        )));
+        assert!(is_ephemeral_binary(&std::env::temp_dir().join("herdr-mcp")));
+        assert!(is_ephemeral_binary(Path::new("/repo/deps/herdr_mcp-1234")));
+        assert!(!is_ephemeral_binary(Path::new(
+            "/home/user/.config/herdr-mcp/runtime/current/herdr-mcp"
+        )));
+        // Shell quoting: plain words stay readable, anything else is quoted.
+        assert_eq!(shell_quote("herdr-mcp"), "herdr-mcp");
+        assert_eq!(
+            shell_quote("/Users/me/.config/herdr-mcp/runtime/current/herdr-mcp"),
+            "/Users/me/.config/herdr-mcp/runtime/current/herdr-mcp"
+        );
+        assert_eq!(shell_quote("/tmp/a b/herdr-mcp"), "'/tmp/a b/herdr-mcp'");
+        assert_eq!(
+            shell_quote("/tmp/o'brien/herdr-mcp"),
+            "'/tmp/o'\\''brien/herdr-mcp'"
+        );
+    }
+
+    #[test]
+    fn user_keeps_git_status_clean_and_commits_without_a_tracked_handoff_block() {
+        if !git_available() {
+            return;
+        }
+        let binary = cli_binary_path();
+        let root = temp_dir("tracked-agent-doc");
+        init_git_repo(&root);
+        fs::write(
+            root.join("AGENTS.md"),
+            "# Rules\n\n- [r1] keep tests green\n",
+        )
+        .unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "seed"]);
+
+        write_handoff_current(&root, "# handoff\n").unwrap();
+
+        // Local-only filter state: common-dir attributes (never a tracked
+        // `.gitattributes`), no `required` key, and the PATH form here because
+        // the test process is a cargo build artifact.
+        assert_eq!(
+            fs::read_to_string(root.join(".git/info/attributes")).unwrap(),
+            "/AGENTS.md filter=herdr-handoff\n"
+        );
+        assert!(
+            !root.join(".gitattributes").exists(),
+            "the tracked .gitattributes must never be created or edited"
+        );
+        assert_eq!(
+            git_stdout(
+                &root,
+                &["config", "--local", "--get", "filter.herdr-handoff.clean"]
+            ),
+            "herdr-mcp git-filter strip-handoff"
+        );
+        assert_eq!(
+            git_stdout(
+                &root,
+                &["config", "--local", "--get", "filter.herdr-handoff.smudge"]
+            ),
+            "cat"
+        );
+        assert!(
+            !git_run(
+                &root,
+                &[
+                    "config",
+                    "--local",
+                    "--get",
+                    "filter.herdr-handoff.required"
+                ]
+            )
+            .status
+            .success(),
+            "required must stay unset so a missing binary never breaks a commit"
+        );
+
+        // Run the real clean filter, then assert git reports the tracked doc as
+        // unchanged while the working tree still carries the block.
+        point_filter_at_cli(&root, &binary);
+        refresh_index_stat(&root, "AGENTS.md");
+        assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "");
+        let worktree = fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(worktree.contains(HANDOFF_BLOCK_START), "{worktree}");
+        assert!(worktree.contains(HANDOFF_BLOCK_END), "{worktree}");
+        assert_eq!(
+            git_stdout(&root, &["rev-parse", ":AGENTS.md"]),
+            git_stdout(&root, &["rev-parse", "HEAD:AGENTS.md"]),
+            "the cached blob must stay the committed one"
+        );
+
+        // A real edit stays visible, is committed without the block, and the
+        // working tree keeps both the edit and the block.
+        let mut edited = worktree.clone();
+        edited.push_str("- [r2] real user rule\n");
+        fs::write(root.join("AGENTS.md"), &edited).unwrap();
+        assert_eq!(
+            git_stdout(&root, &["status", "--porcelain"]),
+            " M AGENTS.md"
+        );
+        let diff = git_stdout(&root, &["diff", "--", "AGENTS.md"]);
+        assert!(diff.contains("- [r2] real user rule"), "{diff}");
+        assert!(!diff.contains("herdr:handoff"), "{diff}");
+
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "agent doc"]);
+        let committed = git_stdout(&root, &["show", "HEAD:AGENTS.md"]);
+        assert!(committed.contains("- [r2] real user rule"), "{committed}");
+        assert!(!committed.contains("herdr:handoff"), "{committed}");
+        assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "");
+        let worktree_after = fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(worktree_after.contains("- [r2] real user rule"));
+        assert!(worktree_after.contains(HANDOFF_BLOCK_START));
+
+        // Idempotent: a second handoff write must not duplicate the attribute
+        // line or rewrite identical config values.
+        write_handoff_current(&root, "# handoff two\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".git/info/attributes")).unwrap(),
+            "/AGENTS.md filter=herdr-handoff\n"
+        );
+        assert_eq!(
+            git_stdout(
+                &root,
+                &["config", "--local", "--get", "filter.herdr-handoff.clean"]
+            ),
+            "herdr-mcp git-filter strip-handoff"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Regression: `git update-index` writes the named path, so re-syncing the
+    /// cached stat must never run for content that differs from the index blob —
+    /// otherwise a handoff tick would silently stage a real user edit.
+    #[test]
+    fn user_real_edit_is_never_staged_by_a_handoff_tick() {
+        if !git_available() {
+            return;
+        }
+        let binary = cli_binary_path();
+        let root = temp_dir("real-edit-not-staged");
+        init_git_repo(&root);
+        fs::write(
+            root.join("AGENTS.md"),
+            "# Rules\n\n- [r1] keep tests green\n",
+        )
+        .unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "seed"]);
+        write_handoff_current(&root, "# handoff\n").unwrap();
+        point_filter_at_cli(&root, &binary);
+        refresh_index_stat(&root, "AGENTS.md");
+        assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "");
+        let committed_blob = git_stdout(&root, &["rev-parse", "HEAD:AGENTS.md"]);
+
+        // The user edits the tracked doc while the block is already injected.
+        let mut edited = fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        edited.push_str("- [r2] real user rule\n");
+        fs::write(root.join("AGENTS.md"), &edited).unwrap();
+        for _ in 0..2 {
+            write_handoff_current(&root, "# handoff tick\n").unwrap();
+            point_filter_at_cli(&root, &binary);
+            refresh_index_stat(&root, "AGENTS.md");
+        }
+
+        assert_eq!(
+            git_stdout(&root, &["diff", "--cached", "--stat"]),
+            "",
+            "a handoff tick must never stage the user's edit"
+        );
+        assert_eq!(
+            git_stdout(&root, &["rev-parse", ":AGENTS.md"]),
+            committed_blob,
+            "the index blob must stay the committed one"
+        );
+        assert_eq!(
+            git_stdout(&root, &["status", "--porcelain"]),
+            " M AGENTS.md",
+            "the real edit must stay an unstaged modification"
+        );
+        let diff = git_stdout(&root, &["diff", "--", "AGENTS.md"]);
+        assert!(diff.contains("- [r2] real user rule"), "{diff}");
+        assert!(!diff.contains("herdr:handoff"), "{diff}");
+
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "real edit"]);
+        let committed = git_stdout(&root, &["show", "HEAD:AGENTS.md"]);
+        assert!(committed.contains("- [r2] real user rule"), "{committed}");
+        assert!(!committed.contains("herdr:handoff"), "{committed}");
+        assert!(
+            fs::read_to_string(root.join("AGENTS.md"))
+                .unwrap()
+                .contains(HANDOFF_BLOCK_START)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_in_a_linked_worktree_gets_common_dir_attributes_and_a_shared_filter() {
+        if !git_available() {
+            return;
+        }
+        let binary = cli_binary_path();
+        let base = temp_dir("linked-tracked-agent-doc");
+        let repo = base.join("repo");
+        fs::create_dir(&repo).unwrap();
+        init_git_repo(&repo);
+        fs::write(repo.join("AGENTS.md"), "# Rules\n").unwrap();
+        fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "seed"]);
+        let linked = base.join("linked");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        write_handoff_current(&linked, "# linked handoff\n").unwrap();
+
+        // Attributes live in the COMMON dir, so every linked worktree shares
+        // them; the per-worktree gitdir must stay untouched.
+        assert_eq!(
+            fs::read_to_string(repo.join(".git/info/attributes")).unwrap(),
+            "/AGENTS.md filter=herdr-handoff\n"
+        );
+        let linked_gitdir = linked.join(".git");
+        let linked_gitdir = fs::read_to_string(&linked_gitdir)
+            .unwrap()
+            .trim()
+            .trim_start_matches("gitdir:")
+            .trim()
+            .to_owned();
+        assert!(
+            !Path::new(&linked_gitdir).join("info/attributes").exists(),
+            "info/attributes must not be written into the per-worktree gitdir"
+        );
+        assert_eq!(
+            git_stdout(
+                &linked,
+                &["config", "--local", "--get", "filter.herdr-handoff.clean"]
+            ),
+            "herdr-mcp git-filter strip-handoff"
+        );
+
+        point_filter_at_cli(&linked, &binary);
+        refresh_index_stat(&linked, "AGENTS.md");
+        assert_eq!(git_stdout(&linked, &["status", "--porcelain"]), "");
+        assert!(
+            fs::read_to_string(linked.join("AGENTS.md"))
+                .unwrap()
+                .contains(HANDOFF_BLOCK_START)
+        );
+
+        git_ok(
+            &repo,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn user_keeps_untracked_agent_docs_on_the_existing_exclude_path() {
+        if !git_available() {
+            return;
+        }
+        let root = temp_dir("untracked-agent-doc");
+        init_git_repo(&root);
+        fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "seed"]);
+
+        write_handoff_current(&root, "# handoff\n").unwrap();
+
+        let exclude = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.lines().any(|line| line.trim() == "AGENTS.md"),
+            "{exclude}"
+        );
+        assert!(
+            exclude.lines().any(|line| line.trim() == "HANDOFF.md"),
+            "{exclude}"
+        );
+        assert!(
+            !root.join(".git/info/attributes").exists(),
+            "an untracked agent doc needs no filter"
+        );
+        assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
