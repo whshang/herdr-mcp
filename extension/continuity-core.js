@@ -241,6 +241,66 @@ export function handoffStatusIsActive(status) {
   ].includes(String(status || ""));
 }
 
+/**
+ * A manual ChatGPT Project handoff reuses its source tab and navigates it to the
+ * Project home, so a non-terminal transfer is an owner of that tab id until it
+ * finishes. Tab ids outlive SPA navigation, reloads and manual Project
+ * navigation, so a persisted transfer must never be resumed on a tab that has
+ * since moved to a different conversation (#835).
+ */
+export const HANDOFF_TAB_RESUME_TTL_MS = 15 * 60 * 1000;
+
+// Statuses whose only remaining work is the post-navigation continuation of a
+// manual Project handoff: the source tab has already been navigated to the
+// Project home and only the seed (or its recovery) is outstanding.
+const HANDOFF_TARGET_PAGE_STATUSES = ["target_opening", "seed_submitting", "seed_uncertain"];
+
+/**
+ * Decide whether a transfer may still act on (resume, seed into, or navigate) a
+ * tab whose live URL is `liveUrl`.
+ *
+ * Returns `null` when the tab still belongs to the transfer, otherwise a stable
+ * reason string the caller records on the transfer so it stops being resumable.
+ * Allowed cases are deliberately narrow:
+ *   - the tab is still on the transfer's source conversation;
+ *   - the tab is already on the transfer's recorded target conversation;
+ *   - the tab is the transfer's Project home and the transfer is in an
+ *     in-progress continuation status (source tab already navigated);
+ *   - the page itself confirms the transfer's seed marker (`seedConfirmed`).
+ *     Only the caller can obtain that evidence, and only from the tab's own
+ *     content script, so it proves the tab really is this transfer's target
+ *     conversation rather than a conversation the user started.
+ * Anything else (another conversation in the same Project, another Project, a
+ * non-ChatGPT page, or an abandoned transfer past the resume TTL) is blocked.
+ */
+export function handoffSourceNavigationBlock({
+  transfer = null,
+  liveUrl = null,
+  now = Date.now(),
+  ttlMs = HANDOFF_TAB_RESUME_TTL_MS,
+  seedConfirmed = false,
+} = {}) {
+  if (!transfer || typeof transfer !== "object") return "stale_handoff_missing";
+  const at = Number(transfer.updated_at || transfer.created_at || 0);
+  if (!(at > 0) || Number(now) - at > Number(ttlMs)) return "stale_handoff_expired";
+  const live = chatGptConversationInfo(liveUrl);
+  if (!live) return "stale_handoff_conversation_mismatch";
+  const liveKey = String(live.convKey || "");
+  const sourceKey = String(transfer.source_conv_key || "").trim();
+  const targetKey = String(transfer.target_conv_key || "").trim();
+  if (sourceKey && liveKey === sourceKey) return null;
+  if (targetKey && liveKey === targetKey) return null;
+  const projectId = String(transfer.project_id || "").trim();
+  const sameProject = Boolean(projectId) && String(live.project_id || "") === projectId;
+  if (seedConfirmed === true && live.conversation_id && sameProject) return null;
+  if (
+    live.is_project_home === true
+    && sameProject
+    && HANDOFF_TARGET_PAGE_STATUSES.includes(String(transfer.status || ""))
+  ) return null;
+  return "stale_handoff_conversation_mismatch";
+}
+
 /** Retired source tabs may be discarded only after the handoff commit. */
 export function shouldDiscardRetiredSourceTab({
   committed = false,
