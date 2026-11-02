@@ -356,13 +356,35 @@ fn finish(write: Result<(), String>, reason: &'static str) -> HostOutcome {
     }
 }
 
+/// Neutral working directory chosen by [`run`] before any path work.
+///
+/// `None` means the helper could not move, and relative extension paths must
+/// then fail instead of falling back to `getcwd` on whatever Chrome inherited.
+static NEUTRAL_HELPER_CWD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
     // #844: the extension host is a helper process. It never needs the working
     // directory Chrome or the linker inherited, and inheriting a protected one
     // would let a relative path resolution reach ~/Documents from an identity
     // that holds no grant. Move to a neutral directory before any path work.
-    if let Ok(paths) = crate::paths::RuntimePaths::discover() {
-        let _ = crate::macos_permissions::enter_neutral_helper_cwd(&paths.config_dir);
+    match crate::paths::RuntimePaths::discover() {
+        Ok(paths) => match crate::macos_permissions::enter_neutral_helper_cwd(&paths.config_dir) {
+            Ok(neutral) => {
+                let _ = NEUTRAL_HELPER_CWD.set(neutral);
+            }
+            Err(error) => {
+                // Keep serving, but record why relative paths will be refused
+                // rather than silently leaving the process in an unknown cwd.
+                eprintln!(
+                    "[herdr-mcp native-host] cannot enter a neutral working directory: {error}"
+                );
+            }
+        },
+        Err(error) => {
+            eprintln!(
+                "[herdr-mcp native-host] cannot resolve runtime paths for a neutral working directory: {error}"
+            );
+        }
     }
     let log = NativeHostLog::discover();
     let stdin = std::io::stdin();
@@ -622,20 +644,27 @@ pub(crate) fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        let cwd = env::current_dir()
-            .map_err(|error| format!("cannot resolve extension path: {error}"))?;
-        // #844: a helper that inherited a protected cwd must not resolve a
-        // relative path against it. `run` moves the native host to a neutral
-        // directory first, and this guard keeps the invariant even if that
-        // move is ever skipped.
-        if crate::macos_permissions::runtime_must_not_probe(&cwd) {
+        // #844: never call `getcwd`. On a protected cwd the syscall itself is
+        // the Documents access this guard exists to avoid, so a relative path is
+        // resolved against the neutral directory `run` chose, and refused when
+        // the helper could not choose one.
+        let Some(neutral) = NEUTRAL_HELPER_CWD.get() else {
             return Err(
-                "extension path is relative and the helper working directory is privacy-protected"
+                "extension path is relative and the helper has no neutral working directory"
                     .to_owned(),
             );
-        }
-        cwd.join(path)
+        };
+        neutral.join(path)
     };
+    // An absolute path inside a privacy-protected folder is refused lexically:
+    // the rotating runtime must not `is_dir()`/`is_file()` it, and the broker is
+    // the only authorized reader of that folder.
+    if crate::macos_permissions::runtime_must_not_probe(&absolute) {
+        return Err(format!(
+            "extension path '{}' is inside a macOS privacy-protected folder; load the extension from the managed standalone path instead",
+            absolute.display()
+        ));
+    }
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
         match component {
@@ -1099,6 +1128,20 @@ fn string_field<'a>(message: &'a Value, key: &str) -> Result<&'a str, String> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// user keeps a bounded helper | Given the extension host has no neutral
+    /// working directory | When a relative extension path arrives | Then it is
+    /// refused without ever calling getcwd, which is the Documents access the
+    /// guard exists to avoid on an inherited protected cwd.
+    #[test]
+    fn relative_extension_path_is_refused_without_getcwd() {
+        assert!(
+            super::NEUTRAL_HELPER_CWD.get().is_none(),
+            "test precondition"
+        );
+        let error = super::lexical_absolute(Path::new("extension")).expect_err("must be refused");
+        assert!(error.contains("neutral working directory"), "{error}");
+    }
+
     use super::*;
     use std::fs;
     use std::io::Cursor;

@@ -128,7 +128,6 @@ pub(crate) fn enter_neutral_helper_cwd(neutral: &Path) -> Result<PathBuf, String
 }
 
 /// Whether the rotating runtime must treat `path` as off-limits for direct
-/// Whether the rotating runtime must treat `path` as off-limits for direct
 /// filesystem probing.
 ///
 /// The stable broker child is the authorized client for these folders, so it

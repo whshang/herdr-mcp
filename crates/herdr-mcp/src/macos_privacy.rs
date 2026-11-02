@@ -318,6 +318,130 @@ fn value_after_prefix(text: &str, prefix: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Exit codes of the `__documents-alias-probe` child. The child is the stable
+/// broker identity, so it may inspect `~/Documents` when the rotating runtime
+/// may not; the runtime only reads an exit code, never the protected path.
+#[cfg(target_os = "macos")]
+const ALIAS_READY_EXIT: u8 = 0;
+#[cfg(target_os = "macos")]
+const ALIAS_MISSING_EXIT: u8 = 66;
+#[cfg(target_os = "macos")]
+const ALIAS_OCCUPIED_LINK_EXIT: u8 = 67;
+#[cfg(target_os = "macos")]
+const ALIAS_OCCUPIED_ENTRY_EXIT: u8 = 68;
+#[cfg(target_os = "macos")]
+const ALIAS_DENIED_EXIT: u8 = 77;
+
+/// Outcome of one bounded, broker-routed alias inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BrokeredAlias {
+    /// The entry is a symlink to the expected target.
+    Ready,
+    /// The entry is a symlink to something else.
+    OccupiedLink,
+    /// The entry exists but is not a symlink (file or directory).
+    OccupiedEntry,
+    /// Nothing exists at the path.
+    Missing,
+    /// The broker did not answer within the budget: a prompt is still up.
+    Pending,
+    /// The broker refused, is missing, or failed.
+    Denied(String),
+}
+
+/// Inspect one Chrome-facing alias through the stable broker identity.
+///
+/// This is the whole point of the alias check: the rotating generation must not
+/// run `symlink_metadata`/`read_link` on `~/Documents`, but the answer still has
+/// to be real (so a missing alias can be created and an existing one reused).
+/// One bounded child does the stat, and only a timeout or a refusal turns into
+/// `tcc_pending` upstream.
+#[cfg(target_os = "macos")]
+pub(crate) fn probe_alias_via_stable_broker(
+    config_dir: &Path,
+    path: &Path,
+    expected: &Path,
+) -> BrokeredAlias {
+    use crate::child_process;
+    use std::process::{Command, Stdio};
+
+    let broker = crate::tcc_broker::broker_path(config_dir);
+    let broker_is_owned_regular_file = crate::tcc_broker::status(&broker).is_some();
+    let executable = match documents_probe_executable(&broker, broker_is_owned_regular_file) {
+        Ok(path) => path,
+        Err(detail) => return BrokeredAlias::Denied(detail),
+    };
+    let mut command = Command::new(executable);
+    command
+        .arg("__documents-alias-probe")
+        .arg(path)
+        .arg(expected)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    child_process::configure_process_group(&mut command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return BrokeredAlias::Denied(error.to_string()),
+    };
+    let _registration = child_process::register_owned_child("documents-alias-probe", &child);
+    match child_process::wait_bounded(&mut child, DOCUMENTS_PROBE_TIMEOUT) {
+        Ok(Some(status)) => match status.code().map(|code| code as u8) {
+            Some(ALIAS_READY_EXIT) => BrokeredAlias::Ready,
+            Some(ALIAS_OCCUPIED_LINK_EXIT) => BrokeredAlias::OccupiedLink,
+            Some(ALIAS_OCCUPIED_ENTRY_EXIT) => BrokeredAlias::OccupiedEntry,
+            Some(ALIAS_MISSING_EXIT) => BrokeredAlias::Missing,
+            Some(ALIAS_DENIED_EXIT) => BrokeredAlias::Denied(
+                "the stable broker cannot read this protected path".to_owned(),
+            ),
+            other => BrokeredAlias::Denied(format!("alias probe exit {other:?}")),
+        },
+        Ok(None) => BrokeredAlias::Pending,
+        Err(error) => BrokeredAlias::Denied(error.to_string()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn probe_alias_via_stable_broker(
+    _config_dir: &Path,
+    _path: &Path,
+    _expected: &Path,
+) -> BrokeredAlias {
+    BrokeredAlias::Denied("macOS Documents aliases are not applicable on this platform".to_owned())
+}
+
+/// Child side of [`probe_alias_via_stable_broker`]. Runs only under the stable
+/// broker identity, which is the process that holds the Documents grant.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_documents_alias_probe_child(path: &Path, expected: &Path) -> ExitCode {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::read_link(path) {
+            Ok(target) if target == expected => ExitCode::from(ALIAS_READY_EXIT),
+            Ok(_) => ExitCode::from(ALIAS_OCCUPIED_LINK_EXIT),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                ExitCode::from(ALIAS_DENIED_EXIT)
+            }
+            Err(_) => ExitCode::from(1),
+        },
+        Ok(_) => ExitCode::from(ALIAS_OCCUPIED_ENTRY_EXIT),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ExitCode::from(ALIAS_MISSING_EXIT)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            ExitCode::from(ALIAS_DENIED_EXIT)
+        }
+        Err(_) => ExitCode::from(1),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn run_documents_alias_probe_child(_path: &Path, _expected: &Path) -> ExitCode {
+    ExitCode::from(ALIAS_MISSING_EXIT_CONST)
+}
+
+#[cfg(not(target_os = "macos"))]
+const ALIAS_MISSING_EXIT_CONST: u8 = 66;
+
 /// Where the post-activation Documents preflight is recorded.
 ///
 /// It lives next to the other update artifacts so `update status` can report the

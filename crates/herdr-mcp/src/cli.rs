@@ -36,6 +36,7 @@ pub enum Command {
     Uninstall,
     Reinstall,
     DocumentsProbe,
+    DocumentsAliasProbe(String, String),
     HerdrSupervisor(HerdrSupervisorCommand),
     Scan {
         json: bool,
@@ -646,6 +647,10 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "doctor" => parse_doctor(&args[1..]),
         "network" => parse_network(&args[1..]),
         "__documents-probe" => no_extra(args, Command::DocumentsProbe),
+        "__documents-alias-probe" => match &args[1..] {
+            [path, expected] => Ok(Command::DocumentsAliasProbe(path.clone(), expected.clone())),
+            _ => Err("usage: herdr-mcp __documents-alias-probe <path> <expected>".to_owned()),
+        },
         "__tcc-broker" => no_extra(args, Command::TccBrokerRun),
         "__tcc-herdr-host" => no_extra(args, Command::TccHerdrHost),
         "__credential-helper" => no_extra(args, Command::CredentialHelperRun),

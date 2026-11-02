@@ -1810,35 +1810,121 @@ fn status_load_view(home: &Path, current: &Path, state: Option<&Value>) -> (Valu
     (user_visible_path, load_unpacked_path)
 }
 
+/// Outcome of one alias lookup, already decided by the party that is allowed to
+/// look. Tests inject this so both the answered and the pending branches are
+/// covered on any platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AliasProbe {
+    Ready,
+    OccupiedLink,
+    OccupiedEntry,
+    Missing,
+    /// The brokered lookup did not answer within its budget.
+    Pending,
+    /// The broker refused or is unavailable.
+    Denied(String),
+}
+
+/// The production lookup for a path the rotating runtime must not touch: one
+/// bounded call to the stable broker, never a direct syscall.
+fn brokered_alias_probe(path: &Path, expected: &Path) -> AliasProbe {
+    let Ok(paths) = crate::paths::RuntimePaths::discover() else {
+        return AliasProbe::Denied("runtime paths are unavailable".to_owned());
+    };
+    match crate::macos_privacy::probe_alias_via_stable_broker(&paths.config_dir, path, expected) {
+        crate::macos_privacy::BrokeredAlias::Ready => AliasProbe::Ready,
+        crate::macos_privacy::BrokeredAlias::OccupiedLink => AliasProbe::OccupiedLink,
+        crate::macos_privacy::BrokeredAlias::OccupiedEntry => AliasProbe::OccupiedEntry,
+        crate::macos_privacy::BrokeredAlias::Missing => AliasProbe::Missing,
+        crate::macos_privacy::BrokeredAlias::Pending => AliasProbe::Pending,
+        crate::macos_privacy::BrokeredAlias::Denied(detail) => AliasProbe::Denied(detail),
+    }
+}
+
 fn inspect_alias(path: &Path, current: &Path) -> Value {
-    inspect_alias_with_protection(
+    inspect_alias_with_probe(
         path,
         current,
         crate::macos_permissions::runtime_must_not_probe(path),
+        &brokered_alias_probe,
     )
 }
 
-/// `protected` is the already-decided verdict for `path`.
+/// Inspect the Chrome-facing alias.
 ///
-/// The rotating runtime generation is not the authorized TCC client for
-/// `~/Documents`, so it must not run `symlink_metadata`/`read_link` there: the
-/// first such call is what parks a thread behind the consent prompt. The alias
-/// is still reported, just as `tcc_pending` with a machine-readable code, and
-/// the caller either answers the prompt or asks the stable broker.
-fn inspect_alias_with_protection(path: &Path, current: &Path, protected: bool) -> Value {
-    if protected {
-        // One machine-readable shape for every "the runtime will not probe this"
-        // answer, plus the alias-specific fields this report already returns.
-        let mut payload =
-            crate::macos_permissions::tcc_pending_payload("extension_standalone_alias", path);
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("ready".to_owned(), json!(false));
-            object.insert("status".to_owned(), json!("tcc_pending"));
-            object.insert("path".to_owned(), json!(path));
-            object.insert("target".to_owned(), json!(current));
-        }
-        return payload;
+/// A path the rotating generation must not probe is answered by one bounded,
+/// broker-routed lookup: a missing alias is reported `missing` (so
+/// `ensure_alias` creates it), an existing symlink to `current` is `ready`, and
+/// only an unanswered or refused broker call becomes `tcc_pending`. That keeps
+/// `load_path_ready` and `--path` preflight truthful during an update instead of
+/// turning every protected alias into a permanent stall.
+fn inspect_alias_with_probe(
+    path: &Path,
+    current: &Path,
+    protected: bool,
+    probe: &dyn Fn(&Path, &Path) -> AliasProbe,
+) -> Value {
+    if !protected {
+        return inspect_alias_direct(path, current);
     }
+    match probe(path, current) {
+        AliasProbe::Ready => json!({
+            "ready": true,
+            "status": "ready",
+            "path": path,
+            "target": current,
+            "broker_routed": true,
+        }),
+        AliasProbe::Missing => json!({
+            "ready": false,
+            "status": "missing",
+            "path": path,
+            "target": current,
+            "broker_routed": true,
+        }),
+        AliasProbe::OccupiedLink => json!({
+            "ready": false,
+            "status": "occupied",
+            "kind": "symlink",
+            "path": path,
+            "target": current,
+            "broker_routed": true,
+        }),
+        AliasProbe::OccupiedEntry => json!({
+            "ready": false,
+            "status": "occupied",
+            "kind": "entry",
+            "path": path,
+            "target": current,
+            "broker_routed": true,
+        }),
+        AliasProbe::Pending => tcc_pending_alias_payload(path, current),
+        AliasProbe::Denied(detail) => {
+            let mut payload = tcc_pending_alias_payload(path, current);
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("status".to_owned(), json!("unverified"));
+                object.insert("error".to_owned(), json!(detail));
+            }
+            payload
+        }
+    }
+}
+
+fn tcc_pending_alias_payload(path: &Path, current: &Path) -> Value {
+    let mut payload =
+        crate::macos_permissions::tcc_pending_payload("extension_standalone_alias", path);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("ready".to_owned(), json!(false));
+        object.insert("status".to_owned(), json!("tcc_pending"));
+        object.insert("path".to_owned(), json!(path));
+        object.insert("target".to_owned(), json!(current));
+    }
+    payload
+}
+
+/// Direct filesystem inspection, used only when the runtime may read the path
+/// itself (never for a privacy-protected folder).
+fn inspect_alias_direct(path: &Path, current: &Path) -> Value {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => json!({
             "ready": false,
@@ -2171,34 +2257,80 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    /// user keeps a working control path | Given the Chrome-facing load path is
-    /// inside a macOS privacy-protected folder | When status reports the alias
-    /// | Then it is `tcc_pending` with a machine-readable code and the rotating
-    /// runtime performs no filesystem probe on it.
+    /// user keeps the default install working | Given a protected Documents
+    /// alias and a broker that answers | When the alias is inspected | Then the
+    /// real answer is reported (ready/missing), so install and update do not
+    /// degrade into a permanent tcc_pending.
     #[test]
-    fn protected_alias_is_tcc_pending_without_a_probe() {
+    fn protected_alias_uses_the_broker_answer() {
+        let alias = Path::new("/Users/example/Documents/herdr-mcp/extension");
+        let current = Path::new("/Users/example/Library/herdr-mcp/standalone/current");
+
+        let ready = inspect_alias_with_probe(alias, current, true, &|_, _| AliasProbe::Ready);
+        assert_eq!(ready["status"], "ready");
+        assert_eq!(ready["ready"], true);
+        assert_eq!(ready["broker_routed"], true);
+        // `load_path_ready` reads exactly this flag, and `ensure_alias` only
+        // acts on "missing", so both follow from the brokered answer.
+
+        // A missing alias must stay creatable: `ensure_alias` only acts on
+        // "missing", so reporting tcc_pending here is what broke the default
+        // install.
+        let missing = inspect_alias_with_probe(alias, current, true, &|_, _| AliasProbe::Missing);
+        assert_eq!(missing["status"], "missing");
+        assert_eq!(missing["ready"], false);
+
+        // The explicit `--path` preflight refuses only "occupied"/"unverified";
+        // "missing" and "ready" are accepted, so a protected path is not
+        // falsely reported as occupied.
+        for status in ["missing", "ready"] {
+            assert!(!matches!(status, "occupied" | "unverified"));
+        }
+    }
+
+    /// user sees one stall condition | Given a protected alias and a broker that
+    /// does not answer, or refuses | When the alias is inspected | Then the state
+    /// is `tcc_pending` with a machine-readable code and it is retryable.
+    #[test]
+    fn protected_alias_is_tcc_pending_only_when_the_broker_does_not_answer() {
+        let alias = Path::new("/Users/example/Documents/herdr-mcp/extension");
+        let current = Path::new("/Users/example/Library/herdr-mcp/standalone/current");
+
+        let pending = inspect_alias_with_probe(alias, current, true, &|_, _| AliasProbe::Pending);
+        assert_eq!(pending["status"], "tcc_pending");
+        assert_eq!(pending["code"], "tcc_pending");
+        assert_eq!(pending["retryable"], true);
+        assert_eq!(pending["ready"], false);
+
+        let denied = inspect_alias_with_probe(alias, current, true, &|_, _| {
+            AliasProbe::Denied("broker refused".to_owned())
+        });
+        assert_eq!(denied["status"], "unverified");
+        assert_eq!(denied["code"], "tcc_pending");
+        assert_eq!(denied["error"], "broker refused");
+    }
+
+    /// user keeps an ordinary install unchanged | Given an unprotected path
+    /// | When it is inspected | Then the direct filesystem answer is used and no
+    /// broker is involved.
+    #[test]
+    fn unprotected_alias_still_uses_the_direct_probe() {
         let root = std::env::temp_dir().join(format!(
-            "herdr-alias-protected-{}-{}",
+            "herdr-alias-direct-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_nanos())
                 .unwrap_or_default()
         ));
-        let alias = root.join("Documents/herdr-mcp/extension");
-        let current = root.join("Library/Application Support/herdr-mcp/standalone/current");
-
-        let protected = inspect_alias_with_protection(&alias, &current, true);
-        assert_eq!(protected["status"], "tcc_pending");
-        assert_eq!(protected["code"], "tcc_pending");
-        assert_eq!(protected["retryable"], true);
-        assert_eq!(protected["ready"], false);
-
-        // The same path with protection off is a real probe of a path that does
-        // not exist, which proves the protected branch never reached the
-        // filesystem: a probe there would have reported "missing" instead.
-        let unprotected = inspect_alias_with_protection(&alias, &current, false);
-        assert_eq!(unprotected["status"], "missing");
+        let alias = root.join("extension");
+        let current = root.join("current");
+        std::fs::create_dir_all(&current).unwrap();
+        std::os::unix::fs::symlink(&current, &alias).unwrap();
+        let probe = |_: &Path, _: &Path| -> AliasProbe { panic!("the broker must not be used") };
+        let view = inspect_alias_with_probe(&alias, &current, false, &probe);
+        assert_eq!(view["status"], "ready");
+        assert_eq!(view["ready"], true);
         let _ = std::fs::remove_dir_all(&root);
     }
 
