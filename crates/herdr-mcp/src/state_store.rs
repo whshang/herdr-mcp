@@ -3740,6 +3740,35 @@ impl StateStore {
         &self,
         canonical_url: &str,
     ) -> Result<Option<String>, String> {
+        self.browser_current_generation_source_session_ref_in(canonical_url, None)
+    }
+
+    /// Endpoint-scoped form of the current-generation lookup above (#734).
+    ///
+    /// After a device re-enrollment the same ChatGPT conversation can hold a
+    /// current locator on an endpoint derived from the retired `device_id` and
+    /// another one on the endpoint derived from the live `device_id`. Endpoints
+    /// and locators have no TTL, so the stale endpoint keeps shadowing the live
+    /// one in the global lookup and every `source_turn.observe` for that URL
+    /// failed closed. This variant resolves the URL only among the current
+    /// sessions of the reporting endpoint, which is the only page the user can
+    /// actually be looking at. Zero in-scope sessions is still no match (the
+    /// caller decides whether to fall back), several in-scope sessions stay
+    /// ambiguous, and nothing is deleted or retired.
+    pub fn browser_current_generation_source_session_ref_for_endpoint(
+        &self,
+        canonical_url: &str,
+        endpoint_ref: &str,
+    ) -> Result<Option<String>, String> {
+        validate_browser_endpoint_ref(endpoint_ref)?;
+        self.browser_current_generation_source_session_ref_in(canonical_url, Some(endpoint_ref))
+    }
+
+    fn browser_current_generation_source_session_ref_in(
+        &self,
+        canonical_url: &str,
+        endpoint_ref: Option<&str>,
+    ) -> Result<Option<String>, String> {
         if canonical_url.is_empty()
             || canonical_url.len() > 2048
             || canonical_url != canonical_url.trim()
@@ -3750,7 +3779,9 @@ impl StateStore {
         }
         // A stale registration is not an ambiguity: it cannot be the page the
         // user is looking at. A session whose endpoint/provider has no provider
-        // state row can never be current, so the inner join drops it.
+        // state row can never be current, so the inner join drops it. The
+        // optional endpoint filter is bound as a parameter (NULL keeps the
+        // global contract) so an in-scope lookup can never interpolate a ref.
         let mut stmt = self
             .conn
             .prepare(
@@ -3762,6 +3793,7 @@ impl StateStore {
                  WHERE l.canonical_url = ?1
                    AND r.kind = 'session'
                    AND r.provider = 'chatgpt'
+                   AND (?2 IS NULL OR r.endpoint_ref = ?2)
                    AND l.observation_generation = p.observation_generation
                    AND r.observation_generation = p.observation_generation
                  GROUP BY r.resource_ref
@@ -3769,7 +3801,9 @@ impl StateStore {
             )
             .map_err(|error| format!("cannot prepare browser session URL lookup: {error}"))?;
         let mut refs = stmt
-            .query_map([canonical_url], |row| row.get::<_, String>(0))
+            .query_map(params![canonical_url, endpoint_ref], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|error| format!("cannot query browser session URL lookup: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot read browser session URL lookup: {error}"))?;
