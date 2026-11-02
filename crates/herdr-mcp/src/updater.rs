@@ -666,6 +666,38 @@ fn auto() -> Result<ExitCode, String> {
     apply_inner(None, true, Some(UpdateChannel::Stable), false, false)
 }
 
+/// No-op record for the scheduled/automatic path when the discovered release
+/// is older than the installed runtime. It is deliberately a success result:
+/// a background job that has nothing to install must not report a failure.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn auto_downgrade_skip_record(
+    channel: UpdateChannel,
+    current: &Version,
+    release: &Version,
+    tag: &str,
+) -> Value {
+    json!({
+        "ok": true,
+        "code": "auto_update_skipped",
+        "reason": downgrade_skip_reason(channel),
+        "update_channel": channel.as_str(),
+        "current_version": current.to_string(),
+        "release_version": release.to_string(),
+        "tag": tag,
+        "provenance_verified": true,
+        "network_checked": true,
+        "update_queued": false,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn downgrade_skip_reason(channel: UpdateChannel) -> &'static str {
+    match channel {
+        UpdateChannel::Stable => "stable_older_than_current",
+        UpdateChannel::Preview => "release_older_than_current",
+    }
+}
+
 fn apply_inner(
     manifest_override: Option<&str>,
     allow_current: bool,
@@ -734,6 +766,21 @@ fn apply_inner(
         ));
         let paths = RuntimePaths::discover()?;
         if plan.version < current {
+            // A scheduled/automatic run is not an operator request: when the
+            // release it discovered is behind the installed runtime (for
+            // example Stable v1.0.5 while a v1.1.0 rc is installed) there is
+            // nothing to do, so it reports a no-op skip and exits successfully
+            // instead of failing the daily LaunchAgent run. Only the explicit
+            // `update apply` path keeps refusing the downgrade.
+            if channel_override.is_some() {
+                print_json(&auto_downgrade_skip_record(
+                    channel,
+                    &current,
+                    &plan.version,
+                    &plan.tag,
+                ))?;
+                return Ok(ExitCode::SUCCESS);
+            }
             return Err(format!(
                 "release {} is older than current {}; refusing downgrade",
                 plan.version, current

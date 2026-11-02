@@ -504,9 +504,15 @@ fn reconcile_after_service_install_inner() -> Result<Value, String> {
     if let Some(existing) = read_optional_regular(&plist_path)? {
         verify_owned_plist(&existing, &paths)?;
         if existing == expected {
-            if state == LaunchdState::Absent {
-                bootstrap(&plist_path)?;
-            }
+            // The ProgramArguments resolve through the stable
+            // `runtime/current` path, so an ordinary runtime generation
+            // switch leaves these bytes unchanged. launchd can still hold a
+            // stale LWCR/BTM registration for this label after such a switch
+            // and then fail every run with EX_CONFIG (78) before the binary
+            // is even spawned. Refresh the registration here, best-effort:
+            // a launchctl failure is logged and reported, never turned into a
+            // failed install/update.
+            let reregistration = reregister_after_generation_switch(&paths, &plist_path);
             return Ok(json!({
                 "ok": true,
                 "installed": true,
@@ -514,6 +520,7 @@ fn reconcile_after_service_install_inner() -> Result<Value, String> {
                 "label": AUTO_UPDATE_LABEL,
                 "interval_seconds": AUTO_UPDATE_INTERVAL_SECONDS,
                 "stable_only": true,
+                "reregistration": reregistration,
             }));
         }
         if state == LaunchdState::Loaded {
@@ -536,6 +543,96 @@ fn reconcile_after_service_install_inner() -> Result<Value, String> {
         "interval_seconds": AUTO_UPDATE_INTERVAL_SECONDS,
         "stable_only": true,
     }))
+}
+
+/// Best-effort launchd re-registration of the daily scheduler after a runtime
+/// generation switch.
+///
+/// The generated plist is identical across generations because both
+/// `ProgramArguments` resolve through `runtime/current/herdr-mcp`, so launchd
+/// can keep a stale LWCR/BTM registration for the label and refuse to spawn the
+/// job at all (`last exit code = 78: EX_CONFIG`, "Unable to get updated LWCR").
+/// Bootout + bootstrap re-registers the item. Every failure is logged and
+/// reported in the returned record; it never fails the install/update that
+/// triggered it.
+#[cfg(target_os = "macos")]
+fn reregister_after_generation_switch(paths: &RuntimePaths, plist_path: &Path) -> Value {
+    let mut log = |line: &str| eprintln!("[herdr-mcp auto-update] {line}");
+    reregister_after_generation_switch_with(
+        paths,
+        plist_path,
+        launchd_state,
+        bootstrap,
+        bootout,
+        &mut log,
+    )
+}
+
+/// Testable core of [`reregister_after_generation_switch`] with an injected
+/// launchctl runner so bootout/bootstrap/state failures can be exercised
+/// without touching a real launchd domain.
+#[cfg(target_os = "macos")]
+fn reregister_after_generation_switch_with<State, Bootstrap, Bootout>(
+    paths: &RuntimePaths,
+    plist_path: &Path,
+    state: State,
+    bootstrap: Bootstrap,
+    bootout: Bootout,
+    log: &mut dyn FnMut(&str),
+) -> Value
+where
+    State: Fn(&str) -> Result<LaunchdState, String>,
+    Bootstrap: Fn(&Path) -> Result<(), String>,
+    Bootout: Fn(&str) -> Result<(), String>,
+{
+    let existing = match read_optional_regular(plist_path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return json!({
+                "ok": true,
+                "reregistered": false,
+                "label": AUTO_UPDATE_LABEL,
+                "reason": "scheduler_not_installed",
+            });
+        }
+        Err(error) => return failed_reregistration(log, "scheduler_not_inspectable", &error),
+    };
+    if let Err(error) = verify_owned_plist(&existing, paths) {
+        return failed_reregistration(log, "scheduler_not_owned", &error);
+    }
+    let loaded = match state(AUTO_UPDATE_LABEL) {
+        Ok(LaunchdState::Loaded) => true,
+        Ok(LaunchdState::Absent) => false,
+        Err(error) => return failed_reregistration(log, "launchd_state_unknown", &error),
+    };
+    if loaded && let Err(error) = bootout(AUTO_UPDATE_LABEL) {
+        // A bootstrap against a still-loaded job is refused as already loaded,
+        // so report the stale registration instead of retrying blind.
+        return failed_reregistration(log, "bootout_failed", &error);
+    }
+    if let Err(error) = bootstrap(plist_path) {
+        return failed_reregistration(log, "bootstrap_failed", &error);
+    }
+    json!({
+        "ok": true,
+        "reregistered": true,
+        "label": AUTO_UPDATE_LABEL,
+        "was_loaded": loaded,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn failed_reregistration(log: &mut dyn FnMut(&str), reason: &str, detail: &str) -> Value {
+    log(&format!(
+        "warning: auto-update LaunchAgent re-registration skipped ({reason}): {detail}"
+    ));
+    json!({
+        "ok": false,
+        "reregistered": false,
+        "label": AUTO_UPDATE_LABEL,
+        "reason": reason,
+        "detail": detail,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -584,6 +681,7 @@ fn remove_before_service_uninstall_inner() -> Result<Value, String> {
 #[cfg(target_os = "macos")]
 fn encode_plist(paths: &RuntimePaths) -> Result<Vec<u8>, String> {
     let current_binary = paths.config_dir.join("runtime/current/herdr-mcp");
+    let (stdout_log, stderr_log) = auto_update_log_paths(paths);
     let mut root = Dictionary::new();
     root.insert(
         "Label".to_owned(),
@@ -625,11 +723,29 @@ fn encode_plist(paths: &RuntimePaths) -> Result<Vec<u8>, String> {
         "ThrottleInterval".to_owned(),
         PlistValue::Integer(300_u64.into()),
     );
+    // A scheduled run has no terminal. Without explicit log paths a failure is
+    // only visible as `last exit code = 1` in `launchctl print`.
+    root.insert(
+        "StandardOutPath".to_owned(),
+        PlistValue::String(stdout_log.to_string_lossy().into_owned()),
+    );
+    root.insert(
+        "StandardErrorPath".to_owned(),
+        PlistValue::String(stderr_log.to_string_lossy().into_owned()),
+    );
     let mut bytes = Vec::new();
     PlistValue::Dictionary(root)
         .to_writer_xml(&mut bytes)
         .map_err(|error| format!("cannot encode auto-update LaunchAgent: {error}"))?;
     Ok(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn auto_update_log_paths(paths: &RuntimePaths) -> (PathBuf, PathBuf) {
+    (
+        paths.config_dir.join("auto-update.launchd.out.log"),
+        paths.config_dir.join("auto-update.launchd.err.log"),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -673,6 +789,23 @@ fn verify_owned_plist(bytes: &[u8], paths: &RuntimePaths) -> Result<(), String> 
         != Some(paths.config_dir.to_string_lossy().as_ref())
     {
         return Err("auto-update LaunchAgent config root does not match this instance".to_owned());
+    }
+    // Log paths are optional for ownership: plists generated before they were
+    // added are still owned by herdr-mcp and must keep upgrading. When present
+    // they must point at this instance's own log files.
+    let (stdout_log, stderr_log) = auto_update_log_paths(paths);
+    for (key, expected) in [
+        ("StandardOutPath", stdout_log),
+        ("StandardErrorPath", stderr_log),
+    ] {
+        let Some(actual) = dict.get(key).and_then(PlistValue::as_string) else {
+            continue;
+        };
+        if actual != expected.to_string_lossy() {
+            return Err(format!(
+                "auto-update LaunchAgent {key} does not match this instance"
+            ));
+        }
     }
     Ok(())
 }
@@ -854,6 +987,60 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A scheduled run has no terminal, so the generated plist must write its
+    /// stdout/stderr into this instance's own log directory.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn auto_update_plist_writes_logs_into_the_instance_config_dir() {
+        let (_guard, root, _home, paths) = snapshot_fixture("plist-log-paths");
+        let bytes = encode_plist(&paths).unwrap();
+        verify_owned_plist(&bytes, &paths).unwrap();
+        let value = PlistValue::from_reader(std::io::Cursor::new(&bytes)).unwrap();
+        let dict = value.as_dictionary().unwrap();
+        let (stdout_log, stderr_log) = auto_update_log_paths(&paths);
+        assert_eq!(
+            stdout_log,
+            paths.config_dir.join("auto-update.launchd.out.log")
+        );
+        assert_eq!(
+            stderr_log,
+            paths.config_dir.join("auto-update.launchd.err.log")
+        );
+        assert_eq!(
+            dict.get("StandardOutPath").and_then(PlistValue::as_string),
+            Some(stdout_log.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            dict.get("StandardErrorPath")
+                .and_then(PlistValue::as_string),
+            Some(stderr_log.to_string_lossy().as_ref())
+        );
+
+        // A plist generated before logging existed is still owned, so existing
+        // installations keep upgrading; the next reconcile rewrites it.
+        let mut legacy = dict.clone();
+        legacy.remove("StandardOutPath");
+        legacy.remove("StandardErrorPath");
+        let mut legacy_bytes = Vec::new();
+        PlistValue::Dictionary(legacy)
+            .to_writer_xml(&mut legacy_bytes)
+            .unwrap();
+        verify_owned_plist(&legacy_bytes, &paths).unwrap();
+
+        // When present, the paths must stay inside this instance.
+        let mut foreign = dict.clone();
+        foreign.insert(
+            "StandardOutPath".to_owned(),
+            PlistValue::String("/tmp/somewhere-else.log".to_owned()),
+        );
+        let mut foreign_bytes = Vec::new();
+        PlistValue::Dictionary(foreign)
+            .to_writer_xml(&mut foreign_bytes)
+            .unwrap();
+        assert!(verify_owned_plist(&foreign_bytes, &paths).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn service_uninstall_fence_blocks_updates_until_explicit_install_clears_it() {
@@ -971,6 +1158,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     struct FakeLaunchd {
         loaded: std::cell::Cell<bool>,
+        calls: std::cell::RefCell<Vec<&'static str>>,
         bootout_fail: bool,
         bootstrap_fail: bool,
     }
@@ -980,11 +1168,16 @@ mod tests {
         fn new(loaded: bool) -> Self {
             Self {
                 loaded: std::cell::Cell::new(loaded),
+                calls: std::cell::RefCell::new(Vec::new()),
                 bootout_fail: false,
                 bootstrap_fail: false,
             }
         }
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
         fn state(&self, _label: &str) -> Result<LaunchdState, String> {
+            self.calls.borrow_mut().push("state");
             Ok(if self.loaded.get() {
                 LaunchdState::Loaded
             } else {
@@ -992,6 +1185,7 @@ mod tests {
             })
         }
         fn bootstrap(&self, _path: &Path) -> Result<(), String> {
+            self.calls.borrow_mut().push("bootstrap");
             if self.bootstrap_fail {
                 Err("bootstrap boom".to_owned())
             } else {
@@ -1000,6 +1194,7 @@ mod tests {
             }
         }
         fn bootout(&self, _label: &str) -> Result<(), String> {
+            self.calls.borrow_mut().push("bootout");
             if self.bootout_fail {
                 Err("bootout boom".to_owned())
             } else {
@@ -1219,6 +1414,165 @@ mod tests {
         assert_eq!(fs::read(&plist).unwrap(), bytes);
         assert!(fake.loaded.get());
         assert!(fence_owned(&paths));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Run the injected re-registration core against a fake launchd and return
+    /// the record plus the log lines it emitted.
+    #[cfg(target_os = "macos")]
+    fn reregister(
+        paths: &RuntimePaths,
+        plist_path: &Path,
+        fake: &FakeLaunchd,
+    ) -> (Value, Vec<String>) {
+        let mut logs = Vec::new();
+        let value = reregister_after_generation_switch_with(
+            paths,
+            plist_path,
+            |label| fake.state(label),
+            |path| fake.bootstrap(path),
+            |label| fake.bootout(label),
+            &mut |line| logs.push(line.to_owned()),
+        );
+        (value, logs)
+    }
+
+    /// Write the owned scheduler plist for this instance and return its path.
+    #[cfg(target_os = "macos")]
+    fn install_owned_plist(home: &Path, paths: &RuntimePaths) -> PathBuf {
+        let plist = launch_agent_path(home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, encode_plist(paths).unwrap()).unwrap();
+        plist
+    }
+
+    /// A runtime generation switch leaves the scheduler plist bytes unchanged,
+    /// so the loaded job keeps a stale LWCR/BTM registration; it must be
+    /// booted out and bootstrapped again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn loaded_scheduler_is_reregistered_after_a_generation_switch() {
+        let (_guard, root, home, paths) = snapshot_fixture("reregister-loaded");
+        let plist = install_owned_plist(&home, &paths);
+        let fake = FakeLaunchd::new(true);
+
+        let (value, logs) = reregister(&paths, &plist, &fake);
+
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["reregistered"], json!(true));
+        assert_eq!(value["was_loaded"], json!(true));
+        assert_eq!(fake.calls(), ["state", "bootout", "bootstrap"]);
+        assert!(fake.loaded.get(), "re-registration leaves the job loaded");
+        assert!(
+            logs.is_empty(),
+            "a successful refresh needs no warning: {logs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A scheduler that is owned but not loaded still gets registered.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn absent_scheduler_is_bootstrapped_without_a_bootout() {
+        let (_guard, root, home, paths) = snapshot_fixture("reregister-absent");
+        let plist = install_owned_plist(&home, &paths);
+        let fake = FakeLaunchd::new(false);
+
+        let (value, logs) = reregister(&paths, &plist, &fake);
+
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["reregistered"], json!(true));
+        assert_eq!(value["was_loaded"], json!(false));
+        assert_eq!(fake.calls(), ["state", "bootstrap"]);
+        assert!(logs.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Re-registration is best-effort: a launchctl failure is logged and
+    /// reported, never turned into a failed install/update.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootout_failure_is_logged_and_skips_the_bootstrap() {
+        let (_guard, root, home, paths) = snapshot_fixture("reregister-bootout-fail");
+        let plist = install_owned_plist(&home, &paths);
+        let mut fake = FakeLaunchd::new(true);
+        fake.bootout_fail = true;
+
+        let (value, logs) = reregister(&paths, &plist, &fake);
+
+        assert_eq!(value["ok"], json!(false));
+        assert_eq!(value["reregistered"], json!(false));
+        assert_eq!(value["reason"], "bootout_failed");
+        assert_eq!(
+            fake.calls(),
+            ["state", "bootout"],
+            "a failed bootout must not be followed by a blind bootstrap"
+        );
+        assert!(fake.loaded.get());
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("warning:"));
+        assert!(logs[0].contains("bootout boom"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_failure_is_logged_and_reported() {
+        let (_guard, root, home, paths) = snapshot_fixture("reregister-bootstrap-fail");
+        let plist = install_owned_plist(&home, &paths);
+        let mut fake = FakeLaunchd::new(true);
+        fake.bootstrap_fail = true;
+
+        let (value, logs) = reregister(&paths, &plist, &fake);
+
+        assert_eq!(value["ok"], json!(false));
+        assert_eq!(value["reason"], "bootstrap_failed");
+        assert_eq!(fake.calls(), ["state", "bootout", "bootstrap"]);
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("bootstrap boom"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Nothing to refresh: no owned scheduler plist exists.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_scheduler_plist_never_runs_launchctl() {
+        let (_guard, root, home, paths) = snapshot_fixture("reregister-missing");
+        let fake = FakeLaunchd::new(true);
+
+        let (value, logs) = reregister(&paths, &launch_agent_path(&home), &fake);
+
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["reregistered"], json!(false));
+        assert_eq!(value["reason"], "scheduler_not_installed");
+        assert!(fake.calls().is_empty());
+        assert!(logs.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A foreign plist is reported and never mutated.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn foreign_scheduler_plist_is_reported_and_untouched() {
+        let (_guard, root, home, _paths) = snapshot_fixture("reregister-foreign");
+        let plist = launch_agent_path(&home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(
+            &plist,
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>com.example.other</string></dict></plist>"#,
+        )
+        .unwrap();
+        let paths = RuntimePaths::discover().unwrap();
+        let fake = FakeLaunchd::new(true);
+
+        let (value, logs) = reregister(&paths, &plist, &fake);
+
+        assert_eq!(value["ok"], json!(false));
+        assert_eq!(value["reason"], "scheduler_not_owned");
+        assert!(fake.calls().is_empty());
+        assert_eq!(logs.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 }
