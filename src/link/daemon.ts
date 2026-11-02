@@ -151,8 +151,8 @@ export async function runLinkDaemon(config: LinkDaemonConfig): Promise<number> {
     linkToken: config.linkToken,
     transport,
     logger: safeLogger(),
-    heartbeatMs: 15_000,
-    maxSilenceMs: 60_000,
+    heartbeatMs: 30_000,
+    maxSilenceMs: 90_000,
     handshakeTimeoutMs: 10_000,
     requestTimeoutMs: 60_000,
   });
