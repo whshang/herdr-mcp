@@ -6491,7 +6491,9 @@ function normalizeHerdrMentionAlias(value) {
         : transferBusy
           ? hudText("handoff_blocked_transfer_busy")
           : hudCache?.can_handoff !== true
-            ? hudText("handoff_blocked_unavailable")
+            ? (hudCache?.handoff_unavailable_reason === "continuity_unavailable"
+              ? hudText("handoff_continuity_unavailable")
+              : hudText("handoff_blocked_unavailable"))
             : hudText("handoff_hint");
   }
 
@@ -6558,6 +6560,7 @@ function normalizeHerdrMentionAlias(value) {
       "web_state", "scope_binding_count", "scope_binding_hint", "scope_unbound",
       "manual_continue", "manual_status", "manual_judge", "handoff", "handoff_hint",
       "handoff_resume", "handoff_working", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_llm_required",
+      "handoff_continuity_unavailable",
       "handoff_copy_prompt", "handoff_copy_prompt_hint", "handoff_prompt_copied", "handoff_prompt_copy_failed",
       "automation_on", "automation_off", "aria_toggle_automation",
       "auto_judging", "auto_result", "auto_result_retry", "auto_result_with_cause",
@@ -6712,9 +6715,11 @@ function normalizeHerdrMentionAlias(value) {
         showHudToast(
           error === "handoff_fallback_llm_not_configured"
             ? hudText("handoff_llm_required")
-            : result?.source_preserved === true
-              ? hudText("handoff_failed_source_preserved", { error })
-            : hudText("handoff_failed", { error }),
+            : error === "continuity_unavailable"
+              ? hudText("handoff_continuity_unavailable")
+              : result?.source_preserved === true
+                ? hudText("handoff_failed_source_preserved", { error })
+              : hudText("handoff_failed", { error }),
           "err",
         );
       }

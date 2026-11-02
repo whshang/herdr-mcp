@@ -109,6 +109,9 @@ let failQueuedInsertStorage = false;
 const queuedInsertDeliveries = [];
 const controlActionRequests = [];
 let mockContinuityPersistenceEnabled = false;
+// #811: fail only the read-only HUD durability probe so the fail-safe path can be
+// asserted without also breaking /push/state or the journal append.
+let mockContinuityResolveTransportFails = false;
 let mockContinuityCanonicalId = null;
 const mockContinuityChains = new Set();
 const mockContinuityByConversation = new Map();
@@ -638,6 +641,10 @@ globalThis.chrome = {
       if (message.path === "/extension/continuity/resolve") {
         const body = JSON.parse(message.body || "{}");
         continuityResolveRequests.push(body);
+        if (mockContinuityResolveTransportFails) {
+          callback({ ok: false, error: "connect ECONNREFUSED 127.0.0.1:8772" });
+          return;
+        }
         const continuityId = body.continuity_id || mockContinuityByConversation.get(body.conversation_id) || null;
         const found = mockLocalRuntimeAvailable
           && mockContinuityPersistenceEnabled
@@ -2595,8 +2602,9 @@ console.log("\n[ChatGPT pre-conversation Project binding]");
   const unboundHud = await unboundHudP;
   ok(unboundHud?.bound === false
       && unboundHud?.manual_handoff_available === true
-      && unboundHud?.can_handoff === true,
-    "an unbound ChatGPT Project conversation keeps handoff available", JSON.stringify(unboundHud));
+      && unboundHud?.can_handoff === false
+      && unboundHud?.handoff_unavailable_reason === "continuity_unavailable",
+    "an unbound ChatGPT Project conversation does not advertise 接力 as ready (#811)", JSON.stringify(unboundHud));
 
   let resolveUnboundHandoff;
   const unboundHandoffP = new Promise((r) => { resolveUnboundHandoff = r; });
@@ -2609,6 +2617,65 @@ console.log("\n[ChatGPT pre-conversation Project binding]");
       && Object.keys(storage.herdrConversationTransfers || {}).length === transferCountBeforeUnboundHandoff,
     "unbound Project handoff reaches the continuity safety gate instead of requiring a workspace binding",
     JSON.stringify(unboundHandoff));
+
+  // #811 fail-safe: when the durability probe cannot answer (transport failure,
+  // timeout, 5xx) the HUD keeps today's behavior and the click still fails closed.
+  // The clock jump expires the 45s durability TTL cached by the HUD call above.
+  const failsafeClockBefore = testClockOffsetMs;
+  testClockOffsetMs += 60_000;
+  mockContinuityResolveTransportFails = true;
+  const resolveRequestsBeforeFailsafe = continuityResolveRequests.length;
+  let resolveFailsafeHud;
+  const failsafeHudP = new Promise((r) => { resolveFailsafeHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_SOURCE }, { tab: { id: 365, url: PROJECT_SOURCE_URL } }, (r) => resolveFailsafeHud(r));
+  const failsafeHud = await failsafeHudP;
+  ok(failsafeHud?.manual_handoff_available === true
+      && failsafeHud?.can_handoff === true
+      && failsafeHud?.handoff_unavailable_reason == null,
+    "HUD keeps 接力 enabled when the durability probe fails instead of answering (fail-safe)",
+    JSON.stringify(failsafeHud));
+  ok(continuityResolveRequests.length > resolveRequestsBeforeFailsafe,
+    "the HUD durability decision comes from the read-only continuity resolve probe",
+    `${resolveRequestsBeforeFailsafe} -> ${continuityResolveRequests.length}`);
+
+  const resolveRequestsAfterFailsafeHud = continuityResolveRequests.length;
+  let resolveCachedHud;
+  const cachedHudP = new Promise((r) => { resolveCachedHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_SOURCE }, { tab: { id: 365, url: PROJECT_SOURCE_URL } }, (r) => resolveCachedHud(r));
+  await cachedHudP;
+  ok(continuityResolveRequests.length === resolveRequestsAfterFailsafeHud,
+    "repeated HUD refreshes reuse the cached durability answer instead of re-querying the runtime",
+    `${resolveRequestsAfterFailsafeHud} -> ${continuityResolveRequests.length}`);
+
+  const transferCountBeforeFailsafeHandoff = Object.keys(storage.herdrConversationTransfers || {}).length;
+  let resolveFailsafeHandoff;
+  const failsafeHandoffP = new Promise((r) => { resolveFailsafeHandoff = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 365, trigger: "manual" },
+    { tab: { id: 365, url: PROJECT_SOURCE_URL } }, (r) => resolveFailsafeHandoff(r));
+  const failsafeHandoff = await failsafeHandoffP;
+  ok(failsafeHandoff?.ok === false
+      && failsafeHandoff?.error === "continuity_unavailable"
+      && failsafeHandoff?.source_preserved === true
+      && Object.keys(storage.herdrConversationTransfers || {}).length === transferCountBeforeFailsafeHandoff,
+    "an enabled 接力 click with an unanswerable probe still fails closed and creates no transfer row",
+    JSON.stringify(failsafeHandoff));
+  mockContinuityResolveTransportFails = false;
+  testClockOffsetMs = failsafeClockBefore;
+
+  const handoffUnavailableCopy = {};
+  for (const code of ["zh", "en", "ja"]) {
+    const catalog = JSON.parse(readFileSync(new URL(`../../extension/locales/${code}.json`, import.meta.url), "utf8"));
+    handoffUnavailableCopy[code] = String(catalog.hud_handoff_continuity_unavailable || "");
+  }
+  ok(Object.values(handoffUnavailableCopy).every((text) => text.trim().length > 0)
+      && !Object.values(handoffUnavailableCopy).some((text) => text.includes("continuity_unavailable")),
+    "zh/en/ja explain the missing continuity record without echoing the raw error code",
+    JSON.stringify(handoffUnavailableCopy));
+  ok(/绑定|bind/i.test(handoffUnavailableCopy.zh)
+      && /绑定|bind/i.test(handoffUnavailableCopy.en)
+      && /バインド|bind/i.test(handoffUnavailableCopy.ja),
+    "the localized continuity_unavailable copy explains how to bind the conversation",
+    JSON.stringify(handoffUnavailableCopy));
 
   const rootKey = "https://chatgpt.com";
   installContentScript(367, `${rootKey}/`, rootKey);
@@ -3125,6 +3192,16 @@ console.log("\n[project handoff]");
       && !seed.includes("<<<HERDR_HANDOFF_V1")),
     "durable rollover seeds only the continuity reference and resume instruction",
     JSON.stringify(seedTemplateCaptures).slice(0, 300));
+  let resolveDurableHud;
+  const durableHudP = new Promise((r) => { resolveDurableHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_SOURCE }, { tab: { id: 401 } }, (r) => resolveDurableHud(r));
+  const durableHud = await durableHudP;
+  ok(durableHud?.manual_handoff_available === true
+      && durableHud?.can_handoff === true
+      && durableHud?.handoff_unavailable_reason == null,
+    "a ChatGPT conversation with a durable continuity chain still advertises 接力 as ready",
+    JSON.stringify(durableHud));
+
   mockContinuityPersistenceEnabled = false;
   mockContinuityChains.clear();
   mockContinuityByConversation.clear();

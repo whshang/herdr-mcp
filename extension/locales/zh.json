@@ -128,6 +128,7 @@
   "hud_handoff_blocked_transfer_busy": "当前会话已有接力正在进行。",
   "hud_handoff_blocked_action_busy": "另一个 Herdr 浏览器操作仍在进行。",
   "hud_handoff_blocked_unavailable": "当前会话状态暂不支持接力。",
+  "hud_handoff_continuity_unavailable": "当前会话还没有绑定 Herdr 工作区，本机也没有可用的连续性记录，因此暂时无法接力。当前会话未被修改。请先在面板中把它绑定到 Herdr 工作区，并完成一轮对话后再试接力。",
   "hud_queue_insert": "排队",
   "hud_queue_insert_count": "排队 · {count}",
   "hud_queue_insert_hint": "把输入框内容加入队列；正在生成时不会打断当前回复，回合结束后会合并为下一条消息发送。输入框为空时点击可重试发送；右键可清空队列。",
