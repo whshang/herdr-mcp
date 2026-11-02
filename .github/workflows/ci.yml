@@ -79,6 +79,10 @@ jobs:
         env:
           TEST_POLICY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
         run: node scripts/lint-test-policy.mjs "$TEST_POLICY_BASE_SHA"
+      # Issue #833: extension/manifest.json version is what the Runtime and
+      # `doctor` compare, so two different extension builds must not share one.
+      - name: Extension version guard
+        run: node scripts/check-extension-version.mjs
       - name: Findings/rule promotion gate
         run: |
           node scripts/lint-findings.mjs

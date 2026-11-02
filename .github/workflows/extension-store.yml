@@ -35,6 +35,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Issue #833: a Store upload with an unchanged manifest version is a
+      # duplicate build that Chrome Web Store rejects, and a STORE build that
+      # shares a version with a different STANDALONE build hides the drift.
+      # This job publishes packages, so an unverifiable release tag fails here.
+      - name: Extension version guard
+        run: node scripts/check-extension-version.mjs --strict
       - name: Store contract and browser regression gate
         run: |
           npm run build

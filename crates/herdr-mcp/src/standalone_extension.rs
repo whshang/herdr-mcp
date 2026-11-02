@@ -1,3 +1,4 @@
+use crate::browser_extension_identity::BrowserExtensionIdentity;
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -51,6 +52,49 @@ struct Blob {
     relative_path: PathBuf,
     size: u64,
     git_sha: String,
+}
+
+/// One extension tree resolved at an immutable commit.
+#[derive(Debug)]
+struct ExtensionSnapshot {
+    commit: String,
+    blobs: Vec<Blob>,
+}
+
+/// Fetch boundary for one extension tree.
+///
+/// The CLI `extension standalone install` path fetches from GitHub; the
+/// update-time staging path reuses the same staging/activation/state code
+/// through this trait so its atomic swap, rollback and state record are
+/// exercised for real in tests instead of being faked one level higher.
+trait ExtensionSource {
+    fn resolve_commit(&self, reference: &str) -> Result<String, String>;
+    fn list_blobs(&self, commit: &str) -> Result<Vec<Blob>, String>;
+    fn fetch_blob(&self, commit: &str, blob: &Blob) -> Result<Vec<u8>, String>;
+}
+
+struct GitHubSource {
+    client: Client,
+}
+
+impl GitHubSource {
+    fn new() -> Result<Self, String> {
+        Ok(Self { client: client()? })
+    }
+}
+
+impl ExtensionSource for GitHubSource {
+    fn resolve_commit(&self, reference: &str) -> Result<String, String> {
+        resolve_ref(&self.client, reference)
+    }
+
+    fn list_blobs(&self, commit: &str) -> Result<Vec<Blob>, String> {
+        list_blobs(&self.client, commit)
+    }
+
+    fn fetch_blob(&self, commit: &str, blob: &Blob) -> Result<Vec<u8>, String> {
+        download_blob(&self.client, commit, blob)
+    }
 }
 
 #[derive(Debug)]
@@ -117,6 +161,9 @@ pub(crate) struct StandaloneBrowserDoctor {
     roots: Vec<ScannedRoot>,
     unreadable_profiles: usize,
     reason: Option<String>,
+    /// Version reconciliation between the staged extension, the running
+    /// Runtime release and the registered (running) browser extension.
+    version: ExtensionVersionReport,
 }
 
 impl StandaloneBrowserDoctor {
@@ -157,6 +204,7 @@ impl StandaloneBrowserDoctor {
             "drift_count": self.drift_count(),
             "unreadable_profiles": self.unreadable_profiles,
             "reason": self.reason,
+            "version": self.version.as_json(),
         })
     }
 
@@ -205,6 +253,12 @@ impl StandaloneBrowserDoctor {
         }
     }
 
+    /// Version reconciliation line for `doctor` (staged vs running release vs
+    /// registered browser extension).
+    pub(crate) fn version_line(&self) -> String {
+        self.version.doctor_line()
+    }
+
     fn drift_count(&self) -> usize {
         if self.expected_path.is_none() {
             return 0;
@@ -231,23 +285,38 @@ impl StandaloneBrowserDoctor {
     }
 }
 
-pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
+pub(crate) fn doctor_report(config_dir: &Path) -> StandaloneBrowserDoctor {
+    let home = match home_dir() {
+        Ok(home) => home,
+        Err(error) => {
+            let mut report = doctor_not_probed(None, String::new(), error);
+            report.version = ExtensionVersionReport::unknown("home_dir_unavailable");
+            return report;
+        }
+    };
+    doctor_report_in(&home, config_dir)
+}
+
+fn doctor_report_in(home: &Path, config_dir: &Path) -> StandaloneBrowserDoctor {
+    let mut report = diagnose_extension_load(home);
+    report.version = version_report_in(
+        home,
+        config_dir,
+        crate::runtime_meta::bundled_extension_version(),
+        crate::runtime_meta::compiled_source_commit(),
+    );
+    report
+}
+
+/// Browser-side load evidence. Version reconciliation is attached separately by
+/// `doctor_report_in`, so this probe never depends on the state database.
+fn diagnose_extension_load(home: &Path) -> StandaloneBrowserDoctor {
     let identity = match crate::browser_extension_identity::official_standalone_identity() {
         Ok(identity) => identity,
         Err(error) => return doctor_not_probed(None, String::new(), error),
     };
-    let home = match home_dir() {
-        Ok(home) => home,
-        Err(error) => return doctor_not_probed(None, identity.extension_id, error),
-    };
-    let current = base_dir_for(&home).join("current");
-    let manifest = read_json(&current.join("manifest.json")).ok();
-    let key_ok = manifest
-        .as_ref()
-        .and_then(|value| value.get("key"))
-        .and_then(Value::as_str)
-        .is_some_and(|key| identity.manifest_key.as_deref() == Some(key));
-    if !(current.is_dir() && manifest.is_some() && key_ok) {
+    let current = base_dir_for(home).join("current");
+    if installed_manifest(&current, &identity).is_none() {
         return StandaloneBrowserDoctor {
             state: "not_installed",
             installed: false,
@@ -258,6 +327,7 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
             roots: Vec::new(),
             unreadable_profiles: 0,
             reason: None,
+            version: ExtensionVersionReport::unknown("not_computed"),
         };
     }
 
@@ -269,14 +339,14 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
         // TCC-denied `~/Documents` (or a moved `--path`) cannot turn a healthy
         // managed install into a false `drift`; only a genuinely different
         // directory (for example an old Downloads copy) is drift.
-        let state = read_json(&base_dir_for(&home).join("state.json")).ok();
+        let state = read_json(&base_dir_for(home).join("state.json")).ok();
         let configured_load_path =
-            reported_load_path(&home, state.as_ref()).filter(|path| path != &current);
+            reported_load_path(home, state.as_ref()).filter(|path| path != &current);
         diagnose_chromium_load(
             &current,
             configured_load_path.as_deref(),
             &identity.extension_id,
-            &chromium_roots(&home),
+            &chromium_roots(home),
         )
     }
 
@@ -343,6 +413,7 @@ fn diagnose_chromium_load(
         roots: scan.roots,
         unreadable_profiles: scan.unreadable_profiles,
         reason: None,
+        version: ExtensionVersionReport::unknown("not_computed"),
     };
     let state = if present_roots == 0 {
         // No known Chromium user-data root exists; the historical name is kept
@@ -466,6 +537,7 @@ fn doctor_not_probed(
         roots: Vec::new(),
         unreadable_profiles: 0,
         reason: Some(reason),
+        version: ExtensionVersionReport::unknown("not_probed"),
     }
 }
 
@@ -568,6 +640,397 @@ fn json_quote(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"<unavailable>\"".to_owned())
 }
 
+/// One browser endpoint registration persisted by the running runtime.
+///
+/// `extension_version` is what the browser extension itself reports when it
+/// registers, so it is the only local evidence of the code the browser is
+/// actually executing. The staged files on disk cannot answer that: an unpacked
+/// extension keeps running the code it loaded until it is reloaded (#833).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegisteredExtension {
+    pub(crate) browser_family: String,
+    pub(crate) extension_version: String,
+    pub(crate) last_observed_at: i64,
+}
+
+/// Reconciliation between the staged standalone extension, the running Runtime
+/// release and the extension version the browser registered.
+///
+/// States:
+/// - `current`: staged files and registered (running) extension are this
+///   release's extension version;
+/// - `reload_pending`: the staged files are current, but the browser still runs
+///   an older extension build, so only a Reload in `chrome://extensions` applies
+///   it;
+/// - `extension_stale`: the staged files do not belong to the running Runtime
+///   release at all, so they must be staged again;
+/// - `extension_ahead`: the registered extension is *newer* than the staged
+///   build (for example a STORE build the user actually runs), so no Reload is
+///   requested;
+/// - `not_installed`: this workstation never installed the standalone channel;
+/// - `unknown`: no registration evidence (or unreadable state database).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExtensionVersionReport {
+    state: &'static str,
+    staged_version: Option<String>,
+    staged_source_commit: Option<String>,
+    expected_version: Option<String>,
+    runtime_source_commit: Option<String>,
+    registered: Vec<RegisteredExtension>,
+    reason: Option<String>,
+}
+
+/// The extension version this Runtime release expects and the commit it was
+/// built from. Either side may be unknown in a source build.
+struct ExpectedExtension<'a> {
+    version: Option<&'a str>,
+    source_commit: Option<&'a str>,
+}
+
+const EXTENSION_RELOAD_NEXT_ACTION: &str = "click Reload on chrome://extensions";
+const EXTENSION_INSTALL_NEXT_ACTION: &str = "herdr-mcp extension standalone install";
+
+impl ExtensionVersionReport {
+    pub(crate) fn unknown(reason: impl Into<String>) -> Self {
+        Self {
+            state: "unknown",
+            staged_version: None,
+            staged_source_commit: None,
+            expected_version: None,
+            runtime_source_commit: None,
+            registered: Vec::new(),
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// Test-only value object so the update-result notice mapping can be
+    /// asserted without a workstation fixture.
+    #[cfg(test)]
+    pub(crate) fn for_test(state: &'static str) -> Self {
+        Self {
+            state,
+            staged_version: Some("0.1.230".to_owned()),
+            staged_source_commit: Some("a".repeat(40)),
+            expected_version: Some("0.1.230".to_owned()),
+            runtime_source_commit: Some("b".repeat(40)),
+            registered: vec![RegisteredExtension {
+                browser_family: "chrome".to_owned(),
+                extension_version: "0.1.229".to_owned(),
+                last_observed_at: 1,
+            }],
+            reason: None,
+        }
+    }
+
+    fn registered_version(&self) -> Option<&RegisteredExtension> {
+        self.registered.first()
+    }
+
+    fn next_action(&self) -> Option<&'static str> {
+        match self.state {
+            "reload_pending" => Some(EXTENSION_RELOAD_NEXT_ACTION),
+            "extension_stale" => Some(EXTENSION_INSTALL_NEXT_ACTION),
+            _ => None,
+        }
+    }
+
+    fn action(&self) -> Option<&'static str> {
+        match self.state {
+            "reload_pending" => Some("reload_extension"),
+            "extension_stale" => Some("install_extension"),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_json(&self) -> Value {
+        let registered = self
+            .registered
+            .iter()
+            .map(|entry| {
+                json!({
+                    "browser_family": entry.browser_family,
+                    "extension_version": entry.extension_version,
+                    "last_observed_at": entry.last_observed_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "state": self.state,
+            "staged_version": self.staged_version,
+            "staged_source_commit": self.staged_source_commit,
+            "expected_version": self.expected_version,
+            "runtime_source_commit": self.runtime_source_commit,
+            "registered_version": self.registered_version().map(|entry| entry.extension_version.clone()),
+            "registered_browser": self.registered_version().map(|entry| entry.browser_family.clone()),
+            "registered_endpoints": registered,
+            "action": self.action(),
+            "next_action": self.next_action(),
+            "reason": self.reason,
+        })
+    }
+
+    /// Non-fatal `update apply` notice for a committed Runtime update.
+    ///
+    /// A staged extension that the browser has not loaded yet is a notice; a
+    /// staged extension that does not belong to this release is a warning with
+    /// the exact fix command. Neither changes the Runtime update result.
+    pub(crate) fn update_notice(&self) -> Option<Value> {
+        match self.state {
+            "reload_pending" => Some(json!({
+                "code": "extension_reload_required",
+                "severity": "notice",
+                "fatal": false,
+                "message": "the standalone browser extension was staged for this Runtime release, but the browser is still running an older extension build",
+                "staged_version": self.staged_version,
+                "registered_version": self.registered_version().map(|entry| entry.extension_version.clone()),
+                "next_action": EXTENSION_RELOAD_NEXT_ACTION,
+            })),
+            "extension_stale" => Some(json!({
+                "code": "extension_stale",
+                "severity": "warning",
+                "fatal": false,
+                "message": "the staged standalone browser extension does not belong to this Runtime release",
+                "staged_version": self.staged_version,
+                "staged_source_commit": self.staged_source_commit,
+                "expected_version": self.expected_version,
+                "runtime_source_commit": self.runtime_source_commit,
+                "next_action": EXTENSION_INSTALL_NEXT_ACTION,
+            })),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn doctor_line(&self) -> String {
+        let next_action = self.next_action().unwrap_or("none");
+        match self.state {
+            "current" | "reload_pending" | "extension_stale" => format!(
+                "{} standalone-extension-version state={} staged_version={} registered_version={} expected_version={} staged_source_commit={} runtime_source_commit={} next_action={}",
+                if self.state == "current" {
+                    "INFO"
+                } else {
+                    "WARN"
+                },
+                self.state,
+                quote_opt(self.staged_version.as_deref()),
+                quote_opt(
+                    self.registered_version()
+                        .map(|entry| entry.extension_version.as_str())
+                ),
+                quote_opt(self.expected_version.as_deref()),
+                quote_opt(self.staged_source_commit.as_deref()),
+                quote_opt(self.runtime_source_commit.as_deref()),
+                next_action,
+            ),
+            "not_installed" => "INFO standalone-extension-version state=not_installed".to_owned(),
+            _ => format!(
+                "INFO standalone-extension-version state={} reason={}",
+                self.state,
+                json_quote(self.reason.as_deref().unwrap_or("unknown"))
+            ),
+        }
+    }
+}
+
+/// Order two extension manifest versions. Chrome accepts one to four dotted
+/// numeric components, so a value that does not parse as semver is simply not
+/// ordered (the caller keeps the conservative "versions differ" behavior).
+fn extension_version_order(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let left = semver::Version::parse(left.trim()).ok()?;
+    let right = semver::Version::parse(right.trim()).ok()?;
+    Some(left.cmp(&right))
+}
+
+fn quote_opt(value: Option<&str>) -> String {
+    value.map(json_quote).unwrap_or_else(|| "null".to_owned())
+}
+
+/// Version reconciliation for `doctor` and the update path.
+///
+/// `doctor` passes this binary's own bundled extension version and build commit:
+/// the installed `herdr-mcp` *is* the active Runtime, so its compile-time
+/// identity is the running release. A source build carries no build commit and
+/// reports `null`, which disables only the commit comparison, never the version
+/// comparison.
+pub(crate) fn version_report(
+    config_dir: &Path,
+    expected_version: Option<&str>,
+    expected_commit: Option<&str>,
+) -> ExtensionVersionReport {
+    match home_dir() {
+        Ok(home) => version_report_in(&home, config_dir, expected_version, expected_commit),
+        Err(error) => ExtensionVersionReport::unknown(error),
+    }
+}
+
+fn version_report_in(
+    home: &Path,
+    config_dir: &Path,
+    expected_version: Option<&str>,
+    expected_commit: Option<&str>,
+) -> ExtensionVersionReport {
+    let expected = ExpectedExtension {
+        version: expected_version.filter(|value| !value.trim().is_empty()),
+        // An unverifiable release identity (a source build, or a manifest field
+        // that is not an immutable commit) must never be reported as drift.
+        source_commit: expected_commit.filter(|value| is_sha(value)),
+    };
+    let base = base_dir_for(home);
+    let current = base.join("current");
+    let manifest = crate::browser_extension_identity::official_standalone_identity()
+        .ok()
+        .and_then(|identity| installed_manifest(&current, &identity));
+    let Some(manifest) = manifest else {
+        return ExtensionVersionReport {
+            state: "not_installed",
+            staged_version: None,
+            staged_source_commit: None,
+            expected_version: expected.version.map(str::to_owned),
+            runtime_source_commit: expected.source_commit.map(str::to_owned),
+            registered: Vec::new(),
+            reason: None,
+        };
+    };
+    let staged_version = manifest_version(&manifest);
+    let state = read_json(&base.join("state.json")).ok();
+    let staged_source_commit = json_string(state.as_ref(), "source_commit");
+    let (registered, reason) = match registered_extensions(config_dir, 5) {
+        Ok(registered) => (registered, None),
+        Err(reason) => (Vec::new(), Some(reason)),
+    };
+    classify_extension_version(ExtensionVersionInputs {
+        staged_version,
+        staged_source_commit,
+        expected,
+        registered,
+        reason,
+    })
+}
+
+struct ExtensionVersionInputs<'a> {
+    staged_version: Option<String>,
+    staged_source_commit: Option<String>,
+    expected: ExpectedExtension<'a>,
+    registered: Vec<RegisteredExtension>,
+    reason: Option<String>,
+}
+
+fn classify_extension_version(inputs: ExtensionVersionInputs<'_>) -> ExtensionVersionReport {
+    let ExtensionVersionInputs {
+        staged_version,
+        staged_source_commit,
+        expected,
+        registered,
+        reason,
+    } = inputs;
+    let version_differs = matches!(
+        (expected.version, staged_version.as_deref()),
+        (Some(expected), Some(staged)) if expected != staged
+    );
+    let commit_differs = matches!(
+        (expected.source_commit, staged_source_commit.as_deref()),
+        (Some(expected), Some(staged)) if expected != staged
+    );
+    let registered_version = registered
+        .first()
+        .map(|entry| entry.extension_version.as_str());
+    let (state, reason) = if version_differs || commit_differs {
+        ("extension_stale", reason)
+    } else if staged_version.is_none() {
+        (
+            "unknown",
+            Some("staged_manifest_version_unreadable".to_owned()),
+        )
+    } else if registered_version.is_none() {
+        (
+            "unknown",
+            Some(reason.unwrap_or_else(|| "no_endpoint_registration".to_owned())),
+        )
+    } else if registered_version == staged_version.as_deref() {
+        ("current", reason)
+    } else {
+        // A registered extension behind the staged build is the "click Reload"
+        // case. A registered extension *ahead* of it is a build this Runtime
+        // does not stage (typically STORE), so it is reported without an action
+        // instead of asking the user to downgrade with a Reload.
+        match extension_version_order(
+            registered_version.unwrap_or_default(),
+            staged_version.as_deref().unwrap_or_default(),
+        ) {
+            Some(std::cmp::Ordering::Greater) => (
+                "extension_ahead",
+                Some("registered_extension_newer_than_staged".to_owned()),
+            ),
+            _ => ("reload_pending", reason),
+        }
+    };
+    ExtensionVersionReport {
+        state,
+        staged_version,
+        staged_source_commit,
+        expected_version: expected.version.map(str::to_owned),
+        runtime_source_commit: expected.source_commit.map(str::to_owned),
+        registered,
+        reason,
+    }
+}
+
+/// Read the browser endpoint registrations the running Runtime persisted.
+///
+/// Only opaque registration fields are read (`browser_family`,
+/// `extension_version`, `last_observed_at`); profile seeds, endpoint refs and
+/// page data are never selected, so `doctor` cannot expose browser identity.
+fn registered_extensions(
+    config_dir: &Path,
+    limit: usize,
+) -> Result<Vec<RegisteredExtension>, String> {
+    let db = config_dir.join("state.db");
+    if !db.is_file() {
+        return Err("state_db_missing".to_owned());
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("state_db_open_failed: {error}"))?;
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'browser_endpoints'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !exists {
+        return Err("browser_endpoint_table_missing".to_owned());
+    }
+    let limit = i64::try_from(limit.clamp(1, 64)).unwrap_or(64);
+    let mut stmt = conn
+        .prepare(
+            "SELECT browser_family, extension_version, last_observed_at
+             FROM browser_endpoints
+             ORDER BY last_observed_at DESC, endpoint_ref
+             LIMIT ?1",
+        )
+        .map_err(|error| format!("browser_endpoint_query_failed: {error}"))?;
+    let rows = stmt
+        .query_map([limit], |row| {
+            Ok(RegisteredExtension {
+                browser_family: row.get(0)?,
+                extension_version: row.get(1)?,
+                last_observed_at: row.get(2)?,
+            })
+        })
+        .map_err(|error| format!("browser_endpoint_query_failed: {error}"))?;
+    let mut registered: Vec<RegisteredExtension> = Vec::new();
+    for entry in rows {
+        let entry = entry.map_err(|error| format!("browser_endpoint_decode_failed: {error}"))?;
+        if !registered.iter().any(|seen| {
+            seen.browser_family == entry.browser_family
+                && seen.extension_version == entry.extension_version
+        }) {
+            registered.push(entry);
+        }
+    }
+    Ok(registered)
+}
+
 pub fn run_install(options: StandaloneInstallOptions) -> Result<ExitCode, String> {
     let view = install(options)?;
     println!(
@@ -582,16 +1045,11 @@ pub fn run_status() -> Result<ExitCode, String> {
     let base = base_dir_for(&home);
     let current = base.join("current");
     let identity = crate::browser_extension_identity::official_standalone_identity()?;
-    let manifest = read_json(&current.join("manifest.json")).ok();
-    let key_ok = manifest
-        .as_ref()
-        .and_then(|value| value.get("key"))
-        .and_then(Value::as_str)
-        .is_some_and(|key| identity.manifest_key.as_deref() == Some(key));
+    let installed_manifest = installed_manifest(&current, &identity);
+    let installed = installed_manifest.is_some();
     let state = fs::read_to_string(base.join("state.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    let installed = current.is_dir() && manifest.is_some() && key_ok;
     let (user_visible_path, load_unpacked_path) = status_load_view(&home, &current, state.as_ref());
     let chrome = chrome_hint(
         loading_browser(
@@ -610,7 +1068,7 @@ pub fn run_status() -> Result<ExitCode, String> {
         "user_visible_path": user_visible_path,
         "chrome": chrome,
         "extension_id": identity.extension_id,
-        "manifest_key_matches": key_ok,
+        "manifest_key_matches": installed,
         "state": state,
     });
     println!(
@@ -628,8 +1086,7 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
     let requested_ref = options.reference.unwrap_or_else(default_source_ref);
     validate_ref(&requested_ref)?;
     let home = home_dir()?;
-    let base = base_dir_for(&home);
-    let current = base.join("current");
+    let current = base_dir_for(&home).join("current");
     let explicit_load_path = options
         .load_path
         .as_deref()
@@ -639,67 +1096,53 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         preflight_explicit_load_path(path, &current)?;
     }
 
-    let client = client()?;
-    let commit = resolve_ref(&client, &requested_ref)?;
-    let blobs = list_blobs(&client, &commit)?;
+    let source = GitHubSource::new()?;
+    let commit = source.resolve_commit(&requested_ref)?;
+    let blobs = source.list_blobs(&commit)?;
+    install_snapshot(
+        &home,
+        &requested_ref,
+        &ExtensionSnapshot { commit, blobs },
+        &source,
+        explicit_load_path.as_deref(),
+    )
+}
 
+fn install_snapshot(
+    home: &Path,
+    requested_ref: &str,
+    snapshot: &ExtensionSnapshot,
+    source: &dyn ExtensionSource,
+    explicit_load_path: Option<&Path>,
+) -> Result<Value, String> {
+    let base = base_dir_for(home);
+    let current = base.join("current");
     fs::create_dir_all(&base).map_err(|e| format!("cannot create standalone directory: {e}"))?;
-    let staging = base.join(format!(".staging-{}-{}", std::process::id(), now_ms()));
-    fs::create_dir_all(&staging).map_err(|e| format!("cannot create staging directory: {e}"))?;
+    let (staging, prepared) = write_snapshot(&base, snapshot, source)?;
 
-    let prepared = (|| -> Result<PreparedManifest, String> {
-        for blob in &blobs {
-            let bytes = download_blob(&client, &commit, blob)?;
-            let target = staging.join(&blob.relative_path);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("cannot create extension directory: {e}"))?;
-            }
-            fs::write(&target, bytes).map_err(|e| format!("cannot write extension file: {e}"))?;
-        }
-        prepare_manifest(&staging)
-    })();
-    let prepared = match prepared {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(error);
-        }
-    };
-
-    let backup = base.join(format!(".previous-{}-{}", std::process::id(), now_ms()));
     let had_current = current.exists();
-    if had_current {
-        fs::rename(&current, &backup)
-            .map_err(|e| format!("cannot stage previous standalone extension: {e}"))?;
-    }
-    if let Err(error) = fs::rename(&staging, &current) {
-        if had_current {
-            let _ = fs::rename(&backup, &current);
-        }
-        return Err(format!("cannot activate standalone extension: {error}"));
-    }
+    let backup = activate_snapshot(&base, &current, &staging, had_current)?;
 
-    let user_visible_path = match explicit_load_path.as_deref() {
+    let user_visible_path = match explicit_load_path {
         Some(path) if path == current => json!({
             "ready": true,
             "status": "managed",
             "path": current,
             "target": current,
         }),
-        Some(path) => match ensure_explicit_alias(&home, path, &current) {
+        Some(path) => match ensure_explicit_alias(home, path, &current) {
             Ok(value) => value,
             Err(error) => {
                 rollback_activation(&current, &backup, had_current);
                 return Err(error);
             }
         },
-        None => ensure_user_visible_alias(&home, &current),
+        None => ensure_user_visible_alias(home, &current),
     };
     let load_unpacked_path = preferred_load_unpacked_path(&user_visible_path, &current);
     let chrome = chrome_hint(
         loading_browser(
-            &home,
+            home,
             &prepared.extension_id,
             &current,
             Some(&load_unpacked_path),
@@ -708,18 +1151,14 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         &load_unpacked_path,
     );
 
-    let state = json!({
-        "schema_version": 1,
-        "repository": REPOSITORY,
-        "requested_ref": requested_ref,
-        "source_commit": commit,
-        "extension_version": prepared.version,
-        "extension_id": prepared.extension_id,
-        "source_manifest_sha256": prepared.source_sha256,
-        "installed_at_unix_ms": now_ms(),
-        "path": current,
-        "load_unpacked_path": load_unpacked_path,
-    });
+    let state = state_record(
+        requested_ref,
+        &snapshot.commit,
+        &prepared,
+        &current,
+        &load_unpacked_path,
+        "cli",
+    );
     if let Err(error) = atomic_json(&base.join("state.json"), &state) {
         remove_alias_if_created(&user_visible_path, &current);
         rollback_activation(&current, &backup, had_current);
@@ -743,6 +1182,267 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         "next_command": "herdr-mcp native-host use standalone",
         "note": "All Git-tracked extension/ files come from the pinned commit; manifest.json differs only by the injected standalone public key.",
     }))
+}
+
+/// Download one extension tree into a fresh staging directory and verify its
+/// manifest. The staging directory is removed on any failure so nothing partial
+/// reachable from `current` is ever left behind.
+fn write_snapshot(
+    base: &Path,
+    snapshot: &ExtensionSnapshot,
+    source: &dyn ExtensionSource,
+) -> Result<(PathBuf, PreparedManifest), String> {
+    let staging = base.join(format!(".staging-{}-{}", std::process::id(), now_ms()));
+    fs::create_dir_all(&staging).map_err(|e| format!("cannot create staging directory: {e}"))?;
+    let prepared = (|| -> Result<PreparedManifest, String> {
+        for blob in &snapshot.blobs {
+            let bytes = source.fetch_blob(&snapshot.commit, blob)?;
+            let target = staging.join(&blob.relative_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create extension directory: {e}"))?;
+            }
+            fs::write(&target, bytes).map_err(|e| format!("cannot write extension file: {e}"))?;
+        }
+        prepare_manifest(&staging)
+    })();
+    match prepared {
+        Ok(prepared) => Ok((staging, prepared)),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(error)
+        }
+    }
+}
+
+/// Swap a fully written staging directory in as `current`, restoring the
+/// previous tree if the rename fails. The previous tree is returned as a backup
+/// path the caller removes only after the new state record is durable.
+fn activate_snapshot(
+    base: &Path,
+    current: &Path,
+    staging: &Path,
+    had_current: bool,
+) -> Result<PathBuf, String> {
+    let backup = base.join(format!(".previous-{}-{}", std::process::id(), now_ms()));
+    if had_current {
+        fs::rename(current, &backup)
+            .map_err(|e| format!("cannot stage previous standalone extension: {e}"))?;
+    }
+    if let Err(error) = fs::rename(staging, current) {
+        if had_current {
+            let _ = fs::rename(&backup, current);
+        }
+        return Err(format!("cannot activate standalone extension: {error}"));
+    }
+    Ok(backup)
+}
+
+fn state_record(
+    requested_ref: &str,
+    commit: &str,
+    prepared: &PreparedManifest,
+    current: &Path,
+    load_unpacked_path: &Path,
+    installed_by: &str,
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "repository": REPOSITORY,
+        "requested_ref": requested_ref,
+        "source_commit": commit,
+        "extension_version": prepared.version,
+        "extension_id": prepared.extension_id,
+        "source_manifest_sha256": prepared.source_sha256,
+        "installed_at_unix_ms": now_ms(),
+        "path": current,
+        "load_unpacked_path": load_unpacked_path,
+        "installed_by": installed_by,
+    })
+}
+
+/// Outcome of staging the standalone extension from the Runtime update path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StagedExtensionState {
+    /// No standalone install exists on this workstation; an update never creates
+    /// one because users who never opted in must not gain an unpacked extension.
+    NotInstalled,
+    /// The staged tree already comes from this release.
+    UpToDate,
+    /// A new tree was staged; the browser needs a Reload to execute it.
+    Staged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedExtension {
+    pub(crate) state: StagedExtensionState,
+    pub(crate) reference: String,
+    pub(crate) source_commit: Option<String>,
+    pub(crate) extension_version: Option<String>,
+    pub(crate) previous_source_commit: Option<String>,
+    pub(crate) previous_extension_version: Option<String>,
+    pub(crate) load_unpacked_path: Option<PathBuf>,
+    /// Whether the recorded Chrome-facing load path still resolves to the
+    /// managed `current` directory. When it does not, a Reload alone cannot pick
+    /// up the new files and the user must re-run the CLI install.
+    pub(crate) load_path_ready: bool,
+}
+
+impl StagedExtension {
+    pub(crate) fn as_json(&self) -> Value {
+        let state = match self.state {
+            StagedExtensionState::NotInstalled => "not_installed",
+            StagedExtensionState::UpToDate => "up_to_date",
+            StagedExtensionState::Staged => "staged",
+        };
+        json!({
+            "state": state,
+            "requested_ref": self.reference,
+            "source_commit": self.source_commit,
+            "extension_version": self.extension_version,
+            "previous_source_commit": self.previous_source_commit,
+            "previous_extension_version": self.previous_extension_version,
+            "load_unpacked_path": self.load_unpacked_path,
+            "load_path_ready": self.load_path_ready,
+            "action": self.action(),
+            "next_action": self.next_action(),
+        })
+    }
+
+    fn action(&self) -> Option<&'static str> {
+        match (self.state, self.load_path_ready) {
+            (StagedExtensionState::Staged, true) => Some("reload_extension"),
+            (StagedExtensionState::Staged, false) => Some("install_extension"),
+            (StagedExtensionState::UpToDate, false) => Some("install_extension"),
+            _ => None,
+        }
+    }
+
+    fn next_action(&self) -> Option<&'static str> {
+        match self.action() {
+            Some("reload_extension") => Some(EXTENSION_RELOAD_NEXT_ACTION),
+            Some("install_extension") => Some(EXTENSION_INSTALL_NEXT_ACTION),
+            _ => None,
+        }
+    }
+
+    /// One line for the durable update job detail (kept short: the updater
+    /// truncates job detail to 512 bytes).
+    pub(crate) fn summary(&self) -> String {
+        match self.state {
+            StagedExtensionState::NotInstalled => {
+                "standalone extension not installed; not staged".to_owned()
+            }
+            StagedExtensionState::UpToDate => format!(
+                "standalone extension {} already staged; reload it in chrome://extensions",
+                self.extension_version.as_deref().unwrap_or("unknown")
+            ),
+            StagedExtensionState::Staged => format!(
+                "standalone extension staged {} (previous {}); reload it in chrome://extensions",
+                self.extension_version.as_deref().unwrap_or("unknown"),
+                self.previous_extension_version.as_deref().unwrap_or("none"),
+            ),
+        }
+    }
+}
+
+/// Stage the standalone extension that belongs to `reference` into the managed
+/// `extensions/standalone/current` directory.
+///
+/// This is the same staging code the CLI install uses: one atomic swap of a
+/// fully downloaded tree, the same manifest `key` injection (so the extension
+/// ID and its grants are preserved), and the same durable state record. It never
+/// creates an install for a workstation that has none, and it never touches the
+/// `~/Documents` Chrome-facing alias: that alias is a symlink to `current` and
+/// follows the swap by itself, so an unattended update cannot prompt for
+/// protected-folder access.
+pub(crate) fn stage_release_extension(reference: &str) -> Result<StagedExtension, String> {
+    validate_ref(reference)?;
+    let home = home_dir()?;
+    let source = GitHubSource::new()?;
+    stage_release_extension_in(&home, reference, &source)
+}
+
+fn stage_release_extension_in(
+    home: &Path,
+    reference: &str,
+    source: &dyn ExtensionSource,
+) -> Result<StagedExtension, String> {
+    validate_ref(reference)?;
+    let identity = crate::browser_extension_identity::official_standalone_identity()?;
+    let base = base_dir_for(home);
+    let current = base.join("current");
+    let Some(manifest) = installed_manifest(&current, &identity) else {
+        return Ok(StagedExtension {
+            state: StagedExtensionState::NotInstalled,
+            reference: reference.to_owned(),
+            source_commit: None,
+            extension_version: None,
+            previous_source_commit: None,
+            previous_extension_version: None,
+            load_unpacked_path: None,
+            load_path_ready: false,
+        });
+    };
+    let state = read_json(&base.join("state.json")).ok();
+    let previous_source_commit = json_string(state.as_ref(), "source_commit");
+    let previous_extension_version =
+        json_string(state.as_ref(), "extension_version").or_else(|| manifest_version(&manifest));
+    let commit = source.resolve_commit(reference)?;
+    if previous_source_commit.as_deref() == Some(commit.as_str()) {
+        let load_unpacked_path = reported_load_path(home, state.as_ref())
+            .unwrap_or_else(|| user_visible_alias_path(home));
+        return Ok(StagedExtension {
+            state: StagedExtensionState::UpToDate,
+            reference: reference.to_owned(),
+            extension_version: manifest_version(&manifest),
+            source_commit: Some(commit),
+            previous_extension_version,
+            previous_source_commit,
+            load_path_ready: load_path_ready(&load_unpacked_path, &current),
+            load_unpacked_path: Some(load_unpacked_path),
+        });
+    }
+    let blobs = source.list_blobs(&commit)?;
+    fs::create_dir_all(&base).map_err(|e| format!("cannot create standalone directory: {e}"))?;
+    let (staging, prepared) = write_snapshot(
+        &base,
+        &ExtensionSnapshot {
+            commit: commit.clone(),
+            blobs,
+        },
+        source,
+    )?;
+    let had_current = current.exists();
+    let backup = activate_snapshot(&base, &current, &staging, had_current)?;
+    let load_unpacked_path =
+        reported_load_path(home, state.as_ref()).unwrap_or_else(|| user_visible_alias_path(home));
+    let record = state_record(
+        reference,
+        &commit,
+        &prepared,
+        &current,
+        &load_unpacked_path,
+        "update",
+    );
+    if let Err(error) = atomic_json(&base.join("state.json"), &record) {
+        rollback_activation(&current, &backup, had_current);
+        return Err(error);
+    }
+    if backup.exists() {
+        let _ = fs::remove_dir_all(&backup);
+    }
+    let ready = load_path_ready(&load_unpacked_path, &current);
+    Ok(StagedExtension {
+        state: StagedExtensionState::Staged,
+        reference: reference.to_owned(),
+        source_commit: Some(commit),
+        extension_version: Some(prepared.version),
+        previous_source_commit,
+        previous_extension_version,
+        load_unpacked_path: Some(load_unpacked_path),
+        load_path_ready: ready,
+    })
 }
 
 fn prepare_manifest(root: &Path) -> Result<PreparedManifest, String> {
@@ -1298,6 +1998,49 @@ fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON {}: {e}", path.display()))
 }
 
+/// Manifest of the managed `current` tree, but only when it carries this
+/// channel's fixed standalone `key`. A tree without the key is not a managed
+/// standalone install, so it is never adopted or overwritten by an update.
+fn installed_manifest(current: &Path, identity: &BrowserExtensionIdentity) -> Option<Value> {
+    if !current.is_dir() {
+        return None;
+    }
+    let manifest = read_json(&current.join("manifest.json")).ok()?;
+    let key_ok = manifest
+        .get("key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| identity.manifest_key.as_deref() == Some(key));
+    key_ok.then_some(manifest)
+}
+
+fn manifest_version(manifest: &Value) -> Option<String> {
+    manifest
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn json_string(value: Option<&Value>, field: &str) -> Option<String> {
+    value?
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Whether a recorded Chrome-facing load path still reaches the managed
+/// `current` tree. `current` itself always counts as ready.
+fn load_path_ready(load_path: &Path, current: &Path) -> bool {
+    load_path == current
+        || inspect_alias(load_path, current)
+            .get("ready")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
 fn atomic_json(path: &Path, value: &Value) -> Result<(), String> {
     let parent = path
         .parent()
@@ -1768,6 +2511,479 @@ mod tests {
             assert_eq!(wrong_link["kind"], "symlink");
             assert_eq!(fs::read_link(&alias).unwrap(), other);
         }
+        let _ = fs::remove_dir_all(root);
+    }
+    // ---- #833: update-time staging and version reconciliation -------------
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!(
+            "herdr-833-{label}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn standalone_key() -> String {
+        crate::browser_extension_identity::official_standalone_identity()
+            .unwrap()
+            .manifest_key
+            .unwrap()
+    }
+
+    fn extension_manifest(version: &str) -> Vec<u8> {
+        serde_json::to_vec_pretty(&json!({
+            "manifest_version": 3,
+            "name": "Herdr MCP - Workspace Connector",
+            "version": version,
+        }))
+        .unwrap()
+    }
+
+    /// One fake release tree. Every fetch is counted so a test can prove the
+    /// update-time staging path performs no network work when there is nothing
+    /// to do.
+    struct FakeSource {
+        commit: String,
+        files: Vec<(&'static str, Vec<u8>)>,
+        fetch_calls: std::cell::Cell<usize>,
+        fail_path: Option<&'static str>,
+    }
+
+    impl FakeSource {
+        fn release(commit: &str, version: &str) -> Self {
+            Self {
+                commit: commit.to_owned(),
+                files: vec![
+                    ("manifest.json", extension_manifest(version)),
+                    ("background.js", b"// release bundle\n".to_vec()),
+                ],
+                fetch_calls: std::cell::Cell::new(0),
+                fail_path: None,
+            }
+        }
+    }
+
+    impl ExtensionSource for FakeSource {
+        fn resolve_commit(&self, _reference: &str) -> Result<String, String> {
+            Ok(self.commit.clone())
+        }
+
+        fn list_blobs(&self, _commit: &str) -> Result<Vec<Blob>, String> {
+            Ok(self
+                .files
+                .iter()
+                .map(|(path, bytes)| Blob {
+                    repo_path: format!("extension/{path}"),
+                    relative_path: safe_rel(path).unwrap(),
+                    size: bytes.len() as u64,
+                    git_sha: git_blob_sha(bytes),
+                })
+                .collect())
+        }
+
+        fn fetch_blob(&self, _commit: &str, blob: &Blob) -> Result<Vec<u8>, String> {
+            self.fetch_calls.set(self.fetch_calls.get() + 1);
+            if self.fail_path == Some(blob.repo_path.as_str()) {
+                return Err(format!("simulated download failure: {}", blob.repo_path));
+            }
+            self.files
+                .iter()
+                .find(|(path, _)| blob.repo_path == format!("extension/{path}"))
+                .map(|(_, bytes)| bytes.clone())
+                .ok_or_else(|| format!("fake release has no {}", blob.repo_path))
+        }
+    }
+
+    /// Seed a managed standalone install exactly like a previous CLI (or an
+    /// older Runtime) left it.
+    fn seed_standalone_install(home: &Path, commit: &str, version: &str) -> PathBuf {
+        let base = base_dir_for(home);
+        let current = base.join("current");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(
+            current.join("manifest.json"),
+            serde_json::to_vec(&json!({
+                "manifest_version": 3,
+                "name": "Herdr MCP - Workspace Connector",
+                "version": version,
+                "key": standalone_key(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(current.join("background.js"), b"// previous bundle\n").unwrap();
+        atomic_json(
+            &base.join("state.json"),
+            &json!({
+                "schema_version": 1,
+                "repository": REPOSITORY,
+                "requested_ref": commit,
+                "source_commit": commit,
+                "extension_version": version,
+                "extension_id": crate::browser_extension_identity::official_standalone_identity()
+                    .unwrap()
+                    .extension_id,
+                "installed_at_unix_ms": 1,
+                "path": current,
+                "load_unpacked_path": user_visible_alias_path(home),
+            }),
+        )
+        .unwrap();
+        current
+    }
+
+    fn seed_registrations(config_dir: &Path, entries: &[(&str, &str, i64)]) {
+        use crate::state_store::{BrowserEndpointRegistrationInput, StateStore};
+        fs::create_dir_all(config_dir).unwrap();
+        let mut store = StateStore::open(config_dir.join("state.db")).unwrap();
+        for (index, (family, version, observed_at)) in entries.iter().enumerate() {
+            store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: &format!("profile-seed-0123456789abcde{index}"),
+                    browser_family: family,
+                    extension_version: version,
+                    observed_at: *observed_at,
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn staging_never_creates_a_standalone_install() {
+        // Given a workstation that never installed the standalone extension
+        // When an update stages the release extension
+        // Then nothing is downloaded and no install appears.
+        let root = temp_root("stage-not-installed");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let source = FakeSource::release(&"a".repeat(40), "0.1.230");
+
+        let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap();
+
+        assert_eq!(staged.state, StagedExtensionState::NotInstalled);
+        assert_eq!(source.fetch_calls.get(), 0);
+        assert!(!base_dir_for(&home).join("current").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_swaps_in_the_release_extension_tree_and_records_it() {
+        // Given a standalone install left on an older release commit
+        // When the update stages the new release
+        // Then `current` is the new tree with the same manifest key, the state
+        //      record names the new commit, and no alias is created in Documents.
+        let root = temp_root("stage-swap");
+        let home = root.join("home");
+        let old_commit = "b".repeat(40);
+        let new_commit = "c".repeat(40);
+        seed_standalone_install(&home, &old_commit, "0.1.229");
+        let source = FakeSource::release(&new_commit, "0.1.230");
+
+        let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap();
+
+        assert_eq!(staged.state, StagedExtensionState::Staged);
+        assert_eq!(staged.source_commit.as_deref(), Some(new_commit.as_str()));
+        assert_eq!(staged.extension_version.as_deref(), Some("0.1.230"));
+        assert_eq!(
+            staged.previous_source_commit.as_deref(),
+            Some(old_commit.as_str())
+        );
+        assert_eq!(
+            staged.previous_extension_version.as_deref(),
+            Some("0.1.229")
+        );
+        assert_eq!(
+            staged.action(),
+            Some("install_extension"),
+            "a recorded load path that does not resolve to `current` needs the CLI install, not a Reload"
+        );
+
+        let base = base_dir_for(&home);
+        let current = base.join("current");
+        let manifest = read_json(&current.join("manifest.json")).unwrap();
+        assert_eq!(manifest["version"], "0.1.230");
+        assert_eq!(manifest["key"], standalone_key());
+        assert_eq!(
+            fs::read(current.join("background.js")).unwrap(),
+            b"// release bundle\n"
+        );
+        let state = read_json(&base.join("state.json")).unwrap();
+        assert_eq!(state["source_commit"], new_commit);
+        assert_eq!(state["extension_version"], "0.1.230");
+        assert_eq!(state["installed_by"], "update");
+        assert!(
+            !user_visible_alias_path(&home).exists(),
+            "an unattended update must not create a ~/Documents alias"
+        );
+        let leftovers = fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                name.starts_with(".staging-") || name.starts_with(".previous-")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "staging and backup directories are removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_is_idempotent_for_an_already_staged_release() {
+        // Given the release extension was already staged
+        // When staging runs again (interactive foreground after the worker)
+        // Then it reports up-to-date without downloading anything.
+        let root = temp_root("stage-idempotent");
+        let home = root.join("home");
+        let commit = "d".repeat(40);
+        seed_standalone_install(&home, &commit, "0.1.230");
+        let source = FakeSource::release(&commit, "0.1.230");
+
+        let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap();
+
+        assert_eq!(staged.state, StagedExtensionState::UpToDate);
+        assert_eq!(source.fetch_calls.get(), 0);
+        assert!(staged.summary().contains("already staged"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_keeps_the_previous_tree_when_a_download_fails() {
+        // Given a working standalone install
+        // When the release download fails midway
+        // Then the previous tree and state record survive untouched.
+        let root = temp_root("stage-failure");
+        let home = root.join("home");
+        let old_commit = "e".repeat(40);
+        let current = seed_standalone_install(&home, &old_commit, "0.1.229");
+        let mut source = FakeSource::release(&"f".repeat(40), "0.1.230");
+        source.fail_path = Some("extension/background.js");
+
+        let error = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap_err();
+
+        assert!(error.contains("simulated download failure"), "{error}");
+        let manifest = read_json(&current.join("manifest.json")).unwrap();
+        assert_eq!(manifest["version"], "0.1.229");
+        let state = read_json(&base_dir_for(&home).join("state.json")).unwrap();
+        assert_eq!(state["source_commit"], old_commit);
+        let leftovers = fs::read_dir(base_dir_for(&home))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".staging-"))
+            .count();
+        assert_eq!(leftovers, 0, "a failed staging directory is removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_version_report_marks_a_registered_older_extension_as_reload_pending() {
+        // Given the release extension is staged and the browser registered an
+        //       older extension version
+        // When doctor reconciles versions
+        // Then it reports reload_pending with the Reload fix action.
+        let root = temp_root("version-reload");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        let commit = "1".repeat(40);
+        let expected = crate::runtime_meta::bundled_extension_version().unwrap();
+        seed_standalone_install(&home, &commit, expected);
+        seed_registrations(&config_dir, &[("ego", "0.1.229", 20)]);
+
+        let report = version_report_in(&home, &config_dir, Some(expected), Some(&commit));
+
+        assert_eq!(report.state, "reload_pending");
+        let json = report.as_json();
+        assert_eq!(json["staged_version"], expected);
+        assert_eq!(json["registered_version"], "0.1.229");
+        assert_eq!(json["action"], "reload_extension");
+        assert_eq!(json["next_action"], EXTENSION_RELOAD_NEXT_ACTION);
+        let line = report.doctor_line();
+        assert!(
+            line.starts_with("WARN standalone-extension-version state=reload_pending"),
+            "{line}"
+        );
+        assert!(line.contains("chrome://extensions"), "{line}");
+        let notice = report.update_notice().unwrap();
+        assert_eq!(notice["code"], "extension_reload_required");
+        assert_eq!(notice["fatal"], false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_version_report_is_current_when_the_browser_runs_the_staged_extension() {
+        // Given staged and registered extension versions match this release
+        // When doctor reconciles versions
+        // Then it reports current and produces no update notice.
+        let root = temp_root("version-current");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        let commit = "2".repeat(40);
+        let expected = crate::runtime_meta::bundled_extension_version().unwrap();
+        seed_standalone_install(&home, &commit, expected);
+        seed_registrations(&config_dir, &[("chrome", expected, 30)]);
+
+        let report = version_report_in(&home, &config_dir, Some(expected), Some(&commit));
+
+        assert_eq!(report.state, "current");
+        assert!(report.update_notice().is_none());
+        assert!(
+            report
+                .doctor_line()
+                .starts_with("INFO standalone-extension-version state=current")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_version_report_calls_a_staged_extension_from_another_release_stale() {
+        // Given the staged extension belongs to a different release
+        // When doctor reconciles versions
+        // Then it reports extension_stale with the exact install command, and
+        //      the update result carries the same warning without failing.
+        let root = temp_root("version-stale");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        let expected = crate::runtime_meta::bundled_extension_version().unwrap();
+        seed_standalone_install(&home, &"3".repeat(40), "0.1.229");
+        seed_registrations(&config_dir, &[("ego", "0.1.229", 10)]);
+
+        let report = version_report_in(&home, &config_dir, Some(expected), Some(&"4".repeat(40)));
+
+        assert_eq!(report.state, "extension_stale");
+        let json = report.as_json();
+        assert_eq!(json["action"], "install_extension");
+        assert_eq!(json["next_action"], EXTENSION_INSTALL_NEXT_ACTION);
+        let line = report.doctor_line();
+        assert!(
+            line.starts_with("WARN standalone-extension-version state=extension_stale"),
+            "{line}"
+        );
+        assert!(
+            line.contains("herdr-mcp extension standalone install"),
+            "{line}"
+        );
+        let notice = report.update_notice().unwrap();
+        assert_eq!(notice["code"], "extension_stale");
+        assert_eq!(notice["severity"], "warning");
+        assert_eq!(notice["fatal"], false);
+        assert_eq!(notice["next_action"], EXTENSION_INSTALL_NEXT_ACTION);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_version_report_is_unknown_without_registration_evidence() {
+        // Given a staged extension and no readable endpoint registration
+        // When doctor reconciles versions
+        // Then it reports unknown instead of guessing, and prints no warning.
+        let root = temp_root("version-unknown");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        let commit = "5".repeat(40);
+        let expected = crate::runtime_meta::bundled_extension_version().unwrap();
+        seed_standalone_install(&home, &commit, expected);
+
+        let report = version_report_in(&home, &config_dir, Some(expected), Some(&commit));
+
+        assert_eq!(report.state, "unknown");
+        assert_eq!(report.as_json()["reason"], "state_db_missing");
+        assert!(report.update_notice().is_none());
+        assert!(
+            report
+                .doctor_line()
+                .starts_with("INFO standalone-extension-version state=unknown")
+        );
+
+        let doctor = doctor_report_in(&home, &config_dir);
+        assert_eq!(doctor.as_json()["version"]["state"], "unknown");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_version_report_does_not_ask_for_a_downgrade_reload() {
+        // Given the browser runs a newer extension build than this Runtime
+        //       stages (the ordinary STORE case)
+        // When doctor reconciles versions
+        // Then it reports extension_ahead with no Reload and no install action.
+        let root = temp_root("version-ahead");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        let commit = "8".repeat(40);
+        let expected = crate::runtime_meta::bundled_extension_version().unwrap();
+        seed_standalone_install(&home, &commit, expected);
+        seed_registrations(&config_dir, &[("chrome", "99.0.1", 50)]);
+
+        let report = version_report_in(&home, &config_dir, Some(expected), Some(&commit));
+
+        assert_eq!(report.state, "extension_ahead");
+        assert_eq!(
+            report.as_json()["reason"],
+            "registered_extension_newer_than_staged"
+        );
+        assert_eq!(report.as_json()["action"], Value::Null);
+        assert!(report.update_notice().is_none());
+        assert!(
+            report
+                .doctor_line()
+                .starts_with("INFO standalone-extension-version state=extension_ahead")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_version_report_asks_for_a_reload_when_versions_are_not_orderable() {
+        // Given the registered version is not a comparable version string
+        // When doctor reconciles versions
+        // Then a difference still asks for a Reload instead of being ignored.
+        let root = temp_root("version-unorderable");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        let commit = "9".repeat(40);
+        let expected = crate::runtime_meta::bundled_extension_version().unwrap();
+        seed_standalone_install(&home, &commit, expected);
+        seed_registrations(&config_dir, &[("chrome", "unknown-build", 60)]);
+
+        let report = version_report_in(&home, &config_dir, Some(expected), Some(&commit));
+
+        assert_eq!(report.state, "reload_pending");
+        assert!(report.update_notice().is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_version_report_ignores_an_unverifiable_runtime_identity() {
+        // Given a source build whose release identity is not an immutable commit
+        // When doctor reconciles versions
+        // Then matching versions are current instead of a false stale warning.
+        let root = temp_root("version-unverifiable");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        let expected = crate::runtime_meta::bundled_extension_version().unwrap();
+        seed_standalone_install(&home, &"7".repeat(40), expected);
+        seed_registrations(&config_dir, &[("chrome", expected, 40)]);
+
+        let report = version_report_in(&home, &config_dir, Some(expected), Some("unknown"));
+
+        assert_eq!(report.state, "current");
+        assert!(report.update_notice().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_version_report_is_not_installed_without_a_standalone_install() {
+        // Given no standalone install
+        // When doctor reconciles versions
+        // Then it reports not_installed and never asks for a Reload.
+        let root = temp_root("version-not-installed");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        fs::create_dir_all(&home).unwrap();
+
+        let report = version_report_in(&home, &config_dir, Some("0.1.230"), Some(&"6".repeat(40)));
+
+        assert_eq!(report.state, "not_installed");
+        assert!(report.update_notice().is_none());
         let _ = fs::remove_dir_all(root);
     }
 }

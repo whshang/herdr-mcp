@@ -46,7 +46,14 @@ Herdr uses three extension identities:
 - **STANDALONE** — fixed non-Store identity for auditable manual/GitHub distribution.
 - **DEV** — developer-mode source checkout; path-derived and never treated as a release channel.
 
-Native Messaging ownership must resolve to one supported extension owner at a time. Packaging for STORE or STANDALONE must not mutate the DEV source manifest into a fixed release identity. Runtime self-update does not update the extension.
+Native Messaging ownership must resolve to one supported extension owner at a time. Packaging for STORE or STANDALONE must not mutate the DEV source manifest into a fixed release identity.
+
+### Extension version and Runtime update interaction
+
+Runtime and extension versions stay independent, but the two release planes meet in two places:
+
+- **Version bump rule.** Any change under `extension/` must increase `extension/manifest.json`'s `version` (`H2W_SCRIPT_VERSION` in `extension/background.js` and `H2W_CONTENT_VERSION` in `extension/content/wake.js` follow it). `scripts/check-extension-version.mjs` enforces this in CI against the newest `v*` release tag; release packaging runs it in strict mode. Without a distinct version, neither endpoint registration nor `doctor` can distinguish two extension builds — that is the drift #833 hid.
+- **Runtime update staging.** `herdr-mcp update apply` never changes extension *identity* and never updates the STORE build, but it does re-stage the managed STANDALONE copy (`~/.config/herdr-mcp/extensions/standalone/current`) from the release it installs, using the same staging code and manifest `key` as `herdr-mcp extension standalone install`. It only does so when the workstation already has a STANDALONE install, it never creates the `~/Documents` alias, and a staging failure is reported as a non-fatal notice instead of failing the Runtime update. A browser keeps executing the extension code it loaded, so the user still has to Reload the extension in `chrome://extensions`; `herdr-mcp doctor` reports `reload_pending` until then, and `extension_stale` when the staged copy does not belong to the running Runtime release.
 
 ## Contract compatibility
 
