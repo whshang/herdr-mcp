@@ -374,7 +374,11 @@ herdr-link / runtime generation
 独立した fleet Worker のリリースを runtime の結果に連結していたため、Worker の認証
 情報や reconcile に問題があると、runtime の更新がコミットされヘルスゲートも通過して
 いても `ok: false` と `update_succeeded_worker_update_required` で終了しました。これは
-想定された動作であり、アップグレードの失敗ではありません。まず runtime を確認して
+想定された動作であり、アップグレードの失敗ではありません。`v1.1.0-rc.9` より前の
+updater は、runtime だけを更新する場合でもその Worker ステップを試行することがあります
+（例: 古い runtime から stable/preview チャネルで `update apply --manifest <新しい
+manifest>`）。その試行は runtime に対して非致命的で、runtime は既に更新済みであり、
+残るのは以下に示す独立した Worker リリース手順だけです。まず runtime を確認して
 ください：
 
 ```bash
