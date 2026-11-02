@@ -20,7 +20,6 @@ use serde_json::Map;
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::env;
-#[cfg(unix)]
 use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::time::Duration;
@@ -360,7 +359,7 @@ fn finish(write: Result<(), String>, reason: &'static str) -> HostOutcome {
 ///
 /// `None` means the helper could not move, and relative extension paths must
 /// then fail instead of falling back to `getcwd` on whatever Chrome inherited.
-static NEUTRAL_HELPER_CWD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static NEUTRAL_HELPER_CWD: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
 pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
     // #844: the extension host is a helper process. It never needs the working
@@ -641,6 +640,15 @@ pub(crate) fn validate_extension_origin(origin: &str) -> Result<&str, String> {
 
 #[cfg(unix)]
 pub(crate) fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
+    lexical_absolute_from(path, NEUTRAL_HELPER_CWD.get().map(PathBuf::as_path))
+}
+
+/// Testable seam: `neutral` is the directory a relative path resolves against,
+/// or `None` when the helper never got one.
+pub(crate) fn lexical_absolute_from(
+    path: &Path,
+    neutral: Option<&Path>,
+) -> Result<PathBuf, String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -648,7 +656,7 @@ pub(crate) fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
         // the Documents access this guard exists to avoid, so a relative path is
         // resolved against the neutral directory `run` chose, and refused when
         // the helper could not choose one.
-        let Some(neutral) = NEUTRAL_HELPER_CWD.get() else {
+        let Some(neutral) = neutral else {
             return Err(
                 "extension path is relative and the helper has no neutral working directory"
                     .to_owned(),
@@ -656,15 +664,6 @@ pub(crate) fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
         };
         neutral.join(path)
     };
-    // An absolute path inside a privacy-protected folder is refused lexically:
-    // the rotating runtime must not `is_dir()`/`is_file()` it, and the broker is
-    // the only authorized reader of that folder.
-    if crate::macos_permissions::runtime_must_not_probe(&absolute) {
-        return Err(format!(
-            "extension path '{}' is inside a macOS privacy-protected folder; load the extension from the managed standalone path instead",
-            absolute.display()
-        ));
-    }
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
         match component {
@@ -674,6 +673,15 @@ pub(crate) fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
             }
             _ => normalized.push(component.as_os_str()),
         }
+    }
+    // Normalize before the protection check: `../../Documents/...` joined to the
+    // neutral directory is not lexically under Documents until `..` is applied,
+    // and checking first would let the normalized path reach `is_dir()`.
+    if crate::macos_permissions::runtime_must_not_probe(&normalized) {
+        return Err(format!(
+            "extension path '{}' is inside a macOS privacy-protected folder; load the extension from the managed standalone path instead",
+            normalized.display()
+        ));
     }
     Ok(normalized)
 }
@@ -1140,6 +1148,29 @@ mod tests {
         );
         let error = super::lexical_absolute(Path::new("extension")).expect_err("must be refused");
         assert!(error.contains("neutral working directory"), "{error}");
+    }
+
+    /// A relative path that climbs out of the neutral directory into Documents
+    /// must be normalized before it is classified, otherwise the escape is only
+    /// caught later by is_dir()/is_file() on the protected path.
+    #[test]
+    fn parent_dir_escape_is_normalized_before_the_protection_check() {
+        let neutral = Path::new("/Users/example/.config/herdr-mcp");
+        let resolved = super::lexical_absolute_from(
+            Path::new("../../Documents/herdr-mcp/extension"),
+            Some(neutral),
+        );
+        match resolved {
+            Ok(path) => assert!(
+                path.to_string_lossy().contains("/Documents/"),
+                "the escape must normalize into Documents, got {}",
+                path.display()
+            ),
+            Err(error) => assert!(
+                error.contains("privacy-protected folder"),
+                "an escape must be refused only for the protected folder, got {error}"
+            ),
+        }
     }
 
     use super::*;

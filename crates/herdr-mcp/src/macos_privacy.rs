@@ -321,19 +321,26 @@ fn value_after_prefix(text: &str, prefix: &str) -> Option<String> {
 /// Exit codes of the `__documents-alias-probe` child. The child is the stable
 /// broker identity, so it may inspect `~/Documents` when the rotating runtime
 /// may not; the runtime only reads an exit code, never the protected path.
-#[cfg(target_os = "macos")]
+// The exit-code vocabulary is platform-independent: the mapping is compiled and
+// tested on every target, and only the child that produces these codes is
+// macOS-only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const ALIAS_READY_EXIT: u8 = 0;
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const ALIAS_MISSING_EXIT: u8 = 66;
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const ALIAS_OCCUPIED_LINK_EXIT: u8 = 67;
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const ALIAS_OCCUPIED_ENTRY_EXIT: u8 = 68;
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const ALIAS_DENIED_EXIT: u8 = 77;
 
 /// Outcome of one bounded, broker-routed alias inspection.
+///
+/// Only macOS constructs the answered variants; other targets return `Denied`
+/// or `BrokerOutdated`, so the enum carries a per-platform dead-code allowance.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum BrokeredAlias {
     /// The entry is a symlink to the expected target.
     Ready,
@@ -345,8 +352,32 @@ pub(crate) enum BrokeredAlias {
     Missing,
     /// The broker did not answer within the budget: a prompt is still up.
     Pending,
+    /// The installed broker predates the alias subcommand (it exits 1 for
+    /// "unknown command"). Reinstall the broker; this is not a refusal.
+    BrokerOutdated,
     /// The broker refused, is missing, or failed.
     Denied(String),
+}
+
+/// Map the alias child's exit code to a decision.
+///
+/// Extracted so the mapping is testable on every platform. A pre-#844 broker
+/// rejects the argv and exits 1, which must surface as `BrokerOutdated`
+/// (reinstall) rather than as a permission refusal that would leave the default
+/// Documents alias permanently uncreatable.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn map_alias_probe_exit(code: Option<i32>) -> BrokeredAlias {
+    match code.map(|code| code as u8) {
+        Some(ALIAS_READY_EXIT) => BrokeredAlias::Ready,
+        Some(ALIAS_OCCUPIED_LINK_EXIT) => BrokeredAlias::OccupiedLink,
+        Some(ALIAS_OCCUPIED_ENTRY_EXIT) => BrokeredAlias::OccupiedEntry,
+        Some(ALIAS_MISSING_EXIT) => BrokeredAlias::Missing,
+        Some(ALIAS_DENIED_EXIT) => {
+            BrokeredAlias::Denied("the stable broker cannot read this protected path".to_owned())
+        }
+        Some(1) | None => BrokeredAlias::BrokerOutdated,
+        other => BrokeredAlias::Denied(format!("alias probe exit {other:?}")),
+    }
 }
 
 /// Inspect one Chrome-facing alias through the stable broker identity.
@@ -386,19 +417,100 @@ pub(crate) fn probe_alias_via_stable_broker(
     };
     let _registration = child_process::register_owned_child("documents-alias-probe", &child);
     match child_process::wait_bounded(&mut child, DOCUMENTS_PROBE_TIMEOUT) {
-        Ok(Some(status)) => match status.code().map(|code| code as u8) {
-            Some(ALIAS_READY_EXIT) => BrokeredAlias::Ready,
-            Some(ALIAS_OCCUPIED_LINK_EXIT) => BrokeredAlias::OccupiedLink,
-            Some(ALIAS_OCCUPIED_ENTRY_EXIT) => BrokeredAlias::OccupiedEntry,
-            Some(ALIAS_MISSING_EXIT) => BrokeredAlias::Missing,
-            Some(ALIAS_DENIED_EXIT) => BrokeredAlias::Denied(
-                "the stable broker cannot read this protected path".to_owned(),
-            ),
-            other => BrokeredAlias::Denied(format!("alias probe exit {other:?}")),
-        },
+        Ok(Some(status)) => map_alias_probe_exit(status.code()),
         Ok(None) => BrokeredAlias::Pending,
         Err(error) => BrokeredAlias::Denied(error.to_string()),
     }
+}
+
+/// Create or verify the Chrome-facing alias through the stable broker.
+///
+/// The parent-directory create, the symlink and the readlink verification all
+/// run inside the broker child, so the rotating generation never mutates or
+/// stats `~/Documents`. Bounded like the probe: a timeout is `Pending`, and an
+/// unknown-command exit means the installed broker is outdated.
+#[cfg(target_os = "macos")]
+pub(crate) fn ensure_alias_via_stable_broker(
+    config_dir: &Path,
+    path: &Path,
+    expected: &Path,
+) -> BrokeredAlias {
+    use crate::child_process;
+    use std::process::{Command, Stdio};
+
+    let broker = crate::tcc_broker::broker_path(config_dir);
+    let broker_is_owned_regular_file = crate::tcc_broker::status(&broker).is_some();
+    let executable = match documents_probe_executable(&broker, broker_is_owned_regular_file) {
+        Ok(path) => path,
+        Err(detail) => return BrokeredAlias::Denied(detail),
+    };
+    let mut command = Command::new(executable);
+    command
+        .arg("__documents-alias-ensure")
+        .arg(path)
+        .arg(expected)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    child_process::configure_process_group(&mut command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return BrokeredAlias::Denied(error.to_string()),
+    };
+    let _registration = child_process::register_owned_child("documents-alias-ensure", &child);
+    match child_process::wait_bounded(&mut child, DOCUMENTS_PROBE_TIMEOUT) {
+        Ok(Some(status)) => map_alias_probe_exit(status.code()),
+        Ok(None) => BrokeredAlias::Pending,
+        Err(error) => BrokeredAlias::Denied(error.to_string()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn ensure_alias_via_stable_broker(
+    _config_dir: &Path,
+    _path: &Path,
+    _expected: &Path,
+) -> BrokeredAlias {
+    BrokeredAlias::Denied("macOS Documents aliases are not applicable on this platform".to_owned())
+}
+
+/// Child side of [`ensure_alias_via_stable_broker`], under the broker identity.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_documents_alias_ensure_child(path: &Path, expected: &Path) -> ExitCode {
+    // Probe first so an occupied path is never overwritten.
+    match run_documents_alias_probe_child(path, expected) {
+        ready if ready == ExitCode::from(ALIAS_READY_EXIT) => return ExitCode::SUCCESS,
+        occupied
+            if occupied == ExitCode::from(ALIAS_OCCUPIED_LINK_EXIT)
+                || occupied == ExitCode::from(ALIAS_OCCUPIED_ENTRY_EXIT) =>
+        {
+            return occupied;
+        }
+        denied if denied == ExitCode::from(ALIAS_DENIED_EXIT) => return denied,
+        _ => {}
+    }
+    let Some(parent) = path.parent() else {
+        return ExitCode::from(1);
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return ExitCode::from(1);
+    }
+    if std::os::unix::fs::symlink(expected, path).is_err() {
+        return ExitCode::from(1);
+    }
+    match std::fs::read_link(path) {
+        Ok(target) if target == expected => ExitCode::from(ALIAS_READY_EXIT),
+        Ok(_) => ExitCode::from(ALIAS_OCCUPIED_LINK_EXIT),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            ExitCode::from(ALIAS_DENIED_EXIT)
+        }
+        Err(_) => ExitCode::from(1),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn run_documents_alias_ensure_child(_path: &Path, _expected: &Path) -> ExitCode {
+    ExitCode::from(1)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -436,11 +548,8 @@ pub(crate) fn run_documents_alias_probe_child(path: &Path, expected: &Path) -> E
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn run_documents_alias_probe_child(_path: &Path, _expected: &Path) -> ExitCode {
-    ExitCode::from(ALIAS_MISSING_EXIT_CONST)
+    ExitCode::from(ALIAS_MISSING_EXIT)
 }
-
-#[cfg(not(target_os = "macos"))]
-const ALIAS_MISSING_EXIT_CONST: u8 = 66;
 
 /// Where the post-activation Documents preflight is recorded.
 ///
@@ -502,6 +611,30 @@ pub(crate) fn preflight_after_activation(config_dir: &Path) -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// user can tell an outdated broker from a refusal | Given each alias child
+    /// exit code, including the `unknown command` exit 1 a pre-#844 broker
+    /// returns | When the runtime maps it | Then exit 1 is `broker_outdated`
+    /// (reinstall), not a permission denial that would leave the default
+    /// Documents alias uncreatable forever.
+    #[test]
+    fn alias_probe_exit_codes_map_to_decisions() {
+        use super::{BrokeredAlias, map_alias_probe_exit};
+        assert_eq!(map_alias_probe_exit(Some(0)), BrokeredAlias::Ready);
+        assert_eq!(map_alias_probe_exit(Some(66)), BrokeredAlias::Missing);
+        assert_eq!(map_alias_probe_exit(Some(67)), BrokeredAlias::OccupiedLink);
+        assert_eq!(map_alias_probe_exit(Some(68)), BrokeredAlias::OccupiedEntry);
+        assert!(matches!(
+            map_alias_probe_exit(Some(77)),
+            BrokeredAlias::Denied(_)
+        ));
+        assert_eq!(map_alias_probe_exit(Some(1)), BrokeredAlias::BrokerOutdated);
+        assert_eq!(map_alias_probe_exit(None), BrokeredAlias::BrokerOutdated);
+        assert!(matches!(
+            map_alias_probe_exit(Some(9)),
+            BrokeredAlias::Denied(_)
+        ));
+    }
+
     /// user sees one prompt state everywhere | Given each probe outcome | When
     /// doctor, update status or the persisted preflight name it | Then only a
     /// bounded-out probe is `pending` and every other state is answered.

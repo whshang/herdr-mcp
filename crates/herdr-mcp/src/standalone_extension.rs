@@ -1821,6 +1821,9 @@ pub(crate) enum AliasProbe {
     Missing,
     /// The brokered lookup did not answer within its budget.
     Pending,
+    /// The installed broker predates the alias subcommands and must be
+    /// reinstalled before the alias can be verified or created.
+    BrokerOutdated,
     /// The broker refused or is unavailable.
     Denied(String),
 }
@@ -1837,6 +1840,25 @@ fn brokered_alias_probe(path: &Path, expected: &Path) -> AliasProbe {
         crate::macos_privacy::BrokeredAlias::OccupiedEntry => AliasProbe::OccupiedEntry,
         crate::macos_privacy::BrokeredAlias::Missing => AliasProbe::Missing,
         crate::macos_privacy::BrokeredAlias::Pending => AliasProbe::Pending,
+        crate::macos_privacy::BrokeredAlias::BrokerOutdated => AliasProbe::BrokerOutdated,
+        crate::macos_privacy::BrokeredAlias::Denied(detail) => AliasProbe::Denied(detail),
+    }
+}
+
+/// The production creation path for a protected alias: the broker child creates
+/// the parent directory, the symlink and verifies it, bounded by the same probe
+/// timeout. The rotating generation never mutates `~/Documents`.
+fn brokered_alias_ensure(path: &Path, expected: &Path) -> AliasProbe {
+    let Ok(paths) = crate::paths::RuntimePaths::discover() else {
+        return AliasProbe::Denied("runtime paths are unavailable".to_owned());
+    };
+    match crate::macos_privacy::ensure_alias_via_stable_broker(&paths.config_dir, path, expected) {
+        crate::macos_privacy::BrokeredAlias::Ready => AliasProbe::Ready,
+        crate::macos_privacy::BrokeredAlias::OccupiedLink => AliasProbe::OccupiedLink,
+        crate::macos_privacy::BrokeredAlias::OccupiedEntry => AliasProbe::OccupiedEntry,
+        crate::macos_privacy::BrokeredAlias::Missing => AliasProbe::Missing,
+        crate::macos_privacy::BrokeredAlias::Pending => AliasProbe::Pending,
+        crate::macos_privacy::BrokeredAlias::BrokerOutdated => AliasProbe::BrokerOutdated,
         crate::macos_privacy::BrokeredAlias::Denied(detail) => AliasProbe::Denied(detail),
     }
 }
@@ -1898,6 +1920,22 @@ fn inspect_alias_with_probe(
             "target": current,
             "broker_routed": true,
         }),
+        AliasProbe::BrokerOutdated => {
+            let mut payload = tcc_pending_alias_payload(path, current);
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("status".to_owned(), json!("broker_outdated"));
+                object.insert("code".to_owned(), json!("broker_outdated"));
+                object.insert(
+                    "message".to_owned(),
+                    json!("the installed TCC broker predates the Documents alias check; reinstall it once with `herdr-mcp tcc-broker install --force` (one re-authorization) and retry"),
+                );
+                object.insert(
+                    "next_action".to_owned(),
+                    json!("herdr-mcp tcc-broker install --force"),
+                );
+            }
+            payload
+        }
         AliasProbe::Pending => tcc_pending_alias_payload(path, current),
         AliasProbe::Denied(detail) => {
             let mut payload = tcc_pending_alias_payload(path, current);
@@ -1908,6 +1946,10 @@ fn inspect_alias_with_probe(
             payload
         }
     }
+}
+
+fn broker_outdated_probe(_path: &Path, _current: &Path) -> AliasProbe {
+    AliasProbe::BrokerOutdated
 }
 
 fn tcc_pending_alias_payload(path: &Path, current: &Path) -> Value {
@@ -1992,9 +2034,62 @@ fn ensure_user_visible_alias(home: &Path, current: &Path) -> Value {
 }
 
 fn ensure_alias(home: &Path, path: &Path, current: &Path) -> Value {
-    let initial = inspect_alias(path, current);
+    ensure_alias_with(
+        home,
+        path,
+        current,
+        crate::macos_permissions::runtime_must_not_probe(path),
+        &brokered_alias_probe,
+        &brokered_alias_ensure,
+    )
+}
+
+/// Testable seam: the protected branch answers and creates through injected
+/// provider functions, so both the broker-answered and broker-silent cases can
+/// be exercised without touching `~/Documents`.
+fn ensure_alias_with(
+    home: &Path,
+    path: &Path,
+    current: &Path,
+    protected: bool,
+    probe: &dyn Fn(&Path, &Path) -> AliasProbe,
+    ensure: &dyn Fn(&Path, &Path) -> AliasProbe,
+) -> Value {
+    let initial = inspect_alias_with_probe(path, current, protected, probe);
     if initial.get("status").and_then(Value::as_str) != Some("missing") {
         return initial;
+    }
+    if protected {
+        // Creation itself is a `~/Documents` mutation, so it also happens in the
+        // broker child; the answer is a fresh view of the same states.
+        return match ensure(path, current) {
+            AliasProbe::Ready => json!({
+                "ready": true,
+                "status": "created",
+                "path": path,
+                "target": current,
+                "broker_routed": true,
+            }),
+            AliasProbe::Pending => tcc_pending_alias_payload(path, current),
+            AliasProbe::BrokerOutdated => {
+                inspect_alias_with_probe(path, current, true, &|path, current| {
+                    broker_outdated_probe(path, current)
+                })
+            }
+            AliasProbe::Denied(detail) => {
+                let mut payload = tcc_pending_alias_payload(path, current);
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("status".to_owned(), json!("unverified"));
+                    object.insert("error".to_owned(), json!(detail));
+                }
+                payload
+            }
+            AliasProbe::Missing => inspect_alias_with_probe(path, current, true, probe),
+            occupied => {
+                let decided = occupied.clone();
+                inspect_alias_with_probe(path, current, true, &|_, _| decided.clone())
+            }
+        };
     }
     let Some(parent) = path.parent() else {
         return json!({
@@ -2308,6 +2403,44 @@ mod tests {
         assert_eq!(denied["status"], "unverified");
         assert_eq!(denied["code"], "tcc_pending");
         assert_eq!(denied["error"], "broker refused");
+    }
+
+    /// user keeps the default install working | Given a protected alias that is
+    /// missing and a broker that creates it | When the alias is ensured | Then the
+    /// creation happens through the broker seam, the runtime reports it as
+    /// created, and a broker that does not answer yields tcc_pending instead.
+    #[test]
+    fn protected_alias_creation_goes_through_the_broker_seam() {
+        let home = Path::new("/Users/example");
+        let alias = Path::new("/Users/example/Documents/herdr-mcp/extension");
+        let current = Path::new("/Users/example/Library/herdr-mcp/standalone/current");
+        let no_probe = |_: &Path, _: &Path| -> AliasProbe { AliasProbe::Missing };
+        let broker_creates = |_: &Path, _: &Path| -> AliasProbe { AliasProbe::Ready };
+        let created = ensure_alias_with(home, alias, current, true, &no_probe, &broker_creates);
+        assert_eq!(created["status"], "created");
+        assert_eq!(created["ready"], true);
+        assert_eq!(created["broker_routed"], true);
+
+        let broker_silent = |_: &Path, _: &Path| -> AliasProbe { AliasProbe::Pending };
+        let pending = ensure_alias_with(home, alias, current, true, &no_probe, &broker_silent);
+        assert_eq!(pending["status"], "tcc_pending");
+        assert_eq!(pending["code"], "tcc_pending");
+        assert_eq!(pending["retryable"], true);
+    }
+
+    /// user can fix an old broker without guessing | Given a broker that predates
+    /// the alias subcommands | When the alias is inspected | Then the state is
+    /// `broker_outdated` with the reinstall action, not a permission denial.
+    #[test]
+    fn outdated_broker_is_reported_as_broker_outdated() {
+        let alias = Path::new("/Users/example/Documents/herdr-mcp/extension");
+        let current = Path::new("/Users/example/Library/herdr-mcp/standalone/current");
+        let view =
+            inspect_alias_with_probe(alias, current, true, &|_, _| AliasProbe::BrokerOutdated);
+        assert_eq!(view["status"], "broker_outdated");
+        assert_eq!(view["code"], "broker_outdated");
+        assert_eq!(view["retryable"], true);
+        assert_eq!(view["next_action"], "herdr-mcp tcc-broker install --force");
     }
 
     /// user keeps an ordinary install unchanged | Given an unprotected path

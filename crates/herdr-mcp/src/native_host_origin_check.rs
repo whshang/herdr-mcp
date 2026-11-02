@@ -112,11 +112,14 @@ pub(crate) fn loaded_dev_extension_identity(
     }
     if let Some(path) = extension_path_env.filter(|path| !path.is_empty()) {
         let path = std::path::PathBuf::from(path);
+        // #844: resolve and screen the path lexically *before* any directory
+        // probe, so a protected `HERDR_EXTENSION_PATH` is refused instead of
+        // being is_dir()/is_file()'d by the rotating generation.
+        let path = crate::native_host::lexical_absolute(&path)?;
         let path = crate::native_host::require_extension_dir(
             &path,
             "HERDR_EXTENSION_PATH points to a missing or incomplete unpacked development extension directory",
         )?;
-        let path = crate::native_host::lexical_absolute(&path)?;
         let extension_id = crate::native_host::chromium_id_for_path(&path)?;
         let fix_command = shell_quoted_env_fix("HERDR_EXTENSION_PATH", &path.to_string_lossy());
         return Ok(Some(LoadedDevExtensionIdentity {

@@ -56,7 +56,15 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// still applies the Git-only boundary and reports `outside_managed_roots`, so
 /// the operator must upgrade the broker with
 /// `herdr-mcp permissions setup --upgrade-broker` for that case.
-pub const BROKER_COMPAT_REVISION: u32 = 4;
+/// Bumped to 5 for the #844 Documents alias subcommands
+/// (`__documents-alias-probe` / `__documents-alias-ensure`).
+///
+/// The bump is what makes an already-installed broker get replaced: `install`
+/// returns early when the installed revision already equals this constant, so
+/// without it a pre-#844 broker keeps rejecting the new argv as
+/// "unknown command". The cost is exactly one broker re-authorization on the
+/// next upgrade, which is the same one-prompt-per-upgrade budget #844 asks for.
+pub const BROKER_COMPAT_REVISION: u32 = 5;
 /// First broker revision that implements the read-only `git` identity action.
 #[cfg(target_os = "macos")]
 pub(crate) const GIT_IDENTITY_MIN_COMPAT_REVISION: u32 = 3;
