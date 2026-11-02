@@ -2227,13 +2227,20 @@ fn download_asset<W: Write>(
         }
         file.sync_all()
             .map_err(|error| format!("cannot sync staged update binary: {error}"))?;
+        Ok(())
+    })();
+    // Publish a closed inode: Linux rejects an executable with ETXTBSY while any
+    // writer still owns the inode, including a write descriptor inherited by a
+    // concurrently forked child of this process.
+    drop(file);
+    let result = result.and_then(|()| {
         #[cfg(unix)]
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("cannot make staged update binary executable: {error}"))?;
         fs::rename(&temp, target)
             .map_err(|error| format!("cannot activate staged update binary: {error}"))?;
         Ok(())
-    })();
+    });
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
@@ -2329,6 +2336,53 @@ fn verify_staged_file(path: &Path, expected_sha256: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Linux rejects `execve` with `ETXTBSY` while any process holds a write
+/// descriptor to the file, and a concurrently forked child of this process can
+/// inherit the updater's staging descriptor for a moment. That window is
+/// unrelated to the update itself, so execution of a just-staged candidate is
+/// retried briefly instead of failing the update.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const EXEC_BUSY_ATTEMPTS: usize = 10;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const EXEC_BUSY_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn executable_is_busy(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ETXTBSY)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn retry_text_file_busy<T>(
+    attempts: usize,
+    delay: Duration,
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let attempts = attempts.max(1);
+    let mut attempt = 1;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if attempt >= attempts || !executable_is_busy(&error) {
+                    return Err(error);
+                }
+                attempt += 1;
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn probe_candidate_binary(
     path: &Path,
@@ -2336,11 +2390,13 @@ fn probe_candidate_binary(
     expected_contract: &crate::contract::ContractIdentity,
     expected_schema: i64,
 ) -> Result<(), String> {
-    let output = Command::new(path)
-        .arg("version")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("cannot execute staged update binary: {error}"))?;
+    let output = retry_text_file_busy(EXEC_BUSY_ATTEMPTS, EXEC_BUSY_RETRY_DELAY, || {
+        Command::new(path)
+            .arg("version")
+            .stdin(Stdio::null())
+            .output()
+    })
+    .map_err(|error| format!("cannot execute staged update binary: {error}"))?;
     if !output.status.success() || output.stdout.len() > 16 * 1024 {
         return Err("staged update binary version probe failed".to_owned());
     }
@@ -2408,9 +2464,10 @@ fn spawn_worker(
             Ok(())
         });
     }
-    command
-        .spawn()
-        .map_err(|error| format!("cannot spawn detached update worker: {error}"))
+    retry_text_file_busy(EXEC_BUSY_ATTEMPTS, EXEC_BUSY_RETRY_DELAY, || {
+        command.spawn()
+    })
+    .map_err(|error| format!("cannot spawn detached update worker: {error}"))
 }
 
 fn fetch_bounded(client: &Client, url: Url, max: usize, label: &str) -> Result<Vec<u8>, String> {
@@ -2877,6 +2934,51 @@ mod tests {
     use super::*;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
+    fn exec_busy_retry_retries_text_file_busy_until_the_probe_runs() {
+        let mut calls = 0;
+        let result = retry_text_file_busy(10, Duration::ZERO, || {
+            calls += 1;
+            if calls < 3 {
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            } else {
+                Ok("probed")
+            }
+        });
+        assert_eq!(result.unwrap(), "probed");
+        assert_eq!(calls, 3, "each busy attempt must be retried");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn exec_busy_retry_does_not_retry_unrelated_errors() {
+        let mut calls = 0;
+        let error = retry_text_file_busy(10, Duration::ZERO, || -> std::io::Result<()> {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(calls, 1, "only ETXTBSY may be retried");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn exec_busy_retry_is_bounded_for_a_persistently_busy_binary() {
+        let mut calls = 0;
+        let error = retry_text_file_busy(10, Duration::ZERO, || -> std::io::Result<()> {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
+        assert_eq!(
+            calls, 10,
+            "a stuck executable must fail after bounded retries"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
     fn candidate_probe_verifies_the_manifest_target_epoch_hash_count_and_schema() {
         let local = crate::contract::identity().unwrap();
         let target = crate::contract::ContractIdentity {
@@ -2946,8 +3048,16 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn write_test_executable(path: &Path, body: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, body.as_bytes()).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let staged = path.with_file_name(format!(".{name}.staged"));
+        let mut file = fs::File::create(&staged).unwrap();
+        file.write_all(body.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        // Publish a closed inode before the fixture is executed: Linux rejects an
+        // executable with ETXTBSY while any writer still owns the inode.
+        drop(file);
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&staged, path).unwrap();
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
