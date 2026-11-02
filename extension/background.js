@@ -1999,6 +1999,22 @@ async function postBrowserRegistry(payload) {
   return parsed;
 }
 
+// #734: the observing endpoint of a user turn, taken from the endpoint this
+// profile already registered (never from the tab URL or message text). The
+// runtime re-derives the same ref from its own device identity plus the profile
+// seed and rejects a ref that does not match, so this only lets it resolve the
+// conversation inside the endpoint that is actually reporting the turn instead
+// of failing closed on a stale endpoint another device_id left behind. Without a
+// registered endpoint the payload keeps its previous shape and the runtime keeps
+// its global lookup.
+async function sourceTurnEndpointProvenance() {
+  const endpointRef = String(browserEndpointView(browserEndpoint)?.endpoint_ref || "").trim();
+  if (!endpointRef) return {};
+  const profileSeed = await getOrCreateBrowserProfileSeed().catch(() => "");
+  if (!validBrowserProfileSeed(profileSeed)) return {};
+  return { profile_seed: profileSeed, endpoint_ref: endpointRef };
+}
+
 // Trusted local Extension IPC: report one finalized worker assistant turn so the
 // runtime can settle the exact already-applied dispatch. Sends only exact
 // provider/session/generation/user-message/assistant-message identity plus the
@@ -12538,10 +12554,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "continuity-fields-incomplete" });
         return;
       }
-      const observeSourceTurn = () => postBrowserRegistry({
+      const observeSourceTurn = async () => postBrowserRegistry({
         operation: "source_turn.observe",
         canonical_url: convKey,
         user_text: userText,
+        ...(await sourceTurnEndpointProvenance()),
         observed_at: msg?.startedAt || Date.now(),
       });
       try {

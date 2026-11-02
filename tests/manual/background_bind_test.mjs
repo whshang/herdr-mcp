@@ -4490,6 +4490,10 @@ console.log("\n[Source-turn observe retry covers the fresh-conversation registra
   const attempts = observesFor(retryConv);
   ok(attempts.length === 3,
     "the retry schedule makes exactly one initial attempt plus two bounded retries");
+  ok(attempts.every((attempt) => attempt.endpoint_ref === "bep_test"
+      && attempt.profile_seed === storage.herdrBrowserProfileSeedV1),
+    "user turn is reported from the observing endpoint | Given this browser profile already registered its endpoint | When source_turn.observe is posted | Then every attempt carries the registered endpoint_ref plus the stored profile seed so the Runtime resolves the conversation inside the observing endpoint (#734)",
+    JSON.stringify(attempts));
   ok(attempts.every((attempt) => attempt.user_text === "确认当前用户回合"
       && attempt.observed_at === startedAt),
     "every retry replays the same trimmed text and original submit time");
