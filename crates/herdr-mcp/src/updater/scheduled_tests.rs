@@ -83,7 +83,15 @@ struct Scenario {
 
 impl Scenario {
     fn new(edit: impl FnOnce(&mut Value), bad_probe: bool) -> Self {
+        Self::with_version("9.9.9", edit, bad_probe)
+    }
+
+    /// Same real updater path with a caller-chosen release version, so a
+    /// release older than the installed runtime (the scheduled-downgrade case)
+    /// can be represented with a consistent tag, identity and asset URL.
+    fn with_version(version: &str, edit: impl FnOnce(&mut Value), bad_probe: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tag = format!("v{version}");
         let root = env::temp_dir().join(format!(
             "herdr-auto-{}-{}-{}",
             std::process::id(),
@@ -99,7 +107,7 @@ impl Scenario {
         let bytes = format!(
             "#!/bin/sh\n\
              if [ \"$1\" = version ]; then\n\
-             printf '%s\\n' 'herdr-mcp 9.9.9' 'contract epoch {} / {} tools' \
+             printf '%s\\n' 'herdr-mcp {version}' 'contract epoch {} / {} tools' \
              'state schema {SCHEMA_VERSION}' 'contract hash {reported_hash}'\n\
              else\n\
              printf '%s\\n' \"$@\" > \"$HERDR_MCP_CONFIG_DIR/worker-argv\"\n\
@@ -107,16 +115,16 @@ impl Scenario {
             target.epoch, target.tool_count,
         )
         .into_bytes();
-        let name = format!("herdr-mcp-9.9.9-{}", current_target().unwrap());
+        let name = format!("herdr-mcp-{version}-{}", current_target().unwrap());
         let mut manifest = json!({
             "schema_version": release_trust::MANIFEST_SCHEMA_VERSION,
             "product": "herdr-mcp",
             "state_schema": SCHEMA_VERSION,
-            "version": "9.9.9",
-            "tag": "v9.9.9",
+            "version": version,
+            "tag": tag,
             "release_identity": {
-                "tag": "v9.9.9", "source_commit": "b".repeat(40),
-                "source_ref": "refs/tags/v9.9.9",
+                "tag": tag, "source_commit": "b".repeat(40),
+                "source_ref": format!("refs/tags/{tag}"),
             },
             "repository_identity": {
                 "repository": release_trust::RELEASE_REPOSITORY,
@@ -139,13 +147,13 @@ impl Scenario {
             "assets": [{
                 "target": current_target().unwrap(), "name": name,
                 "size": bytes.len(), "sha256": sha256_bytes(&bytes),
-                "url": format!("https://github.com/whshang/herdr-mcp/releases/download/v9.9.9/{name}"),
+                "url": format!("https://github.com/whshang/herdr-mcp/releases/download/{tag}/{name}"),
             }],
         });
         edit(&mut manifest);
         RELEASE.with(|slot| {
             *slot.borrow_mut() = Some(ReleaseFixture {
-                identity: release_trust::parse_manifest_identity(&manifest, "v9.9.9").unwrap(),
+                identity: release_trust::parse_manifest_identity(&manifest, &tag).unwrap(),
                 manifest: serde_json::to_vec(&manifest).unwrap(),
                 local,
                 asset_url: Url::parse("http://127.0.0.1:1/unused").unwrap(),
@@ -154,14 +162,15 @@ impl Scenario {
                 attestations: Vec::new(),
             });
         });
+        let manifest_url = format!(
+            "https://github.com/whshang/herdr-mcp/releases/download/{tag}/runtime-manifest.json"
+        );
         let values = [
             ("HERDR_MCP_CONFIG_DIR", Some(root.as_os_str())),
             ("HERDR_MCP_INSTANCE", None),
             (
                 "HERDR_MCP_UPDATE_MANIFEST_URL",
-                Some(std::ffi::OsStr::new(
-                    "https://github.com/whshang/herdr-mcp/releases/download/v9.9.9/runtime-manifest.json",
-                )),
+                Some(std::ffi::OsStr::new(manifest_url.as_str())),
             ),
         ];
         let previous_env = values
@@ -455,4 +464,56 @@ fn auto_cross_epoch_install_preserves_epoch_four_generation_for_single_use_rollb
     );
     assert_eq!(fs::read(previous_binary).unwrap(), previous_bytes);
     assert!(state.latest_ready_service_rollback().unwrap().is_none());
+}
+
+/// Scheduled path: a Stable release behind the installed runtime (the rc
+/// install case in #824) is a successful no-op, never a refused downgrade.
+#[test]
+fn auto_skips_stable_release_older_than_installed_runtime() {
+    let _guard = crate::test_env::lock();
+    let scenario = Scenario::with_version("1.0.5", |_| {}, false);
+    assert!(
+        current_version().unwrap() > Version::parse("1.0.5").unwrap(),
+        "the installable fixture release must be older than this runtime"
+    );
+
+    assert_eq!(scenario.run_auto().unwrap(), ExitCode::SUCCESS);
+
+    // No mutation: no staged candidate, no durable job, no detached worker.
+    assert!(!scenario.root.join("update").exists());
+    assert!(!scenario.root.join("worker-argv").exists());
+    let paths = RuntimePaths::discover().unwrap();
+    let store = UpdateStore::open(&paths).unwrap();
+    assert!(store.active_update_job().unwrap().is_none());
+    assert!(store.latest_update_job().unwrap().is_none());
+}
+
+/// The scheduled branch prints exactly this record (exit 0, no downgrade).
+#[test]
+fn scheduled_downgrade_records_a_skip_with_stable_older_than_current() {
+    let current = Version::parse("1.1.0-rc.10").unwrap();
+    let release = Version::parse("1.0.5").unwrap();
+    let record = auto_downgrade_skip_record(UpdateChannel::Stable, &current, &release, "v1.0.5");
+    assert_eq!(record["ok"], json!(true));
+    assert_eq!(record["code"], "auto_update_skipped");
+    assert_eq!(record["reason"], "stable_older_than_current");
+    assert_eq!(record["network_checked"], json!(true));
+    assert_eq!(record["update_queued"], json!(false));
+    assert_eq!(record["update_channel"], "stable");
+    assert_eq!(record["current_version"], "1.1.0-rc.10");
+    assert_eq!(record["release_version"], "1.0.5");
+    assert_eq!(record["tag"], "v1.0.5");
+}
+
+/// Manual `update apply` keeps refusing the downgrade with an error.
+#[test]
+fn manual_apply_still_refuses_downgrade_to_older_stable_release() {
+    let _guard = crate::test_env::lock();
+    let scenario = Scenario::with_version("1.0.5", |_| {}, false);
+
+    let error = apply_inner(None, false, None, false, false).unwrap_err();
+    assert!(error.contains("refusing downgrade"), "{error}");
+    assert!(error.contains("1.0.5"), "{error}");
+    assert!(!scenario.root.join("update").exists());
+    assert!(!scenario.root.join("worker-argv").exists());
 }
