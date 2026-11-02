@@ -133,9 +133,17 @@ agent manifests, session/worktree binding, provider/session identity, `herdr_ref
 `labels` (free-form, never interpreted) and `parent` (the terminal that started it) instead —
 neither carries identity that herdr-mcp's WebChat binding or continuity could anchor to.
 
-Score: **6 equivalent (3 observed-adjacent, all `file.*` schema-only), 8 partial, 5 none** out of the
-18 tools — before counting the missing workspace/tab/pane/agent object graph that most of the partial
-rows depend on.
+Score across the 18 rows above: **3 equivalent** (`herdr_fs_read`, `herdr_fs_edit`, `herdr_fs_write`
+— all `file.*`, schema/help only, none executed by this spike), **9 partial** (`herdr_methods`,
+`herdr_inspect`, `herdr_call`, `herdr_since`, `herdr_exec`, `herdr_exec_start`, `herdr_exec_read`,
+`herdr_exec_kill`, `herdr_prompt`), **6 none** (`herdr_fs_list`, `herdr_fs_grep`, `herdr_fs_image`,
+`herdr_fs_patch`, `herdr_git`, `herdr_skill`).
+
+Of the six `none` rows, five are lost capability and one is not: `herdr_skill` has no hc mapping
+because it is runtime-independent (it bootstraps herdr-mcp's own documentation), so it works on any
+backend and its `none` verdict costs nothing. That leaves **5 of 18 tools genuinely unservable by
+hc**. Either way the score is before counting the missing workspace/tab/pane/agent object graph that
+most of the partial rows depend on.
 
 ---
 
