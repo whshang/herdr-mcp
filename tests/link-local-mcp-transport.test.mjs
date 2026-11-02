@@ -120,7 +120,7 @@ test("constructor: loopback guard accepts 127.x/localhost/[::1] and rejects LAN"
   new LocalMcpRuntimeTransport(opts({ endpoint: "http://192.168.1.5:8772/mcp", allowNonLoopback: true }));
 });
 
-test("user cannot advertise a foreign execution epoch | Given the transport serves the current runtime contract epoch | When constructed with epoch 2, 1, or \"1\" | Then construction throws and the current epoch is accepted", () => {
+test("user cannot advertise a foreign execution epoch | Given the transport serves the current runtime contract epoch | When constructed with epoch 2 or epoch 1 | Then construction throws and the current epoch is accepted", () => {
   assert.throws(() => new LocalMcpRuntimeTransport(opts({ endpoint: "ws://127.0.0.1:8772/mcp" })));
   assert.throws(() => new LocalMcpRuntimeTransport(opts({ endpoint: "not a url" })));
   assert.throws(() => new LocalMcpRuntimeTransport(opts({ contractEpoch: 2 })));
