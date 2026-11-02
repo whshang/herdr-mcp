@@ -454,6 +454,14 @@ pub fn print_doctor(
     let authenticated_local_mcp = probe_authenticated_local_mcp(config.runtime_port);
     let standalone_browser = crate::standalone_extension::doctor_report();
     let local_agent_skill = crate::local_agent_skill::status_summary();
+    // #834: the durable continuity journal is what ChatGPT 接力 needs. UAT could
+    // only see its absence by querying state.db by hand, so doctor reports the
+    // last journal write here. Read-only: doctor never creates or migrates state.
+    let continuity_state_dir = std::env::var_os("HERDR_MCP_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths.config_dir.clone());
+    let continuity_journal =
+        crate::state_store::probe_continuity_journal(&continuity_state_dir.join("state.db"));
     // Read-only herdr-core / Herdr app detection (#765) and WebChat grant
     // snapshot (#772). Neither affects Result.
     let herdr_core = crate::herdr_core::probe();
@@ -647,6 +655,7 @@ pub fn print_doctor(
         "LAYER webchat-grants-summary {}",
         crate::webchat_grants::summary_line(&webchat_grants, language)
     );
+    println!("{}", continuity_journal_layer(&continuity_journal));
     println!("{}", webchat_grants.doctor_line(language));
     let remote = print_layer_ownership(paths, config, &report, verbose);
     println!(
@@ -686,6 +695,7 @@ pub fn print_doctor(
         "herdr_core": crate::herdr_core::probe_json(&herdr_core),
         "warnings": crate::herdr_core::warnings_json(&herdr_core),
         "webchat_grants": webchat_grants.as_json(),
+        "continuity_journal": continuity_journal_json(&continuity_journal),
         "overall": readiness.as_str(),
     });
     println!("DOCTOR_JSON {doctor_json}");
@@ -976,6 +986,66 @@ fn unix_now_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
         .unwrap_or(0)
+}
+
+/// #834: one doctor line for the durable continuity journal.
+///
+/// Only a live probe can show a stalled journal (the observed UAT symptom was
+/// "no continuity write for weeks"), so the last write time is always reported
+/// instead of being folded into a pass/fail check. A missing or unreadable state
+/// database stays a non-fatal `unknown`/`none`: doctor must not rewrite state.
+fn continuity_journal_layer(
+    probe: &Result<Option<crate::state_store::ContinuityJournalProbe>, String>,
+) -> String {
+    match probe {
+        Ok(Some(probe)) => format!(
+            "LAYER continuity-journal last_write={} last_bind={} turns={} chains={}",
+            continuity_journal_timestamp(probe.last_turn_at),
+            continuity_journal_timestamp(probe.last_binding_at),
+            probe.turn_count,
+            probe.chain_count,
+        ),
+        Ok(None) => {
+            "LAYER continuity-journal last_write=none turns=0 chains=0 reason=state_database_missing"
+                .to_owned()
+        }
+        // The underlying error can name a filesystem path, so the layer reports
+        // the condition and `DOCTOR_JSON` carries no free-form detail.
+        Err(_) => {
+            "LAYER continuity-journal last_write=unknown reason=state_database_unreadable"
+                .to_owned()
+        }
+    }
+}
+
+fn continuity_journal_json(
+    probe: &Result<Option<crate::state_store::ContinuityJournalProbe>, String>,
+) -> Value {
+    match probe {
+        Ok(Some(probe)) => json!({
+            "state": "observed",
+            "last_write_at": probe.last_turn_at,
+            "last_bind_at": probe.last_binding_at,
+            "turns": probe.turn_count,
+            "chains": probe.chain_count,
+        }),
+        Ok(None) => json!({"state": "absent"}),
+        Err(_) => json!({"state": "unreadable"}),
+    }
+}
+
+fn continuity_journal_timestamp(at_ms: Option<i64>) -> String {
+    let Some(at_ms) = at_ms else {
+        return "none".to_owned();
+    };
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at_ms) * 1_000_000)
+        .ok()
+        .and_then(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn format_herdr_layer(paths: &RuntimePaths, report: &StatusReport) -> String {
@@ -2009,6 +2079,41 @@ mod tests {
         assert!(layer.contains("link_loaded=true"));
         assert!(layer.contains("production_ready_eligible=true"));
         assert!(!layer.contains("production_owner=absent"));
+    }
+
+    /// user can see a stalled continuity journal | Given the doctor probe input
+    /// | When the layer and JSON are rendered | Then the last journal write time
+    /// is visible, and an unreadable/missing database never fails doctor nor
+    /// leaks a filesystem error.
+    #[test]
+    fn continuity_journal_doctor_layer_reports_last_write_and_never_leaks_errors() {
+        let observed = Ok(Some(crate::state_store::ContinuityJournalProbe {
+            last_turn_at: Some(1_700_000_123_456),
+            last_binding_at: Some(1_699_999_000_000),
+            turn_count: 318,
+            chain_count: 9,
+        }));
+        let layer = continuity_journal_layer(&observed);
+        assert!(
+            layer.starts_with("LAYER continuity-journal last_write=2023-11-14T22:15:23.456Z"),
+            "{layer}"
+        );
+        assert!(layer.contains("turns=318"));
+        assert!(layer.contains("chains=9"));
+        assert_eq!(
+            continuity_journal_json(&observed)["last_write_at"],
+            1_700_000_123_456_i64
+        );
+
+        assert!(
+            continuity_journal_layer(&Ok(None)).contains("last_write=none"),
+            "a missing database is reported, not created"
+        );
+        let unreadable = Err("cannot read continuity journal: /Users/secret/state.db".to_owned());
+        let layer = continuity_journal_layer(&unreadable);
+        assert!(layer.contains("last_write=unknown"));
+        assert!(!layer.contains("state.db"), "the layer never echoes a path");
+        assert_eq!(continuity_journal_json(&unreadable)["state"], "unreadable");
     }
 
     #[test]

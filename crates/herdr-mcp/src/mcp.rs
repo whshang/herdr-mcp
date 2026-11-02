@@ -684,6 +684,84 @@ fn agent_task_dispatch_parent_session(
     }
 }
 
+/// #834: attach the durable continuity chain that owns the conversation a
+/// successfully bound dispatch belongs to.
+///
+/// Before this, only an explicit HUD/panel bind created `continuity_chains` /
+/// `continuity_bindings`, so `/extension/continuity/resolve` answered
+/// `continuity_not_found` for every conversation bound through
+/// `agent.task.dispatch` (including the #786 late-bind path, whose first turn is
+/// reported before the session exists). With #812 gating 接力 on that resolve,
+/// handoff was therefore disabled almost everywhere.
+///
+/// Best-effort by contract: the dispatch already succeeded, so a missing
+/// locator, an unregistered session, or a failed attach never fails, retries or
+/// rewrites the dispatch result. The attach itself is idempotent, so a repeated
+/// dispatch of the same conversation reuses the same chain instead of creating a
+/// second one. `parent_session` in the result is unchanged: this only adds
+/// durable continuity state and never reports delivery evidence.
+fn attach_dispatch_continuity(context: &RuntimeContext<'_>, session_ref: &str, result: &Value) {
+    // Only a dispatch that actually produced a task may attach durable
+    // continuity: a refused or failed dispatch never bound this conversation to
+    // the workspace, even when its error payload carries task-shaped fields.
+    if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    // A task without a durable workspace column has no Herdr workspace binding
+    // to attach; deriving one from the requested target string would bind the
+    // conversation to a workspace the task itself does not record.
+    let Some(workspace_id) = result
+        .pointer("/task/workspace_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Ok(mut store) = context.state_store.lock() else {
+        return;
+    };
+    let Ok(Some(locator)) = store.browser_resource_locator(session_ref) else {
+        return;
+    };
+    let Ok(Some(session)) = store.browser_resource(session_ref) else {
+        return;
+    };
+    let Ok(account_ref) = browser_resource_account_ref(&store, &session) else {
+        return;
+    };
+    // A session's parent is its Project space when one exists, otherwise the
+    // account itself, so the space binding stays typed instead of guessed.
+    let space_ref = match session.parent_ref.as_deref() {
+        Some(parent_ref) if parent_ref != account_ref.as_str() => Some(parent_ref),
+        _ => None,
+    };
+    // The provider-native conversation id is the identity the extension resolves
+    // and hands off with; the canonical URL is the journal's fallback identity for
+    // providers whose URL shape the runtime cannot parse. Bind both so either
+    // lookup reaches the same chain.
+    let conversation = browser_conversation_url_ref(&locator.canonical_url)
+        .ok()
+        .flatten();
+    let conversation_id = conversation
+        .as_ref()
+        .map(|value| value.conversation_id.clone())
+        .unwrap_or_else(|| locator.canonical_url.clone());
+    let project_id = conversation.and_then(|value| value.project_id);
+    let _ = store.attach_continuity_for_conversation(crate::state_store::ContinuityAttachInput {
+        conversation_id: &conversation_id,
+        conversation_aliases: &[locator.canonical_url.as_str()],
+        provider: Some(session.provider.as_str()),
+        account_ref: Some(account_ref.as_str()),
+        space_ref,
+        session_ref: Some(session_ref),
+        workspace_id: Some(workspace_id),
+        project_id: project_id.as_deref(),
+        title: session.display_label.as_deref(),
+        observed_at: browser_epoch_ms(),
+    });
+}
+
 pub trait BrowserActuator: Send + Sync {
     fn actuate(
         &self,
@@ -1022,6 +1100,11 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &prompt_params,
                     parent_session_ref.as_deref(),
                 );
+                // #834: a durable dispatch binding also owns a durable continuity
+                // chain, so 接力 works without a separate explicit panel bind.
+                if let Some(session_ref) = parent_session_ref.as_deref() {
+                    attach_dispatch_continuity(context, session_ref, &result);
+                }
                 let diagnostic = source_turn_unbound_diagnostic(context, &binding, &params);
                 if let Some(fact) = agent_task_parent_session_fact(&binding, &result, diagnostic)
                     && let Some(object) = result.as_object_mut()

@@ -4896,5 +4896,152 @@ console.log("\n[Held source turn replays with the legacy payload on a Runtime wi
   await sleep(50);
 }
 
+console.log("\n[#834 dispatch-bound conversations journal into the Runtime-owned chain]");
+{
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const priorPersistence = mockContinuityPersistenceEnabled;
+  const priorCanonicalId = mockContinuityCanonicalId;
+  const priorByConversation = new Map(mockContinuityByConversation);
+  mockContinuityPersistenceEnabled = true;
+  mockContinuityCanonicalId = null;
+  try {
+    // A conversation bound only through agent.task.dispatch: the Runtime owns the
+    // chain, the extension holds no panel binding for it.
+    const boundConv = "https://chatgpt.com/c/834-dispatch-bound";
+    const boundConversationId = "834-dispatch-bound";
+    const runtimeChain = "hc:runtime-owned-834";
+    mockContinuityChains.add(runtimeChain);
+    mockContinuityByConversation.set(boundConversationId, runtimeChain);
+    ok(!Object.values(storage.herdrWakeBindings || {}).some((b) => b?.convKey === boundConv || b?.binding_key === boundConv),
+      "user's dispatch-bound conversation has no local panel binding | Given a conversation bound through agent.task.dispatch | When the extension inspects its bindings | Then no explicit HUD/panel binding exists for it",
+      JSON.stringify(Object.keys(storage.herdrWakeBindings || {})));
+
+    let resolveBoundStart;
+    const boundStartP = new Promise((r) => { resolveBoundStart = r; });
+    onMsg({
+      type: "h2w_turn_started",
+      convKey: boundConv,
+      startedAt: 1700000000100,
+      userText: "用 dispatch 派到工作区",
+    }, { tab: { id: 646, url: boundConv } }, (r) => resolveBoundStart(r));
+    const boundStart = await boundStartP;
+    ok(boundStart?.ok === true && boundStart?.durable === true,
+      "user's turn is journaled for a dispatch-bound conversation | Given a conversation whose durable chain exists only in the Runtime | When the first turn starts | Then the journal persists it durably instead of answering continuity_unbound",
+      JSON.stringify(boundStart));
+    const boundStartTurn = continuityTurnRequests.at(-1);
+    ok(boundStartTurn?.continuity_id === runtimeChain
+        && boundStartTurn?.role === "user"
+        && boundStartTurn?.text === "用 dispatch 派到工作区",
+      "user's turn joins the Runtime-owned chain | Given the Runtime resolves this conversation to its own chain | When the journal appends the turn | Then it uses that continuity_id",
+      JSON.stringify(boundStartTurn));
+    ok(boundStartTurn?.conversation_id === boundConversationId,
+      "user's turn carries the provider conversation identity | Given a ChatGPT turn without a page-supplied conversation id | When the journal appends it | Then the durable turn uses the provider conversation id rather than the conversation URL, so a handoff packet accepts the chain as its source",
+      JSON.stringify(boundStartTurn));
+
+    const resolveCountAfterStart = continuityResolveRequests.length;
+    let resolveBoundEnd;
+    const boundEndP = new Promise((r) => { resolveBoundEnd = r; });
+    onMsg({
+      type: "h2w_turn_ended",
+      convKey: boundConv,
+      startedAt: 1700000000100,
+      endedAt: 1700000009000,
+      userText: "用 dispatch 派到工作区",
+      assistantText: "已完成派发。",
+    }, { tab: { id: 646, url: boundConv } }, (r) => resolveBoundEnd(r));
+    await boundEndP;
+    const endedTurns = continuityTurnRequests.slice(-2);
+    ok(endedTurns.length === 2
+        && endedTurns[0]?.role === "user"
+        && endedTurns[1]?.role === "assistant"
+        && endedTurns.every((row) => row?.continuity_id === runtimeChain),
+      "user's finished turn gives a handoff content | Given the same dispatch-bound conversation | When the assistant reply settles | Then both sides are journaled into the same Runtime-owned chain",
+      JSON.stringify(endedTurns));
+    ok(continuityResolveRequests.length === resolveCountAfterStart,
+      "user pays for at most one chain lookup per conversation | Given a resolved durable chain | When the next turn of the same conversation journals | Then the cached owner is reused instead of probing the Runtime again",
+      JSON.stringify(continuityResolveRequests.slice(resolveCountAfterStart)));
+
+    // #812 stays intact for a conversation that really has no durable chain.
+    const unboundConv = "https://chatgpt.com/c/834-truly-unbound";
+    const unboundConversationId = "834-truly-unbound";
+    const turnRequestsBeforeUnbound = continuityTurnRequests.length;
+    let resolveUnbound;
+    const unboundP = new Promise((r) => { resolveUnbound = r; });
+    onMsg({
+      type: "h2w_turn_started",
+      convKey: unboundConv,
+      startedAt: 1700000000200,
+      userText: "没有任何工作区绑定",
+    }, { tab: { id: 647, url: unboundConv } }, (r) => resolveUnbound(r));
+    const unbound = await unboundP;
+    ok(unbound?.ok === false && unbound?.error === "continuity_unbound",
+      "user keeps the honest continuity gate for a truly unbound conversation | Given a conversation with no durable chain and no local binding | When a turn starts | Then the journal still reports continuity_unbound instead of fabricating a chain",
+      JSON.stringify(unbound));
+    ok(continuityTurnRequests.length === turnRequestsBeforeUnbound,
+      "user's unbound conversation writes nothing | Given no durable chain | When the turn is rejected | Then no continuity turn is posted",
+      JSON.stringify(continuityTurnRequests.slice(turnRequestsBeforeUnbound)));
+    const unboundResolveBodies = continuityResolveRequests.slice(-2);
+    ok(unboundResolveBodies.length === 2
+        && unboundResolveBodies[0]?.conversation_id === unboundConversationId
+        && unboundResolveBodies[1]?.conversation_id === unboundConv,
+      "user's unbound lookup is bounded | Given a conversation the Runtime does not own | When the journal asks for its chain | Then it tries the provider conversation id and the canonical URL once each",
+      JSON.stringify(unboundResolveBodies));
+    // The real ordering is turn_started (no chain yet) -> the Runtime attaches
+    // the chain on dispatch -> turn_ended. A cached miss would drop both sides of
+    // that same round, so the miss must be re-probed.
+    const attachedChain = "hc:attached-on-dispatch-834";
+    mockContinuityChains.add(attachedChain);
+    mockContinuityByConversation.set(unboundConversationId, attachedChain);
+    const turnRequestsBeforeAttachedEnd = continuityTurnRequests.length;
+    const resolveCountBeforeAttachedEnd = continuityResolveRequests.length;
+    let resolveAttachedEnd;
+    const attachedEndP = new Promise((r) => { resolveAttachedEnd = r; });
+    onMsg({
+      type: "h2w_turn_ended",
+      convKey: unboundConv,
+      startedAt: 1700000000300,
+      endedAt: 1700000000900,
+      userText: "没有任何工作区绑定",
+      assistantText: "已在工作区完成。",
+    }, { tab: { id: 647, url: unboundConv } }, (r) => resolveAttachedEnd(r));
+    await attachedEndP;
+    ok(continuityResolveRequests.length > resolveCountBeforeAttachedEnd,
+      "user's miss is re-probed after a dispatch attaches the chain | Given a conversation whose earlier journal lookup missed | When the turn finishes after the Runtime attached the chain | Then the journal probes again instead of reusing the cached miss",
+      JSON.stringify(continuityResolveRequests.slice(resolveCountBeforeAttachedEnd)));
+    const attachedTurns = continuityTurnRequests.slice(turnRequestsBeforeAttachedEnd);
+    ok(attachedTurns.length === 2
+        && attachedTurns.every((row) => row?.continuity_id === attachedChain),
+      "user's same-round turn is journaled once the chain exists | Given the chain attached between turn start and turn end | When the finalized turn is journaled | Then both sides land on that chain so a handoff has content",
+      JSON.stringify(attachedTurns));
+
+    // A Runtime that cannot answer is not evidence that the chain is missing:
+    // the turn stays journaled-incomplete and nothing is invented.
+    const transportResolveBefore = continuityResolveRequests.length;
+    mockContinuityResolveTransportFails = true;
+    let resolveTransport;
+    const transportP = new Promise((r) => { resolveTransport = r; });
+    onMsg({
+      type: "h2w_turn_started",
+      convKey: "https://chatgpt.com/c/834-transport",
+      startedAt: 1700000000400,
+      userText: "Runtime 不可达",
+    }, { tab: { id: 648, url: "https://chatgpt.com/c/834-transport" } }, (r) => resolveTransport(r));
+    const transport = await transportP;
+    ok(transport?.ok === false && transport?.error === "continuity_unbound",
+      "user is never given a fabricated chain when the Runtime is unreachable",
+      JSON.stringify(transport));
+    ok(continuityResolveRequests.length === transportResolveBefore + 1,
+      "user's transport failure is not cached as a missing chain | Given an unreachable Runtime | When the journal looks up the chain | Then only one bounded probe runs",
+      JSON.stringify(continuityResolveRequests.slice(transportResolveBefore)));
+    await sleep(20);
+  } finally {
+    mockContinuityPersistenceEnabled = priorPersistence;
+    mockContinuityCanonicalId = priorCanonicalId;
+    mockContinuityResolveTransportFails = false;
+    mockContinuityByConversation.clear();
+    for (const [key, value] of priorByConversation) mockContinuityByConversation.set(key, value);
+  }
+}
+
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);
 process.exit(failures === 0 ? 0 : 1);
