@@ -35,7 +35,8 @@ use std::process::ExitCode;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -56,6 +57,10 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(45);
 const METADATA_FETCH_ATTEMPTS: usize = 2;
 const METADATA_RETRY_DELAY: Duration = Duration::from_millis(750);
 const MAX_REDIRECTS: usize = 5;
+/// The only host that may receive the optional operator GitHub token.
+const GITHUB_API_HOST: &str = "api.github.com";
+/// Stable error code for an exhausted GitHub API rate limit.
+const GITHUB_RATE_LIMITED_CODE: &str = "github_rate_limited";
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const DOWNLOAD_PROGRESS_STEP_PERCENT: u64 = 5;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2168,8 +2173,8 @@ fn download_asset<W: Write>(
     let url = scheduled_tests::asset_url(&asset.url);
     #[cfg(not(test))]
     let url = asset.url.clone();
-    let mut response = client
-        .get(url)
+    let token = github_api_token();
+    let mut response = authorized_get(client, &url, token.as_deref())
         .send()
         .map_err(|error| format!("release asset download failed: {}", error_kind(&error)))?;
     validate_response(&response)?;
@@ -2432,8 +2437,9 @@ fn fetch_bounded_with_retry(
     retry_delay: Duration,
 ) -> Result<Vec<u8>, String> {
     let attempts = attempts.max(1);
+    let token = github_api_token();
     for attempt_index in 0..attempts {
-        let mut response = match client.get(url.clone()).send() {
+        let mut response = match authorized_get(client, &url, token.as_deref()).send() {
             Ok(response) => response,
             Err(error) => {
                 let retryable = error.is_timeout() || error.is_connect();
@@ -2478,8 +2484,8 @@ fn verify_artifact_attestation(
         return result;
     }
     let url = release_trust::attestation_api_url(sha256)?;
-    let mut response = client
-        .get(url)
+    let token = github_api_token();
+    let mut response = authorized_get(client, &url, token.as_deref())
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
@@ -2510,14 +2516,19 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 fn update_client() -> Result<Client, String> {
+    update_client_with_github_auth(github_api_token().is_some())
+}
+
+fn update_client_with_github_auth(github_auth_configured: bool) -> Result<Client, String> {
     Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
         .user_agent(format!("herdr-mcp-updater/{}", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error("too many update redirects");
             }
-            if update_redirect_allowed(attempt.url()) {
+            let previous = attempt.previous().last();
+            if update_redirect_allowed(previous, attempt.url(), github_auth_configured) {
                 attempt.follow()
             } else {
                 attempt.stop()
@@ -2527,17 +2538,146 @@ fn update_client() -> Result<Client, String> {
         .map_err(|error| format!("cannot create update HTTP client: {error}"))
 }
 
+/// The optional operator token used to lift GitHub's anonymous API quota.
+///
+/// It is read from `GH_TOKEN` first, then `GITHUB_TOKEN`, and only a non-empty
+/// value is used. The value is never logged, printed, embedded in an error, or
+/// exposed through `Debug`/doctor output: it only ever reaches
+/// [`authorized_get`], which attaches it to `api.github.com` requests.
+fn github_api_token() -> Option<String> {
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        let Ok(value) = env::var(name) else {
+            continue;
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+/// True only for the exact GitHub API origin: HTTPS, `api.github.com`, no
+/// userinfo. Lookalike hosts (`api.github.com.example.test`), HTTP, and other
+/// GitHub hosts (release assets, `objects.githubusercontent.com`) are excluded
+/// so the operator token can never leak to them.
+fn github_api_auth_allowed(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(GITHUB_API_HOST))
+}
+
+fn authorized_get(
+    client: &Client,
+    url: &Url,
+    token: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    let request = client.get(url.clone());
+    match token
+        .filter(|_| github_api_auth_allowed(url))
+        .and_then(sensitive_bearer_header)
+    {
+        Some(value) => request.header(reqwest::header::AUTHORIZATION, value),
+        None => request,
+    }
+}
+
+/// Marks the bearer header sensitive so the value is redacted ("Sensitive")
+/// even if a request is ever formatted with `Debug`.
+fn sensitive_bearer_header(token: &str) -> Option<reqwest::header::HeaderValue> {
+    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+    value.set_sensitive(true);
+    Some(value)
+}
+
 fn validate_response(response: &Response) -> Result<(), String> {
     if !update_url_allowed(response.url()) {
         return Err("release download redirected to a disallowed URL".to_owned());
     }
     if !response.status().is_success() {
-        return Err(format!(
-            "release download returned HTTP {}",
-            response.status().as_u16()
-        ));
+        let status = response.status().as_u16();
+        if let Some(error) = github_rate_limit_error(
+            status,
+            header_str(response, "x-ratelimit-remaining"),
+            header_str(response, "x-ratelimit-reset"),
+            header_str(response, "retry-after"),
+            now_unix_seconds(),
+        ) {
+            return Err(error);
+        }
+        return Err(format!("release download returned HTTP {status}"));
     }
     Ok(())
+}
+
+fn header_str<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Maps GitHub's unauthenticated quota exhaustion to one distinct, actionable
+/// error instead of a generic `HTTP 403`.
+///
+/// A primary rate limit reports `403` (or `429`) with `x-ratelimit-remaining: 0`
+/// plus `x-ratelimit-reset`; a secondary limit reports `429` or a `retry-after`
+/// header. Every other `403` keeps the previous generic message.
+fn github_rate_limit_error(
+    status: u16,
+    remaining: Option<&str>,
+    reset_unix: Option<&str>,
+    retry_after: Option<&str>,
+    now_unix: i64,
+) -> Option<String> {
+    if status != 403 && status != 429 {
+        return None;
+    }
+    let quota_exhausted = remaining.map(str::trim) == Some("0");
+    if !quota_exhausted && status != 429 && retry_after.is_none() {
+        return None;
+    }
+    let reset_at = reset_unix
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            retry_after
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|value| *value >= 0)
+                .map(|seconds| now_unix.saturating_add(seconds))
+        })
+        .and_then(unix_seconds_rfc3339);
+    let hint = "set GH_TOKEN or GITHUB_TOKEN to raise the GitHub API limit, or retry later";
+    Some(match reset_at {
+        Some(reset_at) => format!(
+            "{GITHUB_RATE_LIMITED_CODE}: GitHub API rate limit exhausted (HTTP {status}), resets at {reset_at}; {hint}"
+        ),
+        None => format!(
+            "{GITHUB_RATE_LIMITED_CODE}: GitHub API rate limit exhausted (HTTP {status}); {hint}"
+        ),
+    })
+}
+
+fn now_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn unix_seconds_rfc3339(seconds: i64) -> Option<String> {
+    time::OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()
+        .and_then(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
 }
 
 fn parse_update_url(raw: &str) -> Result<Url, String> {
@@ -2561,8 +2701,23 @@ fn update_url_allowed(url: &Url) -> bool {
     loopback_host(url.host_str())
 }
 
-fn update_redirect_allowed(url: &Url) -> bool {
+fn update_redirect_allowed(
+    previous: Option<&Url>,
+    url: &Url,
+    github_auth_configured: bool,
+) -> bool {
     if !update_url_allowed(url) {
+        return false;
+    }
+    // The operator token is attached only to `api.github.com` requests. Refuse
+    // any redirect that would carry the request off that host (including onto a
+    // loopback host) so a token can never reach a release-asset, lookalike, or
+    // local address, even if the transport stops stripping sensitive headers on
+    // cross-host redirects.
+    if github_auth_configured
+        && previous.is_some_and(github_api_auth_allowed)
+        && !github_api_auth_allowed(url)
+    {
         return false;
     }
     if loopback_host(url.host_str()) {
@@ -2572,7 +2727,7 @@ fn update_redirect_allowed(url: &Url) -> bool {
         url.host_str().map(|host| host.to_ascii_lowercase()),
         Some(host)
             if host == "github.com"
-                || host == "api.github.com"
+                || host == GITHUB_API_HOST
                 || host == "objects.githubusercontent.com"
                 || host == "release-assets.githubusercontent.com"
     )
@@ -3866,17 +4021,176 @@ mod tests {
         assert!(parse_update_url("https://user:pass@example.com/manifest.json").is_err());
         assert!(parse_update_url("file:///tmp/manifest.json").is_err());
         assert!(update_redirect_allowed(
-            &Url::parse("https://release-assets.githubusercontent.com/a/b").unwrap()
+            None,
+            &Url::parse("https://release-assets.githubusercontent.com/a/b").unwrap(),
+            false
         ));
         assert!(update_redirect_allowed(
-            &Url::parse("https://objects.githubusercontent.com/a/b").unwrap()
+            None,
+            &Url::parse("https://objects.githubusercontent.com/a/b").unwrap(),
+            false
         ));
         assert!(update_redirect_allowed(
-            &Url::parse("http://127.0.0.1:9000/artifact").unwrap()
+            None,
+            &Url::parse("http://127.0.0.1:9000/artifact").unwrap(),
+            false
         ));
         assert!(!update_redirect_allowed(
-            &Url::parse("https://example.com/artifact").unwrap()
+            None,
+            &Url::parse("https://example.com/artifact").unwrap(),
+            false
         ));
+    }
+
+    #[test]
+    fn github_token_is_attached_only_to_the_exact_api_origin() {
+        let client = Client::builder().build().unwrap();
+        let request = |raw: &str| {
+            authorized_get(&client, &Url::parse(raw).unwrap(), Some("ghp_test_token"))
+                .build()
+                .unwrap()
+        };
+        let api = request("https://api.github.com/repos/whshang/herdr-mcp/releases");
+        let header = api.headers().get(reqwest::header::AUTHORIZATION).unwrap();
+        assert_eq!(header.to_str().unwrap(), "Bearer ghp_test_token");
+        assert!(header.is_sensitive());
+        for anonymous in [
+            "https://objects.githubusercontent.com/a/b",
+            "https://release-assets.githubusercontent.com/a/b",
+            "https://github.com/whshang/herdr-mcp/releases/download/v1/x",
+            "https://api.github.com.example.test/releases",
+            "https://sub.api.github.com/releases",
+            "http://api.github.com/repos/whshang/herdr-mcp/releases",
+            "https://API.github.com.example.test/releases",
+            "https://[::1]/releases",
+        ] {
+            assert!(
+                !request(anonymous)
+                    .headers()
+                    .get_all(reqwest::header::AUTHORIZATION)
+                    .into_iter()
+                    .any(|value| value
+                        .to_str()
+                        .is_ok_and(|value| value.contains("ghp_test_token"))),
+                "github token leaked to {anonymous}"
+            );
+        }
+        // A URL carrying credentials never receives the operator token either.
+        assert!(
+            !request("https://user:pass@api.github.com/releases")
+                .headers()
+                .get_all(reqwest::header::AUTHORIZATION)
+                .into_iter()
+                .any(|value| value
+                    .to_str()
+                    .is_ok_and(|value| value.contains("ghp_test_token")))
+        );
+        assert!(
+            authorized_get(
+                &client,
+                &Url::parse("https://api.github.com/releases").unwrap(),
+                None
+            )
+            .build()
+            .unwrap()
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .is_none()
+        );
+        // The header is marked sensitive, so even Debug formatting a request
+        // redacts it instead of printing the operator token.
+        assert!(!format!("{api:?}").contains("ghp_test_token"));
+    }
+
+    #[test]
+    fn github_api_redirect_never_carries_the_token_off_the_api_host() {
+        let api = Url::parse("https://api.github.com/repos/a/b/releases").unwrap();
+        let asset = Url::parse("https://objects.githubusercontent.com/a/b").unwrap();
+        let home = Url::parse("https://github.com/a/b").unwrap();
+        let loopback = Url::parse("http://127.0.0.1:9000/a/b").unwrap();
+        // With a token configured, a redirect off api.github.com is refused even
+        // though the target host is on the ordinary download/loopback allowlist.
+        assert!(!update_redirect_allowed(Some(&api), &asset, true));
+        assert!(!update_redirect_allowed(Some(&api), &home, true));
+        assert!(!update_redirect_allowed(Some(&api), &loopback, true));
+        assert!(update_redirect_allowed(Some(&api), &api, true));
+        // Anonymous requests keep the previous redirect behavior.
+        assert!(update_redirect_allowed(Some(&api), &asset, false));
+        assert!(update_redirect_allowed(Some(&api), &loopback, false));
+        assert!(update_redirect_allowed(Some(&home), &asset, true));
+    }
+
+    #[test]
+    fn exhausted_github_rate_limit_maps_to_one_actionable_error() {
+        let reset_unix = "1761742080";
+        let message = github_rate_limit_error(403, Some("0"), Some(reset_unix), None, 0).unwrap();
+        assert!(message.starts_with("github_rate_limited: "));
+        assert!(message.contains("HTTP 403"));
+        assert!(
+            message.contains("resets at 2025-10-29T12:48:00Z"),
+            "{message}"
+        );
+        assert!(message.contains("GH_TOKEN"));
+        assert!(message.contains("GITHUB_TOKEN"));
+
+        // 429 and retry-after are rate limits even without a zeroed budget.
+        let limited = github_rate_limit_error(429, None, None, Some("60"), 1_000).unwrap();
+        assert!(limited.contains("HTTP 429"));
+        assert!(
+            limited.contains("resets at 1970-01-01T00:17:40Z"),
+            "{limited}"
+        );
+        assert!(github_rate_limit_error(403, Some("7"), None, Some("30"), 0).is_some());
+        // A rate-limit signal without a reset still names the code and the hint.
+        let bare = github_rate_limit_error(429, None, None, None, 0).unwrap();
+        assert!(bare.starts_with("github_rate_limited: "));
+        assert!(!bare.contains("resets at"));
+        assert!(bare.contains("retry later"));
+
+        // Every other 403 keeps the pre-existing generic behavior.
+        for (status, remaining, retry_after) in [
+            (403, Some("7"), None),
+            (403, None, None),
+            (401, Some("0"), None),
+            (500, Some("0"), None),
+            (404, None, Some("30")),
+        ] {
+            assert!(
+                github_rate_limit_error(status, remaining, None, retry_after, 0).is_none(),
+                "unexpected rate-limit mapping for {status}/{remaining:?}/{retry_after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limit_error_does_not_echo_the_configured_token() {
+        // The token reaches only the Authorization header. Errors are built from
+        // the status and response headers, so no configured token can appear in
+        // a message the user sees.
+        let token = "ghp_unit_test_only_token_value";
+        let client = Client::builder().build().unwrap();
+        let request = authorized_get(
+            &client,
+            &Url::parse("https://api.github.com/releases").unwrap(),
+            Some(token),
+        )
+        .build()
+        .unwrap();
+        assert!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains(token)
+        );
+        let message = github_rate_limit_error(403, Some("0"), Some("1761742080"), None, 0).unwrap();
+        assert!(!message.contains(token));
+        // The token is also absent from the only derived message the CLI prints.
+        let wrapped = update_check_indeterminate_error(&message);
+        assert!(wrapped.contains(GITHUB_RATE_LIMITED_CODE));
+        assert!(!wrapped.contains(token));
     }
 
     #[test]
