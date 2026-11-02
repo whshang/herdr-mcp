@@ -375,7 +375,11 @@ the separate fleet Worker release into the runtime result, so a Worker
 credential or reconciliation problem ended the upgrade with `ok: false` and
 `update_succeeded_worker_update_required` — even though the runtime update
 committed and its health gate passed. That is expected and it is not a failed
-upgrade. Confirm the runtime first:
+upgrade. A pre-`v1.1.0-rc.9` updater can still attempt that Worker step even
+when it is only updating the Runtime (for example `update apply --manifest
+<newer manifest>` from an older installed Runtime, on the stable or preview
+channel); the attempt is non-fatal for the Runtime, which is already updated,
+and only the separate Worker release below is left. Confirm the runtime first:
 
 ```bash
 herdr-mcp --version
