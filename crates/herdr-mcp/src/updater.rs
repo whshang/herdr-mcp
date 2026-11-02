@@ -669,6 +669,7 @@ fn auto() -> Result<ExitCode, String> {
 /// No-op record for the scheduled/automatic path when the discovered release
 /// is older than the installed runtime. It is deliberately a success result:
 /// a background job that has nothing to install must not report a failure.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn auto_downgrade_skip_record(
     channel: UpdateChannel,
     current: &Version,
@@ -689,6 +690,7 @@ fn auto_downgrade_skip_record(
     })
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn downgrade_skip_reason(channel: UpdateChannel) -> &'static str {
     match channel {
         UpdateChannel::Stable => "stable_older_than_current",
