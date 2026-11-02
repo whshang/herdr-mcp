@@ -709,13 +709,13 @@ impl ExtensionVersionReport {
     pub(crate) fn for_test(state: &'static str) -> Self {
         Self {
             state,
-            staged_version: Some("0.1.230".to_owned()),
+            staged_version: Some("0.1.240".to_owned()),
             staged_source_commit: Some("a".repeat(40)),
-            expected_version: Some("0.1.230".to_owned()),
+            expected_version: Some("0.1.240".to_owned()),
             runtime_source_commit: Some("b".repeat(40)),
             registered: vec![RegisteredExtension {
                 browser_family: "chrome".to_owned(),
-                extension_version: "0.1.229".to_owned(),
+                extension_version: "0.1.239".to_owned(),
                 last_observed_at: 1,
             }],
             reason: None,
@@ -1117,7 +1117,7 @@ fn install_snapshot(
 ) -> Result<Value, String> {
     let base = base_dir_for(home);
     let current = base.join("current");
-    fs::create_dir_all(&base).map_err(|e| format!("cannot create standalone directory: {e}"))?;
+    create_private_dir(&base).map_err(|e| format!("cannot create standalone directory: {e}"))?;
     let (staging, prepared) = write_snapshot(&base, snapshot, source)?;
 
     let had_current = current.exists();
@@ -1184,6 +1184,62 @@ fn install_snapshot(
     }))
 }
 
+/// Managed extension copies and the install state record are private to the
+/// installing user: the staged tree is a browser-readable copy of the extension
+/// bundle and `state.json` records install provenance, neither of which belongs
+/// to other local accounts. Both the CLI install and the update-time staging
+/// create every directory `0700` and every file `0600` instead of inheriting the
+/// process umask (which produced `0755`/`0644`, #833).
+const PRIVATE_DIR_MODE: u32 = 0o700;
+const PRIVATE_FILE_MODE: u32 = 0o600;
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(PRIVATE_DIR_MODE)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+/// Create a private file. `create_new` refuses to follow or overwrite anything
+/// that already exists at that path, and the mode applies at creation, so the
+/// file is never briefly readable or writable by other accounts.
+fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+}
+
+#[cfg(unix)]
+fn tighten_private_file(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+}
+
+#[cfg(not(unix))]
+fn tighten_private_file(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Download one extension tree into a fresh staging directory and verify its
 /// manifest. The staging directory is removed on any failure so nothing partial
 /// reachable from `current` is ever left behind.
@@ -1193,16 +1249,21 @@ fn write_snapshot(
     source: &dyn ExtensionSource,
 ) -> Result<(PathBuf, PreparedManifest), String> {
     let staging = base.join(format!(".staging-{}-{}", std::process::id(), now_ms()));
-    fs::create_dir_all(&staging).map_err(|e| format!("cannot create staging directory: {e}"))?;
+    create_private_dir(&staging).map_err(|e| format!("cannot create staging directory: {e}"))?;
     let prepared = (|| -> Result<PreparedManifest, String> {
         for blob in &snapshot.blobs {
             let bytes = source.fetch_blob(&snapshot.commit, blob)?;
             let target = staging.join(&blob.relative_path);
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
+                create_private_dir(parent)
                     .map_err(|e| format!("cannot create extension directory: {e}"))?;
             }
-            fs::write(&target, bytes).map_err(|e| format!("cannot write extension file: {e}"))?;
+            let mut file = create_private_file(&target)
+                .map_err(|e| format!("cannot create extension file: {e}"))?;
+            file.write_all(&bytes)
+                .map_err(|e| format!("cannot write extension file: {e}"))?;
+            file.sync_all()
+                .map_err(|e| format!("cannot sync extension file: {e}"))?;
         }
         prepare_manifest(&staging)
     })();
@@ -1404,7 +1465,7 @@ fn stage_release_extension_in(
         });
     }
     let blobs = source.list_blobs(&commit)?;
-    fs::create_dir_all(&base).map_err(|e| format!("cannot create standalone directory: {e}"))?;
+    create_private_dir(&base).map_err(|e| format!("cannot create standalone directory: {e}"))?;
     let (staging, prepared) = write_snapshot(
         &base,
         &ExtensionSnapshot {
@@ -1477,6 +1538,9 @@ fn prepare_manifest(root: &Path) -> Result<PreparedManifest, String> {
         None => inject_key(&source, key)?,
     };
     fs::write(&path, bytes).map_err(|e| format!("cannot write standalone manifest: {e}"))?;
+    // `fs::write` truncates in place, so the mode stays whatever the download
+    // created; re-assert the private mode in case a caller passed a wider file.
+    tighten_private_file(&path).map_err(|e| format!("cannot secure standalone manifest: {e}"))?;
     let verify = read_json(&path)?;
     if verify.get("key").and_then(Value::as_str) != Some(key) {
         return Err("standalone manifest key verification failed".to_owned());
@@ -2045,16 +2109,22 @@ fn atomic_json(path: &Path, value: &Value) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "state path has no parent".to_owned())?;
-    fs::create_dir_all(parent).map_err(|e| format!("cannot create state directory: {e}"))?;
+    create_private_dir(parent).map_err(|e| format!("cannot create state directory: {e}"))?;
     let tmp = parent.join(format!(".state-{}-{}.tmp", std::process::id(), now_ms()));
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    let mut file = fs::File::create(&tmp).map_err(|e| format!("cannot create state file: {e}"))?;
+    // The temporary file is created `0600` and renamed over the target, so the
+    // durable state record is never readable by another local account, and an
+    // existing looser mode is replaced instead of preserved (#833).
+    let mut file =
+        create_private_file(&tmp).map_err(|e| format!("cannot create state file: {e}"))?;
     file.write_all(&bytes)
         .map_err(|e| format!("cannot write state file: {e}"))?;
     file.sync_all()
         .map_err(|e| format!("cannot sync state file: {e}"))?;
-    fs::rename(&tmp, path).map_err(|e| format!("cannot activate state file: {e}"))
+    drop(file);
+    fs::rename(&tmp, path).map_err(|e| format!("cannot activate state file: {e}"))?;
+    tighten_private_file(path).map_err(|e| format!("cannot secure state file: {e}"))
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -2558,6 +2628,7 @@ mod tests {
                 files: vec![
                     ("manifest.json", extension_manifest(version)),
                     ("background.js", b"// release bundle\n".to_vec()),
+                    ("content/wake.js", b"// nested release file\n".to_vec()),
                 ],
                 fetch_calls: std::cell::Cell::new(0),
                 fail_path: None,
@@ -2659,7 +2730,7 @@ mod tests {
         let root = temp_root("stage-not-installed");
         let home = root.join("home");
         fs::create_dir_all(&home).unwrap();
-        let source = FakeSource::release(&"a".repeat(40), "0.1.230");
+        let source = FakeSource::release(&"a".repeat(40), "0.1.240");
 
         let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap();
 
@@ -2680,13 +2751,13 @@ mod tests {
         let old_commit = "b".repeat(40);
         let new_commit = "c".repeat(40);
         seed_standalone_install(&home, &old_commit, "0.1.229");
-        let source = FakeSource::release(&new_commit, "0.1.230");
+        let source = FakeSource::release(&new_commit, "0.1.240");
 
         let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap();
 
         assert_eq!(staged.state, StagedExtensionState::Staged);
         assert_eq!(staged.source_commit.as_deref(), Some(new_commit.as_str()));
-        assert_eq!(staged.extension_version.as_deref(), Some("0.1.230"));
+        assert_eq!(staged.extension_version.as_deref(), Some("0.1.240"));
         assert_eq!(
             staged.previous_source_commit.as_deref(),
             Some(old_commit.as_str())
@@ -2704,7 +2775,7 @@ mod tests {
         let base = base_dir_for(&home);
         let current = base.join("current");
         let manifest = read_json(&current.join("manifest.json")).unwrap();
-        assert_eq!(manifest["version"], "0.1.230");
+        assert_eq!(manifest["version"], "0.1.240");
         assert_eq!(manifest["key"], standalone_key());
         assert_eq!(
             fs::read(current.join("background.js")).unwrap(),
@@ -2712,7 +2783,7 @@ mod tests {
         );
         let state = read_json(&base.join("state.json")).unwrap();
         assert_eq!(state["source_commit"], new_commit);
-        assert_eq!(state["extension_version"], "0.1.230");
+        assert_eq!(state["extension_version"], "0.1.240");
         assert_eq!(state["installed_by"], "update");
         assert!(
             !user_visible_alias_path(&home).exists(),
@@ -2739,7 +2810,7 @@ mod tests {
         let home = root.join("home");
         let commit = "d".repeat(40);
         seed_standalone_install(&home, &commit, "0.1.230");
-        let source = FakeSource::release(&commit, "0.1.230");
+        let source = FakeSource::release(&commit, "0.1.240");
 
         let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap();
 
@@ -2758,7 +2829,7 @@ mod tests {
         let home = root.join("home");
         let old_commit = "e".repeat(40);
         let current = seed_standalone_install(&home, &old_commit, "0.1.229");
-        let mut source = FakeSource::release(&"f".repeat(40), "0.1.230");
+        let mut source = FakeSource::release(&"f".repeat(40), "0.1.240");
         source.fail_path = Some("extension/background.js");
 
         let error = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap_err();
@@ -2774,6 +2845,112 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(".staging-"))
             .count();
         assert_eq!(leftovers, 0, "a failed staging directory is removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_install_writes_a_private_tree_and_state_record() {
+        // Given no standalone install and a permissive process umask
+        // When `extension standalone install` stages the release tree
+        // Then the managed tree is 0700 and every file including state.json is
+        //      0600, so other local accounts cannot read the extension or its
+        //      install provenance.
+        let root = temp_root("perms-fresh");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let commit = "a".repeat(40);
+        let source = FakeSource::release(&commit, "0.1.240");
+        let snapshot = ExtensionSnapshot {
+            commit: commit.clone(),
+            blobs: source.list_blobs(&commit).unwrap(),
+        };
+
+        let view = install_snapshot(&home, "v1.1.0-rc.13", &snapshot, &source, None).unwrap();
+
+        assert_eq!(view["ok"], true);
+        let base = base_dir_for(&home);
+        let current = base.join("current");
+        assert_eq!(mode_of(&base), 0o700, "standalone state dir");
+        assert_eq!(mode_of(&current), 0o700, "managed extension tree");
+        assert_eq!(mode_of(&current.join("content")), 0o700, "nested tree dir");
+        assert_eq!(mode_of(&current.join("manifest.json")), 0o600);
+        assert_eq!(mode_of(&current.join("background.js")), 0o600);
+        assert_eq!(mode_of(&current.join("content/wake.js")), 0o600);
+        assert_eq!(mode_of(&base.join("state.json")), 0o600);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_staging_keeps_a_private_tree_private() {
+        // Given an existing install that is already 0700/0600
+        // When the runtime update stages the next release over it
+        // Then the swapped-in tree and the rewritten state record stay private.
+        let root = temp_root("perms-restage");
+        let home = root.join("home");
+        let current = seed_standalone_install(&home, &"b".repeat(40), "0.1.239");
+        let base = base_dir_for(&home);
+        set_mode(&base, 0o700);
+        set_mode(&current, 0o700);
+        set_mode(&current.join("manifest.json"), 0o600);
+        set_mode(&current.join("background.js"), 0o600);
+        set_mode(&base.join("state.json"), 0o600);
+        let source = FakeSource::release(&"c".repeat(40), "0.1.240");
+
+        let staged = stage_release_extension_in(&home, "v1.1.0-rc.13", &source).unwrap();
+
+        assert_eq!(staged.state, StagedExtensionState::Staged);
+        assert_eq!(mode_of(&current), 0o700);
+        assert_eq!(mode_of(&current.join("content")), 0o700);
+        assert_eq!(mode_of(&current.join("manifest.json")), 0o600);
+        assert_eq!(mode_of(&current.join("content/wake.js")), 0o600);
+        assert_eq!(mode_of(&base.join("state.json")), 0o600);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_staging_repairs_a_loosened_tree_and_state_record() {
+        // Given an install left world-readable by an earlier release
+        //       (0755 tree, 0644 state.json, the #833 report)
+        // When the runtime update stages the next release
+        // Then the managed tree and the state record are private again.
+        let root = temp_root("perms-repair");
+        let home = root.join("home");
+        let current = seed_standalone_install(&home, &"d".repeat(40), "0.1.239");
+        let base = base_dir_for(&home);
+        set_mode(&base, 0o755);
+        set_mode(&current, 0o755);
+        set_mode(&current.join("manifest.json"), 0o644);
+        set_mode(&current.join("background.js"), 0o644);
+        set_mode(&base.join("state.json"), 0o644);
+        let source = FakeSource::release(&"e".repeat(40), "0.1.240");
+
+        let staged = stage_release_extension_in(&home, "v1.1.0-rc.13", &source).unwrap();
+
+        assert_eq!(staged.state, StagedExtensionState::Staged);
+        assert_eq!(mode_of(&current), 0o700, "the swapped-in tree is private");
+        assert_eq!(mode_of(&current.join("content")), 0o700);
+        assert_eq!(mode_of(&current.join("manifest.json")), 0o600);
+        assert_eq!(mode_of(&current.join("content/wake.js")), 0o600);
+        assert_eq!(
+            mode_of(&base.join("state.json")),
+            0o600,
+            "the rewritten state record is private"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2980,7 +3157,7 @@ mod tests {
         let config_dir = root.join("config");
         fs::create_dir_all(&home).unwrap();
 
-        let report = version_report_in(&home, &config_dir, Some("0.1.230"), Some(&"6".repeat(40)));
+        let report = version_report_in(&home, &config_dir, Some("0.1.240"), Some(&"6".repeat(40)));
 
         assert_eq!(report.state, "not_installed");
         assert!(report.update_notice().is_none());
