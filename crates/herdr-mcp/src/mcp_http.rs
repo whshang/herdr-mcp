@@ -65,6 +65,9 @@ const MAX_MCP_ACTIVITY_RECORDS: usize = 2000;
 const MAX_MCP_ACTIVITY_RESULTS: usize = 50;
 const MAX_MCP_ACTIVITY_LOOKBACK_MS: u64 = 30 * 60_000;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
+/// #629: identifies one `/push/events` SSE stream in the lifecycle log so an
+/// open/close pair can be matched without logging any stream content.
+static NEXT_PUSH_STREAM: AtomicU64 = AtomicU64::new(0);
 
 const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
 
@@ -748,6 +751,7 @@ async fn post_extension_browser_actuation(State(state): State<AppState>, body: B
                     "generation_status_observed",
                 )?,
                 generation_stopped: browser_registry_bool(&payload, "generation_stopped")?,
+                endpoint_last_seen_age_ms: None,
                 result: actuation_result,
             },
         )
@@ -791,6 +795,18 @@ fn extension_browser_endpoint_register(
         extension_version,
         observed_at,
     })?;
+    // #629: endpoint lifecycle timeline. Only opaque ids, the browser family and
+    // the extension version are logged; `profile_seed`, page content, titles and
+    // URLs never are.
+    actuation::emit_browser_endpoint_event(
+        "register",
+        &[
+            ("endpoint_ref", endpoint.endpoint_ref.clone()),
+            ("browser_family", endpoint.browser_family.clone()),
+            ("extension_version", endpoint.extension_version.clone()),
+            ("observed_at", endpoint.last_observed_at.to_string()),
+        ],
+    );
     Ok(json!({
         "ok": true,
         "endpoint": browser_endpoint_http_json(endpoint),
@@ -1732,6 +1748,10 @@ struct PushStreamState {
     trusted_extension_ipc: bool,
     browser_endpoint_ref: Option<String>,
     endpoint_registered: bool,
+    /// #629: identity and open time of this SSE stream, used only for the
+    /// content-free `stream_open`/`stream_close` lifecycle log lines.
+    stream_id: u64,
+    opened_at: Instant,
 }
 
 impl PushStreamState {
@@ -1746,6 +1766,31 @@ impl PushStreamState {
             Some(_) => self.endpoint_registered,
             None => true,
         }
+    }
+}
+
+/// #629: the stream future is dropped both on a normal end and on a client
+/// disconnect, so the close side of the SSE timeline belongs in `Drop`.
+impl Drop for PushStreamState {
+    fn drop(&mut self) {
+        if !self.trusted_extension_ipc {
+            return;
+        }
+        let duration_ms = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut fields = vec![
+            (
+                "endpoint_ref",
+                self.browser_endpoint_ref
+                    .clone()
+                    .unwrap_or_else(|| "-".to_owned()),
+            ),
+            ("stream_id", self.stream_id.to_string()),
+            ("duration_ms", duration_ms.to_string()),
+        ];
+        if self.browser_endpoint_ref.is_some() {
+            fields.push(("endpoint_registered", self.endpoint_registered.to_string()));
+        }
+        actuation::emit_browser_endpoint_event("stream_close", &fields);
     }
 }
 
@@ -1988,6 +2033,23 @@ fn push_events_response(
             ))
         })
         .collect();
+    let stream_id = NEXT_PUSH_STREAM.fetch_add(1, Ordering::Relaxed);
+    let opened_at = Instant::now();
+    if trusted_extension_ipc && browser_endpoint_ref.is_some() {
+        actuation::emit_browser_endpoint_event(
+            "stream_open",
+            &[
+                (
+                    "endpoint_ref",
+                    browser_endpoint_ref
+                        .clone()
+                        .unwrap_or_else(|| "-".to_owned()),
+                ),
+                ("stream_id", stream_id.to_string()),
+                ("endpoint_registered", endpoint_registered.to_string()),
+            ],
+        );
+    }
     let state = PushStreamState {
         cache,
         cursor_rx,
@@ -2001,6 +2063,8 @@ fn push_events_response(
         trusted_extension_ipc,
         browser_endpoint_ref,
         endpoint_registered,
+        stream_id,
+        opened_at,
     };
     let events = stream::unfold(state, |mut state| async move {
         if state.first {
@@ -4990,6 +5054,8 @@ mod tests {
             trusted_extension_ipc: false,
             browser_endpoint_ref: None,
             endpoint_registered: false,
+            stream_id: 0,
+            opened_at: Instant::now(),
         };
         let working = json!({
             "agent":"pi","pane":"w1:p1","status":"working","workspace":"w1"
@@ -5106,6 +5172,85 @@ mod tests {
         let mut body = response.into_body();
         let frame = body.frame().await.unwrap().unwrap();
         String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap()
+    }
+
+    /// #629: registering an endpoint and opening/closing its `/push/events`
+    /// stream appear in the lifecycle log with ids and durations only. The
+    /// register input carries a `profile_seed`; it must never be logged.
+    #[tokio::test]
+    async fn browser_endpoint_lifecycle_log_records_register_and_stream_events() {
+        let root = test_root("endpoint-lifecycle-log");
+        let mut extension_state =
+            test_state_with_snapshot(&root, json!({"workspaces": [], "panes": [], "agents": []}));
+        extension_state.trusted_extension_ipc = true;
+        let extension = candidate_router(extension_state);
+
+        let profile_seed = "issue-629-lifecycle-profile-seed";
+        let register_request = Request::builder()
+            .method(Method::POST)
+            .uri("/extension/browser/registry")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "operation": "endpoint.register",
+                    "profile_seed": profile_seed,
+                    "browser_family": "chrome",
+                    "extension_version": "0.1.229",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let register_response = extension.clone().oneshot(register_request).await.unwrap();
+        assert_eq!(register_response.status(), StatusCode::OK);
+        let bytes = register_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let registered: Value = serde_json::from_slice(&bytes).unwrap();
+        let endpoint_ref = registered["endpoint"]["endpoint_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Open the trusted extension stream and let the response body drop at
+        // the end of this scope, which is the stream-close point.
+        {
+            let _hello = issue_632_open_push_stream(extension, &endpoint_ref).await;
+        }
+
+        let lines = actuation::endpoint_log_capture::take_for_endpoint(&endpoint_ref);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("event=register") && joined.contains("extension_version=0.1.229"),
+            "register must be logged with the extension version: {joined}"
+        );
+        assert!(
+            joined.contains("event=stream_open") && joined.contains("event=stream_close"),
+            "both sides of the SSE stream must be logged: {joined}"
+        );
+        assert!(
+            joined.contains("duration_ms=") && joined.contains("stream_id="),
+            "the stream close must carry its duration: {joined}"
+        );
+        assert!(
+            !joined.contains(profile_seed),
+            "a profile seed must never be logged: {joined}"
+        );
+        for line in &lines {
+            assert!(
+                line.starts_with("herdr-mcp: browser endpoint event="),
+                "{line}"
+            );
+            for needle in ["http", "://", "?", "page_ref", "title"] {
+                assert!(
+                    !line.contains(needle),
+                    "lifecycle log line must stay content-free ({needle}): {line}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// #632: register a browser endpoint through the real registry route and
