@@ -168,6 +168,19 @@ const archiveTabCloseInFlight = new Set();
 let browserEndpoint = null;
 let browserObservationGeneration = null;
 const browserCapabilitySnapshots = new Map();
+// #786: the first turn of a brand-new ChatGPT conversation can be submitted
+// before the `/c/<id>` browser session exists, so the Runtime rejects the
+// source-turn evidence with `browser_source_session_not_found`. The bounded
+// observe retry in the turn-started handler covers seconds, not the minutes a
+// fresh conversation's registration can lag (#771 live evidence). Hold the
+// newest unrecorded turn per tab+conversation in memory only (never storage,
+// never a provider resend) and replay that exact evidence once the Runtime
+// confirms the same conversation's session. Any other failure stays
+// fail-closed and nothing is held.
+const SOURCE_TURN_REGISTRATION_CODE = "browser_source_session_not_found";
+const SOURCE_TURN_HOLD_TTL_MS = 5 * 60 * 1000;
+const SOURCE_TURN_HOLD_MAX = 32;
+const heldSourceTurns = new Map();
 const AUTOMATION_MODE_MANUAL = "manual";
 const AUTOMATION_MODE_PROJECT = "project_auto";
 const HANDOFF_RETENTION_MS = 7 * 86400000;
@@ -228,6 +241,7 @@ function hudLabels() {
     "manual_disabled_auto", "manual_disabled_busy",
     "handoff", "handoff_resume", "handoff_working", "handoff_hint", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_failed_source_preserved", "handoff_llm_required", "handoff_copy_prompt", "handoff_copy_prompt_hint", "handoff_prompt_copied", "handoff_prompt_copy_failed",
     "handoff_blocked_working", "handoff_blocked_transfer_busy", "handoff_blocked_action_busy", "handoff_blocked_unavailable",
+    "handoff_continuity_unavailable",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
     "queue_full", "queue_failed", "queue_extension_reloaded", "queue_background_unavailable", "queue_storage_unavailable",
     "queue_added_draft_changed", "queue_added_clear_failed", "queue_app_restore_failed", "queue_clear_confirm", "queue_cleared",
@@ -1998,6 +2012,78 @@ async function postBrowserRegistry(payload) {
   return parsed;
 }
 
+function heldSourceTurnKey(tabId, convKey) {
+  return `${Number.isInteger(tabId) ? tabId : "-"}::${convKey}`;
+}
+
+function pruneExpiredHeldSourceTurns(now = Date.now()) {
+  for (const [key, held] of heldSourceTurns) {
+    if (!held || held.expiresAt <= now) heldSourceTurns.delete(key);
+  }
+}
+
+function dropHeldSourceTurn(tabId, convKey) {
+  heldSourceTurns.delete(heldSourceTurnKey(tabId, convKey));
+}
+
+function holdSourceTurnForLateSession({ tabId, convKey, userText, observedAt }) {
+  const now = Date.now();
+  pruneExpiredHeldSourceTurns(now);
+  const key = heldSourceTurnKey(tabId, convKey);
+  // At most one pending turn per tab+conversation: the newest genuine submit
+  // replaces older evidence instead of growing an in-memory queue.
+  heldSourceTurns.delete(key);
+  heldSourceTurns.set(key, {
+    tabId: Number.isInteger(tabId) ? tabId : null,
+    convKey,
+    userText,
+    observedAt,
+    expiresAt: now + SOURCE_TURN_HOLD_TTL_MS,
+  });
+  while (heldSourceTurns.size > SOURCE_TURN_HOLD_MAX) {
+    heldSourceTurns.delete(heldSourceTurns.keys().next().value);
+  }
+}
+
+// Re-report an already-observed turn to the local Runtime once its conversation
+// session has been registered. The payload is the original evidence unchanged
+// (canonical URL, trimmed text, submit time), so this stays the same idempotent
+// per-session upsert the Runtime dedupes; nothing is ever sent to ChatGPT.
+async function replayHeldSourceTurn({ tabId, convKey }) {
+  if (!convKey) return null;
+  pruneExpiredHeldSourceTurns();
+  const key = heldSourceTurnKey(tabId, convKey);
+  let heldKey = heldSourceTurns.has(key) ? key : null;
+  if (!heldKey) {
+    // A turn can arrive from a tab the service worker cannot attribute; the
+    // canonical conversation URL is then the exact identity to replay against.
+    for (const [candidateKey, candidate] of heldSourceTurns) {
+      if (candidate?.convKey === convKey) { heldKey = candidateKey; break; }
+    }
+  }
+  if (!heldKey) return null;
+  const held = heldSourceTurns.get(heldKey);
+  heldSourceTurns.delete(heldKey);
+  try {
+    await postBrowserRegistry({
+      operation: "source_turn.observe",
+      canonical_url: held.convKey,
+      user_text: held.userText,
+      observed_at: held.observedAt,
+    });
+    return { replayed: true };
+  } catch (error) {
+    const code = error?.message || String(error);
+    // Only a still-missing registration keeps the turn for a later attempt; it
+    // expires on its own. Every other rejection is final and stays fail-closed.
+    if (code === SOURCE_TURN_REGISTRATION_CODE && held.expiresAt > Date.now()) {
+      heldSourceTurns.set(heldKey, held);
+    }
+    warnLog("held source_turn.observe replay failed:", code);
+    return { replayed: false, code };
+  }
+}
+
 // Trusted local Extension IPC: report one finalized worker assistant turn so the
 // runtime can settle the exact already-applied dispatch. Sends only exact
 // provider/session/generation/user-message/assistant-message identity plus the
@@ -2570,6 +2656,9 @@ async function journalPostTurnToRust(payload) {
     const parsed = await response.json().catch(() => null);
     if (response.ok && parsed?.ok === true) {
       noteLocalRuntimeReachability(true);
+      // A durable turn is exactly what makes this conversation handoff-ready, so
+      // any cached HUD durability answer is now stale.
+      invalidateHandoffDurabilityCache();
       const continuityId = String(parsed?.continuity_id || payload?.continuity_id || "").trim();
       if (continuityId) {
         await loadRustAcked();
@@ -2768,6 +2857,108 @@ async function durableChainForConversation(conversationIdRaw) {
     noteLocalRuntimeReachability(false);
     return null;
   }
+}
+
+// ---- #811 ChatGPT handoff availability (HUD) ----
+// A ChatGPT handoff is only possible with a durable continuity chain in state.db.
+// The HUD must not advertise 接力 as ready when the conversation has none, so this
+// runs one bounded, cached, read-only resolve. Only a definitive 404
+// (`continuity_not_found`) may disable the affordance: a timeout, transport
+// failure, or any other answer keeps today's behavior (button enabled) because
+// the click still fails closed at startHandoffForTab -> continuity_unavailable
+// with source_preserved:true.
+const HANDOFF_DURABILITY_TTL_MS = 45_000;
+const HANDOFF_DURABILITY_UNKNOWN_TTL_MS = 5_000;
+const HANDOFF_DURABILITY_PROBE_TIMEOUT_MS = 1_500;
+const HANDOFF_DURABILITY_CACHE_MAX = 32;
+const handoffDurabilityCache = new Map(); // `${conversation_id}::${continuity_id}` -> probe row
+
+/** Drop cached HUD durability answers (bind/unbind, durable journal ack). */
+function invalidateHandoffDurabilityCache() {
+  handoffDurabilityCache.clear();
+}
+
+/**
+ * One read-only `POST /extension/continuity/resolve` with a short deadline.
+ * Returns state "ready" | "unavailable" (definitive 404) | "unknown".
+ * Deliberately does not touch localRuntimeReachability: a HUD probe must never
+ * flip the HUD to offline or disable Auto.
+ */
+async function resolveContinuityAvailability(body, timeoutMs = HANDOFF_DURABILITY_PROBE_TIMEOUT_MS) {
+  let timer = null;
+  try {
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("continuity_resolve_timeout")), timeoutMs);
+    });
+    const response = await Promise.race([
+      localHerdrFetch(continuityResolveUrl(), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        nativeTimeoutMs: timeoutMs,
+      }),
+      deadline,
+    ]);
+    const parsed = await response.json().catch(() => null);
+    const continuityId = String(parsed?.continuity_id || "").trim();
+    if (response.ok && parsed?.ok === true && continuityId) {
+      return { state: "ready", continuity_id: continuityId };
+    }
+    if (Number(response.status) === 404 && String(parsed?.error || "") === "continuity_not_found") {
+      return { state: "unavailable", continuity_id: null };
+    }
+    return { state: "unknown", continuity_id: null };
+  } catch (_) {
+    return { state: "unknown", continuity_id: null };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Cheap, fail-safe durable-chain probe for the HUD. Resolves the current
+ * conversation and the bound chain in parallel (same two identities
+ * startHandoffForTab accepts), so a chain that is durable by continuity_id is
+ * never reported as missing and the whole probe stays within one deadline.
+ * Any non-definitive answer (timeout/transport/5xx/unknown) is cached briefly and
+ * reported as "unknown" instead of "unavailable".
+ */
+async function chatGptHandoffDurability(convInfo, session) {
+  const conversationId = String(convInfo?.conversation_id || "").trim();
+  const continuityId = String((session || []).map((b) => b?.continuity_id).find(Boolean) || "").trim();
+  if (!conversationId && !continuityId) return { state: "unknown", continuity_id: null };
+  const key = `${conversationId}::${continuityId}`;
+  const now = Date.now();
+  const cached = handoffDurabilityCache.get(key);
+  if (cached) {
+    const ttl = cached.state === "unknown" ? HANDOFF_DURABILITY_UNKNOWN_TTL_MS : HANDOFF_DURABILITY_TTL_MS;
+    const age = now - Number(cached.at || 0);
+    // A backwards system-clock jump must expire the entry instead of pinning it.
+    if (age >= 0 && age < ttl) return cached;
+  }
+  const bodies = [];
+  if (conversationId) bodies.push({ conversation_id: conversationId });
+  if (continuityId) bodies.push({ continuity_id: continuityId });
+  const results = await Promise.all(bodies.map((body) => resolveContinuityAvailability(body)));
+  const ready = results.find((result) => result.state === "ready" && result.continuity_id) || null;
+  const state = ready
+    ? "ready"
+    : results.every((result) => result.state === "unavailable")
+      ? "unavailable"
+      : "unknown";
+  const row = {
+    at: Date.now(),
+    state,
+    continuity_id: ready?.continuity_id || null,
+    conversation_id: conversationId || null,
+    bound_continuity_id: continuityId || null,
+  };
+  handoffDurabilityCache.set(key, row);
+  if (handoffDurabilityCache.size > HANDOFF_DURABILITY_CACHE_MAX) {
+    const oldest = [...handoffDurabilityCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    if (oldest) handoffDurabilityCache.delete(oldest[0]);
+  }
+  return row;
 }
 
 async function prepareCanonicalBrowserHandoff({ transferId, continuityId, sourceUrl } = {}) {
@@ -8029,14 +8220,13 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     };
   }
 
-  if (manualChatGptProjectHandoff(row)) {
-    return prepareManualProjectHandoffWithoutSourcePrompt(
-      transferId,
-      sourceSnapshot,
-      "manual_project_continuity_unavailable",
-    );
-  }
-
+  // #811: ChatGPT never reaches this point without a durable chain — it returns
+  // `continuity_unavailable` earlier, and `manualChatGptProjectHandoff` requires
+  // site === "chatgpt". The former manual Project fallback here was therefore
+  // unreachable; it stayed dead on purpose rather than being made reachable,
+  // because that path navigates the source tab into the Project target and so
+  // could never satisfy the "never modify the source conversation" invariant for
+  // a conversation with no durable continuity record.
   const sourceLimitBlocked = sourceSnapshot?.handoffBlockReason === "conversation_limit_ui";
   if (sourceLimitBlocked) {
     return failWithHandoffFallback(transferId, {
@@ -11359,6 +11549,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const browserPageInfo = ["chatgpt", "gemini", "claude", "grok"].includes(registeringSite)
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
+      // #786: a provisional `local-chatgpt:<uuid>` route is not a provider
+      // conversation identity. ChatGPT's adapter already refuses to derive a
+      // conversation key from it, so refuse it here too: a provisional id must
+      // never register a browser session, hold a source turn, or become a
+      // canonical source/target for a dispatch.
+      if (registeringSite === "chatgpt"
+          && /^local-chatgpt(?::|%3a)/i.test(String(browserPageInfo?.conversation_id || ""))) {
+        sendResponse({ ok: false, error: "provisional_conversation_identity" });
+        return;
+      }
       const accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
       const accountDisplayLabel = formatPlatformAccountDisplay(
         registeringSite,
@@ -11405,6 +11605,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             callLog("browser observation failed:", code);
           }
         }
+      }
+      // #786: this registration is the Runtime's confirmation that the exact
+      // conversation's browser session exists. A first turn rejected before
+      // that session existed is replayed here, once, with its original evidence
+      // — never a provider resend. Nothing is held in the common case, so this
+      // resolves without a network call.
+      if (browserObservation?.sessionRef && sender.tab?.id) {
+        await replayHeldSourceTurn({
+          tabId: sender.tab.id,
+          convKey: browserPageInfo?.convKey || pageInfo?.convKey || String(msg.convKey || ""),
+        });
       }
       let matched = bindingsForPageInfo(bindings, pageInfo, msg.convKey);
       if (!matched.length && sender.tab?.id) {
@@ -11790,6 +12001,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const taskSummary = await aggregateAgentTaskSummary(liveSession);
       const semanticCapabilities = await runtimeSemanticCapabilities();
       const last = convKey ? (lastIdleNudgeResult.get(convKey) || null) : null;
+      const handoffReadyNow = Boolean(
+        convInfo?.manual_handoff_available
+        && (!handoffStatusIsActive(transfer?.status) || transferView?.can_resume === true),
+      );
+      // #811: ChatGPT handoff needs a durable continuity chain; without one the
+      // click fails closed with continuity_unavailable. Probe cheaply (cached,
+      // bounded, read-only) so the HUD does not advertise 接力 as ready. Any
+      // probe failure keeps today's fail-safe behavior (enabled, fails closed).
+      let handoffUnavailableReason = null;
+      if (handoffReadyNow
+          && String(convInfo?.site || "") === "chatgpt"
+          && transferView?.can_resume !== true) {
+        try {
+          const durability = await chatGptHandoffDurability(convInfo, session);
+          if (durability?.state === "unavailable") handoffUnavailableReason = "continuity_unavailable";
+        } catch (_) {}
+      }
       sendResponse({
         ok: true,
         version: H2W_SCRIPT_VERSION,
@@ -11829,10 +12057,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           execution_state: await reconcileTabExecutionState(b),
         }))),
         continuity_id: session.map((b) => b.continuity_id).find(Boolean) || transfer?.continuity_id || null,
-        can_handoff: Boolean(
-          convInfo?.manual_handoff_available
-          && (!handoffStatusIsActive(transfer?.status) || transferView?.can_resume === true),
-        ),
+        can_handoff: handoffReadyNow && !handoffUnavailableReason,
+        handoff_unavailable_reason: handoffUnavailableReason,
         handoff: transferView,
         workspace_source: state?.source || (state?.ok ? "push_state" : null),
         workspace_status: state?.ok ? 200 : (state?.status || 0),
@@ -12226,6 +12452,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       });
       bindings[storeKey] = b;
       await saveBindings(bindings);
+      invalidateHandoffDurabilityCache();
       // A binding created after Auto was already enabled must start watching
       // immediately instead of waiting for the next keepalive reconcile.
       reconcileProgressTimers(bindings);
@@ -12281,6 +12508,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         clearProgressTimer(storeKey);
       }
       await saveBindings(bindings);
+      invalidateHandoffDurabilityCache();
       // Removing an auto binding is an explicit user decision: the same
       // session must not recreate it just because its task is still in the inbox.
       for (const removed of removedAutoBindings) {
@@ -12416,18 +12644,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "continuity-fields-incomplete" });
         return;
       }
+      // The submit time is captured once so the initial attempt, every retry and
+      // any late replay re-report the identical evidence: the Runtime dedupes a
+      // source turn by canonical URL plus this exact timestamp.
+      const observedAt = msg?.startedAt || Date.now();
+      const holdTabId = Number.isInteger(sender.tab?.id) ? sender.tab.id : null;
       const observeSourceTurn = () => postBrowserRegistry({
         operation: "source_turn.observe",
         canonical_url: convKey,
         user_text: userText,
-        observed_at: msg?.startedAt || Date.now(),
+        observed_at: observedAt,
       });
       try {
         await observeSourceTurn();
+        dropHeldSourceTurn(holdTabId, convKey);
       } catch (error) {
         const code = error?.message || String(error);
         callLog("current source turn observe failed:", code);
-        if (code === "browser_source_session_not_found") {
+        if (code === SOURCE_TURN_REGISTRATION_CODE) {
           // The first turn of a brand-new conversation can mount before the
           // 1s route poll registers the session for its canonical URL, so the
           // exact-turn evidence is dropped exactly when a fresh WebChat
@@ -12442,21 +12676,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               await new Promise((resolve) => setTimeout(resolve, delayMs));
               try {
                 await observeSourceTurn();
+                dropHeldSourceTurn(holdTabId, convKey);
                 return;
               } catch (retryError) {
                 const retryCode = retryError?.message || String(retryError);
                 callLog("current source turn observe retry failed:", retryCode);
-                if (retryCode !== "browser_source_session_not_found") {
+                if (retryCode !== SOURCE_TURN_REGISTRATION_CODE) {
                   warnLog("source_turn.observe failed:", retryCode);
+                  dropHeldSourceTurn(holdTabId, convKey);
                   return;
                 }
               }
             }
+            // #786: the schedule above only covers seconds. A brand-new
+            // conversation registers its `/c/<id>` session only once the
+            // content script's provider readback proves the chat, which lags
+            // the first send by minutes in live evidence (#771). Hold the turn
+            // for a bounded window and replay it when registration lands.
+            holdSourceTurnForLateSession({ tabId: holdTabId, convKey, userText, observedAt });
           })();
         } else {
           // A non-registration rejection is never retried, so this is the only
           // record of it. Warn with the typed Runtime code alone: the canonical
           // URL and the captured user turn must never reach the console.
+          dropHeldSourceTurn(holdTabId, convKey);
           warnLog("source_turn.observe failed:", code);
         }
       }

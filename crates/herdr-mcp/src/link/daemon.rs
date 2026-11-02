@@ -63,12 +63,12 @@ pub fn is_runtime_rollback_compatible(epoch: u64, hash: &str) -> bool {
         || (epoch == 2 && hash == LEGACY_EPOCH2_CONTRACT_HASH)
 }
 
-const DAEMON_TRANSPORT_PING_MS: i64 = 15_000;
+const DAEMON_TRANSPORT_PING_MS: i64 = 30_000;
 // Transport liveness is covered by RFC WebSocket ping/pong. Keep the
 // application heartbeat aligned with the Edge recovery-checkpoint cadence so
 // an idle Link does not wake the hibernated workstation DO every minute.
 const DAEMON_HEARTBEAT_MS: i64 = 300_000;
-const DAEMON_MAX_SILENCE_MS: i64 = 60_000;
+const DAEMON_MAX_SILENCE_MS: i64 = 90_000;
 const DAEMON_REQUEST_TIMEOUT_MS: u64 = 60_000;
 const DAEMON_DRAIN_MS: u64 = 5_000;
 

@@ -128,6 +128,7 @@
   "hud_handoff_blocked_transfer_busy": "この会話ではすでに引き継ぎが進行中です。",
   "hud_handoff_blocked_action_busy": "別の Herdr ブラウザー操作がまだ実行中です。",
   "hud_handoff_blocked_unavailable": "現在の会話状態では引き継ぎを利用できません。",
+  "hud_handoff_continuity_unavailable": "この会話はまだ Herdr ワークスペースにバインドされておらず、ローカル継続記録もないため、引き継ぎを利用できません。現在の会話は変更されていません。パネルから Herdr ワークスペースにバインドし、1 往復の会話を完了してから引き継ぎを再試行してください。",
   "hud_queue_insert": "キュー",
   "hud_queue_insert_count": "キュー · {count}",
   "hud_queue_insert_hint": "返信中は中断せず入力内容をキューに追加します。返信終了後、キュー内容を次のメッセージとしてまとめて送信します。入力が空なら再送を試し、右クリックでキューを消去できます。",
