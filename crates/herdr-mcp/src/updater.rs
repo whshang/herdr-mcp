@@ -46,7 +46,10 @@ use std::os::unix::process::CommandExt;
 
 mod release_plan;
 
-use release_plan::{ReleaseAsset, ReleasePlan, StateSchemaMigration, fetch_release_plan};
+use release_plan::{
+    OlderRelease, OlderReleasePolicy, ReleaseAsset, ReleaseDiscovery, ReleasePlan,
+    StateSchemaMigration, fetch_release_plan,
+};
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod scheduled_tests;
@@ -206,8 +209,20 @@ pub fn run(command: UpdateCommand) -> Result<ExitCode, String> {
 
 fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
     let channel = load_update_channel()?;
-    let plan = fetch_release_plan(manifest_override, channel)
-        .map_err(|error| update_check_indeterminate_error(&error))?;
+    let plan = match fetch_release_plan(manifest_override, channel, OlderReleasePolicy::Refuse)
+        .map_err(|error| update_check_indeterminate_error(&error))?
+    {
+        ReleaseDiscovery::Ready(plan) => *plan,
+        // `Refuse` never classifies an older release; keep the operator-facing
+        // downgrade refusal if that policy ever changes.
+        ReleaseDiscovery::Older(older) => {
+            return Err(format!(
+                "release {} is older than current {}; refusing downgrade",
+                older.version,
+                current_version()?
+            ));
+        }
+    };
     let current = current_version()?;
     let available = plan.version > current;
     let paths = RuntimePaths::discover()?;
@@ -698,6 +713,33 @@ fn downgrade_skip_reason(channel: UpdateChannel) -> &'static str {
     }
 }
 
+/// No-op record for the scheduled/automatic path when the discovered release is
+/// older on contract identity or state schema (#829). The manifest was
+/// discovered and matches the update channel, but nothing is staged, so its
+/// attestation is deliberately not verified.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn auto_older_release_skip_record(
+    channel: UpdateChannel,
+    current: &Version,
+    older: &OlderRelease,
+) -> Value {
+    json!({
+        "ok": true,
+        "code": "auto_update_skipped",
+        "reason": downgrade_skip_reason(channel),
+        "reason_detail": older.detail,
+        "update_channel": channel.as_str(),
+        "current_version": current.to_string(),
+        "release_version": older.version.to_string(),
+        "tag": &older.tag,
+        "release_contract_epoch": older.contract_epoch,
+        "release_state_schema": older.state_schema,
+        "provenance_verified": false,
+        "network_checked": true,
+        "update_queued": false,
+    })
+}
+
 fn apply_inner(
     manifest_override: Option<&str>,
     allow_current: bool,
@@ -750,7 +792,35 @@ fn apply_inner(
             "Checking {} release metadata and provenance...",
             channel.as_str()
         ));
-        let plan = fetch_release_plan(manifest_override, channel)?;
+        let plan = match fetch_release_plan(
+            manifest_override,
+            channel,
+            if channel_override.is_some() {
+                OlderReleasePolicy::SkipInScheduled
+            } else {
+                OlderReleasePolicy::Refuse
+            },
+        )? {
+            ReleaseDiscovery::Ready(plan) => *plan,
+            ReleaseDiscovery::Older(older) => {
+                // Scheduled/automatic runs have nothing to install, so an older
+                // release is a successful no-op instead of the contract-identity
+                // or downgrade failure an operator-facing command must report.
+                if channel_override.is_none() {
+                    return Err(format!(
+                        "release {} is older than current {}; refusing downgrade",
+                        older.version,
+                        current_version()?
+                    ));
+                }
+                print_json(&auto_older_release_skip_record(
+                    channel,
+                    &current_version()?,
+                    &older,
+                ))?;
+                return Ok(ExitCode::SUCCESS);
+            }
+        };
         if channel_override.is_some()
             && let Some(migration) = plan.state_schema_migration.as_ref()
         {

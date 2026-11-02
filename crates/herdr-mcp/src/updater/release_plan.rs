@@ -73,10 +73,41 @@ pub(super) struct ReleasePlan {
     pub(super) asset: ReleaseAsset,
 }
 
+/// A discovered release that is older than this build on contract identity or
+/// state schema. It is classified from the raw manifest because the contract
+/// admission below refuses a lower epoch or schema by design.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OlderRelease {
+    pub(super) version: Version,
+    pub(super) tag: String,
+    pub(super) detail: &'static str,
+    pub(super) contract_epoch: u32,
+    pub(super) state_schema: i64,
+}
+
+/// What an older discovered release means to the caller. An operator-requested
+/// update keeps refusing it; only the scheduled/automatic path may ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OlderReleasePolicy {
+    /// `update apply` / `update check`: an older release is a refusal.
+    Refuse,
+    /// `update auto`: an older release is a no-op skip (#829).
+    SkipInScheduled,
+}
+
+/// Result of release discovery: either a plan that passed the contract
+/// admission, or an older release the scheduled path may skip.
+pub(super) enum ReleaseDiscovery {
+    /// Boxed so the large validated plan does not inflate every `Result`.
+    Ready(Box<ReleasePlan>),
+    Older(OlderRelease),
+}
+
 pub(super) fn fetch_release_plan(
     manifest_override: Option<&str>,
     channel: UpdateChannel,
-) -> Result<ReleasePlan, String> {
+    older_release: OlderReleasePolicy,
+) -> Result<ReleaseDiscovery, String> {
     let client = update_client()?;
     let (manifest_url, manifest_name) = match manifest_override
         .map(str::to_owned)
@@ -97,11 +128,17 @@ pub(super) fn fetch_release_plan(
     )?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("release manifest is invalid JSON: {error}"))?;
-    let plan = parse_release_plan(&value, current_target()?)?;
-    if manifest_override.is_none()
-        && env::var("HERDR_MCP_UPDATE_MANIFEST_URL").is_err()
-        && !channel.accepts_version(&plan.version)
+    let discovering =
+        manifest_override.is_none() && env::var("HERDR_MCP_UPDATE_MANIFEST_URL").is_err();
+    if older_release == OlderReleasePolicy::SkipInScheduled
+        && let Some(older) = older_release_for_scheduled(&value, channel, discovering)?
     {
+        // Nothing is staged or activated, so the manifest attestation is not
+        // verified: there is no artifact to trust yet.
+        return Ok(ReleaseDiscovery::Older(older));
+    }
+    let plan = parse_release_plan(&value, current_target()?)?;
+    if discovering && !channel.accepts_version(&plan.version) {
         return Err(format!(
             "discovered release {} is outside update channel {}",
             plan.version,
@@ -110,7 +147,80 @@ pub(super) fn fetch_release_plan(
     }
     let manifest_sha256 = sha256_bytes(&bytes);
     verify_artifact_attestation(&client, manifest_name, &manifest_sha256, &plan.identity)?;
-    Ok(plan)
+    Ok(ReleaseDiscovery::Ready(Box::new(plan)))
+}
+
+/// Classify a discovered release as older than this build before contract
+/// admission runs (#829). `update auto` must treat an older Stable release as a
+/// no-op: the contract-identity admission refuses a lower epoch or state schema,
+/// which is the correct answer for an operator-requested upgrade but must never
+/// fail a scheduled run that has nothing to install.
+///
+/// Only a strictly older identity is classified, and only when neither the
+/// epoch nor the schema points forward, so a forward mismatch (a target this
+/// build cannot admit) still fails closed in [`parse_release_plan`]. A manifest
+/// whose contract or schema is missing or malformed is left to that admission as
+/// well, so its canonical error is unchanged.
+fn older_release_for_scheduled(
+    value: &Value,
+    channel: UpdateChannel,
+    discovering: bool,
+) -> Result<Option<OlderRelease>, String> {
+    let (Some(version_text), Some(tag)) = (
+        value.get("version").and_then(Value::as_str),
+        value.get("tag").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    let Ok(version) = Version::parse(version_text) else {
+        return Ok(None);
+    };
+    if tag != format!("v{version}") {
+        return Ok(None);
+    }
+    if discovering && !channel.accepts_version(&version) {
+        return Err(format!(
+            "discovered release {version} is outside update channel {}",
+            channel.as_str()
+        ));
+    }
+    let Some(target) = value.get("contract").and_then(parse_contract_identity) else {
+        return Ok(None);
+    };
+    let Some(target_schema) = value.get("state_schema").and_then(Value::as_i64) else {
+        return Ok(None);
+    };
+    let local = local_contract_identity()?;
+    let epoch_older = target.epoch < local.epoch;
+    let schema_older = target_schema < SCHEMA_VERSION;
+    if !epoch_older && !schema_older {
+        return Ok(None);
+    }
+    if target.epoch > local.epoch || target_schema > SCHEMA_VERSION {
+        // Inconsistent identity (older in one dimension, ahead in the other):
+        // let the admission reject it instead of silently skipping.
+        return Ok(None);
+    }
+    let detail = match (epoch_older, schema_older) {
+        (true, true) => "older_contract_epoch_and_state_schema",
+        (true, false) => "older_contract_epoch",
+        (false, true) => "older_state_schema",
+        (false, false) => unreachable!("classification returned early above"),
+    };
+    Ok(Some(OlderRelease {
+        version,
+        tag: tag.to_owned(),
+        detail,
+        contract_epoch: target.epoch,
+        state_schema: target_schema,
+    }))
+}
+
+fn local_contract_identity() -> Result<contract::ContractIdentity, String> {
+    let local = contract::identity()?;
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    let local = super::scheduled_tests::local_contract().unwrap_or(local);
+    Ok(local)
 }
 
 fn release_manifest_name(url: &Url) -> Result<&'static str, String> {
@@ -214,9 +324,7 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
     if value.get("product").and_then(Value::as_str) != Some("herdr-mcp") {
         return Err("release manifest product mismatch".to_owned());
     }
-    let local = contract::identity()?;
-    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-    let local = super::scheduled_tests::local_contract().unwrap_or(local);
+    let local = local_contract_identity()?;
     let (target_contract, state_schema_migration) =
         admit_release_contract(value, &local, SCHEMA_VERSION)?;
     let version_text = value
@@ -869,6 +977,82 @@ mod tests {
             )
             .unwrap(),
             Some("v1.0.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn older_release_classification_only_covers_releases_that_point_backwards() {
+        let target = current_target().unwrap();
+        let local = local_contract_identity().unwrap();
+        assert_eq!(local.epoch, crate::contract::identity().unwrap().epoch);
+        let mut older = manifest_for(target, "1.0.5");
+        older["contract"] = json!({
+            "epoch": local.epoch - 1,
+            "hash": local.hash,
+            "tool_count": local.tool_count,
+        });
+        older["state_schema"] = json!(SCHEMA_VERSION - 1);
+        let classified = older_release_for_scheduled(&older, UpdateChannel::Stable, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(classified.version, Version::parse("1.0.5").unwrap());
+        assert_eq!(classified.tag, "v1.0.5");
+        assert_eq!(classified.detail, "older_contract_epoch_and_state_schema");
+        assert_eq!(classified.contract_epoch, local.epoch - 1);
+        assert_eq!(classified.state_schema, SCHEMA_VERSION - 1);
+
+        // Only one dimension older is still an older release.
+        let mut older_epoch_only = older.clone();
+        older_epoch_only["state_schema"] = json!(SCHEMA_VERSION);
+        assert_eq!(
+            older_release_for_scheduled(&older_epoch_only, UpdateChannel::Stable, false)
+                .unwrap()
+                .unwrap()
+                .detail,
+            "older_contract_epoch"
+        );
+        let mut older_schema_only = older.clone();
+        older_schema_only["contract"] = json!({
+            "epoch": local.epoch,
+            "hash": local.hash,
+            "tool_count": local.tool_count,
+        });
+        assert_eq!(
+            older_release_for_scheduled(&older_schema_only, UpdateChannel::Stable, false)
+                .unwrap()
+                .unwrap()
+                .detail,
+            "older_state_schema"
+        );
+
+        // Forward epoch / forward schema is never classified as older, so the
+        // admission still fails closed for a target this build cannot admit.
+        let mut forward_epoch = older.clone();
+        forward_epoch["contract"]["epoch"] = json!(local.epoch + 2);
+        forward_epoch["state_schema"] = json!(SCHEMA_VERSION);
+        assert!(
+            older_release_for_scheduled(&forward_epoch, UpdateChannel::Stable, false)
+                .unwrap()
+                .is_none()
+        );
+        let mut forward_schema = older.clone();
+        forward_schema["contract"]["epoch"] = json!(local.epoch);
+        forward_schema["state_schema"] = json!(SCHEMA_VERSION + 1);
+        assert!(
+            older_release_for_scheduled(&forward_schema, UpdateChannel::Stable, false)
+                .unwrap()
+                .is_none()
+        );
+
+        // A current identity is not older.
+        assert!(
+            older_release_for_scheduled(
+                &manifest_for(target, "9.9.9"),
+                UpdateChannel::Stable,
+                false
+            )
+            .unwrap()
+            .is_none()
         );
     }
 }
