@@ -141,6 +141,36 @@ pub struct ContinuityTurnInput<'a> {
     pub observed_at: i64,
 }
 
+/// Inputs for the #834 auto-attach of a durable continuity chain to a WebChat
+/// conversation that a dispatched or auto-bound ChatGPT session already owns.
+#[derive(Debug, Clone, Copy)]
+pub struct ContinuityAttachInput<'a> {
+    /// Primary conversation identity. For ChatGPT this is the provider-native
+    /// conversation id, exactly the identity `continuity_for_conversation` and
+    /// `/extension/continuity/resolve` receive from the extension.
+    pub conversation_id: &'a str,
+    /// Additional identities that must resolve to the same chain, such as the
+    /// canonical conversation URL the extension journals its turns under.
+    pub conversation_aliases: &'a [&'a str],
+    pub provider: Option<&'a str>,
+    pub account_ref: Option<&'a str>,
+    pub space_ref: Option<&'a str>,
+    pub session_ref: Option<&'a str>,
+    pub workspace_id: Option<&'a str>,
+    pub project_id: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuityAttachRecord {
+    pub continuity_id: String,
+    /// True when this call created the chain; a repeated attach reports false.
+    pub created: bool,
+    /// True when this call added a workspace binding row.
+    pub workspace_bound: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuityTurnRecord {
     pub conversation_id: String,
@@ -1740,6 +1770,168 @@ impl StateStore {
             return Err("continuity_binding_ambiguous".to_owned());
         }
         Ok(segments.last().map(|segment| segment.0.clone()))
+    }
+
+    /// #834: attach the durable continuity chain that owns one WebChat
+    /// conversation when the conversation is already bound to a Herdr workspace
+    /// through the dispatch or auto-bind path, without an explicit HUD/panel bind.
+    ///
+    /// Idempotent by construction, so a repeated dispatch, a concurrent attach and
+    /// a late extension journal all converge on exactly one chain:
+    ///
+    /// - an existing single active owner of any supplied conversation identity is
+    ///   reused instead of creating a second chain;
+    /// - a new chain gets a deterministic id derived from the provider plus the
+    ///   primary conversation identity, so a retry before the first binding row is
+    ///   visible still cannot fork the chain;
+    /// - every identity (primary plus aliases), the workspace binding and the
+    ///   provider/session binding are inserted `OR IGNORE`, so re-attaching only
+    ///   completes a partial binding set.
+    ///
+    /// Ambiguous ownership fails closed as `continuity_binding_ambiguous` rather
+    /// than guessing or creating a duplicate chain.
+    pub fn attach_continuity_for_conversation(
+        &mut self,
+        input: ContinuityAttachInput<'_>,
+    ) -> Result<ContinuityAttachRecord, String> {
+        let ContinuityAttachInput {
+            conversation_id,
+            conversation_aliases,
+            provider,
+            account_ref,
+            space_ref,
+            session_ref,
+            workspace_id,
+            project_id,
+            title,
+            observed_at,
+        } = input;
+        validate_work_memory_ref(conversation_id, 256, "conversation_id")?;
+        for alias in conversation_aliases {
+            validate_work_memory_ref(alias, 2048, "conversation_alias")?;
+        }
+        if let Some(value) = workspace_id {
+            validate_work_memory_ref(value, 256, "workspace_id")?;
+        }
+        if let Some(value) = project_id {
+            validate_work_memory_ref(value, 256, "project_id")?;
+        }
+        if let Some(value) = title {
+            validate_work_memory_ref(value, 512, "title")?;
+        }
+        if observed_at < 0 {
+            return Err("continuity_observed_at_invalid".to_owned());
+        }
+        match (provider, session_ref) {
+            (Some(provider), Some(session_ref)) => {
+                validate_provider_binding(provider, account_ref, space_ref, session_ref)?;
+            }
+            (None, None) => {}
+            _ => return Err("continuity_provider_binding_incomplete".to_owned()),
+        }
+        let mut identities: Vec<&str> = Vec::with_capacity(conversation_aliases.len() + 1);
+        identities.push(conversation_id);
+        for alias in conversation_aliases {
+            if !identities.contains(alias) {
+                identities.push(alias);
+            }
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin continuity attach: {error}"))?;
+        let mut owners: Vec<String> = Vec::new();
+        {
+            let mut statement = tx
+                .prepare(
+                    "SELECT DISTINCT b.continuity_id
+                     FROM continuity_bindings b
+                     JOIN continuity_chains c ON c.continuity_id = b.continuity_id
+                     WHERE b.conversation_id = ?1 AND c.status = 'active'
+                     ORDER BY b.continuity_id",
+                )
+                .map_err(|error| format!("cannot prepare continuity attach lookup: {error}"))?;
+            for identity in &identities {
+                let rows = statement
+                    .query_map([identity], |row| row.get::<_, String>(0))
+                    .map_err(|error| format!("cannot query continuity attach lookup: {error}"))?;
+                for row in rows {
+                    owners.push(row.map_err(|error| {
+                        format!("cannot decode continuity attach lookup: {error}")
+                    })?);
+                }
+            }
+        }
+        owners.sort();
+        owners.dedup();
+        let (continuity_id, created) = match owners.as_slice() {
+            [] => {
+                // Deterministic id: the same conversation always derives the same
+                // chain, so an attach that races another attach cannot fork it.
+                let digest = sha256_text(&format!(
+                    "{}\n{}",
+                    provider.unwrap_or("webchat"),
+                    conversation_id
+                ));
+                (format!("hc:auto:{}", &digest[..24]), true)
+            }
+            [only] => (only.clone(), false),
+            _ => return Err("continuity_binding_ambiguous".to_owned()),
+        };
+        tx.execute(
+            "INSERT INTO continuity_chains (
+                continuity_id, title, project_id, status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'active', ?4, ?4)
+             ON CONFLICT(continuity_id) DO UPDATE SET
+                title = COALESCE(excluded.title, continuity_chains.title),
+                project_id = COALESCE(excluded.project_id, continuity_chains.project_id),
+                updated_at = MAX(continuity_chains.updated_at, excluded.updated_at)",
+            params![continuity_id, title, project_id, observed_at],
+        )
+        .map_err(|error| format!("cannot upsert continuity chain: {error}"))?;
+        let mut workspace_bound = false;
+        for identity in &identities {
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO continuity_bindings (
+                        continuity_id, conversation_id, workspace_id, bound_at
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        continuity_id,
+                        identity,
+                        workspace_id.unwrap_or(""),
+                        observed_at
+                    ],
+                )
+                .map_err(|error| format!("cannot persist continuity binding: {error}"))?;
+            if inserted == 1 && workspace_id.is_some() {
+                workspace_bound = true;
+            }
+        }
+        if let (Some(provider), Some(session_ref)) = (provider, session_ref) {
+            tx.execute(
+                "INSERT OR IGNORE INTO continuity_provider_bindings (
+                    continuity_id, provider, account_ref, space_ref, session_ref, bound_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    continuity_id,
+                    provider,
+                    account_ref.unwrap_or(""),
+                    space_ref.unwrap_or(""),
+                    session_ref,
+                    observed_at
+                ],
+            )
+            .map_err(|error| format!("cannot persist continuity provider binding: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit continuity attach: {error}"))?;
+        Ok(ContinuityAttachRecord {
+            continuity_id,
+            created,
+            workspace_bound,
+        })
     }
 
     pub fn continuity_for_provider_session(
@@ -7070,6 +7262,54 @@ fn work_memory_fts_queries(query: &str) -> Result<(String, String), String> {
     Ok((tokens.join(" AND "), tokens.join(" OR ")))
 }
 
+/// #834: read-only summary of the durable continuity journal for
+/// `herdr-mcp doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuityJournalProbe {
+    /// Newest journaled turn (`continuity_turns.observed_at`), epoch ms.
+    pub last_turn_at: Option<i64>,
+    /// Newest conversation binding (`continuity_bindings.bound_at`), epoch ms.
+    pub last_binding_at: Option<i64>,
+    pub turn_count: i64,
+    pub chain_count: i64,
+}
+
+/// #834: observe the continuity journal without creating, migrating or locking
+/// the state database for writes.
+///
+/// A silent stall (no journal write since some date) is exactly what #834
+/// reported, so doctor must be able to show it. Doctor never mutates state:
+/// the database is opened read-only, a missing file reports `Ok(None)`, and a
+/// store that predates the continuity tables reports a typed error instead of
+/// being upgraded in place.
+pub fn probe_continuity_journal(
+    state_db_path: &Path,
+) -> Result<Option<ContinuityJournalProbe>, String> {
+    if !state_db_path.is_file() {
+        return Ok(None);
+    }
+    let conn =
+        Connection::open_with_flags(state_db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("cannot open state database for continuity probe: {error}"))?;
+    conn.query_row(
+        "SELECT (SELECT MAX(observed_at) FROM continuity_turns),
+                (SELECT MAX(bound_at) FROM continuity_bindings),
+                (SELECT COUNT(*) FROM continuity_turns),
+                (SELECT COUNT(*) FROM continuity_chains)",
+        [],
+        |row| {
+            Ok(ContinuityJournalProbe {
+                last_turn_at: row.get(0)?,
+                last_binding_at: row.get(1)?,
+                turn_count: row.get(2)?,
+                chain_count: row.get(3)?,
+            })
+        },
+    )
+    .map(Some)
+    .map_err(|error| format!("cannot read continuity journal: {error}"))
+}
+
 fn bounded_continuity_excerpt(text: &str) -> String {
     const MAX_CHARS: usize = 240;
     let mut chars = text.trim().chars();
@@ -9300,6 +9540,248 @@ mod tests {
             store.continuity_for_conversation("conv-a").unwrap_err(),
             "continuity_binding_ambiguous"
         );
+    }
+
+    /// user keeps 接力 after a dispatch bind | Given a ChatGPT conversation and
+    /// workspace bound only through the dispatch/auto-bind path | When the same
+    /// conversation is attached twice | Then one durable chain owns both the
+    /// provider conversation id and its canonical URL, with one provider binding,
+    /// and a repeat attach creates nothing.
+    #[test]
+    fn attach_continuity_is_idempotent_and_resolves_both_conversation_identities() {
+        let state_db_dir = temp_dir();
+        let mut store = StateStore::open_in_dir(&state_db_dir, "state").unwrap();
+        let attach = |store: &mut StateStore| {
+            store
+                .attach_continuity_for_conversation(ContinuityAttachInput {
+                    conversation_id: "6ae86982-3f8f-83e9-8c9f-b99360c5b44f",
+                    conversation_aliases: &[
+                        "https://chatgpt.com/c/6ae86982-3f8f-83e9-8c9f-b99360c5b44f",
+                    ],
+                    provider: Some("chatgpt"),
+                    account_ref: Some("bra_chatgpt_account"),
+                    space_ref: Some("brs_chatgpt_space"),
+                    session_ref: Some("brs_chatgpt_6ae86982"),
+                    workspace_id: Some("w1"),
+                    project_id: Some("g-p-6a89c078669481918c8eb70fdfd3d978"),
+                    title: Some("Herdr 会话"),
+                    observed_at: 1_700_000_000_000,
+                })
+                .unwrap()
+        };
+        let first = attach(&mut store);
+        assert!(first.created);
+        assert!(first.workspace_bound);
+        let second = attach(&mut store);
+        assert_eq!(second.continuity_id, first.continuity_id);
+        assert!(!second.created);
+        assert!(
+            !second.workspace_bound,
+            "a repeated attach must not insert another binding row"
+        );
+
+        // Both identities the extension uses resolve to the same chain, which is
+        // exactly what `/extension/continuity/resolve` and `browser_handoff.prepare`
+        // need after a dispatch-only bind.
+        assert_eq!(
+            store
+                .continuity_for_conversation("6ae86982-3f8f-83e9-8c9f-b99360c5b44f")
+                .unwrap(),
+            Some(first.continuity_id.clone())
+        );
+        assert_eq!(
+            store
+                .continuity_for_conversation(
+                    "https://chatgpt.com/c/6ae86982-3f8f-83e9-8c9f-b99360c5b44f"
+                )
+                .unwrap(),
+            Some(first.continuity_id.clone())
+        );
+        assert_eq!(
+            store
+                .continuity_for_provider_session("chatgpt", "brs_chatgpt_6ae86982")
+                .unwrap(),
+            Some(first.continuity_id.clone())
+        );
+        let chain_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM continuity_chains", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            chain_count, 1,
+            "repeat binds must not create duplicate chains"
+        );
+        let provider_binding_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM continuity_provider_bindings",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider_binding_count, 1);
+        let resume = store
+            .continuity_resume(&first.continuity_id, 8)
+            .unwrap()
+            .expect("attached chain must be durable");
+        assert_eq!(resume.status, "active");
+        assert_eq!(resume.title.as_deref(), Some("Herdr 会话"));
+        assert_eq!(
+            resume.project_id.as_deref(),
+            Some("g-p-6a89c078669481918c8eb70fdfd3d978")
+        );
+        std::fs::remove_dir_all(state_db_dir).ok();
+    }
+
+    /// user keeps one continuity chain | Given a chain the extension already
+    /// created by journaling a turn | When the dispatch attaches the same
+    /// conversation | Then the existing chain is reused instead of forked.
+    #[test]
+    fn attach_continuity_reuses_an_existing_journal_owner_chain() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .append_continuity_turn(ContinuityTurnInput {
+                continuity_id: "hc:1abc:7zzzzzz",
+                conversation_id: "conv-dispatch",
+                workspace_id: Some("w7"),
+                project_id: None,
+                title: None,
+                message_id: "m1",
+                role: "user",
+                text: "继续实现 #834",
+                fingerprint: None,
+                observed_at: 100,
+            })
+            .unwrap();
+        let attached = store
+            .attach_continuity_for_conversation(ContinuityAttachInput {
+                conversation_id: "conv-dispatch",
+                conversation_aliases: &["https://chatgpt.com/c/conv-dispatch"],
+                provider: Some("chatgpt"),
+                account_ref: Some("account-a"),
+                space_ref: None,
+                session_ref: Some("session-a"),
+                workspace_id: Some("w7"),
+                project_id: None,
+                title: None,
+                observed_at: 200,
+            })
+            .unwrap();
+        assert_eq!(attached.continuity_id, "hc:1abc:7zzzzzz");
+        assert!(!attached.created);
+        let chain_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM continuity_chains", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(chain_count, 1);
+        assert_eq!(
+            store
+                .continuity_for_conversation("https://chatgpt.com/c/conv-dispatch")
+                .unwrap(),
+            Some("hc:1abc:7zzzzzz".to_owned())
+        );
+    }
+
+    /// user is never handed the wrong work chain | Given two active chains that
+    /// already own one conversation | When a dispatch attaches that conversation
+    /// | Then the attach fails closed and writes no third chain.
+    #[test]
+    fn attach_continuity_fails_closed_on_ambiguous_ownership() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO continuity_chains
+                    (continuity_id, project_id, status, created_at, updated_at)
+                 VALUES
+                    ('hc:alpha', 'project-a', 'active', 90, 110),
+                    ('hc:beta', 'project-a', 'active', 190, 210);
+                 INSERT INTO continuity_bindings
+                    (continuity_id, conversation_id, workspace_id, bound_at)
+                 VALUES
+                    ('hc:alpha', 'conv-a', 'w1', 100),
+                    ('hc:beta', 'conv-a', 'w2', 200);",
+            )
+            .unwrap();
+        let error = store
+            .attach_continuity_for_conversation(ContinuityAttachInput {
+                conversation_id: "conv-a",
+                conversation_aliases: &[],
+                provider: Some("chatgpt"),
+                account_ref: None,
+                space_ref: None,
+                session_ref: Some("session-a"),
+                workspace_id: Some("w1"),
+                project_id: None,
+                title: None,
+                observed_at: 300,
+            })
+            .unwrap_err();
+        assert_eq!(error, "continuity_binding_ambiguous");
+        let chain_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM continuity_chains", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            chain_count, 2,
+            "an ambiguous attach must not create a chain"
+        );
+        let provider_binding_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM continuity_provider_bindings",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider_binding_count, 0);
+    }
+
+    /// user can see a stalled continuity journal | Given a state database with a
+    /// journaled turn | When doctor probes it read-only | Then the probe reports
+    /// the last write time and counts, and a missing database stays absent
+    /// instead of being created.
+    #[test]
+    fn continuity_journal_probe_reports_last_write_without_mutating_state() {
+        let state_db_dir = temp_dir();
+        let mut store = StateStore::open_in_dir(&state_db_dir, "state").unwrap();
+        store
+            .append_continuity_turn(ContinuityTurnInput {
+                continuity_id: "hc:probe",
+                conversation_id: "conv-probe",
+                workspace_id: Some("w1"),
+                project_id: None,
+                title: None,
+                message_id: "m1",
+                role: "user",
+                text: "doctor 需要看到 journal 的最后写入时间",
+                fingerprint: None,
+                observed_at: 1_700_000_123_456,
+            })
+            .unwrap();
+        let state_db_path = state_db_dir.join("state.db");
+        let probe = probe_continuity_journal(&state_db_path)
+            .unwrap()
+            .expect("existing database is probed");
+        assert_eq!(probe.last_turn_at, Some(1_700_000_123_456));
+        assert_eq!(probe.last_binding_at, Some(1_700_000_123_456));
+        assert_eq!(probe.turn_count, 1);
+        assert_eq!(probe.chain_count, 1);
+        drop(store);
+
+        let missing = probe_continuity_journal(&state_db_dir.join("absent.db")).unwrap();
+        assert!(missing.is_none());
+        assert!(
+            !state_db_dir.join("absent.db").exists(),
+            "doctor must never create a state database"
+        );
+        std::fs::remove_dir_all(state_db_dir).ok();
     }
 
     #[test]
