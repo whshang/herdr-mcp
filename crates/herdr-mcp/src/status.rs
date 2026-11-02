@@ -452,7 +452,7 @@ pub fn print_doctor(
     let documents_permission = macos_privacy::probe_documents_permission(&paths.config_dir);
     let code_identity = macos_privacy::probe_code_identity();
     let authenticated_local_mcp = probe_authenticated_local_mcp(config.runtime_port);
-    let standalone_browser = crate::standalone_extension::doctor_report();
+    let standalone_browser = crate::standalone_extension::doctor_report(&paths.config_dir);
     let local_agent_skill = crate::local_agent_skill::status_summary();
     // #834: the durable continuity journal is what ChatGPT 接力 needs. UAT could
     // only see its absence by querying state.db by hand, so doctor reports the
@@ -568,6 +568,7 @@ pub fn print_doctor(
     );
     println!("{}", crate::child_process::doctor_line());
     println!("{}", standalone_browser.doctor_line());
+    println!("{}", standalone_browser.version_line());
     let semantic = crate::semantic::SemanticService::from_config().capability_json();
     let semantic_configured = semantic["configured"].as_bool().unwrap_or(false);
     let semantic_degraded = semantic["provider_state"].as_str() == Some("degraded");
@@ -873,6 +874,30 @@ pub fn print_doctor(
                     )
                     .to_owned(),
             );
+        }
+        match doctor_json
+            .pointer("/standalone_extension/version/state")
+            .and_then(Value::as_str)
+        {
+            Some("reload_pending") => attention.push(
+                language
+                    .text(
+                        "the browser extension was staged for this release but the browser still runs the old build · click Reload on chrome://extensions",
+                        "浏览器扩展已为本版本就位，但浏览器仍在运行旧版本 · 请在 chrome://extensions 点击 Reload",
+                        "ブラウザ拡張はこのリリース用に配置済みですが、ブラウザは旧ビルドのままです · chrome://extensions で Reload をクリックしてください",
+                    )
+                    .to_owned(),
+            ),
+            Some("extension_stale") => attention.push(
+                language
+                    .text(
+                        "the staged browser extension does not match this runtime release · run herdr-mcp extension standalone install",
+                        "已就位的浏览器扩展与当前运行时版本不一致 · 请运行 herdr-mcp extension standalone install",
+                        "配置済みのブラウザ拡張がこのランタイムリリースと一致しません · herdr-mcp extension standalone install を実行してください",
+                    )
+                    .to_owned(),
+            ),
+            _ => {}
         }
         if !local_agent_skill.0 {
             attention.push(format!(

@@ -56,6 +56,28 @@ pub fn compiled_source_dirty() -> bool {
     matches!(option_env!("HERDR_MCP_BUILD_DIRTY"), Some("1" | "true"))
 }
 
+/// Browser-extension `manifest.json` bundled into this Runtime build.
+///
+/// The Runtime does not ship extension files; it records which extension version
+/// belongs to this release so `doctor` can tell a stale staged standalone
+/// extension from a current one without a network call (#833).
+const BUNDLED_EXTENSION_MANIFEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../extension/manifest.json"
+));
+
+static BUNDLED_EXTENSION_VERSION: OnceLock<Option<String>> = OnceLock::new();
+
+pub fn bundled_extension_version() -> Option<&'static str> {
+    BUNDLED_EXTENSION_VERSION
+        .get_or_init(|| {
+            let manifest = serde_json::from_str::<Value>(BUNDLED_EXTENSION_MANIFEST).ok()?;
+            let version = manifest.get("version")?.as_str()?.trim();
+            (!version.is_empty()).then(|| version.to_owned())
+        })
+        .as_deref()
+}
+
 pub fn build_info() -> Value {
     let started_at = started_at();
     let built_at = env::var("HERDR_MCP_BUILT_AT").unwrap_or_else(|_| started_at.clone());

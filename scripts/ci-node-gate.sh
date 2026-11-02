@@ -27,6 +27,7 @@ case "${MODE}" in
       tests/extension-local-auth.test.mjs \
       tests/extension-native-host.test.mjs \
       tests/extension-recovery.test.mjs \
+      tests/extension-version-guard.test.mjs \
       tests/options-i18n.test.mjs \
       tests/pack-extension.test.mjs \
       tests/page-assist-content.test.mjs \

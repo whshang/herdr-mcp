@@ -12,6 +12,7 @@ use crate::cli::UpdateCommand;
 use crate::config::{Config, UpdateChannel};
 use crate::paths::RuntimePaths;
 use crate::release_trust::{self, ReleaseIdentity};
+use crate::standalone_extension::{ExtensionVersionReport, StagedExtension, StagedExtensionState};
 use crate::state_store::SCHEMA_VERSION;
 use crate::updater_store::{UpdateJobRecord, UpdateStore};
 use reqwest::blocking::{Client, Response};
@@ -329,23 +330,108 @@ fn worker_update_notices(worker_update: &Value) -> Value {
         .unwrap_or_else(|| json!([]))
 }
 
+/// Stage the standalone browser extension that belongs to the release this
+/// process is running (§833).
+///
+/// `update apply` used to leave `extensions/standalone/current` on whatever ref
+/// was last installed by hand, so the browser kept running old extension code
+/// with no way to notice. Staging reuses the CLI install path (same manifest
+/// `key`, same atomic swap), only when the user already has a standalone
+/// install, and never fails the Runtime update: the caller reports the outcome
+/// as a notice and the exact fix command.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stage_standalone_extension_after_update(
+    reference: Option<&str>,
+) -> Result<StagedExtension, String> {
+    let reference = match reference {
+        Some(reference) => reference.to_owned(),
+        // The detached worker is the newly downloaded release binary, so its own
+        // build commit is the release it just activated. The interactive
+        // foreground process is still the *old* release and passes the target
+        // commit explicitly instead.
+        None => crate::runtime_meta::compiled_source_commit()
+            .map(str::to_owned)
+            .or_else(|| {
+                env::var("HERDR_MCP_BUILD_COMMIT").ok().filter(|value| {
+                    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            })
+            .ok_or_else(|| {
+                "this runtime build carries no source commit; run `herdr-mcp extension standalone install` to stage the extension".to_owned()
+            })?,
+    };
+    crate::standalone_extension::stage_release_extension(&reference)
+}
+
+/// Report the result of update-time extension staging without changing the
+/// Runtime update result.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn report_standalone_extension_staging(staging: &Result<StagedExtension, String>) {
+    match staging {
+        Ok(staged) => match staged.state {
+            StagedExtensionState::NotInstalled => {}
+            _ => eprintln!(
+                "[herdr-mcp update] The standalone browser extension was staged for this release: {}. Reload the Herdr extension in chrome://extensions.",
+                staged.summary()
+            ),
+        },
+        Err(error) => eprintln!(
+            "[herdr-mcp update] The Runtime update succeeded, but staging the standalone browser extension did not complete ({error}); run `herdr-mcp extension standalone install`."
+        ),
+    }
+}
+
+/// Extension notices for a committed Runtime update. A staged extension the
+/// browser has not loaded yet is a notice; a staged extension that does not
+/// belong to this release is a warning. Neither is fatal.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn append_standalone_extension_notice(
+    notices: Value,
+    extension: &crate::standalone_extension::ExtensionVersionReport,
+) -> Value {
+    let mut notices = notices.as_array().cloned().unwrap_or_default();
+    if let Some(notice) = extension.update_notice() {
+        notices.push(notice);
+    }
+    Value::Array(notices)
+}
+
+/// Extension status for one committed Runtime update.
+///
+/// `expected_release_commit` is the release this update activates (it can differ
+/// from the running binary on the interactive path, where the old Runtime is
+/// still the foreground process).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn standalone_extension_report(
+    paths: &RuntimePaths,
+    expected_release_commit: Option<&str>,
+) -> crate::standalone_extension::ExtensionVersionReport {
+    crate::standalone_extension::version_report(&paths.config_dir, None, expected_release_commit)
+}
+
 /// Notices for a committed Runtime update. Drift is a notice; a failed
 /// `--with-worker` attempt is a warning. Neither is fatal, because the Runtime
 /// update itself succeeded.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn runtime_update_notices(worker_update: &Value, chain: WorkerChain) -> Value {
-    if chain == WorkerChain::WithWorker
+fn runtime_update_notices(
+    worker_update: &Value,
+    chain: WorkerChain,
+    extension: &crate::standalone_extension::ExtensionVersionReport,
+) -> Value {
+    let notices = if chain == WorkerChain::WithWorker
         && worker_update.get("ok").and_then(Value::as_bool) == Some(false)
     {
-        return json!([{
+        json!([{
             "code": "worker_update_failed",
             "severity": "warning",
             "fatal": false,
             "message": "the Runtime update succeeded, but the requested --with-worker Worker update did not complete; run `herdr-mcp worker update` to retry that separate step",
             "next_action": WORKER_UPDATE_NEXT_ACTION,
-        }]);
-    }
-    worker_update_notices(worker_update)
+        }])
+    } else {
+        worker_update_notices(worker_update)
+    };
+    append_standalone_extension_notice(notices, extension)
 }
 
 /// Notice for the one-time macOS consent prompt a newly activated generation may
@@ -492,6 +578,8 @@ struct RuntimeUpdateOutcome<'a> {
     migration: Option<&'a StateSchemaMigration>,
     worker_update: Value,
     worker_chain: WorkerChain,
+    extension: ExtensionVersionReport,
+    extension_staging: Option<StagedExtension>,
 }
 
 /// The Runtime update is what `update apply` guarantees. Worker drift is
@@ -519,9 +607,12 @@ fn runtime_update_succeeded_result(outcome: RuntimeUpdateOutcome<'_>) -> (Value,
         "worker_update_chained": outcome.worker_chain == WorkerChain::WithWorker,
         "worker_update_required": worker_update_required,
         "worker_update": outcome.worker_update,
+        "standalone_extension": outcome.extension.as_json(),
+        "standalone_extension_staging": outcome.extension_staging.as_ref().map(StagedExtension::as_json).unwrap_or(Value::Null),
         "notices": with_macos_tcc_prompt_notice(runtime_update_notices(
             &outcome.worker_update,
             outcome.worker_chain,
+            &outcome.extension,
         )),
         "next_action": if worker_update_required {
             Some(WORKER_UPDATE_NEXT_ACTION)
@@ -540,30 +631,37 @@ fn runtime_update_succeeded_result(outcome: RuntimeUpdateOutcome<'_>) -> (Value,
 /// explicit `--with-worker` reconcile — is only a notice; `ok` and the exit code
 /// stay with the Runtime outcome.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn update_current_result(
+struct UpdateCurrentOutcome<'a> {
     channel: UpdateChannel,
-    current_version: &str,
-    target_version: &str,
-    tag: &str,
-    migration: Option<&StateSchemaMigration>,
+    current_version: &'a str,
+    target_version: &'a str,
+    tag: &'a str,
+    migration: Option<&'a StateSchemaMigration>,
     worker_update: Value,
     worker_chain: WorkerChain,
-) -> (Value, ExitCode) {
-    let worker_update_required = worker_update_required(&worker_update);
+    extension: &'a ExtensionVersionReport,
+    extension_staging: Option<&'a StagedExtension>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn update_current_result(outcome: UpdateCurrentOutcome<'_>) -> (Value, ExitCode) {
+    let worker_update_required = worker_update_required(&outcome.worker_update);
     let payload = json!({
         "ok": true,
         "code": "update_current",
-        "update_channel": channel.as_str(),
-        "current_version": current_version,
-        "release_version": target_version,
-        "tag": tag,
+        "update_channel": outcome.channel.as_str(),
+        "current_version": outcome.current_version,
+        "release_version": outcome.target_version,
+        "tag": outcome.tag,
         "provenance_verified": true,
         "runtime_changed": false,
-        "worker_update_chained": worker_chain == WorkerChain::WithWorker,
+        "worker_update_chained": outcome.worker_chain == WorkerChain::WithWorker,
         "worker_update_required": worker_update_required,
-        "warning": migration.map(StateSchemaMigration::warning),
-        "worker_update": worker_update,
-        "notices": runtime_update_notices(&worker_update, worker_chain),
+        "warning": outcome.migration.map(StateSchemaMigration::warning),
+        "worker_update": outcome.worker_update,
+        "standalone_extension": outcome.extension.as_json(),
+        "standalone_extension_staging": outcome.extension_staging.map(StagedExtension::as_json).unwrap_or(Value::Null),
+        "notices": runtime_update_notices(&outcome.worker_update, outcome.worker_chain, outcome.extension),
         "next_action": if worker_update_required {
             Some(WORKER_UPDATE_NEXT_ACTION)
         } else {
@@ -893,15 +991,26 @@ fn apply_inner(
                 || reconcile_worker_with_active_runtime(&paths),
             );
             report_worker_update_notice(&worker_update, worker_chain);
-            let (payload, code) = update_current_result(
+            // The Runtime is already on this release, so re-stage the matching
+            // standalone extension if this workstation has one: that is the
+            // repair path for a workstation whose extension was left behind by
+            // an older updater (§833).
+            let staging =
+                stage_standalone_extension_after_update(Some(&plan.identity.source_commit));
+            report_standalone_extension_staging(&staging);
+            let staged = staging.as_ref().ok();
+            let extension = standalone_extension_report(&paths, Some(&plan.identity.source_commit));
+            let (payload, code) = update_current_result(UpdateCurrentOutcome {
                 channel,
-                &current.to_string(),
-                &target_version,
-                &plan.tag,
-                plan.state_schema_migration.as_ref(),
+                current_version: &current.to_string(),
+                target_version: &target_version,
+                tag: &plan.tag,
+                migration: plan.state_schema_migration.as_ref(),
                 worker_update,
                 worker_chain,
-            );
+                extension: &extension,
+                extension_staging: staged,
+            });
             print_json(&payload)?;
             return Ok(code);
         }
@@ -1017,6 +1126,15 @@ fn apply_inner(
                     || reconcile_worker_with_active_runtime(&paths),
                 );
                 report_worker_update_notice(&worker_update, worker_chain);
+                // The detached worker stages the extension right after its
+                // service install commits. Re-running staging here with the
+                // target release commit is idempotent (the worker already
+                // recorded that commit) and lets the foreground result carry the
+                // exact Reload/refresh action.
+                let staging =
+                    stage_standalone_extension_after_update(Some(&plan.identity.source_commit));
+                let extension =
+                    standalone_extension_report(&paths, Some(&plan.identity.source_commit));
                 let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
                     target_version,
                     target: plan.asset.target.clone(),
@@ -1028,6 +1146,8 @@ fn apply_inner(
                     migration: plan.state_schema_migration.as_ref(),
                     worker_update,
                     worker_chain,
+                    extension,
+                    extension_staging: staging.ok(),
                 });
                 print_json(&payload)?;
                 return Ok(code);
@@ -2186,13 +2306,22 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
         let install = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false });
         let succeeded = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
         if succeeded {
-            store.update_update_job(
-                job_id,
-                "succeeded",
-                Some("service install committed and health gate passed"),
-                None,
-                now_ms_i64(),
-            )?;
+            // The newly activated release is the only process that knows which
+            // extension version belongs to it, and the detached worker is where
+            // both the interactive and the queued `update apply` paths converge.
+            // Staging is best-effort: the Runtime update already committed.
+            let staging = stage_standalone_extension_after_update(None);
+            report_standalone_extension_staging(&staging);
+            let detail = match staging {
+                Ok(staged) => format!(
+                    "service install committed and health gate passed; {}",
+                    staged.summary()
+                ),
+                Err(error) => format!(
+                    "service install committed and health gate passed; extension staging did not complete: {error}"
+                ),
+            };
+            store.update_update_job(job_id, "succeeded", Some(&detail), None, now_ms_i64())?;
             crate::local_agent_skill::sync_after_install_best_effort();
             cleanup_staging(&binary);
             Ok(ExitCode::SUCCESS)
@@ -4562,6 +4691,8 @@ mod tests {
             migration: None,
             worker_update: behind,
             worker_chain: WorkerChain::RuntimeOnly,
+            extension: ExtensionVersionReport::unknown("test"),
+            extension_staging: None,
         });
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(payload["ok"], true);
@@ -4610,6 +4741,8 @@ mod tests {
             migration: None,
             worker_update: failed_worker,
             worker_chain: WorkerChain::WithWorker,
+            extension: ExtensionVersionReport::unknown("test"),
+            extension_staging: None,
         });
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(payload["code"], "update_succeeded");
@@ -4717,6 +4850,8 @@ mod tests {
             migration: None,
             worker_update: outdated_worker,
             worker_chain: WorkerChain::RuntimeOnly,
+            extension: ExtensionVersionReport::unknown("test"),
+            extension_staging: None,
         });
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(payload["ok"], true);
@@ -4907,15 +5042,17 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn update_current_stays_successful_when_the_worker_step_fails() {
-        let (payload, code) = update_current_result(
-            UpdateChannel::Stable,
-            "1.1.0-rc.9",
-            "1.1.0-rc.9",
-            "v1.1.0-rc.9",
-            None,
-            json!({ "ok": false, "code": "worker_update_failed", "error": "reconciliation did not complete" }),
-            WorkerChain::WithWorker,
-        );
+        let (payload, code) = update_current_result(UpdateCurrentOutcome {
+            channel: UpdateChannel::Stable,
+            current_version: "1.1.0-rc.9",
+            target_version: "1.1.0-rc.9",
+            tag: "v1.1.0-rc.9",
+            migration: None,
+            worker_update: json!({ "ok": false, "code": "worker_update_failed", "error": "reconciliation did not complete" }),
+            worker_chain: WorkerChain::WithWorker,
+            extension: &ExtensionVersionReport::unknown("test"),
+            extension_staging: None,
+        });
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(payload["ok"], true);
         assert_eq!(payload["code"], "update_current");
@@ -4930,18 +5067,93 @@ mod tests {
         assert_eq!(notice["next_action"], "herdr-mcp worker update");
 
         // The default runtime-only path never chains the Worker at all.
-        let (payload, code) = update_current_result(
-            UpdateChannel::Stable,
-            "1.1.0-rc.9",
-            "1.1.0-rc.9",
-            "v1.1.0-rc.9",
-            None,
-            json!({ "configured": false, "update_required": false }),
-            WorkerChain::RuntimeOnly,
-        );
+        let (payload, code) = update_current_result(UpdateCurrentOutcome {
+            channel: UpdateChannel::Stable,
+            current_version: "1.1.0-rc.9",
+            target_version: "1.1.0-rc.9",
+            tag: "v1.1.0-rc.9",
+            migration: None,
+            worker_update: json!({ "configured": false, "update_required": false }),
+            worker_chain: WorkerChain::RuntimeOnly,
+            extension: &ExtensionVersionReport::unknown("test"),
+            extension_staging: None,
+        });
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(payload["ok"], true);
         assert_eq!(payload["worker_update_chained"], false);
+    }
+
+    /// Given a Runtime update that committed
+    /// When the standalone browser extension needs a Reload
+    /// Then the result stays successful and the Reload is a non-fatal notice
+    ///     carrying the exact user action (§833).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn runtime_update_reports_a_pending_extension_reload_as_a_notice() {
+        let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+            job_id: "upd-833".to_owned(),
+            target_version: "1.1.0-rc.12".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            asset: "herdr-mcp".to_owned(),
+            worker_pid: 7,
+            worker_pid_persisted: true,
+            job: json!({ "job_id": "upd-833", "state": "succeeded" }),
+            migration: None,
+            worker_update: json!({ "configured": false, "update_required": false }),
+            worker_chain: WorkerChain::RuntimeOnly,
+            extension: ExtensionVersionReport::for_test("reload_pending"),
+            extension_staging: None,
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["code"], "update_succeeded");
+        assert_eq!(payload["standalone_extension"]["state"], "reload_pending");
+        assert_eq!(payload["standalone_extension_staging"], Value::Null);
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "extension_reload_required")
+            .expect("a staged extension the browser has not loaded is a notice");
+        assert_eq!(notice["severity"], "notice");
+        assert_eq!(notice["fatal"], false);
+        assert!(
+            notice["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("chrome://extensions")
+        );
+
+        // A staged extension that belongs to another release is a warning with
+        // the exact fix command, and still not a failed Runtime update.
+        let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+            job_id: "upd-833-stale".to_owned(),
+            target_version: "1.1.0-rc.12".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            asset: "herdr-mcp".to_owned(),
+            worker_pid: 7,
+            worker_pid_persisted: true,
+            job: json!({ "job_id": "upd-833-stale", "state": "succeeded" }),
+            migration: None,
+            worker_update: json!({ "configured": false, "update_required": false }),
+            worker_chain: WorkerChain::RuntimeOnly,
+            extension: ExtensionVersionReport::for_test("extension_stale"),
+            extension_staging: None,
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(payload["ok"], true);
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "extension_stale")
+            .expect("a staged extension from another release is reported");
+        assert_eq!(notice["severity"], "warning");
+        assert_eq!(notice["fatal"], false);
+        assert_eq!(
+            notice["next_action"],
+            "herdr-mcp extension standalone install"
+        );
     }
 
     /// Given a Runtime update that activated a new generation

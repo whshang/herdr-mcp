@@ -17,6 +17,7 @@ const EXTENSION_TESTS = new Set([
   "tests/browser-extension-store-contract.test.mjs",
   "tests/chatgpt-artifact-capture.test.mjs",
   "tests/extension-i18n.test.mjs",
+  "tests/extension-version-guard.test.mjs",
   "tests/options-i18n.test.mjs",
   "tests/page-assist-content.test.mjs",
   "tests/page-assist-core.test.mjs",
