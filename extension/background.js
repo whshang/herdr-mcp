@@ -19,7 +19,7 @@ import {
 import {
   buildHandoffFallbackPrompt, buildHandoffRequest, buildHandoffSeed, chatGptConversationInfo,
   classifyHandoffAssistantReply, extractHandoffPacket, handoffSeedContainsTransfer, handoffStatusIsActive,
-  newContinuityId, newTransferId, shouldDiscardRetiredSourceTab,
+  handoffSourceNavigationBlock, newContinuityId, newTransferId, shouldDiscardRetiredSourceTab,
 } from "./continuity-core.js";
 import {
   CONTINUITY_JOURNAL_STORAGE_KEY, continuityJournalEntry, turnFingerprint,
@@ -7837,18 +7837,35 @@ async function launchHandoffTarget(transferId) {
       return { ok: false, error: "local_runtime_unavailable", reason: runtimeGate.reason };
     }
   }
-  await markTransfer(transferId, { status: "target_opening", error: null });
-  let tab;
-  if (manualChatGptProjectHandoff(transfer)) {
-    // Manual handoff reuses the current source tab: navigate it to the Project
-    // home instead of opening a new tab. The source content script is destroyed
-    // by navigation (expected); the handoff packet is already persisted in
-    // background storage and the new page's content script restores readiness.
+  const manualProject = manualChatGptProjectHandoff(transfer);
+  if (manualProject) {
+    // #835: this branch is the only place that navigates an EXISTING tab, and a
+    // non-terminal transfer can outlive the conversation it was created from
+    // (tab ids survive reloads, SPA navigation and new conversations). Verify
+    // tab ownership before the status touch and before navigation, so a stale
+    // transfer can never pull the tab away from a conversation it is not
+    // handing off. The check reads the pre-touch timestamp for its TTL.
     const sourceTabId = transfer.source_tab_id;
     if (!sourceTabId || !(await tabStillExists(sourceTabId))) {
       await markTransfer(transferId, { status: "seed_uncertain", error: "target_tab_gone" });
       return { ok: false, error: "target_tab_gone" };
     }
+    let liveTab = null;
+    try { liveTab = await chrome.tabs.get(sourceTabId); } catch (_) {}
+    const navigationBlock = handoffSourceNavigationBlock({ transfer, liveUrl: liveTab?.url || null });
+    if (navigationBlock) {
+      await markTransfer(transferId, { status: "failed", error: navigationBlock });
+      return { ok: false, error: navigationBlock };
+    }
+  }
+  await markTransfer(transferId, { status: "target_opening", error: null });
+  let tab;
+  if (manualProject) {
+    // Manual handoff reuses the current source tab: navigate it to the Project
+    // home instead of opening a new tab. The source content script is destroyed
+    // by navigation (expected); the handoff packet is already persisted in
+    // background storage and the new page's content script restores readiness.
+    const sourceTabId = transfer.source_tab_id;
     try {
       await chrome.tabs.update(sourceTabId, { url: launchUrl, active: true });
     } catch (e) {
@@ -7869,7 +7886,6 @@ async function launchHandoffTarget(transferId) {
     return { ok: false, error: "target_tab_missing" };
   }
   await markTransfer(transferId, { status: "target_opening", target_tab_id: tab.id });
-  const manualProject = manualChatGptProjectHandoff(transfer);
   const ready = manualProject
     ? await waitForManualProjectHome(tab.id, transfer, 20000)
     : await waitForTabComplete(tab.id, 20000);
@@ -8058,6 +8074,26 @@ async function resumeSummaryRequested(transfer) {
   return { ok: true, pending: true, handoff: handoffView(retried) };
 }
 
+// A seed can only be present in the page once the transfer reached the target.
+const HANDOFF_SEED_EVIDENCE_STATUSES = ["target_opening", "seed_submitting", "seed_uncertain"];
+
+async function handoffTabCarriesTransferSeed(tabId, transfer) {
+  if (!HANDOFF_SEED_EVIDENCE_STATUSES.includes(String(transfer?.status || ""))) return false;
+  if (String(transfer?.site || "chatgpt") !== "chatgpt") return false;
+  // Deliberately a single read-only probe: sendHandoffTabMessage's missing
+  // receiver recovery reloads the tab, which must never happen while deciding
+  // whether the tab belongs to this transfer at all.
+  try {
+    const probe = await chrome.tabs.sendMessage(tabId, {
+      type: "h2w_handoff_probe",
+      transferId: transfer.id,
+    });
+    return probe?.seedConfirmed === true;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function resumeHandoffForCurrentTab(tabId) {
   // Manual current-tab handoff: after the source tab was navigated to the
   // Project home, the live URL no longer resolves to the old source
@@ -8073,8 +8109,32 @@ async function resumeHandoffForCurrentTab(tabId) {
     && (Number(row.source_tab_id || -1) === tid || Number(row.target_tab_id || -1) === tid)
   ));
   if (!matches.length) return null;
-  if (matches.length > 1) return { ok: false, error: "handoff_ambiguous_for_tab" };
-  const transfer = matches[0];
+  // #835: a tab id is not an owner identity. Partition the matches against the
+  // tab's LIVE url before any resume navigates or seeds into it; a transfer that
+  // no longer owns this tab is failed so it can never act on it again, and a tab
+  // that owns no transfer is free to start a fresh handoff below.
+  let liveUrl = null;
+  try { liveUrl = (await chrome.tabs.get(tid))?.url || null; } catch (_) {}
+  const owned = [];
+  for (const row of matches) {
+    let block = handoffSourceNavigationBlock({ transfer: row, liveUrl });
+    if (block === "stale_handoff_conversation_mismatch") {
+      // The tab may already carry this transfer's seed: an uncertain delivery, or
+      // a crash between submit and commit, leaves the transfer without a target
+      // conversation while the page is already the target. Only positive page
+      // evidence re-allows it; a foreign conversation never reports the marker.
+      const seedConfirmed = await handoffTabCarriesTransferSeed(tid, row);
+      if (seedConfirmed) block = handoffSourceNavigationBlock({ transfer: row, liveUrl, seedConfirmed });
+    }
+    if (block) {
+      await markTransfer(row.id, { status: "failed", error: block });
+      continue;
+    }
+    owned.push(row);
+  }
+  if (!owned.length) return null;
+  if (owned.length > 1) return { ok: false, error: "handoff_ambiguous_for_tab" };
+  const transfer = owned[0];
   if (transfer.status === "seed_uncertain") return resumeUncertainHandoff(transfer);
   const ageMs = Date.now() - Number(transfer.updated_at || transfer.created_at || Date.now());
   if (ageMs >= 120000 && transfer.status === "summary_requested") return resumeSummaryRequested(transfer);
@@ -8144,7 +8204,15 @@ async function startHandoffForTab(tabId, trigger = "manual") {
 
   const transfers = await loadHandoffTransfers();
   const active = activeTransferFromSource(transfers, convInfo.convKey);
-  if (active) {
+  // #835: a manual Project transfer navigates the source tab, so it may only be
+  // resumed while this tab still shows a page that transfer owns. An abandoned
+  // one is failed here and the request falls through to a fresh transfer.
+  const activeBlock = active && manualChatGptProjectHandoff(active)
+    ? handoffSourceNavigationBlock({ transfer: active, liveUrl: liveInfo?.url || null })
+    : null;
+  if (activeBlock) {
+    await markTransfer(active.id, { status: "failed", error: activeBlock });
+  } else if (active) {
     if (active.status === "seed_uncertain") return resumeUncertainHandoff(active);
     const ageMs = Date.now() - Number(active.updated_at || active.created_at || Date.now());
     if (ageMs >= 120000 && active.status === "summary_requested") {
