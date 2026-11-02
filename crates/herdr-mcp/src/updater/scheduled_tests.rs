@@ -81,6 +81,44 @@ struct Scenario {
     bytes: Vec<u8>,
 }
 
+/// Contract identity and state schema of a fixture release plus the identity the
+/// installed runtime reports. The default shape is the adjacent forward
+/// migration (local epoch 4 / schema 16 → target epoch 5).
+struct FixtureShape {
+    local: ContractIdentity,
+    manifest_contract: ContractIdentity,
+    manifest_state_schema: i64,
+    contract_migration: bool,
+}
+
+impl FixtureShape {
+    fn forward_migration() -> Self {
+        let local = crate::contract::previous_identity().unwrap();
+        let target = crate::contract::identity().unwrap();
+        assert_eq!(local.epoch, 4);
+        assert_eq!(target.epoch, 5);
+        Self {
+            local,
+            manifest_contract: target,
+            manifest_state_schema: SCHEMA_VERSION,
+            contract_migration: true,
+        }
+    }
+
+    fn older_stable() -> Self {
+        let local = crate::contract::identity().unwrap();
+        let stable = crate::contract::previous_identity().unwrap();
+        assert_eq!(local.epoch, 5);
+        assert_eq!(stable.epoch, 4);
+        Self {
+            local,
+            manifest_contract: stable,
+            manifest_state_schema: SCHEMA_VERSION - 1,
+            contract_migration: false,
+        }
+    }
+}
+
 impl Scenario {
     fn new(edit: impl FnOnce(&mut Value), bad_probe: bool) -> Self {
         Self::with_version("9.9.9", edit, bad_probe)
@@ -90,6 +128,22 @@ impl Scenario {
     /// release older than the installed runtime (the scheduled-downgrade case)
     /// can be represented with a consistent tag, identity and asset URL.
     fn with_version(version: &str, edit: impl FnOnce(&mut Value), bad_probe: bool) -> Self {
+        Self::with_shape(version, FixtureShape::forward_migration(), edit, bad_probe)
+    }
+
+    /// Real Stable shape (#829): the installed runtime is epoch 5 / schema 16
+    /// while the discovered release is epoch 4 / schema 15, exactly like a
+    /// v1.1.0 rc install seeing Stable v1.0.5.
+    fn older_stable(version: &str, edit: impl FnOnce(&mut Value), bad_probe: bool) -> Self {
+        Self::with_shape(version, FixtureShape::older_stable(), edit, bad_probe)
+    }
+
+    fn with_shape(
+        version: &str,
+        shape: FixtureShape,
+        edit: impl FnOnce(&mut Value),
+        bad_probe: bool,
+    ) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = format!("v{version}");
         let root = env::temp_dir().join(format!(
@@ -99,10 +153,9 @@ impl Scenario {
             NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(&root).unwrap();
-        let local = crate::contract::previous_identity().unwrap();
-        let target = crate::contract::identity().unwrap();
-        assert_eq!(local.epoch, 4);
-        assert_eq!(target.epoch, 5);
+        let local = shape.local;
+        let target = shape.manifest_contract;
+        let manifest_state_schema = shape.manifest_state_schema;
         let reported_hash = if bad_probe { &local.hash } else { &target.hash };
         let bytes = format!(
             "#!/bin/sh\n\
@@ -119,7 +172,7 @@ impl Scenario {
         let mut manifest = json!({
             "schema_version": release_trust::MANIFEST_SCHEMA_VERSION,
             "product": "herdr-mcp",
-            "state_schema": SCHEMA_VERSION,
+            "state_schema": manifest_state_schema,
             "version": version,
             "tag": tag,
             "release_identity": {
@@ -140,16 +193,18 @@ impl Scenario {
                 "runner_environment": release_trust::RELEASE_RUNNER_ENVIRONMENT,
             },
             "contract": {"epoch": target.epoch, "hash": target.hash, "tool_count": target.tool_count},
-            "contract_migration": {
-                "from": {"epoch": local.epoch, "hash": local.hash, "tool_count": local.tool_count},
-                "state_schema_from": SCHEMA_VERSION,
-            },
             "assets": [{
                 "target": current_target().unwrap(), "name": name,
                 "size": bytes.len(), "sha256": sha256_bytes(&bytes),
                 "url": format!("https://github.com/whshang/herdr-mcp/releases/download/{tag}/{name}"),
             }],
         });
+        if shape.contract_migration {
+            manifest["contract_migration"] = json!({
+                "from": {"epoch": local.epoch, "hash": local.hash, "tool_count": local.tool_count},
+                "state_schema_from": SCHEMA_VERSION,
+            });
+        }
         edit(&mut manifest);
         RELEASE.with(|slot| {
             *slot.borrow_mut() = Some(ReleaseFixture {
@@ -514,6 +569,128 @@ fn manual_apply_still_refuses_downgrade_to_older_stable_release() {
     let error = apply_inner(None, false, None, false, false).unwrap_err();
     assert!(error.contains("refusing downgrade"), "{error}");
     assert!(error.contains("1.0.5"), "{error}");
+    assert!(!scenario.root.join("update").exists());
+    assert!(!scenario.root.join("worker-argv").exists());
+}
+
+/// #829: the real Stable v1.0.5 identity (epoch 4 / schema 15) against an
+/// installed epoch 5 / schema 16 runtime must be a scheduled no-op, not the
+/// contract-identity failure that used to escape before the older-Stable skip.
+#[test]
+fn auto_skips_older_stable_contract_identity_before_admission() {
+    let _guard = crate::test_env::lock();
+    let scenario = Scenario::older_stable("1.0.5", |_| {}, false);
+
+    assert_eq!(scenario.run_auto().unwrap(), ExitCode::SUCCESS);
+
+    // No mutation: no staged candidate, no durable job, no detached worker.
+    assert!(!scenario.root.join("update").exists());
+    assert!(!scenario.root.join("worker-argv").exists());
+    let paths = RuntimePaths::discover().unwrap();
+    let store = UpdateStore::open(&paths).unwrap();
+    assert!(store.active_update_job().unwrap().is_none());
+    assert!(store.latest_update_job().unwrap().is_none());
+    // Nothing was installable, so no artifact attestation was consulted.
+    RELEASE.with(|slot| {
+        assert!(
+            slot.borrow().as_ref().unwrap().attestations.is_empty(),
+            "an uninstallable older release must not verify artifacts"
+        );
+    });
+}
+
+/// The scheduled older-identity skip says exactly what happened, and never
+/// claims a verified artifact it did not download.
+#[test]
+fn scheduled_older_identity_skip_record_is_a_no_op_without_provenance() {
+    let current = Version::parse("1.1.0-rc.11").unwrap();
+    let older = OlderRelease {
+        version: Version::parse("1.0.5").unwrap(),
+        tag: "v1.0.5".to_owned(),
+        detail: "older_contract_epoch_and_state_schema",
+        contract_epoch: 4,
+        state_schema: 15,
+    };
+    let record = auto_older_release_skip_record(UpdateChannel::Stable, &current, &older);
+    assert_eq!(record["ok"], json!(true));
+    assert_eq!(record["code"], "auto_update_skipped");
+    assert_eq!(record["reason"], "stable_older_than_current");
+    assert_eq!(
+        record["reason_detail"],
+        "older_contract_epoch_and_state_schema"
+    );
+    assert_eq!(record["release_contract_epoch"], json!(4));
+    assert_eq!(record["release_state_schema"], json!(15));
+    assert_eq!(record["provenance_verified"], json!(false));
+    assert_eq!(record["network_checked"], json!(true));
+    assert_eq!(record["update_queued"], json!(false));
+    assert_eq!(record["update_channel"], "stable");
+    assert_eq!(record["current_version"], "1.1.0-rc.11");
+    assert_eq!(record["release_version"], "1.0.5");
+    assert_eq!(record["tag"], "v1.0.5");
+}
+
+/// A forward mismatch is never masked by the older-release skip (#829): a
+/// target this build cannot admit still fails closed in the scheduled path.
+#[test]
+fn auto_still_fails_closed_on_forward_contract_mismatch() {
+    let _guard = crate::test_env::lock();
+    let current = crate::contract::identity().unwrap();
+    for case in ["epoch", "schema"] {
+        let scenario = Scenario::older_stable(
+            "9.9.9",
+            |manifest| match case {
+                "epoch" => {
+                    manifest["contract"]["epoch"] = json!(current.epoch + 1);
+                    manifest["contract"]["hash"] = json!(current.hash);
+                    manifest["contract"]["tool_count"] = json!(current.tool_count);
+                    manifest["state_schema"] = json!(SCHEMA_VERSION);
+                }
+                "schema" => {
+                    manifest["contract"]["epoch"] = json!(current.epoch);
+                    manifest["contract"]["hash"] = json!(current.hash);
+                    manifest["contract"]["tool_count"] = json!(current.tool_count);
+                    manifest["state_schema"] = json!(SCHEMA_VERSION + 2);
+                }
+                _ => unreachable!(),
+            },
+            false,
+        );
+        let error = auto().unwrap_err();
+        assert!(
+            error.contains("contract identity mismatch"),
+            "{case}: {error}"
+        );
+        assert!(!scenario.root.join("update").exists());
+        assert!(!scenario.root.join("worker-argv").exists());
+        let paths = RuntimePaths::discover().unwrap();
+        let store = UpdateStore::open(&paths).unwrap();
+        assert!(store.active_update_job().unwrap().is_none());
+        assert!(store.latest_update_job().unwrap().is_none());
+    }
+}
+
+/// Manual `update apply` / `update check` keep the contract-identity downgrade
+/// refusal: the #829 skip exists only on the scheduled path.
+#[test]
+fn manual_apply_and_check_still_refuse_older_stable_contract_identity() {
+    let _guard = crate::test_env::lock();
+    let scenario = Scenario::older_stable("1.0.5", |_| {}, false);
+
+    let apply_error = apply_inner(None, false, None, false, false).unwrap_err();
+    assert!(
+        apply_error.contains("contract identity mismatch"),
+        "{apply_error}"
+    );
+    assert!(apply_error.contains("refusing downgrade"), "{apply_error}");
+
+    let check_error = check(None).unwrap_err();
+    assert!(
+        check_error.contains("could not determine whether an update is available"),
+        "{check_error}"
+    );
+    assert!(check_error.contains("refusing downgrade"), "{check_error}");
+
     assert!(!scenario.root.join("update").exists());
     assert!(!scenario.root.join("worker-argv").exists());
 }
