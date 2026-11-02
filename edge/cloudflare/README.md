@@ -199,6 +199,30 @@ node tests/manual/dev-link-smoke.mjs
 `npm test` at the repo root still runs only the repo suite; the edge suite is run
 explicitly as above so root `package.json` stays untouched.
 
+### Edge→runtime integration harness (issue #613)
+
+`tests/edge-runtime-harness.test.mjs` runs the real `handleMcp` handler against a
+real `herdr-mcp` candidate runtime built from this checkout. Only the transport
+between them is replaced: the harness projects the exact Relay Protocol v1
+`tool_request` the workstation DO would emit (validated with this edge's own
+canonical validator), performs the Rust Link's trusted-IPC hop to the runtime's
+0600 Unix socket, and hands the runtime's own tool result back as the forwarded
+completion. The runtime process gets a throwaway HOME/config/state directory, a
+random bearer token and its own IPC socket — never `~/.config/herdr-mcp`, the
+installed runtime, or any non-loopback network.
+
+```sh
+cargo build -p herdr-mcp --bin herdr-mcp          # required; the tests skip without it
+npx tsc -p edge/cloudflare/tsconfig.json
+node --test edge/cloudflare/tests/edge-runtime-harness.test.mjs
+```
+
+`HERDR_MCP_EDGE_RUNTIME_BIN` points the harness at a different build;
+`HERDR_MCP_EDGE_RUNTIME_REQUIRED=1` (used by CI's Rust job) turns "binary not
+built" from a skip into a failure so the real-runtime coverage cannot silently
+disappear. The harness is reusable for other grant-routed methods through
+`startEdgeRuntime()` + `createEdgeToRuntimeTransport()`.
+
 ## Deliberate non-goals / next work
 
 - **No implicit contract drift.** The current first-party DEV/PROD public ABI is
