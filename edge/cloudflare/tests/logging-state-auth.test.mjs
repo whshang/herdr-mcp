@@ -52,10 +52,11 @@ test("logger: never emits sensitive or body-shaped fields", () => {
 });
 
 test("logger: sanitize redacts token-like keys", () => {
-  const out = sanitize({ apiKey: "abc", fine: 1, nested: { secret: "s" } });
+  const out = sanitize({ apiKey: "abc", fine: 1, nested: { secret: "s" }, connectorId: "conn_logconnector123" });
   assert.equal(out.apiKey, "[redacted]");
   assert.equal(out.nested.secret, "[redacted]");
   assert.equal(out.fine, 1);
+  assert.equal(out.connectorId, "conn_logconnector123");
 });
 
 test("state: hello claims round-trip through storage blob", () => {
