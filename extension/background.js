@@ -228,6 +228,7 @@ function hudLabels() {
     "manual_disabled_auto", "manual_disabled_busy",
     "handoff", "handoff_resume", "handoff_working", "handoff_hint", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_failed_source_preserved", "handoff_llm_required", "handoff_copy_prompt", "handoff_copy_prompt_hint", "handoff_prompt_copied", "handoff_prompt_copy_failed",
     "handoff_blocked_working", "handoff_blocked_transfer_busy", "handoff_blocked_action_busy", "handoff_blocked_unavailable",
+    "handoff_continuity_unavailable",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
     "queue_full", "queue_failed", "queue_extension_reloaded", "queue_background_unavailable", "queue_storage_unavailable",
     "queue_added_draft_changed", "queue_added_clear_failed", "queue_app_restore_failed", "queue_clear_confirm", "queue_cleared",
@@ -2570,6 +2571,9 @@ async function journalPostTurnToRust(payload) {
     const parsed = await response.json().catch(() => null);
     if (response.ok && parsed?.ok === true) {
       noteLocalRuntimeReachability(true);
+      // A durable turn is exactly what makes this conversation handoff-ready, so
+      // any cached HUD durability answer is now stale.
+      invalidateHandoffDurabilityCache();
       const continuityId = String(parsed?.continuity_id || payload?.continuity_id || "").trim();
       if (continuityId) {
         await loadRustAcked();
@@ -2768,6 +2772,108 @@ async function durableChainForConversation(conversationIdRaw) {
     noteLocalRuntimeReachability(false);
     return null;
   }
+}
+
+// ---- #811 ChatGPT handoff availability (HUD) ----
+// A ChatGPT handoff is only possible with a durable continuity chain in state.db.
+// The HUD must not advertise 接力 as ready when the conversation has none, so this
+// runs one bounded, cached, read-only resolve. Only a definitive 404
+// (`continuity_not_found`) may disable the affordance: a timeout, transport
+// failure, or any other answer keeps today's behavior (button enabled) because
+// the click still fails closed at startHandoffForTab -> continuity_unavailable
+// with source_preserved:true.
+const HANDOFF_DURABILITY_TTL_MS = 45_000;
+const HANDOFF_DURABILITY_UNKNOWN_TTL_MS = 5_000;
+const HANDOFF_DURABILITY_PROBE_TIMEOUT_MS = 1_500;
+const HANDOFF_DURABILITY_CACHE_MAX = 32;
+const handoffDurabilityCache = new Map(); // `${conversation_id}::${continuity_id}` -> probe row
+
+/** Drop cached HUD durability answers (bind/unbind, durable journal ack). */
+function invalidateHandoffDurabilityCache() {
+  handoffDurabilityCache.clear();
+}
+
+/**
+ * One read-only `POST /extension/continuity/resolve` with a short deadline.
+ * Returns state "ready" | "unavailable" (definitive 404) | "unknown".
+ * Deliberately does not touch localRuntimeReachability: a HUD probe must never
+ * flip the HUD to offline or disable Auto.
+ */
+async function resolveContinuityAvailability(body, timeoutMs = HANDOFF_DURABILITY_PROBE_TIMEOUT_MS) {
+  let timer = null;
+  try {
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("continuity_resolve_timeout")), timeoutMs);
+    });
+    const response = await Promise.race([
+      localHerdrFetch(continuityResolveUrl(), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        nativeTimeoutMs: timeoutMs,
+      }),
+      deadline,
+    ]);
+    const parsed = await response.json().catch(() => null);
+    const continuityId = String(parsed?.continuity_id || "").trim();
+    if (response.ok && parsed?.ok === true && continuityId) {
+      return { state: "ready", continuity_id: continuityId };
+    }
+    if (Number(response.status) === 404 && String(parsed?.error || "") === "continuity_not_found") {
+      return { state: "unavailable", continuity_id: null };
+    }
+    return { state: "unknown", continuity_id: null };
+  } catch (_) {
+    return { state: "unknown", continuity_id: null };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Cheap, fail-safe durable-chain probe for the HUD. Resolves the current
+ * conversation and the bound chain in parallel (same two identities
+ * startHandoffForTab accepts), so a chain that is durable by continuity_id is
+ * never reported as missing and the whole probe stays within one deadline.
+ * Any non-definitive answer (timeout/transport/5xx/unknown) is cached briefly and
+ * reported as "unknown" instead of "unavailable".
+ */
+async function chatGptHandoffDurability(convInfo, session) {
+  const conversationId = String(convInfo?.conversation_id || "").trim();
+  const continuityId = String((session || []).map((b) => b?.continuity_id).find(Boolean) || "").trim();
+  if (!conversationId && !continuityId) return { state: "unknown", continuity_id: null };
+  const key = `${conversationId}::${continuityId}`;
+  const now = Date.now();
+  const cached = handoffDurabilityCache.get(key);
+  if (cached) {
+    const ttl = cached.state === "unknown" ? HANDOFF_DURABILITY_UNKNOWN_TTL_MS : HANDOFF_DURABILITY_TTL_MS;
+    const age = now - Number(cached.at || 0);
+    // A backwards system-clock jump must expire the entry instead of pinning it.
+    if (age >= 0 && age < ttl) return cached;
+  }
+  const bodies = [];
+  if (conversationId) bodies.push({ conversation_id: conversationId });
+  if (continuityId) bodies.push({ continuity_id: continuityId });
+  const results = await Promise.all(bodies.map((body) => resolveContinuityAvailability(body)));
+  const ready = results.find((result) => result.state === "ready" && result.continuity_id) || null;
+  const state = ready
+    ? "ready"
+    : results.every((result) => result.state === "unavailable")
+      ? "unavailable"
+      : "unknown";
+  const row = {
+    at: Date.now(),
+    state,
+    continuity_id: ready?.continuity_id || null,
+    conversation_id: conversationId || null,
+    bound_continuity_id: continuityId || null,
+  };
+  handoffDurabilityCache.set(key, row);
+  if (handoffDurabilityCache.size > HANDOFF_DURABILITY_CACHE_MAX) {
+    const oldest = [...handoffDurabilityCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    if (oldest) handoffDurabilityCache.delete(oldest[0]);
+  }
+  return row;
 }
 
 async function prepareCanonicalBrowserHandoff({ transferId, continuityId, sourceUrl } = {}) {
@@ -8029,14 +8135,13 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     };
   }
 
-  if (manualChatGptProjectHandoff(row)) {
-    return prepareManualProjectHandoffWithoutSourcePrompt(
-      transferId,
-      sourceSnapshot,
-      "manual_project_continuity_unavailable",
-    );
-  }
-
+  // #811: ChatGPT never reaches this point without a durable chain — it returns
+  // `continuity_unavailable` earlier, and `manualChatGptProjectHandoff` requires
+  // site === "chatgpt". The former manual Project fallback here was therefore
+  // unreachable; it stayed dead on purpose rather than being made reachable,
+  // because that path navigates the source tab into the Project target and so
+  // could never satisfy the "never modify the source conversation" invariant for
+  // a conversation with no durable continuity record.
   const sourceLimitBlocked = sourceSnapshot?.handoffBlockReason === "conversation_limit_ui";
   if (sourceLimitBlocked) {
     return failWithHandoffFallback(transferId, {
@@ -11790,6 +11895,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const taskSummary = await aggregateAgentTaskSummary(liveSession);
       const semanticCapabilities = await runtimeSemanticCapabilities();
       const last = convKey ? (lastIdleNudgeResult.get(convKey) || null) : null;
+      const handoffReadyNow = Boolean(
+        convInfo?.manual_handoff_available
+        && (!handoffStatusIsActive(transfer?.status) || transferView?.can_resume === true),
+      );
+      // #811: ChatGPT handoff needs a durable continuity chain; without one the
+      // click fails closed with continuity_unavailable. Probe cheaply (cached,
+      // bounded, read-only) so the HUD does not advertise 接力 as ready. Any
+      // probe failure keeps today's fail-safe behavior (enabled, fails closed).
+      let handoffUnavailableReason = null;
+      if (handoffReadyNow
+          && String(convInfo?.site || "") === "chatgpt"
+          && transferView?.can_resume !== true) {
+        try {
+          const durability = await chatGptHandoffDurability(convInfo, session);
+          if (durability?.state === "unavailable") handoffUnavailableReason = "continuity_unavailable";
+        } catch (_) {}
+      }
       sendResponse({
         ok: true,
         version: H2W_SCRIPT_VERSION,
@@ -11829,10 +11951,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           execution_state: await reconcileTabExecutionState(b),
         }))),
         continuity_id: session.map((b) => b.continuity_id).find(Boolean) || transfer?.continuity_id || null,
-        can_handoff: Boolean(
-          convInfo?.manual_handoff_available
-          && (!handoffStatusIsActive(transfer?.status) || transferView?.can_resume === true),
-        ),
+        can_handoff: handoffReadyNow && !handoffUnavailableReason,
+        handoff_unavailable_reason: handoffUnavailableReason,
         handoff: transferView,
         workspace_source: state?.source || (state?.ok ? "push_state" : null),
         workspace_status: state?.ok ? 200 : (state?.status || 0),
@@ -12226,6 +12346,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       });
       bindings[storeKey] = b;
       await saveBindings(bindings);
+      invalidateHandoffDurabilityCache();
       // A binding created after Auto was already enabled must start watching
       // immediately instead of waiting for the next keepalive reconcile.
       reconcileProgressTimers(bindings);
@@ -12281,6 +12402,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         clearProgressTimer(storeKey);
       }
       await saveBindings(bindings);
+      invalidateHandoffDurabilityCache();
       // Removing an auto binding is an explicit user decision: the same
       // session must not recreate it just because its task is still in the inbox.
       for (const removed of removedAutoBindings) {
