@@ -30,8 +30,107 @@ const BROWSER_ACTUATION_ENDPOINT_PARAM: &str = "__herdr_browser_endpoint_ref";
 // the liveness window above that 15s cadence so an idle healthy stream is not
 // classified offline between polls.
 const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(20);
+// #629: how long one endpoint's last-poll timestamp is kept after it stops
+// polling. It is deliberately much longer than the liveness window: the
+// last-seen age is the diagnostic that separates a closed browser from an
+// endpoint that never polled, and pruning it at the liveness window would
+// report a known-but-quiet endpoint as never seen.
+const BROWSER_ENDPOINT_LAST_SEEN_RETENTION: Duration = Duration::from_secs(600);
 
 static NEXT_BROWSER_ACTUATION: AtomicU64 = AtomicU64::new(0);
+
+/// #629: one content-free structured line per browser-endpoint lifecycle
+/// event. Callers pass only opaque ids, enum codes, timestamps, durations and
+/// millisecond ages: page content, tab titles, URLs (and their query strings),
+/// `profile_seed` values and credentials must never reach this formatter.
+fn browser_endpoint_log_line(event: &str, fields: &[(&str, String)]) -> String {
+    let mut line = format!("herdr-mcp: browser endpoint event={event}");
+    for (key, value) in fields {
+        line.push(' ');
+        line.push_str(key);
+        line.push('=');
+        line.push_str(&sanitize_log_field(value));
+    }
+    line
+}
+
+/// Keep one lifecycle event on one greppable line: no control characters, no
+/// embedded whitespace that would split a field, and a bounded width. The bound
+/// is wider than the longest validated id (`endpoint_ref` is at most 96 bytes),
+/// so an id is never truncated into an unmatchable prefix.
+fn sanitize_log_field(value: &str) -> String {
+    const MAX_LOG_FIELD_CHARS: usize = 128;
+    value
+        .chars()
+        .take(MAX_LOG_FIELD_CHARS)
+        .map(|character| {
+            if character.is_control() || character.is_whitespace() {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+/// Emit a lifecycle event through the runtime's existing logging facility
+/// (stderr, captured into `server.log` by the managed service owner). There is
+/// no separate log file, rotation policy or tracing crate in this runtime, and
+/// #629 deliberately does not add one.
+pub(super) fn emit_browser_endpoint_event(event: &str, fields: &[(&str, String)]) {
+    let line = browser_endpoint_log_line(event, fields);
+    #[cfg(test)]
+    endpoint_log_capture::record(&line);
+    eprintln!("{line}");
+}
+
+/// Test-only sink so a test can assert what a lifecycle line actually contains
+/// without redirecting the process stderr.
+#[cfg(test)]
+pub(super) mod endpoint_log_capture {
+    use std::sync::Mutex;
+
+    static CAPTURED_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(line: &str) {
+        if let Ok(mut lines) = CAPTURED_LINES.lock() {
+            lines.push(line.to_owned());
+            let excess = lines.len().saturating_sub(256);
+            lines.drain(..excess);
+        }
+    }
+
+    /// Drain the captured lines for one endpoint. Tests use a unique endpoint
+    /// ref so parallel tests cannot consume each other's lines.
+    pub(in crate::mcp_http) fn take_for_endpoint(endpoint_ref: &str) -> Vec<String> {
+        let Ok(mut lines) = CAPTURED_LINES.lock() else {
+            return Vec::new();
+        };
+        let needle = format!("endpoint_ref={endpoint_ref} ");
+        let exact = format!("endpoint_ref={endpoint_ref}");
+        let mut matched = Vec::new();
+        let mut kept = Vec::new();
+        for line in lines.drain(..) {
+            if line.contains(&needle) || line.ends_with(&exact) {
+                matched.push(line);
+            } else {
+                kept.push(line);
+            }
+        }
+        *lines = kept;
+        matched
+    }
+}
+
+fn log_endpoint_ref(endpoint_ref: Option<&str>) -> String {
+    endpoint_ref.unwrap_or("-").to_owned()
+}
+
+fn log_last_seen_ms(last_seen_age_ms: Option<u64>) -> String {
+    last_seen_age_ms
+        .map(|age| age.to_string())
+        .unwrap_or_else(|| "never".to_owned())
+}
 
 #[derive(Clone)]
 pub(super) struct BrowserActuationBroker {
@@ -107,6 +206,15 @@ impl BrowserActuationBroker {
         }
     }
 
+    /// Milliseconds since this endpoint's last `/push/events` poll, when it was
+    /// ever polled. `None` means the endpoint was never seen in this runtime
+    /// generation, which is not the same as an endpoint that went quiet.
+    fn last_seen_age_ms(state: &BrowserActuationState, endpoint_ref: Option<&str>) -> Option<u64> {
+        let endpoint_ref = endpoint_ref?;
+        let seen = state.last_endpoint_polls.get(endpoint_ref)?;
+        u64::try_from(seen.elapsed().as_millis()).ok()
+    }
+
     fn note_poll(state: &mut BrowserActuationState, endpoint_ref: Option<&str>) {
         let now = Instant::now();
         state.last_extension_poll = Some(now);
@@ -115,9 +223,9 @@ impl BrowserActuationBroker {
                 .last_endpoint_polls
                 .insert(endpoint_ref.to_owned(), now);
         }
-        state.last_endpoint_polls.retain(|_, seen| {
-            seen.elapsed() <= BROWSER_EXTENSION_LIVE_WINDOW + BROWSER_EXTENSION_LIVE_WINDOW
-        });
+        state
+            .last_endpoint_polls
+            .retain(|_, seen| seen.elapsed() <= BROWSER_ENDPOINT_LAST_SEEN_RETENTION);
     }
 
     pub(super) fn take_next_for_extension(&self, endpoint_ref: Option<&str>) -> Option<Value> {
@@ -218,6 +326,25 @@ impl BrowserActuator for BrowserActuationBroker {
             .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
         self.prune_expired(&mut state);
         if !Self::extension_live(&state, target_endpoint_ref) {
+            // #629: no `/push/events` poll inside the liveness window, so this
+            // command provably never left the runtime. The endpoint's last-seen
+            // age separates "went quiet 45s ago" from "never seen"
+            // (`last_seen_ms=never`), which is exactly what the 2026-10-13
+            // `browser_page_unavailable` repro could not tell apart.
+            let endpoint_last_seen_age_ms = Self::last_seen_age_ms(&state, target_endpoint_ref);
+            emit_browser_endpoint_event(
+                "stale",
+                &[
+                    ("endpoint_ref", log_endpoint_ref(target_endpoint_ref)),
+                    ("operation", operation.to_owned()),
+                    ("actuation_id", actuation_id.clone()),
+                    ("last_seen_ms", log_last_seen_ms(endpoint_last_seen_age_ms)),
+                    (
+                        "window_ms",
+                        BROWSER_EXTENSION_LIVE_WINDOW.as_millis().to_string(),
+                    ),
+                ],
+            );
             return Ok(BrowserPostconditionEvidence {
                 observed_generation: expected_generation,
                 command_accepted: false,
@@ -234,6 +361,7 @@ impl BrowserActuator for BrowserActuationBroker {
                 generation_owner: None,
                 generation_status_observed: false,
                 generation_stopped: false,
+                endpoint_last_seen_age_ms,
                 result: None,
             });
         }
@@ -287,13 +415,24 @@ impl BrowserActuator for BrowserActuationBroker {
                 if let Some(position) = queued_position {
                     state.queued.remove(position);
                     state.pending.remove(&actuation_id);
-                    eprintln!(
-                        "herdr-mcp browser actuation not_delivered actuation_id={} operation={} target_endpoint_ref={} dispatch_id={} timeout_ms={} reason=queued_untaken_at_timeout",
-                        actuation_id,
-                        operation,
-                        target_endpoint_ref.unwrap_or("-"),
-                        dispatch_id.unwrap_or("-"),
-                        timeout.as_millis(),
+                    emit_browser_endpoint_event(
+                        "command_timeout",
+                        &[
+                            ("endpoint_ref", log_endpoint_ref(target_endpoint_ref)),
+                            ("operation", operation.to_owned()),
+                            ("actuation_id", actuation_id.clone()),
+                            ("dispatch_id", dispatch_id.unwrap_or("-").to_owned()),
+                            ("timeout_ms", timeout.as_millis().to_string()),
+                            ("delivery_state", "not_delivered".to_owned()),
+                            ("reason", "queued_untaken_at_timeout".to_owned()),
+                            (
+                                "last_seen_ms",
+                                log_last_seen_ms(Self::last_seen_age_ms(
+                                    &state,
+                                    target_endpoint_ref,
+                                )),
+                            ),
+                        ],
                     );
                     return Ok(BrowserPostconditionEvidence {
                         observed_generation: expected_generation,
@@ -311,6 +450,7 @@ impl BrowserActuator for BrowserActuationBroker {
                         generation_owner: None,
                         generation_status_observed: false,
                         generation_stopped: false,
+                        endpoint_last_seen_age_ms: None,
                         result: None,
                     });
                 }
@@ -325,13 +465,21 @@ impl BrowserActuator for BrowserActuationBroker {
                     command.get("actuation_id").and_then(Value::as_str)
                         != Some(actuation_id.as_str())
                 });
-                eprintln!(
-                    "herdr-mcp browser actuation delivery_unknown actuation_id={} operation={} target_endpoint_ref={} dispatch_id={} timeout_ms={} reason=handed_out_unacknowledged",
-                    actuation_id,
-                    operation,
-                    target_endpoint_ref.unwrap_or("-"),
-                    dispatch_id.unwrap_or("-"),
-                    timeout.as_millis(),
+                emit_browser_endpoint_event(
+                    "command_timeout",
+                    &[
+                        ("endpoint_ref", log_endpoint_ref(target_endpoint_ref)),
+                        ("operation", operation.to_owned()),
+                        ("actuation_id", actuation_id.clone()),
+                        ("dispatch_id", dispatch_id.unwrap_or("-").to_owned()),
+                        ("timeout_ms", timeout.as_millis().to_string()),
+                        ("delivery_state", "delivery_unknown".to_owned()),
+                        ("reason", "completion_timeout".to_owned()),
+                        (
+                            "last_seen_ms",
+                            log_last_seen_ms(Self::last_seen_age_ms(&state, target_endpoint_ref)),
+                        ),
+                    ],
                 );
                 // Once a command may have crossed the SSE boundary, a missing
                 // acknowledgement is delivery-uncertain and must never invite replay.
@@ -351,6 +499,7 @@ impl BrowserActuator for BrowserActuationBroker {
                     generation_owner: None,
                     generation_status_observed: false,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: None,
                 });
             }
@@ -510,7 +659,69 @@ mod tests {
             );
             assert!(evidence.browser_online);
             assert!(evidence.result.is_none());
+            // #629: a timeout that never crossed the SSE boundary carries no
+            // last-seen age, because the endpoint was live when it was queued.
+            assert_eq!(evidence.endpoint_last_seen_age_ms, None);
         }
+    }
+
+    /// #629: an endpoint with no poll inside the liveness window is refused
+    /// before the command is ever queued. That is not a timeout, so it must
+    /// report `browser_online: false` and no last-seen age when the endpoint was
+    /// never seen in this runtime generation.
+    #[tokio::test]
+    async fn offline_endpoint_refusal_never_waits_for_the_actuation_deadline() {
+        let broker = BrowserActuationBroker::with_durations(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        );
+        let endpoint_ref = format!("bep_{}", "1".repeat(64));
+        let started = Instant::now();
+        let evidence = issue_632_actuate_in_background(&broker, &endpoint_ref, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an offline endpoint must be refused without waiting for the actuation deadline"
+        );
+        assert!(!evidence.browser_online);
+        assert!(!evidence.command_accepted);
+        assert!(evidence.result.is_none());
+        assert_eq!(evidence.endpoint_last_seen_age_ms, None);
+    }
+
+    /// #629: an endpoint that went quiet reports how long ago it was last seen,
+    /// so a closed browser is distinguishable from a browser that never polled.
+    #[tokio::test]
+    async fn stale_endpoint_refusal_reports_last_seen_age() {
+        let broker = BrowserActuationBroker::with_durations(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        );
+        let endpoint_ref = format!("bep_{}", "2".repeat(64));
+        broker.note_extension_poll(Some(&endpoint_ref));
+        {
+            let (lock, _) = &*broker.inner;
+            let mut state = lock.lock().unwrap();
+            state.last_endpoint_polls.insert(
+                endpoint_ref.clone(),
+                Instant::now() - Duration::from_secs(45),
+            );
+        }
+        let evidence = issue_632_actuate_in_background(&broker, &endpoint_ref, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!evidence.browser_online);
+        assert!(!evidence.command_accepted);
+        assert!(
+            evidence
+                .endpoint_last_seen_age_ms
+                .is_some_and(|age| age >= 45_000),
+            "a quiet endpoint must report its last-seen age: {:?}",
+            evidence.endpoint_last_seen_age_ms
+        );
     }
 
     /// #632: after a queued-untaken timeout the command is gone from the queue,
@@ -570,6 +781,120 @@ mod tests {
             "handed-out command keeps delivery_unknown"
         );
         assert!(evidence.browser_online);
+        assert_eq!(
+            evidence.endpoint_last_seen_age_ms, None,
+            "a post-handoff timeout is classified by command_accepted, not by liveness age"
+        );
+    }
+
+    /// #629: every endpoint lifecycle line is structured and content-free: ids,
+    /// enum codes, timestamps and millisecond durations only. No URL, query
+    /// string, title, page content or profile seed may reach the log.
+    #[tokio::test]
+    async fn endpoint_lifecycle_log_lines_carry_ids_and_no_page_content() {
+        fn assert_content_free(line: &str) {
+            assert!(
+                line.starts_with("herdr-mcp: browser endpoint event="),
+                "{line}"
+            );
+            assert_eq!(line.lines().count(), 1, "{line}");
+            for needle in [
+                "http",
+                "://",
+                "?",
+                "page_ref",
+                "bp_",
+                "title",
+                "profile_seed",
+            ] {
+                assert!(
+                    !line.contains(needle),
+                    "lifecycle log line must stay content-free ({needle}): {line}"
+                );
+            }
+            for token in line.split(' ').skip(4) {
+                assert!(
+                    token.contains('='),
+                    "every lifecycle log field must be key=value: {line}"
+                );
+            }
+        }
+
+        // offline endpoint: the command is refused before it is queued.
+        let offline_broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(150),
+            Duration::from_millis(150),
+        );
+        let offline_endpoint = format!("bep_{}", "4".repeat(64));
+        let _ = issue_632_actuate_in_background(&offline_broker, &offline_endpoint, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let offline_lines = endpoint_log_capture::take_for_endpoint(&offline_endpoint);
+        assert!(
+            offline_lines
+                .iter()
+                .any(|line| line.contains("event=stale") && line.contains("last_seen_ms=")),
+            "an offline refusal must log the endpoint's last-seen age: {offline_lines:?}"
+        );
+
+        // queued but never taken: provably not delivered at the deadline.
+        let untaken_broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(150),
+            Duration::from_millis(150),
+        );
+        let untaken_endpoint = format!("bep_{}", "5".repeat(64));
+        untaken_broker.note_extension_poll(Some(&untaken_endpoint));
+        let _ = issue_632_actuate_in_background(&untaken_broker, &untaken_endpoint, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let untaken_lines = endpoint_log_capture::take_for_endpoint(&untaken_endpoint);
+        assert!(
+            untaken_lines
+                .iter()
+                .any(|line| line.contains("event=command_timeout")
+                    && line.contains("reason=queued_untaken_at_timeout")
+                    && line.contains("delivery_state=not_delivered")),
+            "a queued-untaken timeout must be logged as not delivered: {untaken_lines:?}"
+        );
+
+        // handed to the extension's SSE stream without a completion.
+        let handed_out_broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        );
+        let handed_out_endpoint = format!("bep_{}", "6".repeat(64));
+        handed_out_broker.note_extension_poll(Some(&handed_out_endpoint));
+        let mut wake_rx = handed_out_broker.subscribe_wake();
+        let task = issue_632_actuate_in_background(&handed_out_broker, &handed_out_endpoint, None);
+        tokio::time::timeout(Duration::from_millis(200), wake_rx.changed())
+            .await
+            .expect("enqueue wakes push")
+            .expect("wake channel open");
+        assert!(
+            handed_out_broker
+                .take_next_for_extension(Some(&handed_out_endpoint))
+                .is_some()
+        );
+        let _ = task.await.unwrap().unwrap();
+        let handed_out_lines = endpoint_log_capture::take_for_endpoint(&handed_out_endpoint);
+        assert!(
+            handed_out_lines
+                .iter()
+                .any(|line| line.contains("event=command_timeout")
+                    && line.contains("reason=completion_timeout")
+                    && line.contains("delivery_state=delivery_unknown")),
+            "a post-handoff timeout must be logged as delivery unknown: {handed_out_lines:?}"
+        );
+
+        for line in offline_lines
+            .iter()
+            .chain(untaken_lines.iter())
+            .chain(handed_out_lines.iter())
+        {
+            assert_content_free(line);
+        }
     }
 
     #[tokio::test]
@@ -626,6 +951,7 @@ mod tests {
                     generation_owner: Some(7),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: None,
                 },
             )
@@ -693,6 +1019,7 @@ mod tests {
             generation_owner: Some(7),
             generation_status_observed: true,
             generation_stopped: false,
+            endpoint_last_seen_age_ms: None,
             result: None,
         };
         broker.complete(&actuation_id, late.clone()).unwrap();
@@ -762,6 +1089,7 @@ mod tests {
                     generation_owner: None,
                     generation_status_observed: false,
                     generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
                     result: None,
                 }
             ),
