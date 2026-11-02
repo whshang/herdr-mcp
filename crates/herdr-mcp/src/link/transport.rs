@@ -24,7 +24,7 @@ use crate::relay::wire::{
 use serde_json::{Number, Value};
 use std::io::{self, Write};
 
-pub const LINK_DEFAULT_TRANSPORT_PING_MS: i64 = 15_000;
+pub const LINK_DEFAULT_TRANSPORT_PING_MS: i64 = 30_000;
 /// Application-level telemetry/checkpoint heartbeat. RFC WebSocket ping/pong
 /// owns transport liveness, so the JSON heartbeat can stay sparse and avoid
 /// waking a hibernated Edge Durable Object during otherwise idle periods.
@@ -818,7 +818,7 @@ mod tests {
                     ..
                 },
                 TransportAction::StartOnlineTimers {
-                    transport_ping_ms: 15_000,
+                    transport_ping_ms: 30_000,
                     heartbeat_ms: 300_000,
                     silence_check_ms: 30_000.0,
                 }
