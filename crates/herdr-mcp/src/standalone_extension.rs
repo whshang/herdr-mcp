@@ -1811,6 +1811,34 @@ fn status_load_view(home: &Path, current: &Path, state: Option<&Value>) -> (Valu
 }
 
 fn inspect_alias(path: &Path, current: &Path) -> Value {
+    inspect_alias_with_protection(
+        path,
+        current,
+        crate::macos_permissions::runtime_must_not_probe(path),
+    )
+}
+
+/// `protected` is the already-decided verdict for `path`.
+///
+/// The rotating runtime generation is not the authorized TCC client for
+/// `~/Documents`, so it must not run `symlink_metadata`/`read_link` there: the
+/// first such call is what parks a thread behind the consent prompt. The alias
+/// is still reported, just as `tcc_pending` with a machine-readable code, and
+/// the caller either answers the prompt or asks the stable broker.
+fn inspect_alias_with_protection(path: &Path, current: &Path, protected: bool) -> Value {
+    if protected {
+        // One machine-readable shape for every "the runtime will not probe this"
+        // answer, plus the alias-specific fields this report already returns.
+        let mut payload =
+            crate::macos_permissions::tcc_pending_payload("extension_standalone_alias", path);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("ready".to_owned(), json!(false));
+            object.insert("status".to_owned(), json!("tcc_pending"));
+            object.insert("path".to_owned(), json!(path));
+            object.insert("target".to_owned(), json!(current));
+        }
+        return payload;
+    }
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => json!({
             "ready": false,
@@ -2143,6 +2171,37 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    /// user keeps a working control path | Given the Chrome-facing load path is
+    /// inside a macOS privacy-protected folder | When status reports the alias
+    /// | Then it is `tcc_pending` with a machine-readable code and the rotating
+    /// runtime performs no filesystem probe on it.
+    #[test]
+    fn protected_alias_is_tcc_pending_without_a_probe() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-alias-protected-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        let alias = root.join("Documents/herdr-mcp/extension");
+        let current = root.join("Library/Application Support/herdr-mcp/standalone/current");
+
+        let protected = inspect_alias_with_protection(&alias, &current, true);
+        assert_eq!(protected["status"], "tcc_pending");
+        assert_eq!(protected["code"], "tcc_pending");
+        assert_eq!(protected["retryable"], true);
+        assert_eq!(protected["ready"], false);
+
+        // The same path with protection off is a real probe of a path that does
+        // not exist, which proves the protected branch never reached the
+        // filesystem: a probe there would have reported "missing" instead.
+        let unprotected = inspect_alias_with_protection(&alias, &current, false);
+        assert_eq!(unprotected["status"], "missing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     #[test]

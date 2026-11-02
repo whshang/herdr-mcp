@@ -84,6 +84,50 @@ pub(crate) fn is_protected_user_path_lexical(path: &Path) -> bool {
     }
 }
 
+/// Structured result for a request that needs a protected path but must not
+/// park on a macOS consent prompt.
+///
+/// The runtime generation is not the authorized client for Documents, so the
+/// honest answer is "the stable broker has to answer this" rather than a
+/// blocking syscall. `retryable` is true because a pending prompt resolves once
+/// the operator answers it.
+pub(crate) fn tcc_pending_payload(operation: &str, path: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "code": "tcc_pending",
+        "retryable": true,
+        "operation": operation,
+        "path": path.to_string_lossy(),
+        "message": "this request needs a macOS privacy-protected path that only the stable TCC broker may read; answer the Documents prompt and retry, or run the same operation through the broker",
+        "next_action": "answer the macOS Documents prompt, then retry",
+    })
+}
+
+/// Move a helper process off whatever working directory it inherited.
+///
+/// Helper entry points (extension host, credential helper) never need the
+/// caller's cwd, and inheriting a protected one means `current_dir()`,
+/// `canonicalize(".")` or a relative path join can all reach `~/Documents` from
+/// an identity that has no grant. Helpers call this as their first action so
+/// every later relative resolution stays inside a neutral, unprotected
+/// directory.
+pub(crate) fn enter_neutral_helper_cwd(neutral: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(neutral).map_err(|error| {
+        format!(
+            "cannot prepare neutral helper cwd {}: {error}",
+            neutral.display()
+        )
+    })?;
+    std::env::set_current_dir(neutral).map_err(|error| {
+        format!(
+            "cannot enter neutral helper cwd {}: {error}",
+            neutral.display()
+        )
+    })?;
+    Ok(neutral.to_path_buf())
+}
+
+/// Whether the rotating runtime must treat `path` as off-limits for direct
 /// Whether the rotating runtime must treat `path` as off-limits for direct
 /// filesystem probing.
 ///
@@ -162,6 +206,18 @@ static PROTECTED_PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 thread_local! {
     static REAL_PATH_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only accessors so another module can prove that a decision took no
+/// real-path probe at all.
+#[cfg(test)]
+pub(crate) fn test_real_path_probes() -> usize {
+    REAL_PATH_PROBES.with(|count| count.get())
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_real_path_probes() {
+    REAL_PATH_PROBES.with(|count| count.set(0));
 }
 
 /// Run `probe` on a worker thread and give up after `budget`.
@@ -1047,6 +1103,47 @@ fn open_full_disk_access_settings() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// user keeps a working control path | Given a path that is lexically
+    /// inside ~/Documents | When the runtime decides whether to delegate to the
+    /// broker | Then the decision performs zero real-path probes, so a pending
+    /// consent prompt cannot park the caller before any delegation check.
+    #[test]
+    fn lexical_protection_decision_never_probes_the_filesystem() {
+        let home = Path::new("/Users/example");
+        super::test_reset_real_path_probes();
+        assert!(super::is_protected_user_path_lexical_for_home(
+            Path::new("/Users/example/Documents/herdr-mcp/extension"),
+            home,
+        ));
+        assert!(!super::is_protected_user_path_lexical_for_home(
+            Path::new("/Users/example/.herdr/worktrees/herdr-mcp"),
+            home,
+        ));
+        assert_eq!(
+            super::test_real_path_probes(),
+            0,
+            "the lexical decision must not resolve any real path"
+        );
+    }
+
+    /// user sees one machine-readable stall condition | Given a request that
+    /// needs a protected path | When the runtime refuses to probe it | Then the
+    /// caller gets the structured `tcc_pending` result with a retry action.
+    #[test]
+    fn tcc_pending_payload_is_machine_readable() {
+        let payload = super::tcc_pending_payload("exec", Path::new("/Users/example/Documents/x"));
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["code"], "tcc_pending");
+        assert_eq!(payload["retryable"], true);
+        assert_eq!(payload["operation"], "exec");
+        assert!(
+            payload["next_action"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Documents")
+        );
+    }
+
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

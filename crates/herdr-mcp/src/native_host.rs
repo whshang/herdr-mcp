@@ -357,6 +357,13 @@ fn finish(write: Result<(), String>, reason: &'static str) -> HostOutcome {
 }
 
 pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
+    // #844: the extension host is a helper process. It never needs the working
+    // directory Chrome or the linker inherited, and inheriting a protected one
+    // would let a relative path resolution reach ~/Documents from an identity
+    // that holds no grant. Move to a neutral directory before any path work.
+    if let Ok(paths) = crate::paths::RuntimePaths::discover() {
+        let _ = crate::macos_permissions::enter_neutral_helper_cwd(&paths.config_dir);
+    }
     let log = NativeHostLog::discover();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -615,9 +622,19 @@ pub(crate) fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        env::current_dir()
-            .map_err(|error| format!("cannot resolve extension path: {error}"))?
-            .join(path)
+        let cwd = env::current_dir()
+            .map_err(|error| format!("cannot resolve extension path: {error}"))?;
+        // #844: a helper that inherited a protected cwd must not resolve a
+        // relative path against it. `run` moves the native host to a neutral
+        // directory first, and this guard keeps the invariant even if that
+        // move is ever skipped.
+        if crate::macos_permissions::runtime_must_not_probe(&cwd) {
+            return Err(
+                "extension path is relative and the helper working directory is privacy-protected"
+                    .to_owned(),
+            );
+        }
+        cwd.join(path)
     };
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
