@@ -353,6 +353,10 @@ tool catalog/schema が変わった場合、それは contract migration であ�
 
 詳しくは [Runtime A/B](runtime-self-upgrade.md) を参照してください。
 
+## 症状：update が `github_rate_limited` で失敗する
+
+updater は `api.github.com` から release メタデータと attestation を匿名で取得するため、共有または枯渇した外向け IP は GitHub の未認証 quota に当たり、その失敗は quota の reset 時刻付きで `github_rate_limited` として報告されます。`GH_TOKEN` または `GITHUB_TOKEN` を設定すると上限が上がります。その token は `api.github.com` にだけ送信され、ログには残りません。
+
 ## issue に有用な evidence
 
 有用で secret を含まない診断情報：
