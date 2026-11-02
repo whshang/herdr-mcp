@@ -142,7 +142,7 @@ private IP や Tailscale-only address は ChatGPT cloud から直接到達でき
 
 ### どの Herdr をサポートしていますか？
 
-サポートするのは **Herdr TUI**（`herdr` CLI と `herdr server`）だけです。CI は Herdr TUI `0.8.2` に固定しており、上流の現行 TUI リリースは `0.9.5` です。新しい Herdr app とその herdr-core runtime（`hc`）は TUI と Agent を共有しない別の runtime であり、herdr-mcp v1.1 はサポートしません。Herdr TUI のドキュメントは <https://herdr.dev/tui/docs/> に移動しました。詳細は [プラットフォームサポートマトリクス](docs/i18n/ja/platform-support-matrix.md) を参照してください。
+サポートするのは **Herdr TUI**（`herdr` CLI と `herdr server`）だけです。CI は Herdr TUI `0.9.5` に固定しています。新しい Herdr app とその herdr-core runtime（`hc`）は TUI と Agent を共有しない別の runtime であり、herdr-mcp v1.1 はサポートしません。Herdr TUI のドキュメントは <https://herdr.dev/tui/docs/> に移動しました。詳細は [プラットフォームサポートマトリクス](docs/i18n/ja/platform-support-matrix.md) を参照してください。
 
 ### 初回インストール後に Herdr window / Server が見つからない場合は？
 

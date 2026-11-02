@@ -83,7 +83,7 @@ setup_isolated_herdr() {
     host_herdr="$(command -v herdr 2>/dev/null || true)"
     if [ -n "${host_herdr}" ] && [ -x "${host_herdr}" ]; then
       host_version="$("${host_herdr}" --version 2>/dev/null | awk '{print $2}')"
-      if [ "${host_version}" = "${HERDR_VERSION:-0.8.2}" ]; then
+      if [ "${host_version}" = "${HERDR_VERSION:-0.9.5}" ]; then
         mkdir -p "${HERDR_INSTALL_DIR}"
         cp "${host_herdr}" "${HERDR_BIN}"
         chmod +x "${HERDR_BIN}"
