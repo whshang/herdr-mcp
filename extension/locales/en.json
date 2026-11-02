@@ -128,6 +128,7 @@
   "hud_handoff_blocked_transfer_busy": "A handoff is already in progress for this conversation.",
   "hud_handoff_blocked_action_busy": "Another Herdr browser action is still running.",
   "hud_handoff_blocked_unavailable": "Handoff is not available for the current conversation state.",
+  "hud_handoff_continuity_unavailable": "This conversation is not bound to a Herdr workspace yet and has no local continuity record, so Handoff is unavailable. The current conversation was not modified. Bind it to a Herdr workspace from the panel, finish one round of the conversation, then retry Handoff.",
   "hud_queue_insert": "Queue",
   "hud_queue_insert_count": "Queue · {count}",
   "hud_queue_insert_hint": "Queue the composer message without interrupting a live reply. Queued messages merge into the next turn after the reply settles. Click with an empty composer to retry; right-click to clear.",
