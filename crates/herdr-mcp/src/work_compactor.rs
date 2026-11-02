@@ -1820,9 +1820,21 @@ fn is_ephemeral_binary(path: &Path) -> bool {
     })
 }
 
-/// Git runs filter commands through a shell, so quote the path for `sh`.
+/// Git runs filter commands through a shell, so an executable path is quoted
+/// for `sh` when it contains anything a shell would interpret. A plain word
+/// (the `herdr-mcp` PATH fallback, or an ordinary installed path) is kept as
+/// written so `git config --get filter.herdr-handoff.clean` stays readable.
 fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    let plain = !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '-' | '.' | '/' | '@' | '%' | '+' | ':')
+        });
+    if plain {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 fn git_status_output(worktree: &Path, args: &[&str]) -> Option<std::process::Output> {
@@ -1861,12 +1873,75 @@ fn set_git_local_config(worktree: &Path, key: &str, value: &str) -> Result<(), S
 /// `git status` compares cached stat data first, so a size-changing clean
 /// filter alone leaves a tracked agent doc permanently reported as modified
 /// (while `git diff` is already empty, because diffing does run the filter).
-/// `git update-index --refresh` re-hashes the path through the filter and
-/// rewrites the cached stat; it exits non-zero with `needs update` for a
-/// genuinely edited file, which is expected and ignored. Unlike `git add` it
-/// never changes the index blob, so unrelated unstaged edits stay unstaged.
+///
+/// Re-syncing the index entry is only safe when the clean-filtered
+/// working-tree content is byte-identical to the stage-0 blob, so the content
+/// check comes first and nothing happens for a real user edit. `git
+/// update-index` (unlike a bare `--refresh`, which also writes the path) then
+/// records the stat data. A concurrent edit that lands between the check and
+/// the update is detected afterwards and the original entry is restored, so a
+/// user edit is never left staged by a handoff tick.
 fn refresh_index_stat(worktree: &Path, name: &str) {
-    let _ = git_status_output(worktree, &["update-index", "--refresh", "--", name]);
+    let Some((original_mode, original_blob)) = index_entry(worktree, name) else {
+        return;
+    };
+    // `hash-object --path` runs the configured clean filter, so this is what
+    // `git add` would stage for the path right now.
+    let Some(filtered) = filtered_worktree_blob(worktree, name) else {
+        return;
+    };
+    if filtered != original_blob {
+        // The user has a real unstaged edit (or the filter could not run):
+        // leave the index alone so `git status`/`git diff` keep showing it.
+        return;
+    }
+    let _ = git_status_output(worktree, &["update-index", "--", name]);
+    if index_entry(worktree, name)
+        .is_some_and(|(mode, blob)| mode != original_mode || blob != original_blob)
+    {
+        let _ = git_status_output(
+            worktree,
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("{original_mode},{original_blob},{name}"),
+            ],
+        );
+    }
+}
+
+/// Stage-0 `(mode, blob)` of `name`, or `None` when the path is absent or has
+/// unmerged stages (never touch an entry in conflict).
+fn index_entry(worktree: &Path, name: &str) -> Option<(String, String)> {
+    let output = git_status_output(worktree, &["ls-files", "-s", "--", name])?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let line = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    let mut fields = line.split_whitespace();
+    let mode = fields.next()?.to_owned();
+    let blob = fields.next()?.to_owned();
+    if fields.next()? != "0" {
+        return None;
+    }
+    Some((mode, blob))
+}
+
+fn filtered_worktree_blob(worktree: &Path, name: &str) -> Option<String> {
+    let output = git_status_output(
+        worktree,
+        &["hash-object", &format!("--path={name}"), "--", name],
+    )?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_owned()
+    })
 }
 
 /// Append `lines` to `<common dir>/info/<file_name>`, idempotently and without
@@ -2528,19 +2603,37 @@ mod tests {
         git_ok(dir, &["config", "core.autocrlf", "false"]);
     }
 
-    /// The CLI binary the in-crate test process was built beside: unit tests run
-    /// from `<target>/<profile>/deps/`, and `cargo test` also builds the binary
-    /// the clean filter needs.
-    fn cli_binary_path() -> Option<PathBuf> {
-        let test_binary = std::env::current_exe().ok()?;
-        let profile_dir = test_binary.parent()?.parent()?;
+    /// Path of the real CLI binary that `cargo test` builds alongside the test
+    /// harness. This repository sets Cargo `build-dir`, so the test binary does
+    /// not always sit next to the uplifted CLI binary; try every layout and
+    /// fail loudly instead of silently skipping the Git tests.
+    fn cli_binary_path() -> PathBuf {
         let name = if cfg!(windows) {
             "herdr-mcp.exe"
         } else {
             "herdr-mcp"
         };
-        let candidate = profile_dir.join(name);
-        candidate.is_file().then_some(candidate)
+        let mut candidates = Vec::new();
+        if let Ok(test_binary) = std::env::current_exe()
+            && let Some(profile_dir) = test_binary.parent().and_then(Path::parent)
+        {
+            candidates.push(profile_dir.join(name));
+        }
+        let target_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        for profile in ["debug", "release"] {
+            candidates.push(target_dir.join(profile).join(name));
+            if let Some(explicit) = std::env::var_os("CARGO_TARGET_DIR") {
+                candidates.push(PathBuf::from(explicit).join(profile).join(name));
+            }
+        }
+        candidates
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "cargo test builds the herdr-mcp CLI binary the clean filter runs; none of the expected paths exist"
+                )
+            })
     }
 
     fn point_filter_at_cli(dir: &Path, binary: &Path) {
@@ -2647,6 +2740,17 @@ mod tests {
         assert!(!is_ephemeral_binary(Path::new(
             "/home/user/.config/herdr-mcp/runtime/current/herdr-mcp"
         )));
+        // Shell quoting: plain words stay readable, anything else is quoted.
+        assert_eq!(shell_quote("herdr-mcp"), "herdr-mcp");
+        assert_eq!(
+            shell_quote("/Users/me/.config/herdr-mcp/runtime/current/herdr-mcp"),
+            "/Users/me/.config/herdr-mcp/runtime/current/herdr-mcp"
+        );
+        assert_eq!(shell_quote("/tmp/a b/herdr-mcp"), "'/tmp/a b/herdr-mcp'");
+        assert_eq!(
+            shell_quote("/tmp/o'brien/herdr-mcp"),
+            "'/tmp/o'\\''brien/herdr-mcp'"
+        );
     }
 
     #[test]
@@ -2654,9 +2758,7 @@ mod tests {
         if !git_available() {
             return;
         }
-        let Some(binary) = cli_binary_path() else {
-            return;
-        };
+        let binary = cli_binary_path();
         let root = temp_dir("tracked-agent-doc");
         init_git_repo(&root);
         fs::write(
@@ -2712,7 +2814,7 @@ mod tests {
         // Run the real clean filter, then assert git reports the tracked doc as
         // unchanged while the working tree still carries the block.
         point_filter_at_cli(&root, &binary);
-        git_run(&root, &["update-index", "--refresh", "--", "AGENTS.md"]);
+        refresh_index_stat(&root, "AGENTS.md");
         assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "");
         let worktree = fs::read_to_string(root.join("AGENTS.md")).unwrap();
         assert!(worktree.contains(HANDOFF_BLOCK_START), "{worktree}");
@@ -2764,14 +2866,79 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Regression: `git update-index` writes the named path, so re-syncing the
+    /// cached stat must never run for content that differs from the index blob —
+    /// otherwise a handoff tick would silently stage a real user edit.
+    #[test]
+    fn user_real_edit_is_never_staged_by_a_handoff_tick() {
+        if !git_available() {
+            return;
+        }
+        let binary = cli_binary_path();
+        let root = temp_dir("real-edit-not-staged");
+        init_git_repo(&root);
+        fs::write(
+            root.join("AGENTS.md"),
+            "# Rules\n\n- [r1] keep tests green\n",
+        )
+        .unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "seed"]);
+        write_handoff_current(&root, "# handoff\n").unwrap();
+        point_filter_at_cli(&root, &binary);
+        refresh_index_stat(&root, "AGENTS.md");
+        assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "");
+        let committed_blob = git_stdout(&root, &["rev-parse", "HEAD:AGENTS.md"]);
+
+        // The user edits the tracked doc while the block is already injected.
+        let mut edited = fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        edited.push_str("- [r2] real user rule\n");
+        fs::write(root.join("AGENTS.md"), &edited).unwrap();
+        for _ in 0..2 {
+            write_handoff_current(&root, "# handoff tick\n").unwrap();
+            point_filter_at_cli(&root, &binary);
+            refresh_index_stat(&root, "AGENTS.md");
+        }
+
+        assert_eq!(
+            git_stdout(&root, &["diff", "--cached", "--stat"]),
+            "",
+            "a handoff tick must never stage the user's edit"
+        );
+        assert_eq!(
+            git_stdout(&root, &["rev-parse", ":AGENTS.md"]),
+            committed_blob,
+            "the index blob must stay the committed one"
+        );
+        assert_eq!(
+            git_stdout(&root, &["status", "--porcelain"]),
+            " M AGENTS.md",
+            "the real edit must stay an unstaged modification"
+        );
+        let diff = git_stdout(&root, &["diff", "--", "AGENTS.md"]);
+        assert!(diff.contains("- [r2] real user rule"), "{diff}");
+        assert!(!diff.contains("herdr:handoff"), "{diff}");
+
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "real edit"]);
+        let committed = git_stdout(&root, &["show", "HEAD:AGENTS.md"]);
+        assert!(committed.contains("- [r2] real user rule"), "{committed}");
+        assert!(!committed.contains("herdr:handoff"), "{committed}");
+        assert!(
+            fs::read_to_string(root.join("AGENTS.md"))
+                .unwrap()
+                .contains(HANDOFF_BLOCK_START)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn user_in_a_linked_worktree_gets_common_dir_attributes_and_a_shared_filter() {
         if !git_available() {
             return;
         }
-        let Some(binary) = cli_binary_path() else {
-            return;
-        };
+        let binary = cli_binary_path();
         let base = temp_dir("linked-tracked-agent-doc");
         let repo = base.join("repo");
         fs::create_dir(&repo).unwrap();
@@ -2820,7 +2987,7 @@ mod tests {
         );
 
         point_filter_at_cli(&linked, &binary);
-        git_run(&linked, &["update-index", "--refresh", "--", "AGENTS.md"]);
+        refresh_index_stat(&linked, "AGENTS.md");
         assert_eq!(git_stdout(&linked, &["status", "--porcelain"]), "");
         assert!(
             fs::read_to_string(linked.join("AGENTS.md"))
