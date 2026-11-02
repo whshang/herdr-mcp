@@ -54,6 +54,7 @@ mod mcp_http;
 mod mutation;
 mod native_host;
 mod native_host_install;
+mod native_host_log;
 // Origin-check diagnostics serve native-host status on macOS and Linux, plus
 // the cross-platform unit tests. Windows has no native-host installer.
 #[cfg(any(unix, test))]

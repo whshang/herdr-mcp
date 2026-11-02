@@ -4408,6 +4408,151 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    // #586 old-extension -> new-runtime compatibility: the extension payloads of
+    // the previous release plane (`v1.1.0-rc.10`, extension `0.1.229`) must
+    // still be accepted by this runtime. The fixtures below are the exact
+    // rc.10 payload shapes (`endpoint.register`; `provider.observe` with the
+    // rc.10 capabilities document; `source_turn.observe` with its four legacy
+    // fields). A newer peer must also stay *forward* compatible here, which is
+    // why a higher `adapter_protocol_version` is admitted rather than refused.
+    #[tokio::test]
+    async fn compat_rc10_extension_payloads_stay_accepted_by_the_current_runtime() {
+        let root = test_root("compat-rc10-extension-payloads");
+        let mut extension_state = test_state(&root);
+        extension_state.trusted_extension_ipc = true;
+        extension_state.local_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned());
+        let store = extension_state.state_store.clone();
+        let app = candidate_router(extension_state);
+        let request = |payload: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/extension/browser/registry")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+        let post = |payload: Value| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request(payload)).await.unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                (status, value)
+            }
+        };
+
+        // rc.10 `endpoint.register` (its allow-list has no other keys).
+        let (status, registered) = post(json!({
+            "operation": "endpoint.register",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "browser_family": "chrome",
+            "extension_version": "0.1.229",
+            "observed_at": 1000
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{registered}");
+        assert_eq!(registered["ok"], true);
+        assert_eq!(registered["endpoint"]["extension_version"], "0.1.229");
+        assert_eq!(
+            registered["endpoint"]["device_id"],
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
+        let endpoint_ref = registered["endpoint"]["endpoint_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let consent = json!({
+            "operation": "endpoint.consent",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "expected_consent_revision": 0,
+            "webchat_control_allowed": true,
+            "tool_bridge_allowed": true,
+            "tool_bridge_mutation_allowed": false,
+            "observed_at": 1001
+        });
+        let (status, _) = post(consent).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // `browserProviderCapabilities("chatgpt")` as shipped in 0.1.229.
+        let rc10_capabilities = json!({
+            "schema_version": 1,
+            "operations": [
+                "composer.submit",
+                "composer.select_tool",
+                "generation.status",
+                "generation.stop",
+                "session.archive",
+                "session.inspect",
+                "session.open",
+                "session.create",
+                "session.title_projection"
+            ],
+            "input_modalities": ["text"],
+            "output_modalities": ["text"],
+            "limits": {
+                "attachment_count": {
+                    "status": "known",
+                    "max": 0,
+                    "authority": "browser_control_v1"
+                },
+                "provider_message_chars": {"status": "unknown", "authority": "provider"},
+                "provider_response_timeout_ms": {"status": "unknown", "authority": "provider"},
+                "provider_model_reasoning_combinations": {
+                    "status": "unknown",
+                    "authority": "provider"
+                }
+            }
+        });
+        let provider_observe = |protocol: i64, generation: i64| {
+            json!({
+                "operation": "provider.observe",
+                "profile_seed": "extension-profile-seed-0123456789abcdef",
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "adapter_protocol_version": protocol,
+                "observation_generation": generation,
+                "capabilities": rc10_capabilities,
+                "observed_at": 1002
+            })
+        };
+        let (status, observed) = post(provider_observe(1, 1)).await;
+        assert_eq!(status, StatusCode::OK, "{observed}");
+        assert_eq!(observed["ok"], true);
+
+        // Forward compatibility: a newer peer protocol is admitted, and its
+        // capability snapshot replaces the older one instead of failing.
+        let (status, observed) = post(provider_observe(2, 2)).await;
+        assert_eq!(status, StatusCode::OK, "{observed}");
+        assert_eq!(observed["ok"], true);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .browser_provider_state(&endpoint_ref, "chatgpt")
+                .unwrap()
+                .unwrap()
+                .adapter_protocol_version,
+            2
+        );
+
+        // The rc.10 four-field source turn is still a *valid* payload, so the
+        // rejection is the typed session lookup, never a field rejection.
+        let (status, source_turn) = post(json!({
+            "operation": "source_turn.observe",
+            "canonical_url": "https://chatgpt.com/c/rc10-legacy-source-turn",
+            "user_text": "legacy four-field payload",
+            "observed_at": 1003
+        }))
+        .await;
+        assert_eq!(source_turn["code"], "browser_source_session_not_found");
+        assert_ne!(source_turn["code"], "browser_registry_params_invalid");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn browser_dispatch_result_route_settles_exact_dispatch_and_replays() {
         use crate::state_store::{
