@@ -83,6 +83,10 @@ agent が「完了した」と言うことは、完了のエビデンスには�
 
 agent が repo を mutation した可能性のある後に timeout した場合は、再試行するか決める前に Git を調べます。
 
+### HANDOFF ブロックは commit に含めない
+
+herdr-mcp は `HANDOFF.md` を維持し、その短い `<!-- herdr:handoff:start --> … <!-- herdr:handoff:end -->` ブロックをプロジェクトの `AGENTS.md`（Claude Code を使う場合は `CLAUDE.md` も）に注入します。ブロックは **working tree** にだけ残ります。herdr-mcp が新規作成したファイルはリポジトリ自身の `info/exclude` に登録されますが、すでに **tracked** な `AGENTS.md`/`CLAUDE.md` の場合は代わりにローカル専用の Git 状態を設定します。`<git-common-dir>/info/attributes` のルート固定の `/AGENTS.md filter=herdr-handoff` 行（linked worktree と共有）と、リポジトリ設定の `filter.herdr-handoff.clean` / `filter.herdr-handoff.smudge` です。clean filter（`herdr-mcp git-filter strip-handoff`）は管理対象ブロックと injector が追加した空行だけを削除するため、stage/commit される blob にブロックは入らず、`git status` / `git diff` は clean のままで、同じファイルへのあなた自身の編集は可視のまま commit できます。tracked な `.gitattributes` には一切触れず、`required` は意図的に未設定なので、バイナリが見つからない場合は commit を失敗させずフィルタなしの内容にフォールバックします。これはローカルの便宜であり、agent が repo を変更した後に Git を検証しなくてよい理由にはなりません。
+
 ## 6. 不確実な mutation を盲目的に再試行しない
 
 危険なリモートの失敗は次の形です。

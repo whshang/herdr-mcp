@@ -81,6 +81,10 @@ git diff --check
 
 不要为了得到状态而让另一个 Agent 运行 `git status`。这些确定性事实直接读取更快，也更可靠。
 
+### HANDOFF 区块不进入提交
+
+herdr-mcp 维护 `HANDOFF.md`，并把一小段 `<!-- herdr:handoff:start --> … <!-- herdr:handoff:end -->` 区块注入项目的 `AGENTS.md`（使用 Claude Code 时还有 `CLAUDE.md`）。区块只保留在 **working tree**。herdr-mcp 新建的文件会写入仓库自身的 `info/exclude`；如果 `AGENTS.md`/`CLAUDE.md` 已经是 **tracked** 文件，则改用仅本地的 Git 配置：在 `<git-common-dir>/info/attributes` 写入根锚定的 `/AGENTS.md filter=herdr-handoff`（linked worktree 共享），并在仓库配置里设置 `filter.herdr-handoff.clean` / `filter.herdr-handoff.smudge`。clean filter（`herdr-mcp git-filter strip-handoff`）只删除受管区块和注入器添加的空行，因此 stage/commit 的 blob 永不会包含它，`git status` / `git diff` 保持干净，而你对同一文件的真实修改仍然可见、可以提交。全程不会修改 tracked 的 `.gitattributes`，也不设置 `required`，所以二进制缺失时只会回退到未过滤内容而不会让提交失败。这只是本地便利，不构成 Agent 修改仓库后可以跳过 Git 验证的理由。
+
 ## 7. 浏览器扩展只负责“时间上的连续”，不替代 planner
 
 当任务会跨越当前网页回合时，扩展负责把本机进度、恢复和接力重新接到正确会话；它不负责重新规划任务，也不能因为“继续”而跳过 live-state 验证。

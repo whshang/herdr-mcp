@@ -68,6 +68,8 @@ pub enum Command {
         caller_origin: String,
     },
     ArtifactImport(crate::artifact_import::ImportArgs),
+    /// Internal clean filter: strip the managed handoff block from stdin.
+    GitFilterStripHandoff,
     Link(LinkCommand),
     TccBroker(TccBrokerCommand),
     TccBrokerRun,
@@ -677,6 +679,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "native-host" => parse_native_host(&args[1..]),
         "extension-host" => parse_extension_host(&args[1..]),
         "artifact" => parse_artifact(&args[1..]),
+        "git-filter" => parse_git_filter(&args[1..]),
         "link" => parse_link(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
     }
@@ -1485,6 +1488,13 @@ fn parse_herdr_supervisor(args: &[String]) -> Result<Command, String> {
         [subcommand, ..] => return Err(format!("invalid herdr-supervisor command or arguments for '{subcommand}'")),
     };
     Ok(Command::HerdrSupervisor(command))
+}
+
+fn parse_git_filter(args: &[String]) -> Result<Command, String> {
+    match args {
+        [command] if command == "strip-handoff" => Ok(Command::GitFilterStripHandoff),
+        _ => Err("usage: herdr-mcp git-filter strip-handoff".to_owned()),
+    }
 }
 
 fn parse_link(args: &[String]) -> Result<Command, String> {
@@ -4053,6 +4063,15 @@ mod tests {
             parse(args(&["status", "--verbose"])).unwrap().command,
             Command::Status { verbose: true }
         );
+        assert_eq!(
+            parse(args(&["git-filter", "strip-handoff"]))
+                .unwrap()
+                .command,
+            Command::GitFilterStripHandoff
+        );
+        assert!(parse(args(&["git-filter"])).is_err());
+        assert!(parse(args(&["git-filter", "strip-handoff", "extra"])).is_err());
+        assert!(parse(args(&["git-filter", "strip"])).is_err());
         assert_eq!(
             parse(args(&["doctor"])).unwrap().command,
             Command::Doctor {
