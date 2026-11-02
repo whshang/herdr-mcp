@@ -5,7 +5,9 @@ import { RuntimeControlLoop } from "./runtime-control.js";
 import { RuntimeGenerationManager } from "./runtime-generation.js";
 
 /// Current runtime execution contract epoch 5, shaped from the frozen epoch-2
-/// catalog by `contracts/runtime-exec-v5.json`.
+/// catalog by `contracts/runtime-exec-v5.json`. Must stay equal to
+/// `LOCAL_MCP_CONTRACT_EPOCH` (mirrors the Rust `PUBLIC_CONTRACT_EPOCH` /
+/// `LOCAL_MCP_CONTRACT_EPOCH` pairing).
 export const PUBLIC_CONTRACT_EPOCH = 5;
 export const PUBLIC_CONTRACT_HASH =
   "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030";
@@ -15,6 +17,12 @@ export const PUBLIC_CONTRACT_HASH =
 export const PREVIOUS_PUBLIC_CONTRACT_EPOCH = 4;
 export const PREVIOUS_PUBLIC_CONTRACT_HASH =
   "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135";
+/**
+ * Frozen epoch-1 rollback baseline. Edge/Relay keep accepting it during a
+ * rollout window, but this build only *runs* the current runtime execution
+ * contract: a rollback activates the previous binary. This pair is therefore
+ * rejected by `readLinkDaemonConfig` instead of failing later.
+ */
 export const LEGACY_EPOCH1_CONTRACT_HASH =
   "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
 
@@ -47,9 +55,7 @@ export function readLinkDaemonConfig(env: NodeJS.ProcessEnv = process.env): Link
   const runtimeGeneration = env.HERDR_RUNTIME_GENERATION?.trim() || "local-mcp-active";
   const contractHash = env.HERDR_CONTRACT_HASH?.trim() || PUBLIC_CONTRACT_HASH;
   const epochRaw = env.HERDR_CONTRACT_EPOCH?.trim();
-  const contractEpoch = epochRaw
-    ? Number(epochRaw)
-    : (contractHash === LEGACY_EPOCH1_CONTRACT_HASH ? 1 : PUBLIC_CONTRACT_EPOCH);
+  const contractEpoch = epochRaw ? Number(epochRaw) : PUBLIC_CONTRACT_EPOCH;
   const runtimeControlDir = env.HERDR_RUNTIME_CONTROL_DIR?.trim() || join(homedir(), ".config", "herdr-mcp");
   const runtimeControlPath = env.HERDR_RUNTIME_CONTROL_PATH?.trim() || join(runtimeControlDir, "runtime-control.json");
   const runtimeStatusPath = env.HERDR_RUNTIME_STATUS_PATH?.trim() || join(runtimeControlDir, "runtime-status.json");
@@ -66,11 +72,15 @@ export function readLinkDaemonConfig(env: NodeJS.ProcessEnv = process.env): Link
   if (!/^[A-Za-z0-9_.-]{1,64}$/.test(runtimeGeneration)) {
     throw new Error("herdr-link daemon: HERDR_RUNTIME_GENERATION is invalid");
   }
-  const validContract =
-    (contractEpoch === PUBLIC_CONTRACT_EPOCH && contractHash === PUBLIC_CONTRACT_HASH) ||
-    (contractEpoch === 1 && contractHash === LEGACY_EPOCH1_CONTRACT_HASH);
+  // Only the current runtime execution contract is startable. Rollback pairs
+  // (frozen epoch 1/2) stay readable as identities for Edge/Relay, but this build
+  // never executes them, so they are rejected here — up front, before any
+  // RuntimeGenerationManager construction.
+  const validContract = contractEpoch === PUBLIC_CONTRACT_EPOCH && contractHash === PUBLIC_CONTRACT_HASH;
   if (!validContract) {
-    throw new Error("herdr-link daemon: contract epoch/hash pair is not a supported public or rollback contract");
+    throw new Error(
+      `herdr-link daemon: contract epoch/hash pair is not a supported public or rollback contract (requires contract epoch ${PUBLIC_CONTRACT_EPOCH})`,
+    );
   }
   return {
     edgeUrl,
@@ -141,8 +151,8 @@ export async function runLinkDaemon(config: LinkDaemonConfig): Promise<number> {
     linkToken: config.linkToken,
     transport,
     logger: safeLogger(),
-    heartbeatMs: 15_000,
-    maxSilenceMs: 60_000,
+    heartbeatMs: 30_000,
+    maxSilenceMs: 90_000,
     handshakeTimeoutMs: 10_000,
     requestTimeoutMs: 60_000,
   });

@@ -316,8 +316,10 @@ Agent 应按这个顺序做：
 
 参见 [#632](https://github.com/whshang/herdr-mcp/issues/632)。
 
-- **在线规则。** 只有在**当前 Runtime generation** 的注册表中已注册（本次 Runtime 启动后注册或重新观察过），并且扩展正在轮询 `/push/events` 的 browser endpoint 才算在线。只轮询但未注册、或只有上一个 generation 遗留的陈旧注册的 endpoint 一律视为离线：浏览器变更会立刻返回可重试的 `not_delivered`（例如 `browser_page_unavailable`），而不是等到超时。push 的 `hello` 帧会报告 `endpoint_registered`。
-- **超时结果。** actuation 超时时，如果命令仍在队列中、从未被任何扩展取走，Runtime 会把它移出队列（之后不可能再被投递），并返回带 `retry_safe: true` 的 `not_delivered`，可以安全地重试原意图。只有已经交给扩展的命令才保留 `delivery_unknown`：先重新观察，不要盲目重试。
+- **在线规则。** 只有在**当前 Runtime generation** 的注册表中已注册（本次 Runtime 启动后注册或重新观察过），并且扩展正在轮询 `/push/events` 的 browser endpoint 才算在线。只轮询但未注册、或只有上一个 generation 遗留的陈旧注册的 endpoint 一律视为离线：浏览器变更会立刻返回可重试的 `not_delivered`（例如 `browser_page_unavailable`），而不是等到超时，其 `reason` 为 `endpoint_offline`，若该 endpoint 之前轮询过还会带上 `endpoint_last_seen_age_ms`。push 的 `hello` 帧会报告 `endpoint_registered`。
+- **超时结果。** actuation 超时时，如果命令仍在队列中、从未被任何扩展取走，Runtime 会把它移出队列（之后不可能再被投递），并返回带 `retry_safe: true` 的 `not_delivered`，其 `reason` 为 `queued_untaken_at_timeout`，可以安全地重试原意图。只有已经交给扩展的命令才保留 `delivery_unknown`，此时 `reason` 为 `completion_timeout`、`retry_safe: false`：先重新观察，不要盲目重试。只读调用（`observe`、`screenshot`、`expect`）与页面 `lifecycle` 调用在同一个 `browser_page_unavailable` 错误码下返回同样的字段，因此超时的只读请求不会被误判为可重试的离线端点。
+- **Endpoint 生命周期日志。** 注册、`/push/events` 流的开始与结束、在线变陈旧的拒绝，以及每一次等待中的命令超时，都会写入 Runtime 常规日志（stderr，由托管服务写入 `server.log`），每个事件一条不含内容的 `event=` 行，只带 endpoint/actuation id、毫秒时间差与持续时间。绝不记录页面内容、tab 标题、带查询串的 URL、`profile_seed` 或任何凭据。
+- **Native host 日志。** Chrome Native Messaging host 会在 herdr-mcp 配置根目录（默认 `~/.config/herdr-mcp`；尊重 `HERDR_MCP_CONFIG_DIR`、`XDG_CONFIG_HOME` 与命名实例叶子目录）下的 `native-host/native-host.log` 写入自己的有界轮转日志。单个文件到 1 MiB 即轮转，依次生成 `native-host.log.1` 与 `native-host.log.2`，整个集合不超过 3 MiB；文件权限为 `0600`，目录权限为 `0700`。每个 host 进程写一行 `connect`（host 版本、pid、扩展 origin、消息类型、编码后大小）、一行 `disconnect`（原因码、消息类型、毫秒耗时），以及本地 IPC socket 或流失败时的一行 `io_error`（带错误码）。绝不写入消息正文、页面内容、带查询串的 URL、请求头、token 或任何凭据，日志写入失败也绝不会阻塞或导致 host 失败。
 - **升级顺序。** 切换 Runtime **之前**，先把浏览器扩展升级到 `0.1.203` 或更高版本。扩展 `0.1.203` 在 Runtime 的 `boot_id` 变化、或 `hello` 携带 `endpoint_registered: false` 时会自动重新注册 endpoint。旧扩展在 Runtime 切换后会显示离线，直到其 service worker 重启；临时办法：在 `chrome://extensions` 中只重载扩展的 service worker（无需重启 Chrome）。
 
 ## 9. Continuity / Work Memory / Browser session 的区别

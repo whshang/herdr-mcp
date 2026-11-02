@@ -65,6 +65,9 @@ const MAX_MCP_ACTIVITY_RECORDS: usize = 2000;
 const MAX_MCP_ACTIVITY_RESULTS: usize = 50;
 const MAX_MCP_ACTIVITY_LOOKBACK_MS: u64 = 30 * 60_000;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
+/// #629: identifies one `/push/events` SSE stream in the lifecycle log so an
+/// open/close pair can be matched without logging any stream content.
+static NEXT_PUSH_STREAM: AtomicU64 = AtomicU64::new(0);
 
 const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
 
@@ -748,6 +751,7 @@ async fn post_extension_browser_actuation(State(state): State<AppState>, body: B
                     "generation_status_observed",
                 )?,
                 generation_stopped: browser_registry_bool(&payload, "generation_stopped")?,
+                endpoint_last_seen_age_ms: None,
                 result: actuation_result,
             },
         )
@@ -791,6 +795,18 @@ fn extension_browser_endpoint_register(
         extension_version,
         observed_at,
     })?;
+    // #629: endpoint lifecycle timeline. Only opaque ids, the browser family and
+    // the extension version are logged; `profile_seed`, page content, titles and
+    // URLs never are.
+    actuation::emit_browser_endpoint_event(
+        "register",
+        &[
+            ("endpoint_ref", endpoint.endpoint_ref.clone()),
+            ("browser_family", endpoint.browser_family.clone()),
+            ("extension_version", endpoint.extension_version.clone()),
+            ("observed_at", endpoint.last_observed_at.to_string()),
+        ],
+    );
     Ok(json!({
         "ok": true,
         "endpoint": browser_endpoint_http_json(endpoint),
@@ -814,6 +830,58 @@ fn browser_registry_authoritative_endpoint_ref(
         return Err("browser_endpoint_ref_mismatch".to_owned());
     }
     Ok(authoritative_ref)
+}
+
+/// The endpoint that is reporting a `source_turn.observe` (#734).
+///
+/// The registry POST carries no per-connection endpoint identity, so the scope
+/// is derived exactly like `endpoint.register` / `provider.observe` /
+/// `resource.observe`: from this runtime's own device identity plus the
+/// extension's profile seed. A caller-supplied `endpoint_ref` is only ever
+/// compared against that derivation, never used as the scope, so a stale
+/// endpoint left behind by a retired `device_id` cannot capture the turn.
+///
+/// `Ok(None)` means "no verifiable endpoint context": the caller keeps the
+/// previous global lookup instead of failing closed on a runtime that was never
+/// enrolled (which can derive no endpoint at all).
+fn browser_source_turn_observing_endpoint_ref(
+    state: &AppState,
+    payload: &Value,
+) -> Result<Option<String>, String> {
+    let profile_seed = browser_registry_optional_string(payload, "profile_seed", 256)?;
+    let caller_ref = browser_registry_optional_string(payload, "endpoint_ref", 96)?;
+    if profile_seed.is_some() {
+        if state.local_device_id.is_none() {
+            // A runtime without a device identity derives no endpoint, so there
+            // is nothing to verify. Keep the previous behavior for that
+            // degraded mode instead of turning it into a new hard failure.
+            return Ok(None);
+        }
+        // Rejects a caller ref that is not the endpoint of this device+profile.
+        return browser_registry_authoritative_endpoint_ref(state, payload).map(Some);
+    }
+    let Some(caller_ref) = caller_ref else {
+        return Ok(None);
+    };
+    // Without a profile seed the reported ref can only be accepted when it
+    // names an endpoint this runtime's current device identity owns. Anything
+    // else (including an endpoint derived from a retired device_id) could
+    // point at another device's browser state and is refused.
+    let device_id = state
+        .local_device_id
+        .as_deref()
+        .ok_or_else(|| "browser_endpoint_ref_mismatch".to_owned())?;
+    let endpoint = {
+        let store = state
+            .state_store
+            .lock()
+            .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+        store.browser_endpoint(caller_ref)?
+    };
+    match endpoint {
+        Some(endpoint) if endpoint.device_id == device_id => Ok(Some(caller_ref.to_owned())),
+        _ => Err("browser_endpoint_ref_mismatch".to_owned()),
+    }
 }
 
 fn extension_browser_endpoint_consent(
@@ -1069,7 +1137,14 @@ fn extension_browser_source_turn_observe(
 ) -> Result<Value, String> {
     browser_registry_allow_fields(
         payload,
-        &["operation", "canonical_url", "user_text", "observed_at"],
+        &[
+            "operation",
+            "canonical_url",
+            "user_text",
+            "profile_seed",
+            "endpoint_ref",
+            "observed_at",
+        ],
     )?;
     let canonical_url = browser_registry_string(payload, "canonical_url", 2048)?;
     let user_text = browser_registry_string(payload, "user_text", MAX_BROWSER_RESULT_TEXT_BYTES)?;
@@ -1082,37 +1157,24 @@ fn extension_browser_source_turn_observe(
         return Err("browser_user_text_invalid".to_owned());
     }
     let user_text_sha256 = mcp::source_turn_sha256(user_text);
+    // #734: the endpoint that is reporting the turn is derived and verified
+    // server-side before it is used as a lookup scope; a caller-supplied ref is
+    // never taken as the scope.
+    let observing_endpoint_ref = browser_source_turn_observing_endpoint_ref(state, payload)?;
     let mut store = state
         .state_store
         .lock()
         .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
-    let session_ref = match store.browser_current_generation_source_session_ref(canonical_url)? {
+    let scoped_session_ref = match observing_endpoint_ref.as_deref() {
+        Some(endpoint_ref) => store.browser_current_generation_source_session_ref_for_endpoint(
+            canonical_url,
+            endpoint_ref,
+        )?,
+        None => None,
+    };
+    let session_ref = match scoped_session_ref {
         Some(session_ref) => session_ref,
-        None => {
-            // #771: no current-generation session resolves this conversation
-            // URL. Only a URL with no session row at all is the brand-new-chat
-            // case whose first turn cannot bind yet. The classification must
-            // never replace the typed rejection: two historical sessions for
-            // one URL are `browser_canonical_url_ambiguous` here (#734/#740),
-            // and the extension retries only on
-            // `browser_source_session_not_found`, so an ambiguity or store
-            // error is classified as "not the brand-new-chat case" and the
-            // rejection below stays byte-identical.
-            let unregistered = matches!(
-                store.browser_session_ref_for_canonical_url(canonical_url),
-                Ok(None)
-            );
-            if unregistered {
-                // Diagnostic evidence only: recording must never replace the
-                // typed registry rejection the extension retries on.
-                let _ = store.record_unregistered_browser_source_turn(
-                    "chatgpt",
-                    &user_text_sha256,
-                    mcp::browser_epoch_ms(),
-                );
-            }
-            return Err("browser_source_session_not_found".to_owned());
-        }
+        None => resolve_global_source_session_ref(&mut store, canonical_url, &user_text_sha256)?,
     };
     let session = store
         .browser_resource(&session_ref)?
@@ -1132,6 +1194,44 @@ fn extension_browser_source_turn_observe(
         "session_ref": session_ref,
         "expected_generation": expected_generation,
     }))
+}
+
+/// Device-global fallback of `source_turn.observe` (#734, #771).
+///
+/// Used when the observing endpoint has no current session for the URL (or when
+/// the caller supplied no verifiable endpoint context). The contract here is
+/// unchanged from before endpoint scoping existed: zero current sessions is the
+/// brand-new-chat case, several are ambiguous, and nothing is picked by recency.
+fn resolve_global_source_session_ref(
+    store: &mut crate::state_store::StateStore,
+    canonical_url: &str,
+    user_text_sha256: &str,
+) -> Result<String, String> {
+    if let Some(session_ref) = store.browser_current_generation_source_session_ref(canonical_url)? {
+        return Ok(session_ref);
+    }
+    // #771: no current-generation session resolves this conversation URL. Only a
+    // URL with no session row at all is the brand-new-chat case whose first turn
+    // cannot bind yet. The classification must never replace the typed
+    // rejection: two historical sessions for one URL are
+    // `browser_canonical_url_ambiguous` here (#734/#740), and the extension
+    // retries only on `browser_source_session_not_found`, so an ambiguity or
+    // store error is classified as "not the brand-new-chat case" and the
+    // rejection below stays byte-identical.
+    let unregistered = matches!(
+        store.browser_session_ref_for_canonical_url(canonical_url),
+        Ok(None)
+    );
+    if unregistered {
+        // Diagnostic evidence only: recording must never replace the typed
+        // registry rejection the extension retries on.
+        let _ = store.record_unregistered_browser_source_turn(
+            "chatgpt",
+            user_text_sha256,
+            mcp::browser_epoch_ms(),
+        );
+    }
+    Err("browser_source_session_not_found".to_owned())
 }
 
 fn extension_browser_archive_claim(
@@ -1732,6 +1832,10 @@ struct PushStreamState {
     trusted_extension_ipc: bool,
     browser_endpoint_ref: Option<String>,
     endpoint_registered: bool,
+    /// #629: identity and open time of this SSE stream, used only for the
+    /// content-free `stream_open`/`stream_close` lifecycle log lines.
+    stream_id: u64,
+    opened_at: Instant,
 }
 
 impl PushStreamState {
@@ -1746,6 +1850,31 @@ impl PushStreamState {
             Some(_) => self.endpoint_registered,
             None => true,
         }
+    }
+}
+
+/// #629: the stream future is dropped both on a normal end and on a client
+/// disconnect, so the close side of the SSE timeline belongs in `Drop`.
+impl Drop for PushStreamState {
+    fn drop(&mut self) {
+        if !self.trusted_extension_ipc {
+            return;
+        }
+        let duration_ms = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut fields = vec![
+            (
+                "endpoint_ref",
+                self.browser_endpoint_ref
+                    .clone()
+                    .unwrap_or_else(|| "-".to_owned()),
+            ),
+            ("stream_id", self.stream_id.to_string()),
+            ("duration_ms", duration_ms.to_string()),
+        ];
+        if self.browser_endpoint_ref.is_some() {
+            fields.push(("endpoint_registered", self.endpoint_registered.to_string()));
+        }
+        actuation::emit_browser_endpoint_event("stream_close", &fields);
     }
 }
 
@@ -1988,6 +2117,23 @@ fn push_events_response(
             ))
         })
         .collect();
+    let stream_id = NEXT_PUSH_STREAM.fetch_add(1, Ordering::Relaxed);
+    let opened_at = Instant::now();
+    if trusted_extension_ipc && browser_endpoint_ref.is_some() {
+        actuation::emit_browser_endpoint_event(
+            "stream_open",
+            &[
+                (
+                    "endpoint_ref",
+                    browser_endpoint_ref
+                        .clone()
+                        .unwrap_or_else(|| "-".to_owned()),
+                ),
+                ("stream_id", stream_id.to_string()),
+                ("endpoint_registered", endpoint_registered.to_string()),
+            ],
+        );
+    }
     let state = PushStreamState {
         cache,
         cursor_rx,
@@ -2001,6 +2147,8 @@ fn push_events_response(
         trusted_extension_ipc,
         browser_endpoint_ref,
         endpoint_registered,
+        stream_id,
+        opened_at,
     };
     let events = stream::unfold(state, |mut state| async move {
         if state.first {
@@ -4260,6 +4408,151 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    // #586 old-extension -> new-runtime compatibility: the extension payloads of
+    // the previous release plane (`v1.1.0-rc.10`, extension `0.1.229`) must
+    // still be accepted by this runtime. The fixtures below are the exact
+    // rc.10 payload shapes (`endpoint.register`; `provider.observe` with the
+    // rc.10 capabilities document; `source_turn.observe` with its four legacy
+    // fields). A newer peer must also stay *forward* compatible here, which is
+    // why a higher `adapter_protocol_version` is admitted rather than refused.
+    #[tokio::test]
+    async fn compat_rc10_extension_payloads_stay_accepted_by_the_current_runtime() {
+        let root = test_root("compat-rc10-extension-payloads");
+        let mut extension_state = test_state(&root);
+        extension_state.trusted_extension_ipc = true;
+        extension_state.local_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned());
+        let store = extension_state.state_store.clone();
+        let app = candidate_router(extension_state);
+        let request = |payload: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/extension/browser/registry")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+        let post = |payload: Value| {
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request(payload)).await.unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                (status, value)
+            }
+        };
+
+        // rc.10 `endpoint.register` (its allow-list has no other keys).
+        let (status, registered) = post(json!({
+            "operation": "endpoint.register",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "browser_family": "chrome",
+            "extension_version": "0.1.229",
+            "observed_at": 1000
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{registered}");
+        assert_eq!(registered["ok"], true);
+        assert_eq!(registered["endpoint"]["extension_version"], "0.1.229");
+        assert_eq!(
+            registered["endpoint"]["device_id"],
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
+        let endpoint_ref = registered["endpoint"]["endpoint_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let consent = json!({
+            "operation": "endpoint.consent",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "expected_consent_revision": 0,
+            "webchat_control_allowed": true,
+            "tool_bridge_allowed": true,
+            "tool_bridge_mutation_allowed": false,
+            "observed_at": 1001
+        });
+        let (status, _) = post(consent).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // `browserProviderCapabilities("chatgpt")` as shipped in 0.1.229.
+        let rc10_capabilities = json!({
+            "schema_version": 1,
+            "operations": [
+                "composer.submit",
+                "composer.select_tool",
+                "generation.status",
+                "generation.stop",
+                "session.archive",
+                "session.inspect",
+                "session.open",
+                "session.create",
+                "session.title_projection"
+            ],
+            "input_modalities": ["text"],
+            "output_modalities": ["text"],
+            "limits": {
+                "attachment_count": {
+                    "status": "known",
+                    "max": 0,
+                    "authority": "browser_control_v1"
+                },
+                "provider_message_chars": {"status": "unknown", "authority": "provider"},
+                "provider_response_timeout_ms": {"status": "unknown", "authority": "provider"},
+                "provider_model_reasoning_combinations": {
+                    "status": "unknown",
+                    "authority": "provider"
+                }
+            }
+        });
+        let provider_observe = |protocol: i64, generation: i64| {
+            json!({
+                "operation": "provider.observe",
+                "profile_seed": "extension-profile-seed-0123456789abcdef",
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "adapter_protocol_version": protocol,
+                "observation_generation": generation,
+                "capabilities": rc10_capabilities,
+                "observed_at": 1002
+            })
+        };
+        let (status, observed) = post(provider_observe(1, 1)).await;
+        assert_eq!(status, StatusCode::OK, "{observed}");
+        assert_eq!(observed["ok"], true);
+
+        // Forward compatibility: a newer peer protocol is admitted, and its
+        // capability snapshot replaces the older one instead of failing.
+        let (status, observed) = post(provider_observe(2, 2)).await;
+        assert_eq!(status, StatusCode::OK, "{observed}");
+        assert_eq!(observed["ok"], true);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .browser_provider_state(&endpoint_ref, "chatgpt")
+                .unwrap()
+                .unwrap()
+                .adapter_protocol_version,
+            2
+        );
+
+        // The rc.10 four-field source turn is still a *valid* payload, so the
+        // rejection is the typed session lookup, never a field rejection.
+        let (status, source_turn) = post(json!({
+            "operation": "source_turn.observe",
+            "canonical_url": "https://chatgpt.com/c/rc10-legacy-source-turn",
+            "user_text": "legacy four-field payload",
+            "observed_at": 1003
+        }))
+        .await;
+        assert_eq!(source_turn["code"], "browser_source_session_not_found");
+        assert_ne!(source_turn["code"], "browser_registry_params_invalid");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn browser_dispatch_result_route_settles_exact_dispatch_and_replays() {
         use crate::state_store::{
@@ -4990,6 +5283,8 @@ mod tests {
             trusted_extension_ipc: false,
             browser_endpoint_ref: None,
             endpoint_registered: false,
+            stream_id: 0,
+            opened_at: Instant::now(),
         };
         let working = json!({
             "agent":"pi","pane":"w1:p1","status":"working","workspace":"w1"
@@ -5106,6 +5401,85 @@ mod tests {
         let mut body = response.into_body();
         let frame = body.frame().await.unwrap().unwrap();
         String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap()
+    }
+
+    /// #629: registering an endpoint and opening/closing its `/push/events`
+    /// stream appear in the lifecycle log with ids and durations only. The
+    /// register input carries a `profile_seed`; it must never be logged.
+    #[tokio::test]
+    async fn browser_endpoint_lifecycle_log_records_register_and_stream_events() {
+        let root = test_root("endpoint-lifecycle-log");
+        let mut extension_state =
+            test_state_with_snapshot(&root, json!({"workspaces": [], "panes": [], "agents": []}));
+        extension_state.trusted_extension_ipc = true;
+        let extension = candidate_router(extension_state);
+
+        let profile_seed = "issue-629-lifecycle-profile-seed";
+        let register_request = Request::builder()
+            .method(Method::POST)
+            .uri("/extension/browser/registry")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "operation": "endpoint.register",
+                    "profile_seed": profile_seed,
+                    "browser_family": "chrome",
+                    "extension_version": "0.1.229",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let register_response = extension.clone().oneshot(register_request).await.unwrap();
+        assert_eq!(register_response.status(), StatusCode::OK);
+        let bytes = register_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let registered: Value = serde_json::from_slice(&bytes).unwrap();
+        let endpoint_ref = registered["endpoint"]["endpoint_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Open the trusted extension stream and let the response body drop at
+        // the end of this scope, which is the stream-close point.
+        {
+            let _hello = issue_632_open_push_stream(extension, &endpoint_ref).await;
+        }
+
+        let lines = actuation::endpoint_log_capture::take_for_endpoint(&endpoint_ref);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("event=register") && joined.contains("extension_version=0.1.229"),
+            "register must be logged with the extension version: {joined}"
+        );
+        assert!(
+            joined.contains("event=stream_open") && joined.contains("event=stream_close"),
+            "both sides of the SSE stream must be logged: {joined}"
+        );
+        assert!(
+            joined.contains("duration_ms=") && joined.contains("stream_id="),
+            "the stream close must carry its duration: {joined}"
+        );
+        assert!(
+            !joined.contains(profile_seed),
+            "a profile seed must never be logged: {joined}"
+        );
+        for line in &lines {
+            assert!(
+                line.starts_with("herdr-mcp: browser endpoint event="),
+                "{line}"
+            );
+            for needle in ["http", "://", "?", "page_ref", "title"] {
+                assert!(
+                    !line.contains(needle),
+                    "lifecycle log line must stay content-free ({needle}): {line}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// #632: register a browser endpoint through the real registry route and
@@ -6469,6 +6843,269 @@ mod tests {
                 .resolve_browser_source_turn(&mcp::source_turn_sha256("归档当前对话"), 3004),
             Err("browser_current_turn_not_found".to_owned())
         );
+
+        // #734: scoping the lookup to the observing endpoint cannot disambiguate
+        // two sessions that are both current on that same endpoint either.
+        let scoped_source_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": SHARED_URL,
+            "user_text": "归档当前对话",
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "observed_at": 3005
+        });
+        let response = app
+            .clone()
+            .oneshot(registry_request(scoped_source_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "browser_canonical_url_ambiguous");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn source_turn_observe_resolves_within_the_observing_endpoint_after_device_reenrollment()
+    {
+        // #734: a device re-enrollment leaves the retired device_id's endpoint and
+        // its session locator in place. Both endpoints then hold a *current*
+        // locator for the same canonical URL, so the global lookup is ambiguous
+        // forever and every source turn for that conversation is dropped. The
+        // turn is reported by the live endpoint, so the lookup resolves inside
+        // that endpoint instead of failing closed.
+        const SHARED_URL: &str = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/6adafccc-88a4-83e9-9917-968bae77e514";
+        const RETIRED_ONLY_URL: &str = "https://chatgpt.com/c/source-turn-retired-only";
+        const RETIRED_DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const LIVE_DEVICE: &str = "dev_01M1BDHFQJ7Q2V6R7Z9T4Y5W3X";
+        let root = test_root("source-turn-observing-endpoint");
+        let mut retired_state = test_state(&root);
+        retired_state.trusted_extension_ipc = true;
+        retired_state.local_device_id = Some(RETIRED_DEVICE.to_owned());
+        let store = retired_state.state_store.clone();
+        let retired_router = candidate_router(retired_state.clone());
+        let (retired_router, retired_seed, retired_endpoint_ref, _account) =
+            register_chatgpt_endpoint(retired_router, "source-turn-retired-device", 4001).await;
+        let (retired_router, _account_ref, retired_sessions) = observe_chatgpt_account_generation(
+            retired_router,
+            &retired_seed,
+            &retired_endpoint_ref,
+            "source-turn-retired-device",
+            1,
+            &[("source-turn-retired-session", SHARED_URL)],
+            4002,
+        )
+        .await;
+        let retired_session_ref = retired_sessions[0].clone();
+        // A conversation only the retired endpoint ever observed: the live
+        // endpoint has no in-scope session for it, which must keep resolving
+        // through the unchanged global lookup.
+        let (_retired_router, _account_ref, retired_only_sessions) =
+            observe_chatgpt_account_generation(
+                retired_router,
+                &retired_seed,
+                &retired_endpoint_ref,
+                "source-turn-retired-only",
+                1,
+                &[("source-turn-retired-only-session", RETIRED_ONLY_URL)],
+                4003,
+            )
+            .await;
+        let retired_only_session_ref = retired_only_sessions[0].clone();
+
+        // Re-enrollment: the same workstation now reports another device_id, so
+        // the live extension registers an endpoint that leaves the retired
+        // endpoint, its locators and its sessions untouched.
+        let live_router = candidate_router(AppState {
+            local_device_id: Some(LIVE_DEVICE.to_owned()),
+            ..retired_state.clone()
+        });
+        let (live_router, live_seed, live_endpoint_ref, _account) =
+            register_chatgpt_endpoint(live_router, "source-turn-live-device", 4004).await;
+        assert_ne!(live_endpoint_ref, retired_endpoint_ref);
+        let (live_router, _account_ref, live_sessions) = observe_chatgpt_account_generation(
+            live_router,
+            &live_seed,
+            &live_endpoint_ref,
+            "source-turn-live-device",
+            1,
+            &[("source-turn-live-session", SHARED_URL)],
+            4005,
+        )
+        .await;
+        let live_session_ref = live_sessions[0].clone();
+        assert_ne!(live_session_ref, retired_session_ref);
+        {
+            let guard = store.lock().unwrap();
+            // Both locators are current for their own endpoint: nothing expired
+            // or retired them, which is exactly the #734 state.
+            assert!(
+                guard
+                    .browser_resource_locator(&retired_session_ref)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                guard
+                    .browser_resource_locator(&live_session_ref)
+                    .unwrap()
+                    .is_some()
+            );
+            // The global lookups keep their existing fail-closed contract, so
+            // archive, dispatch and source-anchored create are untouched.
+            assert_eq!(
+                guard.browser_current_generation_source_session_ref(SHARED_URL),
+                Err("browser_canonical_url_ambiguous".to_owned())
+            );
+            assert_eq!(
+                guard.browser_session_ref_for_canonical_url(SHARED_URL),
+                Err("browser_canonical_url_ambiguous".to_owned())
+            );
+        }
+
+        // The live endpoint's own turn resolves inside the live endpoint.
+        let live_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": SHARED_URL,
+            "user_text": "归档重新注册后的对话",
+            "profile_seed": live_seed,
+            "endpoint_ref": live_endpoint_ref,
+            "observed_at": 4006
+        });
+        let response = live_router
+            .clone()
+            .oneshot(registry_request(live_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["session_ref"], live_session_ref);
+        let live_turn_sha = mcp::source_turn_sha256("归档重新注册后的对话");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&live_turn_sha, 4007)
+                .unwrap(),
+            (live_session_ref.clone(), 1)
+        );
+
+        // The same payload without endpoint context keeps the previous global
+        // contract, including the ambiguity the issue is about.
+        let unprovenanced_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": SHARED_URL,
+            "user_text": "没有端点上下文的回合",
+            "observed_at": 4008
+        });
+        let response = live_router
+            .clone()
+            .oneshot(registry_request(unprovenanced_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "browser_canonical_url_ambiguous");
+        assert_eq!(
+            store.lock().unwrap().resolve_browser_source_turn(
+                &mcp::source_turn_sha256("没有端点上下文的回合"),
+                4009
+            ),
+            Err("browser_current_turn_not_found".to_owned())
+        );
+
+        // A ref that is not the endpoint of this device+profile is never used as
+        // the scope: the turn cannot be retargeted to the retired endpoint.
+        let foreign_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": SHARED_URL,
+            "user_text": "伪造端点回合",
+            "profile_seed": live_seed,
+            "endpoint_ref": retired_endpoint_ref,
+            "observed_at": 4010
+        });
+        let response = live_router
+            .clone()
+            .oneshot(registry_request(foreign_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "browser_endpoint_ref_mismatch");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&mcp::source_turn_sha256("伪造端点回合"), 4011),
+            Err("browser_current_turn_not_found".to_owned())
+        );
+
+        // Without a profile seed a reported ref is only accepted when the
+        // endpoint row is owned by this runtime's current device identity.
+        let retired_only_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": SHARED_URL,
+            "user_text": "退役设备端点回合",
+            "endpoint_ref": retired_endpoint_ref,
+            "observed_at": 4012
+        });
+        let response = live_router
+            .clone()
+            .oneshot(registry_request(retired_only_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "browser_endpoint_ref_mismatch");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&mcp::source_turn_sha256("退役设备端点回合"), 4013),
+            Err("browser_current_turn_not_found".to_owned())
+        );
+        let own_ref_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": SHARED_URL,
+            "user_text": "本设备端点回合",
+            "endpoint_ref": live_endpoint_ref,
+            "observed_at": 4014
+        });
+        let response = live_router
+            .clone()
+            .oneshot(registry_request(own_ref_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["session_ref"], live_session_ref);
+
+        // Zero in-scope sessions falls back to the unchanged global lookup.
+        let fallback_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": RETIRED_ONLY_URL,
+            "user_text": "只在退役端点观测过的对话",
+            "profile_seed": live_seed,
+            "endpoint_ref": live_endpoint_ref,
+            "observed_at": 4015
+        });
+        let response = live_router
+            .clone()
+            .oneshot(registry_request(fallback_turn))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["session_ref"], retired_only_session_ref);
 
         let _ = std::fs::remove_dir_all(root);
     }
