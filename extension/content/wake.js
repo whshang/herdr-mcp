@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.240";
+const H2W_CONTENT_VERSION = "0.1.241";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -1912,19 +1912,84 @@ function normalizeHerdrMentionAlias(value) {
       .split(ACCEPTANCE_SPLIT_RE).filter(Boolean).join(" ");
   }
 
-  // Strip only leading `@?<app>` mention tokens the caller named, matching the
-  // normalization the runtime late-acceptance readback applies to the stored
-  // body before hashing.
+  // A selected App reaches an accepted user turn as an inline chip whose text
+  // form depends on the provider build: `@herdr-mcp`, `herdr-mcp`,
+  // `$herdr-mcp` (the chip's prompt-link label), the same name under another
+  // separator (`Herdr MCP`, `herdr_mcp`), and zero-width characters next to the
+  // chip. Names are therefore compared as separator-delimited tokens: the token
+  // sequence `herdr` + `mcp` is the App `herdr-mcp`, while a different provider
+  // App id such as `herdrmcp` is not.
+  const APP_MENTION_TOKEN_CHAR_RE = /[a-z0-9]/;
+  // Separators allowed *between* the tokens of one App mention.
+  const APP_MENTION_TOKEN_SEPARATOR_RE = new RegExp(
+    `(?:${ACCEPTANCE_WHITESPACE_CLASS}|[@$_\\-]|[\\u200b-\\u200d\\u2060\\ufeff])`,
+  );
+  // Separators allowed *between* the App mention token and the body. Dashes and
+  // underscores are deliberately excluded: a body may legitimately start with
+  // `- ` and must not be swallowed by the pill normalization, and an empty
+  // separator is never a boundary, so `@herdrmcp hello` is not a mention of the
+  // App `herdr`.
+  const APP_MENTION_BODY_SEPARATOR_RE = new RegExp(
+    `(?:${ACCEPTANCE_WHITESPACE_CLASS}|[\\u200b-\\u200d\\u2060\\ufeff])`,
+  );
+
+  // Separator-delimited tokens of an App name, lowercased.
+  function appMentionTokens(value) {
+    return String(value ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  }
+
+  // Consumed length of a leading App mention token for `tokens`, or 0 when the
+  // text does not start with that App's mention. A mention starts the text, may
+  // carry an `@`/`$` prefix, is separated from the body by a real separator (or
+  // the end of the text), and its own tokens are delimiter-matched: a missing or
+  // empty separator falls through to 0 instead of gluing the body onto the pill.
+  function leadingAppMentionTokenLength(text, tokens) {
+    if (!tokens.length) return 0;
+    let index = text[0] === "@" || text[0] === "$" ? 1 : 0;
+    for (let tokenIndex = 0; tokenIndex < tokens.length; tokenIndex += 1) {
+      if (tokenIndex > 0) {
+        const before = index;
+        while (index < text.length && APP_MENTION_TOKEN_SEPARATOR_RE.test(text[index])) index += 1;
+        if (index === before) return 0;
+      }
+      const token = tokens[tokenIndex];
+      for (let characterIndex = 0; characterIndex < token.length; characterIndex += 1) {
+        const character = String(text[index + characterIndex] ?? "").toLowerCase();
+        if (character !== token[characterIndex]) return 0;
+      }
+      index += token.length;
+    }
+    const next = text[index];
+    if (next !== undefined && !APP_MENTION_BODY_SEPARATOR_RE.test(next)) return 0;
+    while (index < text.length && APP_MENTION_BODY_SEPARATOR_RE.test(text[index])) index += 1;
+    return index;
+  }
+
+  // Strip only the leading App mention tokens the caller named, in every
+  // provider rendering. This is the extension half of the pill-normalized
+  // acceptance contract; the runtime accepts exactly these forms as an explicit
+  // "App pill + text" expectation (browser_expected_acceptance_digests in
+  // crates/herdr-mcp/src/mcp.rs), and the shared parity fixture
+  // (tests/fixtures/browser-acceptance-digest-parity.json) pins both halves.
+  // Only the App names the caller explicitly requested may ever be stripped, and
+  // the longest one is tried first so a shorter App name that prefixes a longer
+  // one can never eat part of the longer pill.
   function stripLeadingAppMentionTokens(text, apps) {
-    let body = String(text || "");
-    const names = (Array.isArray(apps) ? apps : [])
-      .map((app) => String(app || "").trim().toLowerCase())
-      .filter((app) => /^[a-z0-9_-]{1,64}$/.test(app));
+    const names = [...new Set((Array.isArray(apps) ? apps : [])
+      .map((app) => appMentionTokens(app).join(" "))
+      .filter(Boolean))]
+      .sort((left, right) => right.length - left.length)
+      .map((name) => name.split(" "));
+    let body = acceptanceTrim(String(text || ""));
+    if (!names.length) return body;
     for (let changed = true; changed;) {
       changed = false;
-      for (const name of names) {
-        const match = body.match(new RegExp(`^@?${name}(?:${ACCEPTANCE_WHITESPACE_CLASS}+|$)`, "i"));
-        if (match) { body = body.slice(match[0].length); changed = true; }
+      for (const tokens of names) {
+        const length = leadingAppMentionTokenLength(body, tokens);
+        if (length > 0) {
+          body = acceptanceTrim(body.slice(length));
+          changed = true;
+        }
       }
     }
     return body;
@@ -2425,13 +2490,6 @@ function normalizeHerdrMentionAlias(value) {
           try {
             const hex = async (text) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))]
               .map((byte) => byte.toString(16).padStart(2, "0")).join("");
-            // The stored text can carry the selected App mention as a leading
-            // token (live E1: `herdr` pill before the body). Strip only exact
-            // required-App tokens the runtime named, then trim.
-            const apps = (Array.isArray(params.required_apps) ? params.required_apps : [])
-              .filter((app) => typeof app === "string" && /^[a-z0-9_-]{1,64}$/.test(app));
-            const full = acceptanceTrim(parts.join(""));
-            const body = acceptanceTrim(stripLeadingAppMentionTokens(full, apps));
             evidence.result.accepted_user_message_ref = users[0].id;
             // App identity for late acceptance must come from the same accepted
             // provider message as the ref and the digests above, and only from
@@ -2445,6 +2503,17 @@ function normalizeHerdrMentionAlias(value) {
               ? acceptedApps.map((app) => app.name)
               : [];
             if (acceptedApps.length) evidence.result.accepted_user_apps = acceptedApps;
+            // The stored text can carry the selected App mention as a leading
+            // token (live E1: `herdr` pill before the body). Only the App names
+            // the caller *explicitly requested* may be stripped: a pill for any
+            // other App must keep its body different from the create message, so
+            // a create without `--required-app` can never be promoted from an
+            // unrelated App's turn. String parts are joined with a real
+            // separator (the same way the transcript is sampled) so a separate
+            // pill part can never glue itself onto the body.
+            const requestedApps = Array.isArray(params.required_apps) ? params.required_apps : [];
+            const full = acceptanceTrim(parts.join("\n"));
+            const body = acceptanceTrim(stripLeadingAppMentionTokens(full, requestedApps));
             evidence.result.accepted_user_text_sha256 = await hex(full);
             evidence.result.accepted_user_body_sha256 = await hex(body);
             // Whitespace-canonical digests: ChatGPT re-renders composer line
@@ -3321,6 +3390,7 @@ function normalizeHerdrMentionAlias(value) {
             identityRelation: lastBrowserIdentityRelation,
             contactProof: lastBrowserContactProof,
             bearerRelation: lastBrowserBearerRelation,
+            identityShape: lastBrowserIdentityShape,
           });
         })();
         return true;
@@ -3766,6 +3836,33 @@ function normalizeHerdrMentionAlias(value) {
   let lastBrowserIdentityRelation = "not_observed";
   let lastBrowserContactProof = "not_observed";
   let lastBrowserBearerRelation = "not_observed";
+  // #847: redacted identity payload shape (presence/equality codes only, never an
+  // id or email). A refused registration carries it so the next provider-side
+  // UAT can name the exact /me vs session shape instead of guessing from enums
+  // that three different payload bodies can produce.
+  let lastBrowserIdentityShape = null;
+  const BROWSER_IDENTITY_SHAPE_CODES = Object.freeze({
+    me_user_id: ["me_user_id_present", "me_user_id_absent"],
+    session_user_id: ["session_user_id_present", "session_user_id_absent"],
+    session_top_id: [
+      "session_top_id_absent", "session_top_id_equals_account",
+      "session_top_id_differs_from_account",
+    ],
+    id_comparison: [
+      "user_ids_match", "user_ids_differ", "single_user_id_present", "no_user_id_present",
+    ],
+    me_account_id: ["me_account_id_present", "me_account_id_absent"],
+  });
+
+  function browserIdentityShape(observed) {
+    if (!observed || typeof observed !== "object" || Array.isArray(observed)) return null;
+    const shape = {};
+    for (const [key, allowed] of Object.entries(BROWSER_IDENTITY_SHAPE_CODES)) {
+      const value = observed[key];
+      if (typeof value === "string" && allowed.includes(value)) shape[key] = value;
+    }
+    return Object.keys(shape).length ? shape : null;
+  }
 
   // Authenticated account observation for registration. The adapter may expose
   // a bounded observation (identity + display email + fixed conflict codes);
@@ -3784,10 +3881,12 @@ function normalizeHerdrMentionAlias(value) {
         return {
           nativeIdentity,
           email: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null,
+          idShape: browserIdentityShape(observed?.idShape),
           reason: [
             "native_id_conflict_matching_email",
             "native_id_conflict_different_email",
             "native_id_conflict_unverified_email",
+            "native_id_unconfirmed_namespace",
             "email_conflict",
           ].includes(observed?.reason) ? observed.reason : null,
           idRelation: [
@@ -3835,6 +3934,7 @@ function normalizeHerdrMentionAlias(value) {
       native_id_conflict_matching_email: "id_conflict_matching_email",
       native_id_conflict_different_email: "id_conflict_different_email",
       native_id_conflict_unverified_email: "id_conflict_unverified_email",
+      native_id_unconfirmed_namespace: "id_namespace_unconfirmed",
       email_conflict: "email_conflict",
     };
     // A throttled bearer verification means the identity is unknown, not
@@ -3846,6 +3946,7 @@ function normalizeHerdrMentionAlias(value) {
     lastBrowserIdentityRelation = accountObservation?.idRelation || "not_observed";
     lastBrowserContactProof = accountObservation?.emailProof || "not_observed";
     lastBrowserBearerRelation = accountObservation?.bearerRelation || "not_observed";
+    lastBrowserIdentityShape = accountObservation?.idShape || lastBrowserIdentityShape;
     // Never attempt to associate a ChatGPT route when no authenticated
     // identity is available. A fresh tab can have conflicting login endpoints
     // during an account switch; report only a bounded diagnostic state.
