@@ -4616,6 +4616,8 @@ function chatGptTitleProjectionHarness({
   patchAbort = false,
   sidebarTitle = null,
   documentTitle = null,
+  liveConversationId = "conv-123",
+  navigateAfterReads = 0,
 } = {}) {
   const constantsStart = wakeSource.indexOf("  const CHATGPT_TITLE_AUTH_TIMEOUT_MS = ");
   const start = wakeSource.indexOf("  async function projectChatGptConversationTitle(");
@@ -4636,13 +4638,15 @@ function chatGptTitleProjectionHarness({
     readbackFails,
     sidebarTitle,
     documentTitle,
+    liveConversationId,
+    navigateAfterReads,
     readCount: 0,
   };
-  const project = new Function("ctx", `
+  const api = new Function("ctx", `
     const ADAPTER = { name: "chatgpt", capabilities: { titleProjection: true } };
     const adapterSupports = (capability) => ADAPTER.capabilities?.[capability] === true;
     const normText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
-    const chatGptConversationId = () => "conv-123";
+    const chatGptConversationId = () => ctx.liveConversationId;
     const chatGptCurrentConversationAnchor = (id) => (ctx.sidebarTitle == null ? null : {
       innerText: ctx.sidebarTitle,
       textContent: ctx.sidebarTitle,
@@ -4651,6 +4655,10 @@ function chatGptTitleProjectionHarness({
     const fetchChatGptConversationDetail = async ({ conversationId }) => {
       ctx.readCount += 1;
       ctx.now += 100;
+      // The live page can move away while a scoped step is running: the move
+      // lands right after the Nth provider read returns.
+      const movedNow = Boolean(ctx.navigateAfterReads) && ctx.readCount === ctx.navigateAfterReads;
+      if (movedNow) ctx.liveConversationId = "conv-OTHER";
       if (ctx.readCount > 1 && ctx.readbackStatus === 429) {
         return { ok: false, status: 429, reason: "http-429" };
       }
@@ -4690,9 +4698,9 @@ function chatGptTitleProjectionHarness({
     let chatGptTitleProjectionReapplied = false;
     let chatGptTitleProjectionReapplying = false;
     ${helperSource}
-    return projectChatGptConversationTitle;
+    return { project: projectChatGptConversationTitle, target: () => chatGptTitleProjectionTarget };
   `)(ctx);
-  return { ctx, project };
+  return { ctx, project: api.project, target: api.target };
 }
 
 test("user sees the requested ChatGPT worker title | Given a new conversation has a different provider title | When session.create projects its display label | Then one provider PATCH is accepted only after exact title readback", async () => {
@@ -4853,6 +4861,46 @@ test("user never gets a title verified while the provider rejects the rename | G
   assert.equal(result.status, "failed");
   assert.equal(result.reason, "title_projection_provider_rejected");
   assert.equal(result.readback_verified, false);
+});
+
+test("user never gets a title written into another conversation | Given a scoped projection whose page already shows a different conversation | When the projection runs | Then nothing is read, written or recorded", async () => {
+  const { ctx, project, target } = chatGptTitleProjectionHarness({ liveConversationId: "conv-OTHER" });
+  const result = await project("Worker scoped", { conversationId: "conv-123" });
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "title_projection_conversation_changed");
+  assert.equal(result.readback_verified, false);
+  assert.equal(ctx.patchCalls.length, 0, "a scoped projection never writes another conversation");
+  assert.equal(ctx.readCount, 0, "a scoped projection does not even read another conversation");
+  assert.equal(target(), null, "no target is recorded for a conversation the page is not showing");
+});
+
+test("user never gets a title written after the page moves mid-projection | Given a scoped projection whose page moves after the baseline read | When the single PATCH would run | Then the scope re-check blocks the write", async () => {
+  const { ctx, project } = chatGptTitleProjectionHarness({
+    initialTitle: "Provider title",
+    readbackTitles: ["Worker moved"],
+    navigateAfterReads: 1,
+  });
+  const result = await project("Worker moved", { conversationId: "conv-123" });
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "title_projection_conversation_changed");
+  assert.equal(ctx.patchCalls.length, 0, "the write must not follow the live page id");
+  assert.equal(ctx.readCount, 1, "the move is detected before the write");
+});
+
+test("user keeps the label when the provider title already matched | Given the provider title already equals the label | When the projection runs | Then the target records the concrete conversation and baseline", async () => {
+  const { ctx, project, target } = chatGptTitleProjectionHarness({ initialTitle: "Worker already" });
+  const result = await project("Worker already");
+
+  assert.equal(result.status, "verified");
+  assert.equal(result.changed, false);
+  assert.equal(ctx.patchCalls.length, 0);
+  assert.deepEqual(target(), {
+    title: "Worker already",
+    conversationId: "conv-123",
+    baselineTitle: "Worker already",
+  }, "an already-matching projection still records a scoped target");
 });
 
 test("user returns ChatGPT browser actuation to Chat mode | Given Work mode is active | When browser actuation runs | Then the provider adapter switches to Chat mode", () => {
@@ -6830,7 +6878,13 @@ test("user bounds an untrusted read Retry-After | Given an authenticated convers
   assert.equal((await read({ conversationId: "conv-1" })).status, 429);
   assert.ok(context.urls.length > urlsAfterFirst, "an unbounded Retry-After must not disable reads permanently");
 });
-function chatGptTitleReapplyHarness({ titles = ["Provider title"], sidebarTitles = [null] } = {}) {
+function chatGptTitleReapplyHarness({
+  titles = ["Provider title"],
+  sidebarTitles = null,
+  liveConversationId = "conv-624",
+  navigateAfterReads = 0,
+  confirmationFails = false,
+} = {}) {
   const constantsStart = wakeSource.indexOf("  const CHATGPT_TITLE_AUTH_TIMEOUT_MS = ");
   const helperStart = wakeSource.indexOf("  async function reapplyChatGptConversationTitleAfterSettlement() {");
   const projectionEnd = wakeSource.indexOf("  async function fetchChatGptArchivedConversationList(", helperStart);
@@ -6854,8 +6908,11 @@ function chatGptTitleReapplyHarness({ titles = ["Provider title"], sidebarTitles
     const ADAPTER = { name: "chatgpt" };
     function adapterSupports(capability) { return capability === "titleProjection"; }
     function normText(value) { return String(value ?? "").replace(/\\s+/g, " ").trim(); }
-    function chatGptConversationId() { return ctx.conversationId; }
+    function chatGptConversationId() { return ctx.liveConversationId; }
     function chatGptCurrentConversationAnchor() {
+      // A null entry models a conversation the sidebar no longer lists.
+      if (ctx.sidebarTitles == null) return ctx.lastTitle == null ? null
+        : { innerText: ctx.lastTitle, textContent: ctx.lastTitle, getAttribute: () => null };
       const title = ctx.sidebarTitles.length > 1 ? ctx.sidebarTitles.shift() : ctx.sidebarTitles[0];
       return title == null ? null : { innerText: title, textContent: title, getAttribute: () => null };
     }
@@ -6864,16 +6921,24 @@ function chatGptTitleReapplyHarness({ titles = ["Provider title"], sidebarTitles
     async function fetchChatGptConversation() { return { ok: false, reason: "plural-unused" }; }
     async function fetchChatGptConversationDetail() {
       ctx.reads += 1;
+      // The confirmation read is the one immediately before the write.
+      if (ctx.confirmationFails && ctx.reads >= ctx.confirmationAt) return { ok: false, reason: "timeout" };
       const title = ctx.titles.length > 1 ? ctx.titles.shift() : ctx.titles[0];
+      ctx.lastTitle = title;
+      // A page move lands right after the Nth provider read returns.
+      if (ctx.navigateAfterReads && ctx.reads === ctx.navigateAfterReads) {
+        ctx.liveConversationId = "conv-OTHER";
+      }
       return { ok: true, body: { title } };
     }
     const fetch = async (url, init) => {
       if (init?.method === "PATCH") {
         ctx.patchCount += 1;
+        ctx.patchUrls.push(url);
         const title = JSON.parse(init.body).title;
         ctx.patchedTitles.push(title);
         ctx.titles = [title];
-        ctx.sidebarTitles = [title];
+        ctx.lastTitle = title;
         return { ok: true };
       }
       return { ok: true };
@@ -6889,10 +6954,15 @@ function chatGptTitleReapplyHarness({ titles = ["Provider title"], sidebarTitles
     now: 0,
     reads: 0,
     patchCount: 0,
+    patchUrls: [],
     patchedTitles: [],
-    conversationId: "conv-624",
+    liveConversationId,
+    navigateAfterReads,
+    confirmationFails,
+    confirmationAt: 2,
+    lastTitle: titles.length === 1 ? titles[0] : null,
     titles: [...titles],
-    sidebarTitles: [...sidebarTitles],
+    sidebarTitles: sidebarTitles == null ? null : [...sidebarTitles],
   };
   return { ctx, api: factory(ctx) };
 }
@@ -6948,4 +7018,67 @@ test("user never gets a title re-applied to another conversation | Given the pag
   assert.equal(await api.reapply(), null);
   assert.equal(ctx.patchCount, 0);
   assert.equal(ctx.reads, 0, "no provider read for a conversation the page no longer shows");
+});
+
+test("user never gets a title re-applied after the page moves mid-wait | Given the watch window sees a page move | When the provider auto-title never appears | Then nothing is written and the watch stays unspent", async () => {
+  const { ctx, api } = chatGptTitleReapplyHarness({ titles: ["New chat"], navigateAfterReads: 1 });
+  api.setTarget({ title: "Herdr worker", conversationId: "conv-624", baselineTitle: "New chat" });
+  const result = await api.reapply();
+
+  assert.equal(ctx.patchCount, 0);
+  assert.deepEqual(ctx.patchUrls, []);
+  assert.equal(result, null);
+  assert.equal(api.state().reapplied, false, "a moved page never spends the watch");
+});
+
+test("user never gets a title re-applied after the page moves before the write | Given the auto-title was observed and the page then moved | When the single re-apply would run | Then nothing is written and the watch stays unspent", async () => {
+  const { ctx, api } = chatGptTitleReapplyHarness({ titles: ["下发任务"], navigateAfterReads: 1 });
+  api.setTarget({ title: "Herdr worker", conversationId: "conv-624", baselineTitle: "New chat" });
+  const result = await api.reapply();
+
+  assert.equal(ctx.patchCount, 0, "the re-apply must not follow the live page id");
+  assert.equal(result, null);
+  assert.equal(api.state().reapplied, false);
+});
+
+test("user keeps a manual rename when the confirmation read fails | Given the auto-title was observed and the confirmation read times out | When the re-apply would run | Then no provider write happens", async () => {
+  const { ctx, api } = chatGptTitleReapplyHarness({ titles: ["下发任务"], confirmationFails: true });
+  api.setTarget({ title: "Herdr worker", conversationId: "conv-624", baselineTitle: "New chat" });
+  const result = await api.reapply();
+
+  assert.equal(ctx.patchCount, 0, "missing evidence is never permission to overwrite");
+  assert.equal(result, null);
+  assert.equal(api.state().reapplied, true);
+});
+
+test("user keeps a manual rename when the sidebar has no entry | Given the auto-title was observed and the sidebar lists no entry | When the re-apply would run | Then no provider write happens", async () => {
+  const { ctx, api } = chatGptTitleReapplyHarness({ titles: ["下发任务"], sidebarTitles: [null] });
+  api.setTarget({ title: "Herdr worker", conversationId: "conv-624", baselineTitle: "New chat" });
+  const result = await api.reapply();
+
+  assert.equal(ctx.patchCount, 0);
+  assert.equal(result, null);
+  assert.equal(api.state().reapplied, true);
+});
+
+test("user keeps a manual rename when the pre-projection baseline is unknown | Given a target with no baseline title | When the first assistant turn settles | Then no provider write happens", async () => {
+  const { ctx, api } = chatGptTitleReapplyHarness({ titles: ["下发任务"] });
+  api.setTarget({ title: "Herdr worker", conversationId: "conv-624", baselineTitle: null });
+  const result = await api.reapply();
+
+  assert.equal(ctx.patchCount, 0, "without a baseline the auto-title cannot be told apart from a rename");
+  assert.equal(ctx.reads, 0);
+  assert.equal(result, null);
+  assert.equal(api.state().reapplied, true);
+});
+
+test("user never gets a title re-applied from a target without a conversation | Given a target whose conversation id is null | When the first assistant turn settles | Then nothing is read or written", async () => {
+  const { ctx, api } = chatGptTitleReapplyHarness({ titles: ["下发任务"] });
+  api.setTarget({ title: "Herdr worker", conversationId: null, baselineTitle: "New chat" });
+  const result = await api.reapply();
+
+  assert.equal(ctx.reads, 0, "no provider read is authorized without a concrete conversation");
+  assert.equal(ctx.patchCount, 0);
+  assert.equal(result, null);
+  assert.equal(api.state().reapplied, false);
 });

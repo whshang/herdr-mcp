@@ -2915,16 +2915,10 @@ function normalizeHerdrMentionAlias(value) {
                 readback_verified: false,
                 reason: "title_projection_unsupported",
               };
-          // The projection records its own target (title, conversation and
-          // pre-projection baseline). Keep a fallback target so the
-          // post-settlement reapply still knows what to restore when the
-          // projection stopped before it could record one.
-          if (typeof chatGptTitleProjectionTarget !== "undefined" && !chatGptTitleProjectionTarget) {
-            const label = String(params.display_label ?? "").replace(/\s+/g, " ").trim();
-            if (label) {
-              chatGptTitleProjectionTarget = { title: label, conversationId: null, baselineTitle: null };
-            }
-          }
+          // Only the projection itself records a target, and only with a
+          // concrete conversation id and pre-projection baseline. A projection
+          // that stopped before that point leaves no target, so the
+          // post-settlement reapply can never write to whatever page is open.
           if (typeof chatGptTitleProjectionResult !== "undefined") {
             chatGptTitleProjectionResult = titleProjection;
           }
@@ -4668,7 +4662,12 @@ function normalizeHerdrMentionAlias(value) {
       : chatGptTitleProjectionTarget;
     if (!target?.title) return null;
     if (ADAPTER.name !== "chatgpt" || !adapterSupports("titleProjection")) return null;
-    const conversationId = target.conversationId || chatGptConversationId();
+    // The scope must be the exact conversation the label was projected into.
+    // A target without a concrete conversation id can never authorize a write:
+    // resolving the live page id here would PATCH whatever is open now.
+    const conversationId = typeof target.conversationId === "string" && target.conversationId
+      ? target.conversationId
+      : null;
     if (!conversationId || chatGptConversationId() !== conversationId) return null;
     const currentResult = () => (typeof chatGptTitleProjectionResult === "undefined"
       ? null
@@ -4681,7 +4680,14 @@ function normalizeHerdrMentionAlias(value) {
     }
     if (typeof chatGptTitleProjectionReapplying !== "undefined") chatGptTitleProjectionReapplying = true;
     try {
+      // Without the provider title that existed before the projection there is
+      // no way to tell the provider auto-title from a user rename, so nothing is
+      // overwritten and the watch is spent.
       const baselineTitle = normText(target.baselineTitle || "") || null;
+      if (!baselineTitle) {
+        if (typeof chatGptTitleProjectionReapplied !== "undefined") chatGptTitleProjectionReapplied = true;
+        return currentResult();
+      }
       // One short-lived token for the whole watch window: the auto-title poll
       // must not re-read /api/auth/session on every sample.
       const accessToken = await readChatGptAccessToken(CHATGPT_TITLE_AUTH_TIMEOUT_MS).catch(() => null);
@@ -4689,6 +4695,9 @@ function normalizeHerdrMentionAlias(value) {
       const deadline = Date.now() + CHATGPT_TITLE_AUTO_TITLE_WINDOW_MS;
       let autoTitle = null;
       while (Date.now() < deadline) {
+        // A page move ends the watch without spending it: the projected
+        // conversation is no longer the one being observed.
+        if (chatGptConversationId() !== conversationId) return currentResult();
         const read = await readChatGptProviderTitle(conversationId, {
           sessionToken,
           timeoutMs: CHATGPT_TITLE_READ_TIMEOUT_MS,
@@ -4708,24 +4717,33 @@ function normalizeHerdrMentionAlias(value) {
       if (!autoTitle) {
         // No provider auto-title within the bounded window: keep the first
         // projection result and stop watching this conversation.
+        if (chatGptConversationId() !== conversationId) return currentResult();
         if (typeof chatGptTitleProjectionReapplied !== "undefined") chatGptTitleProjectionReapplied = true;
         return currentResult();
       }
       // Re-read immediately before the single re-apply. Only the auto-title just
       // observed (or the pre-projection baseline) may be overwritten; any other
-      // title is a user rename and is never fought.
+      // title is a user rename and is never fought. A missing confirmation read
+      // or a missing sidebar entry is missing evidence, not permission: it is
+      // never treated as provider-owned.
       const live = await readChatGptProviderTitle(conversationId, {
         sessionToken,
         timeoutMs: CHATGPT_TITLE_READ_TIMEOUT_MS,
       });
       const liveTitle = live.ok ? live.title : null;
       const sidebarTitle = readChatGptSidebarTitle(conversationId);
-      const stillProviderOwned = (value) => value === null || value === autoTitle || value === baselineTitle;
-      if (!stillProviderOwned(liveTitle) || !stillProviderOwned(sidebarTitle)) {
+      const providerOwned = (value) => Boolean(value) && (value === autoTitle || value === baselineTitle);
+      if (!providerOwned(liveTitle) || !providerOwned(sidebarTitle)) {
         if (typeof chatGptTitleProjectionReapplied !== "undefined") chatGptTitleProjectionReapplied = true;
         return currentResult();
       }
-      const reapplied = await projectChatGptConversationTitle(target.title);
+      // The page may have moved while the auto-title was being watched. The
+      // write stays scoped to the projected conversation and is skipped (with
+      // the watch left unspent) when the live page is no longer that one.
+      if (chatGptConversationId() !== conversationId) return currentResult();
+      const reapplied = await projectChatGptConversationTitle(target.title, { conversationId });
+      // Publish the reapply state only for the conversation that was written.
+      if (chatGptConversationId() !== conversationId) return currentResult();
       if (typeof chatGptTitleProjectionReapplied !== "undefined") chatGptTitleProjectionReapplied = true;
       if (typeof chatGptTitleProjectionResult !== "undefined") chatGptTitleProjectionResult = reapplied;
       return reapplied;
@@ -4738,7 +4756,11 @@ function normalizeHerdrMentionAlias(value) {
   // conversation title with exactly one authenticated PATCH, then verify the
   // provider's own title. The step is bounded and its failure is evidence only:
   // it never fails an otherwise successful create.
-  async function projectChatGptConversationTitle(rawTitle) {
+  //
+  // `conversationId` scopes the whole step. Callers that are not the create that
+  // just landed on this route (the post-settlement reapply) must pass it so the
+  // PATCH can never follow the live page id into another conversation.
+  async function projectChatGptConversationTitle(rawTitle, { conversationId: scopedConversationId = null } = {}) {
     const provider = "chatgpt";
     const title = normText(rawTitle);
     const unsupported = (reason) => ({
@@ -4765,10 +4787,16 @@ function normalizeHerdrMentionAlias(value) {
     if (ADAPTER.name !== "chatgpt" || !adapterSupports("titleProjection")) {
       return unsupported("title_projection_unsupported");
     }
-    const conversationId = chatGptConversationId();
+    const conversationId = (typeof scopedConversationId === "string" && scopedConversationId)
+      ? scopedConversationId
+      : chatGptConversationId();
     if (!conversationId || !title || title.length > 256) {
       return failed("title_projection_params_invalid");
     }
+    // A scoped projection is only valid while the page still shows that exact
+    // conversation; otherwise it must not read, PATCH or record a target.
+    const conversationStillOpen = () => chatGptConversationId() === conversationId;
+    if (!conversationStillOpen()) return failed("title_projection_conversation_changed");
 
     const phaseDeadline = Date.now() + CHATGPT_TITLE_PRE_PATCH_BUDGET_MS;
     const remainingPhase = (ceiling) => Math.max(1, Math.min(ceiling, phaseDeadline - Date.now()));
@@ -4785,17 +4813,20 @@ function normalizeHerdrMentionAlias(value) {
       timeoutMs: remainingPhase(CHATGPT_TITLE_READ_TIMEOUT_MS),
     });
     const baselineTitle = current.ok ? current.title : null;
-    if (baselineTitle === title) return verified(false);
-    if (Date.now() >= phaseDeadline) return failed("title_projection_timeout");
-    // Remember what the provider owned before this projection so the
-    // post-settlement reapply can tell its auto-title from a user rename.
+    // Remember what the provider owned before this projection - including when
+    // it already matched, so a later create never inherits a target without a
+    // concrete conversation and baseline.
     if (typeof chatGptTitleProjectionTarget !== "undefined") {
       chatGptTitleProjectionTarget = { title, conversationId, baselineTitle };
     }
+    if (baselineTitle === title) return verified(false);
+    if (Date.now() >= phaseDeadline) return failed("title_projection_timeout");
 
     // Exactly one provider mutation. An aborted request is ambiguous, not a
     // failure: the provider may already have applied it, so the readback below
     // decides the outcome instead of reporting a timeout from the client abort.
+    // Re-check the scope immediately before the single write.
+    if (!conversationStillOpen()) return failed("title_projection_conversation_changed");
     let patchAmbiguous = false;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CHATGPT_TITLE_PATCH_TIMEOUT_MS);
