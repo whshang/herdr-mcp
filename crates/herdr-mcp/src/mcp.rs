@@ -3478,14 +3478,22 @@ fn browser_required_apps_match_evidence(
         return Ok(true);
     }
     // The readback lists Apps in provider DOM order; `requested` is sorted, so
-    // compare as sorted multisets to match the late-acceptance matcher.
-    let mut readback: Vec<&str> = evidence
+    // compare as sorted multisets of App-name tokens to match the late-acceptance
+    // matcher. The provider renders the same App under different separators and
+    // casings (`herdr-mcp`, `Herdr MCP`, `herdr_mcp`), which is one identity;
+    // a different App id such as `herdrmcp` still differs.
+    let mut readback: Vec<Vec<String>> = evidence
         .required_apps_readback
         .iter()
-        .map(String::as_str)
+        .map(|name| browser_app_mention_tokens(name))
         .collect();
-    readback.sort_unstable();
-    Ok(readback.len() == requested.len() && readback.into_iter().eq(requested))
+    readback.sort();
+    let mut requested: Vec<Vec<String>> = requested
+        .iter()
+        .map(|name| browser_app_mention_tokens(name))
+        .collect();
+    requested.sort();
+    Ok(readback == requested)
 }
 
 /// App identity read from one accepted provider user message. The extension
@@ -3513,15 +3521,17 @@ fn browser_accepted_user_apps_match(result: &Value, requested: &[&str]) -> bool 
         if path.trim().is_empty() {
             return false;
         }
-        names.push(name.to_owned());
+        names.push(browser_app_mention_tokens(name));
     }
-    names.sort_unstable();
+    names.sort();
     names.dedup();
-    names.len() == requested.len()
-        && names
-            .iter()
-            .map(String::as_str)
-            .eq(requested.iter().copied())
+    let mut requested: Vec<Vec<String>> = requested
+        .iter()
+        .map(|name| browser_app_mention_tokens(name))
+        .collect();
+    requested.sort();
+    requested.dedup();
+    names == requested
 }
 
 fn browser_delivery_state_from_postcondition(
@@ -3653,11 +3663,56 @@ fn browser_evidence_accepted_user_message_ref(
     Ok(Some(text.to_owned()))
 }
 
+/// The provider keeps a selected App inside the accepted user turn as an inline
+/// chip. Its stored text form depends on the provider build (`@herdr-mcp`,
+/// `herdr-mcp`, `$herdr-mcp`, another separator, zero-width characters next to
+/// the chip), so the App pill must never be a content-script-side heuristic the
+/// runtime cannot reproduce. Names are compared as separator-delimited tokens:
+/// `herdr-mcp`, `Herdr MCP` and `herdr_mcp` are the same provider App, while a
+/// different provider App id such as `herdrmcp` is not.
+fn browser_app_mention_tokens(name: &str) -> Vec<String> {
+    name.to_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Expected acceptance digests for one requested create/dispatch message.
+/// The plain message is the only expectation when no App was requested. With a
+/// requested App, the provider's own `<App pill> <body>` rendering is an explicit
+/// expectation as well: the pill forms are built from the requested App names
+/// and the requested message, so a foreign, truncated, extended, glued, or
+/// otherwise different turn still matches none of them. Both the exact-trimmed
+/// and the whitespace-canonical form are covered; a separator between pill and
+/// body is always required, because `@herdrmcp hello` is not a mention of the App
+/// `herdr` plus the message `mcp hello`.
+fn browser_expected_acceptance_digests(message: &str, apps: &[&str]) -> Vec<String> {
+    let mut digests = vec![
+        browser_sha256(message.trim()),
+        browser_sha256(&browser_readback_text_canonical(message)),
+    ];
+    let body = browser_readback_text_canonical(message);
+    for app in apps {
+        let name = app.trim();
+        if name.is_empty() {
+            continue;
+        }
+        for prefix in [format!("@{name}"), name.to_owned(), format!("${name}")] {
+            let rendered = format!("{prefix} {body}");
+            digests.push(browser_sha256(&rendered));
+            digests.push(browser_sha256(&browser_readback_text_canonical(&rendered)));
+        }
+    }
+    digests
+}
+
 /// Re-verify the accepted provider user text reported by browser actuation.
 /// The content script reports the digest of the text it matched as accepted;
 /// the runtime accepts delivery only when one of those digests equals the
 /// submitted message (raw or whitespace-canonical, matching the late-acceptance
-/// readback rule). Absent evidence is missing proof, not success, so a submit
+/// readback rule) or the provider's explicit `<App pill><message>` rendering for
+/// a requested App. Absent evidence is missing proof, not success, so a submit
 /// whose provider turn was not read back stays uncertain instead of applied.
 fn browser_evidence_accepted_text_matches(
     params: &Value,
@@ -3668,12 +3723,11 @@ fn browser_evidence_accepted_text_matches(
     };
     // The submit path carries the message text; the reconcile path only keeps
     // the stored raw digest of that message (plus its whitespace-canonical digest
-    // when the row is new enough to have one).
+    // when the row is new enough to have one). Only the reconcile path cannot
+    // build App-pill expectations, because it no longer holds the message text.
     let expected = if let Some(message) = params.get("message").and_then(Value::as_str) {
-        vec![
-            browser_sha256(message.trim()),
-            browser_sha256(&browser_readback_text_canonical(message)),
-        ]
+        let requested_apps = browser_required_apps(params, true).unwrap_or_default();
+        browser_expected_acceptance_digests(message, &requested_apps)
     } else if let Some(digest) = params.get("message_sha256").and_then(Value::as_str) {
         let mut expected = vec![digest.to_owned()];
         if let Some(canonical) = params
@@ -4859,31 +4913,37 @@ fn browser_session_create_late_acceptance_readback(
                 _ => "readback_multiple_visible_user_messages",
             }
         })?;
-    // Match the exact create text, trimmed; the extension also reports the body
-    // with only the named required-App mention tokens removed.
-    // ChatGPT re-renders composer line breaks (paragraph splits, NBSP) when it
-    // stores the user turn, so also compare a whitespace-canonical digest of
-    // the same single visible user message. Identity stays bound to that one
-    // message id; only whitespace layout is ignored.
-    let expected = browser_sha256(message.trim());
-    let expected_canonical = browser_sha256(&browser_readback_text_canonical(message));
-    let matches = ["accepted_user_text_sha256", "accepted_user_body_sha256"]
-        .iter()
-        .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected.as_str()))
-        || [
-            "accepted_user_text_canonical_sha256",
-            "accepted_user_body_canonical_sha256",
-        ]
-        .iter()
-        .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected_canonical.as_str()));
-    if !matches {
-        return Err("readback_digest_mismatch");
-    }
     // Late acceptance must also prove the requested App identity came from this
     // same provider message. Without that proof the reservation stays
     // Uncertain instead of promoting an unverified App to Applied.
     let requested_apps =
         browser_required_apps(params, true).map_err(|_| "readback_required_apps_invalid")?;
+    // Match the exact create text, trimmed; the extension also reports the body
+    // with only the named App mention tokens removed. ChatGPT re-renders composer
+    // line breaks (paragraph splits, NBSP) when it stores the user turn and keeps
+    // a requested App as a leading inline chip, so the accepted digests are
+    // compared against an explicit expectation set built from the create message
+    // and the requested App names: `<message>`, and the provider's
+    // `<App pill><message>` renderings. Identity stays bound to that one message
+    // id; only whitespace layout and the requested App pill are ignored, and a
+    // genuinely different text still mismatches every expected digest.
+    let expected = browser_expected_acceptance_digests(message, &requested_apps);
+    let matches = [
+        "accepted_user_text_sha256",
+        "accepted_user_body_sha256",
+        "accepted_user_text_canonical_sha256",
+        "accepted_user_body_canonical_sha256",
+    ]
+    .iter()
+    .any(|key| {
+        result
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|digest| expected.iter().any(|candidate| candidate == digest))
+    });
+    if !matches {
+        return Err("readback_digest_mismatch");
+    }
     if !requested_apps.is_empty() && !browser_accepted_user_apps_match(result, &requested_apps) {
         return Err("readback_app_identity_mismatch");
     }
@@ -5527,6 +5587,7 @@ fn browser_session_create_public_delivery_evidence(
                     "id_conflict_matching_email",
                     "id_conflict_different_email",
                     "id_conflict_unverified_email",
+                    "id_namespace_unconfirmed",
                     "email_conflict",
                 ],
             ),
@@ -5566,6 +5627,39 @@ fn browser_session_create_public_delivery_evidence(
                     "bearer_network_unavailable",
                     "not_observed",
                 ],
+            ),
+            // #847: redacted identity payload shape (presence / equality codes
+            // only). These finite codes let the next provider-side UAT name the
+            // exact /me vs session body that refused registration, instead of
+            // inferring it from enums three different payload shapes can produce.
+            (
+                "me_user_id_shape",
+                &["me_user_id_present", "me_user_id_absent"],
+            ),
+            (
+                "session_user_id_shape",
+                &["session_user_id_present", "session_user_id_absent"],
+            ),
+            (
+                "session_top_id_shape",
+                &[
+                    "session_top_id_absent",
+                    "session_top_id_equals_account",
+                    "session_top_id_differs_from_account",
+                ],
+            ),
+            (
+                "id_namespace_comparison",
+                &[
+                    "user_ids_match",
+                    "user_ids_differ",
+                    "single_user_id_present",
+                    "no_user_id_present",
+                ],
+            ),
+            (
+                "me_account_id_shape",
+                &["me_account_id_present", "me_account_id_absent"],
             ),
             (
                 "scope_failure",
@@ -14177,6 +14271,151 @@ mod tests {
         );
     }
 
+    /// The Rust half of the App-pill acceptance contract (#848). The extension
+    /// strips only the requested App mention token from the observed user turn;
+    /// this runtime instead plans for the exact `<App pill><message>` rendering
+    /// as an expectation. One fixture pins both halves, so a pill form the
+    /// extension tolerates can never be rejected here, and a different turn can
+    /// never be accepted here.
+    #[test]
+    fn browser_app_mention_pill_parity_with_extension_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/browser-acceptance-digest-parity.json"
+        ))
+        .unwrap();
+        let cases = fixture["app_mention_cases"].as_array().unwrap();
+        assert!(
+            cases.len() >= 10,
+            "the shared fixture must pin a real App-pill rendering matrix"
+        );
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let app = case["app"].as_str().unwrap();
+            let message = case["message"].as_str().unwrap();
+            let observed = case["observed_text"].as_str().unwrap();
+            let tolerated = case["tolerated"].as_bool().unwrap();
+            let expected_by_runtime = case["runtime_expectation"].as_bool().unwrap();
+            let trimmed = browser_sha256(observed.trim());
+            let canonical = browser_sha256(&browser_readback_text_canonical(observed));
+            assert_eq!(
+                trimmed,
+                case["observed_text_trimmed_sha256"].as_str().unwrap(),
+                "{name}: the extension-reported trimmed digest must stay pinned"
+            );
+            assert_eq!(
+                canonical,
+                case["observed_text_canonical_sha256"].as_str().unwrap(),
+                "{name}: the extension-reported canonical digest must stay pinned"
+            );
+            let expected = browser_expected_acceptance_digests(message, &[app]);
+            let matched = [trimmed, canonical]
+                .iter()
+                .any(|digest| expected.iter().any(|candidate| candidate == digest));
+            assert_eq!(
+                matched, expected_by_runtime,
+                "{name}: the runtime must plan for exactly the App-pill renderings it can build from the requested name, and the extension strip covers the remaining provider renderings"
+            );
+            if expected_by_runtime {
+                assert!(
+                    tolerated,
+                    "{name}: whatever the runtime accepts must be an accepted rendering for the extension too"
+                );
+            }
+        }
+    }
+
+    /// user owner | Given a create for a message with a requested App | When the
+    /// runtime builds its acceptance expectations | Then only the message and its
+    /// requested-App pill renderings are accepted, so a foreign or partial turn
+    /// can never be promoted to applied.
+    #[test]
+    fn browser_expected_acceptance_digests_cover_only_the_requested_pill() {
+        let message = "Line one\n\nLine two";
+        let body_canonical = browser_sha256(&browser_readback_text_canonical(message));
+        let expected = browser_expected_acceptance_digests(message, &["herdr-mcp"]);
+        for accepted in [
+            message,
+            "@herdr-mcp Line one\n\nLine two",
+            "@herdr-mcp Line one Line two",
+            "herdr-mcp Line one Line two",
+            "$herdr-mcp Line one Line two",
+            "@herdr-mcp\n\nLine one\n\nLine two",
+        ] {
+            let digest = browser_sha256(&browser_readback_text_canonical(accepted));
+            assert!(
+                expected.contains(&digest),
+                "{accepted:?} must be an accepted rendering of the create message"
+            );
+        }
+        assert!(expected.contains(&body_canonical));
+        for rejected in [
+            "@otherapp Line one\n\nLine two",
+            "@herdr Line one\n\nLine two",
+            "@herdr-mcp Line one\n\nLine two extra",
+            "@herdr-mcp Line one",
+            "Line one\n\nLine two extra",
+            "@herdr-mcp - Line one Line two",
+            "@herdr-mcpLine one Line two",
+            "herdr-mcpLine one Line two",
+            "herdrmcp Line one Line two",
+            "@herdr-mcp\u{200b}Line one Line two",
+        ] {
+            let digest = browser_sha256(&browser_readback_text_canonical(rejected));
+            assert!(
+                !expected.contains(&digest),
+                "{rejected:?} must never be accepted as the create message"
+            );
+        }
+        // No requested App means no pill expectation at all: only the message
+        // itself is accepted, so the normalization never widens by accident.
+        let without_app = browser_expected_acceptance_digests(message, &[]);
+        assert_eq!(without_app.len(), 2);
+        assert!(without_app.contains(&body_canonical));
+        assert!(
+            !without_app.contains(&browser_sha256(&browser_readback_text_canonical(
+                "@herdr-mcp Line one Line two"
+            )))
+        );
+    }
+
+    /// user owner | Given an accepted turn whose App identity is rendered under a
+    /// different separator than the requested name | When the runtime compares
+    /// the accepted App identity | Then the same App matches and a different App
+    /// still does not.
+    #[test]
+    fn browser_accepted_app_identity_ignores_provider_name_separators() {
+        let requested = ["herdr-mcp"];
+        for same in ["herdr-mcp", "herdr_mcp", "Herdr MCP", "HERDR-MCP"] {
+            assert!(
+                browser_accepted_user_apps_match(
+                    &json!({"accepted_user_apps": [{"name": same, "path": "app://connector"}]}),
+                    &requested
+                ),
+                "{same} is the requested App under a provider separator"
+            );
+        }
+        for different in ["herdr", "otherapp", "herdr-mcp-extra", "herdrmcp"] {
+            assert!(
+                !browser_accepted_user_apps_match(
+                    &json!({"accepted_user_apps": [{"name": different, "path": "app://connector"}]}),
+                    &requested
+                ),
+                "{different} is not the requested App"
+            );
+        }
+        let evidence = BrowserPostconditionEvidence {
+            required_apps_readback: vec!["Herdr MCP".to_owned()],
+            ..BrowserPostconditionEvidence::resource_unavailable(7)
+        };
+        assert_eq!(
+            browser_required_apps_match_evidence(
+                &json!({"required_apps": ["herdr-mcp"]}),
+                &evidence
+            ),
+            Ok(true)
+        );
+    }
+
     #[test]
     fn negotiate_protocol_version_matches_runtime_parity_probe() {
         let parity: Value =
@@ -16544,6 +16783,80 @@ mod tests {
         assert!(result.get("hint").is_none(), "{result}");
     }
 
+    /// user webchat create | Given a Project tab whose account identity could not be proven | When the create is refused | Then only the bounded identity shape codes and fixed statuses are published and no account identifier or email is echoed
+    #[test]
+    fn user_webchat_create_given_unproven_project_identity_when_refused_then_only_bounded_shape_codes_are_published()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator =
+            ScriptedCreateActuator::new(ScriptedCreateEvidence::resource_unavailable(json!({
+                "error": "browser_create_scope_unavailable",
+                "phase": "scope_handshake",
+                "scope_failure": "registry_handshake_delay",
+                "registration_status": "id_namespace_unconfirmed",
+                "identity_relation": "me_differs_session_user_and_account_id",
+                "contact_proof": "both_emails_missing",
+                "bearer_relation": "bearer_token_unavailable",
+                "me_user_id_shape": "me_user_id_present",
+                "session_user_id_shape": "session_user_id_absent",
+                "session_top_id_shape": "session_top_id_equals_account",
+                "id_namespace_comparison": "single_user_id_present",
+                "me_account_id_shape": "me_account_id_absent",
+                // Non-conforming values must never be echoed, even under an
+                // allowlisted key.
+                "scope_failure_injected": "user-1234567890",
+                "session_user_id": "user-1234567890",
+                "account_email": "operator@example.com",
+                "message_submitted": false,
+                "retry_safe": true,
+            })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-identity-shape-1",
+        );
+        let evidence = &result["delivery_evidence"];
+        assert_eq!(
+            evidence["registration_status"], "id_namespace_unconfirmed",
+            "{result}"
+        );
+        assert_eq!(
+            evidence["me_user_id_shape"], "me_user_id_present",
+            "{result}"
+        );
+        assert_eq!(
+            evidence["session_user_id_shape"], "session_user_id_absent",
+            "{result}"
+        );
+        assert_eq!(
+            evidence["session_top_id_shape"], "session_top_id_equals_account",
+            "{result}"
+        );
+        assert_eq!(
+            evidence["id_namespace_comparison"], "single_user_id_present",
+            "{result}"
+        );
+        assert_eq!(
+            evidence["me_account_id_shape"], "me_account_id_absent",
+            "{result}"
+        );
+        assert_eq!(evidence["message_submitted"], false, "{result}");
+        assert_eq!(evidence["retry_safe"], true, "{result}");
+        let serialized = result.to_string();
+        assert!(
+            !serialized.contains("user-1234567890"),
+            "no provider id may cross: {result}"
+        );
+        assert!(
+            !serialized.contains("operator@example.com"),
+            "no email may cross: {result}"
+        );
+        assert!(evidence.get("scope_failure_injected").is_none(), "{result}");
+        assert!(evidence.get("account_email").is_none(), "{result}");
+    }
+
     /// user webchat create | Given a fresh tab whose composer never mounted | When the extension refuses with its live rejected shape | Then the fixed code is surfaced as the reason without a busy hint
     #[test]
     fn user_webchat_create_given_composer_unavailable_when_rejected_then_code_surfaced_without_hint()
@@ -18312,6 +18625,13 @@ mod tests {
 
     struct LateAcceptanceReadbackActuator {
         accepted_user_apps: Option<Value>,
+        /// `(text, body)` the readback hashes instead of the plain create message.
+        /// `text` models the stored provider turn that carries the requested App
+        /// pill and `body` what the extension's strip reports for it: an old
+        /// extension repeats the pill-carrying text as the body, a current one
+        /// reports the recovered message, and a genuinely different turn reports
+        /// something else.
+        observed: Option<(&'static str, &'static str)>,
     }
 
     impl BrowserActuator for LateAcceptanceReadbackActuator {
@@ -18334,7 +18654,10 @@ mod tests {
             _dispatch_id: Option<&str>,
         ) -> Result<BrowserPostconditionEvidence, String> {
             assert_eq!(operation, BROWSER_SESSION_ARCHIVE_STATUS_METHOD);
-            let mut result = accepted_text_evidence("late accepted turn");
+            let mut result = match self.observed {
+                Some((text, body)) => accepted_text_and_body_evidence(text, body),
+                None => accepted_text_evidence("late accepted turn"),
+            };
             let object = result.as_object_mut().unwrap();
             object.insert(
                 "accepted_user_message_ref".to_owned(),
@@ -18452,6 +18775,7 @@ mod tests {
             };
             let actuator = LateAcceptanceReadbackActuator {
                 accepted_user_apps: apps,
+                observed: None,
             };
             let outcome = browser_session_create_late_acceptance_readback(
                 &store,
@@ -18474,6 +18798,316 @@ mod tests {
                     "{name}"
                 );
             }
+        }
+    }
+
+    /// user owner | Given a materialized uncertain create whose stored provider
+    /// turn carries the requested App pill | When the late-acceptance readback
+    /// reports the pill-carrying text digests | Then the create is promoted,
+    /// because the runtime plans for that exact pill rendering itself, and any
+    /// other text still stays uncertain.
+    #[test]
+    fn browser_late_acceptance_accepts_the_requested_app_pill_explicitly() {
+        use crate::state_store::{
+            BrowserResourceObservationInput, BrowserSessionReservation,
+            BrowserSessionReservationInput,
+        };
+
+        let accepted_apps = json!([{"name": "herdr", "path": "connectors/herdr"}]);
+        let message = "late accepted turn";
+        for (name, observed, expected_reason) in [
+            // The runtime plans for the pill itself, so an extension that could
+            // not strip it still promotes.
+            (
+                "at-sign pill",
+                ("@herdr late accepted turn", "@herdr late accepted turn"),
+                None,
+            ),
+            (
+                "bare name pill",
+                ("herdr late accepted turn", "herdr late accepted turn"),
+                None,
+            ),
+            (
+                "prompt-link label pill",
+                ("$herdr late accepted turn", "$herdr late accepted turn"),
+                None,
+            ),
+            (
+                "pill glued to the body",
+                ("@herdrlate accepted turn", "@herdrlate accepted turn"),
+                Some("readback_digest_mismatch"),
+            ),
+            (
+                "shorter pill absorbing the message",
+                ("@herdrmcp hello", "@herdrmcp hello"),
+                Some("readback_digest_mismatch"),
+            ),
+            // Provider renderings the runtime cannot rebuild from the requested
+            // name are covered by the extension's own strip of the pill.
+            (
+                "chip label under another separator",
+                ("Herdr late accepted turn", message),
+                None,
+            ),
+            (
+                "zero-width separator",
+                ("@herdr\u{200b} late accepted turn", message),
+                None,
+            ),
+            (
+                "different body",
+                ("@herdr something else", "something else"),
+                Some("readback_digest_mismatch"),
+            ),
+            (
+                "unrequested app pill",
+                (
+                    "@otherapp late accepted turn",
+                    "@otherapp late accepted turn",
+                ),
+                Some("readback_digest_mismatch"),
+            ),
+            (
+                "extended body",
+                (
+                    "@herdr late accepted turn extra",
+                    "late accepted turn extra",
+                ),
+                Some("readback_digest_mismatch"),
+            ),
+        ] {
+            let (store, endpoint_ref, observed_session_ref) = browser_dispatch_reconcile_fixture();
+            let (reservation, params) = {
+                let mut guard = store.lock().unwrap();
+                let account_ref = guard
+                    .browser_resource(&observed_session_ref)
+                    .unwrap()
+                    .unwrap()
+                    .parent_ref
+                    .unwrap();
+                let reservation = match guard
+                    .reserve_browser_session(BrowserSessionReservationInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        account_ref: &account_ref,
+                        space_ref: None,
+                        display_label: "Late acceptance pill",
+                        expected_generation: 7,
+                        idempotency_key_digest: &browser_sha256(&format!("late-pill-key-{name}")),
+                        request_digest: &browser_sha256(&format!("late-pill-request-{name}")),
+                        created_at: 40,
+                        expires_at: 4000,
+                    })
+                    .unwrap()
+                {
+                    BrowserSessionReservation::Reserved(record) => record,
+                    BrowserSessionReservation::Existing(_) => {
+                        panic!("fixture reservation must be new")
+                    }
+                };
+                let created = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        kind: "session",
+                        parent_ref: Some(&account_ref),
+                        native_identity: &format!("late-pill-created-{name}"),
+                        display_label: None,
+                        observation_generation: 7,
+                        observed_at: 41,
+                    })
+                    .unwrap();
+                guard
+                    .upsert_browser_resource_locator(
+                        &created.resource_ref,
+                        &format!("https://chatgpt.com/c/late-pill-{name}"),
+                        7,
+                        41,
+                    )
+                    .unwrap();
+                guard
+                    .materialize_browser_session_reservation(
+                        &reservation.reservation_ref,
+                        &created.resource_ref,
+                        42,
+                    )
+                    .unwrap();
+                guard
+                    .update_browser_session_reservation_delivery(
+                        &reservation.reservation_ref,
+                        7,
+                        BrowserDeliveryState::Uncertain,
+                        None,
+                        43,
+                    )
+                    .unwrap();
+                (
+                    guard
+                        .browser_session_reservation(&reservation.reservation_ref)
+                        .unwrap()
+                        .unwrap(),
+                    json!({
+                        "message": "late accepted turn",
+                        "required_apps": ["herdr"],
+                    }),
+                )
+            };
+            let actuator = LateAcceptanceReadbackActuator {
+                accepted_user_apps: Some(accepted_apps.clone()),
+                observed: Some(observed),
+            };
+            let outcome = browser_session_create_late_acceptance_readback(
+                &store,
+                &reservation,
+                &params,
+                &actuator,
+                7,
+            );
+            match expected_reason {
+                None => {
+                    let promoted = outcome
+                        .unwrap_or_else(|reason| panic!("{name} should promote, stayed {reason}"));
+                    assert_eq!(
+                        promoted.delivery_state,
+                        BrowserDeliveryState::Applied.as_str(),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        promoted.accepted_user_message_ref.as_deref(),
+                        Some("provider-late-user"),
+                        "{name}: promotion stays bound to the provider message"
+                    );
+                }
+                Some(reason) => assert_eq!(outcome.unwrap_err(), reason, "{name}"),
+            }
+        }
+    }
+
+    /// user owner | Given an uncertain create whose stored turn carries an App
+    /// pill that was never requested | When the late-acceptance readback reports
+    /// that turn | Then the create is never promoted from an unrelated App, and a
+    /// requested App is never satisfied by another App's identity.
+    #[test]
+    fn browser_late_acceptance_never_accepts_an_unrequested_app_pill() {
+        use crate::state_store::{
+            BrowserResourceObservationInput, BrowserSessionReservation,
+            BrowserSessionReservationInput,
+        };
+
+        for (name, required_apps, accepted_apps, observed, expected_reason) in [
+            (
+                "no requested app, pill body left intact",
+                json!([]),
+                Some(json!([{"name": "otherapp", "path": "app://otherapp"}])),
+                (
+                    "@otherapp late accepted turn",
+                    "@otherapp late accepted turn",
+                ),
+                "readback_digest_mismatch",
+            ),
+            (
+                "requested app, other app identity",
+                json!(["herdr"]),
+                Some(json!([{"name": "otherapp", "path": "app://otherapp"}])),
+                ("@otherapp late accepted turn", "late accepted turn"),
+                "readback_app_identity_mismatch",
+            ),
+        ] {
+            let (store, endpoint_ref, observed_session_ref) = browser_dispatch_reconcile_fixture();
+            let (reservation, params) = {
+                let mut guard = store.lock().unwrap();
+                let account_ref = guard
+                    .browser_resource(&observed_session_ref)
+                    .unwrap()
+                    .unwrap()
+                    .parent_ref
+                    .unwrap();
+                let reservation = match guard
+                    .reserve_browser_session(BrowserSessionReservationInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        account_ref: &account_ref,
+                        space_ref: None,
+                        display_label: "Late acceptance unrequested app",
+                        expected_generation: 7,
+                        idempotency_key_digest: &browser_sha256(&format!(
+                            "late-unrequested-key-{name}"
+                        )),
+                        request_digest: &browser_sha256(&format!(
+                            "late-unrequested-request-{name}"
+                        )),
+                        created_at: 40,
+                        expires_at: 4000,
+                    })
+                    .unwrap()
+                {
+                    BrowserSessionReservation::Reserved(record) => record,
+                    BrowserSessionReservation::Existing(_) => {
+                        panic!("fixture reservation must be new")
+                    }
+                };
+                let created = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        kind: "session",
+                        parent_ref: Some(&account_ref),
+                        native_identity: &format!("late-unrequested-created-{name}"),
+                        display_label: None,
+                        observation_generation: 7,
+                        observed_at: 41,
+                    })
+                    .unwrap();
+                guard
+                    .upsert_browser_resource_locator(
+                        &created.resource_ref,
+                        &format!("https://chatgpt.com/c/late-unrequested-{name}"),
+                        7,
+                        41,
+                    )
+                    .unwrap();
+                guard
+                    .materialize_browser_session_reservation(
+                        &reservation.reservation_ref,
+                        &created.resource_ref,
+                        42,
+                    )
+                    .unwrap();
+                guard
+                    .update_browser_session_reservation_delivery(
+                        &reservation.reservation_ref,
+                        7,
+                        BrowserDeliveryState::Uncertain,
+                        None,
+                        43,
+                    )
+                    .unwrap();
+                let params = if required_apps.as_array().is_some_and(|apps| apps.is_empty()) {
+                    json!({"message": "late accepted turn", "required_apps": []})
+                } else {
+                    json!({"message": "late accepted turn", "required_apps": required_apps})
+                };
+                (
+                    guard
+                        .browser_session_reservation(&reservation.reservation_ref)
+                        .unwrap()
+                        .unwrap(),
+                    params,
+                )
+            };
+            let actuator = LateAcceptanceReadbackActuator {
+                accepted_user_apps: accepted_apps,
+                observed: Some(observed),
+            };
+            let outcome = browser_session_create_late_acceptance_readback(
+                &store,
+                &reservation,
+                &params,
+                &actuator,
+                7,
+            );
+            assert_eq!(outcome.unwrap_err(), expected_reason, "{name}");
         }
     }
 

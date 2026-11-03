@@ -211,6 +211,18 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Uninstall => product_lifecycle::uninstall(),
         cli::Command::Reinstall => product_lifecycle::reinstall(),
         cli::Command::DocumentsProbe => Ok(macos_privacy::run_documents_probe_child()),
+        cli::Command::DocumentsAliasEnsure(path, expected) => {
+            Ok(macos_privacy::run_documents_alias_ensure_child(
+                std::path::Path::new(&path),
+                std::path::Path::new(&expected),
+            ))
+        }
+        cli::Command::DocumentsAliasProbe(path, expected) => {
+            Ok(macos_privacy::run_documents_alias_probe_child(
+                std::path::Path::new(&path),
+                std::path::Path::new(&expected),
+            ))
+        }
         cli::Command::TccBrokerRun => Ok(tcc_broker::run_broker_once()),
         cli::Command::TccHerdrHost => tcc_broker::run_herdr_host(),
         cli::Command::CredentialHelperRun => Ok(macos_credential_helper::run_once()),

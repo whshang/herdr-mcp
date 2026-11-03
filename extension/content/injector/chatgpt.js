@@ -86,6 +86,63 @@ class ChatGPTAdapter extends BaseAdapter {
     return (await this.getAccountObservation(timeoutMs))?.nativeIdentity ?? null;
   }
 
+  // #847: the two authenticated endpoints answer in more than one ID namespace.
+  // /me answers a user id, while a ChatGPT session can carry a workspace/account
+  // `id` beside `user.id` and `account.id`; a Project/workspace route (the
+  // `/g/g-p-…` surface) is where that extra top-level id appears. These helpers
+  // keep the namespaces apart and describe the observed shape with presence /
+  // equality facts only: no id, email, account, token or raw payload ever leaves
+  // getAccountObservation() through them.
+  accountIdFacts(payload) {
+    const read = (value) => (typeof value === "string" ? value.trim() : "");
+    return {
+      userId: read(payload?.user?.id),
+      topLevelId: read(payload?.id),
+      accountId: read(payload?.account?.id),
+      email: this.displayEmailFromPayload(payload),
+    };
+  }
+
+  // A user-namespace id only. A top-level id that mirrors `account.id` belongs to
+  // the workspace/account namespace and must never stand in for a user id, and
+  // `account.id` itself is never promoted to the account identity.
+  accountUserId(facts) {
+    if (facts?.userId) return facts.userId;
+    if (facts?.topLevelId && facts.topLevelId !== facts.accountId) return facts.topLevelId;
+    return "";
+  }
+
+  accountEmailProof(meEmail, sessionEmail) {
+    if (meEmail && sessionEmail) return meEmail === sessionEmail ? "emails_match" : "emails_differ";
+    if (meEmail) return "session_email_missing";
+    if (sessionEmail) return "me_email_missing";
+    return "both_emails_missing";
+  }
+
+  // Bounded, redacted identity shape. Finite codes only: presence of each
+  // namespace form plus the comparison result, so a refused registration tells
+  // the operator which payload shape produced it without exposing any identifier.
+  // #847's recorded enum pair can be produced by three different payload bodies
+  // (the session top-level id shadowing user.id, a workspace-only session, or two
+  // genuinely different user ids), so these codes are what distinguishes them.
+  accountIdentityShape(me, session) {
+    const meUserId = this.accountUserId(me);
+    const sessionUserId = this.accountUserId(session);
+    const topLevelId = session?.topLevelId || "";
+    return {
+      me_user_id: meUserId ? "me_user_id_present" : "me_user_id_absent",
+      session_user_id: sessionUserId ? "session_user_id_present" : "session_user_id_absent",
+      session_top_id: !topLevelId
+        ? "session_top_id_absent"
+        : (session?.accountId && topLevelId === session.accountId
+          ? "session_top_id_equals_account" : "session_top_id_differs_from_account"),
+      id_comparison: meUserId && sessionUserId
+        ? (meUserId === sessionUserId ? "user_ids_match" : "user_ids_differ")
+        : (meUserId || sessionUserId ? "single_user_id_present" : "no_user_id_present"),
+      me_account_id: me?.accountId ? "me_account_id_present" : "me_account_id_absent",
+    };
+  }
+
   // One authenticated observation of the signed-in account. The two provider
   // endpoints are cross-checked instead of trusting the first response: an old
   // tab can retain the former account's /me payload after an account switch.
@@ -97,8 +154,8 @@ class ChatGPTAdapter extends BaseAdapter {
     if (Date.now() < (this._accountIdentity429Until || 0)) {
       return { nativeIdentity: null, email: null };
     }
-    let nativeIdentity = null;
-    let email = null;
+    const facts = { "/backend-api/me": null, "/api/auth/session": null };
+    let sessionAccessToken = "";
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -120,121 +177,184 @@ class ChatGPTAdapter extends BaseAdapter {
         if (!response.ok) continue;
         this._accountIdentity429Count = 0;
         const payload = await response.json();
-        const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-        const observedIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
-        if (!observedIdentity) continue;
-        const observedEmail = this.displayEmailFromPayload(payload);
-        // An old tab can retain the former account's authenticated /me response
-        // after a ChatGPT account switch. Reject conflicting provider identities.
-        if (nativeIdentity && observedIdentity !== nativeIdentity) {
-          const reason = email && observedEmail
-            ? (email === observedEmail
-              ? "native_id_conflict_matching_email" : "native_id_conflict_different_email")
-            : "native_id_conflict_unverified_email";
-          // Only compare identity equality and source shape. Never return the
-          // raw identifiers or session/account payload to the extension host.
-          const sessionAccountId = typeof payload?.account?.id === "string"
-            ? payload.account.id.trim() : "";
-          const idRelation = url === "/api/auth/session"
-            ? (sessionAccountId
-              ? (nativeIdentity === sessionAccountId
-                ? "me_matches_session_account_id" : "me_differs_session_user_and_account_id")
-              : "me_differs_session_user_without_account_id")
-            : "unclassified";
-          const emailProof = email && observedEmail
-            ? (email === observedEmail ? "emails_match" : "emails_differ")
-            : (email ? "session_email_missing"
-              : (observedEmail ? "me_email_missing" : "both_emails_missing"));
-          let bearerRelation = "bearer_token_unavailable";
-          // Probe only after conflicting cookie-authenticated responses. The
-          // bearer token remains in this page's memory and never enters a
-          // background message, log, Registry record or diagnostic payload.
-          if (url === "/api/auth/session" && typeof payload?.accessToken === "string"
-              && payload.accessToken.trim()) {
-            const now = Date.now();
-            const cached = this._bearerIdentityProbe;
-            if (cached && cached.meId === nativeIdentity
-                && cached.sessionUserId === observedIdentity
-                && cached.sessionAccountId === sessionAccountId
-                && now - cached.checkedAt < 30_000) {
-              bearerRelation = cached.relation;
-            } else {
-              const bearerController = new AbortController();
-              const bearerTimer = setTimeout(() => bearerController.abort(), timeoutMs);
-              try {
-                const verified = await fetch("/backend-api/me", {
-                  method: "GET",
-                  credentials: "include",
-                  cache: "no-store",
-                  headers: {
-                    accept: "application/json",
-                    authorization: `Bearer ${payload.accessToken}`,
-                  },
-                  signal: bearerController.signal,
-                });
-                if (!verified.ok) {
-                  // A throttled bearer probe arms the same cooldown: the account is
-                  // rate limited on both authenticated paths, so the next
-                  // observation must not immediately re-read either endpoint.
-                  if (verified.status === 429) this.noteAccountIdentity429(verified);
-                  bearerRelation = verified.status === 401 || verified.status === 403
-                    ? "bearer_not_authorized" : verified.status === 429
-                      ? "bearer_rate_limited" : "bearer_response_unavailable";
-                } else {
-                  const identity = await verified.json();
-                  const candidateId = identity?.id || identity?.user?.id || identity?.account?.id;
-                  const bearerId = typeof candidateId === "string" ? candidateId.trim() : "";
-                  bearerRelation = !bearerId ? "bearer_identity_missing"
-                    : bearerId === observedIdentity ? "bearer_matches_session_user"
-                    : bearerId === sessionAccountId ? "bearer_matches_session_account"
-                    : bearerId === nativeIdentity ? "bearer_matches_cookie_me"
-                    : "bearer_differs_from_session";
-                }
-              } catch (_) {
-                bearerRelation = "bearer_network_unavailable";
-              } finally {
-                clearTimeout(bearerTimer);
-              }
-              this._bearerIdentityProbe = {
-                meId: nativeIdentity,
-                sessionUserId: observedIdentity,
-                sessionAccountId,
-                relation: bearerRelation,
-                checkedAt: now,
-              };
-            }
-          }
-          // The cookie-backed /me ID may come from a stale account or a
-          // different ID namespace. Accept only a current-session user ID
-          // independently confirmed by /me using that session's bearer token,
-          // with a valid current email and no contradictory email evidence.
-          // All other conflicts continue to fail closed.
-          if (bearerRelation === "bearer_matches_session_user"
-              && observedEmail && (!email || email === observedEmail)) {
-            this._accountIdentity429Count = 0;
-            return {
-              nativeIdentity: observedIdentity,
-              email: observedEmail,
-              identityVerification: "bearer_verified_session_user",
-              idRelation, emailProof, bearerRelation,
-            };
-          }
-          return { nativeIdentity: null, email: null, reason, idRelation, emailProof, bearerRelation };
+        facts[url] = this.accountIdFacts(payload);
+        if (url === "/api/auth/session" && typeof payload?.accessToken === "string") {
+          sessionAccessToken = payload.accessToken.trim();
         }
-        if (email && observedEmail && email !== observedEmail) {
-          return { nativeIdentity: null, email: null, reason: "email_conflict" };
-        }
-        nativeIdentity = observedIdentity;
-        email ||= observedEmail;
       } catch (_) {
       } finally {
         clearTimeout(timer);
       }
     }
-    if (nativeIdentity) this._accountIdentity429Count = 0;
-    return nativeIdentity
-      ? { nativeIdentity, email }
-      : { nativeIdentity: null, email: null, reason: "authenticated_identity_unavailable" };
+    const me = facts["/backend-api/me"];
+    const session = facts["/api/auth/session"];
+    const shape = this.accountIdentityShape(me, session);
+    const meUserId = this.accountUserId(me);
+    const sessionUserId = this.accountUserId(session);
+    const meEmail = me?.email || null;
+    const sessionEmail = session?.email || null;
+    const emailProof = this.accountEmailProof(meEmail, sessionEmail);
+    const emailConflict = emailProof === "emails_differ";
+    // Canonical display email: the session's, else the /me one. It is display
+    // state only and never an identity source.
+    const agreedEmail = sessionEmail || meEmail;
+    // An accepted observation keeps the historical {nativeIdentity, email}
+    // contract: the redacted shape is a refusal diagnostic only.
+    const accept = (nativeIdentity, extra = {}) => {
+      this._accountIdentity429Count = 0;
+      return { nativeIdentity, email: agreedEmail, ...extra };
+    };
+
+    // Neither endpoint names a user-namespace id: there is nothing to register.
+    if (!meUserId && !sessionUserId) {
+      return {
+        nativeIdentity: null,
+        email: null,
+        idShape: shape,
+        reason: "authenticated_identity_unavailable",
+      };
+    }
+    if (!meUserId || !sessionUserId) {
+      // Exactly one endpoint names a user id.
+      //
+      // When the OTHER endpoint answered only in a different namespace (its
+      // workspace/account id, or a top-level id that mirrors it), it is NOT
+      // dropped from the cross-check: dropping it would let a stale /me user id
+      // from the previous account be published whenever the session payload
+      // named its workspace instead of a user. Accept only on a positive
+      // same-account proof (both endpoints agree on account.id); anything weaker
+      // stays fail-closed and is reported through the redacted shape codes so the
+      // next provider-side UAT can name the exact payload. Neither read is
+      // workspace-scoped - this repo sends no account-selection header on
+      // /backend-api/me or /api/auth/session - so a Project tab can legitimately
+      // observe two different workspace user ids and account.id agreement is the
+      // only same-account proof available without inventing that provider header.
+      const otherFacts = meUserId ? session : me;
+      const otherAnswered = Boolean(otherFacts);
+      if (!otherAnswered) {
+        // The other authenticated endpoint did not answer or exposed no id at
+        // all. Keep the historical single-source fallback: the session user id
+        // wins, else the /me user id.
+        if (emailConflict) {
+          return { nativeIdentity: null, email: null, idShape: shape, reason: "email_conflict" };
+        }
+        return accept(sessionUserId || meUserId);
+      }
+      const sharedAccountId = Boolean(
+        me?.accountId && session?.accountId && me.accountId === session.accountId,
+      );
+      if (!sharedAccountId || emailConflict) {
+        return {
+          nativeIdentity: null,
+          email: null,
+          idShape: shape,
+          reason: sharedAccountId ? "email_conflict" : "native_id_unconfirmed_namespace",
+          idRelation: "not_observed",
+          emailProof,
+          bearerRelation: "not_observed",
+        };
+      }
+      return accept(meUserId || sessionUserId, { identityVerification: "account_id_agreement" });
+    }
+    if (meUserId === sessionUserId) {
+      if (emailConflict) {
+        return { nativeIdentity: null, email: null, idShape: shape, reason: "email_conflict" };
+      }
+      return accept(meUserId);
+    }
+
+    // Two different user-namespace ids: a genuine account switch, or a stale
+    // cookie /me after a switch. Report only bounded comparisons.
+    const reason = meEmail && sessionEmail
+      ? (emailProof === "emails_match"
+        ? "native_id_conflict_matching_email" : "native_id_conflict_different_email")
+      : "native_id_conflict_unverified_email";
+    const idRelation = session.accountId
+      ? (meUserId === session.accountId
+        ? "me_matches_session_account_id" : "me_differs_session_user_and_account_id")
+      : "me_differs_session_user_without_account_id";
+    let bearerRelation = "bearer_token_unavailable";
+    // Probe only after conflicting cookie-authenticated responses. The bearer
+    // token remains in this page's memory and never enters a background message,
+    // log, Registry record or diagnostic payload.
+    if (sessionAccessToken) {
+      const now = Date.now();
+      const cached = this._bearerIdentityProbe;
+      if (cached && cached.meId === meUserId
+          && cached.sessionUserId === sessionUserId
+          && cached.sessionAccountId === session.accountId
+          && now - cached.checkedAt < 30_000) {
+        bearerRelation = cached.relation;
+      } else {
+        const bearerController = new AbortController();
+        const bearerTimer = setTimeout(() => bearerController.abort(), timeoutMs);
+        try {
+          const verified = await fetch("/backend-api/me", {
+            method: "GET",
+            credentials: "include",
+            cache: "no-store",
+            headers: {
+              accept: "application/json",
+              authorization: `Bearer ${sessionAccessToken}`,
+            },
+            signal: bearerController.signal,
+          });
+          if (!verified.ok) {
+            // A throttled bearer probe arms the same cooldown: the account is
+            // rate limited on both authenticated paths, so the next observation
+            // must not immediately re-read either endpoint.
+            if (verified.status === 429) this.noteAccountIdentity429(verified);
+            bearerRelation = verified.status === 401 || verified.status === 403
+              ? "bearer_not_authorized" : verified.status === 429
+                ? "bearer_rate_limited" : "bearer_response_unavailable";
+          } else {
+            // The bearer re-read is the same authenticated endpoint, so it is
+            // read through the same namespace-aware extraction: a workspace-shaped
+            // top-level id can never be mistaken for the session user.
+            const bearerId = this.accountUserId(this.accountIdFacts(await verified.json()));
+            bearerRelation = !bearerId ? "bearer_identity_missing"
+              : bearerId === sessionUserId ? "bearer_matches_session_user"
+              : bearerId === session.accountId ? "bearer_matches_session_account"
+              : bearerId === meUserId ? "bearer_matches_cookie_me"
+              : "bearer_differs_from_session";
+          }
+        } catch (_) {
+          bearerRelation = "bearer_network_unavailable";
+        } finally {
+          clearTimeout(bearerTimer);
+        }
+        this._bearerIdentityProbe = {
+          meId: meUserId,
+          sessionUserId,
+          sessionAccountId: session.accountId,
+          relation: bearerRelation,
+          checkedAt: now,
+        };
+      }
+    }
+    // The cookie-backed /me ID may come from a stale account or a different ID
+    // namespace. Accept only a current-session user ID independently confirmed
+    // by /me using that session's bearer token, with a valid current email and
+    // no contradictory email evidence. All other conflicts continue to fail
+    // closed.
+    if (bearerRelation === "bearer_matches_session_user"
+        && sessionEmail && (!meEmail || meEmail === sessionEmail)) {
+      return accept(sessionUserId, {
+        identityVerification: "bearer_verified_session_user",
+        idRelation,
+        emailProof,
+        bearerRelation,
+      });
+    }
+    return {
+      nativeIdentity: null,
+      email: null,
+      idShape: shape,
+      reason,
+      idRelation,
+      emailProof,
+      bearerRelation,
+    };
   }
 
   getConversationKey() {
@@ -450,6 +570,27 @@ class ChatGPTAdapter extends BaseAdapter {
     });
   }
 
+  // Accepted user bubbles (2026-10) render the same App chip without the
+  // app-mention-* attributes, only as a provider-owned prompt link
+  // (`data-prompt-link-href="app://<id>"` plus `data-prompt-link-label="$<name>"`,
+  // #754). The app:// href is provider-owned, so plain text still never
+  // qualifies as a requested App, and the href itself is the mention path.
+  getAcceptedPromptLinkAppMentions(root) {
+    if (!root || typeof root.querySelectorAll !== 'function') return [];
+    const out = [];
+    for (const node of root.querySelectorAll(
+      '[data-appearance="inline-mention"][data-prompt-link-href][data-prompt-link-label]',
+    )) {
+      const href = String(node.getAttribute('data-prompt-link-href') || '').trim();
+      if (!/^app:\/\/\S/.test(href)) continue;
+      const name = String(node.getAttribute('data-prompt-link-label') || '')
+        .trim().replace(/^[$@]+/, '').trim().toLowerCase();
+      if (!/^[a-z0-9_-]{1,64}$/.test(name)) continue;
+      out.push({ name, path: href.slice(0, 240) });
+    }
+    return out;
+  }
+
   // App identity carried by one exact accepted provider user message. Only the
   // provider's own inline mention nodes with a non-empty app-mention-path count:
   // plain text (including a typed `@herdr`) never selected an App, and a
@@ -471,13 +612,19 @@ class ChatGPTAdapter extends BaseAdapter {
       || carrier;
     const seen = new Set();
     const out = [];
-    for (const mention of this.getInlineAppMentionNodes(turn)) {
-      const name = String(mention.getAttribute('app-mention-name') || '').trim().toLowerCase();
-      const path = String(mention.getAttribute('app-mention-path') || '').trim();
-      if (!/^[a-z0-9_-]{1,64}$/.test(name) || !path || seen.has(name)) continue;
+    const add = (name, path) => {
+      const trimmed = String(path || '').trim();
+      if (!/^[a-z0-9_-]{1,64}$/.test(name) || !trimmed || seen.has(name)) return;
       seen.add(name);
-      out.push({ name, path: path.slice(0, 240) });
+      out.push({ name, path: trimmed.slice(0, 240) });
+    };
+    for (const mention of this.getInlineAppMentionNodes(turn)) {
+      add(
+        String(mention.getAttribute('app-mention-name') || '').trim().toLowerCase(),
+        mention.getAttribute('app-mention-path'),
+      );
     }
+    for (const mention of this.getAcceptedPromptLinkAppMentions(turn)) add(mention.name, mention.path);
     return out;
   }
 

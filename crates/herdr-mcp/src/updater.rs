@@ -343,6 +343,19 @@ fn worker_update_notices(worker_update: &Value) -> Value {
 fn stage_standalone_extension_after_update(
     reference: Option<&str>,
 ) -> Result<StagedExtension, String> {
+    stage_standalone_extension_after_update_with_policy(reference, true)
+}
+
+/// Stage the extension while controlling whether the Chrome-facing alias may be
+/// probed.
+///
+/// The update path passes `false` when the broker preflight is pending or was
+/// refused: the alias probe is a `~/Documents` request, and the same upgrade must
+/// not ask twice.
+fn stage_standalone_extension_after_update_with_policy(
+    reference: Option<&str>,
+    allow_alias_probe: bool,
+) -> Result<StagedExtension, String> {
     let reference = match reference {
         Some(reference) => reference.to_owned(),
         // The detached worker is the newly downloaded release binary, so its own
@@ -360,7 +373,10 @@ fn stage_standalone_extension_after_update(
                 "this runtime build carries no source commit; run `herdr-mcp extension standalone install` to stage the extension".to_owned()
             })?,
     };
-    crate::standalone_extension::stage_release_extension(&reference)
+    crate::standalone_extension::stage_release_extension_with_probe_policy(
+        &reference,
+        allow_alias_probe,
+    )
 }
 
 /// Report the result of update-time extension staging without changing the
@@ -621,6 +637,195 @@ fn runtime_update_succeeded_result(outcome: RuntimeUpdateOutcome<'_>) -> (Value,
         },
     });
     (payload, ExitCode::SUCCESS)
+}
+
+/// Pure decision behind [`migrate_broker_after_update`]: `installed` is the
+/// revision the config dir records (or `None` when it cannot be read), and
+/// `migrate` performs the real replacement.
+fn broker_migration_decision<F>(
+    installed: Option<u32>,
+    target: u32,
+    migrate: F,
+    config_dir: &std::path::Path,
+) -> Value
+where
+    F: FnOnce(&std::path::Path) -> Result<bool, String>,
+{
+    let Some(installed) = installed else {
+        return json!({
+            "state": "unknown",
+            "installed_revision": Value::Null,
+            "target_revision": target,
+            "next_action": "herdr-mcp permissions setup --upgrade-broker",
+        });
+    };
+    if installed >= target {
+        return json!({
+            "state": "current",
+            "installed_revision": installed,
+            "target_revision": target,
+        });
+    }
+    match migrate(config_dir) {
+        Ok(true) => json!({
+            "state": "migrated",
+            "installed_revision": installed,
+            "target_revision": target,
+            "needs_reauthorization": true,
+            "message": "the TCC broker was replaced with the revision that implements the Documents alias subcommands; the next Documents access asks for authorization once",
+            "next_action": "answer the macOS Documents prompt",
+        }),
+        Ok(false) => json!({
+            "state": "current",
+            "installed_revision": installed,
+            "target_revision": target,
+        }),
+        Err(error) => json!({
+            "state": "failed",
+            "installed_revision": installed,
+            "target_revision": target,
+            "error": error,
+            "next_action": "herdr-mcp permissions setup --upgrade-broker",
+        }),
+    }
+}
+
+/// Attach the broker migration outcome to an update result.
+///
+/// A migration that ran is a notice (one re-authorization follows); a failed one
+/// is a warning with the command that performs the same migration by hand.
+/// Neither is fatal: the Runtime already committed.
+fn attach_tcc_broker_migration(payload: &mut Value, migration: Value) {
+    let state = migration
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.insert("tcc_broker_migration".to_owned(), migration);
+    if !matches!(state.as_str(), "migrated" | "failed") {
+        return;
+    }
+    let notice = if state == "migrated" {
+        json!({
+            "code": "tcc_broker_migrated",
+            "severity": "notice",
+            "fatal": false,
+            "message": "the TCC broker was migrated to the revision that implements the Documents alias subcommands; answer the one macOS Documents prompt that follows",
+            "next_action": "answer the macOS Documents prompt",
+        })
+    } else {
+        json!({
+            "code": "tcc_broker_migration_failed",
+            "severity": "warning",
+            "fatal": false,
+            "message": "the TCC broker still predates the Documents alias subcommands; run the migration command to install them",
+            "next_action": "herdr-mcp permissions setup --upgrade-broker",
+        })
+    };
+    let notices = object
+        .entry("notices".to_owned())
+        .or_insert_with(|| json!([]));
+    if let Some(list) = notices.as_array_mut() {
+        list.push(notice);
+    }
+}
+
+/// Run the post-commit TCC steps in the only order that costs one prompt.
+///
+/// The migration has no Documents syscall; it replaces the broker file. Running
+/// the preflight first would raise the prompt for the broker that the migration
+/// then discards (a new ad-hoc identity), so the operator would answer twice and
+/// the surviving broker would still be ungranted. Migrate, then probe the broker
+/// that stays installed. Both steps are injected so the order is testable.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn attach_post_commit_tcc<M, P>(
+    payload: &mut Value,
+    config_dir: &std::path::Path,
+    installed_revision: Option<u32>,
+    migrate: M,
+    preflight: P,
+) where
+    M: FnOnce(&std::path::Path) -> Result<bool, String>,
+    P: FnOnce(&std::path::Path) -> Value,
+{
+    let migration = broker_migration_decision(
+        installed_revision,
+        crate::tcc_broker::BROKER_COMPAT_REVISION,
+        migrate,
+        config_dir,
+    );
+    attach_tcc_broker_migration(payload, migration);
+    attach_tcc_preflight(payload, preflight(config_dir));
+}
+
+/// Attach the records the worker already wrote, without migrating or probing.
+///
+/// The foreground `update apply` finishes inside the *previous* release binary,
+/// so running the post-commit step here would migrate the broker and raise a
+/// second Documents prompt for an upgrade that already had its one prompt. This
+/// only reads `update/tcc-broker-migration.json` and `update/tcc-preflight.json`
+/// and reports them with the same shape the worker used.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn attach_persisted_tcc_records(payload: &mut Value, config_dir: &std::path::Path) {
+    let migration = persisted_broker_migration(config_dir);
+    let preflight = crate::macos_privacy::persisted_tcc_preflight(config_dir);
+    attach_tcc_broker_migration(payload, migration);
+    attach_tcc_preflight(payload, preflight);
+}
+
+/// Persist the broker migration outcome next to the other update artifacts so
+/// `update status` can report it without re-running codesign or a migration.
+fn persist_broker_migration(config_dir: &std::path::Path, migration: &Value) {
+    let path = config_dir.join("update").join("tcc-broker-migration.json");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = crate::mutation::atomic_write(&path, migration.to_string().as_bytes());
+}
+
+/// Persisted broker migration outcome, or an explicit `unknown` shape.
+fn persisted_broker_migration(config_dir: &std::path::Path) -> Value {
+    std::fs::read_to_string(config_dir.join("update").join("tcc-broker-migration.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({"state": "unknown", "reported_by": Value::Null}))
+}
+
+/// Attach the post-activation macOS Documents preflight to an update result.
+///
+/// TCC prompts are an operator-visible condition, not an update failure: the
+/// Runtime already committed, so a pending prompt is a non-fatal notice with the
+/// separate recovery step. The raw preflight object is always included so a
+/// caller can tell "no prompt" from "not probed on this platform".
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn attach_tcc_preflight(payload: &mut Value, preflight: Value) {
+    let pending = preflight
+        .get("prompt_pending")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.insert("tcc_preflight".to_owned(), preflight);
+    object.insert("tcc_prompt_pending".to_owned(), json!(pending));
+    if !pending {
+        return;
+    }
+    let notices = object
+        .entry("notices".to_owned())
+        .or_insert_with(|| json!([]));
+    if let Some(list) = notices.as_array_mut() {
+        list.push(json!({
+            "code": "tcc_prompt_pending",
+            "severity": "notice",
+            "fatal": false,
+            "message": "the Runtime update succeeded, but a macOS Documents permission prompt is still unanswered; answer it once and control requests stay responsive",
+            "next_action": "answer the macOS Documents prompt",
+        }));
+    }
 }
 
 /// Result of an `update apply` that found the Runtime already on the target
@@ -1126,16 +1331,13 @@ fn apply_inner(
                     || reconcile_worker_with_active_runtime(&paths),
                 );
                 report_worker_update_notice(&worker_update, worker_chain);
-                // The detached worker stages the extension right after its
-                // service install commits. Re-running staging here with the
-                // target release commit is idempotent (the worker already
-                // recorded that commit) and lets the foreground result carry the
-                // exact Reload/refresh action.
-                let staging =
-                    stage_standalone_extension_after_update(Some(&plan.identity.source_commit));
+                // The detached worker already staged the extension and persisted
+                // the result. This process is the previous release: staging again
+                // would probe the Chrome-facing `~/Documents` alias a second time
+                // in the same upgrade, so it only reports what was recorded.
                 let extension =
                     standalone_extension_report(&paths, Some(&plan.identity.source_commit));
-                let (payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
+                let (mut payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
                     target_version,
                     target: plan.asset.target.clone(),
                     asset: plan.asset.name.clone(),
@@ -1147,8 +1349,15 @@ fn apply_inner(
                     worker_update,
                     worker_chain,
                     extension,
-                    extension_staging: staging.ok(),
+                    // The worker owns staging; this process reports only.
+                    extension_staging: None,
                 });
+                // #844: the worker (the newly activated binary) already ran the
+                // migrate-then-preflight step and persisted both records. This
+                // foreground process is the previous release: it must not migrate
+                // or probe again, or the operator answers a second Documents
+                // prompt. Report what the worker recorded.
+                attach_persisted_tcc_records(&mut payload, &paths.config_dir);
                 print_json(&payload)?;
                 return Ok(code);
             }
@@ -2225,11 +2434,20 @@ fn status() -> Result<ExitCode, String> {
     let latest = store.latest_update_job()?;
     let current_version = current_version()?.to_string();
     let worker_update = worker_update_status_view(&paths, &current_version);
-    print_json(&update_status_view(
-        latest.as_ref(),
-        &current_version,
-        worker_update,
-    ))?;
+    let mut view = update_status_view(latest.as_ref(), &current_version, worker_update);
+    // #844: report the recorded preflight. A status query must never become the
+    // syscall that blocks on a macOS permission dialog.
+    if let Some(object) = view.as_object_mut() {
+        object.insert(
+            "tcc_preflight".to_owned(),
+            crate::macos_privacy::persisted_tcc_preflight(&paths.config_dir),
+        );
+        object.insert(
+            "tcc_broker_migration".to_owned(),
+            persisted_broker_migration(&paths.config_dir),
+        );
+    }
+    print_json(&view)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2306,11 +2524,47 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
         let install = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false });
         let succeeded = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
         if succeeded {
+            // #844: this process is the newly downloaded binary, and every apply
+            // path (interactive, `update auto`, and the queued path with no
+            // foreground watcher) converges here. That makes it the only place
+            // where the broker migration reliably runs on the first apply of this
+            // release: the foreground updater that installed it is the previous
+            // binary and does not contain this code.
+            //
+            // Order matters for the one-prompt budget: migrate (a file write, no
+            // Documents syscall), run the single bounded preflight, and only then
+            // stage the extension. Staging may probe the Chrome-facing alias, so
+            // it uses the preflight result instead of asking a second time.
+            let mut broker_preflight_pending = false;
+            if let Ok(paths) = crate::paths::RuntimePaths::discover() {
+                let mut scratch = json!({});
+                let installed_revision =
+                    crate::tcc_broker::installed_compat_revision(&paths.config_dir);
+                attach_post_commit_tcc(
+                    &mut scratch,
+                    &paths.config_dir,
+                    installed_revision,
+                    |config_dir| {
+                        crate::tcc_broker::migrate_for_explicit_reauthorization(config_dir)
+                    },
+                    crate::macos_privacy::preflight_after_activation,
+                );
+                broker_preflight_pending = scratch
+                    .get("tcc_prompt_pending")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if let Some(migration) = scratch.get("tcc_broker_migration") {
+                    persist_broker_migration(&paths.config_dir, migration);
+                }
+            }
             // The newly activated release is the only process that knows which
             // extension version belongs to it, and the detached worker is where
             // both the interactive and the queued `update apply` paths converge.
             // Staging is best-effort: the Runtime update already committed.
-            let staging = stage_standalone_extension_after_update(None);
+            let staging = stage_standalone_extension_after_update_with_policy(
+                None,
+                !broker_preflight_pending,
+            );
             report_standalone_extension_staging(&staging);
             let detail = match staging {
                 Ok(staged) => format!(
@@ -2321,6 +2575,11 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
                     "service install committed and health gate passed; extension staging did not complete: {error}"
                 ),
             };
+            if broker_preflight_pending {
+                eprintln!(
+                    "[herdr-mcp update] The macOS Documents prompt is still unanswered; the Chrome load-path alias was not probed again, so the extension may report load_path_ready=false until `herdr-mcp extension standalone status` can confirm it."
+                );
+            }
             store.update_update_job(job_id, "succeeded", Some(&detail), None, now_ms_i64())?;
             crate::local_agent_skill::sync_after_install_best_effort();
             cleanup_staging(&binary);
@@ -4797,6 +5056,279 @@ mod tests {
         );
         assert_eq!(worker_update_invocations, 1);
         assert_eq!(chained["code"], "worker_update_succeeded");
+    }
+
+    /// user answers at most one prompt | Given a worker that already persisted
+    /// the migration and preflight records | When the watched foreground result is
+    /// assembled | Then it reports exactly those records: no codesign, no
+    /// migration and no Documents probe run in the foreground, so no second
+    /// prompt can be raised.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn watched_foreground_attaches_only_the_persisted_records() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-foreground-records-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        // Values a live probe could never produce: if the foreground probed or
+        // migrated, these sentinels would be replaced.
+        persist_broker_migration(
+            &root,
+            &json!({"state": "migrated", "installed_revision": 4, "target_revision": 5}),
+        );
+        // A real preflight record, written through the same function the worker
+        // uses, with an unanswered prompt.
+        crate::macos_privacy::persist_tcc_preflight(
+            &root,
+            &crate::macos_privacy::DocumentsPermission::TimedOut,
+        )
+        .unwrap();
+        let mut payload = json!({"ok": true, "code": "update_succeeded", "notices": []});
+        attach_persisted_tcc_records(&mut payload, &root);
+
+        assert_eq!(payload["tcc_broker_migration"]["state"], "migrated");
+        assert_eq!(payload["tcc_broker_migration"]["installed_revision"], 4);
+        // The pending prompt must survive the round-trip: a dropped record would
+        // read back as the empty-file default and hide a stuck upgrade.
+        assert_eq!(payload["tcc_preflight"]["probe"], "pending");
+        assert_eq!(payload["tcc_preflight"]["prompt_pending"], true);
+        assert_eq!(payload["tcc_prompt_pending"], true);
+        assert_eq!(payload["ok"], true);
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "tcc_prompt_pending")
+            .expect("a pending prompt must be reported");
+        assert_eq!(notice["fatal"], false);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// user answers at most one prompt | Given a committed Runtime update whose
+    /// installed broker predates the alias subcommands | When the post-commit TCC
+    /// steps run | Then the broker is migrated BEFORE the single preflight, and
+    /// both outcomes are attached to the result.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn post_commit_tcc_migrates_before_the_single_preflight() {
+        let config_dir = Path::new("/tmp/herdr-post-commit-tcc-order");
+        let order = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let mut payload = json!({"ok": true, "code": "update_succeeded", "notices": []});
+        // The migration writes the broker file only; the preflight is the step
+        // that can raise a Documents prompt, so it must observe the migrated
+        // broker, never the one the migration replaces.
+        attach_post_commit_tcc(
+            &mut payload,
+            config_dir,
+            Some(4),
+            |_config_dir| {
+                order.borrow_mut().push("migrate");
+                Ok(true)
+            },
+            |_config_dir| {
+                order.borrow_mut().push("preflight");
+                json!({"probe": "pending", "prompt_pending": true, "detail": null})
+            },
+        );
+        assert_eq!(*order.borrow(), vec!["migrate", "preflight"]);
+        assert_eq!(payload["tcc_broker_migration"]["state"], "migrated");
+        assert_eq!(payload["tcc_prompt_pending"], true);
+        assert_eq!(payload["ok"], true);
+
+        // A current broker is not migrated, but the single preflight still runs.
+        let order = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let mut payload = json!({"ok": true, "notices": []});
+        attach_post_commit_tcc(
+            &mut payload,
+            config_dir,
+            Some(crate::tcc_broker::BROKER_COMPAT_REVISION),
+            |_config_dir| {
+                order.borrow_mut().push("migrate");
+                Ok(true)
+            },
+            |_config_dir| {
+                order.borrow_mut().push("preflight");
+                json!({"probe": "available", "prompt_pending": false, "detail": null})
+            },
+        );
+        assert_eq!(*order.borrow(), vec!["preflight"]);
+        assert_eq!(payload["tcc_broker_migration"]["state"], "current");
+        assert_eq!(payload["tcc_prompt_pending"], false);
+    }
+
+    /// user gets the alias subcommands on the first apply of this release |
+    /// Given the worker persisted a migration outcome | When `update status`
+    /// reads it | Then the recorded state is reported without re-running codesign
+    /// or a migration.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn broker_migration_outcome_round_trips_through_the_update_record() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-broker-record-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        assert_eq!(persisted_broker_migration(&root)["state"], "unknown");
+        let migration = json!({
+            "state": "migrated",
+            "installed_revision": 4,
+            "target_revision": crate::tcc_broker::BROKER_COMPAT_REVISION,
+            "needs_reauthorization": true,
+        });
+        persist_broker_migration(&root, &migration);
+        let recorded = persisted_broker_migration(&root);
+        assert_eq!(recorded["state"], "migrated");
+        assert_eq!(recorded["installed_revision"], 4);
+        assert_eq!(recorded["needs_reauthorization"], true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// user gets the alias subcommands installed by the upgrade | Given an
+    /// installed broker at an older compatibility revision | When the committed
+    /// update path runs the broker migration | Then it performs exactly one
+    /// explicit-reauthorization migration and reports it as a non-fatal notice,
+    /// while a current revision is left untouched.
+    #[test]
+    fn broker_migration_runs_once_for_an_older_revision() {
+        let config_dir = Path::new("/tmp/herdr-broker-migration-decision");
+        let target = crate::tcc_broker::BROKER_COMPAT_REVISION;
+        let mut invocations = 0;
+        let migration = broker_migration_decision(
+            Some(4),
+            target,
+            |_config_dir| {
+                invocations += 1;
+                Ok(true)
+            },
+            config_dir,
+        );
+        assert_eq!(invocations, 1, "an older revision must be migrated once");
+        assert_eq!(migration["state"], "migrated");
+        assert_eq!(migration["installed_revision"], 4);
+        assert_eq!(migration["target_revision"], target);
+        assert_eq!(migration["needs_reauthorization"], true);
+
+        let mut payload = json!({"ok": true, "code": "update_succeeded", "notices": []});
+        attach_tcc_broker_migration(&mut payload, migration);
+        assert_eq!(payload["ok"], true, "a migration is never fatal");
+        assert_eq!(payload["tcc_broker_migration"]["state"], "migrated");
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "tcc_broker_migrated")
+            .expect("a migration must be reported");
+        assert_eq!(notice["fatal"], false);
+
+        // A current broker is not migrated again.
+        let mut second = 0;
+        let current = broker_migration_decision(
+            Some(target),
+            target,
+            |_config_dir| {
+                second += 1;
+                Ok(true)
+            },
+            config_dir,
+        );
+        assert_eq!(second, 0, "a current broker must not be migrated");
+        assert_eq!(current["state"], "current");
+        let mut payload = json!({"ok": true, "notices": []});
+        attach_tcc_broker_migration(&mut payload, current);
+        assert!(payload["notices"].as_array().unwrap().is_empty());
+
+        // An unreadable revision is reported, never silently migrated or failed.
+        let unknown = broker_migration_decision(
+            None,
+            target,
+            |_config_dir| panic!("must not migrate without a known installed revision"),
+            config_dir,
+        );
+        assert_eq!(unknown["state"], "unknown");
+        assert_eq!(
+            unknown["next_action"],
+            "herdr-mcp permissions setup --upgrade-broker"
+        );
+    }
+
+    /// user is told the exact command that works | Given a migration that fails |
+    /// When the result is reported | Then it is a non-fatal warning naming
+    /// `permissions setup --upgrade-broker`, never `tcc-broker install --force`.
+    #[test]
+    fn failed_broker_migration_reports_the_working_command() {
+        let config_dir = Path::new("/tmp/herdr-broker-migration-decision-fail");
+        let migration = broker_migration_decision(
+            Some(4),
+            crate::tcc_broker::BROKER_COMPAT_REVISION,
+            |_config_dir| Err("codesign verification failed".to_owned()),
+            config_dir,
+        );
+        assert_eq!(migration["state"], "failed");
+        assert_eq!(
+            migration["next_action"],
+            "herdr-mcp permissions setup --upgrade-broker"
+        );
+        let mut payload = json!({"ok": true, "code": "update_succeeded", "notices": []});
+        attach_tcc_broker_migration(&mut payload, migration);
+        assert_eq!(
+            payload["ok"], true,
+            "a failed migration is not an update failure"
+        );
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "tcc_broker_migration_failed")
+            .expect("a failed migration must be reported");
+        assert_eq!(notice["severity"], "warning");
+        assert_eq!(
+            notice["next_action"],
+            "herdr-mcp permissions setup --upgrade-broker"
+        );
+    }
+
+    /// user keeps a working control path | Given a Runtime update that
+    /// committed while a macOS Documents prompt is still unanswered | When the
+    /// result is reported | Then the prompt is a non-fatal notice and the update
+    /// still succeeds, and an answered probe adds no notice.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn tcc_preflight_pending_is_a_non_fatal_update_notice() {
+        let mut payload = json!({
+            "ok": true,
+            "code": "update_succeeded",
+            "notices": [],
+        });
+        attach_tcc_preflight(
+            &mut payload,
+            json!({"probe": "pending", "prompt_pending": true, "detail": null}),
+        );
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["code"], "update_succeeded");
+        assert_eq!(payload["tcc_prompt_pending"], true);
+        assert_eq!(payload["tcc_preflight"]["probe"], "pending");
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "tcc_prompt_pending")
+            .expect("an unanswered Documents prompt must be reported");
+        assert_eq!(notice["severity"], "notice");
+        assert_eq!(notice["fatal"], false);
+
+        // An answered probe (or one that never needed a prompt) adds no notice
+        // and leaves the update result untouched.
+        let mut answered = json!({"ok": true, "code": "update_succeeded", "notices": []});
+        attach_tcc_preflight(
+            &mut answered,
+            json!({"probe": "available", "prompt_pending": false, "detail": null}),
+        );
+        assert_eq!(answered["tcc_prompt_pending"], false);
+        assert!(
+            answered["notices"].as_array().unwrap().is_empty(),
+            "an answered probe must not add a notice: {answered}"
+        );
     }
 
     /// Given a stable-channel `update apply --manifest <newer manifest>` whose

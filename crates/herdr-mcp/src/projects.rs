@@ -334,9 +334,18 @@ fn should_use_stable_broker(snapshot: &Value, path: &Path) -> bool {
     if crate::tcc_broker::is_broker_child_process() {
         return false;
     }
-    crate::macos_permissions::is_protected_user_path(path)
+    // Decide from the lexical form first: resolving a protected path to answer
+    // "is this protected?" is itself the syscall that parks on a consent prompt.
+    if crate::macos_permissions::is_protected_user_path_lexical(path)
         || is_herdr_managed_worktree(path)
         || snapshot_declares_protected_repo_storage(snapshot, path)
+    {
+        return true;
+    }
+    // Only a lexically unprotected path may be resolved, so a symlink alias
+    // into a protected folder is still routed to the broker without ever
+    // parking the caller on the protected target itself.
+    crate::macos_permissions::is_protected_user_path(path)
 }
 
 fn is_herdr_managed_worktree(path: &Path) -> bool {
@@ -361,7 +370,9 @@ fn snapshot_declares_protected_repo_storage(snapshot: &Value, path: &Path) -> bo
         ["repo_key", "repo_root"]
             .into_iter()
             .filter_map(|field| worktree.get(field).and_then(Value::as_str))
-            .any(|repo_path| crate::macos_permissions::is_protected_user_path(Path::new(repo_path)))
+            .any(|repo_path| {
+                crate::macos_permissions::is_protected_user_path_lexical(Path::new(repo_path))
+            })
     })
 }
 
