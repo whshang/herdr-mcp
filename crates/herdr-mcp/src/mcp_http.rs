@@ -9563,6 +9563,349 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// user keeps 接力 for a herdr-created conversation | Given a ChatGPT
+    /// conversation the runtime created and submitted to itself in a
+    /// background/owned tab, so no DOM `source_turn.observe` ever happens |
+    /// When ChatGPT dispatches a task carrying that first message | Then the
+    /// dispatch binds the created session and owns an `hc:auto:*` continuity
+    /// chain, and a turn the runtime never delivered stays unbound.
+    #[tokio::test]
+    async fn webchat_dispatch_binds_from_an_applied_background_create() {
+        async fn post_registry(app: axum::Router, payload: Value) -> Value {
+            let response = app.oneshot(registry_request(payload)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let root = test_root("webchat-dispatch-create-source-turn");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
+            json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
+            json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 7}}}),
+        ]);
+        let mut state = dispatch_test_state_with_snapshot(
+            &root,
+            &socket,
+            json!({
+                "workspaces": [{"workspace_id": "w1", "label": "create-source-turn"}],
+                "panes": [{
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "agent_status": "idle",
+                }],
+                "agents": [],
+            }),
+        );
+        state.trusted_extension_ipc = true;
+        let broker = state.browser_actuation.clone();
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+
+        let profile_seed = "extension-profile-seed-create-source-turn";
+        let endpoint = post_registry(
+            app.clone(),
+            json!({
+                "operation": "endpoint.register",
+                "profile_seed": profile_seed,
+                "browser_family": "chrome",
+                "extension_version": "0.1.240",
+                "observed_at": now,
+            }),
+        )
+        .await;
+        let endpoint_ref = endpoint["endpoint"]["endpoint_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        post_registry(
+            app.clone(),
+            json!({
+                "operation": "provider.observe",
+                "profile_seed": profile_seed,
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "adapter_protocol_version": 1,
+                "observation_generation": 1,
+                "capabilities": {"operations": [
+                    "composer.submit",
+                    "composer.select_tool",
+                    "generation.status",
+                    "generation.stop",
+                    "session.create",
+                    "session.inspect",
+                    "session.open",
+                    "session.archive",
+                    "session.title_projection"
+                ]},
+                "observed_at": now,
+            }),
+        )
+        .await;
+        let account = post_registry(
+            app.clone(),
+            json!({
+                "operation": "resource.observe",
+                "profile_seed": profile_seed,
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "kind": "account",
+                "native_identity": "runtime-create-account",
+                "display_label": "Work",
+                "canonical_url": "https://chatgpt.com/",
+                "observation_generation": 1,
+                "observed_at": now,
+            }),
+        )
+        .await;
+        let account_ref = account["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // The runtime creates the conversation and submits the first message
+        // itself, exactly like `webchat create` on a background/owned tab.
+        let first_message = "把 t259 的源证据修复派给 pi";
+        let create_headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+            ),
+        ];
+        broker.note_extension_poll(Some(&endpoint_ref));
+        let pending_create = {
+            let create_app = app.clone();
+            let create_headers = create_headers.clone();
+            let endpoint_ref = endpoint_ref.clone();
+            let account_ref = account_ref.clone();
+            let message = first_message.to_owned();
+            tokio::spawn(async move {
+                webchat_tool_call(
+                    create_app,
+                    &create_headers,
+                    "herdr_mcp.browser_session.create",
+                    json!({
+                        "endpoint_ref": endpoint_ref,
+                        "provider": "chatgpt",
+                        "account_ref": account_ref,
+                        "display_label": "herdr UAT create bind",
+                        "message": message,
+                        "expected_generation": 1,
+                        "idempotency_key": "runtime-create-source-turn-1",
+                    }),
+                )
+                .await
+            })
+        };
+        let command = loop {
+            if let Some(command) = broker.take_next_for_extension(Some(&endpoint_ref)) {
+                break command;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert_eq!(command["operation"], "herdr_mcp.browser_session.create");
+        let reservation_ref = command["params"]["reservation_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // The new conversation registers itself against the create reservation;
+        // the tab stays hidden for the whole turn, so the DOM turn watcher never
+        // reports `source_turn.observe` for it (#846).
+        let created = post_registry(
+            app.clone(),
+            json!({
+                "operation": "resource.observe",
+                "profile_seed": profile_seed,
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "kind": "session",
+                "parent_ref": account_ref,
+                "native_identity": "runtime-create-session",
+                "display_label": null,
+                "canonical_url": "https://chatgpt.com/c/runtime-create-846",
+                "reservation_ref": reservation_ref,
+                "observation_generation": 1,
+                "observed_at": now + 1,
+            }),
+        )
+        .await;
+        let session_ref = created["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(created["reservation"]["state"], "materialized");
+
+        let evidence = json!({
+            "actuation_id": command["actuation_id"],
+            "observed_generation": 1,
+            "command_accepted": true,
+            "browser_online": true,
+            "resource_available": true,
+            "rejected": false,
+            "stable_resource_ref_observed": true,
+            "lifecycle_observed": true,
+            "canonical_url_observed": true,
+            "accepted_message_observed": true,
+            "message_baseline_advanced": true,
+            "reasoning_effort_readback": null,
+            "required_apps_readback": [],
+            "generation_owner": 1,
+            "generation_status_observed": true,
+            "generation_stopped": false,
+            "result": {
+                "accepted_user_message_ref": "provider-user-runtime-create",
+                "accepted_user_text_sha256": crate::mcp::browser_sha256(first_message.trim()),
+                "accepted_user_body_sha256": crate::mcp::browser_sha256(first_message.trim()),
+                "accepted_user_text_canonical_sha256": crate::mcp::browser_sha256(first_message.trim()),
+                "accepted_user_body_canonical_sha256": crate::mcp::browser_sha256(first_message.trim()),
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/extension/browser/actuation")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(evidence.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created_result = pending_create.await.unwrap();
+        assert_eq!(created_result["ok"], true, "{created_result}");
+        assert_eq!(created_result["delivery_state"], "applied");
+        assert_eq!(created_result["session_ref"], session_ref.as_str());
+
+        // The create's own settlement is now the session's source-turn evidence,
+        // even though the tab never ran the visible-turn watcher.
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(
+                    &mcp::source_turn_sha256(first_message),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64
+                )
+                .unwrap(),
+            (session_ref.clone(), 1)
+        );
+
+        let edge_headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-authorization",
+                json!({
+                    "principal_ref": "connector:conn_RuntimeCreate1",
+                    "connector_id": "conn_RuntimeCreate1",
+                    "grant_generation": 1
+                })
+                .to_string(),
+            ),
+            (
+                "x-herdr-edge-browser-caller-session",
+                json!({"provider": "chatgpt", "opaque_session_id": "opaque-runtime-create-1"})
+                    .to_string(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": endpoint_ref, "provider": "chatgpt"}]).to_string(),
+            ),
+        ];
+
+        // ChatGPT dispatches its own tool call from that conversation: the exact
+        // created turn binds the caller to the created session.
+        let bound = webchat_tool_call(
+            app.clone(),
+            &edge_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "run the t259 lane",
+                "idempotency_key": "runtime-create-dispatch-1",
+                "current_user_message": format!("  {first_message}  "),
+            }),
+        )
+        .await;
+        assert_eq!(bound["ok"], true, "{bound}");
+        assert_eq!(bound["parent_session"], json!({"bound": true}), "{bound}");
+        assert_eq!(bound["task"]["parent_session_ref"], session_ref.as_str());
+        assert_eq!(bound["task"]["workspace_id"], "w1");
+
+        // #837's automatic chain now exists for the created conversation, which
+        // is what 接力 resolves against.
+        let continuity_id = store
+            .lock()
+            .unwrap()
+            .continuity_for_conversation("runtime-create-846")
+            .unwrap()
+            .expect("a bound dispatch must own a durable continuity chain");
+        assert!(
+            continuity_id.starts_with("hc:auto:"),
+            "unexpected continuity id {continuity_id}"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .continuity_for_conversation("https://chatgpt.com/c/runtime-create-846")
+                .unwrap(),
+            Some(continuity_id.clone())
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .continuity_for_provider_session("chatgpt", &session_ref)
+                .unwrap(),
+            Some(continuity_id)
+        );
+
+        // A turn the runtime never delivered to this session stays unbound: the
+        // recorded create turn is evidence of exact delivery, not a licence to
+        // bind arbitrary caller text.
+        let unbound = webchat_tool_call(
+            app,
+            &edge_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "run an unrelated lane",
+                "idempotency_key": "runtime-create-dispatch-2",
+                "current_user_message": "从未提交过的消息",
+            }),
+        )
+        .await;
+        assert_eq!(unbound["ok"], true, "{unbound}");
+        assert!(unbound["task"]["parent_session_ref"].is_null());
+        assert_eq!(unbound["parent_session"]["bound"], false);
+        assert_eq!(unbound["parent_session"]["reason"], "source_turn_not_found");
+        assert_dispatch_diagnostic(
+            &unbound["parent_session"]["diagnostic"],
+            "从未提交过的消息",
+            Some(first_message),
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// `tools/call` with an explicit tool name. `webchat_tool_call` always
     /// posts `herdr_call`, which never enters the public `herdr_prompt` arm.
     async fn webchat_named_tool_call(

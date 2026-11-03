@@ -5061,6 +5061,86 @@ impl StateStore {
         Ok(record)
     }
 
+    /// Record the first user turn of a proven `session.create` as its new
+    /// session's current source-turn evidence (#846).
+    ///
+    /// A herdr-created conversation is opened as a background/owned tab, so it
+    /// never runs the visible-tab DOM turn watcher that reports
+    /// `source_turn.observe`. Without this row a ChatGPT-side
+    /// `agent.task.dispatch` carrying that very turn answers
+    /// `source_turn_not_found`, so no parent session is bound, #837 never
+    /// attaches an `hc:auto:*` continuity chain, and 接力 stays unavailable for
+    /// exactly the dispatch-bound case #834/#837 targeted.
+    ///
+    /// The create's own settlement is what makes the write trustworthy:
+    /// `applied` delivery already required the exact accepted provider message
+    /// plus the runtime-re-verified text digest of the created message, and a
+    /// materialized reservation names the session that message landed in. Every
+    /// fence is re-checked here inside one transaction. A refused fence writes
+    /// nothing and reports `Ok(false)`, so a conversation whose evidence cannot
+    /// be proven simply stays unbindable instead of binding unproven evidence.
+    ///
+    /// `observed_at` is monotonic per session: a later observation always wins,
+    /// so a late create settlement can never overwrite fresher turn evidence.
+    pub fn record_browser_session_create_source_turn(
+        &mut self,
+        reservation_ref: &str,
+        source_turn: BrowserDispatchSourceTurn<'_>,
+    ) -> Result<bool, String> {
+        validate_browser_session_reservation_ref(reservation_ref)?;
+        validate_browser_resource_ref(source_turn.session_ref)?;
+        if !is_browser_digest(source_turn.user_text_sha256) || source_turn.observed_at < 0 {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser create source turn: {error}"))?;
+        let reservation = read_browser_session_reservation_by_ref(&tx, reservation_ref)?
+            .ok_or_else(|| "browser_session_reservation_not_found".to_owned())?;
+        let fenced = reservation.state == "materialized"
+            && reservation.delivery_state == BrowserDeliveryState::Applied.as_str()
+            && reservation.session_ref.as_deref() == Some(source_turn.session_ref)
+            && require_current_browser_generation(
+                &tx,
+                &reservation.endpoint_ref,
+                &reservation.provider,
+                reservation.expected_generation,
+            )
+            .is_ok()
+            && require_browser_session_target(
+                &tx,
+                &reservation.endpoint_ref,
+                &reservation.provider,
+                source_turn.session_ref,
+                reservation.expected_generation,
+            )
+            .is_ok()
+            && require_browser_session_account_lineage(
+                &tx,
+                &reservation.endpoint_ref,
+                &reservation.provider,
+                source_turn.session_ref,
+                reservation.expected_generation,
+            )
+            .is_ok();
+        if !fenced {
+            tx.commit()
+                .map_err(|error| format!("cannot commit browser create source turn: {error}"))?;
+            return Ok(false);
+        }
+        write_browser_source_turn(
+            &tx,
+            source_turn.session_ref,
+            reservation.expected_generation,
+            source_turn.user_text_sha256,
+            source_turn.observed_at,
+        )?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser create source turn: {error}"))?;
+        Ok(true)
+    }
+
     pub fn materialize_browser_session_reservation(
         &mut self,
         reservation_ref: &str,

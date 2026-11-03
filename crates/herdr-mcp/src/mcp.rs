@@ -4651,6 +4651,15 @@ fn browser_session_create_success(
         }
         Err(error) => return browser_store_error(error),
     };
+    // #846: the runtime delivered this create's first user turn itself, so the
+    // background/owned tab never runs the DOM turn watcher that reports
+    // `source_turn.observe`. Record that exact turn from the create's own
+    // settlement proof, otherwise a ChatGPT-side `agent.task.dispatch` of it can
+    // never bind this conversation. Every create success path (first attempt,
+    // same-key replay, reconciled uncertain) funnels through here, and the write
+    // is an idempotent monotonic upsert, so a replay also repairs a create that
+    // an older runtime settled without source-turn evidence.
+    record_created_session_source_turn(store, &reservation, params);
     // A create that names an existing work chain joins it before the worker can
     // settle, so the assistant turn lands in Work Memory without a parent race.
     let work_chain_binding =
@@ -4698,6 +4707,53 @@ fn browser_session_create_success(
         "work_memory_writeback": work_memory_writeback,
         "work_chain_binding": work_chain_binding,
     })
+}
+
+/// #846: durable source-turn evidence for one herdr-created conversation.
+///
+/// Only ChatGPT WebChat sessions have a source-turn consumer today (both the
+/// DOM `source_turn.observe` path and the settled `browser_dispatch.submit`
+/// path are ChatGPT-only), so a create for any other provider writes nothing. `observed_at` is the reservation's
+/// pre-actuation time: the store's monotonic per-session upsert then keeps any
+/// later observation of a newer turn, so a slow or reconciled create can never
+/// claim to be the conversation's current turn.
+fn record_created_session_source_turn(
+    store: &mut StateStore,
+    reservation: &BrowserSessionReservationRecord,
+    params: &Value,
+) {
+    if reservation.provider != "chatgpt" {
+        return;
+    }
+    let (Some(session_ref), Some(message)) = (
+        reservation.session_ref.as_deref(),
+        params.get("message").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let message = message.trim();
+    if message.is_empty() {
+        return;
+    }
+    let user_text_sha256 = source_turn_sha256(message);
+    match store.record_browser_session_create_source_turn(
+        reservation.reservation_ref.as_str(),
+        crate::state_store::BrowserDispatchSourceTurn {
+            session_ref,
+            user_text_sha256: &user_text_sha256,
+            observed_at: reservation.created_at,
+        },
+    ) {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "browser session.create source turn not recorded: reason=evidence_fence reservation={}",
+            reservation.reservation_ref
+        ),
+        Err(error) => eprintln!(
+            "browser session.create source turn not recorded: error={error} reservation={}",
+            reservation.reservation_ref
+        ),
+    }
 }
 
 /// A session.create success settled by the reconcile path: the same shape as
