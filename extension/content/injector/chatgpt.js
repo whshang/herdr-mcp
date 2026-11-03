@@ -570,6 +570,27 @@ class ChatGPTAdapter extends BaseAdapter {
     });
   }
 
+  // Accepted user bubbles (2026-10) render the same App chip without the
+  // app-mention-* attributes, only as a provider-owned prompt link
+  // (`data-prompt-link-href="app://<id>"` plus `data-prompt-link-label="$<name>"`,
+  // #754). The app:// href is provider-owned, so plain text still never
+  // qualifies as a requested App, and the href itself is the mention path.
+  getAcceptedPromptLinkAppMentions(root) {
+    if (!root || typeof root.querySelectorAll !== 'function') return [];
+    const out = [];
+    for (const node of root.querySelectorAll(
+      '[data-appearance="inline-mention"][data-prompt-link-href][data-prompt-link-label]',
+    )) {
+      const href = String(node.getAttribute('data-prompt-link-href') || '').trim();
+      if (!/^app:\/\/\S/.test(href)) continue;
+      const name = String(node.getAttribute('data-prompt-link-label') || '')
+        .trim().replace(/^[$@]+/, '').trim().toLowerCase();
+      if (!/^[a-z0-9_-]{1,64}$/.test(name)) continue;
+      out.push({ name, path: href.slice(0, 240) });
+    }
+    return out;
+  }
+
   // App identity carried by one exact accepted provider user message. Only the
   // provider's own inline mention nodes with a non-empty app-mention-path count:
   // plain text (including a typed `@herdr`) never selected an App, and a
@@ -591,13 +612,19 @@ class ChatGPTAdapter extends BaseAdapter {
       || carrier;
     const seen = new Set();
     const out = [];
-    for (const mention of this.getInlineAppMentionNodes(turn)) {
-      const name = String(mention.getAttribute('app-mention-name') || '').trim().toLowerCase();
-      const path = String(mention.getAttribute('app-mention-path') || '').trim();
-      if (!/^[a-z0-9_-]{1,64}$/.test(name) || !path || seen.has(name)) continue;
+    const add = (name, path) => {
+      const trimmed = String(path || '').trim();
+      if (!/^[a-z0-9_-]{1,64}$/.test(name) || !trimmed || seen.has(name)) return;
       seen.add(name);
-      out.push({ name, path: path.slice(0, 240) });
+      out.push({ name, path: trimmed.slice(0, 240) });
+    };
+    for (const mention of this.getInlineAppMentionNodes(turn)) {
+      add(
+        String(mention.getAttribute('app-mention-name') || '').trim().toLowerCase(),
+        mention.getAttribute('app-mention-path'),
+      );
     }
+    for (const mention of this.getAcceptedPromptLinkAppMentions(turn)) add(mention.name, mention.path);
     return out;
   }
 
