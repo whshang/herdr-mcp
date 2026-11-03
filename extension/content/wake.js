@@ -4741,9 +4741,17 @@ function normalizeHerdrMentionAlias(value) {
       // write stays scoped to the projected conversation and is skipped (with
       // the watch left unspent) when the live page is no longer that one.
       if (chatGptConversationId() !== conversationId) return currentResult();
-      const reapplied = await projectChatGptConversationTitle(target.title, { conversationId });
-      // Publish the reapply state only for the conversation that was written.
+      const reapplied = await projectChatGptConversationTitle(target.title, {
+        conversationId,
+        expectedTitles: [autoTitle, baselineTitle],
+        recordTarget: false,
+      });
+      // Publish the reapply state only while the page and the target are still
+      // the ones this watch owns.
       if (chatGptConversationId() !== conversationId) return currentResult();
+      if (typeof chatGptTitleProjectionTarget !== "undefined" && chatGptTitleProjectionTarget !== target) {
+        return currentResult();
+      }
       if (typeof chatGptTitleProjectionReapplied !== "undefined") chatGptTitleProjectionReapplied = true;
       if (typeof chatGptTitleProjectionResult !== "undefined") chatGptTitleProjectionResult = reapplied;
       return reapplied;
@@ -4760,7 +4768,11 @@ function normalizeHerdrMentionAlias(value) {
   // `conversationId` scopes the whole step. Callers that are not the create that
   // just landed on this route (the post-settlement reapply) must pass it so the
   // PATCH can never follow the live page id into another conversation.
-  async function projectChatGptConversationTitle(rawTitle, { conversationId: scopedConversationId = null } = {}) {
+  async function projectChatGptConversationTitle(rawTitle, {
+    conversationId: scopedConversationId = null,
+    expectedTitles = null,
+    recordTarget = true,
+  } = {}) {
     const provider = "chatgpt";
     const title = normText(rawTitle);
     const unsupported = (reason) => ({
@@ -4797,6 +4809,11 @@ function normalizeHerdrMentionAlias(value) {
     // conversation; otherwise it must not read, PATCH or record a target.
     const conversationStillOpen = () => chatGptConversationId() === conversationId;
     if (!conversationStillOpen()) return failed("title_projection_conversation_changed");
+    // The target that belongs to the caller. A concurrent create may install a
+    // newer one while this step awaits; that newer target is never replaced.
+    const priorTarget = typeof chatGptTitleProjectionTarget === "undefined"
+      ? null
+      : chatGptTitleProjectionTarget;
 
     const phaseDeadline = Date.now() + CHATGPT_TITLE_PRE_PATCH_BUDGET_MS;
     const remainingPhase = (ceiling) => Math.max(1, Math.min(ceiling, phaseDeadline - Date.now()));
@@ -4813,11 +4830,35 @@ function normalizeHerdrMentionAlias(value) {
       timeoutMs: remainingPhase(CHATGPT_TITLE_READ_TIMEOUT_MS),
     });
     const baselineTitle = current.ok ? current.title : null;
-    // Remember what the provider owned before this projection - including when
-    // it already matched, so a later create never inherits a target without a
-    // concrete conversation and baseline.
-    if (typeof chatGptTitleProjectionTarget !== "undefined") {
-      chatGptTitleProjectionTarget = { title, conversationId, baselineTitle };
+    // Nothing may be recorded or written unless the page is still this exact
+    // conversation and no newer target replaced the caller's while this read was
+    // in flight. A moved page must leave the previous target and its baseline
+    // untouched, otherwise the unspent watch could never recover.
+    if (!conversationStillOpen()) return failed("title_projection_conversation_changed");
+    if (typeof chatGptTitleProjectionTarget !== "undefined" && chatGptTitleProjectionTarget !== priorTarget) {
+      return failed("title_projection_superseded");
+    }
+    // The post-settlement reapply names the only titles it may overwrite: the
+    // auto-title it observed and the pre-projection baseline. Anything else on
+    // this fresh read is a user rename and is never overwritten.
+    const overwritableTitles = Array.isArray(expectedTitles)
+      ? expectedTitles.filter((value) => typeof value === "string" && value)
+      : null;
+    if (overwritableTitles) {
+      if (!baselineTitle) return failed("title_projection_readback_unverified");
+      if (baselineTitle !== title && !overwritableTitles.includes(baselineTitle)) {
+        return failed("title_projection_title_changed");
+      }
+    }
+    if (recordTarget && typeof chatGptTitleProjectionTarget !== "undefined") {
+      // An already-matching title has no distinct provider baseline: storing the
+      // label as the baseline would make a later user rename look like the
+      // provider auto-title, so only the scope is recorded.
+      chatGptTitleProjectionTarget = {
+        title,
+        conversationId,
+        baselineTitle: baselineTitle === title ? null : baselineTitle,
+      };
     }
     if (baselineTitle === title) return verified(false);
     if (Date.now() >= phaseDeadline) return failed("title_projection_timeout");
