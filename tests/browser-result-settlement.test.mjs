@@ -19,7 +19,13 @@ assert.ok(postStart >= 0 && postEnd > postStart, "background settlement post mus
 const postSource = backgroundSource.slice(postStart, postEnd);
 const TEST_DISPATCH_ID = `bd_${"a".repeat(64)}`;
 
-function settlementHarness({ sessionRef = "br_session_1", generation = 7, accepted = null, sends = [] } = {}) {
+function settlementHarness({
+  sessionRef = "br_session_1",
+  generation = 7,
+  accepted = null,
+  sends = [],
+  reapply = undefined,
+} = {}) {
   const acceptedDispatchAssignments = new Map();
   if (accepted) {
     acceptedDispatchAssignments.set(sessionRef, {
@@ -42,8 +48,9 @@ function settlementHarness({ sessionRef = "br_session_1", generation = 7, accept
     "acceptedDispatchAssignments",
     "sendBg",
     "ADAPTER",
+    "reapplyChatGptConversationTitleAfterSettlement",
     `${settlementSource}; return reportBrowserResultSettlement;`,
-  )(sessionRef, generation, acceptedDispatchAssignments, sendBg, { name: "chatgpt" });
+  )(sessionRef, generation, acceptedDispatchAssignments, sendBg, { name: "chatgpt" }, reapply);
   return { report, sent, acceptedDispatchAssignments };
 }
 
@@ -127,6 +134,44 @@ test("repeated settlement for one assistant message is locally idempotent", asyn
   assert.equal(await report(snapshot), true);
   assert.equal(await report(snapshot), true);
   assert.equal(sent.length, 1);
+});
+
+test("user keeps the projected title when the result ACK is rejected | Given an uncertain create delivery | When the first assistant turn settles | Then the bounded title re-apply still runs off the ACK path", async () => {
+  const reapplyCalls = [];
+  const rejected = settlementHarness({
+    sessionRef: "br_abc",
+    generation: 7,
+    accepted: "user-1",
+    sends: [{ ok: false, error: "browser_dispatch_result_unmatched" }],
+    reapply: () => {
+      reapplyCalls.push("reapply");
+      return Promise.resolve(null);
+    },
+  });
+  const ok = await rejected.report({
+    ok: true,
+    finished: true,
+    messageId: "assistant-1",
+    userMessageId: "user-1",
+    text: "worker answer",
+  });
+  await new Promise(setImmediate);
+  assert.equal(ok, false, "the rejected ACK still fails the settlement");
+  assert.deepEqual(reapplyCalls, ["reapply"], "the provider auto-title must still be replaced");
+
+  const skippedCalls = [];
+  const skipped = settlementHarness({
+    sessionRef: "br_abc",
+    generation: 7,
+    accepted: "user-1",
+    reapply: () => {
+      skippedCalls.push("reapply");
+      return Promise.resolve(null);
+    },
+  });
+  assert.equal(await skipped.report({ ok: true, finished: true, messageId: "assistant-1" }), false);
+  await new Promise(setImmediate);
+  assert.deepEqual(skippedCalls, [], "an unprovable settlement never arms a provider title write");
 });
 
 test("settlement has no physical tab focus dependency", () => {
