@@ -148,7 +148,16 @@ pub(crate) fn terminate_and_reap(child: &mut Child) {
         if kill_result != 0 {
             let _ = child.kill();
         }
-        let _ = child.wait();
+        // A process wedged in an uninterruptible syscall cannot be reaped even
+        // after SIGKILL, so the final wait is bounded too: blocking here would
+        // park the caller forever.
+        let reaped_by = Instant::now() + TERMINATE_GRACE;
+        while Instant::now() < reaped_by {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => thread::sleep(POLL_INTERVAL),
+            }
+        }
     }
     #[cfg(not(unix))]
     {

@@ -1460,9 +1460,20 @@ fn absolute_path(path: &Path) -> PathBuf {
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
-    if crate::macos_permissions::is_protected_user_path(left)
-        || crate::macos_permissions::is_protected_user_path(right)
-    {
+    paths_equivalent_with_protection(
+        left,
+        right,
+        crate::macos_permissions::is_protected_user_path_lexical(left)
+            || crate::macos_permissions::is_protected_user_path_lexical(right)
+            || crate::macos_permissions::is_protected_user_path(left)
+            || crate::macos_permissions::is_protected_user_path(right),
+    )
+}
+
+/// Testable seam: `protected` is the already-decided protection verdict, so the
+/// no-canonicalize branch can be exercised on any platform.
+fn paths_equivalent_with_protection(left: &Path, right: &Path, protected: bool) -> bool {
+    if protected {
         // Both candidates come from the live Herdr snapshot / explicit tool
         // argument. Do not canonicalize protected folders in the rotating
         // runtime merely to compare two project-root identities.
@@ -1789,6 +1800,39 @@ fn invalid(message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// user gets a bounded control path | Given two project roots under a macOS
+    /// privacy-protected folder | When they are compared | Then the comparison is
+    /// lexical and never canonicalizes either path.
+    #[test]
+    fn protected_project_roots_compare_without_canonicalizing() {
+        use super::paths_equivalent_with_protection;
+        use std::path::Path;
+        let left = Path::new("/Users/example/Documents/a");
+        let right = Path::new("/Users/example/Documents/b");
+        assert!(paths_equivalent_with_protection(left, left, true));
+        assert!(!paths_equivalent_with_protection(left, right, true));
+
+        // Unprotected paths still resolve, so an alias and its target compare
+        // equal: the bounded branch is a protection override, not a behaviour
+        // change for ordinary roots.
+        let root = std::env::temp_dir().join(format!(
+            "herdr-paths-equivalent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(unix)]
+        assert!(paths_equivalent_with_protection(&link, &target, false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
     use std::io::Write;
     use std::sync::Arc;

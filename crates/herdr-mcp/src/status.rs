@@ -537,6 +537,23 @@ pub fn print_doctor(
     );
     let macos_permissions = crate::macos_permissions::collect_status();
     println!("{}", documents_permission.doctor_line());
+    if documents_permission.tcc_prompt_pending() {
+        // #844: a pending macOS Documents prompt is what stalls every control
+        // request. Name the state, and point at the post-update record only when
+        // one actually exists: this line comes from the live probe, so citing a
+        // file that is not there would be a false trail.
+        let record = crate::macos_privacy::tcc_preflight_path(&paths.config_dir);
+        if record.is_file() {
+            println!(
+                "WARN tcc_prompt_pending probe=pending — answer the macOS Documents prompt; the post-update preflight record is {}",
+                record.display()
+            );
+        } else {
+            println!(
+                "WARN tcc_prompt_pending probe=pending — answer the macOS Documents prompt; control requests stay responsive once it is answered"
+            );
+        }
+    }
     println!(
         "{}",
         crate::macos_permissions::doctor_layer_from(&macos_permissions)
