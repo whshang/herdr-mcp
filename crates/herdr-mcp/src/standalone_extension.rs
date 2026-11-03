@@ -1417,17 +1417,28 @@ impl StagedExtension {
 /// `~/Documents` Chrome-facing alias: that alias is a symlink to `current` and
 /// follows the swap by itself, so an unattended update cannot prompt for
 /// protected-folder access.
-pub(crate) fn stage_release_extension(reference: &str) -> Result<StagedExtension, String> {
+/// Stage the standalone extension, optionally skipping the Chrome-facing alias
+/// probe.
+///
+/// `allow_alias_probe = false` is for an update whose broker preflight is still
+/// pending or was refused: probing `~/Documents/herdr-mcp/extension` there would be
+/// a second macOS Documents request in the same upgrade. The recorded
+/// `load_path_ready` stays false until a later stage can ask the broker again.
+pub(crate) fn stage_release_extension_with_probe_policy(
+    reference: &str,
+    allow_alias_probe: bool,
+) -> Result<StagedExtension, String> {
     validate_ref(reference)?;
     let home = home_dir()?;
     let source = GitHubSource::new()?;
-    stage_release_extension_in(&home, reference, &source)
+    stage_release_extension_in(&home, reference, &source, allow_alias_probe)
 }
 
 fn stage_release_extension_in(
     home: &Path,
     reference: &str,
     source: &dyn ExtensionSource,
+    allow_alias_probe: bool,
 ) -> Result<StagedExtension, String> {
     validate_ref(reference)?;
     let identity = crate::browser_extension_identity::official_standalone_identity()?;
@@ -1460,7 +1471,7 @@ fn stage_release_extension_in(
             source_commit: Some(commit),
             previous_extension_version,
             previous_source_commit,
-            load_path_ready: load_path_ready(&load_unpacked_path, &current),
+            load_path_ready: allow_alias_probe && load_path_ready(&load_unpacked_path, &current),
             load_unpacked_path: Some(load_unpacked_path),
         });
     }
@@ -1493,7 +1504,7 @@ fn stage_release_extension_in(
     if backup.exists() {
         let _ = fs::remove_dir_all(&backup);
     }
-    let ready = load_path_ready(&load_unpacked_path, &current);
+    let ready = gated_load_path_ready(&load_unpacked_path, &current, allow_alias_probe);
     Ok(StagedExtension {
         state: StagedExtensionState::Staged,
         reference: reference.to_owned(),
@@ -1863,7 +1874,26 @@ fn brokered_alias_ensure(path: &Path, expected: &Path) -> AliasProbe {
     }
 }
 
+// Test-only count of alias inspections performed by this thread, so a test can
+// prove that a path (staging when the broker preflight is pending) performs none.
+#[cfg(test)]
+thread_local! {
+    static ALIAS_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_alias_probes() -> usize {
+    ALIAS_PROBES.with(|count| count.get())
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_alias_probes() {
+    ALIAS_PROBES.with(|count| count.set(0));
+}
+
 fn inspect_alias(path: &Path, current: &Path) -> Value {
+    #[cfg(test)]
+    ALIAS_PROBES.with(|count| count.set(count.get() + 1));
     inspect_alias_with_probe(
         path,
         current,
@@ -2311,6 +2341,17 @@ fn json_string(value: Option<&Value>, field: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// `load_path_ready` behind the update's broker-probe policy.
+///
+/// Staging runs during an upgrade, and reading the Chrome-facing alias is a
+/// `~/Documents` request. When the broker preflight for this upgrade is still
+/// pending (or was refused) the upgrade has already spent its one prompt, so the
+/// alias is not probed again and readiness is recorded as false until a later
+/// status check can confirm it.
+fn gated_load_path_ready(load_path: &Path, current: &Path, allow_alias_probe: bool) -> bool {
+    allow_alias_probe && load_path_ready(load_path, current)
+}
+
 /// Whether a recorded Chrome-facing load path still reaches the managed
 /// `current` tree. `current` itself always counts as ready.
 fn load_path_ready(load_path: &Path, current: &Path) -> bool {
@@ -2359,6 +2400,39 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    /// user answers at most one prompt | Given a staged extension whose Chrome
+    /// alias lives outside the managed tree | When the broker preflight for this
+    /// upgrade is still pending | Then staging records readiness as false without
+    /// performing any alias probe, and only a permitted staging probes once.
+    #[test]
+    fn staging_skips_the_alias_probe_when_the_broker_preflight_is_pending() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-stage-probe-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        let alias = root.join("Documents/herdr-mcp/extension");
+        let current = root.join("Library/herdr-mcp/standalone/current");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&current, &alias).unwrap();
+
+        test_reset_alias_probes();
+        assert!(!super::gated_load_path_ready(&alias, &current, false));
+        assert_eq!(
+            test_alias_probes(),
+            0,
+            "a pending broker preflight must not probe the Documents alias again"
+        );
+
+        assert!(super::gated_load_path_ready(&alias, &current, true));
+        assert_eq!(test_alias_probes(), 1, "a permitted staging probes once");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// user keeps the default install working | Given a protected Documents
     /// alias and a broker that answers | When the alias is inspected | Then the
     /// real answer is reported (ready/missing), so install and update do not
@@ -3066,7 +3140,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         let source = FakeSource::release(&"a".repeat(40), "0.1.240");
 
-        let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap();
+        let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source, true).unwrap();
 
         assert_eq!(staged.state, StagedExtensionState::NotInstalled);
         assert_eq!(source.fetch_calls.get(), 0);
@@ -3087,7 +3161,7 @@ mod tests {
         seed_standalone_install(&home, &old_commit, "0.1.229");
         let source = FakeSource::release(&new_commit, "0.1.240");
 
-        let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap();
+        let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source, true).unwrap();
 
         assert_eq!(staged.state, StagedExtensionState::Staged);
         assert_eq!(staged.source_commit.as_deref(), Some(new_commit.as_str()));
@@ -3146,7 +3220,7 @@ mod tests {
         seed_standalone_install(&home, &commit, "0.1.230");
         let source = FakeSource::release(&commit, "0.1.240");
 
-        let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap();
+        let staged = stage_release_extension_in(&home, "v1.1.0-rc.12", &source, true).unwrap();
 
         assert_eq!(staged.state, StagedExtensionState::UpToDate);
         assert_eq!(source.fetch_calls.get(), 0);
@@ -3166,7 +3240,7 @@ mod tests {
         let mut source = FakeSource::release(&"f".repeat(40), "0.1.240");
         source.fail_path = Some("extension/background.js");
 
-        let error = stage_release_extension_in(&home, "v1.1.0-rc.12", &source).unwrap_err();
+        let error = stage_release_extension_in(&home, "v1.1.0-rc.12", &source, true).unwrap_err();
 
         assert!(error.contains("simulated download failure"), "{error}");
         let manifest = read_json(&current.join("manifest.json")).unwrap();
@@ -3244,7 +3318,7 @@ mod tests {
         set_mode(&base.join("state.json"), 0o600);
         let source = FakeSource::release(&"c".repeat(40), "0.1.240");
 
-        let staged = stage_release_extension_in(&home, "v1.1.0-rc.13", &source).unwrap();
+        let staged = stage_release_extension_in(&home, "v1.1.0-rc.13", &source, true).unwrap();
 
         assert_eq!(staged.state, StagedExtensionState::Staged);
         assert_eq!(mode_of(&current), 0o700);
@@ -3273,7 +3347,7 @@ mod tests {
         set_mode(&base.join("state.json"), 0o644);
         let source = FakeSource::release(&"e".repeat(40), "0.1.240");
 
-        let staged = stage_release_extension_in(&home, "v1.1.0-rc.13", &source).unwrap();
+        let staged = stage_release_extension_in(&home, "v1.1.0-rc.13", &source, true).unwrap();
 
         assert_eq!(staged.state, StagedExtensionState::Staged);
         assert_eq!(mode_of(&current), 0o700, "the swapped-in tree is private");

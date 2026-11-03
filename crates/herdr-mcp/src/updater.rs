@@ -343,6 +343,19 @@ fn worker_update_notices(worker_update: &Value) -> Value {
 fn stage_standalone_extension_after_update(
     reference: Option<&str>,
 ) -> Result<StagedExtension, String> {
+    stage_standalone_extension_after_update_with_policy(reference, true)
+}
+
+/// Stage the extension while controlling whether the Chrome-facing alias may be
+/// probed.
+///
+/// The update path passes `false` when the broker preflight is pending or was
+/// refused: the alias probe is a `~/Documents` request, and the same upgrade must
+/// not ask twice.
+fn stage_standalone_extension_after_update_with_policy(
+    reference: Option<&str>,
+    allow_alias_probe: bool,
+) -> Result<StagedExtension, String> {
     let reference = match reference {
         Some(reference) => reference.to_owned(),
         // The detached worker is the newly downloaded release binary, so its own
@@ -360,7 +373,10 @@ fn stage_standalone_extension_after_update(
                 "this runtime build carries no source commit; run `herdr-mcp extension standalone install` to stage the extension".to_owned()
             })?,
     };
-    crate::standalone_extension::stage_release_extension(&reference)
+    crate::standalone_extension::stage_release_extension_with_probe_policy(
+        &reference,
+        allow_alias_probe,
+    )
 }
 
 /// Report the result of update-time extension staging without changing the
@@ -1315,13 +1331,10 @@ fn apply_inner(
                     || reconcile_worker_with_active_runtime(&paths),
                 );
                 report_worker_update_notice(&worker_update, worker_chain);
-                // The detached worker stages the extension right after its
-                // service install commits. Re-running staging here with the
-                // target release commit is idempotent (the worker already
-                // recorded that commit) and lets the foreground result carry the
-                // exact Reload/refresh action.
-                let staging =
-                    stage_standalone_extension_after_update(Some(&plan.identity.source_commit));
+                // The detached worker already staged the extension and persisted
+                // the result. This process is the previous release: staging again
+                // would probe the Chrome-facing `~/Documents` alias a second time
+                // in the same upgrade, so it only reports what was recorded.
                 let extension =
                     standalone_extension_report(&paths, Some(&plan.identity.source_commit));
                 let (mut payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
@@ -1336,7 +1349,8 @@ fn apply_inner(
                     worker_update,
                     worker_chain,
                     extension,
-                    extension_staging: staging.ok(),
+                    // The worker owns staging; this process reports only.
+                    extension_staging: None,
                 });
                 // #844: the worker (the newly activated binary) already ran the
                 // migrate-then-preflight step and persisted both records. This
@@ -2510,32 +2524,19 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
         let install = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false });
         let succeeded = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
         if succeeded {
-            // The newly activated release is the only process that knows which
-            // extension version belongs to it, and the detached worker is where
-            // both the interactive and the queued `update apply` paths converge.
-            // Staging is best-effort: the Runtime update already committed.
-            let staging = stage_standalone_extension_after_update(None);
-            report_standalone_extension_staging(&staging);
-            let detail = match staging {
-                Ok(staged) => format!(
-                    "service install committed and health gate passed; {}",
-                    staged.summary()
-                ),
-                Err(error) => format!(
-                    "service install committed and health gate passed; extension staging did not complete: {error}"
-                ),
-            };
             // #844: this process is the newly downloaded binary, and every apply
             // path (interactive, `update auto`, and the queued path with no
             // foreground watcher) converges here. That makes it the only place
             // where the broker migration reliably runs on the first apply of this
             // release: the foreground updater that installed it is the previous
-            // binary and does not contain this code. Migration has no Documents
-            // syscall and is best-effort, so a failure never changes the job state.
+            // binary and does not contain this code.
+            //
+            // Order matters for the one-prompt budget: migrate (a file write, no
+            // Documents syscall), run the single bounded preflight, and only then
+            // stage the extension. Staging may probe the Chrome-facing alias, so
+            // it uses the preflight result instead of asking a second time.
+            let mut broker_preflight_pending = false;
             if let Ok(paths) = crate::paths::RuntimePaths::discover() {
-                // Same ordering as the foreground: migrate (no Documents syscall)
-                // and only then run the one bounded preflight, so the single
-                // prompt belongs to the broker that stays installed.
                 let mut scratch = json!({});
                 let installed_revision =
                     crate::tcc_broker::installed_compat_revision(&paths.config_dir);
@@ -2548,9 +2549,36 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
                     },
                     crate::macos_privacy::preflight_after_activation,
                 );
+                broker_preflight_pending = scratch
+                    .get("tcc_prompt_pending")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if let Some(migration) = scratch.get("tcc_broker_migration") {
                     persist_broker_migration(&paths.config_dir, migration);
                 }
+            }
+            // The newly activated release is the only process that knows which
+            // extension version belongs to it, and the detached worker is where
+            // both the interactive and the queued `update apply` paths converge.
+            // Staging is best-effort: the Runtime update already committed.
+            let staging = stage_standalone_extension_after_update_with_policy(
+                None,
+                !broker_preflight_pending,
+            );
+            report_standalone_extension_staging(&staging);
+            let detail = match staging {
+                Ok(staged) => format!(
+                    "service install committed and health gate passed; {}",
+                    staged.summary()
+                ),
+                Err(error) => format!(
+                    "service install committed and health gate passed; extension staging did not complete: {error}"
+                ),
+            };
+            if broker_preflight_pending {
+                eprintln!(
+                    "[herdr-mcp update] The macOS Documents prompt is still unanswered; the Chrome load-path alias was not probed again, so the extension may report load_path_ready=false until `herdr-mcp extension standalone status` can confirm it."
+                );
             }
             store.update_update_job(job_id, "succeeded", Some(&detail), None, now_ms_i64())?;
             crate::local_agent_skill::sync_after_install_best_effort();
@@ -5049,16 +5077,31 @@ mod tests {
             &root,
             &json!({"state": "migrated", "installed_revision": 4, "target_revision": 5}),
         );
+        // A real preflight record, written through the same function the worker
+        // uses, with an unanswered prompt.
+        crate::macos_privacy::persist_tcc_preflight(
+            &root,
+            &crate::macos_privacy::DocumentsPermission::TimedOut,
+        )
+        .unwrap();
         let mut payload = json!({"ok": true, "code": "update_succeeded", "notices": []});
-        // The foreground only has the persisted preflight path available; write
-        // the worker's record and read it back through the same helper.
         attach_persisted_tcc_records(&mut payload, &root);
 
         assert_eq!(payload["tcc_broker_migration"]["state"], "migrated");
         assert_eq!(payload["tcc_broker_migration"]["installed_revision"], 4);
-        assert_eq!(payload["tcc_preflight"]["probe"], "unknown");
-        assert_eq!(payload["tcc_prompt_pending"], false);
+        // The pending prompt must survive the round-trip: a dropped record would
+        // read back as the empty-file default and hide a stuck upgrade.
+        assert_eq!(payload["tcc_preflight"]["probe"], "pending");
+        assert_eq!(payload["tcc_preflight"]["prompt_pending"], true);
+        assert_eq!(payload["tcc_prompt_pending"], true);
         assert_eq!(payload["ok"], true);
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "tcc_prompt_pending")
+            .expect("a pending prompt must be reported");
+        assert_eq!(notice["fatal"], false);
         let _ = std::fs::remove_dir_all(&root);
     }
 
