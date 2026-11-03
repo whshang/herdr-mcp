@@ -389,8 +389,8 @@ fn map_alias_probe_exit(code: Option<i32>) -> BrokeredAlias {
         Some(ALIAS_IO_ERROR_EXIT) => BrokeredAlias::Denied(
             "the broker hit an I/O error while checking the Documents alias".to_owned(),
         ),
-        // Only exit 1 / no code means the installed broker did not understand the
-        // argv at all: `herdr-mcp <unknown-subcommand>` prints usage and returns
+        // Exit 1 is the only "broker does not understand the argv" signal:
+        // `herdr-mcp <unknown-subcommand>` prints usage and returns
         // `ExitCode::FAILURE` (1) from the CLI error path, which is exactly what a
         // pre-#844 broker does with `__documents-alias-probe`/`-ensure`.
         Some(1) => BrokeredAlias::BrokerOutdated,

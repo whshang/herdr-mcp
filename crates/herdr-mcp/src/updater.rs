@@ -745,6 +745,21 @@ fn attach_post_commit_tcc<M, P>(
     attach_tcc_preflight(payload, preflight(config_dir));
 }
 
+/// Attach the records the worker already wrote, without migrating or probing.
+///
+/// The foreground `update apply` finishes inside the *previous* release binary,
+/// so running the post-commit step here would migrate the broker and raise a
+/// second Documents prompt for an upgrade that already had its one prompt. This
+/// only reads `update/tcc-broker-migration.json` and `update/tcc-preflight.json`
+/// and reports them with the same shape the worker used.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn attach_persisted_tcc_records(payload: &mut Value, config_dir: &std::path::Path) {
+    let migration = persisted_broker_migration(config_dir);
+    let preflight = crate::macos_privacy::persisted_tcc_preflight(config_dir);
+    attach_tcc_broker_migration(payload, migration);
+    attach_tcc_preflight(payload, preflight);
+}
+
 /// Persist the broker migration outcome next to the other update artifacts so
 /// `update status` can report it without re-running codesign or a migration.
 fn persist_broker_migration(config_dir: &std::path::Path, migration: &Value) {
@@ -1323,24 +1338,12 @@ fn apply_inner(
                     extension,
                     extension_staging: staging.ok(),
                 });
-                // #844: migrate the broker first (no Documents syscall), then run
-                // exactly one bounded preflight against the broker that stays
-                // installed. Both results are persisted so `update status` never
-                // has to probe.
-                let installed_revision =
-                    crate::tcc_broker::installed_compat_revision(&paths.config_dir);
-                attach_post_commit_tcc(
-                    &mut payload,
-                    &paths.config_dir,
-                    installed_revision,
-                    |config_dir| {
-                        crate::tcc_broker::migrate_for_explicit_reauthorization(config_dir)
-                    },
-                    crate::macos_privacy::preflight_after_activation,
-                );
-                if let Some(migration) = payload.get("tcc_broker_migration") {
-                    persist_broker_migration(&paths.config_dir, migration);
-                }
+                // #844: the worker (the newly activated binary) already ran the
+                // migrate-then-preflight step and persisted both records. This
+                // foreground process is the previous release: it must not migrate
+                // or probe again, or the operator answers a second Documents
+                // prompt. Report what the worker recorded.
+                attach_persisted_tcc_records(&mut payload, &paths.config_dir);
                 print_json(&payload)?;
                 return Ok(code);
             }
@@ -5027,6 +5030,38 @@ mod tests {
         assert_eq!(chained["code"], "worker_update_succeeded");
     }
 
+    /// user answers at most one prompt | Given a worker that already persisted
+    /// the migration and preflight records | When the watched foreground result is
+    /// assembled | Then it reports exactly those records: no codesign, no
+    /// migration and no Documents probe run in the foreground, so no second
+    /// prompt can be raised.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn watched_foreground_attaches_only_the_persisted_records() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-foreground-records-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        // Values a live probe could never produce: if the foreground probed or
+        // migrated, these sentinels would be replaced.
+        persist_broker_migration(
+            &root,
+            &json!({"state": "migrated", "installed_revision": 4, "target_revision": 5}),
+        );
+        let mut payload = json!({"ok": true, "code": "update_succeeded", "notices": []});
+        // The foreground only has the persisted preflight path available; write
+        // the worker's record and read it back through the same helper.
+        attach_persisted_tcc_records(&mut payload, &root);
+
+        assert_eq!(payload["tcc_broker_migration"]["state"], "migrated");
+        assert_eq!(payload["tcc_broker_migration"]["installed_revision"], 4);
+        assert_eq!(payload["tcc_preflight"]["probe"], "unknown");
+        assert_eq!(payload["tcc_prompt_pending"], false);
+        assert_eq!(payload["ok"], true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// user answers at most one prompt | Given a committed Runtime update whose
     /// installed broker predates the alias subcommands | When the post-commit TCC
     /// steps run | Then the broker is migrated BEFORE the single preflight, and
@@ -5106,7 +5141,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// user gets the alias subcommands installed by the upgrade | Given an    /// user gets the alias subcommands installed by the upgrade | Given an
+    /// user gets the alias subcommands installed by the upgrade | Given an
     /// installed broker at an older compatibility revision | When the committed
     /// update path runs the broker migration | Then it performs exactly one
     /// explicit-reauthorization migration and reports it as a non-fatal notice,
