@@ -54,6 +54,23 @@ function commitAll(root, message) {
   git(root, ["commit", "-q", "-m", message]);
 }
 
+/** A tag-less shallow clone of `origin`, with the local identity a fresh clone lacks. */
+function shallowClone(origin) {
+  const clone = `${origin}-shallow`;
+  git(cloneParent(origin), [
+    "clone",
+    "-q",
+    "--depth=1",
+    "--no-tags",
+    `file://${origin}`,
+    clone,
+  ]);
+  roots.push(clone);
+  git(clone, ["config", "user.email", "guard@example.test"]);
+  git(clone, ["config", "user.name", "Extension Guard"]);
+  return clone;
+}
+
 function releaseTag(root, version, tag = "v1.0.0") {
   writeExtension(root, { version, marker: "released-bundle" });
   commitAll(root, `release ${version}`);
@@ -181,5 +198,43 @@ test(
     assert.equal(result.status, 0, result.stdout);
     assert.match(result.stdout, /PASS/);
     assert.match(result.stdout, /0\.1\.229 -> 0\.1\.230/);
+  },
+);
+
+test(
+  "user gets the newest published release as baseline | Given origin also carries archive/v1.0-* evidence tags beside two release candidates | When the guard runs in a shallow checkout with no local tags | Then it names v1.1.0-rc.14 and never the archive tag",
+  () => {
+    const origin = repository();
+    releaseTag(origin, "0.1.90", "archive/v1.0-evidence-semantics-20260905");
+    releaseTag(origin, "0.1.200", "v1.1.0-rc.9");
+    releaseTag(origin, "0.1.243", "v1.1.0-rc.14");
+    const clone = shallowClone(origin);
+    writeFileSync(join(clone, "README.md"), "docs only\n");
+    commitAll(clone, "docs: unrelated change");
+    assert.equal(git(clone, ["tag", "--list", "v*"]), "");
+
+    const result = runGuard(clone, []);
+
+    assert.equal(result.status, 0, result.stdout);
+    assert.match(result.stdout, /unchanged since v1\.1\.0-rc\.14 \(0\.1\.243\)/);
+    assert.doesNotMatch(result.stdout, /archive/);
+  },
+);
+
+test(
+  "user gets the numerically newest release candidate | Given origin has v1.1.0-rc.9 and v1.1.0-rc.14 | When the guard runs in a shallow checkout with no local tags | Then it names rc.14 instead of the lexicographically earlier rc.9",
+  () => {
+    const origin = repository();
+    releaseTag(origin, "0.1.200", "v1.1.0-rc.9");
+    releaseTag(origin, "0.1.243", "v1.1.0-rc.14");
+    const clone = shallowClone(origin);
+    writeFileSync(join(clone, "README.md"), "docs only\n");
+    commitAll(clone, "docs: unrelated change");
+    assert.equal(git(clone, ["tag", "--list", "v*"]), "");
+
+    const result = runGuard(clone, []);
+
+    assert.equal(result.status, 0, result.stdout);
+    assert.match(result.stdout, /unchanged since v1\.1\.0-rc\.14 \(0\.1\.243\)/);
   },
 );

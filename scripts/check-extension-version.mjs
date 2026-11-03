@@ -65,6 +65,42 @@ function resolves(ref) {
   return git(["rev-parse", "--verify", `${ref}^{commit}`], { allowFailure: true }) !== null;
 }
 
+/**
+ * A tag the guard may compare against: `v<dotted numeric core>` with an optional
+ * pre-release. Evidence tags such as `archive/v1.0-evidence-semantics-20260905`
+ * share a `v*` tail, so shape — not just the `v` prefix — decides the baseline.
+ */
+const RELEASE_TAG = /^v\d+(?:\.\d+)*(?:-[0-9A-Za-z.-]+)?$/;
+
+function isReleaseVersionTag(tag) {
+  return RELEASE_TAG.test(String(tag).trim());
+}
+
+/** Compare dot-separated pre-release identifiers: numeric by value, then lexical. */
+function comparePrereleaseIdentifiers(left, right) {
+  const a = left ? left.split(".") : [];
+  const b = right ? right.split(".") : [];
+  if (left === right) return 0;
+  if (a.length === 0) return 1;
+  if (b.length === 0) return -1;
+  const length = Math.max(a.length, b.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = a[index];
+    const rightPart = b[index];
+    if (leftPart === undefined) return -1;
+    if (rightPart === undefined) return 1;
+    if (leftPart === rightPart) continue;
+    const leftNumeric = /^\d+$/.test(leftPart);
+    const rightNumeric = /^\d+$/.test(rightPart);
+    if (leftNumeric && rightNumeric) {
+      return Number(leftPart) < Number(rightPart) ? -1 : 1;
+    }
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return leftPart < rightPart ? -1 : 1;
+  }
+  return 0;
+}
+
 /** Order dotted numeric versions; pre-release suffixes sort before the release. */
 export function compareExtensionVersions(left, right) {
   const parse = (value) => {
@@ -83,15 +119,12 @@ export function compareExtensionVersions(left, right) {
     const rightPart = b.numbers[index] ?? 0;
     if (leftPart !== rightPart) return leftPart < rightPart ? -1 : 1;
   }
-  if (a.prerelease === b.prerelease) return 0;
-  if (!a.prerelease) return 1;
-  if (!b.prerelease) return -1;
-  return a.prerelease < b.prerelease ? -1 : 1;
+  return comparePrereleaseIdentifiers(a.prerelease, b.prerelease);
 }
 
 function newestReleaseTags() {
   const local = git(["tag", "--list", "v*", "--sort=-v:refname"], { allowFailure: true });
-  const tags = local ? local.split("\n").filter(Boolean) : [];
+  const tags = local ? local.split("\n").filter(isReleaseVersionTag) : [];
   if (tags.some(resolves)) return tags;
   // A shallow CI checkout has no tags; fetch just the tag refs so the guard can
   // still compare against the last real release instead of silently skipping.
@@ -99,18 +132,19 @@ function newestReleaseTags() {
     allowFailure: true,
   });
   if (!remote) return tags;
+  // `ls-remote` matches `v*` against the last path segment, so it also returns
+  // `refs/tags/archive/v1.0-*` evidence tags. Only release-shaped names can be
+  // a baseline: an archive tag's `archive/v1.0` core is not dotted numeric, so
+  // comparing it raised and the old fail-open sort kept ls-remote order.
   const remoteTags = remote
     .split("\n")
     .filter(Boolean)
     .map((line) => line.split("\t")[1]?.replace("refs/tags/", "") || "")
-    .filter(Boolean);
-  remoteTags.sort((left, right) => {
-    try {
-      return -compareExtensionVersions(left.replace(/^v/, ""), right.replace(/^v/, ""));
-    } catch {
-      return 0;
-    }
-  });
+    .filter(isReleaseVersionTag);
+  // After the shape filter every name parses, so ordering never fails open.
+  remoteTags.sort((left, right) =>
+    -compareExtensionVersions(left.replace(/^v/, ""), right.replace(/^v/, "")),
+  );
   for (const tag of remoteTags) {
     if (resolves(tag)) return [tag, ...tags];
     // The destination refspec is required: a source-only refspec leaves the
