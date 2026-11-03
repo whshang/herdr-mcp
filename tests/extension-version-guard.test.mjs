@@ -35,6 +35,11 @@ function repository() {
   return root;
 }
 
+/** Shallow clones must come from a parent directory: the origin dir nests the clone path. */
+function cloneParent(origin) {
+  return dirname(origin);
+}
+
 function writeExtension(root, { version, marker = "bundle-1", fileName = "background.js" }) {
   mkdirSync(join(root, "extension"), { recursive: true });
   writeFileSync(
@@ -47,6 +52,23 @@ function writeExtension(root, { version, marker = "bundle-1", fileName = "backgr
 function commitAll(root, message) {
   git(root, ["add", "-A"]);
   git(root, ["commit", "-q", "-m", message]);
+}
+
+/** A tag-less shallow clone of `origin`, with the local identity a fresh clone lacks. */
+function shallowClone(origin) {
+  const clone = `${origin}-shallow`;
+  git(cloneParent(origin), [
+    "clone",
+    "-q",
+    "--depth=1",
+    "--no-tags",
+    `file://${origin}`,
+    clone,
+  ]);
+  roots.push(clone);
+  git(clone, ["config", "user.email", "guard@example.test"]);
+  git(clone, ["config", "user.name", "Extension Guard"]);
+  return clone;
 }
 
 function releaseTag(root, version, tag = "v1.0.0") {
@@ -145,5 +167,74 @@ test(
 
     assert.equal(result.status, 0, result.stdout);
     assert.match(result.stdout, /SKIP/);
+  },
+);
+
+test(
+  "user gets a verified baseline in a shallow CI checkout | Given the release tag exists only on origin and the checkout is shallow with no tags | When the guard runs | Then it fetches the tag into refs/tags and compares against the released version",
+  () => {
+    const origin = repository();
+    releaseTag(origin, "0.1.229");
+    const clone = `${origin}-shallow`;
+    git(cloneParent(origin), [
+      "clone",
+      "-q",
+      "--depth=1",
+      "--no-tags",
+      `file://${origin}`,
+      clone,
+    ]);
+    roots.push(clone);
+    // A fresh clone does not inherit origin's repo-local git identity, and CI
+    // runners have none globally, so set it before committing in the clone.
+    git(clone, ["config", "user.email", "guard@example.test"]);
+    git(clone, ["config", "user.name", "Extension Guard"]);
+    writeExtension(clone, { version: "0.1.230", marker: "bundle-2" });
+    commitAll(clone, "fix(extension): ship the next build");
+    assert.equal(git(clone, ["tag", "--list", "v*"]), "");
+
+    const result = runGuard(clone, []);
+
+    assert.equal(result.status, 0, result.stdout);
+    assert.match(result.stdout, /PASS/);
+    assert.match(result.stdout, /0\.1\.229 -> 0\.1\.230/);
+  },
+);
+
+test(
+  "user gets the newest published release as baseline | Given origin also carries archive/v1.0-* evidence tags beside two release candidates | When the guard runs in a shallow checkout with no local tags | Then it names v1.1.0-rc.14 and never the archive tag",
+  () => {
+    const origin = repository();
+    releaseTag(origin, "0.1.90", "archive/v1.0-evidence-semantics-20260905");
+    releaseTag(origin, "0.1.200", "v1.1.0-rc.9");
+    releaseTag(origin, "0.1.243", "v1.1.0-rc.14");
+    const clone = shallowClone(origin);
+    writeFileSync(join(clone, "README.md"), "docs only\n");
+    commitAll(clone, "docs: unrelated change");
+    assert.equal(git(clone, ["tag", "--list", "v*"]), "");
+
+    const result = runGuard(clone, []);
+
+    assert.equal(result.status, 0, result.stdout);
+    assert.match(result.stdout, /unchanged since v1\.1\.0-rc\.14 \(0\.1\.243\)/);
+    assert.doesNotMatch(result.stdout, /archive/);
+  },
+);
+
+test(
+  "user gets the numerically newest release candidate | Given origin has v1.1.0-rc.9 and v1.1.0-rc.14 | When the guard runs in a shallow checkout with no local tags | Then it names rc.14 instead of the lexicographically earlier rc.9",
+  () => {
+    const origin = repository();
+    releaseTag(origin, "0.1.200", "v1.1.0-rc.9");
+    releaseTag(origin, "0.1.243", "v1.1.0-rc.14");
+    const clone = shallowClone(origin);
+    writeFileSync(join(clone, "README.md"), "docs only\n");
+    commitAll(clone, "docs: unrelated change");
+    assert.equal(git(clone, ["tag", "--list", "v*"]), "");
+
+    const result = runGuard(clone, []);
+
+    assert.equal(result.status, 0, result.stdout);
+    assert.match(result.stdout, /unchanged since v1\.1\.0-rc\.14 \(0\.1\.243\)/);
   },
 );
