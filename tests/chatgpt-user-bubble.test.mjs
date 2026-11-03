@@ -157,6 +157,29 @@ test("user accepted App identity resolves through a bubble carrier | Given a dat
   assert.deepEqual(identity, [{ name: "herdr", path: "connectors/herdr" }]);
 });
 
+test("user gets a required-App create confirmed when the accepted bubble renders the chip as a prompt link | Given an accepted turn whose App chip only carries data-prompt-link-href app:// and a $label | When the accepted identity is read | Then the provider-owned chip is the requested App identity", () => {
+  const chip = el({ tag: "span", attrs: {
+    "data-appearance": "inline-mention",
+    "data-prompt-link-href": "app://g-abc123-herdr",
+    "data-prompt-link-label": "$herdr-mcp",
+  } });
+  const carrier = el({ attrs: { "data-message-id": "u1" }, children: [el({ attrs: { "data-user-message-bubble": "true" }, children: [chip] })] });
+  const adapter = loadAdapter(documentOf(el({ children: [carrier] })));
+  const identity = [...adapter.getAcceptedUserAppIdentity("u1")].map((app) => ({ name: app.name, path: app.path }));
+  assert.deepEqual(identity, [{ name: "herdr-mcp", path: "app://g-abc123-herdr" }]);
+});
+
+test("user never gets a plain-text mention accepted as the App identity | Given a chip without a provider-owned app:// href | When the accepted identity is read | Then no App is reported", () => {
+  const typed = el({ tag: "span", attrs: {
+    "data-appearance": "inline-mention",
+    "data-prompt-link-href": "https://example.com/herdr",
+    "data-prompt-link-label": "$herdr-mcp",
+  } });
+  const carrier = el({ attrs: { "data-message-id": "u1" }, children: [el({ attrs: { "data-user-message-bubble": "true" }, children: [typed] })] });
+  const adapter = loadAdapter(documentOf(el({ children: [carrier] })));
+  assert.deepEqual([...adapter.getAcceptedUserAppIdentity("u1")], []);
+});
+
 function loadBrowserPerformance() {
   const context = vm.createContext({ console, Date, Math });
   const source = readFileSync(new URL("../extension/performance-core.js", import.meta.url), "utf8");
