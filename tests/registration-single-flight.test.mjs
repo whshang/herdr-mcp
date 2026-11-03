@@ -14,6 +14,9 @@ const wakeSource = readFileSync(new URL("../extension/content/wake.js", import.m
 
 const KEY_A = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const KEY_B = "https://claude.ai/chat/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+// The Project-scoped new-chat surface from #847: a `/g/g-p-…` route whose
+// registration gate must publish a scope before any create may submit.
+const PROJECT_KEY = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978";
 
 function sliceSource(startMarker, endMarker, what) {
   const start = wakeSource.indexOf(startMarker);
@@ -42,16 +45,20 @@ async function flush(turns = 12) {
   for (let i = 0; i < turns; i += 1) await Promise.resolve();
 }
 
-function registrationHarness(initialConvKey = KEY_A, { site = "claude", projectSequence = null } = {}) {
+function registrationHarness(initialConvKey = KEY_A, { site = "claude", projectSequence = null, accountObservation = null } = {}) {
   const sends = [];
   let resolveAccount;
   let resolveCatalog;
   const accountBox = { promise: new Promise((resolve) => { resolveAccount = resolve; }) };
   const catalogBox = { promise: new Promise((resolve) => { resolveCatalog = resolve; }) };
+  // Optional provider-shaped account observation. When present it is the only
+  // identity source, exactly like ADAPTER.getAccountObservation() in wake.js.
+  const observationBox = { value: accountObservation, get() { return this.value; } };
   const api = new Function(
     "accountBox",
     "catalogBox",
     "sends",
+    "observationBox",
     `
     let currentConvKey = ${JSON.stringify(initialConvKey)};
     let currentUrl = currentConvKey;
@@ -66,6 +73,7 @@ function registrationHarness(initialConvKey = KEY_A, { site = "claude", projectS
       name: ${JSON.stringify(site)},
       getConversationKey: () => currentConvKey,
       resolveProjectIdentity: async () => null,
+      ${accountObservation ? "getAccountObservation: () => observationBox.get()," : ""}
     };
     const location = { get href() { return currentUrl; } };
     const runtimeAlive = () => true;
@@ -117,13 +125,15 @@ function registrationHarness(initialConvKey = KEY_A, { site = "claude", projectS
       },
     };
     `,
-  )(accountBox, catalogBox, sends);
+  )(accountBox, catalogBox, sends, observationBox);
   return {
     register: (reason, options) => api.register(reason, options),
     setRoute: (value) => api.setRoute(value),
     state: () => api.state(),
     status: () => api.status(),
     sends,
+    // Later observations can converge (or start failing) mid-registration.
+    setAccountObservation(value) { observationBox.value = value; },
     // Resolve the stalled pre-registration work and make later runs flow.
     releaseAccount(identity = "opaque-account") {
       resolveAccount(identity);
@@ -296,6 +306,52 @@ test("user cannot register a switched project | Given the conversation's project
   assert.deepEqual(harness.sends.map((send) => send.payload.type), ["h2w_clear_scope"],
     "a project change must refuse registration and drop the stale tab scope");
   assert.equal(harness.status(), "project_changed", "the refusal reason stays a fixed enum");
+});
+
+test("user creates a chat inside a ChatGPT Project | Given the Project new-chat route and one reconciled account identity | When registration runs | Then exactly one h2w_register carries that identity without waiting on the sidebar catalog", async () => {
+  const harness = registrationHarness(PROJECT_KEY, {
+    site: "chatgpt",
+    accountObservation: { nativeIdentity: "user-abc", email: null },
+  });
+  const registration = harness.register("identity-recovery");
+  await flush();
+
+  assert.deepEqual(harness.sends.map((send) => send.payload.type), ["h2w_register"],
+    "a Project route must publish its scope from the observed identity alone");
+  assert.equal(harness.sends[0].payload.convKey, PROJECT_KEY);
+  assert.equal(harness.sends[0].payload.accountNativeIdentity, "user-abc");
+  assert.equal(harness.sends[0].payload.browserSessionReservationRef, null);
+
+  harness.sends[0].resolve({
+    browser_session_ref: "br_project",
+    browser_account_ref: "br_account_project",
+    browser_generation: 7,
+    bound: false,
+  });
+  const result = await registration;
+  assert.equal(result?.browser_session_ref, "br_project");
+  assert.equal(harness.status(), "registry_observed");
+});
+
+test("user still refuses a genuine Project identity mismatch | Given the Project new-chat route and a refused account observation | When registration runs | Then nothing is registered and the tab scope is cleared", async () => {
+  const harness = registrationHarness(PROJECT_KEY, {
+    site: "chatgpt",
+    accountObservation: {
+      nativeIdentity: null,
+      email: null,
+      reason: "native_id_conflict_unverified_email",
+      idRelation: "me_differs_session_user_and_account_id",
+      bearerRelation: "bearer_token_unavailable",
+    },
+  });
+  const registration = harness.register("identity-recovery");
+  await flush();
+
+  assert.equal(await registration, null);
+  assert.deepEqual(harness.sends.map((send) => send.payload.type), ["h2w_clear_scope"],
+    "a real identity mismatch must never publish a scope, so no create can submit");
+  assert.equal(harness.status(), "id_conflict_unverified_email",
+    "the refusal keeps a precise conflict reason instead of a handshake-delay guess");
 });
 
 test("user clears a scope it cannot re-verify | Given a ChatGPT tab without an authenticated identity | When registration runs | Then nothing is published and the tab scope is cleared", async () => {

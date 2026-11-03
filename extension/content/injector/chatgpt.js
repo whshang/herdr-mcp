@@ -86,6 +86,25 @@ class ChatGPTAdapter extends BaseAdapter {
     return (await this.getAccountObservation(timeoutMs))?.nativeIdentity ?? null;
   }
 
+  // #847: the two authenticated endpoints do not share one ID namespace. /me
+  // answers a user id, while a ChatGPT session can carry a workspace/account
+  // `id` beside `user.id` and `account.id`; a Project/workspace route (the
+  // `/g/g-p-…` surface) is exactly where that extra top-level id appears. Only
+  // a user-namespace id may become the account identity, so a nested `user.id`
+  // wins and a top-level `id` is used only when it is not the account id.
+  // `account.id` is never promoted to a user identity: doing so compared a
+  // workspace id with /me's user id and reported a false identity conflict for
+  // the same signed-in account, which refused registration and surfaced later
+  // as a scope handshake delay on Project-scoped create.
+  accountUserId(payload) {
+    const nestedUserId = typeof payload?.user?.id === "string" ? payload.user.id.trim() : "";
+    if (nestedUserId) return nestedUserId;
+    const accountId = typeof payload?.account?.id === "string" ? payload.account.id.trim() : "";
+    const topLevelId = typeof payload?.id === "string" ? payload.id.trim() : "";
+    if (!topLevelId || (accountId && topLevelId === accountId)) return null;
+    return topLevelId;
+  }
+
   // One authenticated observation of the signed-in account. The two provider
   // endpoints are cross-checked instead of trusting the first response: an old
   // tab can retain the former account's /me payload after an account switch.
@@ -120,8 +139,10 @@ class ChatGPTAdapter extends BaseAdapter {
         if (!response.ok) continue;
         this._accountIdentity429Count = 0;
         const payload = await response.json();
-        const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-        const observedIdentity = typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+        const observedIdentity = this.accountUserId(payload);
+        // An endpoint that exposes no user-namespace id contributes no
+        // comparable identity: skip it instead of manufacturing a conflict from
+        // a workspace/account id in a different namespace.
         if (!observedIdentity) continue;
         const observedEmail = this.displayEmailFromPayload(payload);
         // An old tab can retain the former account's authenticated /me response

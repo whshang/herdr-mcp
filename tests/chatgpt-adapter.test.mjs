@@ -266,6 +266,72 @@ test("user rejects inconsistent ChatGPT account identity | Given authenticated e
   assert.equal(consistent.email, "prior@example.com");
 });
 
+test("user registers the signed-in account inside a ChatGPT Project | Given a workspace-scoped session whose top-level id is the workspace while user.id matches /me | When the account is observed | Then the user id is the canonical identity and no identity conflict is reported", async () => {
+  const payloads = {
+    "/backend-api/me": { id: "user-abc", account: { id: "ws-workspace" } },
+    "/api/auth/session": {
+      id: "ws-workspace",
+      user: { id: "user-abc" },
+      account: { id: "ws-workspace" },
+    },
+  };
+  const fetch = async (url) => ({ ok: true, json: async () => payloads[url] });
+  const adapter = loadAdapterWithDocument({}, fetch);
+
+  const projectScoped = await adapter.getAccountObservation();
+  assert.equal(projectScoped.nativeIdentity, "user-abc", "a workspace top-level id must not shadow the session user id");
+  assert.equal(projectScoped.reason, undefined, "the same signed-in account is not an identity conflict");
+  assert.equal(projectScoped.email, null, "no email is still a registerable identity when the ids agree");
+
+  // A Project route can also answer /me with the workspace id on top and the
+  // user id nested; the user-namespace id still wins.
+  payloads["/backend-api/me"] = { id: "ws-workspace", user: { id: "user-abc" } };
+  const nestedMe = await adapter.getAccountObservation();
+  assert.equal(nestedMe.nativeIdentity, "user-abc");
+
+  // An endpoint that exposes only an account id contributes no comparable
+  // identity: it is skipped instead of being compared with /me's user id.
+  delete payloads["/api/auth/session"].user;
+  delete payloads["/api/auth/session"].id;
+  const accountOnlySession = await adapter.getAccountObservation();
+  assert.equal(accountOnlySession.nativeIdentity, "user-abc");
+  assert.equal(accountOnlySession.reason, undefined);
+});
+
+test("user refuses a genuinely different Project login | Given /me and the session name different users under one workspace id | When the account is observed | Then no identity is published and the conflict reason stays precise", async () => {
+  const payloads = {
+    "/backend-api/me": { id: "user-abc" },
+    "/api/auth/session": {
+      id: "ws-workspace",
+      user: { id: "user-other" },
+      account: { id: "ws-workspace" },
+    },
+  };
+  const fetch = async (url) => ({ ok: true, json: async () => payloads[url] });
+  const adapter = loadAdapterWithDocument({}, fetch);
+
+  const mismatch = await adapter.getAccountObservation();
+  assert.equal(mismatch.nativeIdentity, null, "a real user-id mismatch must still fail closed before submit");
+  assert.equal(mismatch.email, null);
+  assert.equal(mismatch.reason, "native_id_conflict_unverified_email");
+  assert.equal(mismatch.idRelation, "me_differs_session_user_and_account_id");
+  assert.equal(mismatch.bearerRelation, "bearer_token_unavailable");
+
+  payloads["/backend-api/me"].email = "one@example.com";
+  payloads["/api/auth/session"].user.email = "two@example.com";
+  const differentEmails = await adapter.getAccountObservation();
+  assert.equal(differentEmails.nativeIdentity, null);
+  assert.equal(differentEmails.reason, "native_id_conflict_different_email");
+
+  // The same user id in both endpoints is never a conflict, even when /me also
+  // reports the workspace account id.
+  payloads["/api/auth/session"].user.id = "user-abc";
+  payloads["/api/auth/session"].user.email = "one@example.com";
+  const consistent = await adapter.getAccountObservation();
+  assert.equal(consistent.nativeIdentity, "user-abc");
+  assert.equal(consistent.email, "one@example.com");
+});
+
 test("user safely adopts a bearer-verified session identity | Given conflicting cookie and session IDs | When the active bearer proves the session user | Then the canonical account identity is bounded and cache-safe", async () => {
   let bearerCalls = 0;
   const payloads = {
