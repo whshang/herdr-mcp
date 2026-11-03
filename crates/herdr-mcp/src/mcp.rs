@@ -3478,21 +3478,21 @@ fn browser_required_apps_match_evidence(
         return Ok(true);
     }
     // The readback lists Apps in provider DOM order; `requested` is sorted, so
-    // compare as sorted multisets of App-name slugs to match the late-acceptance
+    // compare as sorted multisets of App-name tokens to match the late-acceptance
     // matcher. The provider renders the same App under different separators and
-    // casings (`herdr-mcp`, `Herdr MCP`), which is one identity; a different App
-    // still differs.
-    let mut readback: Vec<String> = evidence
+    // casings (`herdr-mcp`, `Herdr MCP`, `herdr_mcp`), which is one identity;
+    // a different App id such as `herdrmcp` still differs.
+    let mut readback: Vec<Vec<String>> = evidence
         .required_apps_readback
         .iter()
-        .map(|name| browser_app_mention_slug(name))
+        .map(|name| browser_app_mention_tokens(name))
         .collect();
-    readback.sort_unstable();
-    let mut requested: Vec<String> = requested
+    readback.sort();
+    let mut requested: Vec<Vec<String>> = requested
         .iter()
-        .map(|name| browser_app_mention_slug(name))
+        .map(|name| browser_app_mention_tokens(name))
         .collect();
-    requested.sort_unstable();
+    requested.sort();
     Ok(readback == requested)
 }
 
@@ -3521,15 +3521,15 @@ fn browser_accepted_user_apps_match(result: &Value, requested: &[&str]) -> bool 
         if path.trim().is_empty() {
             return false;
         }
-        names.push(browser_app_mention_slug(name));
+        names.push(browser_app_mention_tokens(name));
     }
-    names.sort_unstable();
+    names.sort();
     names.dedup();
-    let mut requested: Vec<String> = requested
+    let mut requested: Vec<Vec<String>> = requested
         .iter()
-        .map(|name| browser_app_mention_slug(name))
+        .map(|name| browser_app_mention_tokens(name))
         .collect();
-    requested.sort_unstable();
+    requested.sort();
     requested.dedup();
     names == requested
 }
@@ -3665,27 +3665,28 @@ fn browser_evidence_accepted_user_message_ref(
 
 /// The provider keeps a selected App inside the accepted user turn as an inline
 /// chip. Its stored text form depends on the provider build (`@herdr-mcp`,
-/// `herdr-mcp`, `$herdr-mcp`, another separator, or no separator at all when the
-/// stored parts are joined), so the App pill must never be a content-script-side
-/// heuristic the runtime cannot reproduce. Comparison instead runs on the App
-/// name's alphanumeric slug, which is why `herdr-mcp` and `Herdr MCP` are the
-/// same requested App. A genuinely different App still differs.
-fn browser_app_mention_slug(name: &str) -> String {
-    name.chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .map(|character| character.to_ascii_lowercase())
+/// `herdr-mcp`, `$herdr-mcp`, another separator, zero-width characters next to
+/// the chip), so the App pill must never be a content-script-side heuristic the
+/// runtime cannot reproduce. Names are compared as separator-delimited tokens:
+/// `herdr-mcp`, `Herdr MCP` and `herdr_mcp` are the same provider App, while a
+/// different provider App id such as `herdrmcp` is not.
+fn browser_app_mention_tokens(name: &str) -> Vec<String> {
+    name.to_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
         .collect()
 }
 
 /// Expected acceptance digests for one requested create/dispatch message.
 /// The plain message is the only expectation when no App was requested. With a
-/// requested App, the provider's own `<App pill><body>` rendering is an explicit
+/// requested App, the provider's own `<App pill> <body>` rendering is an explicit
 /// expectation as well: the pill forms are built from the requested App names
-/// and the requested message, so a foreign, truncated, extended, or otherwise
-/// different turn still matches none of them. Both the exact-trimmed and the
-/// whitespace-canonical form are covered, and the separator between pill and
-/// body is either absent (parts joined without one) or a single space
-/// (canonical form).
+/// and the requested message, so a foreign, truncated, extended, glued, or
+/// otherwise different turn still matches none of them. Both the exact-trimmed
+/// and the whitespace-canonical form are covered; a separator between pill and
+/// body is always required, because `@herdrmcp hello` is not a mention of the App
+/// `herdr` plus the message `mcp hello`.
 fn browser_expected_acceptance_digests(message: &str, apps: &[&str]) -> Vec<String> {
     let mut digests = vec![
         browser_sha256(message.trim()),
@@ -3698,11 +3699,9 @@ fn browser_expected_acceptance_digests(message: &str, apps: &[&str]) -> Vec<Stri
             continue;
         }
         for prefix in [format!("@{name}"), name.to_owned(), format!("${name}")] {
-            for separator in ["", " "] {
-                let rendered = format!("{prefix}{separator}{body}");
-                digests.push(browser_sha256(&rendered));
-                digests.push(browser_sha256(&browser_readback_text_canonical(&rendered)));
-            }
+            let rendered = format!("{prefix} {body}");
+            digests.push(browser_sha256(&rendered));
+            digests.push(browser_sha256(&browser_readback_text_canonical(&rendered)));
         }
     }
     digests
@@ -14306,8 +14305,6 @@ mod tests {
             "@herdr-mcp Line one Line two",
             "herdr-mcp Line one Line two",
             "$herdr-mcp Line one Line two",
-            "@herdr-mcpLine one Line two",
-            "herdr-mcpLine one Line two",
             "@herdr-mcp\n\nLine one\n\nLine two",
         ] {
             let digest = browser_sha256(&browser_readback_text_canonical(accepted));
@@ -14324,6 +14321,10 @@ mod tests {
             "@herdr-mcp Line one",
             "Line one\n\nLine two extra",
             "@herdr-mcp - Line one Line two",
+            "@herdr-mcpLine one Line two",
+            "herdr-mcpLine one Line two",
+            "herdrmcp Line one Line two",
+            "@herdr-mcp\u{200b}Line one Line two",
         ] {
             let digest = browser_sha256(&browser_readback_text_canonical(rejected));
             assert!(
@@ -14350,7 +14351,7 @@ mod tests {
     #[test]
     fn browser_accepted_app_identity_ignores_provider_name_separators() {
         let requested = ["herdr-mcp"];
-        for same in ["herdr-mcp", "herdr_mcp", "Herdr MCP", "HERDRMCP"] {
+        for same in ["herdr-mcp", "herdr_mcp", "Herdr MCP", "HERDR-MCP"] {
             assert!(
                 browser_accepted_user_apps_match(
                     &json!({"accepted_user_apps": [{"name": same, "path": "app://connector"}]}),
@@ -14359,7 +14360,7 @@ mod tests {
                 "{same} is the requested App under a provider separator"
             );
         }
-        for different in ["herdr", "otherapp", "herdr-mcp-extra"] {
+        for different in ["herdr", "otherapp", "herdr-mcp-extra", "herdrmcp"] {
             assert!(
                 !browser_accepted_user_apps_match(
                     &json!({"accepted_user_apps": [{"name": different, "path": "app://connector"}]}),
@@ -18725,9 +18726,14 @@ mod tests {
                 None,
             ),
             (
-                "joined without a separator",
+                "pill glued to the body",
                 ("@herdrlate accepted turn", "@herdrlate accepted turn"),
-                None,
+                Some("readback_digest_mismatch"),
+            ),
+            (
+                "shorter pill absorbing the message",
+                ("@herdrmcp hello", "@herdrmcp hello"),
+                Some("readback_digest_mismatch"),
             ),
             // Provider renderings the runtime cannot rebuild from the requested
             // name are covered by the extension's own strip of the pill.
@@ -18867,6 +18873,133 @@ mod tests {
                 }
                 Some(reason) => assert_eq!(outcome.unwrap_err(), reason, "{name}"),
             }
+        }
+    }
+
+    /// user owner | Given an uncertain create whose stored turn carries an App
+    /// pill that was never requested | When the late-acceptance readback reports
+    /// that turn | Then the create is never promoted from an unrelated App, and a
+    /// requested App is never satisfied by another App's identity.
+    #[test]
+    fn browser_late_acceptance_never_accepts_an_unrequested_app_pill() {
+        use crate::state_store::{
+            BrowserResourceObservationInput, BrowserSessionReservation,
+            BrowserSessionReservationInput,
+        };
+
+        for (name, required_apps, accepted_apps, observed, expected_reason) in [
+            (
+                "no requested app, pill body left intact",
+                json!([]),
+                Some(json!([{"name": "otherapp", "path": "app://otherapp"}])),
+                (
+                    "@otherapp late accepted turn",
+                    "@otherapp late accepted turn",
+                ),
+                "readback_digest_mismatch",
+            ),
+            (
+                "requested app, other app identity",
+                json!(["herdr"]),
+                Some(json!([{"name": "otherapp", "path": "app://otherapp"}])),
+                ("@otherapp late accepted turn", "late accepted turn"),
+                "readback_app_identity_mismatch",
+            ),
+        ] {
+            let (store, endpoint_ref, observed_session_ref) = browser_dispatch_reconcile_fixture();
+            let (reservation, params) = {
+                let mut guard = store.lock().unwrap();
+                let account_ref = guard
+                    .browser_resource(&observed_session_ref)
+                    .unwrap()
+                    .unwrap()
+                    .parent_ref
+                    .unwrap();
+                let reservation = match guard
+                    .reserve_browser_session(BrowserSessionReservationInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        account_ref: &account_ref,
+                        space_ref: None,
+                        display_label: "Late acceptance unrequested app",
+                        expected_generation: 7,
+                        idempotency_key_digest: &browser_sha256(&format!(
+                            "late-unrequested-key-{name}"
+                        )),
+                        request_digest: &browser_sha256(&format!(
+                            "late-unrequested-request-{name}"
+                        )),
+                        created_at: 40,
+                        expires_at: 4000,
+                    })
+                    .unwrap()
+                {
+                    BrowserSessionReservation::Reserved(record) => record,
+                    BrowserSessionReservation::Existing(_) => {
+                        panic!("fixture reservation must be new")
+                    }
+                };
+                let created = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        kind: "session",
+                        parent_ref: Some(&account_ref),
+                        native_identity: &format!("late-unrequested-created-{name}"),
+                        display_label: None,
+                        observation_generation: 7,
+                        observed_at: 41,
+                    })
+                    .unwrap();
+                guard
+                    .upsert_browser_resource_locator(
+                        &created.resource_ref,
+                        &format!("https://chatgpt.com/c/late-unrequested-{name}"),
+                        7,
+                        41,
+                    )
+                    .unwrap();
+                guard
+                    .materialize_browser_session_reservation(
+                        &reservation.reservation_ref,
+                        &created.resource_ref,
+                        42,
+                    )
+                    .unwrap();
+                guard
+                    .update_browser_session_reservation_delivery(
+                        &reservation.reservation_ref,
+                        7,
+                        BrowserDeliveryState::Uncertain,
+                        None,
+                        43,
+                    )
+                    .unwrap();
+                let params = if required_apps.as_array().is_some_and(|apps| apps.is_empty()) {
+                    json!({"message": "late accepted turn", "required_apps": []})
+                } else {
+                    json!({"message": "late accepted turn", "required_apps": required_apps})
+                };
+                (
+                    guard
+                        .browser_session_reservation(&reservation.reservation_ref)
+                        .unwrap()
+                        .unwrap(),
+                    params,
+                )
+            };
+            let actuator = LateAcceptanceReadbackActuator {
+                accepted_user_apps: accepted_apps,
+                observed: Some(observed),
+            };
+            let outcome = browser_session_create_late_acceptance_readback(
+                &store,
+                &reservation,
+                &params,
+                &actuator,
+                7,
+            );
+            assert_eq!(outcome.unwrap_err(), expected_reason, "{name}");
         }
     }
 

@@ -136,3 +136,58 @@ test("user never gets a foreign turn accepted as the requested message | Given a
     "no requested App means no normalization at all",
   );
 });
+
+test("user never gets a message glued onto a shorter App pill | Given the App `herdr` and the message `mcp hello` | When the observed turn is `@herdrmcp hello` | Then no separator means no mention and the text stays unchanged", () => {
+  assert.equal(
+    stripLeadingAppMentionTokens("@herdrmcp hello", ["herdr"]),
+    "@herdrmcp hello",
+    "an empty separator is not a pill boundary",
+  );
+  assert.equal(
+    stripLeadingAppMentionTokens("herdrmcp hello", ["herdr"]),
+    "herdrmcp hello",
+    "the body may not start where the App name ends without a separator",
+  );
+  assert.equal(
+    stripLeadingAppMentionTokens("@herdr-mcphello world", ["herdr-mcp"]),
+    "@herdr-mcphello world",
+    "a pill glued to the body by joined parts is not a mention",
+  );
+  assert.equal(
+    stripLeadingAppMentionTokens("herdrmcp hello world", ["herdr-mcp"]),
+    "herdrmcp hello world",
+    "a different provider App id is not the requested separator-delimited name",
+  );
+  assert.equal(
+    stripLeadingAppMentionTokens("@herdr-mcp--deep hello", ["herdr-mcp"]),
+    "@herdr-mcp--deep hello",
+    "a dash right after the pill is not a body separator",
+  );
+});
+
+test("user never gets an unrequested App pill stripped from the late readback | Given the late-acceptance readback in wake.js | When it normalizes the stored user turn | Then only the App names the caller explicitly requested are stripped", () => {
+  const start = wakeSource.indexOf("const requestedApps = Array.isArray(params.required_apps)");
+  const end = wakeSource.indexOf("evidence.result.accepted_user_text_sha256", start);
+  assert.ok(start >= 0 && end > start, "the late-acceptance readback must stay extractable");
+  const segment = wakeSource.slice(start, end);
+  assert.match(
+    segment,
+    /stripLeadingAppMentionTokens\(\s*full,\s*requestedApps\s*\)/,
+    "the readback must strip through the requested-App list",
+  );
+  assert.match(
+    segment,
+    /const requestedApps = Array\.isArray\(params\.required_apps\) \? params\.required_apps : \[\];/,
+    "the stripped App names must come from params.required_apps only",
+  );
+  assert.doesNotMatch(
+    segment,
+    /acceptedApps/,
+    "an App the bubble happens to carry must never be stripped unless it was requested",
+  );
+  assert.match(
+    segment,
+    /parts\.join\("\\n"\)/,
+    "stored parts are joined with a real separator so a pill part cannot glue onto the body",
+  );
+});

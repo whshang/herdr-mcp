@@ -1915,54 +1915,52 @@ function normalizeHerdrMentionAlias(value) {
   // A selected App reaches an accepted user turn as an inline chip whose text
   // form depends on the provider build: `@herdr-mcp`, `herdr-mcp`,
   // `$herdr-mcp` (the chip's prompt-link label), the same name under another
-  // separator (`Herdr MCP`, `herdr_mcp`), and - when the stored turn is split
-  // into parts that the readback joins - butted directly against the body
-  // (`@herdr-mcphello`). Zero-width characters also sit next to the chip.
-  // Matching therefore runs on the App name's alphanumeric slug, only at the
-  // start of the text, and only for the App names the caller named.
-  const APP_MENTION_SLUG_CHAR_RE = /[a-z0-9]/;
-  // Separators allowed *inside* a provider App mention token.
-  const APP_MENTION_NAME_SEPARATOR_RE = new RegExp(
+  // separator (`Herdr MCP`, `herdr_mcp`), and zero-width characters next to the
+  // chip. Names are therefore compared as separator-delimited tokens: the token
+  // sequence `herdr` + `mcp` is the App `herdr-mcp`, while a different provider
+  // App id such as `herdrmcp` is not.
+  const APP_MENTION_TOKEN_CHAR_RE = /[a-z0-9]/;
+  // Separators allowed *between* the tokens of one App mention.
+  const APP_MENTION_TOKEN_SEPARATOR_RE = new RegExp(
     `(?:${ACCEPTANCE_WHITESPACE_CLASS}|[@$_\\-]|[\\u200b-\\u200d\\u2060\\ufeff])`,
   );
   // Separators allowed *between* the App mention token and the body. Dashes and
   // underscores are deliberately excluded: a body may legitimately start with
-  // `- ` and must not be swallowed by the pill normalization.
+  // `- ` and must not be swallowed by the pill normalization, and an empty
+  // separator is never a boundary, so `@herdrmcp hello` is not a mention of the
+  // App `herdr`.
   const APP_MENTION_BODY_SEPARATOR_RE = new RegExp(
     `(?:${ACCEPTANCE_WHITESPACE_CLASS}|[\\u200b-\\u200d\\u2060\\ufeff])`,
   );
 
-  function appMentionSlug(value) {
-    return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  // Separator-delimited tokens of an App name, lowercased.
+  function appMentionTokens(value) {
+    return String(value ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
   }
 
-  // Consumed length of a leading App mention token for `slug`, or 0 when the
-  // text does not start with that App's mention.
-  function leadingAppMentionTokenLength(text, slug) {
-    if (!slug) return 0;
+  // Consumed length of a leading App mention token for `tokens`, or 0 when the
+  // text does not start with that App's mention. A mention starts the text, may
+  // carry an `@`/`$` prefix, is separated from the body by a real separator (or
+  // the end of the text), and its own tokens are delimiter-matched: a missing or
+  // empty separator falls through to 0 instead of gluing the body onto the pill.
+  function leadingAppMentionTokenLength(text, tokens) {
+    if (!tokens.length) return 0;
     let index = text[0] === "@" || text[0] === "$" ? 1 : 0;
-    let matched = 0;
-    for (; index < text.length && matched < slug.length; index += 1) {
-      const character = text[index].toLowerCase();
-      if (APP_MENTION_SLUG_CHAR_RE.test(character)) {
-        if (character !== slug[matched]) return 0;
-        matched += 1;
-      } else if (!APP_MENTION_NAME_SEPARATOR_RE.test(character)) {
-        return 0;
+    for (let tokenIndex = 0; tokenIndex < tokens.length; tokenIndex += 1) {
+      if (tokenIndex > 0) {
+        const before = index;
+        while (index < text.length && APP_MENTION_TOKEN_SEPARATOR_RE.test(text[index])) index += 1;
+        if (index === before) return 0;
       }
+      const token = tokens[tokenIndex];
+      for (let characterIndex = 0; characterIndex < token.length; characterIndex += 1) {
+        const character = String(text[index + characterIndex] ?? "").toLowerCase();
+        if (character !== token[characterIndex]) return 0;
+      }
+      index += token.length;
     }
-    if (matched !== slug.length) return 0;
-    // The App name must end the token: end of text, a body separator, or the
-    // body itself when the stored parts were joined without a separator. A
-    // separator that continues into more App-name characters means this is a
-    // *different*, longer App pill (requested `herdr`, rendered `@herdr-mcp`),
-    // and stripping a part of it must never happen.
     const next = text[index];
-    if (next !== undefined
-        && !APP_MENTION_SLUG_CHAR_RE.test(next.toLowerCase())
-        && !APP_MENTION_BODY_SEPARATOR_RE.test(next)) {
-      return 0;
-    }
+    if (next !== undefined && !APP_MENTION_BODY_SEPARATOR_RE.test(next)) return 0;
     while (index < text.length && APP_MENTION_BODY_SEPARATOR_RE.test(text[index])) index += 1;
     return index;
   }
@@ -1973,19 +1971,21 @@ function normalizeHerdrMentionAlias(value) {
   // "App pill + text" expectation (browser_expected_acceptance_digests in
   // crates/herdr-mcp/src/mcp.rs), and the shared parity fixture
   // (tests/fixtures/browser-acceptance-digest-parity.json) pins both halves.
-  // Longest slug first so a shorter App name that prefixes a longer one can
-  // never eat part of the longer pill.
+  // Only the App names the caller explicitly requested may ever be stripped, and
+  // the longest one is tried first so a shorter App name that prefixes a longer
+  // one can never eat part of the longer pill.
   function stripLeadingAppMentionTokens(text, apps) {
-    const slugs = [...new Set((Array.isArray(apps) ? apps : [])
-      .map(appMentionSlug)
-      .filter((slug) => slug.length >= 1 && slug.length <= 64))]
-      .sort((left, right) => right.length - left.length);
+    const names = [...new Set((Array.isArray(apps) ? apps : [])
+      .map((app) => appMentionTokens(app).join(" "))
+      .filter(Boolean))]
+      .sort((left, right) => right.length - left.length)
+      .map((name) => name.split(" "));
     let body = acceptanceTrim(String(text || ""));
-    if (!slugs.length) return body;
+    if (!names.length) return body;
     for (let changed = true; changed;) {
       changed = false;
-      for (const slug of slugs) {
-        const length = leadingAppMentionTokenLength(body, slug);
+      for (const tokens of names) {
+        const length = leadingAppMentionTokenLength(body, tokens);
         if (length > 0) {
           body = acceptanceTrim(body.slice(length));
           changed = true;
@@ -2504,19 +2504,16 @@ function normalizeHerdrMentionAlias(value) {
               : [];
             if (acceptedApps.length) evidence.result.accepted_user_apps = acceptedApps;
             // The stored text can carry the selected App mention as a leading
-            // token (live E1: `herdr` pill before the body). Strip the App names
-            // the runtime named *and* the pill this accepted message itself
-            // carries: a learned/bound App keyword or a chip rendered under a
-            // different name would otherwise leave the pill in the body and the
-            // digest could never equal the create message.
-            const requestedApps = (Array.isArray(params.required_apps) ? params.required_apps : [])
-              .filter((app) => typeof app === "string" && app.trim());
-            const toleratedApps = [...new Set([
-              ...requestedApps,
-              ...(Array.isArray(acceptedApps) ? acceptedApps.map((app) => String(app?.name || "")) : []),
-            ])];
-            const full = acceptanceTrim(parts.join(""));
-            const body = acceptanceTrim(stripLeadingAppMentionTokens(full, toleratedApps));
+            // token (live E1: `herdr` pill before the body). Only the App names
+            // the caller *explicitly requested* may be stripped: a pill for any
+            // other App must keep its body different from the create message, so
+            // a create without `--required-app` can never be promoted from an
+            // unrelated App's turn. String parts are joined with a real
+            // separator (the same way the transcript is sampled) so a separate
+            // pill part can never glue itself onto the body.
+            const requestedApps = Array.isArray(params.required_apps) ? params.required_apps : [];
+            const full = acceptanceTrim(parts.join("\n"));
+            const body = acceptanceTrim(stripLeadingAppMentionTokens(full, requestedApps));
             evidence.result.accepted_user_text_sha256 = await hex(full);
             evidence.result.accepted_user_body_sha256 = await hex(body);
             // Whitespace-canonical digests: ChatGPT re-renders composer line
