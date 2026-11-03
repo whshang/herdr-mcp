@@ -6115,22 +6115,15 @@ function normalizeHerdrMentionAlias(value) {
       }
     };
 
-    const onTick = () => {
-      if (document.hidden) return;
-      uiPressure?.recordTick();
-      if (!chatGptConversationId()) {
-        generating = false;
-        sawGrowth = false;
-        stableRounds = 0;
-        // Rehydrate when an SPA route changes into a conversation.
-        markLatestTurnsDirty();
-        if (settleTimer) { clearInterval(settleTimer); settleTimer = null; }
-        return;
-      }
+    // #846: capture the confirmed source turn for the message this tab just
+    // submitted. Extracted from the visible sampler so a background/owned tab
+    // (hidden document, no visible ticks) can still record the exact turn herdr
+    // submitted for it. Acceptance is unchanged and still fail-closed: the
+    // latest user bubble must match the fresh pending-submit anchor's exact
+    // text, and one submit anchor is reported at most once.
+    const maybeCaptureSourceTurn = () => {
+      if (!chatGptConversationId()) return false;
       syncPendingSubmitAnchor();
-      const stopping = isComposerGenerating();
-      const stoppingEnded = wasStopping && !stopping;
-      wasStopping = stopping;
       const currentUser = roleSnapshot("user");
       const currentUserText = currentUser.text;
       const currentUserSignature = assistantSignature(currentUserText);
@@ -6144,38 +6137,74 @@ function normalizeHerdrMentionAlias(value) {
         }
       }
       const userChanged = currentUserText && (currentUserSignature !== lastUserSignature || currentUserCount > lastUserCount);
-      if (userChanged) {
-        // ChatGPT virtualizes old turns while scrolling. A mounted user node
-        // changing is not sufficient evidence by itself. Pair it with the fresh
-        // pending-submit anchor and exact composer/extension text before
-        // persisting the user intent. The accepted user message may already have
-        // finished generating before this watcher tick, so reply-pending is not
-        // part of the acceptance proof.
-        const submitAt = syncPendingSubmitAnchor();
-        const expectedUser = pendingUserTextHint();
-        const comparableCurrentUser = normText(currentUserText);
-        const confirmedPendingUser = submitAt > 0
-          && Date.now() - submitAt <= 30000
-          && expectedUser
-          && pendingUserTextMatches(expectedUser, comparableCurrentUser, currentUser.appMentions);
-        const journalKey = `${submitAt}`;
-        if (!confirmedPendingUser && submitAt > 0 && journalKey !== lastStartedJournalKey) {
-          const reason = Date.now() - submitAt > 30000 ? "stale submit anchor"
-            : (!expectedUser ? "no expected user text" : "text mismatch");
-          console.debug(`[h2w] source turn capture skipped: ${reason} (expected_len=${expectedUser.length}, bubble_len=${comparableCurrentUser.length})`);
-        }
-        if (confirmedPendingUser && journalKey !== lastStartedJournalKey) {
-          lastStartedJournalKey = journalKey;
-          void sendBg({
-            type: "h2w_turn_started",
-            convKey: ADAPTER.getConversationKey(),
-            startedAt: submitAt,
-            userText: currentUser.sourceTurnText || currentUserText,
-          });
-        }
-        lastUserSignature = currentUserSignature;
-        lastUserCount = currentUserCount;
+      if (!userChanged) return false;
+      // ChatGPT virtualizes old turns while scrolling. A mounted user node
+      // changing is not sufficient evidence by itself. Pair it with the fresh
+      // pending-submit anchor and exact composer/extension text before
+      // persisting the user intent. The accepted user message may already have
+      // finished generating before this watcher tick, so reply-pending is not
+      // part of the acceptance proof.
+      const submitAt = syncPendingSubmitAnchor();
+      const expectedUser = pendingUserTextHint();
+      const comparableCurrentUser = normText(currentUserText);
+      const confirmedPendingUser = submitAt > 0
+        && Date.now() - submitAt <= 30000
+        && expectedUser
+        && pendingUserTextMatches(expectedUser, comparableCurrentUser, currentUser.appMentions);
+      const journalKey = `${submitAt}`;
+      if (!confirmedPendingUser && submitAt > 0 && journalKey !== lastStartedJournalKey) {
+        const reason = Date.now() - submitAt > 30000 ? "stale submit anchor"
+          : (!expectedUser ? "no expected user text" : "text mismatch");
+        console.debug(`[h2w] source turn capture skipped: ${reason} (expected_len=${expectedUser.length}, bubble_len=${comparableCurrentUser.length})`);
       }
+      if (confirmedPendingUser && journalKey !== lastStartedJournalKey) {
+        lastStartedJournalKey = journalKey;
+        void sendBg({
+          type: "h2w_turn_started",
+          convKey: ADAPTER.getConversationKey(),
+          startedAt: submitAt,
+          userText: currentUser.sourceTurnText || currentUserText,
+        });
+      }
+      lastUserSignature = currentUserSignature;
+      lastUserCount = currentUserCount;
+      return confirmedPendingUser;
+    };
+
+    // #846: hidden tabs are how herdr opens and drives its own conversations
+    // (created worker tabs, owned background tabs), so their first submitted
+    // turn used to be invisible to the runtime: no `h2w_turn_started`, no
+    // `source_turn.observe`, and a WebChat dispatch of that conversation stayed
+    // `source_turn_not_found`. Capture only the confirmed source turn, and only
+    // while one fresh pending-submit anchor exists: the hidden MutationObserver
+    // never marks the latest-turn cache dirty, so re-discover it here, and do no
+    // DOM work at all when there is no fresh anchor or the anchor was already
+    // reported. Assistant growth, settle detection, HUD, images and idle nudges
+    // remain visible-only.
+    const maybeCaptureHiddenSourceTurn = () => {
+      const submitAt = Number(conversationHealth?.last_user_submit_at || 0);
+      if (!(submitAt > 0) || Date.now() - submitAt > 30000) return false;
+      if (`${submitAt}` === lastStartedJournalKey) return false;
+      markLatestTurnsDirty();
+      return maybeCaptureSourceTurn();
+    };
+
+    const onTick = () => {
+      if (document.hidden) return;
+      uiPressure?.recordTick();
+      if (!chatGptConversationId()) {
+        generating = false;
+        sawGrowth = false;
+        stableRounds = 0;
+        // Rehydrate when an SPA route changes into a conversation.
+        markLatestTurnsDirty();
+        if (settleTimer) { clearInterval(settleTimer); settleTimer = null; }
+        return;
+      }
+      maybeCaptureSourceTurn();
+      const stopping = isComposerGenerating();
+      const stoppingEnded = wasStopping && !stopping;
+      wasStopping = stopping;
       const currentAssistant = roleSnapshot("assistant");
       const assistantText = currentAssistant.text;
       const curLen = currentAssistant.totalChars;
@@ -6252,7 +6281,11 @@ function normalizeHerdrMentionAlias(value) {
     let lastIntervalAt = Date.now();
     setInterval(() => {
       const scheduledAt = Date.now();
-      if (document.hidden) { lastIntervalAt = scheduledAt; return; }
+      if (document.hidden) {
+        lastIntervalAt = scheduledAt;
+        maybeCaptureHiddenSourceTurn();
+        return;
+      }
       const driftMs = scheduledAt - lastIntervalAt - 800;
       lastIntervalAt = scheduledAt;
       // Timer drift is the sampler-fidelity fallback signal (throttled timers,
