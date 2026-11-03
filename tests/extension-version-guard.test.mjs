@@ -35,6 +35,11 @@ function repository() {
   return root;
 }
 
+/** Shallow clones must come from a parent directory: the origin dir nests the clone path. */
+function cloneParent(origin) {
+  return dirname(origin);
+}
+
 function writeExtension(root, { version, marker = "bundle-1", fileName = "background.js" }) {
   mkdirSync(join(root, "extension"), { recursive: true });
   writeFileSync(
@@ -145,5 +150,36 @@ test(
 
     assert.equal(result.status, 0, result.stdout);
     assert.match(result.stdout, /SKIP/);
+  },
+);
+
+test(
+  "user gets a verified baseline in a shallow CI checkout | Given the release tag exists only on origin and the checkout is shallow with no tags | When the guard runs | Then it fetches the tag into refs/tags and compares against the released version",
+  () => {
+    const origin = repository();
+    releaseTag(origin, "0.1.229");
+    const clone = `${origin}-shallow`;
+    git(cloneParent(origin), [
+      "clone",
+      "-q",
+      "--depth=1",
+      "--no-tags",
+      `file://${origin}`,
+      clone,
+    ]);
+    roots.push(clone);
+    // A fresh clone does not inherit origin's repo-local git identity, and CI
+    // runners have none globally, so set it before committing in the clone.
+    git(clone, ["config", "user.email", "guard@example.test"]);
+    git(clone, ["config", "user.name", "Extension Guard"]);
+    writeExtension(clone, { version: "0.1.230", marker: "bundle-2" });
+    commitAll(clone, "fix(extension): ship the next build");
+    assert.equal(git(clone, ["tag", "--list", "v*"]), "");
+
+    const result = runGuard(clone, []);
+
+    assert.equal(result.status, 0, result.stdout);
+    assert.match(result.stdout, /PASS/);
+    assert.match(result.stdout, /0\.1\.229 -> 0\.1\.230/);
   },
 );

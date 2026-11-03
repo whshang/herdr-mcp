@@ -113,9 +113,13 @@ function newestReleaseTags() {
   });
   for (const tag of remoteTags) {
     if (resolves(tag)) return [tag, ...tags];
-    git(["fetch", "--no-tags", "--depth=1", "origin", `refs/tags/${tag}`], {
-      allowFailure: true,
-    });
+    // The destination refspec is required: a source-only refspec leaves the
+    // fetched tag in FETCH_HEAD and never creates refs/tags/<tag>, so
+    // `resolves` would keep failing and --strict CI runs would skip the guard.
+    git(
+      ["fetch", "--no-tags", "--depth=1", "origin", `+refs/tags/${tag}:refs/tags/${tag}`],
+      { allowFailure: true },
+    );
     if (resolves(tag)) return [tag, ...tags];
   }
   return tags;
