@@ -5603,12 +5603,19 @@ mod tests {
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             for mut response in responses {
-                let (mut stream, _) = listener.accept().unwrap();
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
+                match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if fake_peer_gone(&error) => break,
+                    Err(error) => panic!("fake Herdr socket could not read a request: {error}"),
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    break;
+                };
                 if request["method"] == "agent.prompt" {
                     prompt_texts
                         .lock()
@@ -5616,7 +5623,9 @@ mod tests {
                         .push(request["params"]["text"].as_str().unwrap().to_owned());
                 }
                 response["id"] = request["id"].clone();
-                writeln!(stream, "{response}").unwrap();
+                if !write_fake_reply(&mut stream, &response.to_string()) {
+                    break;
+                }
             }
         })
     }
@@ -5768,6 +5777,34 @@ mod tests {
         )
     }
 
+    /// Whether an error means the client on the other end of a fake socket is
+    /// already gone. A Runtime under test with a deliberately short timeout can
+    /// close the connection before the scripted reply lands; on a loaded CI
+    /// runner that is a legitimate outcome of the code under test, never a
+    /// harness failure, so a fake must stop instead of panicking the test
+    /// thread (the assertions still verify what the Runtime actually did).
+    fn fake_peer_gone(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    }
+
+    /// Write one scripted reply to a fake socket.
+    ///
+    /// Returns `false` when the peer already hung up so the caller can stop the
+    /// fake loop; any other write error is still a harness bug and panics.
+    fn write_fake_reply<W: std::io::Write>(stream: &mut W, payload: &str) -> bool {
+        match writeln!(stream, "{payload}") {
+            Ok(()) => true,
+            Err(error) if fake_peer_gone(&error) => false,
+            Err(error) => panic!("fake Herdr socket could not write a reply: {error}"),
+        }
+    }
+
     /// Socket fake that records every request so a test can prove which native
     /// calls happened (and, for a replay, that none happened again).
     fn scripted_spawn_server(
@@ -5777,15 +5814,24 @@ mod tests {
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             for mut response in responses {
-                let (mut stream, _) = listener.accept().unwrap();
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
+                match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if fake_peer_gone(&error) => break,
+                    Err(error) => panic!("fake Herdr socket could not read a request: {error}"),
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    break;
+                };
                 requests.lock().unwrap().push(request.clone());
                 response["id"] = request["id"].clone();
-                writeln!(stream, "{response}").unwrap();
+                if !write_fake_reply(&mut stream, &response.to_string()) {
+                    break;
+                }
             }
         })
     }
@@ -5830,7 +5876,9 @@ mod tests {
                 } else {
                     json!({"id": request["id"], "result": response})
                 };
-                writeln!(stream, "{envelope}").unwrap();
+                if !write_fake_reply(&mut stream, &envelope.to_string()) {
+                    continue;
+                }
             }
         })
     }
@@ -6105,6 +6153,34 @@ mod tests {
         assert_eq!(replay["failed_step"], "agent_start");
         assert_eq!(requests.lock().unwrap().len(), 2);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user keeps the release gate green | Given a scripted fake whose client
+    /// hangs up before the reply lands | When the fake writes that reply | Then
+    /// it observes the closed peer and stops instead of panicking the test
+    /// thread, which is the shape that failed the v1.1.0-rc.13 release gate.
+    #[test]
+    fn spawn_scripted_fake_survives_a_client_that_hangs_up_before_the_reply() {
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![spawn_tab_created()],
+            requests.clone(),
+        );
+        {
+            let mut client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+            writeln!(client, "{}", json!({"id": 1, "method": "tab.create"})).unwrap();
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        server
+            .join()
+            .expect("a client that hung up must not panic the fake socket thread");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "the request the client did send must still be recorded"
+        );
     }
 
     /// user planner | Given a chain budget too small to start an agent | When
@@ -7076,12 +7152,19 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             for (index, expected) in ["agent.get", "agent.prompt"].into_iter().enumerate() {
-                let (mut stream, _) = listener.accept().unwrap();
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
+                match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if fake_peer_gone(&error) => break,
+                    Err(error) => panic!("fake Herdr socket could not read a request: {error}"),
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    break;
+                };
                 assert_eq!(request["method"], expected);
                 let result = match (index, expected) {
                     (_, "agent.prompt") => json!({"prompt": {
@@ -7093,7 +7176,12 @@ mod tests {
                     }),
                     _ => unreachable!(),
                 };
-                writeln!(stream, "{}", json!({"id": request["id"], "result": result})).unwrap();
+                if !write_fake_reply(
+                    &mut stream,
+                    &json!({"id": request["id"], "result": result}).to_string(),
+                ) {
+                    break;
+                }
             }
         });
         let client = HerdrClient::new(&socket);
@@ -7128,12 +7216,19 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             for (index, expected) in ["agent.get", "agent.prompt"].into_iter().enumerate() {
-                let (mut stream, _) = listener.accept().unwrap();
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
+                match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if fake_peer_gone(&error) => break,
+                    Err(error) => panic!("fake Herdr socket could not read a request: {error}"),
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    break;
+                };
                 assert_eq!(request["method"], expected);
                 let result = match (index, expected) {
                     (_, "agent.prompt") => json!({"prompt": {
@@ -7145,7 +7240,12 @@ mod tests {
                     }),
                     _ => unreachable!(),
                 };
-                writeln!(stream, "{}", json!({"id": request["id"], "result": result})).unwrap();
+                if !write_fake_reply(
+                    &mut stream,
+                    &json!({"id": request["id"], "result": result}).to_string(),
+                ) {
+                    break;
+                }
             }
         });
 
@@ -8932,18 +9032,27 @@ mod tests {
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             for mut response in responses {
-                let (mut stream, _) = listener.accept().unwrap();
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
+                match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if fake_peer_gone(&error) => break,
+                    Err(error) => panic!("fake Herdr socket could not read a request: {error}"),
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    break;
+                };
                 requests.lock().unwrap().push((
                     request["method"].as_str().unwrap_or_default().to_owned(),
                     request["params"].clone(),
                 ));
                 response["id"] = request["id"].clone();
-                writeln!(stream, "{response}").unwrap();
+                if !write_fake_reply(&mut stream, &response.to_string()) {
+                    break;
+                }
             }
         })
     }
@@ -10124,12 +10233,19 @@ mod tests {
                 json!({"result": {"ok": true}}),
             ];
             for mut response in responses {
-                let (mut stream, _) = listener.accept().unwrap();
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
+                match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if fake_peer_gone(&error) => break,
+                    Err(error) => panic!("fake Herdr socket could not read a request: {error}"),
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    break;
+                };
                 requests.lock().unwrap().push((
                     request["method"].as_str().unwrap_or_default().to_owned(),
                     request["params"].clone(),
@@ -10141,7 +10257,9 @@ mod tests {
                         .push(request["params"]["text"].as_str().unwrap().to_owned());
                 }
                 response["id"] = request["id"].clone();
-                writeln!(stream, "{response}").unwrap();
+                if !write_fake_reply(&mut stream, &response.to_string()) {
+                    break;
+                }
             }
         });
 
