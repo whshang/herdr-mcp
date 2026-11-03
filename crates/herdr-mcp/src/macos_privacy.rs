@@ -334,6 +334,14 @@ const ALIAS_OCCUPIED_LINK_EXIT: u8 = 67;
 const ALIAS_OCCUPIED_ENTRY_EXIT: u8 = 68;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const ALIAS_DENIED_EXIT: u8 = 77;
+/// The child's own failure to create the alias (mkdir / symlink). Distinct from
+/// exit 1 so a create failure on a current broker is never mistaken for the
+/// `unknown command` an outdated broker returns.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const ALIAS_CREATE_FAILED_EXIT: u8 = 70;
+/// A generic I/O or verification failure inside a current broker child.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const ALIAS_IO_ERROR_EXIT: u8 = 71;
 
 /// Outcome of one bounded, broker-routed alias inspection.
 ///
@@ -375,6 +383,16 @@ fn map_alias_probe_exit(code: Option<i32>) -> BrokeredAlias {
         Some(ALIAS_DENIED_EXIT) => {
             BrokeredAlias::Denied("the stable broker cannot read this protected path".to_owned())
         }
+        Some(ALIAS_CREATE_FAILED_EXIT) => {
+            BrokeredAlias::Denied("the broker could not create the Documents alias".to_owned())
+        }
+        Some(ALIAS_IO_ERROR_EXIT) => BrokeredAlias::Denied(
+            "the broker hit an I/O error while checking the Documents alias".to_owned(),
+        ),
+        // Only exit 1 / no code means the installed broker did not understand the
+        // argv at all: `herdr-mcp <unknown-subcommand>` prints usage and returns
+        // `ExitCode::FAILURE` (1) from the CLI error path, which is exactly what a
+        // pre-#844 broker does with `__documents-alias-probe`/`-ensure`.
         Some(1) | None => BrokeredAlias::BrokerOutdated,
         other => BrokeredAlias::Denied(format!("alias probe exit {other:?}")),
     }
@@ -490,13 +508,13 @@ pub(crate) fn run_documents_alias_ensure_child(path: &Path, expected: &Path) -> 
         _ => {}
     }
     let Some(parent) = path.parent() else {
-        return ExitCode::from(1);
+        return ExitCode::from(ALIAS_CREATE_FAILED_EXIT);
     };
     if std::fs::create_dir_all(parent).is_err() {
-        return ExitCode::from(1);
+        return ExitCode::from(ALIAS_CREATE_FAILED_EXIT);
     }
     if std::os::unix::fs::symlink(expected, path).is_err() {
-        return ExitCode::from(1);
+        return ExitCode::from(ALIAS_CREATE_FAILED_EXIT);
     }
     match std::fs::read_link(path) {
         Ok(target) if target == expected => ExitCode::from(ALIAS_READY_EXIT),
@@ -504,13 +522,13 @@ pub(crate) fn run_documents_alias_ensure_child(path: &Path, expected: &Path) -> 
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             ExitCode::from(ALIAS_DENIED_EXIT)
         }
-        Err(_) => ExitCode::from(1),
+        Err(_) => ExitCode::from(ALIAS_IO_ERROR_EXIT),
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn run_documents_alias_ensure_child(_path: &Path, _expected: &Path) -> ExitCode {
-    ExitCode::from(1)
+    ExitCode::from(ALIAS_IO_ERROR_EXIT)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -533,7 +551,7 @@ pub(crate) fn run_documents_alias_probe_child(path: &Path, expected: &Path) -> E
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 ExitCode::from(ALIAS_DENIED_EXIT)
             }
-            Err(_) => ExitCode::from(1),
+            Err(_) => ExitCode::from(ALIAS_IO_ERROR_EXIT),
         },
         Ok(_) => ExitCode::from(ALIAS_OCCUPIED_ENTRY_EXIT),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -542,7 +560,7 @@ pub(crate) fn run_documents_alias_probe_child(path: &Path, expected: &Path) -> E
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             ExitCode::from(ALIAS_DENIED_EXIT)
         }
-        Err(_) => ExitCode::from(1),
+        Err(_) => ExitCode::from(ALIAS_IO_ERROR_EXIT),
     }
 }
 
@@ -627,6 +645,19 @@ mod tests {
             map_alias_probe_exit(Some(77)),
             BrokeredAlias::Denied(_)
         ));
+        // 70/71 are the alias child's own failures on a current broker: they must
+        // read as a plain failure with detail, never as "reinstall the broker"
+        // (that path mints a new TCC identity and re-prompts).
+        assert!(matches!(
+            map_alias_probe_exit(Some(70)),
+            BrokeredAlias::Denied(detail) if detail.contains("could not create")
+        ));
+        assert!(matches!(
+            map_alias_probe_exit(Some(71)),
+            BrokeredAlias::Denied(detail) if detail.contains("I/O error")
+        ));
+        // Only exit 1 (the `unknown command` path of a pre-#844 broker) or no
+        // exit code at all means the broker predates the subcommand.
         assert_eq!(map_alias_probe_exit(Some(1)), BrokeredAlias::BrokerOutdated);
         assert_eq!(map_alias_probe_exit(None), BrokeredAlias::BrokerOutdated);
         assert!(matches!(

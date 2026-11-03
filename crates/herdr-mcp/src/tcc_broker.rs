@@ -59,11 +59,16 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Bumped to 5 for the #844 Documents alias subcommands
 /// (`__documents-alias-probe` / `__documents-alias-ensure`).
 ///
-/// The bump is what makes an already-installed broker get replaced: `install`
-/// returns early when the installed revision already equals this constant, so
-/// without it a pre-#844 broker keeps rejecting the new argv as
-/// "unknown command". The cost is exactly one broker re-authorization on the
-/// next upgrade, which is the same one-prompt-per-upgrade budget #844 asks for.
+/// The bump marks an installed broker as out of date, but it does NOT make
+/// [`install`] replace it: `install` returns early when the revisions are equal,
+/// errors when they differ and `force` is false, and refuses an ad-hoc/cdhash
+/// broker even with `force` because the candidate cannot satisfy the installed
+/// stable code requirement. The migration that really swaps the bytes is
+/// [`migrate_for_explicit_reauthorization`] (behind
+/// `herdr-mcp permissions setup --upgrade-broker`), and the committed `update apply`
+/// path now runs it once so the upgrade installs the new subcommands before a
+/// request needs them. That costs one broker re-authorization on that upgrade,
+/// which is the same at-most-one-prompt-per-upgrade budget #844 targets.
 pub const BROKER_COMPAT_REVISION: u32 = 5;
 /// First broker revision that implements the read-only `git` identity action.
 #[cfg(target_os = "macos")]

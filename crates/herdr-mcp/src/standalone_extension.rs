@@ -1927,11 +1927,11 @@ fn inspect_alias_with_probe(
                 object.insert("code".to_owned(), json!("broker_outdated"));
                 object.insert(
                     "message".to_owned(),
-                    json!("the installed TCC broker predates the Documents alias check; reinstall it once with `herdr-mcp tcc-broker install --force` (one re-authorization) and retry"),
+                    json!("the installed TCC broker predates the Documents alias subcommands; migrate it once with `herdr-mcp permissions setup --upgrade-broker` (one re-authorization) and retry"),
                 );
                 object.insert(
                     "next_action".to_owned(),
-                    json!("herdr-mcp tcc-broker install --force"),
+                    json!("herdr-mcp permissions setup --upgrade-broker"),
                 );
             }
             payload
@@ -2231,6 +2231,13 @@ fn remove_alias_if_created(alias: &Value, current: &Path) {
     let Some(path) = alias.get("path").and_then(Value::as_str).map(PathBuf::from) else {
         return;
     };
+    // #844: undoing a broker-created alias would need `read_link` + `remove_file`
+    // on `~/Documents` from the rotating generation, which is exactly the access
+    // this change removes. Leave the alias in place instead; it is a valid
+    // symlink to the managed tree and the next ensure reuses it.
+    if crate::macos_permissions::runtime_must_not_probe(&path) {
+        return;
+    }
     if fs::read_link(&path).ok().as_deref() == Some(current) {
         let _ = fs::remove_file(path);
     }
@@ -2440,7 +2447,10 @@ mod tests {
         assert_eq!(view["status"], "broker_outdated");
         assert_eq!(view["code"], "broker_outdated");
         assert_eq!(view["retryable"], true);
-        assert_eq!(view["next_action"], "herdr-mcp tcc-broker install --force");
+        assert_eq!(
+            view["next_action"],
+            "herdr-mcp permissions setup --upgrade-broker"
+        );
     }
 
     /// user keeps an ordinary install unchanged | Given an unprotected path

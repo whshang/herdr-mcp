@@ -623,6 +623,124 @@ fn runtime_update_succeeded_result(outcome: RuntimeUpdateOutcome<'_>) -> (Value,
     (payload, ExitCode::SUCCESS)
 }
 
+/// Decide and perform the one-time TCC broker migration on the committed update
+/// path.
+///
+/// `tcc_broker::install` deliberately never replaces a broker whose compatibility
+/// revision differs: it returns early for an equal revision, errors for a
+/// different one without `force`, and refuses an ad-hoc/cdhash broker even with
+/// `force`. The migration that does swap the bytes is the explicit
+/// re-authorization path behind `herdr-mcp permissions setup --upgrade-broker`,
+/// so the update runs that same function once instead of reporting a broker
+/// version the installed binary cannot serve. `migrate` is injected so the
+/// decision and the reporting are testable without codesign or a live broker.
+fn migrate_broker_after_update<F>(config_dir: &std::path::Path, migrate: F) -> Value
+where
+    F: FnOnce(&std::path::Path) -> Result<bool, String>,
+{
+    let installed = crate::tcc_broker::installed_compat_revision(config_dir);
+    broker_migration_decision(
+        installed,
+        crate::tcc_broker::BROKER_COMPAT_REVISION,
+        migrate,
+        config_dir,
+    )
+}
+
+/// Pure decision behind [`migrate_broker_after_update`]: `installed` is the
+/// revision the config dir records (or `None` when it cannot be read), and
+/// `migrate` performs the real replacement.
+fn broker_migration_decision<F>(
+    installed: Option<u32>,
+    target: u32,
+    migrate: F,
+    config_dir: &std::path::Path,
+) -> Value
+where
+    F: FnOnce(&std::path::Path) -> Result<bool, String>,
+{
+    let Some(installed) = installed else {
+        return json!({
+            "state": "unknown",
+            "installed_revision": Value::Null,
+            "target_revision": target,
+            "next_action": "herdr-mcp permissions setup --upgrade-broker",
+        });
+    };
+    if installed >= target {
+        return json!({
+            "state": "current",
+            "installed_revision": installed,
+            "target_revision": target,
+        });
+    }
+    match migrate(config_dir) {
+        Ok(true) => json!({
+            "state": "migrated",
+            "installed_revision": installed,
+            "target_revision": target,
+            "needs_reauthorization": true,
+            "message": "the TCC broker was replaced with the revision that implements the Documents alias subcommands; the next Documents access asks for authorization once",
+            "next_action": "answer the macOS Documents prompt",
+        }),
+        Ok(false) => json!({
+            "state": "current",
+            "installed_revision": installed,
+            "target_revision": target,
+        }),
+        Err(error) => json!({
+            "state": "failed",
+            "installed_revision": installed,
+            "target_revision": target,
+            "error": error,
+            "next_action": "herdr-mcp permissions setup --upgrade-broker",
+        }),
+    }
+}
+
+/// Attach the broker migration outcome to an update result.
+///
+/// A migration that ran is a notice (one re-authorization follows); a failed one
+/// is a warning with the command that performs the same migration by hand.
+/// Neither is fatal: the Runtime already committed.
+fn attach_tcc_broker_migration(payload: &mut Value, migration: Value) {
+    let state = migration
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.insert("tcc_broker_migration".to_owned(), migration);
+    if !matches!(state.as_str(), "migrated" | "failed") {
+        return;
+    }
+    let notice = if state == "migrated" {
+        json!({
+            "code": "tcc_broker_migrated",
+            "severity": "notice",
+            "fatal": false,
+            "message": "the TCC broker was migrated to the revision that implements the Documents alias subcommands; answer the one macOS Documents prompt that follows",
+            "next_action": "answer the macOS Documents prompt",
+        })
+    } else {
+        json!({
+            "code": "tcc_broker_migration_failed",
+            "severity": "warning",
+            "fatal": false,
+            "message": "the TCC broker still predates the Documents alias subcommands; run the migration command to install them",
+            "next_action": "herdr-mcp permissions setup --upgrade-broker",
+        })
+    };
+    let notices = object
+        .entry("notices".to_owned())
+        .or_insert_with(|| json!([]));
+    if let Some(list) = notices.as_array_mut() {
+        list.push(notice);
+    }
+}
+
 /// Attach the post-activation macOS Documents preflight to an update result.
 ///
 /// TCC prompts are an operator-visible condition, not an update failure: the
@@ -1189,6 +1307,15 @@ fn apply_inner(
                 attach_tcc_preflight(
                     &mut payload,
                     crate::macos_privacy::preflight_after_activation(&paths.config_dir),
+                );
+                // #844: the alias subcommands only exist in broker revision 5, and
+                // `install` never replaces a differing revision, so the upgrade
+                // performs the one explicit-reauthorization migration here.
+                attach_tcc_broker_migration(
+                    &mut payload,
+                    migrate_broker_after_update(&paths.config_dir, |config_dir| {
+                        crate::tcc_broker::migrate_for_explicit_reauthorization(config_dir)
+                    }),
                 );
                 print_json(&payload)?;
                 return Ok(code);
@@ -4843,6 +4970,110 @@ mod tests {
         );
         assert_eq!(worker_update_invocations, 1);
         assert_eq!(chained["code"], "worker_update_succeeded");
+    }
+
+    /// user gets the alias subcommands installed by the upgrade | Given an
+    /// installed broker at an older compatibility revision | When the committed
+    /// update path runs the broker migration | Then it performs exactly one
+    /// explicit-reauthorization migration and reports it as a non-fatal notice,
+    /// while a current revision is left untouched.
+    #[test]
+    fn broker_migration_runs_once_for_an_older_revision() {
+        let config_dir = Path::new("/tmp/herdr-broker-migration-decision");
+        let target = crate::tcc_broker::BROKER_COMPAT_REVISION;
+        let mut invocations = 0;
+        let migration = broker_migration_decision(
+            Some(4),
+            target,
+            |_config_dir| {
+                invocations += 1;
+                Ok(true)
+            },
+            config_dir,
+        );
+        assert_eq!(invocations, 1, "an older revision must be migrated once");
+        assert_eq!(migration["state"], "migrated");
+        assert_eq!(migration["installed_revision"], 4);
+        assert_eq!(migration["target_revision"], target);
+        assert_eq!(migration["needs_reauthorization"], true);
+
+        let mut payload = json!({"ok": true, "code": "update_succeeded", "notices": []});
+        attach_tcc_broker_migration(&mut payload, migration);
+        assert_eq!(payload["ok"], true, "a migration is never fatal");
+        assert_eq!(payload["tcc_broker_migration"]["state"], "migrated");
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "tcc_broker_migrated")
+            .expect("a migration must be reported");
+        assert_eq!(notice["fatal"], false);
+
+        // A current broker is not migrated again.
+        let mut second = 0;
+        let current = broker_migration_decision(
+            Some(target),
+            target,
+            |_config_dir| {
+                second += 1;
+                Ok(true)
+            },
+            config_dir,
+        );
+        assert_eq!(second, 0, "a current broker must not be migrated");
+        assert_eq!(current["state"], "current");
+        let mut payload = json!({"ok": true, "notices": []});
+        attach_tcc_broker_migration(&mut payload, current);
+        assert!(payload["notices"].as_array().unwrap().is_empty());
+
+        // An unreadable revision is reported, never silently migrated or failed.
+        let unknown = broker_migration_decision(
+            None,
+            target,
+            |_config_dir| panic!("must not migrate without a known installed revision"),
+            config_dir,
+        );
+        assert_eq!(unknown["state"], "unknown");
+        assert_eq!(
+            unknown["next_action"],
+            "herdr-mcp permissions setup --upgrade-broker"
+        );
+    }
+
+    /// user is told the exact command that works | Given a migration that fails |
+    /// When the result is reported | Then it is a non-fatal warning naming
+    /// `permissions setup --upgrade-broker`, never `tcc-broker install --force`.
+    #[test]
+    fn failed_broker_migration_reports_the_working_command() {
+        let config_dir = Path::new("/tmp/herdr-broker-migration-decision-fail");
+        let migration = broker_migration_decision(
+            Some(4),
+            crate::tcc_broker::BROKER_COMPAT_REVISION,
+            |_config_dir| Err("codesign verification failed".to_owned()),
+            config_dir,
+        );
+        assert_eq!(migration["state"], "failed");
+        assert_eq!(
+            migration["next_action"],
+            "herdr-mcp permissions setup --upgrade-broker"
+        );
+        let mut payload = json!({"ok": true, "code": "update_succeeded", "notices": []});
+        attach_tcc_broker_migration(&mut payload, migration);
+        assert_eq!(
+            payload["ok"], true,
+            "a failed migration is not an update failure"
+        );
+        let notice = payload["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|notice| notice["code"] == "tcc_broker_migration_failed")
+            .expect("a failed migration must be reported");
+        assert_eq!(notice["severity"], "warning");
+        assert_eq!(
+            notice["next_action"],
+            "herdr-mcp permissions setup --upgrade-broker"
+        );
     }
 
     /// user keeps a working control path | Given a Runtime update that

@@ -1155,22 +1155,38 @@ mod tests {
     /// caught later by is_dir()/is_file() on the protected path.
     #[test]
     fn parent_dir_escape_is_normalized_before_the_protection_check() {
-        let neutral = Path::new("/Users/example/.config/herdr-mcp");
+        // Use the real HOME so the escape really normalizes into this user's
+        // Documents, and classify with the explicit-home helper so the assertion
+        // does not depend on which probe the platform supports.
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME is set for tests");
+        let neutral = home.join(".config").join("herdr-mcp");
+        let expected = home.join("Documents").join("herdr-mcp").join("extension");
         let resolved = super::lexical_absolute_from(
             Path::new("../../Documents/herdr-mcp/extension"),
-            Some(neutral),
+            Some(&neutral),
         );
         match resolved {
-            Ok(path) => assert!(
-                path.to_string_lossy().contains("/Documents/"),
-                "the escape must normalize into Documents, got {}",
-                path.display()
-            ),
+            Ok(path) => assert_eq!(path, expected, "the escape must normalize into Documents"),
             Err(error) => assert!(
                 error.contains("privacy-protected folder"),
-                "an escape must be refused only for the protected folder, got {error}"
+                "an escape may only be refused for the protected folder, got {error}"
             ),
         }
+        assert!(
+            crate::macos_permissions::is_protected_user_path_lexical_for_home(&expected, &home),
+            "the normalized escape must classify as protected"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            super::lexical_absolute_from(
+                Path::new("../../Documents/herdr-mcp/extension"),
+                Some(&neutral)
+            )
+            .is_err(),
+            "macOS must refuse the escape before any directory probe"
+        );
     }
 
     use super::*;
