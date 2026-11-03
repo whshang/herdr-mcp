@@ -9,11 +9,50 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import vm from "node:vm";
 
 const wakeSource = readFileSync(new URL("../extension/content/wake.js", import.meta.url), "utf8");
+const chatgptAdapterSource = readFileSync(
+  new URL("../extension/content/injector/chatgpt.js", import.meta.url),
+  "utf8",
+);
 
 const KEY_A = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const KEY_B = "https://claude.ai/chat/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+// The Project-scoped new-chat surface from #847: a `/g/g-p-…` route whose
+// registration gate must publish a scope before any create may submit.
+const PROJECT_KEY = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978";
+
+// The shipped ChatGPT adapter, so registration tests exercise the real identity
+// extraction (#847) instead of a hand-written observation object.
+function loadChatGptAdapter(fetchImpl) {
+  let adapter = null;
+  class BaseAdapter {
+    elementVisible() { return true; }
+  }
+  vm.runInNewContext(chatgptAdapterSource, {
+    BaseAdapter,
+    registerH2WAdapter: (registered) => { adapter = registered; },
+    document: { querySelector: () => null, querySelectorAll: () => [] },
+    location: { origin: "https://chatgpt.com", pathname: "/g/g-p-6a89c078669481918c8eb70fdfd3d978/project" },
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    fetch: fetchImpl,
+  }, { filename: "chatgpt.js" });
+  return adapter;
+}
+
+// The real adapter reads these two authenticated endpoints; the fixtures below
+// are the payload shapes involved in #847. Returns an observation thunk so the
+// registration harness drives the live adapter.
+function identityObservation(payloads) {
+  const adapter = loadChatGptAdapter(async (url) => ({
+    ok: true,
+    json: async () => payloads[url],
+  }));
+  return () => adapter.getAccountObservation();
+}
 
 function sliceSource(startMarker, endMarker, what) {
   const start = wakeSource.indexOf(startMarker);
@@ -42,16 +81,23 @@ async function flush(turns = 12) {
   for (let i = 0; i < turns; i += 1) await Promise.resolve();
 }
 
-function registrationHarness(initialConvKey = KEY_A, { site = "claude", projectSequence = null } = {}) {
+function registrationHarness(initialConvKey = KEY_A, { site = "claude", projectSequence = null, accountObservation = null } = {}) {
   const sends = [];
   let resolveAccount;
   let resolveCatalog;
   const accountBox = { promise: new Promise((resolve) => { resolveAccount = resolve; }) };
   const catalogBox = { promise: new Promise((resolve) => { resolveCatalog = resolve; }) };
+  // Optional provider-shaped account observation. When present it is the only
+  // identity source, exactly like ADAPTER.getAccountObservation() in wake.js.
+  const observationBox = {
+    value: accountObservation,
+    get() { return typeof this.value === "function" ? this.value() : this.value; },
+  };
   const api = new Function(
     "accountBox",
     "catalogBox",
     "sends",
+    "observationBox",
     `
     let currentConvKey = ${JSON.stringify(initialConvKey)};
     let currentUrl = currentConvKey;
@@ -66,6 +112,7 @@ function registrationHarness(initialConvKey = KEY_A, { site = "claude", projectS
       name: ${JSON.stringify(site)},
       getConversationKey: () => currentConvKey,
       resolveProjectIdentity: async () => null,
+      ${accountObservation ? "getAccountObservation: () => observationBox.get()," : ""}
     };
     const location = { get href() { return currentUrl; } };
     const runtimeAlive = () => true;
@@ -106,6 +153,7 @@ function registrationHarness(initialConvKey = KEY_A, { site = "claude", projectS
       register: registerCurrentConversation,
       setRoute(value) { currentConvKey = value; currentUrl = value; },
       status() { return lastBrowserRegistrationStatus; },
+      identityShape() { return lastBrowserIdentityShape; },
       state() {
         return {
           convKey: registeredConvKey,
@@ -117,13 +165,16 @@ function registrationHarness(initialConvKey = KEY_A, { site = "claude", projectS
       },
     };
     `,
-  )(accountBox, catalogBox, sends);
+  )(accountBox, catalogBox, sends, observationBox);
   return {
     register: (reason, options) => api.register(reason, options),
     setRoute: (value) => api.setRoute(value),
     state: () => api.state(),
     status: () => api.status(),
+    identityShape: () => api.identityShape(),
     sends,
+    // Later observations can converge (or start failing) mid-registration.
+    setAccountObservation(value) { observationBox.value = value; },
     // Resolve the stalled pre-registration work and make later runs flow.
     releaseAccount(identity = "opaque-account") {
       resolveAccount(identity);
@@ -296,6 +347,99 @@ test("user cannot register a switched project | Given the conversation's project
   assert.deepEqual(harness.sends.map((send) => send.payload.type), ["h2w_clear_scope"],
     "a project change must refuse registration and drop the stale tab scope");
   assert.equal(harness.status(), "project_changed", "the refusal reason stays a fixed enum");
+});
+
+test("user creates a chat inside a ChatGPT Project | Given the Project route and a workspace-shadowed but matching account identity | When registration runs through the real adapter | Then exactly one h2w_register carries the user id and no sidebar catalog wait", async () => {
+  const harness = registrationHarness(PROJECT_KEY, {
+    site: "chatgpt",
+    accountObservation: identityObservation({
+      // Shape 1 from #847: the session's top-level id is the workspace id and
+      // shadows the matching user id.
+      "/backend-api/me": { id: "user-abc", account: { id: "ws-workspace" } },
+      "/api/auth/session": {
+        id: "ws-workspace",
+        user: { id: "user-abc" },
+        account: { id: "ws-workspace" },
+      },
+    }),
+  });
+  const registration = harness.register("identity-recovery");
+  // The real adapter awaits two authenticated reads per observation and
+  // registration observes twice (pre-publish fence), so allow the longer chain.
+  await flush(60);
+
+  assert.deepEqual(harness.sends.map((send) => send.payload.type), ["h2w_register"],
+    "a Project route must publish its scope from the observed identity alone");
+  assert.equal(harness.sends[0].payload.convKey, PROJECT_KEY);
+  assert.equal(harness.sends[0].payload.accountNativeIdentity, "user-abc",
+    "the user-namespace id reaches h2w_register, not the workspace id");
+  assert.equal(harness.sends[0].payload.browserSessionReservationRef, null);
+  assert.equal(harness.identityShape(), null,
+    "the redacted shape is a refusal diagnostic; an accepted registration records none");
+
+  harness.sends[0].resolve({
+    browser_session_ref: "br_project",
+    browser_account_ref: "br_account_project",
+    browser_generation: 7,
+    bound: false,
+  });
+  const result = await registration;
+  assert.equal(result?.browser_session_ref, "br_project");
+  assert.equal(harness.status(), "registry_observed");
+});
+
+test("user refuses an unprovable Project identity namespace | Given a session that names only its workspace and a /me that exposes no account id | When registration runs through the real adapter | Then nothing is registered and the refusal reports id_namespace_unconfirmed with the shape", async () => {
+  const harness = registrationHarness(PROJECT_KEY, {
+    site: "chatgpt",
+    accountObservation: identityObservation({
+      // Shape 2 from #847 without an account-id agreement: the endpoints share
+      // no namespace, so /me's user id must never be published on its own.
+      "/backend-api/me": { id: "old-user" },
+      "/api/auth/session": { account: { id: "new-workspace" } },
+    }),
+  });
+  const registration = harness.register("identity-recovery");
+  await flush();
+
+  assert.equal(await registration, null);
+  assert.deepEqual(harness.sends.map((send) => send.payload.type), ["h2w_clear_scope"],
+    "an unprovable namespace must clear the tab scope instead of publishing an identity");
+  assert.equal(harness.status(), "id_namespace_unconfirmed");
+  assert.deepEqual(
+    { ...harness.identityShape() },
+    {
+      me_user_id: "me_user_id_present",
+      session_user_id: "session_user_id_absent",
+      session_top_id: "session_top_id_absent",
+      id_comparison: "single_user_id_present",
+      me_account_id: "me_account_id_absent",
+    },
+    "the shape codes tell the operator which body refused registration",
+  );
+});
+
+test("user still refuses a genuine Project identity mismatch | Given the Project route and two different session user ids | When registration runs through the real adapter | Then nothing is registered, the scope is cleared and the shape names the mismatch", async () => {
+  const harness = registrationHarness(PROJECT_KEY, {
+    site: "chatgpt",
+    accountObservation: identityObservation({
+      "/backend-api/me": { id: "user-abc" },
+      "/api/auth/session": {
+        id: "ws-workspace",
+        user: { id: "user-other" },
+        account: { id: "ws-workspace" },
+      },
+    }),
+  });
+  const registration = harness.register("identity-recovery");
+  await flush();
+
+  assert.equal(await registration, null);
+  assert.deepEqual(harness.sends.map((send) => send.payload.type), ["h2w_clear_scope"],
+    "a real identity mismatch must never publish a scope, so no create can submit");
+  assert.equal(harness.status(), "id_conflict_unverified_email",
+    "the refusal keeps a precise conflict reason instead of a handshake-delay guess");
+  assert.equal(harness.identityShape().id_comparison, "user_ids_differ");
+  assert.equal(harness.identityShape().session_top_id, "session_top_id_equals_account");
 });
 
 test("user clears a scope it cannot re-verify | Given a ChatGPT tab without an authenticated identity | When registration runs | Then nothing is published and the tab scope is cleared", async () => {

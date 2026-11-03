@@ -64,6 +64,28 @@ const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // never issue a second provider mutation when the initial wait expires.
 const BROWSER_DISPATCH_CONTENT_TIMEOUT_MS = 40_000;
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = 30_000;
+// #847: redacted identity payload shape reported by the content handshake. Only
+// presence/equality codes cross into failed-create evidence - never an id, email,
+// account or raw provider reply. The runtime publishes the same finite set.
+const BROWSER_IDENTITY_SHAPE_CODES = Object.freeze({
+  me_user_id: ["me_user_id_present", "me_user_id_absent"],
+  session_user_id: ["session_user_id_present", "session_user_id_absent"],
+  session_top_id: [
+    "session_top_id_absent", "session_top_id_equals_account",
+    "session_top_id_differs_from_account",
+  ],
+  id_comparison: [
+    "user_ids_match", "user_ids_differ", "single_user_id_present", "no_user_id_present",
+  ],
+  me_account_id: ["me_account_id_present", "me_account_id_absent"],
+});
+const BROWSER_IDENTITY_SHAPE_EVIDENCE_KEYS = Object.freeze({
+  me_user_id: "me_user_id_shape",
+  session_user_id: "session_user_id_shape",
+  session_top_id: "session_top_id_shape",
+  id_comparison: "id_namespace_comparison",
+  me_account_id: "me_account_id_shape",
+});
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -4251,6 +4273,7 @@ async function handleBrowserActuation(command) {
     let probeIdentityRelation = "not_observed";
     let probeEmailProof = "not_observed";
     let probeBearerRelation = "not_observed";
+    let probeIdentityShape = null;
     const scopeDeadline = Date.now() + BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS;
     let nextProbeAt = 0;
     let probeInFlight = false;
@@ -4285,7 +4308,8 @@ async function handleBrowserActuation(command) {
             if ([
               "not_observed", "identity_observed", "identity_unavailable",
               "id_conflict_matching_email", "id_conflict_different_email",
-              "id_conflict_unverified_email", "email_conflict",
+              "id_conflict_unverified_email", "id_namespace_unconfirmed",
+              "email_conflict",
               "account_changed", "project_changed", "identity_rate_limited",
               "provider_readback_unavailable",
               "background_unavailable", "registry_observed", "registry_unobserved",
@@ -4311,6 +4335,17 @@ async function handleBrowserActuation(command) {
               "bearer_differs_from_session", "bearer_network_unavailable",
               "not_observed",
             ].includes(bearerRelation)) probeBearerRelation = bearerRelation;
+            // Shape facts are validated key by key: an unknown or extra key is
+            // dropped, so only the finite vocabulary can reach the evidence.
+            const shape = response?.identityShape;
+            if (shape && typeof shape === "object" && !Array.isArray(shape)) {
+              const validated = {};
+              for (const [key, allowed] of Object.entries(BROWSER_IDENTITY_SHAPE_CODES)) {
+                const value = shape[key];
+                if (typeof value === "string" && allowed.includes(value)) validated[key] = value;
+              }
+              if (Object.keys(validated).length) probeIdentityShape = validated;
+            }
           })
           .catch(() => {
             identityProbeFailed = true;
@@ -4372,6 +4407,11 @@ async function handleBrowserActuation(command) {
             scope_failure: scopeFailure,
             registration_status: probeRegistrationStatus,
             identity_relation: probeIdentityRelation,
+            ...(probeIdentityShape
+              ? Object.fromEntries(Object.entries(BROWSER_IDENTITY_SHAPE_EVIDENCE_KEYS)
+                .filter(([key]) => probeIdentityShape[key])
+                .map(([key, evidenceKey]) => [evidenceKey, probeIdentityShape[key]]))
+              : {}),
             contact_proof: probeEmailProof,
             bearer_relation: probeBearerRelation,
             tab_opened: true,
