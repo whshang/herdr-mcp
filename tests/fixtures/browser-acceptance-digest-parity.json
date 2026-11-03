@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Shared acceptance-text digest parity fixture for the browser extension and the Rust runtime. Both languages must accept-trim and whitespace-canonicalize the same text the same way: Rust str::trim()/split_whitespace() Unicode White_Space semantics, with NBSP and BOM folded to a space before the split. JS String.prototype.trim()/\\s must not be used for these digests because they differ on U+FEFF and U+0085.",
+  "description": "Shared acceptance-text digest parity fixture for the browser extension and the Rust runtime. Both languages must accept-trim and whitespace-canonicalize the same text the same way: Rust str::trim()/split_whitespace() Unicode White_Space semantics, with NBSP and BOM folded to a space before the split. JS String.prototype.trim()/\\s must not be used for these digests because they differ on U+FEFF and U+0085. The app_mention_cases section is the second half of the contract: the extension strips only the requested App mention token from the observed user turn, and the runtime accepts exactly that '<App pill><message>' rendering as an explicit expectation instead of trusting a content-script strip. A tolerated case means the observed text is an accepted rendering of the message; an untolerated case must still fail the runtime's expectation set.",
   "cases": [
     {
       "name": "plain ascii",
@@ -103,6 +103,151 @@
       "text": "hi  😀  there",
       "trimmed_sha256": "a004b41c52cdbb9b216e094a5f802df833c0e670a1aec805c43f1bc5875d01e9",
       "canonical_sha256": "1f6eefbcaeddf8c3665fa3645af00c38a7e7fc689372829cc2fac8742852faf1"
+    }
+  ],
+  "app_mention_cases": [
+    {
+      "name": "at-sign pill",
+      "app": "herdr-mcp",
+      "message": "hello world",
+      "observed_text": "@herdr-mcp hello world",
+      "stripped_body": "hello world",
+      "tolerated": true,
+      "observed_text_trimmed_sha256": "dd59496daccf93381fffc2bf39531fab75b7e4cb43a22804c005372d134b8a33",
+      "observed_text_canonical_sha256": "dd59496daccf93381fffc2bf39531fab75b7e4cb43a22804c005372d134b8a33",
+      "runtime_expectation": true
+    },
+    {
+      "name": "bare name pill",
+      "app": "herdr-mcp",
+      "message": "hello world",
+      "observed_text": "herdr-mcp hello world",
+      "stripped_body": "hello world",
+      "tolerated": true,
+      "observed_text_trimmed_sha256": "2e18515ba05ab41f59087260c21420c55b9f6df74facadf69d23f23338a43899",
+      "observed_text_canonical_sha256": "2e18515ba05ab41f59087260c21420c55b9f6df74facadf69d23f23338a43899",
+      "runtime_expectation": true
+    },
+    {
+      "name": "prompt-link label pill",
+      "app": "herdr-mcp",
+      "message": "hello world",
+      "observed_text": "$herdr-mcp hello world",
+      "stripped_body": "hello world",
+      "tolerated": true,
+      "observed_text_trimmed_sha256": "c434f6b4e182a3cbbb3fe3c69cd1be16e761e0c2c15169b73bc8881a65d9901a",
+      "observed_text_canonical_sha256": "c434f6b4e182a3cbbb3fe3c69cd1be16e761e0c2c15169b73bc8881a65d9901a",
+      "runtime_expectation": true
+    },
+    {
+      "name": "chip label with spaces",
+      "app": "herdr-mcp",
+      "message": "hello world",
+      "observed_text": "Herdr MCP hello world",
+      "stripped_body": "hello world",
+      "tolerated": true,
+      "observed_text_trimmed_sha256": "8b4190b479ab24e5c35121f6c4e5624c390995c78fc29779391a64b3852da5fc",
+      "observed_text_canonical_sha256": "8b4190b479ab24e5c35121f6c4e5624c390995c78fc29779391a64b3852da5fc",
+      "runtime_expectation": false
+    },
+    {
+      "name": "chip label with underscore",
+      "app": "herdr-mcp",
+      "message": "hello world",
+      "observed_text": "herdr_mcp hello world",
+      "stripped_body": "hello world",
+      "tolerated": true,
+      "observed_text_trimmed_sha256": "4dabdfdb25b174736aa82c721de1bdc69e8c83b44285f541f81fe7b1442ecdd8",
+      "observed_text_canonical_sha256": "4dabdfdb25b174736aa82c721de1bdc69e8c83b44285f541f81fe7b1442ecdd8",
+      "runtime_expectation": false
+    },
+    {
+      "name": "parts joined without a separator",
+      "app": "herdr-mcp",
+      "message": "hello world",
+      "observed_text": "@herdr-mcphello world",
+      "stripped_body": "hello world",
+      "tolerated": true,
+      "observed_text_trimmed_sha256": "bbe94af221e444dd467e03833107ebb92e7b68c6181a3a82afd8f09afcb706a6",
+      "observed_text_canonical_sha256": "bbe94af221e444dd467e03833107ebb92e7b68c6181a3a82afd8f09afcb706a6",
+      "runtime_expectation": true
+    },
+    {
+      "name": "zero-width separator",
+      "app": "herdr-mcp",
+      "message": "hello world",
+      "observed_text": "@herdr-mcp​ hello world",
+      "stripped_body": "hello world",
+      "tolerated": true,
+      "observed_text_trimmed_sha256": "02c661f820f4ef92a2bbf31ef640ee8e94c270289e37ecb9fda5410cb4cb6e67",
+      "observed_text_canonical_sha256": "02c661f820f4ef92a2bbf31ef640ee8e94c270289e37ecb9fda5410cb4cb6e67",
+      "runtime_expectation": false
+    },
+    {
+      "name": "multiline body",
+      "app": "herdr-mcp",
+      "message": "Line one\n\nLine two",
+      "observed_text": "@herdr-mcp\n\nLine one\n\nLine two",
+      "stripped_body": "Line one\n\nLine two",
+      "tolerated": true,
+      "observed_text_trimmed_sha256": "e188583216123947afe7d6066dc047c2326fdc91e70486cbb354f3276a60f1ba",
+      "observed_text_canonical_sha256": "0c9c9b1b19ee5c844315b91e4ab8d715777e27e80e0e4c252fd9a195665bec69",
+      "runtime_expectation": true
+    },
+    {
+      "name": "dash body is not swallowed",
+      "app": "herdr-mcp",
+      "message": "- bullet item",
+      "observed_text": "@herdr-mcp - bullet item",
+      "stripped_body": "- bullet item",
+      "tolerated": true,
+      "observed_text_trimmed_sha256": "f4ac5bff925d1b3cd15cd670c1b5061a865daebf87d0a336235027a06fd482eb",
+      "observed_text_canonical_sha256": "f4ac5bff925d1b3cd15cd670c1b5061a865daebf87d0a336235027a06fd482eb",
+      "runtime_expectation": true
+    },
+    {
+      "name": "app name that prefixes the pill",
+      "app": "herdr",
+      "message": "hello world",
+      "observed_text": "@herdr-mcp hello world",
+      "stripped_body": "@herdr-mcp hello world",
+      "tolerated": false,
+      "observed_text_trimmed_sha256": "dd59496daccf93381fffc2bf39531fab75b7e4cb43a22804c005372d134b8a33",
+      "observed_text_canonical_sha256": "dd59496daccf93381fffc2bf39531fab75b7e4cb43a22804c005372d134b8a33",
+      "runtime_expectation": false
+    },
+    {
+      "name": "unrequested app pill",
+      "app": "herdr-mcp",
+      "message": "hello world",
+      "observed_text": "@otherapp hello world",
+      "stripped_body": "@otherapp hello world",
+      "tolerated": false,
+      "observed_text_trimmed_sha256": "7c1dfea7e08a74f39ada664444eec5827755ad955bbcbeccd1a211d1719e8ba9",
+      "observed_text_canonical_sha256": "7c1dfea7e08a74f39ada664444eec5827755ad955bbcbeccd1a211d1719e8ba9",
+      "runtime_expectation": false
+    },
+    {
+      "name": "different body",
+      "app": "herdr-mcp",
+      "message": "hello world",
+      "observed_text": "@herdr-mcp something else",
+      "stripped_body": "something else",
+      "tolerated": false,
+      "observed_text_trimmed_sha256": "7fd30182d42c6a08120ed173f9eb5c8495caa6af8537ffa23550e61e6ab3ef6c",
+      "observed_text_canonical_sha256": "7fd30182d42c6a08120ed173f9eb5c8495caa6af8537ffa23550e61e6ab3ef6c",
+      "runtime_expectation": false
+    },
+    {
+      "name": "longer body",
+      "app": "herdr-mcp",
+      "message": "hello world",
+      "observed_text": "@herdr-mcp hello world extra",
+      "stripped_body": "hello world extra",
+      "tolerated": false,
+      "observed_text_trimmed_sha256": "9089532d059f323175137db2424c91c3818f6ec5eae7137d8fab46886cddf296",
+      "observed_text_canonical_sha256": "9089532d059f323175137db2424c91c3818f6ec5eae7137d8fab46886cddf296",
+      "runtime_expectation": false
     }
   ]
 }
