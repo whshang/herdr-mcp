@@ -5587,6 +5587,7 @@ fn browser_session_create_public_delivery_evidence(
                     "id_conflict_matching_email",
                     "id_conflict_different_email",
                     "id_conflict_unverified_email",
+                    "id_namespace_unconfirmed",
                     "email_conflict",
                 ],
             ),
@@ -5626,6 +5627,39 @@ fn browser_session_create_public_delivery_evidence(
                     "bearer_network_unavailable",
                     "not_observed",
                 ],
+            ),
+            // #847: redacted identity payload shape (presence / equality codes
+            // only). These finite codes let the next provider-side UAT name the
+            // exact /me vs session body that refused registration, instead of
+            // inferring it from enums three different payload shapes can produce.
+            (
+                "me_user_id_shape",
+                &["me_user_id_present", "me_user_id_absent"],
+            ),
+            (
+                "session_user_id_shape",
+                &["session_user_id_present", "session_user_id_absent"],
+            ),
+            (
+                "session_top_id_shape",
+                &[
+                    "session_top_id_absent",
+                    "session_top_id_equals_account",
+                    "session_top_id_differs_from_account",
+                ],
+            ),
+            (
+                "id_namespace_comparison",
+                &[
+                    "user_ids_match",
+                    "user_ids_differ",
+                    "single_user_id_present",
+                    "no_user_id_present",
+                ],
+            ),
+            (
+                "me_account_id_shape",
+                &["me_account_id_present", "me_account_id_absent"],
             ),
             (
                 "scope_failure",
@@ -16747,6 +16781,80 @@ mod tests {
             "the generic resource-unavailable reason is not a fixed evidence code: {result}"
         );
         assert!(result.get("hint").is_none(), "{result}");
+    }
+
+    /// user webchat create | Given a Project tab whose account identity could not be proven | When the create is refused | Then only the bounded identity shape codes and fixed statuses are published and no account identifier or email is echoed
+    #[test]
+    fn user_webchat_create_given_unproven_project_identity_when_refused_then_only_bounded_shape_codes_are_published()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator =
+            ScriptedCreateActuator::new(ScriptedCreateEvidence::resource_unavailable(json!({
+                "error": "browser_create_scope_unavailable",
+                "phase": "scope_handshake",
+                "scope_failure": "registry_handshake_delay",
+                "registration_status": "id_namespace_unconfirmed",
+                "identity_relation": "me_differs_session_user_and_account_id",
+                "contact_proof": "both_emails_missing",
+                "bearer_relation": "bearer_token_unavailable",
+                "me_user_id_shape": "me_user_id_present",
+                "session_user_id_shape": "session_user_id_absent",
+                "session_top_id_shape": "session_top_id_equals_account",
+                "id_namespace_comparison": "single_user_id_present",
+                "me_account_id_shape": "me_account_id_absent",
+                // Non-conforming values must never be echoed, even under an
+                // allowlisted key.
+                "scope_failure_injected": "user-1234567890",
+                "session_user_id": "user-1234567890",
+                "account_email": "operator@example.com",
+                "message_submitted": false,
+                "retry_safe": true,
+            })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-identity-shape-1",
+        );
+        let evidence = &result["delivery_evidence"];
+        assert_eq!(
+            evidence["registration_status"], "id_namespace_unconfirmed",
+            "{result}"
+        );
+        assert_eq!(
+            evidence["me_user_id_shape"], "me_user_id_present",
+            "{result}"
+        );
+        assert_eq!(
+            evidence["session_user_id_shape"], "session_user_id_absent",
+            "{result}"
+        );
+        assert_eq!(
+            evidence["session_top_id_shape"], "session_top_id_equals_account",
+            "{result}"
+        );
+        assert_eq!(
+            evidence["id_namespace_comparison"], "single_user_id_present",
+            "{result}"
+        );
+        assert_eq!(
+            evidence["me_account_id_shape"], "me_account_id_absent",
+            "{result}"
+        );
+        assert_eq!(evidence["message_submitted"], false, "{result}");
+        assert_eq!(evidence["retry_safe"], true, "{result}");
+        let serialized = result.to_string();
+        assert!(
+            !serialized.contains("user-1234567890"),
+            "no provider id may cross: {result}"
+        );
+        assert!(
+            !serialized.contains("operator@example.com"),
+            "no email may cross: {result}"
+        );
+        assert!(evidence.get("scope_failure_injected").is_none(), "{result}");
+        assert!(evidence.get("account_email").is_none(), "{result}");
     }
 
     /// user webchat create | Given a fresh tab whose composer never mounted | When the extension refuses with its live rejected shape | Then the fixed code is surfaced as the reason without a busy hint

@@ -3390,6 +3390,7 @@ function normalizeHerdrMentionAlias(value) {
             identityRelation: lastBrowserIdentityRelation,
             contactProof: lastBrowserContactProof,
             bearerRelation: lastBrowserBearerRelation,
+            identityShape: lastBrowserIdentityShape,
           });
         })();
         return true;
@@ -3835,6 +3836,33 @@ function normalizeHerdrMentionAlias(value) {
   let lastBrowserIdentityRelation = "not_observed";
   let lastBrowserContactProof = "not_observed";
   let lastBrowserBearerRelation = "not_observed";
+  // #847: redacted identity payload shape (presence/equality codes only, never an
+  // id or email). A refused registration carries it so the next provider-side
+  // UAT can name the exact /me vs session shape instead of guessing from enums
+  // that three different payload bodies can produce.
+  let lastBrowserIdentityShape = null;
+  const BROWSER_IDENTITY_SHAPE_CODES = Object.freeze({
+    me_user_id: ["me_user_id_present", "me_user_id_absent"],
+    session_user_id: ["session_user_id_present", "session_user_id_absent"],
+    session_top_id: [
+      "session_top_id_absent", "session_top_id_equals_account",
+      "session_top_id_differs_from_account",
+    ],
+    id_comparison: [
+      "user_ids_match", "user_ids_differ", "single_user_id_present", "no_user_id_present",
+    ],
+    me_account_id: ["me_account_id_present", "me_account_id_absent"],
+  });
+
+  function browserIdentityShape(observed) {
+    if (!observed || typeof observed !== "object" || Array.isArray(observed)) return null;
+    const shape = {};
+    for (const [key, allowed] of Object.entries(BROWSER_IDENTITY_SHAPE_CODES)) {
+      const value = observed[key];
+      if (typeof value === "string" && allowed.includes(value)) shape[key] = value;
+    }
+    return Object.keys(shape).length ? shape : null;
+  }
 
   // Authenticated account observation for registration. The adapter may expose
   // a bounded observation (identity + display email + fixed conflict codes);
@@ -3853,10 +3881,12 @@ function normalizeHerdrMentionAlias(value) {
         return {
           nativeIdentity,
           email: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}$/.test(email) ? email : null,
+          idShape: browserIdentityShape(observed?.idShape),
           reason: [
             "native_id_conflict_matching_email",
             "native_id_conflict_different_email",
             "native_id_conflict_unverified_email",
+            "native_id_unconfirmed_namespace",
             "email_conflict",
           ].includes(observed?.reason) ? observed.reason : null,
           idRelation: [
@@ -3904,6 +3934,7 @@ function normalizeHerdrMentionAlias(value) {
       native_id_conflict_matching_email: "id_conflict_matching_email",
       native_id_conflict_different_email: "id_conflict_different_email",
       native_id_conflict_unverified_email: "id_conflict_unverified_email",
+      native_id_unconfirmed_namespace: "id_namespace_unconfirmed",
       email_conflict: "email_conflict",
     };
     // A throttled bearer verification means the identity is unknown, not
@@ -3915,6 +3946,7 @@ function normalizeHerdrMentionAlias(value) {
     lastBrowserIdentityRelation = accountObservation?.idRelation || "not_observed";
     lastBrowserContactProof = accountObservation?.emailProof || "not_observed";
     lastBrowserBearerRelation = accountObservation?.bearerRelation || "not_observed";
+    lastBrowserIdentityShape = accountObservation?.idShape || lastBrowserIdentityShape;
     // Never attempt to associate a ChatGPT route when no authenticated
     // identity is available. A fresh tab can have conflicting login endpoints
     // during an account switch; report only a bounded diagnostic state.
