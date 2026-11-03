@@ -3753,7 +3753,9 @@ test("user replays a held first turn through the shared source-turn payload | Gi
 });
 
 test("user records a fast-settled ChatGPT turn | Given a fresh submit anchor and matching new user message | When the assistant reply is already settled before the next tick | Then source-turn observation is emitted once with the accepted user text", () => {
-  const start = wakeSource.indexOf("const onTick = () => {");
+  // The confirmed-turn capture lives in its own helper now (#846), shared by the
+  // visible tick and the bounded hidden-tab capture, so the slice starts there.
+  const start = wakeSource.indexOf("    const maybeCaptureSourceTurn = () => {");
   const end = wakeSource.indexOf('      const currentAssistant = roleSnapshot("assistant");', start);
   assert.ok(start >= 0 && end > start, "ChatGPT turn observer must remain extractable");
   const onTickSource = `${wakeSource.slice(start, end)}\n};\nreturn onTick;`;
@@ -3766,13 +3768,15 @@ test("user records a fast-settled ChatGPT turn | Given a fresh submit anchor and
   const onTick = new Function(
     "document", "uiPressure", "chatGptConversationId", "generating", "sawGrowth", "stableRounds",
     "markLatestTurnsDirty", "settleTimer", "clearInterval", "syncPendingSubmitAnchor",
+    "conversationHealth", "lastNoBubbleLoggedSubmitAt", "console",
     "isComposerGenerating", "wasStopping", "roleSnapshot", "assistantSignature", "lastUserSignature",
     "lastUserCount", "normText", "pendingUserTextHint", "hasPendingReply", "lastStartedJournalKey",
     "sendBg", "ADAPTER", "Date", "pendingUserTextMatches",
     onTickSource,
   )(
     { hidden: false }, null, () => "conversation", false, false, 0, () => {}, null, () => {},
-    () => submitAt, () => false, false,
+    () => submitAt, { last_user_submit_at: submitAt }, 0, { debug: () => {} },
+    () => false, false,
     () => ({ text: sampledUserText, count: 2 }),
     (value) => String(value ?? "").trim().toLowerCase(), "previous user turn", 1,
     (value) => String(value ?? "").trim().toLowerCase(), () => "accepted prompt", () => false, "",

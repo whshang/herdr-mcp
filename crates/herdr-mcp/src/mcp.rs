@@ -4705,6 +4705,15 @@ fn browser_session_create_success(
         }
         Err(error) => return browser_store_error(error),
     };
+    // #846: the runtime delivered this create's first user turn itself, so the
+    // background/owned tab never runs the DOM turn watcher that reports
+    // `source_turn.observe`. Record that exact turn from the create's own
+    // settlement proof, otherwise a ChatGPT-side `agent.task.dispatch` of it can
+    // never bind this conversation. Every create success path (first attempt,
+    // same-key replay, reconciled uncertain) funnels through here, and the write
+    // is an idempotent monotonic upsert, so a replay also repairs a create that
+    // an older runtime settled without source-turn evidence.
+    record_created_session_source_turn(store, &reservation, params);
     // A create that names an existing work chain joins it before the worker can
     // settle, so the assistant turn lands in Work Memory without a parent race.
     let work_chain_binding =
@@ -4752,6 +4761,53 @@ fn browser_session_create_success(
         "work_memory_writeback": work_memory_writeback,
         "work_chain_binding": work_chain_binding,
     })
+}
+
+/// #846: durable source-turn evidence for one herdr-created conversation.
+///
+/// Only ChatGPT WebChat sessions have a source-turn consumer today (both the
+/// DOM `source_turn.observe` path and the settled `browser_dispatch.submit`
+/// path are ChatGPT-only), so a create for any other provider writes nothing. `observed_at` is the reservation's
+/// pre-actuation time: the store's monotonic per-session upsert then keeps any
+/// later observation of a newer turn, so a slow or reconciled create can never
+/// claim to be the conversation's current turn.
+fn record_created_session_source_turn(
+    store: &mut StateStore,
+    reservation: &BrowserSessionReservationRecord,
+    params: &Value,
+) {
+    if reservation.provider != "chatgpt" {
+        return;
+    }
+    let (Some(session_ref), Some(message)) = (
+        reservation.session_ref.as_deref(),
+        params.get("message").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let message = message.trim();
+    if message.is_empty() {
+        return;
+    }
+    let user_text_sha256 = source_turn_sha256(message);
+    match store.record_browser_session_create_source_turn(
+        reservation.reservation_ref.as_str(),
+        crate::state_store::BrowserDispatchSourceTurn {
+            session_ref,
+            user_text_sha256: &user_text_sha256,
+            observed_at: reservation.created_at,
+        },
+    ) {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "browser session.create source turn not recorded: reason=evidence_fence reservation={}",
+            reservation.reservation_ref
+        ),
+        Err(error) => eprintln!(
+            "browser session.create source turn not recorded: error={error} reservation={}",
+            reservation.reservation_ref
+        ),
+    }
 }
 
 /// A session.create success settled by the reconcile path: the same shape as
@@ -18375,6 +18431,153 @@ mod tests {
             endpoint.endpoint_ref,
             session.resource_ref,
         )
+    }
+
+    /// Builds one materialized + `applied` `session.create` reservation on the
+    /// shared ChatGPT fixture, so a test can drive the source-turn write
+    /// directly. Returns the store, the reservation (as stored) and the message
+    /// the runtime delivered.
+    fn applied_create_reservation_fixture() -> (
+        std::sync::Arc<std::sync::Mutex<StateStore>>,
+        crate::state_store::BrowserSessionReservationRecord,
+        String,
+    ) {
+        use crate::state_store::{
+            BrowserResourceObservationInput, BrowserSessionReservation,
+            BrowserSessionReservationInput,
+        };
+        let (store, endpoint_ref, observed_session_ref) = browser_dispatch_reconcile_fixture();
+        let message = "herdr UAT：只回复 OK";
+        let mut guard = store.lock().unwrap();
+        let account_ref = guard
+            .browser_resource(&observed_session_ref)
+            .unwrap()
+            .unwrap()
+            .parent_ref
+            .unwrap();
+        let reservation = match guard
+            .reserve_browser_session(BrowserSessionReservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                account_ref: &account_ref,
+                space_ref: None,
+                display_label: "Source turn create",
+                expected_generation: 7,
+                idempotency_key_digest: &browser_sha256("source-turn-create-key"),
+                request_digest: &browser_sha256("source-turn-create-request"),
+                created_at: 40,
+                expires_at: 4000,
+            })
+            .unwrap()
+        {
+            BrowserSessionReservation::Reserved(record) => record,
+            BrowserSessionReservation::Existing(_) => panic!("fixture reservation must be new"),
+        };
+        let created = guard
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&account_ref),
+                native_identity: "source-turn-created-session",
+                display_label: None,
+                observation_generation: 7,
+                observed_at: 41,
+            })
+            .unwrap();
+        guard
+            .upsert_browser_resource_locator(
+                &created.resource_ref,
+                "https://chatgpt.com/c/source-turn-created",
+                7,
+                41,
+            )
+            .unwrap();
+        guard
+            .materialize_browser_session_reservation(
+                &reservation.reservation_ref,
+                &created.resource_ref,
+                42,
+            )
+            .unwrap();
+        guard
+            .update_browser_session_reservation_delivery(
+                &reservation.reservation_ref,
+                7,
+                BrowserDeliveryState::Applied,
+                Some("provider-user-source-turn-create"),
+                43,
+            )
+            .unwrap();
+        let stored = guard
+            .browser_session_reservation(&reservation.reservation_ref)
+            .unwrap()
+            .unwrap();
+        drop(guard);
+        (store, stored, message.to_owned())
+    }
+
+    /// user never binds a non-ChatGPT create | Given an applied, materialized
+    /// create whose provider has no source-turn consumer | When the create
+    /// success path records turn evidence | Then nothing is written, so a
+    /// `browser_source_turns` row can only come from a proven ChatGPT delivery
+    #[test]
+    fn created_session_source_turn_is_chatgpt_only() {
+        let (store, stored, message) = applied_create_reservation_fixture();
+        let params = json!({"message": message});
+        let mut guard = store.lock().unwrap();
+        let mut other_provider = stored.clone();
+        other_provider.provider = "claude".to_owned();
+        record_created_session_source_turn(&mut guard, &other_provider, &params);
+        let session_ref = stored.session_ref.clone().unwrap();
+        assert_eq!(
+            guard
+                .latest_browser_source_turn_sha256(&session_ref, 10_000)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            guard.resolve_browser_source_turn(&source_turn_sha256(&message), 10_000),
+            Err("browser_current_turn_not_found".to_owned())
+        );
+
+        // Positive control: the same settlement for ChatGPT does record it.
+        record_created_session_source_turn(&mut guard, &stored, &params);
+        assert_eq!(
+            guard
+                .latest_browser_source_turn_sha256(&session_ref, 10_000)
+                .unwrap(),
+            Some(source_turn_sha256(&message))
+        );
+    }
+
+    /// user keeps the newest turn | Given a session whose source turn was
+    /// observed later than a create's pre-actuation time | When the create
+    /// records its own delivered turn | Then the newer observation survives and
+    /// the older create turn is not resolvable
+    #[test]
+    fn created_session_source_turn_never_overwrites_a_newer_observation() {
+        let (store, stored, message) = applied_create_reservation_fixture();
+        let params = json!({"message": message});
+        let session_ref = stored.session_ref.clone().unwrap();
+        let newer_digest = source_turn_sha256("a later user turn");
+        let mut guard = store.lock().unwrap();
+        // A newer turn for the same session, observed after the create resolved.
+        guard
+            .observe_browser_source_turn(&session_ref, 7, &newer_digest, 200)
+            .unwrap();
+        record_created_session_source_turn(&mut guard, &stored, &params);
+        assert_eq!(
+            guard
+                .latest_browser_source_turn_sha256(&session_ref, 10_000)
+                .unwrap(),
+            Some(newer_digest)
+        );
+        assert_eq!(
+            guard.resolve_browser_source_turn(&source_turn_sha256(&message), 10_000),
+            Err("browser_current_turn_not_found".to_owned()),
+            "the older create turn must not become the session's current evidence"
+        );
     }
 
     struct CanonicalOnlyReconcileActuator {
