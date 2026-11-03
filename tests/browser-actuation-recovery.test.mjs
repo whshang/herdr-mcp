@@ -17,8 +17,23 @@ function backgroundConstantNumber(name) {
   return Number(match[1].replaceAll("_", ""));
 }
 
+// Read a frozen object/array declaration straight out of background.js so the
+// sliced create branch and this harness can never drift from production.
+function backgroundConstSource(name, reader) {
+  const start = backgroundSource.indexOf(`const ${name} = `);
+  assert.ok(start >= 0, `${name} must remain declared in extension/background.js`);
+  const end = backgroundSource.indexOf("\nconst ", start + 1);
+  const declaration = backgroundSource.slice(start, end === -1 ? undefined : end).trim();
+  return new Function(`${declaration}\nreturn ${reader};`)();
+}
+
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = backgroundConstantNumber("BROWSER_CREATE_CONTENT_TIMEOUT_MS");
 const BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS = backgroundConstantNumber("BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS");
+const BROWSER_IDENTITY_SHAPE_CODES = backgroundConstSource("BROWSER_IDENTITY_SHAPE_CODES", "BROWSER_IDENTITY_SHAPE_CODES");
+const BROWSER_IDENTITY_SHAPE_EVIDENCE_KEYS = backgroundConstSource(
+  "BROWSER_IDENTITY_SHAPE_EVIDENCE_KEYS",
+  "BROWSER_IDENTITY_SHAPE_EVIDENCE_KEYS",
+);
 // The late-content-script scenario uses a ready delay that must stay inside the
 // production handshake window; the assertions below pin both bounds.
 const LATE_CONTENT_SCRIPT_READY_MS = 12_000;
@@ -5157,6 +5172,7 @@ function createActuationBranchHarness({
   publishOnProbeAttempt = 1,
   contentMode = "success",
   probeReadyAfterMs = 0,
+  probeReply = null,
 } = {}) {
   // Virtual clock: each 200ms handshake-loop tick advances the clock, so the
   // scope-gate deadline (BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS) elapses
@@ -5211,6 +5227,7 @@ function createActuationBranchHarness({
             // which publishes the tab's Browser Registry scope on the next poll.
             if (liveScopesByTab.has(tabId)) browserTabScopes.set(tabId, liveScopesByTab.get(tabId));
           }
+          return probeReply || {};
         }
         return {};
       },
@@ -5288,7 +5305,8 @@ function createActuationBranchHarness({
     "sendTabMessageWithTimeout",
     "postBrowserActuationEvidence", "protectBoundTab", "sendBrowserActuationTabMessage",
     "unavailableBrowserActuationEvidence", "BROWSER_CREATE_CONTENT_TIMEOUT_MS",
-    "BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS", "Date", "setTimeout",
+    "BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS", "BROWSER_IDENTITY_SHAPE_CODES",
+    "BROWSER_IDENTITY_SHAPE_EVIDENCE_KEYS", "Date", "setTimeout",
     `async function __actuate(command) {\n` +
     `const actuationId = String(command?.actuation_id || "");\n` +
     `const dispatchId = String(command?.dispatch_id || "");\n` +
@@ -5300,7 +5318,8 @@ function createActuationBranchHarness({
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
     sendTabMessageWithTimeout,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
-    unavailable, BROWSER_CREATE_CONTENT_TIMEOUT_MS, BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS, dateShim, setTimeoutShim);
+    unavailable, BROWSER_CREATE_CONTENT_TIMEOUT_MS, BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS,
+    BROWSER_IDENTITY_SHAPE_CODES, BROWSER_IDENTITY_SHAPE_EVIDENCE_KEYS, dateShim, setTimeoutShim);
 
   return {
     actuate,
@@ -5419,6 +5438,67 @@ test("user keeps the create-scope handshake window ahead of a slow content scrip
       && LATE_CONTENT_SCRIPT_READY_MS < BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS,
     `the 12s-ready scenario (${LATE_CONTENT_SCRIPT_READY_MS}ms) must lie strictly between 8000ms and ${BROWSER_CREATE_SCOPE_HANDSHAKE_TIMEOUT_MS}ms`,
   );
+});
+
+test("user sees which Project identity payload refused the create | Given a Project tab whose identity handshake reports an unprovable namespace and never publishes a scope | When the create gate gives up | Then the failed-create evidence carries the bounded shape codes and the precise registration status", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness({
+    publishOnProbe: false,
+    probeReply: {
+      convKey: `https://chatgpt.com/g/${projectId}`,
+      site: "chatgpt",
+      registrationStatus: "id_namespace_unconfirmed",
+      identityRelation: "not_observed",
+      contactProof: "both_emails_missing",
+      bearerRelation: "not_observed",
+      identityShape: {
+        me_user_id: "me_user_id_present",
+        session_user_id: "session_user_id_absent",
+        session_top_id: "session_top_id_absent",
+        id_comparison: "single_user_id_present",
+        me_account_id: "me_account_id_absent",
+        // Non-conforming extras must never reach the evidence.
+        session_user_id_value: "user-1234567890",
+      },
+    },
+  });
+  const sourceTabId = 71;
+  harness.browserTabScopes.set(sourceTabId, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(sourceTabId, { id: sourceTabId, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "e".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "e".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+
+  assert.equal(harness.actuationMessages.length, 0, "an unprovable identity must never submit");
+  const failure = harness.postCalls.find((call) => call.evidence?.resource_available === false);
+  assert.ok(failure, "the create must fail closed with evidence");
+  assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
+  assert.equal(failure.evidence.result?.phase, "scope_handshake");
+  assert.equal(failure.evidence.result?.registration_status, "id_namespace_unconfirmed");
+  assert.equal(failure.evidence.result?.me_user_id_shape, "me_user_id_present");
+  assert.equal(failure.evidence.result?.session_user_id_shape, "session_user_id_absent");
+  assert.equal(failure.evidence.result?.session_top_id_shape, "session_top_id_absent");
+  assert.equal(failure.evidence.result?.id_namespace_comparison, "single_user_id_present");
+  assert.equal(failure.evidence.result?.me_account_id_shape, "me_account_id_absent");
+  assert.equal(failure.evidence.result?.message_submitted, false);
+  assert.equal(JSON.stringify(failure.evidence).includes("user-1234567890"), false,
+    "no provider identifier may cross into evidence");
 });
 
 test("user create still completes after document_idle injection | Given a freshly created tab whose identity probes reject and whose scope is not registered until ~12s after tab creation | When the content script becomes ready and publishes the matching scope | Then the create command is delivered to that tab instead of failing with scope_unavailable", async () => {
