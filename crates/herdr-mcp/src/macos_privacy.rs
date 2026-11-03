@@ -393,7 +393,9 @@ fn map_alias_probe_exit(code: Option<i32>) -> BrokeredAlias {
         // argv at all: `herdr-mcp <unknown-subcommand>` prints usage and returns
         // `ExitCode::FAILURE` (1) from the CLI error path, which is exactly what a
         // pre-#844 broker does with `__documents-alias-probe`/`-ensure`.
-        Some(1) | None => BrokeredAlias::BrokerOutdated,
+        Some(1) => BrokeredAlias::BrokerOutdated,
+        // A signalled child (no status code) is not an unknown command.
+        None => BrokeredAlias::Denied("alias probe exited without a status code".to_owned()),
         other => BrokeredAlias::Denied(format!("alias probe exit {other:?}")),
     }
 }
@@ -659,7 +661,10 @@ mod tests {
         // Only exit 1 (the `unknown command` path of a pre-#844 broker) or no
         // exit code at all means the broker predates the subcommand.
         assert_eq!(map_alias_probe_exit(Some(1)), BrokeredAlias::BrokerOutdated);
-        assert_eq!(map_alias_probe_exit(None), BrokeredAlias::BrokerOutdated);
+        assert!(matches!(
+            map_alias_probe_exit(None),
+            BrokeredAlias::Denied(detail) if detail.contains("without a status code")
+        ));
         assert!(matches!(
             map_alias_probe_exit(Some(9)),
             BrokeredAlias::Denied(_)

@@ -623,30 +623,6 @@ fn runtime_update_succeeded_result(outcome: RuntimeUpdateOutcome<'_>) -> (Value,
     (payload, ExitCode::SUCCESS)
 }
 
-/// Decide and perform the one-time TCC broker migration on the committed update
-/// path.
-///
-/// `tcc_broker::install` deliberately never replaces a broker whose compatibility
-/// revision differs: it returns early for an equal revision, errors for a
-/// different one without `force`, and refuses an ad-hoc/cdhash broker even with
-/// `force`. The migration that does swap the bytes is the explicit
-/// re-authorization path behind `herdr-mcp permissions setup --upgrade-broker`,
-/// so the update runs that same function once instead of reporting a broker
-/// version the installed binary cannot serve. `migrate` is injected so the
-/// decision and the reporting are testable without codesign or a live broker.
-fn migrate_broker_after_update<F>(config_dir: &std::path::Path, migrate: F) -> Value
-where
-    F: FnOnce(&std::path::Path) -> Result<bool, String>,
-{
-    let installed = crate::tcc_broker::installed_compat_revision(config_dir);
-    broker_migration_decision(
-        installed,
-        crate::tcc_broker::BROKER_COMPAT_REVISION,
-        migrate,
-        config_dir,
-    )
-}
-
 /// Pure decision behind [`migrate_broker_after_update`]: `installed` is the
 /// revision the config dir records (or `None` when it cannot be read), and
 /// `migrate` performs the real replacement.
@@ -739,6 +715,52 @@ fn attach_tcc_broker_migration(payload: &mut Value, migration: Value) {
     if let Some(list) = notices.as_array_mut() {
         list.push(notice);
     }
+}
+
+/// Run the post-commit TCC steps in the only order that costs one prompt.
+///
+/// The migration has no Documents syscall; it replaces the broker file. Running
+/// the preflight first would raise the prompt for the broker that the migration
+/// then discards (a new ad-hoc identity), so the operator would answer twice and
+/// the surviving broker would still be ungranted. Migrate, then probe the broker
+/// that stays installed. Both steps are injected so the order is testable.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn attach_post_commit_tcc<M, P>(
+    payload: &mut Value,
+    config_dir: &std::path::Path,
+    installed_revision: Option<u32>,
+    migrate: M,
+    preflight: P,
+) where
+    M: FnOnce(&std::path::Path) -> Result<bool, String>,
+    P: FnOnce(&std::path::Path) -> Value,
+{
+    let migration = broker_migration_decision(
+        installed_revision,
+        crate::tcc_broker::BROKER_COMPAT_REVISION,
+        migrate,
+        config_dir,
+    );
+    attach_tcc_broker_migration(payload, migration);
+    attach_tcc_preflight(payload, preflight(config_dir));
+}
+
+/// Persist the broker migration outcome next to the other update artifacts so
+/// `update status` can report it without re-running codesign or a migration.
+fn persist_broker_migration(config_dir: &std::path::Path, migration: &Value) {
+    let path = config_dir.join("update").join("tcc-broker-migration.json");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = crate::mutation::atomic_write(&path, migration.to_string().as_bytes());
+}
+
+/// Persisted broker migration outcome, or an explicit `unknown` shape.
+fn persisted_broker_migration(config_dir: &std::path::Path) -> Value {
+    std::fs::read_to_string(config_dir.join("update").join("tcc-broker-migration.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({"state": "unknown", "reported_by": Value::Null}))
 }
 
 /// Attach the post-activation macOS Documents preflight to an update result.
@@ -1301,22 +1323,24 @@ fn apply_inner(
                     extension,
                     extension_staging: staging.ok(),
                 });
-                // #844: exactly one post-activation Documents preflight. It is
-                // bounded and broker-routed, and its result is persisted so
-                // `update status` never has to probe.
-                attach_tcc_preflight(
+                // #844: migrate the broker first (no Documents syscall), then run
+                // exactly one bounded preflight against the broker that stays
+                // installed. Both results are persisted so `update status` never
+                // has to probe.
+                let installed_revision =
+                    crate::tcc_broker::installed_compat_revision(&paths.config_dir);
+                attach_post_commit_tcc(
                     &mut payload,
-                    crate::macos_privacy::preflight_after_activation(&paths.config_dir),
-                );
-                // #844: the alias subcommands only exist in broker revision 5, and
-                // `install` never replaces a differing revision, so the upgrade
-                // performs the one explicit-reauthorization migration here.
-                attach_tcc_broker_migration(
-                    &mut payload,
-                    migrate_broker_after_update(&paths.config_dir, |config_dir| {
+                    &paths.config_dir,
+                    installed_revision,
+                    |config_dir| {
                         crate::tcc_broker::migrate_for_explicit_reauthorization(config_dir)
-                    }),
+                    },
+                    crate::macos_privacy::preflight_after_activation,
                 );
+                if let Some(migration) = payload.get("tcc_broker_migration") {
+                    persist_broker_migration(&paths.config_dir, migration);
+                }
                 print_json(&payload)?;
                 return Ok(code);
             }
@@ -2401,6 +2425,10 @@ fn status() -> Result<ExitCode, String> {
             "tcc_preflight".to_owned(),
             crate::macos_privacy::persisted_tcc_preflight(&paths.config_dir),
         );
+        object.insert(
+            "tcc_broker_migration".to_owned(),
+            persisted_broker_migration(&paths.config_dir),
+        );
     }
     print_json(&view)?;
     Ok(ExitCode::SUCCESS)
@@ -2494,6 +2522,33 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
                     "service install committed and health gate passed; extension staging did not complete: {error}"
                 ),
             };
+            // #844: this process is the newly downloaded binary, and every apply
+            // path (interactive, `update auto`, and the queued path with no
+            // foreground watcher) converges here. That makes it the only place
+            // where the broker migration reliably runs on the first apply of this
+            // release: the foreground updater that installed it is the previous
+            // binary and does not contain this code. Migration has no Documents
+            // syscall and is best-effort, so a failure never changes the job state.
+            if let Ok(paths) = crate::paths::RuntimePaths::discover() {
+                // Same ordering as the foreground: migrate (no Documents syscall)
+                // and only then run the one bounded preflight, so the single
+                // prompt belongs to the broker that stays installed.
+                let mut scratch = json!({});
+                let installed_revision =
+                    crate::tcc_broker::installed_compat_revision(&paths.config_dir);
+                attach_post_commit_tcc(
+                    &mut scratch,
+                    &paths.config_dir,
+                    installed_revision,
+                    |config_dir| {
+                        crate::tcc_broker::migrate_for_explicit_reauthorization(config_dir)
+                    },
+                    crate::macos_privacy::preflight_after_activation,
+                );
+                if let Some(migration) = scratch.get("tcc_broker_migration") {
+                    persist_broker_migration(&paths.config_dir, migration);
+                }
+            }
             store.update_update_job(job_id, "succeeded", Some(&detail), None, now_ms_i64())?;
             crate::local_agent_skill::sync_after_install_best_effort();
             cleanup_staging(&binary);
@@ -4972,7 +5027,86 @@ mod tests {
         assert_eq!(chained["code"], "worker_update_succeeded");
     }
 
-    /// user gets the alias subcommands installed by the upgrade | Given an
+    /// user answers at most one prompt | Given a committed Runtime update whose
+    /// installed broker predates the alias subcommands | When the post-commit TCC
+    /// steps run | Then the broker is migrated BEFORE the single preflight, and
+    /// both outcomes are attached to the result.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn post_commit_tcc_migrates_before_the_single_preflight() {
+        let config_dir = Path::new("/tmp/herdr-post-commit-tcc-order");
+        let order = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let mut payload = json!({"ok": true, "code": "update_succeeded", "notices": []});
+        // The migration writes the broker file only; the preflight is the step
+        // that can raise a Documents prompt, so it must observe the migrated
+        // broker, never the one the migration replaces.
+        attach_post_commit_tcc(
+            &mut payload,
+            config_dir,
+            Some(4),
+            |_config_dir| {
+                order.borrow_mut().push("migrate");
+                Ok(true)
+            },
+            |_config_dir| {
+                order.borrow_mut().push("preflight");
+                json!({"probe": "pending", "prompt_pending": true, "detail": null})
+            },
+        );
+        assert_eq!(*order.borrow(), vec!["migrate", "preflight"]);
+        assert_eq!(payload["tcc_broker_migration"]["state"], "migrated");
+        assert_eq!(payload["tcc_prompt_pending"], true);
+        assert_eq!(payload["ok"], true);
+
+        // A current broker is not migrated, but the single preflight still runs.
+        let order = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let mut payload = json!({"ok": true, "notices": []});
+        attach_post_commit_tcc(
+            &mut payload,
+            config_dir,
+            Some(crate::tcc_broker::BROKER_COMPAT_REVISION),
+            |_config_dir| {
+                order.borrow_mut().push("migrate");
+                Ok(true)
+            },
+            |_config_dir| {
+                order.borrow_mut().push("preflight");
+                json!({"probe": "available", "prompt_pending": false, "detail": null})
+            },
+        );
+        assert_eq!(*order.borrow(), vec!["preflight"]);
+        assert_eq!(payload["tcc_broker_migration"]["state"], "current");
+        assert_eq!(payload["tcc_prompt_pending"], false);
+    }
+
+    /// user gets the alias subcommands on the first apply of this release |
+    /// Given the worker persisted a migration outcome | When `update status`
+    /// reads it | Then the recorded state is reported without re-running codesign
+    /// or a migration.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn broker_migration_outcome_round_trips_through_the_update_record() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-broker-record-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        assert_eq!(persisted_broker_migration(&root)["state"], "unknown");
+        let migration = json!({
+            "state": "migrated",
+            "installed_revision": 4,
+            "target_revision": crate::tcc_broker::BROKER_COMPAT_REVISION,
+            "needs_reauthorization": true,
+        });
+        persist_broker_migration(&root, &migration);
+        let recorded = persisted_broker_migration(&root);
+        assert_eq!(recorded["state"], "migrated");
+        assert_eq!(recorded["installed_revision"], 4);
+        assert_eq!(recorded["needs_reauthorization"], true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// user gets the alias subcommands installed by the upgrade | Given an    /// user gets the alias subcommands installed by the upgrade | Given an
     /// installed broker at an older compatibility revision | When the committed
     /// update path runs the broker migration | Then it performs exactly one
     /// explicit-reauthorization migration and reports it as a non-fatal notice,
