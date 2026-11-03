@@ -20,7 +20,6 @@ use serde_json::Map;
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::env;
-#[cfg(unix)]
 use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::time::Duration;
@@ -356,7 +355,36 @@ fn finish(write: Result<(), String>, reason: &'static str) -> HostOutcome {
     }
 }
 
+/// Neutral working directory chosen by [`run`] before any path work.
+///
+/// `None` means the helper could not move, and relative extension paths must
+/// then fail instead of falling back to `getcwd` on whatever Chrome inherited.
+static NEUTRAL_HELPER_CWD: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
+    // #844: the extension host is a helper process. It never needs the working
+    // directory Chrome or the linker inherited, and inheriting a protected one
+    // would let a relative path resolution reach ~/Documents from an identity
+    // that holds no grant. Move to a neutral directory before any path work.
+    match crate::paths::RuntimePaths::discover() {
+        Ok(paths) => match crate::macos_permissions::enter_neutral_helper_cwd(&paths.config_dir) {
+            Ok(neutral) => {
+                let _ = NEUTRAL_HELPER_CWD.set(neutral);
+            }
+            Err(error) => {
+                // Keep serving, but record why relative paths will be refused
+                // rather than silently leaving the process in an unknown cwd.
+                eprintln!(
+                    "[herdr-mcp native-host] cannot enter a neutral working directory: {error}"
+                );
+            }
+        },
+        Err(error) => {
+            eprintln!(
+                "[herdr-mcp native-host] cannot resolve runtime paths for a neutral working directory: {error}"
+            );
+        }
+    }
     let log = NativeHostLog::discover();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -612,12 +640,29 @@ pub(crate) fn validate_extension_origin(origin: &str) -> Result<&str, String> {
 
 #[cfg(unix)]
 pub(crate) fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
+    lexical_absolute_from(path, NEUTRAL_HELPER_CWD.get().map(PathBuf::as_path))
+}
+
+/// Testable seam: `neutral` is the directory a relative path resolves against,
+/// or `None` when the helper never got one.
+pub(crate) fn lexical_absolute_from(
+    path: &Path,
+    neutral: Option<&Path>,
+) -> Result<PathBuf, String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        env::current_dir()
-            .map_err(|error| format!("cannot resolve extension path: {error}"))?
-            .join(path)
+        // #844: never call `getcwd`. On a protected cwd the syscall itself is
+        // the Documents access this guard exists to avoid, so a relative path is
+        // resolved against the neutral directory `run` chose, and refused when
+        // the helper could not choose one.
+        let Some(neutral) = neutral else {
+            return Err(
+                "extension path is relative and the helper has no neutral working directory"
+                    .to_owned(),
+            );
+        };
+        neutral.join(path)
     };
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
@@ -628,6 +673,15 @@ pub(crate) fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
             }
             _ => normalized.push(component.as_os_str()),
         }
+    }
+    // Normalize before the protection check: `../../Documents/...` joined to the
+    // neutral directory is not lexically under Documents until `..` is applied,
+    // and checking first would let the normalized path reach `is_dir()`.
+    if crate::macos_permissions::runtime_must_not_probe(&normalized) {
+        return Err(format!(
+            "extension path '{}' is inside a macOS privacy-protected folder; load the extension from the managed standalone path instead",
+            normalized.display()
+        ));
     }
     Ok(normalized)
 }
@@ -1082,6 +1136,59 @@ fn string_field<'a>(message: &'a Value, key: &str) -> Result<&'a str, String> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// user keeps a bounded helper | Given the extension host has no neutral
+    /// working directory | When a relative extension path arrives | Then it is
+    /// refused without ever calling getcwd, which is the Documents access the
+    /// guard exists to avoid on an inherited protected cwd.
+    #[test]
+    fn relative_extension_path_is_refused_without_getcwd() {
+        assert!(
+            super::NEUTRAL_HELPER_CWD.get().is_none(),
+            "test precondition"
+        );
+        let error = super::lexical_absolute(Path::new("extension")).expect_err("must be refused");
+        assert!(error.contains("neutral working directory"), "{error}");
+    }
+
+    /// A relative path that climbs out of the neutral directory into Documents
+    /// must be normalized before it is classified, otherwise the escape is only
+    /// caught later by is_dir()/is_file() on the protected path.
+    #[test]
+    fn parent_dir_escape_is_normalized_before_the_protection_check() {
+        // Use the real HOME so the escape really normalizes into this user's
+        // Documents, and classify with the explicit-home helper so the assertion
+        // does not depend on which probe the platform supports.
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME is set for tests");
+        let neutral = home.join(".config").join("herdr-mcp");
+        let expected = home.join("Documents").join("herdr-mcp").join("extension");
+        let resolved = super::lexical_absolute_from(
+            Path::new("../../Documents/herdr-mcp/extension"),
+            Some(&neutral),
+        );
+        match resolved {
+            Ok(path) => assert_eq!(path, expected, "the escape must normalize into Documents"),
+            Err(error) => assert!(
+                error.contains("privacy-protected folder"),
+                "an escape may only be refused for the protected folder, got {error}"
+            ),
+        }
+        assert!(
+            crate::macos_permissions::is_protected_user_path_lexical_for_home(&expected, &home),
+            "the normalized escape must classify as protected"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            super::lexical_absolute_from(
+                Path::new("../../Documents/herdr-mcp/extension"),
+                Some(&neutral)
+            )
+            .is_err(),
+            "macOS must refuse the escape before any directory probe"
+        );
+    }
+
     use super::*;
     use std::fs;
     use std::io::Cursor;
