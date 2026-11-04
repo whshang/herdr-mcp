@@ -88,6 +88,8 @@ scripts/ci-herdr-runtime.sh stop
 
 Never run repository-wide `npm test` in a fresh worktree and interpret the result without first building `dist/`. Several retained compatibility tests import `dist/*.js`; `ERR_MODULE_NOT_FOUND` for `dist/...` after a direct `npm test` is normally a missing-build precondition, not a Rust runtime regression. Do not report it as a Rust service failure.
 
+For local release-like iteration, use `cargo build --profile release-fast`. It inherits `[profile.release]` (including `strip = "symbols"`) but sets `lto = false` and `codegen-units = 16`, so it links far faster than the official profile; artifacts land in `target/release-fast/`. Official releases, tags, and `rust-release.yml` stay on `[profile.release]`; never ship a `release-fast` binary.
+
 ### Test design policy
 
 Tests describe externally observable behavior. Prefer a user/public entrypoint through the real implementation to assertions about internal calls, private methods, or implementation structure. A behavior-preserving refactor should not require broad test rewrites.

@@ -281,6 +281,19 @@ test("CI Rust gate uses a trusted-main-only shared compiler cache", async () => 
     /mozilla-actions\/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba/,
     "sccache action must stay pinned to the reviewed commit",
   );
+  // The registry/git cache is complementary to sccache: it must not cache
+  // target/, and it must only be written from trusted main pushes.
+  assert.match(
+    ci,
+    /Swatinem\/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2\.9\.3/,
+    "rust-cache must stay pinned to the reviewed v2.9.3 commit",
+  );
+  assert.match(ci, /cache-targets:\s*["']false["']/, "rust-cache must not duplicate sccache's target/ caching");
+  assert.match(
+    ci,
+    /save-if:\s*\$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/,
+    "rust-cache saves must mirror the trusted-main-only sccache policy",
+  );
 });
 
 test("user changes unrelated code | Given the Windows candidate workflow | When CI selects jobs | Then Windows runs only for relevant inputs and reuses trusted compiler cache", async () => {
