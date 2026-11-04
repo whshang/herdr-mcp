@@ -1,4 +1,7 @@
 [build]
 # Keep intermediates under CARGO_HOME, but isolate them by manifest path so
 # concurrent worktrees cannot reuse stale local-crate artifacts.
+# Stock cargo honors this. The local huacnlee/cargo fork ignores `build-dir` and
+# always uses `~/.cargo/targets`, printing a harmless warning; keep it anyway so
+# CI and stock toolchains keep per-worktree isolation.
 build-dir = "{cargo-cache-home}/herdr-mcp-build/{workspace-path-hash}"

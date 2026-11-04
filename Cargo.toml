@@ -2,10 +2,16 @@
 members = ["crates/herdr-mcp"]
 resolver = "3"
 
+# `split-debuginfo` is intentionally not set: macOS already defaults to
+# `unpacked` for dev, while an explicit `unpacked` is unstable on windows-msvc
+# and would emit `.dwo` files on Linux.
 [profile.dev]
 debug = "line-tables-only"
 
+# Optimize dependencies for local iteration; the workspace crates stay
+# unoptimized so incremental rebuilds of first-party code stay fast.
 [profile.dev.package."*"]
+opt-level = 1
 debug = false
 
 [profile.debugging]
@@ -16,3 +22,9 @@ debug = true
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Local release-like builds only. Official releases stay on `release`.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
