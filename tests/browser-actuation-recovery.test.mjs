@@ -3965,7 +3965,16 @@ function selfArchiveHarness(overrides = {}) {
     "acceptance canonicalization helpers must remain extractable");
   const acceptanceSource = wakeSource.slice(acceptanceStart, acceptanceEnd);
   const api = new Function("ctx", "sessionStorage", "setTimeout", "Date", `
-    const ADAPTER = { name: "chatgpt", ...(ctx.adapter || {}) };
+    const ADAPTER = {
+      name: "chatgpt",
+      capabilities: { sessionArchive: true, sessionArchiveStatus: true },
+      ...(ctx.adapter || {}),
+    };
+    // Mirrors the host helper (wake.js adapterSupports) that the extracted
+    // archive handlers now call instead of a provider-name check.
+    const adapterSupports = (capability) => (typeof ADAPTER.supportsCapability === "function"
+      ? ADAPTER.supportsCapability(capability)
+      : ADAPTER.capabilities?.[String(capability || "")] === true);
     const chatGptConversationId = () => ctx.conversationId;
     const isTurnInProgress = () => ctx.turnInProgress;
     const fetch = ctx.fetch || (() => { throw new Error("unexpected fetch"); });

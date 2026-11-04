@@ -2366,7 +2366,7 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function performChatGptSessionArchive(command, evidence) {
-    if (ADAPTER.name !== "chatgpt") {
+    if (!adapterSupports("sessionArchive")) {
       return browserUnavailableEvidence(evidence, "browser_archive_provider_unavailable");
     }
     const params = command?.params && typeof command.params === "object" ? command.params : {};
@@ -2428,7 +2428,7 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function performChatGptSessionArchiveStatus(command, evidence) {
-    if (ADAPTER.name !== "chatgpt") {
+    if (!adapterSupports("sessionArchiveStatus")) {
       return browserUnavailableEvidence(evidence, "browser_archive_status_provider_unavailable");
     }
     const params = command?.params && typeof command.params === "object" ? command.params : {};
