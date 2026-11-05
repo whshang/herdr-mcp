@@ -11481,22 +11481,14 @@ fn browser_page_action_call(
         });
     }
 
-    // Applied results keep their bounded existing TTL. A handed-out mutation
-    // whose outcome was never learned (delivery_unknown) becomes a durable
+    // Only a learned `applied` outcome keeps the bounded existing TTL. Every
+    // other verdict (off-contract string, missing or non-string
+    // delivery_state, normalized delivery_unknown) is a durable unknown
     // tombstone: no expiry, never re-actuated, replayable under the same
     // op_id. Retaining unknowns indefinitely implies eventual fail-closed
     // admission until an operator reconciles; see the cap check in
     // reserve_operation.
-    //
-    // The verdict is read back from the normalized outward result, not the raw
-    // delivery_state: an off-contract state that was just normalized to
-    // `delivery_unknown` must persist as the durable unknown tombstone too,
-    // otherwise it is stored as an expiring row and the same idempotency key
-    // can re-actuate the page after the TTL prunes it.
-    let unknown_verdict = result
-        .get("delivery_state")
-        .and_then(Value::as_str)
-        .is_some_and(|state| state == "delivery_unknown");
+    let unknown_verdict = delivery_state != "applied";
     let Ok(mut guard) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
@@ -25029,20 +25021,24 @@ mod tests {
                 _endpoint_ref: Option<&str>,
                 _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
                 let mut evidence =
                     BrowserPostconditionEvidence::resource_unavailable(expected_generation);
                 evidence.command_accepted = true;
                 evidence.browser_online = true;
                 evidence.resource_available = true;
-                // Off-contract pair: refused, yet not retry-safe. It is
-                // normalized outward to delivery_unknown and must persist as
-                // the durable unknown tombstone, not an expiring verdict.
-                evidence.result = Some(json!({
-                    "ok": false,
-                    "delivery_state": "not_applied",
-                    "retry_safe": false,
-                }));
+                evidence.result = Some(match call {
+                    // Off-contract pair: refused, yet not retry-safe.
+                    0 => json!({
+                        "ok": false,
+                        "delivery_state": "not_applied",
+                        "retry_safe": false,
+                    }),
+                    // No delivery_state at all: the local verdict defaults to
+                    // delivery_unknown, so this must not become an expiring
+                    // applied-style row either.
+                    _ => json!({"ok": false, "error": "no_delivery_state"}),
+                });
                 Ok(evidence)
             }
         }
@@ -25054,7 +25050,7 @@ mod tests {
         let actuator = NoncontractStateActuator {
             calls: AtomicUsize::new(0),
         };
-        let params = json!({
+        let mut params = json!({
             "endpoint_ref": "bep_test",
             "page_ref": format!("bp_{}", "a".repeat(64)),
             "action": "click",
@@ -25070,10 +25066,20 @@ mod tests {
         assert_eq!(unknown["retryable"], false);
         assert_eq!(unknown["retry_safe"], false);
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
-        let original_op_id = unknown["op_id"].clone();
+        let noncontract_op_id = unknown["op_id"].clone();
 
-        // Age the reservation past the ten-minute TTL. An expiring row would
-        // be pruned by the next reservation and re-actuate here.
+        // Second, distinct mutation whose evidence carries no delivery_state.
+        params["idempotency_key"] = json!("page-click-missing-state-1");
+        params["ref"] = json!("ref_pa_gen_1_test_1");
+        let missing = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(missing["ok"], false, "{missing}");
+        assert_eq!(missing["idempotent_replay"], false);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+        let missing_op_id = missing["op_id"].clone();
+        assert_ne!(missing_op_id, noncontract_op_id, "distinct mutations");
+
+        // Age both reservations past the ten-minute TTL: an expiring row
+        // would be pruned by the next reservation and re-actuate here.
         store
             .lock()
             .unwrap()
@@ -25086,14 +25092,22 @@ mod tests {
             .unwrap();
         let replay = browser_page_action_call(&store, &params, &grants, Some(&actuator));
         assert_eq!(replay["idempotent_replay"], true, "{replay}");
-        assert_eq!(replay["op_id"], original_op_id, "op_id preserved on replay");
+        assert_eq!(replay["op_id"], missing_op_id, "missing-state op_id kept");
+        assert_eq!(replay["delivery_state"], "delivery_unknown");
+        assert_eq!(replay["retryable"], false);
+
+        params["idempotency_key"] = json!("page-click-noncontract-state-1");
+        params["ref"] = json!("ref_pa_gen_1_test_0");
+        let replay = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["op_id"], noncontract_op_id, "noncontract op_id kept");
         assert_eq!(replay["code"], "browser_page_delivery_unknown");
         assert_eq!(replay["delivery_state"], "delivery_unknown");
         assert_eq!(replay["retryable"], false);
         assert_eq!(
             actuator.calls.load(Ordering::SeqCst),
-            1,
-            "expired noncontract verdict must never re-actuate"
+            2,
+            "expired noncontract/missing verdicts must never re-actuate"
         );
     }
 
