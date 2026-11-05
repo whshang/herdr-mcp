@@ -6851,7 +6851,7 @@ fn browser_session_open(
                 }
             }
         }
-        OperationReservation::Reserved => {}
+        OperationReservation::Reserved | OperationReservation::CapacityExhausted => {}
     }
 
     let mut actuation_params = params.clone();
@@ -11273,6 +11273,19 @@ fn browser_page_action_call(
             Some(expires_at),
         ) {
             Ok(OperationReservation::Reserved) => {}
+            Ok(OperationReservation::CapacityExhausted) => {
+                return json!({
+                    "ok": false,
+                    "code": "browser_page_unknown_capacity_exhausted",
+                    "retryable": false,
+                    "retry_safe": false,
+                    "delivery_state": "not_delivered",
+                    "message": "durable unknown tombstone cap reached; operator reconciliation required before new high-risk browser page mutations",
+                    "reconciliation": "inspect the durable unknown row via browser_page.action observe/expect on the same page_ref, then decide manually; never auto-retry or auto-delete",
+                    "op_id": op_id,
+                    "idempotent_replay": false,
+                });
+            }
             Ok(OperationReservation::Existing(record)) => {
                 if record.request_hash != request_hash {
                     return json!({
@@ -11289,6 +11302,34 @@ fn browser_page_action_call(
                             "op_id": record.op_id,
                             "retry_safe": false,
                         });
+                    }
+                    Some("unknown") => {
+                        // Terminal uncertainty: the original outcome was never
+                        // learned (handed out and lost, or the process crashed
+                        // while pending). Re-actuating could double-apply the
+                        // mutation, so the original op_id is returned with the
+                        // stored unknown verdict forever.
+                        let mut replay = if let Some(result_json) = record.result_json.as_deref()
+                            && let Ok(value) = serde_json::from_str::<Value>(result_json)
+                        {
+                            value
+                        } else {
+                            json!({
+                                "ok": false,
+                                "code": "browser_page_delivery_unknown",
+                                "retryable": false,
+                                "retry_safe": false,
+                                "delivery_state": "delivery_unknown",
+                            })
+                        };
+                        if let Some(object) = replay.as_object_mut() {
+                            object.insert("op_id".to_owned(), json!(record.op_id));
+                            object.insert("idempotent_replay".to_owned(), json!(true));
+                            object.insert("delivery_state".to_owned(), json!("delivery_unknown"));
+                            object.insert("retryable".to_owned(), json!(false));
+                            object.insert("retry_safe".to_owned(), json!(false));
+                        }
+                        return replay;
                     }
                     Some("complete") => {
                         let Some(result_json) = record.result_json else {
@@ -11364,13 +11405,15 @@ fn browser_page_action_call(
             let Ok(mut guard) = store.lock() else {
                 return json!({"ok": false, "code": "browser_operation_store_unavailable"});
             };
-            if let Err(error) = guard.complete_operation(
+            // The mutation may have been handed out before the transport
+            // failed, so the verdict is durably unknown: no expiry, never
+            // re-actuated, replayable forever under the same op_id.
+            if let Err(error) = guard.complete_operation_unknown(
                 "browser_page.action",
                 &idempotency_digest,
                 &request_hash,
                 &result.to_string(),
                 browser_epoch_ms(),
-                Some(expires_at),
             ) {
                 return browser_store_error(error);
             }
@@ -11438,17 +11481,35 @@ fn browser_page_action_call(
         });
     }
 
+    // Applied results keep their bounded existing TTL. A handed-out mutation
+    // whose outcome was never learned (delivery_unknown) becomes a durable
+    // tombstone: no expiry, never re-actuated, replayable under the same
+    // op_id. Retaining unknowns indefinitely implies eventual fail-closed
+    // admission until an operator reconciles; see the cap check in
+    // reserve_operation.
+    let unknown_verdict = delivery_state == "delivery_unknown";
     let Ok(mut guard) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
-    if let Err(error) = guard.complete_operation(
-        "browser_page.action",
-        &idempotency_digest,
-        &request_hash,
-        &result.to_string(),
-        browser_epoch_ms(),
-        Some(expires_at),
-    ) {
+    let completion = if unknown_verdict {
+        guard.complete_operation_unknown(
+            "browser_page.action",
+            &idempotency_digest,
+            &request_hash,
+            &result.to_string(),
+            browser_epoch_ms(),
+        )
+    } else {
+        guard.complete_operation(
+            "browser_page.action",
+            &idempotency_digest,
+            &request_hash,
+            &result.to_string(),
+            browser_epoch_ms(),
+            Some(expires_at),
+        )
+    };
+    if let Err(error) = completion {
         return browser_store_error(error);
     }
     result
@@ -11590,6 +11651,11 @@ fn doubao_image_generate_call(
             Some(expires_at),
         ) {
             Ok(OperationReservation::Reserved) => {}
+            // Capacity admission applies only to browser_page.action; other
+            // kinds keep their historical behavior.
+            Ok(OperationReservation::CapacityExhausted) => unreachable!(
+                "capacity admission is scoped to browser_page.action, not doubao.image.generate"
+            ),
             Ok(OperationReservation::Existing(record)) => {
                 if record.request_hash != request_hash {
                     return json!({
@@ -24727,6 +24793,204 @@ mod tests {
         let refused = browser_page_action_call(&store, &hover, &grants, Some(&actuator));
         assert_eq!(refused["code"], "invalid_params");
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn browser_page_action_unknown_is_durable_never_reactuated_and_fails_closed_at_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct UnknownOnceActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for UnknownOnceActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage action must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _endpoint_ref: Option<&str>,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    // Handed to the extension, completion never arrived:
+                    // delivery is unknown.
+                    let mut evidence =
+                        BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                    evidence.command_accepted = true;
+                    evidence.browser_online = true;
+                    evidence.resource_available = true;
+                    evidence.result = None;
+                    Ok(evidence)
+                } else {
+                    panic!("unknown mutation must never actuate again; call {call}")
+                }
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = UnknownOnceActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let page_ref = format!("bp_{}", "a".repeat(64));
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "click",
+            "generation": "pa_gen_1_test",
+            "ref": "ref_pa_gen_1_test_0",
+            "idempotency_key": "page-click-unknown-1",
+        });
+
+        // 1. Handed-out mutation whose completion never arrived.
+        let unknown = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(unknown["ok"], false, "{unknown}");
+        assert_eq!(unknown["code"], "browser_page_delivery_unknown");
+        assert_eq!(unknown["delivery_state"], "delivery_unknown");
+        assert_eq!(unknown["retryable"], false);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        let original_op_id = unknown["op_id"].clone();
+
+        // 2. Replay long after the original ten-minute expiry: the verdict is
+        // durable, the exact same key must never actuate again, and the
+        // original op_id is preserved.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE operations SET updated_at = updated_at - 11 * 60 * 1000")
+            .unwrap();
+        let replay = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["op_id"], original_op_id, "op_id preserved on replay");
+        assert_eq!(replay["delivery_state"], "delivery_unknown");
+        assert_eq!(replay["retryable"], false);
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            1,
+            "unknown replay must never re-actuate"
+        );
+
+        // 3. Crash while pending: the expired pending row must terminalize to
+        // the same durable unknown tombstone (not delete, not stay in-flight).
+        let crash_params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "click",
+            "generation": "pa_gen_1_test",
+            "ref": "ref_pa_gen_1_test_1",
+            "idempotency_key": "page-click-crash-1",
+        });
+        {
+            let mut guard = store.lock().unwrap();
+            let digest = browser_sha256("page-click-crash-1");
+            let request = browser_sha256(
+                &json!({
+                    "operation": BROWSER_PAGE_ACTION_METHOD,
+                    "endpoint_ref": "bep_test",
+                    "page_ref": page_ref,
+                    "action": "click",
+                    "generation": "pa_gen_1_test",
+                    "ref": "ref_pa_gen_1_test_1",
+                    "value_digest": null,
+                    "expected_url": null,
+                })
+                .to_string(),
+            );
+            let op_id = format!("op:browser_page_action:{}", &digest[..32]);
+            let now = browser_epoch_ms();
+            guard
+                .reserve_operation(
+                    "browser_page.action",
+                    &digest,
+                    &request,
+                    &op_id,
+                    now - 11 * 60 * 1000,
+                    Some(now - 60 * 1000),
+                )
+                .unwrap();
+        }
+        let crash_replay =
+            browser_page_action_call(&store, &crash_params, &grants, Some(&actuator));
+        assert_eq!(crash_replay["idempotent_replay"], true, "{crash_replay}");
+        assert_eq!(crash_replay["delivery_state"], "delivery_unknown");
+        assert_eq!(crash_replay["retryable"], false);
+        assert!(
+            crash_replay["op_id"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("op:browser_page_action:"))
+        );
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            1,
+            "crash-terminalized unknown must never actuate"
+        );
+
+        // 4. Capacity: once the tombstone cap is reached, a NEW mutation is
+        // rejected fail-closed with zero actuation; same-key replay above
+        // still works, and the rejected attempt leaves no pending residue.
+        {
+            let guard = store.lock().unwrap();
+            let now = browser_epoch_ms();
+            let mut batch = String::from("BEGIN;\n");
+            for i in 0..2047 {
+                let digest = browser_sha256(&format!("filler-{i}"));
+                batch.push_str(&format!(
+                    "INSERT INTO operations (
+                        op_id, kind, idempotency_key, request_hash, phase, state,
+                        created_at, updated_at, expires_at
+                     ) VALUES ('op:browser_page_action:{}', 'browser_page.action', '{d}', '{d}',
+                               'settled', 'unknown', {now}, {now}, NULL);\n",
+                    &digest[..32],
+                    d = digest,
+                ));
+            }
+            batch.push_str("COMMIT;\n");
+            guard.execute_batch(&batch).unwrap();
+        }
+        let mut new_mutation = params.clone();
+        new_mutation["idempotency_key"] = json!("page-click-after-cap");
+        new_mutation["ref"] = json!("ref_pa_gen_1_test_2");
+        let rejected = browser_page_action_call(&store, &new_mutation, &grants, Some(&actuator));
+        assert_eq!(
+            rejected["code"], "browser_page_unknown_capacity_exhausted",
+            "{rejected}"
+        );
+        assert_eq!(rejected["retryable"], false);
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            1,
+            "cap rejection must not actuate"
+        );
+        {
+            let pending = store
+                .lock()
+                .unwrap()
+                .scalar_i64("SELECT COUNT(*) FROM operations WHERE state = 'pending'")
+                .unwrap()
+                .unwrap_or(0);
+            assert_eq!(
+                pending, 0,
+                "rejected mutation must leave no pending residue"
+            );
+            // Same-key replay of an existing unknown still works at cap.
+            let still_replays = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+            assert_eq!(still_replays["idempotent_replay"], true, "{still_replays}");
+            assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
