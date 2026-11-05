@@ -11487,7 +11487,16 @@ fn browser_page_action_call(
     // op_id. Retaining unknowns indefinitely implies eventual fail-closed
     // admission until an operator reconciles; see the cap check in
     // reserve_operation.
-    let unknown_verdict = delivery_state == "delivery_unknown";
+    //
+    // The verdict is read back from the normalized outward result, not the raw
+    // delivery_state: an off-contract state that was just normalized to
+    // `delivery_unknown` must persist as the durable unknown tombstone too,
+    // otherwise it is stored as an expiring row and the same idempotency key
+    // can re-actuate the page after the TTL prunes it.
+    let unknown_verdict = result
+        .get("delivery_state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| state == "delivery_unknown");
     let Ok(mut guard) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
@@ -24991,6 +25000,101 @@ mod tests {
             assert_eq!(still_replays["idempotent_replay"], true, "{still_replays}");
             assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn browser_page_action_noncontract_delivery_state_stays_durable_unknown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct NoncontractStateActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for NoncontractStateActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage action must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _endpoint_ref: Option<&str>,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                // Off-contract pair: refused, yet not retry-safe. It is
+                // normalized outward to delivery_unknown and must persist as
+                // the durable unknown tombstone, not an expiring verdict.
+                evidence.result = Some(json!({
+                    "ok": false,
+                    "delivery_state": "not_applied",
+                    "retry_safe": false,
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = NoncontractStateActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "click",
+            "generation": "pa_gen_1_test",
+            "ref": "ref_pa_gen_1_test_0",
+            "idempotency_key": "page-click-noncontract-state-1",
+        });
+
+        let unknown = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(unknown["ok"], false, "{unknown}");
+        assert_eq!(unknown["code"], "browser_page_delivery_unknown");
+        assert_eq!(unknown["delivery_state"], "delivery_unknown");
+        assert_eq!(unknown["retryable"], false);
+        assert_eq!(unknown["retry_safe"], false);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        let original_op_id = unknown["op_id"].clone();
+
+        // Age the reservation past the ten-minute TTL. An expiring row would
+        // be pruned by the next reservation and re-actuate here.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE operations
+                 SET created_at = created_at - 11 * 60 * 1000,
+                     updated_at = updated_at - 11 * 60 * 1000,
+                     expires_at = expires_at - 11 * 60 * 1000",
+            )
+            .unwrap();
+        let replay = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["op_id"], original_op_id, "op_id preserved on replay");
+        assert_eq!(replay["code"], "browser_page_delivery_unknown");
+        assert_eq!(replay["delivery_state"], "delivery_unknown");
+        assert_eq!(replay["retryable"], false);
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            1,
+            "expired noncontract verdict must never re-actuate"
+        );
     }
 
     #[test]
