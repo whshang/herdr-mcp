@@ -11280,8 +11280,8 @@ fn browser_page_action_call(
                     "retryable": false,
                     "retry_safe": false,
                     "delivery_state": "not_delivered",
-                    "message": "durable unknown tombstone cap reached; operator reconciliation required before new high-risk browser page mutations",
-                    "reconciliation": "inspect the durable unknown row via browser_page.action observe/expect on the same page_ref, then decide manually; never auto-retry or auto-delete",
+                    "message": "pending and unknown BrowserPage reservations reached the admission limit; wait for safe settlement or operator reconciliation before new mutations",
+                    "reconciliation": "inspect current page state with read-only observe/expect and preserve the original op_id and key; investigate pending or unknown results manually; never auto-retry or auto-delete",
                     "op_id": op_id,
                     "idempotent_replay": false,
                 });
@@ -24992,6 +24992,79 @@ mod tests {
             assert_eq!(still_replays["idempotent_replay"], true, "{still_replays}");
             assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
         }
+
+        // Existing pending reservations consume future unknown capacity.
+        // At 2,047 unresolved rows the 2,048th must be admitted, but a
+        // further mutation must be rejected without touching the page.
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .execute_batch(
+                    "DELETE FROM operations WHERE op_id IN (
+                         SELECT op_id FROM operations
+                         WHERE kind = 'browser_page.action'
+                           AND state = 'unknown' AND result_json IS NULL LIMIT 2
+                     );
+                     UPDATE operations SET state = 'pending', phase = 'reserved',
+                         expires_at = (CAST(strftime('%s','now') AS INTEGER) + 600) * 1000
+                     WHERE kind = 'browser_page.action'
+                       AND state = 'unknown' AND result_json IS NULL;",
+                )
+                .unwrap();
+            let unresolved = guard
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM operations WHERE kind = 'browser_page.action'
+                 AND state IN ('pending', 'unknown')",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(unresolved, 2047);
+        }
+        let digest = browser_sha256("cap-accepted-last-pending");
+        let last_op_id = format!("op:browser_page_action:{}", &digest[..32]);
+        let accepted = store
+            .lock()
+            .unwrap()
+            .reserve_operation(
+                "browser_page.action",
+                &digest,
+                &digest,
+                &last_op_id,
+                browser_epoch_ms(),
+                Some(browser_epoch_ms() + 600_000),
+            )
+            .unwrap();
+        assert!(matches!(accepted, OperationReservation::Reserved));
+        new_mutation["idempotency_key"] = json!("page-click-over-pending-cap");
+        let rejected_pending =
+            browser_page_action_call(&store, &new_mutation, &grants, Some(&actuator));
+        assert_eq!(
+            rejected_pending["code"],
+            "browser_page_unknown_capacity_exhausted"
+        );
+        assert!(
+            rejected_pending["message"]
+                .as_str()
+                .unwrap()
+                .contains("pending and unknown")
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        let remaining = store
+            .lock()
+            .unwrap()
+            .scalar_i64(
+                "SELECT COUNT(*) FROM operations WHERE kind = 'browser_page.action'
+             AND state IN ('pending', 'unknown')",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            remaining, 2048,
+            "rejection must not retain its new pending row"
+        );
+        let replay_again = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(replay_again["idempotent_replay"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

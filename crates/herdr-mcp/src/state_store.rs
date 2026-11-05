@@ -1021,24 +1021,23 @@ impl StateStore {
             )
             .map_err(|error| format!("cannot reserve operation: {error}"))?;
         if inserted == 1 {
-            // Fail-closed admission for browser page mutations: a bounded cap
-            // on durable unknown tombstones per state DB. Reject the NEW
-            // mutation without evicting uncertain evidence; same-key replays
-            // (Existing branch) and read-only actions are unaffected. The
-            // count uses the existing unique (kind, idempotency_key) index
-            // prefix on the smallest covering index; N is capped in practice
-            // so the scan stays cheap. Constant mirrors the one in mcp.rs.
-            const BROWSER_PAGE_UNKNOWN_TOMBSTONE_CAP: i64 = 2048;
+            // Count every unresolved BrowserPage reservation, including the
+            // newly inserted pending row. The action handler constructs these
+            // op_ids with the stable prefix, allowing the existing primary-key
+            // index to avoid a full operations-table scan.
+            const BROWSER_PAGE_UNRESOLVED_CAP: i64 = 2048;
             if kind == "browser_page.action" {
-                let unknown_count: i64 = tx
+                let unresolved_count: i64 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM operations
-                         WHERE kind = 'browser_page.action' AND state = 'unknown'",
+                         WHERE op_id GLOB 'op:browser_page_action:*'
+                           AND kind = 'browser_page.action'
+                           AND state IN ('pending', 'unknown')",
                         [],
                         |row| row.get(0),
                     )
-                    .map_err(|error| format!("cannot count unknown operations: {error}"))?;
-                if unknown_count >= BROWSER_PAGE_UNKNOWN_TOMBSTONE_CAP {
+                    .map_err(|error| format!("cannot count unresolved operations: {error}"))?;
+                if unresolved_count > BROWSER_PAGE_UNRESOLVED_CAP {
                     // Roll back the fresh reservation (tx drop would also do
                     // it, but be explicit): a rejected mutation must leave no
                     // pending residue and must not actuate.
