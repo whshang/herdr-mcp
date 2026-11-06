@@ -125,6 +125,11 @@ pub struct OperationLedgerInput<'a> {
 pub enum OperationReservation {
     Reserved,
     Existing(OperationRecord),
+    /// A new `browser_page.action` reservation was rolled back because the
+    /// state DB already holds more than the bounded cap of durable unknown
+    /// tombstones. No actuation may happen; operator reconciliation is
+    /// required before further high-risk mutations are admitted.
+    CapacityExhausted,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -971,8 +976,29 @@ impl StateStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("cannot begin operation reservation: {error}"))?;
+        // Expired `browser_page.action` pending rows are never deleted: a
+        // crashed mutation must resolve to a durable non-retryable unknown
+        // tombstone (preserving its op_id) instead of lingering in-flight or
+        // being silently re-reserved and re-actuated. Other operation kinds
+        // keep the historical delete-on-expiry behavior.
+        tx.execute(
+            "UPDATE operations
+             SET phase = 'settled', state = 'unknown', expires_at = NULL,
+                 updated_at = ?1,
+                 result_json = '{\"ok\":false,\"code\":\"browser_page_delivery_unknown\",\"delivery_state\":\"delivery_unknown\",\"retryable\":false,\"retry_safe\":false,\"reason\":\"pending_expired_after_crash\"}'
+             WHERE kind = 'browser_page.action' AND state = 'pending'
+               AND expires_at IS NOT NULL AND expires_at <= ?1
+               AND NOT EXISTS (SELECT 1 FROM task_decision_gates
+                               WHERE task_id = operations.op_id AND status = 'open')",
+            params![now_ms],
+        )
+        .map_err(|error| {
+            format!("cannot terminalize expired browser page operation: {error}")
+        })?;
         tx.execute(
             "DELETE FROM operations WHERE expires_at IS NOT NULL AND expires_at <= ?1
+             AND NOT (kind = 'browser_page.action'
+                      AND state IN ('pending', 'unknown'))
              AND NOT EXISTS (SELECT 1 FROM task_decision_gates
                              WHERE task_id = operations.op_id AND status = 'open')",
             params![now_ms],
@@ -995,6 +1021,29 @@ impl StateStore {
             )
             .map_err(|error| format!("cannot reserve operation: {error}"))?;
         if inserted == 1 {
+            // Count every unresolved BrowserPage reservation, including the
+            // newly inserted pending row. The action handler constructs these
+            // op_ids with the stable prefix, allowing the existing primary-key
+            // index to avoid a full operations-table scan.
+            const BROWSER_PAGE_UNRESOLVED_CAP: i64 = 2048;
+            if kind == "browser_page.action" {
+                let unresolved_count: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM operations
+                         WHERE op_id GLOB 'op:browser_page_action:*'
+                           AND kind = 'browser_page.action'
+                           AND state IN ('pending', 'unknown')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("cannot count unresolved operations: {error}"))?;
+                if unresolved_count > BROWSER_PAGE_UNRESOLVED_CAP {
+                    // Roll back the fresh reservation (tx drop would also do
+                    // it, but be explicit): a rejected mutation must leave no
+                    // pending residue and must not actuate.
+                    return Ok(OperationReservation::CapacityExhausted);
+                }
+            }
             tx.commit()
                 .map_err(|error| format!("cannot commit operation reservation: {error}"))?;
             return Ok(OperationReservation::Reserved);
@@ -1068,6 +1117,41 @@ impl StateStore {
         }
         tx.commit()
             .map_err(|error| format!("cannot commit operation completion: {error}"))
+    }
+
+    /// Mark one reserved operation complete with a durable unknown outcome.
+    /// The row keeps the original op_id, never carries an expiry, and can only
+    /// be cleared by explicit operator reconciliation (not implemented here).
+    /// Unknown is terminal: the same (kind, idempotency_key) can never be
+    /// re-reserved, so the mutation can never automatically re-actuate.
+    pub fn complete_operation_unknown(
+        &mut self,
+        kind: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+        result_json: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin unknown completion: {error}"))?;
+        let changed = tx
+            .execute(
+                "UPDATE operations
+                 SET phase = 'settled', state = 'unknown', expires_at = NULL,
+                     updated_at = ?2, result_json = ?1
+                 WHERE kind = ?3 AND idempotency_key = ?4 AND request_hash = ?5",
+                params![result_json, now_ms, kind, idempotency_key, request_hash],
+            )
+            .map_err(|error| format!("cannot record unknown completion: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "unknown completion expected one matching row, updated {changed}"
+            ));
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit unknown completion: {error}"))
     }
 
     pub fn release_operation_reservation(
