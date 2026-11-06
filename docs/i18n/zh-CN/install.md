@@ -86,7 +86,7 @@ Herdr 使用 Cloudflare Workers Free 即可，不需要绑卡。没有 Cloudflar
 herdr-mcp worker bootstrap
 ```
 
-该命令负责 Worker 命名、Release artifact 校验、Cloudflare API 直接上传、secret、第一台设备 enrollment 与 readiness 验证。含可信 DNS 恢复的新 runtime 遇到新建 `workers.dev` hostname 本地解析失败时，bootstrap 先尝试 Cloudflare DNS，再尝试 Google DNS；返回 IP 必须通过真实 TLS `/health` Herdr 合同校验，之后才尝试把该 hostname 写成带 Herdr 标记的系统 hosts 记录。Unix 需要时请求 `sudo`，Windows 在 hosts 不可写时需要管理员终端；hosts 持久化失败不会推翻已经验证成功的当前 bootstrap 连接。普通安装不需要源码 checkout、Node.js、npm、Wrangler 或 `wrangler.user.toml`。
+该命令负责 Worker 命名、Release artifact 校验、Cloudflare API 直接上传、secret、第一台设备 enrollment 与 readiness 验证。如果首台设备的 bootstrap 已经部署 Worker，但在 enrollment 之前停住，请重新运行同一命令。本地 bootstrap journal 会从已验证阶段继续。journal 缺失时，只有 Cloudflare 认证证据同时证明以下事实，bootstrap 才会继续：该账户拥有这个 Worker、Worker 没有 fleet pairing secret、设置符合未登记的 `workers.dev` bootstrap，并且经认证读取的设备登记表为空。仅有健康的 `/health` 不能作为这些证据。已经存在 fleet secret 的 Worker 会保持原样，应改由一台已登记电脑执行 pair。如果无法证明所有权或 fleet 状态，bootstrap 会停止，且不修改 Worker、secret 或 enrollment。含可信 DNS 恢复的新 runtime 遇到新建 `workers.dev` hostname 本地解析失败时，bootstrap 先尝试 Cloudflare DNS，再尝试 Google DNS；返回 IP 必须通过真实 TLS `/health` Herdr 合同校验，之后才尝试把该 hostname 写成带 Herdr 标记的系统 hosts 记录。Unix 需要时请求 `sudo`，Windows 在 hosts 不可写时需要管理员终端；hosts 持久化失败不会推翻已经验证成功的当前 bootstrap 连接。普通安装不需要源码 checkout、Node.js、npm、Wrangler 或 `wrangler.user.toml`。
 
 同时遵守：
 
