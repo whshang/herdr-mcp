@@ -204,7 +204,7 @@ fn fence_legacy_dev_edge_prod_credential(
         return Ok(());
     }
     Err(DaemonConfigError::Message(format!(
-        "refusing to load the legacy production link credential ({MACOS_LINK_KEYCHAIN_SERVICE}) for the DEV Edge host {LEGACY_DEV_EDGE_HOST}; set HERDR_LINK_KEYCHAIN_SERVICE to a device-specific credential or provide HERDR_LINK_TOKEN"
+        "refusing to load the legacy production link credential ({MACOS_LINK_KEYCHAIN_SERVICE}) for the DEV Edge host {LEGACY_DEV_EDGE_HOST}; use a device-specific HERDR_LINK_KEYCHAIN_SERVICE for DEV and never copy the production secret into HERDR_LINK_TOKEN"
     )))
 }
 
