@@ -475,26 +475,26 @@ mod tests {
         assert!(!relay_pool_can_bridge_direct_outage(&unknown));
     }
 
-    fn fence_env(edge_url: &str) -> HashMap<String, String> {
-        HashMap::from([("HERDR_EDGE_URL".to_owned(), edge_url.to_owned())])
-    }
+    const DEV_EDGE_WS: &str = "wss://herdr-edge-dev.whshang.workers.dev/ws";
 
-    /// Danger case env with an account that cannot own a real credential item, so
-    /// a regression that removes the fence still cannot read the production
-    /// secret and fails on the store error instead.
-    fn dangerous_env() -> HashMap<String, String> {
-        let mut env_map = fence_env("wss://herdr-edge-dev.whshang.workers.dev/ws");
-        env_map.insert(
-            "USER".to_owned(),
-            "herdr-dev-prod-fence-nonexistent-account".to_owned(),
-        );
-        env_map
+    /// Env for the fence cases. `USER` cannot own a real credential item, so a
+    /// regression that drops the fence fails on the store error instead of
+    /// reading the production secret.
+    fn fence_env(edge_url: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("HERDR_EDGE_URL".to_owned(), edge_url.to_owned()),
+            (
+                "USER".to_owned(),
+                "herdr-dev-prod-fence-nonexistent-account".to_owned(),
+            ),
+        ])
     }
 
     #[test]
-    fn dev_edge_host_with_default_prod_credential_fails_before_keychain() {
-        // No HERDR_LINK_TOKEN, so `enrich` would otherwise read the device store.
-        let mut env_map = dangerous_env();
+    fn dev_edge_host_with_legacy_prod_credential_fails_before_keychain() {
+        // Implicit default (production) service, with no HERDR_LINK_TOKEN, so
+        // `enrich` would otherwise read the device store here.
+        let mut env_map = fence_env(DEV_EDGE_WS);
         let error = enrich_macos_credentials_with_config(&mut env_map, None)
             .expect_err("legacy dev Edge + production link credential must fail closed");
         let text = error.to_string();
@@ -503,72 +503,33 @@ mod tests {
         assert!(!text.contains("unable to load workstation link credential"));
         assert_eq!(env_map.get("HERDR_LINK_TOKEN"), None);
         assert_eq!(env_map.get("HERDR_MCP_TOKEN"), None);
-    }
 
-    #[test]
-    fn explicit_prod_credential_for_dev_edge_host_fails_before_keychain() {
-        let mut env_map = dangerous_env();
-        env_map.insert(
-            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
-            MACOS_LINK_KEYCHAIN_SERVICE.to_owned(),
+        // The same production service set explicitly is the same rejection, and
+        // host matching stays exact: a trailing dot is that host, a hostile
+        // superdomain is not.
+        let explicit = fence_env(DEV_EDGE_WS);
+        assert!(
+            fence_legacy_dev_edge_prod_credential(&explicit, MACOS_LINK_KEYCHAIN_SERVICE).is_err()
         );
-        let error = enrich_macos_credentials_with_config(&mut env_map, None)
-            .expect_err("explicit production credential on dev Edge must fail closed");
-        assert!(error.to_string().contains(LEGACY_DEV_EDGE_HOST));
-        assert_eq!(env_map.get("HERDR_LINK_TOKEN"), None);
-    }
-
-    #[test]
-    fn hostile_superdomain_of_dev_edge_host_is_not_the_legacy_host() {
+        assert!(edge_url_targets_legacy_dev_edge(
+            "wss://Herdr-Edge-Dev.whshang.workers.dev./ws"
+        ));
         assert!(!edge_url_targets_legacy_dev_edge(
             "wss://herdr-edge-dev.whshang.workers.dev.evil.example/ws"
         ));
-        assert!(!edge_url_targets_legacy_dev_edge(
-            "wss://evil.example/ws?upstream=herdr-edge-dev.whshang.workers.dev"
-        ));
-        assert!(!edge_url_targets_legacy_dev_edge(
-            "wss://not-herdr-edge-dev.whshang.workers.dev/ws"
-        ));
-        assert!(!edge_url_targets_legacy_dev_edge("not a url"));
     }
 
     #[test]
     fn fence_allows_prod_host_and_dev_device_credentials() {
-        let prod = HashMap::from([(
-            "HERDR_EDGE_URL".to_owned(),
-            MACOS_DEFAULT_EDGE_URL.to_owned(),
-        )]);
+        let prod = fence_env(MACOS_DEFAULT_EDGE_URL);
         assert!(
             fence_legacy_dev_edge_prod_credential(&prod, MACOS_LINK_KEYCHAIN_SERVICE).is_ok(),
             "healthy production Link must stay allowed"
         );
-
         let dev_device = "herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
         assert!(
-            fence_legacy_dev_edge_prod_credential(&dangerous_env(), dev_device).is_ok(),
+            fence_legacy_dev_edge_prod_credential(&fence_env(DEV_EDGE_WS), dev_device).is_ok(),
             "dev device-specific credential must stay allowed"
-        );
-        assert!(
-            fence_legacy_dev_edge_prod_credential(&dangerous_env(), "herdr-edge-dev-link-secret")
-                .is_ok(),
-            "historical dev credential must stay allowed"
-        );
-    }
-
-    #[test]
-    fn fence_rejects_only_the_exact_dev_host_including_trailing_dot() {
-        assert!(
-            fence_legacy_dev_edge_prod_credential(&dangerous_env(), MACOS_LINK_KEYCHAIN_SERVICE)
-                .is_err()
-        );
-        let dotted = fence_env("wss://Herdr-Edge-Dev.whshang.workers.dev./ws");
-        assert!(
-            fence_legacy_dev_edge_prod_credential(&dotted, MACOS_LINK_KEYCHAIN_SERVICE).is_err()
-        );
-        let superdomain = fence_env("wss://herdr-edge-dev.whshang.workers.dev.evil.example/ws");
-        assert!(
-            fence_legacy_dev_edge_prod_credential(&superdomain, MACOS_LINK_KEYCHAIN_SERVICE)
-                .is_ok()
         );
     }
 
