@@ -86,7 +86,7 @@ ChatGPT がインターネット経由でワークステーションに到達す
 herdr-mcp worker bootstrap
 ```
 
-このコマンドは、Worker の命名、Release artifact の検証、Cloudflare API への直接アップロード、secret、初回デバイスの enrollment、readiness の検証を担います。信頼済み DNS の回復を含む runtime では、新しい `workers.dev` hostname がローカルで解決できない場合、bootstrap は Cloudflare DNS、続いて Google DNS を試し、返されたアドレスを実際の TLS `/health` contract で検証し、そのうえで初めてその hostname の Herdr マーク付きマッピングをシステム hosts ファイルに永続化しようとします。Unix では `sudo` を要求することがあり、hosts ファイルが書き込み可能でない Windows では管理者権限のターミナルが必要です。マッピングの永続化に失敗しても、既に検証済みのプロセス内 bootstrap 経路は無効になりません。通常のインストールには、ソース checkout、Node.js、npm、Wrangler、`wrangler.user.toml` は不要です。
+このコマンドは、Worker の命名、Release artifact の検証、Cloudflare API への直接アップロード、secret、初回デバイスの enrollment、readiness の検証を担います。初回デバイスの bootstrap が Worker をデプロイしたあと enrollment の前に止まった場合は、同じコマンドを再実行します。ローカルの bootstrap journal があれば、検証済みの段階から再開します。journal がない場合、bootstrap が続行するのは、認証済みの Cloudflare 証拠が次をすべて示した場合だけです。このアカウントがその Worker を所有していること、Worker に fleet pairing secret がないこと、設定が未登録の `workers.dev` bootstrap と一致すること、そして認証済みのデバイス台帳の読み取りが空であること。`/health` が正常であること自体は証拠になりません。すでに fleet secret がある Worker は変更せず、登録済みコンピュータから pair します。所有権または fleet 状態を証明できない場合、bootstrap は Worker、secret、enrollment を変更せずに停止します。信頼済み DNS の回復を含む runtime では、新しい `workers.dev` hostname がローカルで解決できない場合、bootstrap は Cloudflare DNS、続いて Google DNS を試し、返されたアドレスを実際の TLS `/health` contract で検証し、そのうえで初めてその hostname の Herdr マーク付きマッピングをシステム hosts ファイルに永続化しようとします。Unix では `sudo` を要求することがあり、hosts ファイルが書き込み可能でない Windows では管理者権限のターミナルが必要です。マッピングの永続化に失敗しても、既に検証済みのプロセス内 bootstrap 経路は無効になりません。通常のインストールには、ソース checkout、Node.js、npm、Wrangler、`wrangler.user.toml` は不要です。
 
 次の制約を守ってください。
 

@@ -32,6 +32,14 @@ const JOURNAL_FILE: &str = "first-worker-v1.json";
 const TEMP_OPERATOR_SECRET: &str = "STATIC_MCP_BEARER_SECRET";
 const TEMP_OPERATOR_EXPIRY_SECRET: &str = "STATIC_MCP_BEARER_EXPIRES_AT_MS";
 const PAIRING_PEPPER_SECRET: &str = "LINK_SHARED_SECRET";
+/// Frozen runtime contract the v1.0.5 Edge publishes in
+/// `currentRuntimeContract*` (that release's previous rollback baseline,
+/// epoch 3). Current Link admission does not include it. Bootstrap may
+/// recognize it only as "this script is a Herdr Worker"; recognition is not
+/// proof the device registry is empty and does not admit a Link.
+const V105_PUBLISHED_RUNTIME_EPOCH: u64 = 3;
+const V105_PUBLISHED_RUNTIME_HASH: &str =
+    "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEVICE_FLOW_MAX: Duration = Duration::from_secs(300);
 const TEMP_OPERATOR_TTL: Duration = Duration::from_secs(10 * 60);
@@ -64,6 +72,12 @@ struct BootstrapJournal {
     canonical_device_id: Option<String>,
     expected_runtime_generation: Option<String>,
     updated_at_ms: u64,
+    /// Set only after an authenticated empty-registry proof, when the existing
+    /// script still has to be upgraded in place before enrollment. It never
+    /// authorizes a second fleet or a Worker that already has pairing-secret
+    /// material.
+    #[serde(default)]
+    recovery_upgrade: bool,
 }
 
 impl BootstrapJournal {
@@ -84,6 +98,7 @@ impl BootstrapJournal {
             canonical_device_id: None,
             expected_runtime_generation: current_runtime_generation(),
             updated_at_ms: now_ms(),
+            recovery_upgrade: false,
         }
     }
 
@@ -189,11 +204,28 @@ impl ExistingWorkerStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum AmbiguousFleetReason {
+    OccupiedName,
+    FleetStateUnproven,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FleetClassification {
     FirstFleet,
     ResumeOwned,
-    ExistingFleet { worker_name: String },
-    AmbiguousTarget,
+    ExistingFleet {
+        worker_name: String,
+    },
+    AmbiguousTarget {
+        reason: AmbiguousFleetReason,
+    },
+    /// Missing local journal, but authenticated Cloudflare evidence shows this
+    /// account's target Worker has no fleet pairing secret and its settings
+    /// match an unenrolled workers.dev bootstrap. Registry emptiness is NOT
+    /// decided here.
+    RecoverableUnenrolled {
+        worker_name: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -1059,28 +1091,95 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
     let scripts = cloudflare.scripts(&account.id)?;
     let existing_subdomain = cloudflare.workers_subdomain(&account.id)?;
     let worker_name = worker_name()?;
-    let classification = classify_fleet(
+    let observation = observe_bootstrap_scripts(
+        &cloudflare,
+        &account.id,
         &scripts,
         existing_subdomain.as_deref(),
+        &worker_name,
+        existing_journal.as_ref(),
+    );
+    let classification = classify_fleet(
+        &observation.scripts,
+        existing_subdomain.is_some(),
         &worker_name,
         existing_journal.as_ref(),
     )?;
     let mut gate = MutationGate::default();
     gate.mark_classified();
 
-    match classification {
+    let recovery_upgrade = match &classification {
         FleetClassification::ExistingFleet { worker_name } => {
             return Err(format!(
                 "existing Herdr Worker '{worker_name}' found in this Cloudflare account; do not deploy a second fleet. On any enrolled computer run `herdr-mcp worker pair`, then run `herdr-mcp worker connect <pairing-address>` here"
             ));
         }
-        FleetClassification::AmbiguousTarget => {
+        FleetClassification::AmbiguousTarget {
+            reason: AmbiguousFleetReason::OccupiedName,
+        } => {
             return Err(format!(
                 "Cloudflare Worker name '{worker_name}' is already occupied but could not be proven to belong to this resumable Herdr bootstrap; no mutation was attempted"
             ));
         }
-        FleetClassification::FirstFleet | FleetClassification::ResumeOwned => {}
-    }
+        FleetClassification::AmbiguousTarget {
+            reason: AmbiguousFleetReason::FleetStateUnproven,
+        } => {
+            return Err(format!(
+                "Herdr Worker '{worker_name}' responded, but this computer has no usable bootstrap journal and authenticated Cloudflare evidence did not prove an empty unenrolled fleet. No Worker script, secret, pairing material, or enrollment change was attempted"
+            ));
+        }
+        FleetClassification::FirstFleet | FleetClassification::ResumeOwned => None,
+        FleetClassification::RecoverableUnenrolled { worker_name } => {
+            let Some(subdomain) = existing_subdomain.as_deref() else {
+                return Err(
+                    "first-device recovery refused because the workers.dev subdomain is not proven; no mutation was attempted"
+                        .to_owned(),
+                );
+            };
+            let Some(edge_http) = observation.target_client.as_ref() else {
+                return Err(
+                    "first-device recovery refused because the Worker health channel is not available; no mutation was attempted"
+                        .to_owned(),
+                );
+            };
+            if let Some(journal) = existing_journal.as_ref() {
+                validate_journal(
+                    journal,
+                    &source_commit,
+                    &runtime_version,
+                    &account.id,
+                    worker_name,
+                )?;
+            }
+            println!(
+                "{}",
+                language.text(
+                    "Authenticated Cloudflare evidence allows a first-device check. Reading the device registry before any enrollment.",
+                    "Cloudflare 认证证据允许按首台设备核对。登记前会先读取设备登记表。",
+                    "認証済みの Cloudflare 証拠により、初回デバイスとして確認できます。登録の前にデバイス台帳を読み取ります。",
+                )
+            );
+            let edge_origin = format!("https://{worker_name}.{subdomain}.workers.dev");
+            prove_unenrolled_registry_empty(
+                &cloudflare,
+                &gate,
+                &account.id,
+                worker_name,
+                edge_http,
+                &edge_origin,
+            )?;
+            let upgrade_script = observation
+                .scripts
+                .iter()
+                .find(|script| script.name == *worker_name)
+                .map(|script| {
+                    script.health != HealthRecognition::LinkAdmitted
+                        || script.edge_version.as_deref() != Some(runtime_version.as_str())
+                })
+                .unwrap_or(true);
+            Some(upgrade_script)
+        }
+    };
 
     let mut journal = match existing_journal {
         Some(journal) => {
@@ -1100,6 +1199,14 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
             worker_name.clone(),
         ),
     };
+    if let Some(upgrade_script) = recovery_upgrade {
+        journal.recovery_upgrade = upgrade_script;
+        journal.advance(if upgrade_script {
+            Phase::WorkerDeploying
+        } else {
+            Phase::WorkerDeployed
+        });
+    }
     write_journal(&journal_path, &journal)?;
 
     let subdomain = match existing_subdomain {
@@ -1125,15 +1232,42 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
         journal.advance(Phase::WorkerDeploying);
         write_journal(&journal_path, &journal)?;
         let bundle = prepare_edge_bundle(&source_commit, &runtime_version)?;
-        let metadata =
-            worker_upload_metadata(&worker_name, &edge_origin, &runtime_version, !script_exists)?;
+        let (metadata, strict_inherit) = if journal.recovery_upgrade && script_exists {
+            let secret_names = cloudflare.list_secret_names(&account.id, &worker_name)?;
+            if !recovery_upgrade_secret_names_allowed(&secret_names) {
+                return Err(
+                    "first-device recovery cannot upgrade this Worker because authenticated secret inventory shows fleet material or an unrecognized secret. No script upload was attempted"
+                        .to_owned(),
+                );
+            }
+            let settings = cloudflare.script_settings(&account.id, &worker_name)?;
+            let metadata = worker_update_metadata(
+                &worker_name,
+                &edge_origin,
+                None,
+                &runtime_version,
+                &settings,
+                &secret_names,
+            )?;
+            (metadata, true)
+        } else {
+            (
+                worker_upload_metadata(
+                    &worker_name,
+                    &edge_origin,
+                    &runtime_version,
+                    !script_exists,
+                )?,
+                false,
+            )
+        };
         cloudflare.upload_worker(
             &gate,
             &account.id,
             &worker_name,
             &bundle.bytes,
             &metadata,
-            false,
+            strict_inherit,
         )?;
         cloudflare.enable_worker_subdomain(&gate, &account.id, &worker_name)?;
         cloudflare.set_worker_schedule(&gate, &account.id, &worker_name)?;
@@ -1303,63 +1437,484 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
     Ok(ExitCode::SUCCESS)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthRecognition {
+    Unrecognized,
+    LinkAdmitted,
+    HistoricalV105Published,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SecretInventory {
+    NotRead,
+    Unreadable,
+    Names(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretDisposition {
+    Unproven,
+    FleetMaterial,
+    Empty,
+    ProbeCredentialOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryProof {
+    Empty,
+    NotEmpty,
+    Unproven,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedScript {
+    name: String,
+    health: HealthRecognition,
+    edge_version: Option<String>,
+    secrets: SecretInventory,
+    bootstrap_identity_proven: bool,
+    health_matches_journal_version: bool,
+}
+
+struct BootstrapObservation {
+    scripts: Vec<ObservedScript>,
+    target_client: Option<EdgeHttpClient>,
+}
+
 fn classify_fleet(
-    scripts: &[Script],
-    subdomain: Option<&str>,
+    scripts: &[ObservedScript],
+    subdomain_known: bool,
     target_worker: &str,
     journal: Option<&BootstrapJournal>,
 ) -> Result<FleetClassification, String> {
     let target_exists = scripts.iter().any(|script| script.name == target_worker);
-    if target_exists {
-        let journal_matches = journal
-            .map(|value| value.worker_name == target_worker)
-            .unwrap_or(false);
-        let journal_proves_deployed = journal
-            .map(|value| value.phase >= Phase::WorkerDeployed)
-            .unwrap_or(false);
-        let observed_matching_health = match (journal, subdomain) {
-            (Some(value), Some(subdomain))
-                if journal_matches && value.phase >= Phase::WorkerDeploying =>
-            {
-                let origin = format!("https://{target_worker}.{subdomain}.workers.dev");
-                verify_health(&origin, target_worker, Some(&value.runtime_version)).is_ok()
-            }
-            _ => false,
-        };
-        if resumable_target_observation(
-            journal_matches,
-            journal_proves_deployed,
-            observed_matching_health,
-        ) {
-            return Ok(FleetClassification::ResumeOwned);
-        }
+    let journal_matches = journal
+        .map(|value| value.worker_name == target_worker)
+        .unwrap_or(false);
+    let journal_proves_deployed = journal
+        .map(|value| value.phase >= Phase::WorkerDeployed)
+        .unwrap_or(false);
+    let observed_matching_health = scripts
+        .iter()
+        .find(|script| script.name == target_worker)
+        .map(|script| script.health_matches_journal_version)
+        .unwrap_or(false);
+    let journal_recovery_upgrade = journal
+        .map(|value| {
+            value.worker_name == target_worker
+                && value.recovery_upgrade
+                && value.phase >= Phase::WorkerDeploying
+                && value.phase < Phase::DeviceEnrolled
+        })
+        .unwrap_or(false);
+    if target_exists
+        && (journal_recovery_upgrade
+            || resumable_target_observation(
+                journal_matches,
+                journal_proves_deployed,
+                observed_matching_health,
+            ))
+    {
+        return Ok(FleetClassification::ResumeOwned);
     }
 
+    let mut recovery: Option<String> = None;
+    let mut unproven_herdr = false;
     for script in scripts
         .iter()
         .filter(|script| script.name.starts_with("herdr-edge"))
     {
-        if let Some(subdomain) = subdomain {
-            let origin = format!("https://{}.{}.workers.dev", script.name, subdomain);
-            if verify_health(&origin, &script.name, None).is_ok() {
-                return Ok(FleetClassification::ExistingFleet {
-                    worker_name: script.name.clone(),
-                });
-            }
-        } else {
+        if !subdomain_known {
             return Ok(if script.name == target_worker {
-                FleetClassification::AmbiguousTarget
+                FleetClassification::AmbiguousTarget {
+                    reason: AmbiguousFleetReason::OccupiedName,
+                }
             } else {
                 FleetClassification::ExistingFleet {
                     worker_name: script.name.clone(),
                 }
             });
         }
+        if script.health == HealthRecognition::Unrecognized {
+            // Another Herdr-named script whose health could not be classified
+            // still blocks first-device recovery. A public 200 is not required
+            // to treat that script as unresolved fleet state.
+            if script.name != target_worker {
+                unproven_herdr = true;
+            }
+            continue;
+        }
+        match secret_disposition(&script.secrets) {
+            SecretDisposition::FleetMaterial => {
+                return Ok(FleetClassification::ExistingFleet {
+                    worker_name: script.name.clone(),
+                });
+            }
+            SecretDisposition::Empty | SecretDisposition::ProbeCredentialOnly
+                if script.name == target_worker && script.bootstrap_identity_proven =>
+            {
+                recovery = Some(script.name.clone());
+            }
+            SecretDisposition::Empty
+            | SecretDisposition::ProbeCredentialOnly
+            | SecretDisposition::Unproven => {
+                unproven_herdr = true;
+            }
+        }
+    }
+    if recovery.is_some() && !unproven_herdr {
+        return Ok(FleetClassification::RecoverableUnenrolled {
+            worker_name: target_worker.to_owned(),
+        });
+    }
+    if unproven_herdr {
+        return Ok(FleetClassification::AmbiguousTarget {
+            reason: AmbiguousFleetReason::FleetStateUnproven,
+        });
     }
     if target_exists {
-        return Ok(FleetClassification::AmbiguousTarget);
+        return Ok(FleetClassification::AmbiguousTarget {
+            reason: AmbiguousFleetReason::OccupiedName,
+        });
     }
     Ok(FleetClassification::FirstFleet)
+}
+
+fn secret_disposition(inventory: &SecretInventory) -> SecretDisposition {
+    let SecretInventory::Names(names) = inventory else {
+        return SecretDisposition::Unproven;
+    };
+    if names.iter().any(|name| name == PAIRING_PEPPER_SECRET) {
+        return SecretDisposition::FleetMaterial;
+    }
+    if names.is_empty() {
+        return SecretDisposition::Empty;
+    }
+    if names.iter().all(|name| is_probe_operator_secret(name)) {
+        return SecretDisposition::ProbeCredentialOnly;
+    }
+    SecretDisposition::Unproven
+}
+
+fn is_probe_operator_secret(name: &str) -> bool {
+    name == TEMP_OPERATOR_SECRET || name == TEMP_OPERATOR_EXPIRY_SECRET
+}
+
+fn recovery_upgrade_secret_names_allowed(names: &[String]) -> bool {
+    names.iter().all(|name| is_probe_operator_secret(name))
+}
+
+fn recovery_mutation_stage(proof: RegistryProof, upgrade_required: bool) -> &'static str {
+    match proof {
+        RegistryProof::Empty if upgrade_required => "strict-inherit-upgrade",
+        RegistryProof::Empty => "enroll-existing-script",
+        RegistryProof::NotEmpty | RegistryProof::Unproven => "operator-probe-only",
+    }
+}
+
+fn registry_proof(device_count: Result<usize, ()>) -> RegistryProof {
+    match device_count {
+        Ok(0) => RegistryProof::Empty,
+        Ok(_) => RegistryProof::NotEmpty,
+        Err(()) => RegistryProof::Unproven,
+    }
+}
+
+fn recognize_published_health(payload: &Value, worker_name: &str) -> HealthRecognition {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true)
+        || payload.get("service").and_then(Value::as_str) != Some(worker_name)
+    {
+        return HealthRecognition::Unrecognized;
+    }
+    let Ok(contract) = crate::link::edge_contract::parse_edge_health_contract(&payload.to_string())
+    else {
+        return HealthRecognition::Unrecognized;
+    };
+    if crate::link::edge_contract::rust_link_admits_edge_health_contract(&contract) {
+        return HealthRecognition::LinkAdmitted;
+    }
+    if contract.contract_epoch == V105_PUBLISHED_RUNTIME_EPOCH
+        && contract.contract_hash == V105_PUBLISHED_RUNTIME_HASH
+    {
+        return HealthRecognition::HistoricalV105Published;
+    }
+    HealthRecognition::Unrecognized
+}
+
+fn proven_unenrolled_bootstrap_identity(
+    settings: &Value,
+    worker_name: &str,
+    edge_origin: &str,
+    edge_version: Option<&str>,
+) -> bool {
+    let Some(edge_version) = edge_version.filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some(bindings) = settings.get("bindings").and_then(Value::as_array) else {
+        return false;
+    };
+    let plain = |name: &str| optional_plain_text_binding_value(bindings, name);
+    let Ok(Some(edge_env)) = plain("EDGE_ENV") else {
+        return false;
+    };
+    let Ok(Some(project)) = plain("EDGE_PROJECT") else {
+        return false;
+    };
+    let Ok(Some(version)) = plain("EDGE_VERSION") else {
+        return false;
+    };
+    let Ok(Some(issuer)) = plain("OAUTH_ISSUER") else {
+        return false;
+    };
+    let Ok(workstation) = plain("DEFAULT_WORKSTATION_ID") else {
+        return false;
+    };
+    let Ok(legacy_issuer) = plain("OAUTH_LEGACY_ISSUER") else {
+        return false;
+    };
+    if workstation.is_some() || legacy_issuer.is_some() {
+        return false;
+    }
+    if edge_env != "prod"
+        || project != worker_name
+        || version != edge_version
+        || issuer != edge_origin
+    {
+        return false;
+    }
+    ["WORKSTATION_DO", "OAUTH_STORE_DO", "DEVICE_REGISTRY_DO"]
+        .into_iter()
+        .all(|name| {
+            bindings.iter().any(|binding| {
+                binding.get("type").and_then(Value::as_str) == Some("durable_object_namespace")
+                    && binding.get("name").and_then(Value::as_str) == Some(name)
+            })
+        })
+}
+
+fn observe_bootstrap_scripts(
+    cloudflare: &Cloudflare<'_>,
+    account_id: &str,
+    scripts: &[Script],
+    subdomain: Option<&str>,
+    target_worker: &str,
+    journal: Option<&BootstrapJournal>,
+) -> BootstrapObservation {
+    let mut observed = Vec::with_capacity(scripts.len());
+    let mut target_client = None;
+    for script in scripts {
+        let Some(subdomain) = subdomain.filter(|_| script.name.starts_with("herdr-edge")) else {
+            observed.push(ObservedScript {
+                name: script.name.clone(),
+                health: HealthRecognition::Unrecognized,
+                edge_version: None,
+                secrets: SecretInventory::NotRead,
+                bootstrap_identity_proven: false,
+                health_matches_journal_version: false,
+            });
+            continue;
+        };
+        let origin = format!("https://{}.{subdomain}.workers.dev", script.name);
+        let (health, edge_version, client) = load_worker_health(&origin, &script.name);
+        let mut health_matches_journal_version = journal
+            .filter(|value| {
+                value.worker_name == script.name && value.phase >= Phase::WorkerDeploying
+            })
+            .is_some_and(|value| {
+                health == HealthRecognition::LinkAdmitted
+                    && edge_version.as_deref() == Some(value.runtime_version.as_str())
+            });
+        if !health_matches_journal_version
+            && journal.is_some_and(|value| {
+                value.worker_name == script.name && value.phase >= Phase::WorkerDeploying
+            })
+        {
+            let runtime_version = journal
+                .map(|value| value.runtime_version.as_str())
+                .unwrap_or_default();
+            health_matches_journal_version =
+                verify_health(&origin, &script.name, Some(runtime_version)).is_ok();
+        }
+        let (secrets, bootstrap_identity_proven) = if health == HealthRecognition::Unrecognized {
+            (SecretInventory::NotRead, false)
+        } else {
+            let secrets = match cloudflare.list_secret_names(account_id, &script.name) {
+                Ok(names) => SecretInventory::Names(names),
+                Err(_) => SecretInventory::Unreadable,
+            };
+            let identity = script.name == target_worker
+                && matches!(
+                    secret_disposition(&secrets),
+                    SecretDisposition::Empty | SecretDisposition::ProbeCredentialOnly
+                )
+                && match cloudflare.script_settings(account_id, &script.name) {
+                    Ok(settings) => proven_unenrolled_bootstrap_identity(
+                        &settings,
+                        &script.name,
+                        &origin,
+                        edge_version.as_deref(),
+                    ),
+                    Err(_) => false,
+                };
+            (secrets, identity)
+        };
+        if script.name == target_worker && client.is_some() {
+            target_client = client;
+        }
+        observed.push(ObservedScript {
+            name: script.name.clone(),
+            health,
+            edge_version,
+            secrets,
+            bootstrap_identity_proven,
+            health_matches_journal_version,
+        });
+    }
+    BootstrapObservation {
+        scripts: observed,
+        target_client,
+    }
+}
+
+fn load_worker_health(
+    origin: &str,
+    worker_name: &str,
+) -> (HealthRecognition, Option<String>, Option<EdgeHttpClient>) {
+    let Ok(direct) = EdgeHttpClient::direct() else {
+        return (HealthRecognition::Unrecognized, None, None);
+    };
+    match fetch_health_json(&direct, origin) {
+        Ok(payload) => health_view_from_payload(payload, worker_name, direct),
+        Err(error) if error.may_retry_via_proxy() => match verify_health(origin, worker_name, None)
+        {
+            Ok(client) => match fetch_health_json(&client, origin) {
+                Ok(payload) => health_view_from_payload(payload, worker_name, client),
+                Err(_) => (HealthRecognition::LinkAdmitted, None, Some(client)),
+            },
+            Err(_) => (HealthRecognition::Unrecognized, None, None),
+        },
+        Err(_) => (HealthRecognition::Unrecognized, None, None),
+    }
+}
+
+fn health_view_from_payload(
+    payload: Value,
+    worker_name: &str,
+    client: EdgeHttpClient,
+) -> (HealthRecognition, Option<String>, Option<EdgeHttpClient>) {
+    let version = payload
+        .get("edgeVersion")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let recognition = recognize_published_health(&payload, worker_name);
+    let client = if recognition == HealthRecognition::Unrecognized {
+        None
+    } else {
+        Some(client)
+    };
+    (recognition, version, client)
+}
+
+enum ProbeRollback {
+    Removed,
+    StillPresent(String),
+}
+
+fn probe_rollback_sentence(rollback: &ProbeRollback) -> String {
+    match rollback {
+        ProbeRollback::Removed => "The temporary operator credential was removed.".to_owned(),
+        ProbeRollback::StillPresent(error) => format!(
+            "The temporary operator credential could not be removed; bootstrap is NOT complete and the bounded TTL remains the safety fence: {error}"
+        ),
+    }
+}
+
+fn rollback_probe_operator(
+    cloudflare: &Cloudflare<'_>,
+    gate: &MutationGate,
+    account_id: &str,
+    worker_name: &str,
+) -> ProbeRollback {
+    match remove_temporary_operator(
+        |name| cloudflare.delete_secret(gate, account_id, worker_name, name),
+        || cloudflare.list_secret_names(account_id, worker_name),
+    ) {
+        Ok(()) => ProbeRollback::Removed,
+        Err(error) => ProbeRollback::StillPresent(error),
+    }
+}
+
+fn prove_unenrolled_registry_empty(
+    cloudflare: &Cloudflare<'_>,
+    gate: &MutationGate,
+    account_id: &str,
+    worker_name: &str,
+    edge_http: &EdgeHttpClient,
+    edge_origin: &str,
+) -> Result<(), String> {
+    let operator = random_secret(32)?;
+    let expiry = SecretBytes::from_string(temporary_operator_expiry_ms().to_string())?;
+    if let Err(error) = cloudflare.put_secret(
+        gate,
+        account_id,
+        worker_name,
+        TEMP_OPERATOR_EXPIRY_SECRET,
+        &expiry,
+    ) {
+        let rollback = rollback_probe_operator(cloudflare, gate, account_id, worker_name);
+        return Err(format!(
+            "first-device recovery could not install a temporary operator expiry. {} {}",
+            probe_rollback_sentence(&rollback),
+            sanitize_error(&error, &operator)
+        ));
+    }
+    if let Err(error) = cloudflare.put_secret(
+        gate,
+        account_id,
+        worker_name,
+        TEMP_OPERATOR_SECRET,
+        &operator,
+    ) {
+        let rollback = rollback_probe_operator(cloudflare, gate, account_id, worker_name);
+        return Err(format!(
+            "first-device recovery could not install a temporary operator credential. {} {}",
+            probe_rollback_sentence(&rollback),
+            sanitize_error(&error, &operator)
+        ));
+    }
+    let devices = edge_devices_with_operator(edge_http, edge_origin, &operator);
+    let proof = match &devices {
+        Ok(devices) => registry_proof(Ok(devices.len())),
+        Err(_) => registry_proof(Err(())),
+    };
+    if proof == RegistryProof::Empty {
+        debug_assert_ne!(
+            recovery_mutation_stage(proof, true),
+            "operator-probe-only",
+            "empty registry must be allowed to continue"
+        );
+        return Ok(());
+    }
+    debug_assert_eq!(
+        recovery_mutation_stage(proof, true),
+        "operator-probe-only",
+        "an unproven registry must not upgrade or enroll"
+    );
+    let rollback = rollback_probe_operator(cloudflare, gate, account_id, worker_name);
+    let reason = match devices {
+        Ok(_) => "the Worker device registry is not empty".to_owned(),
+        Err(error) => format!("the Worker device registry could not be read ({error})"),
+    };
+    let guidance = if proof == RegistryProof::NotEmpty {
+        " On an enrolled computer run `herdr-mcp worker pair`, then run `herdr-mcp worker connect <pairing-address>` here."
+    } else {
+        " No enrollment was attempted."
+    };
+    Err(format!(
+        "first-device recovery stopped because {reason}. {} No pairing secret was written and the Worker script was not changed.{guidance}",
+        probe_rollback_sentence(&rollback)
+    ))
 }
 
 fn acquire_cloudflare_credential() -> Result<(SecretBytes, Option<SecretBytes>), String> {
@@ -3354,12 +3909,10 @@ fn parse_trusted_dns_ipv4_answers(payload: &Value) -> Vec<IpAddr> {
     ips
 }
 
-fn probe_health(
+fn fetch_health_json(
     edge_http: &EdgeHttpClient,
     edge_origin: &str,
-    worker_name: &str,
-    expected_version: Option<&str>,
-) -> Result<(), EdgeHealthProbeError> {
+) -> Result<Value, EdgeHealthProbeError> {
     let response = edge_http
         .client
         .get(format!("{edge_origin}/health"))
@@ -3373,9 +3926,18 @@ fn probe_health(
             response.status(),
         ));
     }
-    let payload: Value = response.json().map_err(|_| {
-        EdgeHealthProbeError::Validation("Worker health returned non-JSON".to_owned())
-    })?;
+    response
+        .json()
+        .map_err(|_| EdgeHealthProbeError::Validation("Worker health returned non-JSON".to_owned()))
+}
+
+fn probe_health(
+    edge_http: &EdgeHttpClient,
+    edge_origin: &str,
+    worker_name: &str,
+    expected_version: Option<&str>,
+) -> Result<(), EdgeHealthProbeError> {
+    let payload = fetch_health_json(edge_http, edge_origin)?;
     validate_health_payload(&payload, worker_name, expected_version)
         .map_err(EdgeHealthProbeError::Validation)
 }
@@ -3814,19 +4376,27 @@ mod tests {
 
     #[test]
     fn first_fleet_classification_is_conservative() {
-        let scripts = vec![Script {
-            name: "other-worker".to_owned(),
-        }];
+        let scripts = vec![observed_script(
+            "other-worker",
+            HealthRecognition::Unrecognized,
+            SecretInventory::NotRead,
+            false,
+        )];
         assert_eq!(
-            classify_fleet(&scripts, Some("example"), "herdr-edge-mac", None).unwrap(),
+            classify_fleet(&scripts, true, "herdr-edge-mac", None).unwrap(),
             FleetClassification::FirstFleet
         );
-        let occupied = vec![Script {
-            name: "herdr-edge-mac".to_owned(),
-        }];
+        let occupied = vec![observed_script(
+            "herdr-edge-mac",
+            HealthRecognition::Unrecognized,
+            SecretInventory::NotRead,
+            false,
+        )];
         assert_eq!(
-            classify_fleet(&occupied, None, "herdr-edge-mac", None).unwrap(),
-            FleetClassification::AmbiguousTarget
+            classify_fleet(&occupied, false, "herdr-edge-mac", None).unwrap(),
+            FleetClassification::AmbiguousTarget {
+                reason: AmbiguousFleetReason::OccupiedName,
+            }
         );
     }
 
@@ -3843,12 +4413,16 @@ mod tests {
             canonical_device_id: None,
             expected_runtime_generation: None,
             updated_at_ms: 1,
+            recovery_upgrade: false,
         };
-        let scripts = vec![Script {
-            name: "herdr-edge-mac".to_owned(),
-        }];
+        let scripts = vec![observed_script(
+            "herdr-edge-mac",
+            HealthRecognition::Unrecognized,
+            SecretInventory::NotRead,
+            false,
+        )];
         assert_eq!(
-            classify_fleet(&scripts, None, "herdr-edge-mac", Some(&journal)).unwrap(),
+            classify_fleet(&scripts, false, "herdr-edge-mac", Some(&journal)).unwrap(),
             FleetClassification::ResumeOwned
         );
     }
@@ -4142,12 +4716,303 @@ mod tests {
 
     #[test]
     fn same_name_worker_without_resume_proof_is_not_silently_skipped() {
-        let occupied = vec![Script {
-            name: "herdr-edge-mac".to_owned(),
-        }];
+        let occupied = vec![observed_script(
+            "herdr-edge-mac",
+            HealthRecognition::Unrecognized,
+            SecretInventory::NotRead,
+            false,
+        )];
         assert_eq!(
-            classify_fleet(&occupied, None, "herdr-edge-mac", None).unwrap(),
-            FleetClassification::AmbiguousTarget
+            classify_fleet(&occupied, false, "herdr-edge-mac", None).unwrap(),
+            FleetClassification::AmbiguousTarget {
+                reason: AmbiguousFleetReason::OccupiedName,
+            }
+        );
+    }
+
+    fn observed_script(
+        name: &str,
+        health: HealthRecognition,
+        secrets: SecretInventory,
+        bootstrap_identity_proven: bool,
+    ) -> ObservedScript {
+        ObservedScript {
+            name: name.to_owned(),
+            health,
+            edge_version: Some("1.0.5".to_owned()),
+            secrets,
+            bootstrap_identity_proven,
+            health_matches_journal_version: false,
+        }
+    }
+
+    fn bootstrap_settings(worker_name: &str, origin: &str, version: &str) -> Value {
+        json!({
+            "bindings": [
+                {"type": "durable_object_namespace", "name": "WORKSTATION_DO", "class_name": "WorkstationDO"},
+                {"type": "durable_object_namespace", "name": "OAUTH_STORE_DO", "class_name": "OAuthStoreDO"},
+                {"type": "durable_object_namespace", "name": "DEVICE_REGISTRY_DO", "class_name": "DeviceRegistryDO"},
+                {"type": "plain_text", "name": "EDGE_ENV", "text": "prod"},
+                {"type": "plain_text", "name": "EDGE_PROJECT", "text": worker_name},
+                {"type": "plain_text", "name": "EDGE_VERSION", "text": version},
+                {"type": "plain_text", "name": "OAUTH_ISSUER", "text": origin}
+            ]
+        })
+    }
+
+    fn historical_v105_health(service: &str) -> Value {
+        json!({
+            "ok": true,
+            "service": service,
+            "edgeVersion": "1.0.5",
+            "contractEpoch": 7,
+            "contractHash": "sha256:public",
+            "runtimeContractEpoch": 2,
+            "runtimeContractHash": crate::link::daemon::LEGACY_EPOCH2_CONTRACT_HASH,
+            "currentRuntimeContractEpoch": V105_PUBLISHED_RUNTIME_EPOCH,
+            "currentRuntimeContractHash": V105_PUBLISHED_RUNTIME_HASH
+        })
+    }
+
+    #[test]
+    fn missing_journal_empty_fleet_is_recoverable_only_with_authenticated_identity() {
+        let empty = SecretInventory::Names(Vec::new());
+        let mut recoverable = observed_script(
+            "herdr-edge-mac",
+            HealthRecognition::HistoricalV105Published,
+            empty,
+            true,
+        );
+        assert_eq!(
+            classify_fleet(
+                std::slice::from_ref(&recoverable),
+                true,
+                "herdr-edge-mac",
+                None
+            )
+            .unwrap(),
+            FleetClassification::RecoverableUnenrolled {
+                worker_name: "herdr-edge-mac".to_owned(),
+            }
+        );
+        recoverable.bootstrap_identity_proven = false;
+        assert_eq!(
+            classify_fleet(
+                std::slice::from_ref(&recoverable),
+                true,
+                "herdr-edge-mac",
+                None
+            )
+            .unwrap(),
+            FleetClassification::AmbiguousTarget {
+                reason: AmbiguousFleetReason::FleetStateUnproven,
+            }
+        );
+        let probe_only = observed_script(
+            "herdr-edge-mac",
+            HealthRecognition::HistoricalV105Published,
+            SecretInventory::Names(vec![
+                TEMP_OPERATOR_SECRET.to_owned(),
+                TEMP_OPERATOR_EXPIRY_SECRET.to_owned(),
+            ]),
+            true,
+        );
+        assert_eq!(
+            secret_disposition(&probe_only.secrets),
+            SecretDisposition::ProbeCredentialOnly
+        );
+        assert_eq!(
+            classify_fleet(
+                std::slice::from_ref(&probe_only),
+                true,
+                "herdr-edge-mac",
+                None
+            )
+            .unwrap(),
+            FleetClassification::RecoverableUnenrolled {
+                worker_name: "herdr-edge-mac".to_owned(),
+            }
+        );
+        let link_admitted = observed_script(
+            "herdr-edge-mac",
+            HealthRecognition::LinkAdmitted,
+            SecretInventory::Names(Vec::new()),
+            true,
+        );
+        assert_eq!(
+            classify_fleet(
+                std::slice::from_ref(&link_admitted),
+                true,
+                "herdr-edge-mac",
+                None
+            )
+            .unwrap(),
+            FleetClassification::RecoverableUnenrolled {
+                worker_name: "herdr-edge-mac".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn healthy_worker_with_fleet_secret_stays_on_the_pairing_path() {
+        let fleet = observed_script(
+            "herdr-edge-mac",
+            HealthRecognition::HistoricalV105Published,
+            SecretInventory::Names(vec![PAIRING_PEPPER_SECRET.to_owned()]),
+            true,
+        );
+        assert_eq!(
+            classify_fleet(std::slice::from_ref(&fleet), true, "herdr-edge-mac", None).unwrap(),
+            FleetClassification::ExistingFleet {
+                worker_name: "herdr-edge-mac".to_owned(),
+            }
+        );
+        assert_eq!(
+            recovery_mutation_stage(RegistryProof::NotEmpty, true),
+            "operator-probe-only"
+        );
+        assert!(!recovery_upgrade_secret_names_allowed(&[
+            PAIRING_PEPPER_SECRET.to_owned()
+        ]));
+    }
+
+    #[test]
+    fn unreadable_secret_inventory_fails_closed_without_enrollment() {
+        let unknown = observed_script(
+            "herdr-edge-mac",
+            HealthRecognition::LinkAdmitted,
+            SecretInventory::Unreadable,
+            false,
+        );
+        assert_eq!(
+            classify_fleet(std::slice::from_ref(&unknown), true, "herdr-edge-mac", None).unwrap(),
+            FleetClassification::AmbiguousTarget {
+                reason: AmbiguousFleetReason::FleetStateUnproven,
+            }
+        );
+        assert_eq!(
+            secret_disposition(&SecretInventory::NotRead),
+            SecretDisposition::Unproven
+        );
+        assert_eq!(
+            secret_disposition(&SecretInventory::Names(vec!["CUSTOM_TOKEN".to_owned()])),
+            SecretDisposition::Unproven
+        );
+        assert_eq!(registry_proof(Err(())), RegistryProof::Unproven);
+        assert_eq!(
+            recovery_mutation_stage(RegistryProof::Unproven, true),
+            "operator-probe-only"
+        );
+    }
+
+    #[test]
+    fn registry_must_be_empty_before_upgrade_or_enrollment() {
+        assert_eq!(registry_proof(Ok(0)), RegistryProof::Empty);
+        assert_eq!(registry_proof(Ok(2)), RegistryProof::NotEmpty);
+        assert_eq!(
+            recovery_mutation_stage(RegistryProof::Empty, true),
+            "strict-inherit-upgrade"
+        );
+        assert_eq!(
+            recovery_mutation_stage(RegistryProof::Empty, false),
+            "enroll-existing-script"
+        );
+        assert!(recovery_upgrade_secret_names_allowed(&[]));
+        assert!(recovery_upgrade_secret_names_allowed(&[
+            TEMP_OPERATOR_SECRET.to_owned(),
+            TEMP_OPERATOR_EXPIRY_SECRET.to_owned(),
+        ]));
+        assert!(!recovery_upgrade_secret_names_allowed(&[
+            TEMP_OPERATOR_SECRET.to_owned(),
+            PAIRING_PEPPER_SECRET.to_owned(),
+        ]));
+        assert!(!is_probe_operator_secret(PAIRING_PEPPER_SECRET));
+    }
+
+    #[test]
+    fn published_v105_health_is_not_treated_as_unowned_or_link_admitted() {
+        let payload = historical_v105_health("herdr-edge-mac");
+        assert_eq!(
+            recognize_published_health(&payload, "herdr-edge-mac"),
+            HealthRecognition::HistoricalV105Published
+        );
+        assert_eq!(
+            recognize_published_health(&payload, "herdr-edge-other"),
+            HealthRecognition::Unrecognized
+        );
+        let mut wrong_hash = payload.clone();
+        wrong_hash["currentRuntimeContractHash"] = json!("sha256:not-the-v105-contract");
+        assert_eq!(
+            recognize_published_health(&wrong_hash, "herdr-edge-mac"),
+            HealthRecognition::Unrecognized
+        );
+        let admitted = json!({
+            "ok": true,
+            "service": "herdr-edge-mac",
+            "edgeVersion": "1.1.0",
+            "currentRuntimeContractEpoch": crate::link::daemon::PUBLIC_CONTRACT_EPOCH,
+            "currentRuntimeContractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH
+        });
+        assert_eq!(
+            recognize_published_health(&admitted, "herdr-edge-mac"),
+            HealthRecognition::LinkAdmitted
+        );
+        let origin = "https://herdr-edge-mac.example.workers.dev";
+        assert!(proven_unenrolled_bootstrap_identity(
+            &bootstrap_settings("herdr-edge-mac", origin, "1.0.5"),
+            "herdr-edge-mac",
+            origin,
+            Some("1.0.5"),
+        ));
+        let mut owned = bootstrap_settings("herdr-edge-mac", origin, "1.0.5");
+        owned["bindings"].as_array_mut().unwrap().push(
+            json!({"type": "plain_text", "name": "DEFAULT_WORKSTATION_ID", "text": "dev_01"}),
+        );
+        assert!(!proven_unenrolled_bootstrap_identity(
+            &owned,
+            "herdr-edge-mac",
+            origin,
+            Some("1.0.5"),
+        ));
+        assert!(!proven_unenrolled_bootstrap_identity(
+            &bootstrap_settings("herdr-edge-mac", origin, "1.0.5"),
+            "herdr-edge-mac",
+            origin,
+            Some("9.9.9"),
+        ));
+    }
+
+    #[test]
+    fn another_unproven_herdr_worker_blocks_empty_target_recovery() {
+        let target = observed_script(
+            "herdr-edge-mac",
+            HealthRecognition::LinkAdmitted,
+            SecretInventory::Names(Vec::new()),
+            true,
+        );
+        let other = observed_script(
+            "herdr-edge-other",
+            HealthRecognition::LinkAdmitted,
+            SecretInventory::Unreadable,
+            false,
+        );
+        assert_eq!(
+            classify_fleet(&[target.clone(), other], true, "herdr-edge-mac", None).unwrap(),
+            FleetClassification::AmbiguousTarget {
+                reason: AmbiguousFleetReason::FleetStateUnproven,
+            }
+        );
+        let unrecognized = observed_script(
+            "herdr-edge-other",
+            HealthRecognition::Unrecognized,
+            SecretInventory::NotRead,
+            false,
+        );
+        assert_eq!(
+            classify_fleet(&[target, unrecognized], true, "herdr-edge-mac", None).unwrap(),
+            FleetClassification::AmbiguousTarget {
+                reason: AmbiguousFleetReason::FleetStateUnproven,
+            }
         );
     }
 
