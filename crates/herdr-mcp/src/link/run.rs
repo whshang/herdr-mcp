@@ -519,6 +519,25 @@ mod tests {
         ));
     }
 
+    /// The exact shape of the live `dev.herdr-mcp.link-rust-candidate` job:
+    /// a DEV Edge URL with the production Link service pinned explicitly.
+    #[test]
+    fn dev_edge_host_with_explicit_prod_keychain_service_fails_before_keychain() {
+        let mut env_map = fence_env(DEV_EDGE_WS);
+        env_map.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            MACOS_LINK_KEYCHAIN_SERVICE.to_owned(),
+        );
+        let error = enrich_macos_credentials_with_config(&mut env_map, None)
+            .expect_err("explicit production service + DEV Edge must fail closed");
+        let text = error.to_string();
+        assert!(text.contains("refusing to load the legacy production link credential"));
+        assert!(text.contains(LEGACY_DEV_EDGE_HOST));
+        assert!(!text.contains("unable to load workstation link credential"));
+        assert_eq!(env_map.get("HERDR_LINK_TOKEN"), None);
+        assert_eq!(env_map.get("HERDR_MCP_TOKEN"), None);
+    }
+
     #[test]
     fn fence_allows_prod_host_and_dev_device_credentials() {
         let prod = fence_env(MACOS_DEFAULT_EDGE_URL);
