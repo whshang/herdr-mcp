@@ -296,6 +296,11 @@ fn reserve_durable_exec(
     let record = match reservation {
         OperationReservation::Reserved => return Ok(None),
         OperationReservation::Existing(record) => record,
+        // Capacity admission is scoped to browser_page.action; this kind is
+        // never capped.
+        OperationReservation::CapacityExhausted => {
+            unreachable!("capacity admission is scoped to browser_page.action")
+        }
     };
     if record.request_hash != fingerprint {
         return Err(pre_start_rejection(json!({

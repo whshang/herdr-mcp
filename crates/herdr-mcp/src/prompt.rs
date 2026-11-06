@@ -2884,6 +2884,9 @@ fn begin_persisted(
                 })),
             }
         }
+        OperationReservation::CapacityExhausted => {
+            unreachable!("capacity admission is scoped to browser_page.action")
+        }
     }
 }
 
