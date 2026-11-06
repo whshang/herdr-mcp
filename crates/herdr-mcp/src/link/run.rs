@@ -28,6 +28,9 @@ pub const MACOS_LINK_KEYCHAIN_SERVICE: &str = "herdr-edge-prod-link-secret";
 pub const MACOS_DEFAULT_EDGE_URL: &str = "wss://herdr-edge-prod.whshang.workers.dev/ws";
 /// Default workstation id for foreground `link run` without env overrides.
 pub const MACOS_DEFAULT_WORKSTATION_ID: &str = "dev-rust-link-candidate";
+/// Historical DEV Edge Worker host. The default Rust Link credential is the
+/// production item, so that credential must never be loaded for this host.
+const LEGACY_DEV_EDGE_HOST: &str = "herdr-edge-dev.whshang.workers.dev";
 
 const SERVER_PLIST_REL: &str = "Library/LaunchAgents/dev.herdr-mcp.server.plist";
 
@@ -168,14 +171,51 @@ fn enrich_macos_credentials_with_config(
     Ok(())
 }
 
+/// Service name whose secret the platform device store is asked for, defaulting
+/// to the historical production Link credential.
+fn resolved_link_keychain_service(env_map: &HashMap<String, String>) -> String {
+    optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
+        .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned())
+}
+
+/// True only for the exact legacy DEV Edge host: parsed as a URL, host-only,
+/// lowercased, one trailing dot removed. A hostile superdomain, a lookalike
+/// suffix, or a host mentioned in a path/query never matches.
+fn edge_url_targets_legacy_dev_edge(edge_url: &str) -> bool {
+    url::Url::parse(edge_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host.trim_end_matches('.') == LEGACY_DEV_EDGE_HOST)
+}
+
+/// Fail closed before any device-credential read when the run is aimed at the
+/// historical DEV Edge but would use the legacy production Link credential.
+fn fence_legacy_dev_edge_prod_credential(
+    env_map: &HashMap<String, String>,
+    service: &str,
+) -> Result<(), DaemonConfigError> {
+    if service != MACOS_LINK_KEYCHAIN_SERVICE {
+        return Ok(());
+    }
+    let Some(edge_url) = optional_trimmed(env_map, "HERDR_EDGE_URL") else {
+        return Ok(());
+    };
+    if !edge_url_targets_legacy_dev_edge(&edge_url) {
+        return Ok(());
+    }
+    Err(DaemonConfigError::Message(format!(
+        "refusing to load the legacy production link credential ({MACOS_LINK_KEYCHAIN_SERVICE}) for the DEV Edge host {LEGACY_DEV_EDGE_HOST}; use a device-specific HERDR_LINK_KEYCHAIN_SERVICE for DEV and never copy the production secret into HERDR_LINK_TOKEN"
+    )))
+}
+
 fn load_link_token_from_keychain(
     env_map: &HashMap<String, String>,
 ) -> Result<String, DaemonConfigError> {
+    let service = resolved_link_keychain_service(env_map);
+    fence_legacy_dev_edge_prod_credential(env_map, &service)?;
     #[cfg(target_os = "macos")]
     {
         let username = optional_trimmed(env_map, "USER").unwrap_or_else(current_username);
-        let service = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
-            .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned());
         crate::credential_store::load(&service, &username).map_err(DaemonConfigError::Message)
     }
     #[cfg(not(target_os = "macos"))]
@@ -183,22 +223,17 @@ fn load_link_token_from_keychain(
         #[cfg(target_os = "linux")]
         {
             let username = optional_trimmed(env_map, "USER").unwrap_or_else(current_username);
-            let service = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
-                .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned());
             crate::credential_store::load(&service, &username).map_err(DaemonConfigError::Message)
         }
 
         #[cfg(target_os = "windows")]
         {
             let username = optional_trimmed(env_map, "USERNAME").unwrap_or_else(current_username);
-            let service = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
-                .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned());
             crate::credential_store::load(&service, &username).map_err(DaemonConfigError::Message)
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
-            let _ = env_map;
             Err(DaemonConfigError::Message(
                 "HERDR_LINK_TOKEN is required on this platform".to_owned(),
             ))
@@ -438,6 +473,83 @@ mod tests {
         let mut unknown = embedded;
         unknown.source = "unknown";
         assert!(!relay_pool_can_bridge_direct_outage(&unknown));
+    }
+
+    const DEV_EDGE_WS: &str = "wss://herdr-edge-dev.whshang.workers.dev/ws";
+
+    /// Env for the fence cases. `USER` cannot own a real credential item, so a
+    /// regression that drops the fence fails on the store error instead of
+    /// reading the production secret.
+    fn fence_env(edge_url: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("HERDR_EDGE_URL".to_owned(), edge_url.to_owned()),
+            (
+                "USER".to_owned(),
+                "herdr-dev-prod-fence-nonexistent-account".to_owned(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn dev_edge_host_with_legacy_prod_credential_fails_before_keychain() {
+        // Implicit default (production) service, with no HERDR_LINK_TOKEN, so
+        // `enrich` would otherwise read the device store here.
+        let mut env_map = fence_env(DEV_EDGE_WS);
+        let error = enrich_macos_credentials_with_config(&mut env_map, None)
+            .expect_err("legacy dev Edge + production link credential must fail closed");
+        let text = error.to_string();
+        assert!(text.contains("refusing to load the legacy production link credential"));
+        assert!(text.contains(LEGACY_DEV_EDGE_HOST));
+        assert!(!text.contains("unable to load workstation link credential"));
+        assert_eq!(env_map.get("HERDR_LINK_TOKEN"), None);
+        assert_eq!(env_map.get("HERDR_MCP_TOKEN"), None);
+
+        // The same production service set explicitly is the same rejection, and
+        // host matching stays exact: a trailing dot is that host, a hostile
+        // superdomain is not.
+        let explicit = fence_env(DEV_EDGE_WS);
+        assert!(
+            fence_legacy_dev_edge_prod_credential(&explicit, MACOS_LINK_KEYCHAIN_SERVICE).is_err()
+        );
+        assert!(edge_url_targets_legacy_dev_edge(
+            "wss://Herdr-Edge-Dev.whshang.workers.dev./ws"
+        ));
+        assert!(!edge_url_targets_legacy_dev_edge(
+            "wss://herdr-edge-dev.whshang.workers.dev.evil.example/ws"
+        ));
+    }
+
+    /// The exact shape of the live `dev.herdr-mcp.link-rust-candidate` job:
+    /// a DEV Edge URL with the production Link service pinned explicitly.
+    #[test]
+    fn dev_edge_host_with_explicit_prod_keychain_service_fails_before_keychain() {
+        let mut env_map = fence_env(DEV_EDGE_WS);
+        env_map.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            MACOS_LINK_KEYCHAIN_SERVICE.to_owned(),
+        );
+        let error = enrich_macos_credentials_with_config(&mut env_map, None)
+            .expect_err("explicit production service + DEV Edge must fail closed");
+        let text = error.to_string();
+        assert!(text.contains("refusing to load the legacy production link credential"));
+        assert!(text.contains(LEGACY_DEV_EDGE_HOST));
+        assert!(!text.contains("unable to load workstation link credential"));
+        assert_eq!(env_map.get("HERDR_LINK_TOKEN"), None);
+        assert_eq!(env_map.get("HERDR_MCP_TOKEN"), None);
+    }
+
+    #[test]
+    fn fence_allows_prod_host_and_dev_device_credentials() {
+        let prod = fence_env(MACOS_DEFAULT_EDGE_URL);
+        assert!(
+            fence_legacy_dev_edge_prod_credential(&prod, MACOS_LINK_KEYCHAIN_SERVICE).is_ok(),
+            "healthy production Link must stay allowed"
+        );
+        let dev_device = "herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        assert!(
+            fence_legacy_dev_edge_prod_credential(&fence_env(DEV_EDGE_WS), dev_device).is_ok(),
+            "dev device-specific credential must stay allowed"
+        );
     }
 
     #[test]
