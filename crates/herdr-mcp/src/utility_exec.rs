@@ -2427,16 +2427,31 @@ mod tests {
     fn native_test_dir() -> PathBuf {
         static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
         let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        // macOS `sockaddr_un.sun_path` holds 104 bytes including the NUL, and
+        // the default `/var/folders/.../T` prefix already spends 49 of them, so
+        // the directory name stays short and hex-encoded. The previous
+        // `herdr-native-exec-<pid>-<millis>-<seq>` spelling pushed
+        // `missing-herdr.sock` past `SUN_LEN` and turned socket-error assertions
+        // into bind failures.
         let base = env::temp_dir().join(format!(
-            "herdr-native-exec-{}-{}-{}",
+            "hne-{:x}-{:x}-{sequence:x}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis(),
-            sequence,
+                .as_millis()
+                & 0xff_ffff,
         ));
         fs::create_dir_all(&base).unwrap();
+        // Fail here instead of deep inside `bind`, where a too-long sun_path is
+        // reported as an unrelated socket error.
+        for sock in ["herdr.sock", "missing-herdr.sock"] {
+            let path = base.join(sock);
+            assert!(
+                path.as_os_str().len() <= 92,
+                "{path:?} does not fit macOS SUN_LEN (104) with a NUL terminator"
+            );
+        }
         base
     }
 
