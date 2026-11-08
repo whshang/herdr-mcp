@@ -6065,6 +6065,50 @@ fn browser_source_resolve(
     }
 }
 
+/// Bounded continuity history a handoff preparation reads. One turn is not enough:
+/// a same-key replay sees the target conversation's seed turn last and must still
+/// find the source turn immediately before it.
+const BROWSER_HANDOFF_SOURCE_TURN_WINDOW: usize = 64;
+
+/// Same-key replay evidence for a repeated handoff preparation.
+///
+/// The extension persists the target conversation's seed turn while
+/// `browser_session.create` is still running, so a replayed preparation observes a
+/// durable chain whose newest turn belongs to the *target*. Accept that shape only
+/// when the contiguous tail of turns shares one `conversation_id`, the turn
+/// immediately before that tail belongs to the handoff source, and the caller still
+/// proves the tail was seeded by this exact handoff (canonical message match, done
+/// by the caller once the canonical message exists).
+///
+/// Returns `Some((is_native_source, tail_start))` when the predecessor turn matches
+/// the native source conversation id (`true`) or the registered source session ref
+/// (`false`), and `None` for every other shape, including empty history and a chain
+/// that has already continued into a third conversation.
+fn browser_handoff_replayed_source_identity(
+    turns: &[crate::state_store::ContinuityTurnRecord],
+    source_conversation_id: &str,
+    source_route_session_ref: Option<&str>,
+) -> Option<(bool, usize)> {
+    let target_conversation_id = turns.last()?.conversation_id.as_str();
+    if target_conversation_id == source_conversation_id
+        || Some(target_conversation_id) == source_route_session_ref
+    {
+        return None;
+    }
+    let tail_start = turns
+        .iter()
+        .rposition(|turn| turn.conversation_id != target_conversation_id)
+        .map(|index| index + 1)?;
+    let predecessor = turns.get(tail_start.checked_sub(1)?)?;
+    if predecessor.conversation_id == source_conversation_id {
+        Some((true, tail_start))
+    } else if Some(predecessor.conversation_id.as_str()) == source_route_session_ref {
+        Some((false, tail_start))
+    } else {
+        None
+    }
+}
+
 fn browser_handoff_prepare(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -6120,11 +6164,15 @@ fn browser_handoff_prepare(
         let Ok(store) = store.lock() else {
             return json!({"ok": false, "code": "browser_handoff_store_unavailable"});
         };
-        let record = match store.continuity_resume(continuity_id, 1) {
-            Ok(Some(record)) => record,
-            Ok(None) => return json!({"ok": false, "code": "continuity_not_found"}),
-            Err(error) => return browser_store_error(error),
-        };
+        // Read a bounded history instead of only the newest turn: a replayed
+        // same-key handoff must be able to see the source turn that precedes the
+        // target conversation's seed turn (#1.1 same-key replay).
+        let record =
+            match store.continuity_resume(continuity_id, BROWSER_HANDOFF_SOURCE_TURN_WINDOW) {
+                Ok(Some(record)) => record,
+                Ok(None) => return json!({"ok": false, "code": "continuity_not_found"}),
+                Err(error) => return browser_store_error(error),
+            };
         let work_chain_id = match store.continuity_work_chain_id(continuity_id) {
             Ok(value) => value,
             Err(error) => return browser_store_error(error),
@@ -6161,12 +6209,31 @@ fn browser_handoff_prepare(
         .turns
         .last()
         .map(|turn| turn.conversation_id.as_str());
-    let matches_native_conversation = latest_source_ref == Some(source_conversation_id.as_str());
+    let mut matches_native_conversation =
+        latest_source_ref == Some(source_conversation_id.as_str());
     let matches_registered_session = source_route_session_ref
         .as_deref()
         .is_some_and(|session_ref| latest_source_ref == Some(session_ref));
+    // A same-key replay of one handoff no longer sees the source conversation as the
+    // newest turn: the extension persists the target conversation's seed turn before
+    // `browser_session.create` returns, so the durable chain ends on the target. That
+    // shape is accepted only as replay evidence (see the helper) and never widens the
+    // source identity check, so a genuine third conversation still fails closed.
+    let mut replayed_target_tail_start = None;
     if !matches_native_conversation && !matches_registered_session {
-        return json!({"ok": false, "code": "browser_handoff_source_continuity_mismatch"});
+        match browser_handoff_replayed_source_identity(
+            &record.turns,
+            &source_conversation_id,
+            source_route_session_ref.as_deref(),
+        ) {
+            Some((is_native_source, tail_start)) => {
+                matches_native_conversation = is_native_source;
+                replayed_target_tail_start = Some(tail_start);
+            }
+            None => {
+                return json!({"ok": false, "code": "browser_handoff_source_continuity_mismatch"});
+            }
+        }
     }
     if matches_native_conversation
         && source_provider == "chatgpt"
@@ -6199,6 +6266,15 @@ fn browser_handoff_prepare(
     let message = format!(
         "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_reference} 工具执行状态以 Herdr 返回的 delivery/execution 证据为准。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
     );
+    if let Some(tail_start) = replayed_target_tail_start {
+        let canonical_message = browser_readback_text_canonical(&message);
+        let seeded = record.turns[tail_start..].iter().any(|turn| {
+            turn.role == "user" && browser_readback_text_canonical(&turn.text) == canonical_message
+        });
+        if !seeded {
+            return json!({"ok": false, "code": "browser_handoff_source_continuity_mismatch"});
+        }
+    }
 
     json!({
         "ok": true,
@@ -20959,6 +21035,129 @@ mod tests {
                 .continuity_resume("hc:missing", 1)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// user replays the same handoff preparation after delivery | Given a continuity
+    /// chain whose source conversation seeded a target conversation with this exact
+    /// handoff message (plus a later assistant reply on that same target) | When the
+    /// same preparation params are sent again | Then the canonical packet is returned
+    /// unchanged instead of a source-continuity refusal, while a different objective,
+    /// a different source URL, or a chain advanced into a third conversation still
+    /// fails closed.
+    #[test]
+    fn browser_handoff_prepare_replays_after_target_seed_turn() {
+        use crate::state_store::ContinuityTurnInput;
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let append = |turn: ContinuityTurnInput<'_>| {
+            store.lock().unwrap().append_continuity_turn(turn).unwrap();
+        };
+        append(ContinuityTurnInput {
+            continuity_id: "hc:replay",
+            conversation_id: "source-conversation",
+            workspace_id: Some("w-replay"),
+            project_id: Some("g-p-replay"),
+            title: Some("Replay one handoff preparation"),
+            message_id: "source-user-1",
+            role: "user",
+            text: "Deliver the handoff, then reconcile the same key.",
+            fingerprint: None,
+            observed_at: 100,
+        });
+        let source_url = "https://chatgpt.com/g/g-p-replay/c/source-conversation";
+        let params = json!({
+            "continuity_id": "hc:replay",
+            "source_url": source_url,
+            "objective": "Replay one handoff preparation",
+        });
+        let first = browser_handoff_prepare(&store, &params);
+        assert_eq!(first["ok"], true);
+        let handoff_id = first["handoff"]["handoff_id"].as_str().unwrap().to_owned();
+        let message = first["handoff"]["message"].as_str().unwrap().to_owned();
+
+        // The extension wrote the target seed turn before the create call returned.
+        append(ContinuityTurnInput {
+            continuity_id: "hc:replay",
+            conversation_id: "target-conversation",
+            workspace_id: Some("w-replay"),
+            project_id: Some("g-p-replay"),
+            title: None,
+            message_id: "target-user-1",
+            role: "user",
+            text: &message,
+            fingerprint: None,
+            observed_at: 200,
+        });
+        append(ContinuityTurnInput {
+            continuity_id: "hc:replay",
+            conversation_id: "target-conversation",
+            workspace_id: Some("w-replay"),
+            project_id: Some("g-p-replay"),
+            title: None,
+            message_id: "target-assistant-1",
+            role: "assistant",
+            text: "UAT14_HANDOFF_OK",
+            fingerprint: None,
+            observed_at: 300,
+        });
+
+        let replayed = browser_handoff_prepare(&store, &params);
+        assert_eq!(replayed["ok"], true);
+        assert_eq!(replayed["handoff"]["handoff_id"], handoff_id.as_str());
+        assert_eq!(replayed["handoff"]["message"], message.as_str());
+        assert_eq!(
+            replayed["automatic_delivery"]["params"]["message"],
+            message.as_str()
+        );
+
+        // A different objective changes the canonical message, so the target seed turn
+        // no longer proves this handoff and the strict refusal stays.
+        let different_objective = browser_handoff_prepare(
+            &store,
+            &json!({
+                "continuity_id": "hc:replay",
+                "source_url": source_url,
+                "objective": "Something else entirely",
+            }),
+        );
+        assert_eq!(
+            different_objective["code"],
+            "browser_handoff_source_continuity_mismatch"
+        );
+
+        // A different source conversation is not the recorded predecessor either.
+        let different_source = browser_handoff_prepare(
+            &store,
+            &json!({
+                "continuity_id": "hc:replay",
+                "source_url": "https://chatgpt.com/g/g-p-replay/c/other-conversation",
+                "objective": "Replay one handoff preparation",
+            }),
+        );
+        assert_eq!(
+            different_source["code"],
+            "browser_handoff_source_continuity_mismatch"
+        );
+
+        // Once the chain continues into a third conversation the replay window is over.
+        append(ContinuityTurnInput {
+            continuity_id: "hc:replay",
+            conversation_id: "third-conversation",
+            workspace_id: Some("w-replay"),
+            project_id: Some("g-p-replay"),
+            title: None,
+            message_id: "third-user-1",
+            role: "user",
+            text: "third conversation turn",
+            fingerprint: None,
+            observed_at: 400,
+        });
+        let advanced = browser_handoff_prepare(&store, &params);
+        assert_eq!(
+            advanced["code"],
+            "browser_handoff_source_continuity_mismatch"
         );
     }
 

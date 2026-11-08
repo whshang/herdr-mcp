@@ -548,11 +548,6 @@ where
         })
     };
 
-    let delivery_state = delivery
-        .get("delivery_state")
-        .and_then(Value::as_str)
-        .unwrap_or("not_attempted")
-        .to_owned();
     let completed = delivery.get("completed").and_then(Value::as_bool) == Some(true);
     let attempted = delivery.get("attempted").and_then(Value::as_bool) == Some(true);
 
@@ -569,7 +564,11 @@ where
         }
         object.insert(
             "instruction".to_owned(),
-            json!(handoff_instruction(attempted, completed, &delivery_state)),
+            json!(handoff_instruction(
+                attempted,
+                completed,
+                request.prepare_only
+            )),
         );
     }
     Ok(output)
@@ -603,12 +602,12 @@ fn handoff_route_string(route: &Value, field: &str) -> Result<String, String> {
         .ok_or_else(|| format!("canonical handoff packet has no source route {field}"))
 }
 
-fn handoff_instruction(attempted: bool, completed: bool, delivery_state: &str) -> &'static str {
+fn handoff_instruction(attempted: bool, completed: bool, prepare_only: bool) -> &'static str {
     if completed {
         "Canonical handoff prepared and automatically delivered: the target conversation was created and its first step is continuity.resume for the same continuity_id. Re-check live workspace / Git / runtime state on the target side, and do not create a second conversation for the same logical handoff."
     } else if attempted {
         "Canonical handoff prepared, but automatic browser delivery did not complete. Do not blindly re-create it: read the returned delivery_state, session_ref, dispatch_id and result first, and use webchat dispatch-status for an existing dispatch. The same canonical message is available as manual_delivery.copy_prompt. A retry of the same logical handoff must reuse the same idempotency key."
-    } else if delivery_state == "prepare_only" {
+    } else if prepare_only {
         "Canonical handoff prepared only; automatic delivery was not attempted. Nothing was created: hand manual_delivery.copy_prompt to the user for a WebChat conversation, and do not report this as a completed handoff."
     } else {
         "Canonical handoff prepared, but automatic delivery was not attempted because the source conversation route is unavailable. Nothing was created: re-observe the browser resources, or hand manual_delivery.copy_prompt to the user for a WebChat conversation. This is a prepared packet, not a completed handoff."
@@ -1408,6 +1407,14 @@ mod tests {
             prepared["manual_delivery"]["copy_prompt"],
             canonical_handoff_message()
         );
+        // A resolvable source route must not turn --prepare-only into the
+        // "route unavailable" instruction.
+        let instruction = prepared["instruction"].as_str().unwrap();
+        assert!(
+            instruction
+                .contains("Canonical handoff prepared only; automatic delivery was not attempted.")
+        );
+        assert!(!instruction.contains("source conversation route is unavailable"));
 
         let mut runtime = FakeRuntime::new(
             canonical_prepare_response(canonical_source_route(), Value::Null),
