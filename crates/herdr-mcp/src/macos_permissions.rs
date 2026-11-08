@@ -161,18 +161,20 @@ pub(crate) enum BoundedRealPath {
 /// Resolve a real path without letting a pending macOS consent prompt park the
 /// caller.
 ///
-/// At most one worker may be parked behind the prompt at a time: the in-flight
-/// flag is taken before spawning and released by the worker itself, so it stays
-/// held for as long as the syscall stays blocked. Later callers get
-/// [`BoundedRealPath::TimedOut`] immediately instead of parking another thread,
-/// and resolution resumes on its own once the operator answers the prompt.
+/// At most one worker may sit behind the prompt at a time: the slot is claimed
+/// before the worker is spawned and released by the worker itself, so it stays
+/// held for as long as the syscall stays blocked. While a worker is merely
+/// running inside its own budget, later callers wait for it and then take their
+/// turn; only a worker that has already outlived its caller's budget makes them
+/// answer [`BoundedRealPath::TimedOut`] at once instead of parking another
+/// thread. Resolution resumes on its own once the operator answers the prompt.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn bounded_real_path(path: &Path) -> BoundedRealPath {
     #[cfg(test)]
     REAL_PATH_PROBES.with(|count| count.set(count.get() + 1));
     let probe_path = path.to_path_buf();
     match run_exclusive_probe_bounded(
-        &PROTECTED_PROBE_IN_FLIGHT,
+        &PROTECTED_PROBE_SLOT,
         PROTECTED_REALPATH_BUDGET,
         move || std::fs::canonicalize(&probe_path),
     ) {
@@ -190,14 +192,166 @@ pub(crate) fn bounded_real_path(path: &Path) -> BoundedRealPath {
 #[cfg(any(target_os = "macos", test))]
 const PROTECTED_REALPATH_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Exactly one consent-gated probe worker may be parked at a time.
+/// Exactly one consent-gated probe worker may own the slot at a time.
 ///
-/// It is taken before the worker is spawned and released by the worker when the
-/// syscall returns, so a prompt that stays up for minutes cannot accumulate one
-/// parked thread per request (or per retry window).
+/// The slot is claimed before the worker is spawned and released by the worker
+/// when the syscall returns, so a prompt that stays up for minutes cannot
+/// accumulate one parked thread per request (or per retry window).
 #[cfg(any(target_os = "macos", test))]
-static PROTECTED_PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static PROTECTED_PROBE_SLOT: ProbeSlot = ProbeSlot::new();
+
+/// Lifecycle of the single consent-gated probe slot.
+///
+/// The distinction between `Running` and `Parked` is the difference between "a
+/// healthy syscall is in flight" and "the syscall outlived its caller's budget
+/// and macOS has still not returned". Only the second one may refuse a caller
+/// without waiting: treating a healthy probe as parked made every concurrent
+/// caller fail closed and misclassify an ordinary path as privacy-protected.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePhase {
+    /// No worker owns the slot.
+    Idle,
+    /// `generation` owns the slot and is still inside its caller's budget.
+    Running(u64),
+    /// `generation` owns the slot and has outlived its caller's budget; the
+    /// syscall has not returned, so nothing may claim the slot yet.
+    Parked(u64),
+}
+
+/// The single consent-gated probe slot.
+///
+/// Every claim takes a fresh generation, so a late worker can never release a
+/// newer owner's reservation.
+#[cfg(any(target_os = "macos", test))]
+struct ProbeSlot {
+    phase: std::sync::Mutex<ProbePhase>,
+    /// Signalled whenever the owning worker releases or parks the slot.
+    released: std::sync::Condvar,
+    next_generation: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ProbeSlot {
+    const fn new() -> Self {
+        Self {
+            phase: std::sync::Mutex::new(ProbePhase::Idle),
+            released: std::sync::Condvar::new(),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    /// A poisoned lock only means a probe thread panicked between two writes of
+    /// an otherwise valid phase, so recover instead of panicking on every later
+    /// caller.
+    fn lock(&self) -> std::sync::MutexGuard<'_, ProbePhase> {
+        self.phase.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Claim the slot for a new worker. The caller already holds the guard, so
+    /// the claim cannot interleave with a release.
+    fn claim(&self, phase: &mut ProbePhase) -> u64 {
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *phase = ProbePhase::Running(generation);
+        generation
+    }
+
+    /// Record that `generation` outlived its caller's budget while macOS has not
+    /// returned yet.
+    ///
+    /// Only a state that still belongs to `generation` may be overwritten: if
+    /// the worker returned just before the caller gave up, it already reset the
+    /// slot to [`ProbePhase::Idle`] and parking it then would strand the slot
+    /// for the life of the process.
+    fn park(&self, generation: u64) {
+        {
+            let mut phase = self.lock();
+            if *phase != ProbePhase::Running(generation) {
+                return;
+            }
+            *phase = ProbePhase::Parked(generation);
+        }
+        self.released.notify_all();
+    }
+
+    /// Release `generation`'s claim. A worker only ever releases the slot it
+    /// still owns.
+    fn release(&self, generation: u64) {
+        {
+            let mut phase = self.lock();
+            let owned = matches!(
+                *phase,
+                ProbePhase::Running(owner) | ProbePhase::Parked(owner) if owner == generation
+            );
+            if !owned {
+                return;
+            }
+            *phase = ProbePhase::Idle;
+        }
+        self.released.notify_all();
+    }
+}
+
+/// What one caller got out of trying to claim the slot within its own budget.
+#[cfg(any(target_os = "macos", test))]
+enum ProbeClaim {
+    /// The caller now owns the slot with this generation.
+    Claimed(u64),
+    /// A worker is parked past its budget; answer without waiting.
+    Parked,
+    /// The caller's own budget ran out while a worker was still running.
+    BudgetSpent,
+}
+
+/// Claim the slot inside `deadline`, waiting for a healthy in-flight probe.
+///
+/// A probe that is still inside its own budget is not a parked syscall, so a
+/// concurrent caller waits for it instead of failing closed; once it finishes
+/// the waiter claims the slot itself and runs its own probe with whatever
+/// budget is left.
+#[cfg(any(target_os = "macos", test))]
+fn claim_probe_slot_within_budget(
+    slot: &'static ProbeSlot,
+    deadline: std::time::Instant,
+) -> ProbeClaim {
+    loop {
+        let mut phase = slot.lock();
+        match *phase {
+            ProbePhase::Idle => return ProbeClaim::Claimed(slot.claim(&mut phase)),
+            ProbePhase::Parked(_) => return ProbeClaim::Parked,
+            ProbePhase::Running(_) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return ProbeClaim::BudgetSpent;
+                }
+                // The wake-up is advisory: the phase is re-inspected on every
+                // loop, so a missed or spurious notify only costs one timeout
+                // slice.
+                let (guard, _) = slot
+                    .released
+                    .wait_timeout(phase, remaining)
+                    .unwrap_or_else(|error| error.into_inner());
+                drop(guard);
+            }
+        }
+    }
+}
+
+/// Releases the slot when its worker returns, including while unwinding.
+#[cfg(any(target_os = "macos", test))]
+struct ProbeSlotOwner {
+    slot: &'static ProbeSlot,
+    generation: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for ProbeSlotOwner {
+    fn drop(&mut self) {
+        self.slot.release(self.generation);
+    }
+}
 
 // Test-only count of real-path probes started by the calling thread. It exists
 // so a test can prove that a lexically protected path is decided without any
@@ -221,36 +375,52 @@ pub(crate) fn test_reset_real_path_probes() {
 
 /// Run `probe` on a worker thread and give up after `budget`.
 ///
-/// `in_flight` is the single-worker reservation: when it is already held, a
-/// worker is parked in a consent-gated syscall and no second one is started.
-/// The reservation is released by the worker, never by the caller, so a caller
-/// that times out leaves the slot held until the parked syscall really returns.
-/// The worker is detached on timeout because a consent-blocked syscall has no
-/// cancellation path.
+/// `slot` is the single-worker reservation. A caller waits for a healthy
+/// in-flight probe, refuses at once while a worker is parked in a consent-gated
+/// syscall, and never starts a second worker. The reservation is released by
+/// the worker, never by the caller, so a caller that times out leaves the slot
+/// held (and marked [`ProbePhase::Parked`]) until the parked syscall really
+/// returns. The worker is detached on timeout because a consent-blocked syscall
+/// has no cancellation path.
+///
+/// `budget` covers both waiting for the running probe and the probe itself, so no
+/// caller is ever blocked longer than it asked for.
 #[cfg(any(target_os = "macos", test))]
 fn run_exclusive_probe_bounded<T: Send + 'static>(
-    in_flight: &'static std::sync::atomic::AtomicBool,
+    slot: &'static ProbeSlot,
     budget: std::time::Duration,
     probe: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
-    use std::sync::atomic::Ordering;
-
-    if in_flight.swap(true, Ordering::AcqRel) {
-        return None;
-    }
+    let deadline = std::time::Instant::now() + budget;
+    let generation = match claim_probe_slot_within_budget(slot, deadline) {
+        ProbeClaim::Claimed(generation) => generation,
+        ProbeClaim::Parked | ProbeClaim::BudgetSpent => return None,
+    };
     let (sender, receiver) = std::sync::mpsc::channel();
+    let owner = ProbeSlotOwner { slot, generation };
     let spawned = std::thread::Builder::new()
         .name("herdr-tcc-probe".to_owned())
         .spawn(move || {
+            // Held across `probe`, so a panicking probe still releases the slot
+            // instead of stranding it for the life of the process.
             let value = probe();
-            in_flight.store(false, Ordering::Release);
+            drop(owner);
             let _ = sender.send(value);
         });
     if spawned.is_err() {
-        in_flight.store(false, Ordering::Release);
+        slot.release(generation);
         return None;
     }
-    receiver.recv_timeout(budget).ok()
+    match receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            // The syscall has now outlived this caller's budget, so later
+            // callers answer at once while the slot stays held until the worker
+            // really returns.
+            slot.park(generation);
+            None
+        }
+    }
 }
 
 /// Whether commands started from a project root need a TCC-authorized
@@ -370,11 +540,19 @@ fn is_protected_user_path_for_home(path: &Path, home: &Path) -> bool {
     }
     // The resolved candidate may be spelled through `/private` (temp dirs) or
     // the Data-volume firmlink while HOME is not, so compare against the
-    // spellings of the canonical HOME too. HOME is never privacy-protected, so
-    // resolving it cannot raise a consent prompt; if it cannot be resolved the
-    // answer stays fail-closed.
+    // spellings of the canonical HOME too.
     match std::fs::canonicalize(home) {
         Ok(canonical_home) => is_protected_user_path_lexical_for_home(&resolved, &canonical_home),
+        // A HOME that does not exist cannot contain `Documents`, `Desktop` or
+        // `Downloads`, and `resolved` already exists, so no spelling of it can
+        // name one of them. Failing closed here instead turned any caller that
+        // observed a transient HOME (a setup step or another test pointing HOME
+        // at a not-yet-created directory) into a false "this is
+        // privacy-protected" verdict, which routed ordinary temp paths through
+        // the protected transport.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        // A HOME that exists but cannot be resolved may be a permission problem
+        // on the way to a protected folder, so keep the fail-closed answer.
         Err(_) => true,
     }
 }
@@ -1294,6 +1472,37 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// Given a HOME that does not exist yet
+    /// When an existing ordinary path outside the protected spellings is decided
+    /// Then it is not classified as privacy-protected, because no protected
+    /// folder can exist under a missing HOME.
+    ///
+    /// A caller that observed such a transient HOME (a setup step or a
+    /// concurrent test pointing HOME at a not-yet-created directory) used to get
+    /// the fail-closed answer and route an ordinary temp path through the
+    /// protected transport.
+    #[test]
+    fn missing_home_keeps_an_ordinary_path_unprotected() {
+        let base = temp_dir("missing-home");
+        let ordinary = base.join("project");
+        fs::create_dir_all(&ordinary).unwrap();
+        let missing_home = base.join("home");
+
+        assert!(
+            !is_protected_user_path_for_home(&ordinary, &missing_home),
+            "a missing HOME cannot contain a protected folder"
+        );
+        assert!(
+            is_protected_user_path_lexical_for_home(
+                &missing_home.join("Documents/x"),
+                &missing_home
+            ),
+            "the lexical answer is unchanged for a missing HOME"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn protected_path_detection_is_lexical_for_home_and_firmlink_spellings() {
         let home = Path::new("/Users/example");
@@ -1345,10 +1554,11 @@ mod tests {
 
     /// Given a probe that cannot finish because macOS is waiting for the user
     /// When the bounded probe runs
-    /// Then the caller gives up on its own budget instead of waiting for it.
+    /// Then the caller gives up on its own budget instead of waiting for it,
+    /// and the slot stays recorded as parked until the syscall returns.
     #[test]
     fn bounded_probe_returns_without_waiting_for_a_parked_syscall() {
-        static SLOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static SLOT: ProbeSlot = ProbeSlot::new();
         let started = std::time::Instant::now();
         let parked =
             run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(20), || {
@@ -1360,7 +1570,15 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(300),
             "the caller must not wait for the parked worker"
         );
+        assert!(
+            matches!(*SLOT.lock(), ProbePhase::Parked(_)),
+            "a worker that outlived its budget must be recorded as parked"
+        );
         wait_for_slot(&SLOT);
+        assert!(
+            *SLOT.lock() == ProbePhase::Idle,
+            "the worker must free the slot once it returns"
+        );
 
         // A probe that finishes inside the budget still returns its value, and
         // it releases the slot for the next caller.
@@ -1377,7 +1595,7 @@ mod tests {
     /// syscall really returns.
     #[test]
     fn only_one_probe_worker_is_ever_parked() {
-        static SLOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static SLOT: ProbeSlot = ProbeSlot::new();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let parked =
             run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(20), move || {
@@ -1412,6 +1630,104 @@ mod tests {
         wait_for_slot(&SLOT);
     }
 
+    /// Given a probe that is still inside its own budget
+    /// When a second caller asks for the slot
+    /// Then it waits for the healthy probe instead of failing closed, and runs
+    /// its own probe once the slot is free.
+    #[test]
+    fn concurrent_caller_waits_for_a_running_probe_instead_of_failing_closed() {
+        static SLOT: ProbeSlot = ProbeSlot::new();
+        let (started, started_rx) = std::sync::mpsc::channel::<()>();
+        let first = std::thread::spawn(move || {
+            run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(500), move || {
+                let _ = started.send(());
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                1_u8
+            })
+        });
+        // The first caller claims the slot before spawning, so the slot is
+        // `Running` by the time the probe body signals.
+        started_rx.recv().unwrap();
+        let waited = std::time::Instant::now();
+        let second =
+            run_exclusive_probe_bounded(&SLOT, std::time::Duration::from_millis(500), || 2_u8);
+        assert_eq!(
+            second,
+            Some(2),
+            "a healthy in-flight probe must not be refused"
+        );
+        assert!(
+            waited.elapsed() >= std::time::Duration::from_millis(30),
+            "the second caller must wait for the running probe"
+        );
+        assert_eq!(first.join().unwrap(), Some(1));
+        wait_for_slot(&SLOT);
+    }
+
+    /// Given many threads asking for the slot at the same time
+    /// When every probe is short enough to finish well inside the budget
+    /// Then every call succeeds instead of being refused as a parked probe.
+    ///
+    /// This is the regression for the default multi-threaded `cargo test`
+    /// failure, where the slot's single boolean made concurrent ordinary probes
+    /// time out and made `is_protected_user_path` fail closed.
+    #[test]
+    fn concurrent_healthy_probes_never_report_a_timeout() {
+        static SLOT: ProbeSlot = ProbeSlot::new();
+        let mut threads = Vec::with_capacity(8);
+        for _ in 0..8 {
+            threads.push(std::thread::spawn(|| {
+                let mut answered = 0;
+                for _ in 0..50 {
+                    if run_exclusive_probe_bounded(
+                        &SLOT,
+                        std::time::Duration::from_millis(500),
+                        || std::thread::sleep(std::time::Duration::from_micros(200)),
+                    )
+                    .is_some()
+                    {
+                        answered += 1;
+                    }
+                }
+                answered
+            }));
+        }
+        for thread in threads {
+            assert_eq!(
+                thread.join().unwrap(),
+                50,
+                "a healthy probe must never be refused"
+            );
+        }
+        wait_for_slot(&SLOT);
+    }
+
+    /// Given an ordinary, existing path outside the protected spellings
+    /// When many threads ask whether it is privacy-protected at once
+    /// Then every answer is "not protected": ordinary probes queue behind each
+    /// other instead of being mistaken for a parked consent prompt.
+    #[test]
+    fn concurrent_protection_checks_do_not_fail_closed() {
+        let home = std::env::temp_dir();
+        let path = home.clone();
+        let mut threads = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let (path, home) = (path.clone(), home.clone());
+            threads.push(std::thread::spawn(move || {
+                (0..8)
+                    .map(|_| is_protected_user_path_for_home(&path, &home))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for thread in threads {
+            assert_eq!(
+                thread.join().unwrap(),
+                vec![false; 8],
+                "an ordinary path must never be classified as privacy-protected"
+            );
+        }
+    }
+
     /// APFS is case-insensitive by default, so a case-variant spelling names the
     /// same protected folder and must never reach the direct-probe branch.
     #[cfg(target_os = "macos")]
@@ -1435,9 +1751,12 @@ mod tests {
         ));
     }
 
-    fn wait_for_slot(slot: &std::sync::atomic::AtomicBool) {
+    fn wait_for_slot(slot: &'static ProbeSlot) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while slot.load(std::sync::atomic::Ordering::Acquire) {
+        loop {
+            if *slot.lock() == ProbePhase::Idle {
+                return;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "the probe worker never released its slot"
