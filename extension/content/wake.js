@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.243";
+const H2W_CONTENT_VERSION = "0.1.244";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2366,7 +2366,7 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function performChatGptSessionArchive(command, evidence) {
-    if (ADAPTER.name !== "chatgpt") {
+    if (!adapterSupports("sessionArchive")) {
       return browserUnavailableEvidence(evidence, "browser_archive_provider_unavailable");
     }
     const params = command?.params && typeof command.params === "object" ? command.params : {};
@@ -2428,7 +2428,7 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function performChatGptSessionArchiveStatus(command, evidence) {
-    if (ADAPTER.name !== "chatgpt") {
+    if (!adapterSupports("sessionArchiveStatus")) {
       return browserUnavailableEvidence(evidence, "browser_archive_status_provider_unavailable");
     }
     const params = command?.params && typeof command.params === "object" ? command.params : {};

@@ -3931,6 +3931,9 @@ function selfArchiveHarness(overrides = {}) {
     verifyGate: null,
     menuGate: null,
     clicks: [],
+    // Counts every provider readback the extracted handlers perform, so a test
+    // can prove a rejected capability gate never reached the provider.
+    readbacks: 0,
     ...ctxOverrides,
   };
   const storage = sharedStorage instanceof Map ? sharedStorage : new Map();
@@ -3965,7 +3968,16 @@ function selfArchiveHarness(overrides = {}) {
     "acceptance canonicalization helpers must remain extractable");
   const acceptanceSource = wakeSource.slice(acceptanceStart, acceptanceEnd);
   const api = new Function("ctx", "sessionStorage", "setTimeout", "Date", `
-    const ADAPTER = { name: "chatgpt", ...(ctx.adapter || {}) };
+    const ADAPTER = {
+      name: "chatgpt",
+      capabilities: { sessionArchive: true, sessionArchiveStatus: true },
+      ...(ctx.adapter || {}),
+    };
+    // Mirrors the host helper (wake.js adapterSupports) that the extracted
+    // archive handlers now call instead of a provider-name check.
+    const adapterSupports = (capability) => (typeof ADAPTER.supportsCapability === "function"
+      ? ADAPTER.supportsCapability(capability)
+      : ADAPTER.capabilities?.[String(capability || "")] === true);
     const chatGptConversationId = () => ctx.conversationId;
     const isTurnInProgress = () => ctx.turnInProgress;
     const fetch = ctx.fetch || (() => { throw new Error("unexpected fetch"); });
@@ -3984,6 +3996,7 @@ function selfArchiveHarness(overrides = {}) {
         : null;
     };
     const fetchChatGptConversation = async () => {
+      ctx.readbacks = (ctx.readbacks || 0) + 1;
       if (ctx.verifyGate && ctx.clicks.length > 0) await ctx.verifyGate;
       if (ctx.readbackStatus) {
         return { ok: false, status: ctx.readbackStatus, error: "conversation-http", reason: "http-" + ctx.readbackStatus };
@@ -3994,6 +4007,7 @@ function selfArchiveHarness(overrides = {}) {
     };
     const fetchChatGptConversationDetail = async () => ctx.detail || { ok: false };
     const fetchChatGptArchivedConversationList = async () => ({
+      ...(ctx.readbacks = (ctx.readbacks || 0) + 1, {}),
       ok: true,
       items: ctx.archiveListContains
         ? [{ id: ctx.conversationId, is_archived: true }]
@@ -4003,6 +4017,13 @@ function selfArchiveHarness(overrides = {}) {
     const browserRejectedEvidence = (evidence, reason) => ({
       ...evidence,
       rejected: true,
+      result: { error: reason },
+    });
+    // Mirrors wake.js browserUnavailableEvidence: a capability gate reports the
+    // resource as unavailable instead of rejecting an attempted mutation.
+    const browserUnavailableEvidence = (evidence, reason) => ({
+      ...evidence,
+      resource_available: false,
       result: { error: reason },
     });
     let registeredBrowserSessionRef = ctx.sessionRef;
@@ -4020,6 +4041,41 @@ function selfArchiveHarness(overrides = {}) {
   `)(ctx, sessionStorage, () => 0, dateShim);
   return { ctx, api, storage, writeState };
 }
+
+test("user cannot archive through a provider without the archive capability | Given a capability-absent adapter shaped like Claude | When archive and archive-status are requested | Then both fail closed with the provider-unavailable codes and no click, readback or pending intent happens", async () => {
+  const { ctx, api, storage } = selfArchiveHarness({
+    // Claude/Grok declare browserActuation + stopGeneration only; neither
+    // sessionArchive nor sessionArchiveStatus.
+    adapter: {
+      name: "claude",
+      capabilities: { browserActuation: true, stopGeneration: true },
+    },
+  });
+  const params = { session_ref: ctx.sessionRef, expected_generation: 7, idempotency_key: "archive-cap-1" };
+
+  const archive = await api.performChatGptSessionArchive(
+    { operation: "herdr_mcp.browser_session.archive", expected_generation: 7, params },
+    { observed_generation: 7 },
+  );
+  assert.equal(archive.result?.error, "browser_archive_provider_unavailable");
+  assert.equal(archive.resource_available, false);
+  assert.equal(archive.command_accepted, undefined, "a gated archive must not be accepted");
+  assert.equal(archive.lifecycle_observed, undefined);
+
+  const status = await api.performChatGptSessionArchiveStatus(
+    { operation: "herdr_mcp.browser_session.archive_status", expected_generation: 7, params },
+    { observed_generation: 7 },
+  );
+  assert.equal(status.result?.error, "browser_archive_status_provider_unavailable");
+  assert.equal(status.resource_available, false);
+  assert.equal(status.command_accepted, undefined, "a gated status read must not be accepted");
+
+  // Zero provider mutation, zero provider readback, zero persisted intent.
+  assert.equal(ctx.clicks.length, 0, "an unsupported adapter must never click Archive");
+  assert.equal(ctx.readbacks, 0, "an unsupported adapter must never read provider state");
+  assert.equal(api.pendingCount(), 0, "an unsupported adapter must not queue a self-archive intent");
+  assert.equal(storage.size, 0, "nothing may be persisted for a gated archive");
+});
 
 test("user archive status reads provider state without clicking Archive | Given an active then archived conversation | When status is read | Then state changes and click count stays zero", async () => {
   const { ctx, api } = selfArchiveHarness();
