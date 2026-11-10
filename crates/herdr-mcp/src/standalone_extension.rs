@@ -685,6 +685,7 @@ pub(crate) struct ExtensionVersionReport {
 struct ExpectedExtension<'a> {
     version: Option<&'a str>,
     source_commit: Option<&'a str>,
+    source_manifest_sha256: Option<&'a str>,
 }
 
 const EXTENSION_RELOAD_NEXT_ACTION: &str = "click Reload on chrome://extensions";
@@ -868,11 +869,17 @@ fn version_report_in(
     expected_version: Option<&str>,
     expected_commit: Option<&str>,
 ) -> ExtensionVersionReport {
+    let version = expected_version.filter(|value| !value.trim().is_empty());
     let expected = ExpectedExtension {
-        version: expected_version.filter(|value| !value.trim().is_empty()),
+        version,
         // An unverifiable release identity (a source build, or a manifest field
         // that is not an immutable commit) must never be reported as drift.
         source_commit: expected_commit.filter(|value| is_sha(value)),
+        source_manifest_sha256: if version == crate::runtime_meta::bundled_extension_version() {
+            Some(crate::runtime_meta::bundled_extension_manifest_sha256())
+        } else {
+            None
+        },
     };
     let base = base_dir_for(home);
     let current = base.join("current");
@@ -893,6 +900,7 @@ fn version_report_in(
     let staged_version = manifest_version(&manifest);
     let state = read_json(&base.join("state.json")).ok();
     let staged_source_commit = json_string(state.as_ref(), "source_commit");
+    let staged_source_manifest_sha256 = json_string(state.as_ref(), "source_manifest_sha256");
     let (registered, reason) = match registered_extensions(config_dir, 5) {
         Ok(registered) => (registered, None),
         Err(reason) => (Vec::new(), Some(reason)),
@@ -900,6 +908,7 @@ fn version_report_in(
     classify_extension_version(ExtensionVersionInputs {
         staged_version,
         staged_source_commit,
+        staged_source_manifest_sha256,
         expected,
         registered,
         reason,
@@ -909,6 +918,7 @@ fn version_report_in(
 struct ExtensionVersionInputs<'a> {
     staged_version: Option<String>,
     staged_source_commit: Option<String>,
+    staged_source_manifest_sha256: Option<String>,
     expected: ExpectedExtension<'a>,
     registered: Vec<RegisteredExtension>,
     reason: Option<String>,
@@ -918,6 +928,7 @@ fn classify_extension_version(inputs: ExtensionVersionInputs<'_>) -> ExtensionVe
     let ExtensionVersionInputs {
         staged_version,
         staged_source_commit,
+        staged_source_manifest_sha256,
         expected,
         registered,
         reason,
@@ -926,15 +937,37 @@ fn classify_extension_version(inputs: ExtensionVersionInputs<'_>) -> ExtensionVe
         (expected.version, staged_version.as_deref()),
         (Some(expected), Some(staged)) if expected != staged
     );
+    let manifest_differs = matches!(
+        (
+            expected.source_manifest_sha256,
+            staged_source_manifest_sha256.as_deref(),
+        ),
+        (Some(expected), Some(staged)) if expected != staged
+    );
     let commit_differs = matches!(
         (expected.source_commit, staged_source_commit.as_deref()),
         (Some(expected), Some(staged)) if expected != staged
     );
+    // #885: When the Runtime advances to a new source_commit without changing
+    // `extension/` (the staged version matches the bundled version and any
+    // recorded `source_manifest_sha256` matches the bundled manifest),
+    // `commit_differs` is provenance drift only, not stale extension content.
+    let content_stale =
+        version_differs || manifest_differs || (expected.version.is_none() && commit_differs);
     let registered_version = registered
         .first()
         .map(|entry| entry.extension_version.as_str());
-    let (state, reason) = if version_differs || commit_differs {
-        ("extension_stale", reason)
+    let (state, reason) = if content_stale {
+        let stale_reason = reason.or_else(|| {
+            if version_differs {
+                Some("extension_version_differs".to_owned())
+            } else if manifest_differs {
+                Some("extension_manifest_differs".to_owned())
+            } else {
+                Some("source_commit_differs".to_owned())
+            }
+        });
+        ("extension_stale", stale_reason)
     } else if staged_version.is_none() {
         (
             "unknown",
@@ -946,7 +979,12 @@ fn classify_extension_version(inputs: ExtensionVersionInputs<'_>) -> ExtensionVe
             Some(reason.unwrap_or_else(|| "no_endpoint_registration".to_owned())),
         )
     } else if registered_version == staged_version.as_deref() {
-        ("current", reason)
+        let current_reason = if reason.is_none() && commit_differs {
+            Some("source_commit_advanced_extension_unchanged".to_owned())
+        } else {
+            reason
+        };
+        ("current", current_reason)
     } else {
         // A registered extension behind the staged build is the "click Reload"
         // case. A registered extension *ahead* of it is a build this Runtime
@@ -3552,6 +3590,52 @@ mod tests {
 
         assert_eq!(report.state, "current");
         assert!(report.update_notice().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_version_report_treats_advanced_runtime_commit_with_unchanged_extension_as_current() {
+        // Given the staged standalone extension matches this Runtime's bundled
+        //       version and source_manifest_sha256, while the Runtime upgraded
+        //       to a newer source_commit that did not touch `extension/` (#885)
+        // When doctor reconciles versions
+        // Then it reports `current` with reason `source_commit_advanced_extension_unchanged`
+        //      and emits no false-positive `extension_stale` warning.
+        let root = temp_root("version-commit-advanced-unchanged");
+        let home = root.join("home");
+        let config_dir = root.join("config");
+        let staged_commit = "a".repeat(40);
+        let runtime_commit = "b".repeat(40);
+        let expected = crate::runtime_meta::bundled_extension_version().unwrap();
+        seed_standalone_install(&home, &staged_commit, expected);
+        let state_path = base_dir_for(&home).join("state.json");
+        let mut state = read_json(&state_path).unwrap();
+        state["source_manifest_sha256"] =
+            Value::String(crate::runtime_meta::bundled_extension_manifest_sha256().to_owned());
+        atomic_json(&state_path, &state).unwrap();
+        seed_registrations(&config_dir, &[("chrome", expected, 45)]);
+
+        let report = version_report_in(&home, &config_dir, Some(expected), Some(&runtime_commit));
+
+        assert_eq!(report.state, "current");
+        let json = report.as_json();
+        assert_eq!(json["reason"], "source_commit_advanced_extension_unchanged");
+        assert_eq!(json["staged_source_commit"], staged_commit);
+        assert_eq!(json["runtime_source_commit"], runtime_commit);
+        assert!(report.update_notice().is_none());
+        assert!(
+            report
+                .doctor_line()
+                .starts_with("INFO standalone-extension-version state=current")
+        );
+
+        // If source_manifest_sha256 differs even with the same version string,
+        // it still fails closed as extension_stale.
+        state["source_manifest_sha256"] = Value::String("0".repeat(64));
+        atomic_json(&state_path, &state).unwrap();
+        let drifted = version_report_in(&home, &config_dir, Some(expected), Some(&runtime_commit));
+        assert_eq!(drifted.state, "extension_stale");
+        assert_eq!(drifted.as_json()["reason"], "extension_manifest_differs");
         let _ = fs::remove_dir_all(root);
     }
 

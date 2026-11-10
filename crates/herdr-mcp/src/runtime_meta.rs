@@ -67,6 +67,7 @@ const BUNDLED_EXTENSION_MANIFEST: &str = include_str!(concat!(
 ));
 
 static BUNDLED_EXTENSION_VERSION: OnceLock<Option<String>> = OnceLock::new();
+static BUNDLED_EXTENSION_MANIFEST_SHA256: OnceLock<String> = OnceLock::new();
 
 pub fn bundled_extension_version() -> Option<&'static str> {
     BUNDLED_EXTENSION_VERSION
@@ -76,6 +77,17 @@ pub fn bundled_extension_version() -> Option<&'static str> {
             (!version.is_empty()).then(|| version.to_owned())
         })
         .as_deref()
+}
+
+pub fn bundled_extension_manifest_sha256() -> &'static str {
+    BUNDLED_EXTENSION_MANIFEST_SHA256
+        .get_or_init(|| {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(BUNDLED_EXTENSION_MANIFEST.as_bytes());
+            format!("{:x}", hasher.finalize())
+        })
+        .as_str()
 }
 
 pub fn build_info() -> Value {

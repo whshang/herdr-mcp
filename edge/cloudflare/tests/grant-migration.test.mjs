@@ -263,3 +263,49 @@ test("user Given a dry-run plan When the source rows change before apply Then th
 test("user Given a record whose current connector_id is empty When orphans are listed Then nothing is offered", () => {
   assert.deepEqual(listOrphans(record({ connector_id: "" })), []);
 });
+
+test("user Given active sibling connectors in OAuthStoreDO When orphans are listed Then active sibling rows are separated into active_connector_rows and orphan_accounting (#882)", async () => {
+  const h = harness();
+  await h.storage.put(`connector:${NEW}`, {
+    connector_id: NEW,
+    client_id: "c1",
+    status: "active",
+    principal_type: "connector",
+    capabilities: ["mcp_access"],
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect",
+    auth_source: "chatgpt_cimd",
+    approved_at_ms: 1000,
+    approved_by: "device:owner",
+    grant_generation: 2,
+  });
+  await h.storage.put(`connector:${OLD2}`, {
+    connector_id: OLD2,
+    client_id: "c1",
+    status: "active",
+    principal_type: "connector",
+    capabilities: ["mcp_access"],
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect",
+    auth_source: "chatgpt_cimd",
+    approved_at_ms: 900,
+    approved_by: "device:owner",
+    grant_generation: 1,
+  });
+  const res = await h.post({ action: "list", device_id: DEV });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.orphans.map((o) => [o.kind, o.connector_id, o.endpoint_ref]), [
+    ["page_assist", OLD, "ep1"],
+    ["webchat_control", OLD, "ep4"],
+  ]);
+  assert.deepEqual(res.body.active_connector_rows.map((o) => [o.kind, o.connector_id, o.endpoint_ref]), [
+    ["page_assist", OLD2, "ep3"],
+  ]);
+  assert.deepEqual(res.body.orphan_accounting, {
+    stranded_orphan_count: 2,
+    active_rotated_pointer_count: 1,
+    total_non_pointer_rows: 3,
+  });
+});

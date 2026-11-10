@@ -202,6 +202,10 @@ pub enum WorkerCommand {
     ConnectorRevoke {
         connector_id: String,
     },
+    ConnectorPruneStale {
+        confirm: bool,
+        idle_days: u64,
+    },
     ConnectorClientRevoke {
         client_id: String,
     },
@@ -1870,13 +1874,62 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 allowed,
             }))
         }
+        Some("prune-stale") => parse_connector_prune_stale(&args[1..]),
         Some(value) => Err(format!(
-            "unknown connector command '{value}' (expected list, approve, cancel, revoke, revoke-client, label, webchat-control, planner-control, or page-assist)"
+            "unknown connector command '{value}' (expected list, approve, cancel, revoke, prune-stale, revoke-client, label, webchat-control, planner-control, or page-assist)"
         )),
         None => {
-            Err("connector requires list, approve, cancel, revoke, revoke-client, label, webchat-control, planner-control, or page-assist".to_owned())
+            Err("connector requires list, approve, cancel, revoke, prune-stale, revoke-client, label, webchat-control, planner-control, or page-assist".to_owned())
         }
     }
+}
+
+fn parse_connector_prune_stale(args: &[String]) -> Result<Command, String> {
+    let mut dry_run = false;
+    let mut confirm = false;
+    let mut idle_days = 14_u64;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dry-run" => dry_run = true,
+            "--confirm" => confirm = true,
+            "--idle-days" => {
+                index += 1;
+                let raw = args.get(index).ok_or_else(|| {
+                    "connector prune-stale: --idle-days requires a positive integer".to_owned()
+                })?;
+                let parsed = raw.parse::<u64>().map_err(|_| {
+                    "connector prune-stale: --idle-days requires a positive integer".to_owned()
+                })?;
+                if parsed == 0 || parsed > 3650 {
+                    return Err(
+                        "connector prune-stale: --idle-days must be between 1 and 3650".to_owned(),
+                    );
+                }
+                idle_days = parsed;
+            }
+            "--help" | "-h" => {
+                return Ok(Command::Help {
+                    section: HelpSection::Connector,
+                });
+            }
+            other => {
+                return Err(format!(
+                    "connector prune-stale: unexpected argument '{other}' (expected --dry-run, --confirm, or --idle-days <days>)"
+                ));
+            }
+        }
+        index += 1;
+    }
+    if dry_run && confirm {
+        return Err(
+            "connector prune-stale accepts either --dry-run or --confirm, not both".to_owned(),
+        );
+    }
+    Ok(Command::Worker(WorkerCommand::ConnectorPruneStale {
+        confirm,
+        idle_days,
+    }))
 }
 
 fn parse_automation(args: &[String]) -> Result<Command, String> {
@@ -3149,7 +3202,11 @@ All of these require the credential of a device already enrolled in the fleet;\n
   herdr-mcp connector list [--all]\n      Lists current/actionable Connector state by default. --all also includes\n      revoked Connector instances and legacy client/grant tombstones retained\n      for audit and credential fencing.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector cancel <approval-request-id>\n      Cancels a pending or approved-but-never-used request so the OAuth flow can be restarted.\n      Refuses cancellation after credentials have been issued.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes only that Connector instance and its attributed credentials.\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Client-level kill switch: revokes every Connector/grant for that OAuth client\n      and invalidates its issued access/refresh credentials.\n\n\
   herdr-mcp connector label <connector-id> <platform-account>\n      Sets the display label `<platform>-<email>`. It does not change grants.\n      `--clear` removes the label. `connector_id` stays the grant principal.\n      Needs an Edge with the connector-label route; otherwise the command\n      fails with connector_label_requires_edge_support and writes nothing.\n\n\
   herdr-mcp connector webchat-control <allow|deny> ... --confirm\n      Provider-scoped grant for one endpoint. A platform-account label may\n      replace the connector id when it matches exactly one active connector.\n      The endpoint ref must be concrete: a wildcard endpoint is refused.\n\n\
-  herdr-mcp connector webchat-control <allow-device|deny-device> <selector> <device-id> --confirm\n      Device-wide grant. Needs an Edge with device-scope support; otherwise the\n      command fails with device_grant_requires_edge_support and writes nothing.\n      Once that Edge is deployed the requester must be an owner device and the\n      target a non-revoked device in the same fleet.\n"
+  herdr-mcp connector webchat-control <allow-device|deny-device> <selector> <device-id> --confirm\n      Device-wide grant. Needs an Edge with device-scope support; otherwise the\n      command fails with device_grant_requires_edge_support and writes nothing.\n      Once that Edge is deployed the requester must be an owner device and the\n      target a non-revoked device in the same fleet.\n\n\
+  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm\n      Endpoint-scoped Page Assist grant. Allowing Page Assist on a concrete\n      endpoint also derives endpoint-scoped WebChat control for provider `*`\n      and account `*` at forward time (PR #595); denying Page Assist revokes\n      both Page Assist and the derived `*` WebChat control on that endpoint.\n\n\
+  herdr-mcp connector page-assist orphans [--device-id <device-id>]\n      Lists stranded grant rows from revoked/inactive connectors separately\n      from active rotated-pointer sibling connector rows (`orphan_accounting`).\n\n\
+  herdr-mcp connector page-assist migrate --from <old-id> --to <new-id> [--confirm]\n      Plans (or with --confirm applies) a device-scoped grant migration.\n\n\
+  herdr-mcp connector prune-stale [--dry-run | --confirm] [--idle-days <days>]\n      Identifies (or with --confirm revokes) stale duplicate active connectors\n      on the same platform where a newer active sibling exists.\n"
 }
 
 pub fn automation_help() -> &'static str {
@@ -5747,6 +5804,59 @@ mod tests {
         assert!(
             !user_slice.contains("herdr-mcp service install"),
             "user path must not require service install"
+        );
+    }
+
+    #[test]
+    fn connector_help_discloses_page_assist_derived_wildcard_and_prune_stale() {
+        let help = connector_help();
+        assert!(help.contains("herdr-mcp connector page-assist <allow|deny>"));
+        assert!(help.contains("provider `*`"));
+        assert!(help.contains("herdr-mcp connector page-assist orphans"));
+        assert!(help.contains("herdr-mcp connector prune-stale"));
+    }
+
+    #[test]
+    fn parses_connector_prune_stale_flags() {
+        assert_eq!(
+            parse(args(&["connector", "prune-stale"])).unwrap().command,
+            Command::Worker(WorkerCommand::ConnectorPruneStale {
+                confirm: false,
+                idle_days: 14,
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "connector",
+                "prune-stale",
+                "--dry-run",
+                "--idle-days",
+                "7"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::ConnectorPruneStale {
+                confirm: false,
+                idle_days: 7,
+            })
+        );
+        assert_eq!(
+            parse(args(&["connector", "prune-stale", "--confirm"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorPruneStale {
+                confirm: true,
+                idle_days: 14,
+            })
+        );
+        assert!(
+            parse(args(&[
+                "connector",
+                "prune-stale",
+                "--dry-run",
+                "--confirm"
+            ]))
+            .is_err()
         );
     }
 }
