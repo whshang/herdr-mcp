@@ -883,6 +883,7 @@ pub(crate) fn update_existing_worker_for_release(
         &current.edge_version,
         &LegacyWorkerExpectation {
             generic_project: current.legacy_generic_project,
+            enrolled_fleet_member: config.edge_device_id.is_some(),
             default_workstation_id: legacy_default_workstation.as_deref(),
             oauth_issuer: legacy_oauth_issuer.as_deref(),
         },
@@ -2768,6 +2769,8 @@ fn worker_update_metadata(
 struct LegacyWorkerExpectation<'a> {
     /// Health identified the Worker through the generic template project.
     generic_project: bool,
+    /// This computer already holds an enrolled `dev_*` device id in the fleet.
+    enrolled_fleet_member: bool,
     /// This computer has no enrolled device id; its production Link must be
     /// exactly this Worker's `DEFAULT_WORKSTATION_ID`.
     default_workstation_id: Option<&'a str>,
@@ -2965,6 +2968,7 @@ fn validate_existing_worker_settings(
     let default_workstation = legacy_default_workstation_binding(bindings)?;
     if default_workstation.is_some()
         && !legacy.generic_project
+        && !legacy.enrolled_fleet_member
         && legacy.default_workstation_id.is_none()
     {
         return Err(
@@ -5299,6 +5303,7 @@ mod tests {
             "0.1.0",
             &LegacyWorkerExpectation {
                 generic_project: true,
+                enrolled_fleet_member: false,
                 default_workstation_id: Some("my-workstation"),
                 oauth_issuer: Some(legacy_issuer),
             },
@@ -5338,6 +5343,7 @@ mod tests {
             "0.1.0",
             &LegacyWorkerExpectation {
                 generic_project: true,
+                enrolled_fleet_member: false,
                 default_workstation_id: Some("my-workstation"),
                 oauth_issuer: Some(legacy_issuer),
             },
@@ -5542,6 +5548,7 @@ mod tests {
             "0.1.0",
             &LegacyWorkerExpectation {
                 generic_project: true,
+                enrolled_fleet_member: false,
                 default_workstation_id: Some("my-workstation"),
                 oauth_issuer: None,
             },
@@ -5589,6 +5596,7 @@ mod tests {
             "0.1.0",
             &LegacyWorkerExpectation {
                 generic_project: true,
+                enrolled_fleet_member: false,
                 default_workstation_id: Some("another-workstation"),
                 oauth_issuer: None,
             },
@@ -5612,12 +5620,59 @@ mod tests {
             "0.1.0",
             &LegacyWorkerExpectation {
                 generic_project: true,
+                enrolled_fleet_member: false,
                 default_workstation_id: Some("my-workstation"),
                 oauth_issuer: None,
             },
         )
         .unwrap_err();
         assert!(error.contains("legacy default workstation"));
+    }
+
+    #[test]
+    fn enrolled_fleet_member_updates_modern_worker_keeping_legacy_default_workstation() {
+        let mut settings = legacy_template_settings("prod-real-runtime");
+        for binding in settings["bindings"].as_array_mut().unwrap() {
+            if binding["name"] == "EDGE_PROJECT" {
+                binding["text"] = json!("herdr-edge-prod");
+            }
+            if binding["name"] == "OAUTH_ISSUER" {
+                binding["text"] = json!("https://herdr-mcp.agentforme.cc.cd");
+            }
+        }
+        validate_existing_worker_settings(
+            &settings,
+            "herdr-edge-prod",
+            "https://herdr-mcp.agentforme.cc.cd",
+            "0.1.0",
+            &LegacyWorkerExpectation {
+                generic_project: false,
+                enrolled_fleet_member: true,
+                default_workstation_id: None,
+                oauth_issuer: None,
+            },
+        )
+        .unwrap();
+        let metadata = worker_update_metadata(
+            "herdr-edge-prod",
+            "https://herdr-mcp.agentforme.cc.cd",
+            None,
+            "1.1.0",
+            &settings,
+            &["LINK_SHARED_SECRET".to_owned()],
+        )
+        .unwrap();
+        let bindings = metadata.get("bindings").and_then(Value::as_array).unwrap();
+        assert!(bindings.iter().any(|binding| {
+            binding.get("type").and_then(Value::as_str) == Some("plain_text")
+                && binding.get("name").and_then(Value::as_str) == Some("DEFAULT_WORKSTATION_ID")
+                && binding.get("text").and_then(Value::as_str) == Some("prod-real-runtime")
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.get("type").and_then(Value::as_str) == Some("plain_text")
+                && binding.get("name").and_then(Value::as_str) == Some("EDGE_VERSION")
+                && binding.get("text").and_then(Value::as_str) == Some("1.1.0")
+        }));
     }
 
     #[test]
@@ -5664,6 +5719,7 @@ mod tests {
                 "0.1.0",
                 &LegacyWorkerExpectation {
                     generic_project: true,
+                    enrolled_fleet_member: false,
                     default_workstation_id: None,
                     oauth_issuer: None,
                 },
