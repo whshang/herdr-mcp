@@ -5680,6 +5680,69 @@ impl StateStore {
         }
     }
 
+    /// Digests of recent unaccepted (`uncertain`, `rejected`, or
+    /// `resource_unavailable`) `browser_dispatch.submit` rows on `session_ref`.
+    /// Used only to clear a residual composer draft that provably matches an
+    /// unaccepted Herdr automation dispatch on the same session.
+    pub fn unaccepted_browser_dispatch_digests_for_session(
+        &self,
+        session_ref: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>)>, String> {
+        validate_browser_resource_ref(session_ref)?;
+        let limit = i64::try_from(limit.clamp(1, 16)).unwrap_or(8);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT message_digest, message_canonical_digest
+                 FROM browser_dispatches
+                 WHERE target_session_ref = ?1
+                   AND operation = 'browser_dispatch.submit'
+                   AND delivery_state IN ('uncertain', 'rejected', 'resource_unavailable')
+                 ORDER BY created_at DESC, dispatch_id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| format!("cannot prepare unaccepted dispatch digest query: {error}"))?;
+        let rows = stmt
+            .query_map(params![session_ref, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|error| format!("cannot read unaccepted dispatch digests: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode unaccepted dispatch digests: {error}"))
+    }
+
+    /// Whether another already-applied `browser_dispatch.submit` on the same
+    /// session already owns `accepted_user_message_ref`. Prevents live DOM
+    /// reconciliation from attributing an older applied turn to a newer
+    /// uncertain dispatch with identical message text.
+    pub fn browser_session_has_other_applied_dispatch_with_message_ref(
+        &self,
+        session_ref: &str,
+        exclude_dispatch_id: &str,
+        accepted_user_message_ref: &str,
+    ) -> Result<bool, String> {
+        validate_browser_resource_ref(session_ref)?;
+        validate_browser_dispatch_id(exclude_dispatch_id)?;
+        validate_browser_ref_text(accepted_user_message_ref, 512, "accepted_user_message_ref")?;
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM browser_dispatches
+                 WHERE target_session_ref = ?1
+                   AND dispatch_id != ?2
+                   AND operation = 'browser_dispatch.submit'
+                   AND delivery_state = 'applied'
+                   AND accepted_user_message_ref = ?3
+                 LIMIT 1",
+                params![session_ref, exclude_dispatch_id, accepted_user_message_ref],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect applied dispatch message ref: {error}"))?;
+        Ok(found.is_some())
+    }
+
     /// Read-only fanout view: every dispatch already recorded for one work
     /// chain, oldest first, bounded. Reads the existing dispatch ledger only.
     pub fn browser_dispatches_for_work_chain(

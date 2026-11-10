@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.243";
+const H2W_SCRIPT_VERSION = "0.1.244";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -5004,7 +5004,8 @@ async function handlePushBlock(block, streamCtrl = null) {
   }
   if (!event || !data) return;
   if (event === "browser_actuation") {
-    if (data.operation === "herdr_mcp.browser_dispatch.submit") {
+    if (data.operation === "herdr_mcp.browser_dispatch.submit"
+        || data.operation === "herdr_mcp.browser_dispatch.reconcile") {
       // A ChatGPT submit makes nested content-to-background MAIN-world calls.
       // Keep the single attempt running without blocking the shared push queue.
       void handleBrowserActuation(data)
@@ -10039,11 +10040,22 @@ function h2wMainWorldInsertText(text, selector, append) {
     }
     sel.removeAllRanges();
     sel.addRange(range);
-    const ok = document.execCommand("insertText", false, text);
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
-    const got = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
     const want = String(text || "").replace(/\s+/g, " ").trim();
-    return { ok: !!ok, committed: got.includes(want), text: got.slice(0, 40) };
+    let ok = false;
+    if (!append && want === "") {
+      ok = document.execCommand("delete", false, null);
+      if (((el.innerText || el.textContent || "").replace(/[\u00a0\ufeff\u200b]/g, " ").replace(/\s+/g, " ").trim()) !== "") {
+        try { document.execCommand("selectAll", false, null); } catch (_) {}
+        ok = document.execCommand("delete", false, null) || ok;
+      }
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+    } else {
+      ok = document.execCommand("insertText", false, text);
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+    }
+    const got = (el.innerText || el.textContent || "").replace(/[\u00a0\ufeff\u200b]/g, " ").trim();
+    const committed = (!append && want === "") ? got === "" : (want !== "" && got.includes(want));
+    return { ok: !!ok, committed, text: got.slice(0, 40) };
   } catch (e) { return { ok: false, error: String(e) }; }
 }
 
@@ -12027,6 +12039,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .then(() => chrome.tabs.update(tabId, { active: true }))
       .then(() => sendResponse({ ok: true }))
       .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    return true;
+  }
+  if (msg?.type === "h2w_sleep") {
+    const ms = Math.min(Math.max(0, Number(msg.ms) || 0), 10000);
+    setTimeout(() => sendResponse({ ok: true, slept: true }), ms);
     return true;
   }
   if (msg?.type === "h2w_insert_main") {

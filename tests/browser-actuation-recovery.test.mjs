@@ -7248,3 +7248,80 @@ test("user never gets a title re-applied from a target without a conversation | 
   assert.equal(result, null);
   assert.equal(api.state().reapplied, false);
 });
+
+test("user recovers from an unaccepted automation draft and reconciles DOM turns | Given an unaccepted automation draft or a post-timeout DOM turn | When dispatch.submit or dispatch.reconcile runs | Then Herdr drafts are cleared, user drafts are preserved, and DOM reconciliation settles", async () => {
+  // 1. h2wMainWorldInsertText empty-string delete must check got === "", not got.includes("")
+  const mainStart = backgroundSource.indexOf("function h2wMainWorldInsertText(text, selector, append)");
+  const mainEnd = backgroundSource.indexOf("\nfunction h2wFillTargetProbe", mainStart);
+  assert.ok(mainStart >= 0 && mainEnd > mainStart);
+  const mainSegment = backgroundSource.slice(mainStart, mainEnd);
+  assert.match(mainSegment, /document\.execCommand\("delete", false, null\)/);
+  assert.match(mainSegment, /\(!append && want === ""\) \? got === ""/);
+  assert.match(backgroundSource, /if \(msg\?\.type === "h2w_sleep"\)/);
+
+  // 2. Without matching recoverable digest, inputHasContent rejects with browser_dispatch_composer_busy
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    registeredSessionRef: "br_session",
+    registeredConvKey: "https://chatgpt.com/c/current",
+    inputHasContent: true,
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn" },
+      { ok: true, userMessageId: "user-2", userText: "next turn", messageId: "asst-2" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "next turn", count: 2 },
+  });
+  const busyRes = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: {
+      message: "next turn",
+      required_apps: [],
+      recoverable_automation_draft_sha256s: ["0".repeat(64)],
+    },
+  });
+  assert.equal(busyRes.rejected, true);
+  assert.equal(busyRes.result?.error, "browser_dispatch_composer_busy");
+
+  // 3. Reconcile operation returns Applied postcondition evidence when DOM user turn matches digest
+  const promptText = "reconciled Claude turn";
+  const promptSha = Buffer.from(await webcrypto.subtle.digest("SHA-256", new TextEncoder().encode(promptText))).toString("hex");
+  const reconcileAct = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    registeredSessionRef: "br_session",
+    registeredConvKey: "https://chatgpt.com/c/current",
+    snapshots: [{ ok: false }],
+    domBefore: {
+      messageId: "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:4",
+      exactMessageId: true,
+      text: promptText,
+      count: 5,
+    },
+    assistantSnapshot: {
+      messageId: "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:5",
+      text: "Claude reply",
+      count: 5,
+    },
+  });
+  const reconcileRes = await reconcileAct({
+    dispatch_id: "bd_" + "a".repeat(64),
+    operation: "herdr_mcp.browser_dispatch.reconcile",
+    expected_generation: 17,
+    params: {
+      session_ref: "br_session",
+      dispatch_generation: 15,
+      message_sha256: promptSha,
+      message_canonical_sha256: promptSha,
+    },
+  });
+  assert.equal(reconcileRes.command_accepted, true);
+  assert.equal(reconcileRes.accepted_message_observed, true);
+  assert.equal(reconcileRes.message_baseline_advanced, true);
+  assert.equal(reconcileRes.generation_status_observed, true);
+  assert.equal(
+    reconcileRes.result?.accepted_user_message_ref,
+    "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:4",
+  );
+});
