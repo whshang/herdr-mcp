@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.244";
+const H2W_SCRIPT_VERSION = "0.1.245";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -1959,14 +1959,15 @@ function grokConversationInfo(rawUrl) {
     const url = new URL(String(rawUrl || ""));
     if (url.origin !== "https://grok.com") return null;
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const directMatch = url.pathname.match(/^\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+    const directMatch = url.pathname.match(/^\/(c|bot)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
     if (directMatch) {
-      const conversationId = directMatch[1].toLowerCase();
+      const prefix = directMatch[1].toLowerCase();
+      const conversationId = directMatch[2].toLowerCase();
       return {
         site: "grok",
         conversation_id: conversationId,
         project_id: null,
-        convKey: `${url.origin}/c/${conversationId}`,
+        convKey: `${url.origin}/${prefix}/${conversationId}`,
       };
     }
 
@@ -2565,7 +2566,9 @@ async function setLocalBrowserWebchatControlConsent() {
 async function recoverOpenChatGptBrowserRegistry() {
   let tabs = [];
   try {
-    tabs = await chrome.tabs.query({ url: "*://chatgpt.com/*" });
+    tabs = await chrome.tabs.query({
+      url: ["*://chatgpt.com/*", "*://claude.ai/*", "*://grok.com/*"],
+    });
   } catch (_) {
     return { observed: 0 };
   }
@@ -2582,7 +2585,7 @@ async function recoverOpenChatGptBrowserRegistry() {
       // never receives raw account identity on this handshake and does not
       // implement a second identity source.
       const pageInfo = await conversationInfoForTab(tab.id, { refreshObservation: true });
-      if (pageInfo?.site === "chatgpt" && pageInfo?.convKey) observed += 1;
+      if (["chatgpt", "claude", "grok"].includes(pageInfo?.site) && pageInfo?.convKey) observed += 1;
     } catch (error) {
       callLog("browser registry recovery failed:", error?.message || String(error));
     }
@@ -10051,6 +10054,14 @@ function h2wMainWorldInsertText(text, selector, append) {
       el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
     } else {
       ok = document.execCommand("insertText", false, text);
+      const afterExec = (el.innerText || el.textContent || "").replace(/[\u00a0\ufeff\u200b]/g, " ").replace(/\s+/g, " ").trim();
+      if (want !== "" && !afterExec.includes(want) && typeof DataTransfer === "function" && typeof ClipboardEvent === "function") {
+        try {
+          const dt = new DataTransfer();
+          dt.setData("text/plain", text);
+          ok = el.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: dt })) || ok;
+        } catch (_) {}
+      }
       el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
     }
     const got = (el.innerText || el.textContent || "").replace(/[\u00a0\ufeff\u200b]/g, " ").trim();

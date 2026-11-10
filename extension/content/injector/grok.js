@@ -30,13 +30,14 @@ class GrokAdapter extends BaseAdapter {
       const url = new URL(location.href);
       if (url.origin !== "https://grok.com") return null;
       const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      const directMatch = url.pathname.match(/^\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+      const directMatch = url.pathname.match(/^\/(c|bot)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
       if (directMatch) {
-        const sessionId = directMatch[1].toLowerCase();
+        const prefix = directMatch[1].toLowerCase();
+        const sessionId = directMatch[2].toLowerCase();
         return {
           projectId: null,
           sessionId,
-          convKey: `${url.origin}/c/${sessionId}`,
+          convKey: `${url.origin}/${prefix}/${sessionId}`,
         };
       }
 
@@ -84,8 +85,14 @@ class GrokAdapter extends BaseAdapter {
   getInputEl() {
     const selectors = [
       '[data-testid="chat-input"] div.ProseMirror[role="textbox"]',
+      '[data-testid="chat-input"] div.ProseMirror[role="combobox"]',
+      '[data-testid="chat-input"] div.ProseMirror[contenteditable="true"]',
       'div.ProseMirror[role="textbox"][contenteditable="true"]',
+      'div.ProseMirror[role="combobox"][contenteditable="true"]',
+      'div.ProseMirror[contenteditable="true"]',
       'div[contenteditable="true"][role="textbox"][aria-label*="Grok" i]',
+      'div[contenteditable="true"][role="combobox"][aria-label*="Grok" i]',
+      'div[contenteditable="true"][aria-label*="Grok" i]',
     ];
     for (const selector of selectors) {
       const element = document.querySelector(selector);
@@ -100,8 +107,14 @@ class GrokAdapter extends BaseAdapter {
     if (element.id) return `#${CSS.escape(element.id)}[contenteditable="true"]`;
     const selectors = [
       '[data-testid="chat-input"] div.ProseMirror[role="textbox"]',
+      '[data-testid="chat-input"] div.ProseMirror[role="combobox"]',
+      '[data-testid="chat-input"] div.ProseMirror[contenteditable="true"]',
       'div.ProseMirror[role="textbox"][contenteditable="true"]',
+      'div.ProseMirror[role="combobox"][contenteditable="true"]',
+      'div.ProseMirror[contenteditable="true"]',
       'div[contenteditable="true"][role="textbox"][aria-label*="Grok" i]',
+      'div[contenteditable="true"][role="combobox"][aria-label*="Grok" i]',
+      'div[contenteditable="true"][aria-label*="Grok" i]',
     ];
     for (const selector of selectors) {
       if (document.querySelector(selector) === element) return selector;
@@ -156,7 +169,7 @@ class GrokAdapter extends BaseAdapter {
     const selectors = role === "user"
       ? ['[data-testid="user-message"]']
       : role === "assistant"
-        ? ['[data-testid="assistant-message"]']
+        ? ['[data-testid="assistant-message"]', '.group\\/bot-entry .streamdown-chat-md']
         : [];
     const nodes = [];
     const seen = new Set();
@@ -216,11 +229,21 @@ class GrokAdapter extends BaseAdapter {
       const acceptedUser = byDigest || users[userOrdinal] || null;
       if (!acceptedUser) return null;
 
-      const transcript = [
-        ...document.querySelectorAll(
-          '[data-testid="user-message"], [data-testid="assistant-message"]',
-        ),
-      ];
+      const directAssistants = [...document.querySelectorAll('[data-testid="assistant-message"]')];
+      const assistants = directAssistants.length > 0
+        ? directAssistants
+        : [...document.querySelectorAll('.group\\/bot-entry .streamdown-chat-md')];
+      const transcript = directAssistants.length > 0
+        ? [
+          ...document.querySelectorAll(
+            '[data-testid="user-message"], [data-testid="assistant-message"]',
+          ),
+        ]
+        : [
+          ...document.querySelectorAll(
+            '[data-testid="user-message"], [data-testid="assistant-message"], .group\\/bot-entry .streamdown-chat-md',
+          ),
+        ];
       const acceptedIndex = transcript.indexOf(acceptedUser);
       if (acceptedIndex < 0) return null;
 
@@ -233,7 +256,7 @@ class GrokAdapter extends BaseAdapter {
           hasLaterUser = true;
           break;
         }
-        if (testId === "assistant-message") {
+        if (testId === "assistant-message" || assistants.includes(element)) {
           const text = String(element.innerText || element.textContent || "")
             .replace(/\s+/g, " ")
             .trim();
@@ -250,8 +273,6 @@ class GrokAdapter extends BaseAdapter {
           .some((element) => element.getAttribute?.("data-testid") === "user-message");
       }
       if (!hasLaterUser && this.isGenerationInProgress()) return null;
-
-      const assistants = [...document.querySelectorAll('[data-testid="assistant-message"]')];
       const assistantOrdinal = assistants.indexOf(assistantElement);
       if (assistantOrdinal < 0) return null;
       const assistantMessageId = assistantElement.getAttribute?.("data-message-id")
@@ -293,7 +314,10 @@ class GrokAdapter extends BaseAdapter {
     if (this.getStopButtonCandidates().length > 0) return true;
     // Grok keeps unrelated page regions (sidebar/history loaders) aria-busy
     // while idle, so only a busy marker on the latest assistant turn counts.
-    const assistants = [...document.querySelectorAll('[data-testid="assistant-message"]')];
+    const directAssistants = [...document.querySelectorAll('[data-testid="assistant-message"]')];
+    const assistants = directAssistants.length > 0
+      ? directAssistants
+      : [...document.querySelectorAll('.group\\/bot-entry .streamdown-chat-md')];
     const latest = assistants[assistants.length - 1];
     if (!latest || !this.elementVisible(latest)) return false;
     if (latest.getAttribute?.("aria-busy") === "true") return true;

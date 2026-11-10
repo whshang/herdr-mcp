@@ -408,3 +408,54 @@ test("user continues a Grok chat after reload | Given a recorded user ref whose 
   assert.equal(h.adapter.getResultSettlementSnapshot(`grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:1`)?.text, "BETA");
   assert.equal(h.adapter.getResultSettlementSnapshot(`grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:x`), null);
 });
+
+test("Grok adapter supports /bot/<uuid> session identity, combobox composer, and bot-entry assistant settlement (#886)", () => {
+  const bot = harness("https://grok.com/bot/0c239da9-701e-476c-96bf-9cc7a86b1f79?rid=ignored");
+  assert.equal(
+    bot.adapter.getConversationKey(),
+    "https://grok.com/bot/0c239da9-701e-476c-96bf-9cc7a86b1f79",
+  );
+  assert.equal(
+    bot.adapter.getNativeSessionIdentity(),
+    "0c239da9-701e-476c-96bf-9cc7a86b1f79",
+  );
+  assert.equal(
+    bot.adapter.getCanonicalConversationUrl(),
+    "https://grok.com/bot/0c239da9-701e-476c-96bf-9cc7a86b1f79",
+  );
+
+  const comboboxComposer = element();
+  bot.set(
+    '[data-testid="chat-input"] div.ProseMirror[role="combobox"]',
+    comboboxComposer,
+  );
+  assert.equal(bot.adapter.getInputEl(), comboboxComposer);
+  assert.match(bot.adapter.getWatchMainWorldSelector(), /role="combobox"/);
+
+  const user = element({ text: "hello bot", attrs: { "data-testid": "user-message" } });
+  const botAssistant = element({ text: "bot reply" });
+  bot.set('[data-testid="user-message"]', user);
+  bot.set(".group\\/bot-entry .streamdown-chat-md", botAssistant);
+  bot.set(
+    '[data-testid="user-message"], [data-testid="assistant-message"], .group\\/bot-entry .streamdown-chat-md',
+    [user, botAssistant],
+  );
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(bot.adapter.getMessageSnapshot("assistant"))),
+    {
+      messageId: "grok-dom-v1:0c239da9-701e-476c-96bf-9cc7a86b1f79:assistant:0",
+      text: "bot reply",
+      count: 1,
+    },
+  );
+  const settled = bot.adapter.getResultSettlementSnapshot(
+    `grok-dom-v1:0c239da9-701e-476c-96bf-9cc7a86b1f79:user:0:t${grokDigest("hello bot")}`,
+  );
+  assert.equal(settled?.ok, true);
+  assert.equal(settled?.text, "bot reply");
+  assert.equal(
+    settled?.messageId,
+    "grok-dom-v1:0c239da9-701e-476c-96bf-9cc7a86b1f79:assistant:0",
+  );
+});

@@ -1369,10 +1369,10 @@ struct WebChatAdapterRow {
     provider: &'static str,
     /// Hosts the adapter claims, lowercase.
     hosts: &'static [&'static str],
-    /// Path segments of a plain conversation URL, e.g. `["c"]` for
-    /// grok.com/c/<uuid>. Empty for adapters whose richer dedicated parser
-    /// owns the shape until phase 1 (chatgpt).
-    conversation_path: &'static [&'static str],
+    /// Path segment prefixes of a plain conversation URL, e.g. `&[&["c"], &["bot"]]`
+    /// for grok.com/c/<uuid> and grok.com/bot/<uuid>. Empty for adapters whose
+    /// richer dedicated parser owns the shape until phase 1 (chatgpt).
+    conversation_paths: &'static [&'static [&'static str]],
     /// Optional project URL shape: path segments plus the query parameter
     /// carrying the conversation id (grok.com/project/<uuid>?chat=<uuid>).
     project: Option<(&'static [&'static str], &'static str)>,
@@ -1385,21 +1385,21 @@ const WEBCHAT_ADAPTER_REGISTRY: &[WebChatAdapterRow] = &[
         hosts: &["chatgpt.com", "www.chatgpt.com"],
         // Shape parsing stays with the dedicated ChatGPT parser (vanity
         // project suffixes) until phase 1 moves it into the manifest.
-        conversation_path: &[],
+        conversation_paths: &[],
         project: None,
     },
     WebChatAdapterRow {
         adapter_id: "claude",
         provider: "claude",
         hosts: &["claude.ai"],
-        conversation_path: &["chat"],
+        conversation_paths: &[&["chat"]],
         project: None,
     },
     WebChatAdapterRow {
         adapter_id: "grok",
         provider: "grok",
         hosts: &["grok.com"],
-        conversation_path: &["c"],
+        conversation_paths: &[&["c"], &["bot"]],
         project: Some((&["project"], "chat")),
     },
 ];
@@ -1484,21 +1484,23 @@ fn browser_conversation_url_ref(
     // ChatGPT keeps its dedicated shape parser until phase 1 moves the
     // vanity-suffix handling into the manifest; the host claim already came
     // from the registry above.
-    if row.conversation_path.is_empty() {
+    if row.conversation_paths.is_empty() {
         return match chatgpt_conversation_url_ref(raw) {
             Some((conversation_id, project_id)) => Ok(Some(identity(conversation_id, project_id))),
             None => Ok(None),
         };
     }
     // Plain conversation path shape: <conversation_path...>/<uuid>.
-    if segments.len() == row.conversation_path.len() + 1
-        && segments[..row.conversation_path.len()] == *row.conversation_path
-    {
-        let conversation_id = segments[row.conversation_path.len()];
-        if browser_uuid(conversation_id) {
-            return Ok(Some(identity(conversation_id.to_ascii_lowercase(), None)));
+    for conversation_path in row.conversation_paths {
+        if segments.len() == conversation_path.len() + 1
+            && segments[..conversation_path.len()] == **conversation_path
+        {
+            let conversation_id = segments[conversation_path.len()];
+            if browser_uuid(conversation_id) {
+                return Ok(Some(identity(conversation_id.to_ascii_lowercase(), None)));
+            }
+            return Ok(None);
         }
-        return Ok(None);
     }
     // Optional project shape: <project_path...>/<uuid>?<query>=<uuid>.
     if let Some((project_path, query_key)) = row.project
@@ -21589,6 +21591,17 @@ mod tests {
             grok_project.project_id,
             Some(TEST_CONVERSATION_UUID.to_owned())
         );
+
+        let grok_bot = browser_conversation_url_ref(&format!(
+            "https://grok.com/bot/{}?rid=ignored",
+            TEST_CONVERSATION_UUID
+        ))
+        .expect("grok bot must resolve")
+        .expect("grok bot URL must resolve");
+        assert_eq!(grok_bot.adapter_id, "grok");
+        assert_eq!(grok_bot.provider, "grok");
+        assert_eq!(grok_bot.conversation_id, TEST_CONVERSATION_UUID);
+        assert_eq!(grok_bot.project_id, None);
 
         // Malformed and non-https inputs stay Ok(None), never the typed error.
         assert_eq!(browser_conversation_url_ref("not a url"), Ok(None));
