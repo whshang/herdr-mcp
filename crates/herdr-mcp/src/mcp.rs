@@ -4114,6 +4114,11 @@ fn browser_dispatch_submit(
     } else {
         Value::Null
     };
+    let submit_diagnostics = if reason.as_deref() == Some("browser_dispatch_submit_failed") {
+        browser_submit_diagnostics(evidence.result.as_ref())
+    } else {
+        None
+    };
     let mut response = json!({
         "ok": success,
         "code": if success { Value::Null } else { json!(dispatch.delivery_state.as_str()) },
@@ -4124,6 +4129,12 @@ fn browser_dispatch_submit(
     });
     if !composer_busy_probe.is_null() {
         response["composer_busy_probe"] = composer_busy_probe;
+    }
+    if let Some(diag) = submit_diagnostics {
+        response["submit_diagnostics"] = diag;
+        response["hint"] = json!(BROWSER_DISPATCH_SUBMIT_FAILED_HINT);
+    } else if reason.as_deref() == Some("browser_dispatch_submit_failed") {
+        response["hint"] = json!(BROWSER_DISPATCH_SUBMIT_FAILED_HINT);
     }
     response
 }
@@ -5553,6 +5564,9 @@ fn browser_session_create_reconcile_uncertain_inner(
     if let Some(probe) = failure.composer_busy_probe {
         value["composer_busy_probe"] = probe;
     }
+    if let Some(diag) = failure.submit_diagnostics {
+        value["submit_diagnostics"] = diag;
+    }
     if let Some(hint) = failure.hint {
         value["hint"] = json!(hint);
     }
@@ -5598,6 +5612,75 @@ const BROWSER_CREATE_COMPOSER_BUSY_HINT_DRAFT: &str =
     "composer has existing content (possibly a restored ChatGPT draft); clear it and retry";
 const BROWSER_CREATE_COMPOSER_BUSY_HINT_GENERIC: &str =
     "composer is busy; wait until it is idle and retry";
+const BROWSER_CREATE_SUBMIT_FAILED_HINT_GENERIC: &str = "create-with-message submission failed before provider acceptance (create_with_message and existing_session_send are independent provider submission surfaces); inspect submit_diagnostics.submit_stage and ensure the target browser window is focused";
+const BROWSER_CREATE_SUBMIT_FAILED_HINT_URL: &str = "create-with-message submission failed before provider acceptance; message contains a bare http(s):// URL (inspect submit_diagnostics.submit_stage and ensure the target browser window is focused)";
+const BROWSER_DISPATCH_SUBMIT_FAILED_HINT: &str = "existing-session send was rejected before provider acceptance (existing_session_send and create_with_message are independent provider submission surfaces during provider rate-limit windows; a failed send does not imply session.create is unavailable); inspect submit_diagnostics.submit_stage";
+
+fn browser_submit_diagnostics(result: Option<&Value>) -> Option<Value> {
+    let probe = result
+        .and_then(|result| result.get("submit_diagnostics"))
+        .and_then(Value::as_object)?;
+    const SURFACES: &[&str] = &["create_with_message", "existing_session_send"];
+    const STAGES: &[&str] = &[
+        "insert-failed",
+        "no-input",
+        "composer-busy",
+        "submit-unavailable",
+        "submit-input-unavailable",
+        "submit-enter-failed",
+        "submit-unconfirmed",
+        "submit-failed",
+        "commit-failed",
+        "user-typing",
+        "dedupe",
+        "wake-in-flight",
+        "context-invalidated",
+        "empty-template",
+    ];
+    const BOOL_KEYS: &[&str] = &[
+        "submit_attempted",
+        "baseline_server_ok",
+        "send_button_visible",
+        "composer_busy",
+        "document_hidden",
+        "has_bare_http_url",
+    ];
+    let mut out = serde_json::Map::new();
+    if let Some(surface) = probe.get("submission_surface").and_then(Value::as_str)
+        && SURFACES.contains(&surface)
+    {
+        out.insert(
+            "submission_surface".to_owned(),
+            Value::String(surface.to_owned()),
+        );
+    }
+    if let Some(stage) = probe.get("submit_stage").and_then(Value::as_str)
+        && STAGES.contains(&stage)
+    {
+        out.insert("submit_stage".to_owned(), Value::String(stage.to_owned()));
+    }
+    for key in BOOL_KEYS {
+        if let Some(value) = probe.get(*key).and_then(Value::as_bool) {
+            out.insert((*key).to_owned(), Value::Bool(value));
+        }
+    }
+    if let Some(count) = probe.get("baseline_user_count").and_then(Value::as_u64) {
+        out.insert("baseline_user_count".to_owned(), json!(count.min(500)));
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
+}
+
+fn browser_create_submit_failed_hint(submit_diagnostics: Option<&Value>) -> &'static str {
+    if submit_diagnostics
+        .and_then(|diag| diag.get("has_bare_http_url"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        BROWSER_CREATE_SUBMIT_FAILED_HINT_URL
+    } else {
+        BROWSER_CREATE_SUBMIT_FAILED_HINT_GENERIC
+    }
+}
 
 /// The rejected-create reason after the fixed allowlist, if any.
 fn browser_create_rejection_reason(
@@ -5672,6 +5755,7 @@ struct BrowserCreateFailureProjection {
     /// `delivery_evidence.error`: fixed vocabularies only.
     evidence_error: Option<String>,
     composer_busy_probe: Option<Value>,
+    submit_diagnostics: Option<Value>,
     hint: Option<&'static str>,
 }
 
@@ -5697,17 +5781,33 @@ impl BrowserCreateFailureProjection {
             .map(str::to_owned)
             .or_else(|| rejection_reason.map(str::to_owned));
         let busy_composer = evidence_error.as_deref() == Some("browser_create_composer_busy");
+        let submit_failed = evidence_error.as_deref() == Some("browser_create_submit_failed");
         let composer_busy_probe = if busy_composer {
             browser_session_create_composer_busy_probe(evidence)
         } else {
             None
         };
-        let hint =
-            busy_composer.then(|| browser_create_composer_busy_hint(composer_busy_probe.as_ref()));
+        let submit_diagnostics = if submit_failed {
+            browser_submit_diagnostics(evidence.result.as_ref())
+        } else {
+            None
+        };
+        let hint = if busy_composer {
+            Some(browser_create_composer_busy_hint(
+                composer_busy_probe.as_ref(),
+            ))
+        } else if submit_failed {
+            Some(browser_create_submit_failed_hint(
+                submit_diagnostics.as_ref(),
+            ))
+        } else {
+            None
+        };
         Self {
             reason,
             evidence_error,
             composer_busy_probe,
+            submit_diagnostics,
             hint,
         }
     }
@@ -5934,6 +6034,11 @@ fn browser_session_create_public_delivery_evidence(
     }
     if let Some(probe) = composer_busy_probe {
         public.insert("composer_busy_probe".to_owned(), probe.clone());
+    }
+    if error_reason == Some("browser_create_submit_failed")
+        && let Some(diag) = browser_submit_diagnostics(result)
+    {
+        public.insert("submit_diagnostics".to_owned(), diag);
     }
     if let Some(hint) = hint {
         public.insert("hint".to_owned(), Value::String(hint.to_owned()));
@@ -6999,6 +7104,9 @@ fn browser_session_create(
     });
     if let Some(probe) = failure.composer_busy_probe {
         response["composer_busy_probe"] = probe;
+    }
+    if let Some(diag) = failure.submit_diagnostics {
+        response["submit_diagnostics"] = diag;
     }
     if let Some(hint) = failure.hint {
         response["hint"] = json!(hint);
@@ -17279,6 +17387,62 @@ mod tests {
             "an unmounted composer is not a busy composer: {result}"
         );
         assert!(result.get("composer_busy_probe").is_none(), "{result}");
+    }
+
+    /// user webchat create | Given a submit failure with structured diagnostics | When projected | Then allowlisted diagnostics and dual-surface hint are surfaced without leaking untrusted strings (#884 / #888)
+    #[test]
+    fn user_webchat_create_given_submit_failed_diagnostics_when_rejected_then_allowlisted_fields_and_hint_are_surfaced()
+     {
+        let (store, endpoint_ref, account_ref) = browser_create_refusal_fixture();
+        let actuator = ScriptedCreateActuator::new(ScriptedCreateEvidence::rejected(json!({
+            "error": "browser_create_submit_failed",
+            "submit_diagnostics": {
+                "submission_surface": "create_with_message",
+                "submit_stage": "insert-failed",
+                "submit_attempted": false,
+                "baseline_server_ok": false,
+                "baseline_user_count": 9999,
+                "send_button_visible": false,
+                "composer_busy": false,
+                "document_hidden": true,
+                "has_bare_http_url": true,
+                "raw_message": "secret https://internal.example.com/token"
+            }
+        })));
+        let result = create_session_with_scripted_actuator(
+            &store,
+            &endpoint_ref,
+            &account_ref,
+            &actuator,
+            "scripted-create-submit-diag-1",
+        );
+        assert_eq!(result["code"], "rejected", "{result}");
+        assert_eq!(result["reason"], "browser_create_submit_failed", "{result}");
+        let diag = &result["submit_diagnostics"];
+        assert_eq!(
+            diag["submission_surface"], "create_with_message",
+            "{result}"
+        );
+        assert_eq!(diag["submit_stage"], "insert-failed", "{result}");
+        assert_eq!(diag["submit_attempted"], false, "{result}");
+        assert_eq!(diag["baseline_user_count"], 500, "{result}");
+        assert_eq!(diag["document_hidden"], true, "{result}");
+        assert_eq!(diag["has_bare_http_url"], true, "{result}");
+        assert!(diag.get("raw_message").is_none(), "{result}");
+        assert_eq!(
+            result["delivery_evidence"]["submit_diagnostics"], result["submit_diagnostics"],
+            "{result}"
+        );
+        assert!(
+            result["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("bare http(s):// URL")),
+            "{result}"
+        );
+        assert!(
+            !result.to_string().contains("internal.example.com"),
+            "{result}"
+        );
     }
 
     /// user webchat create | Given a resource-unavailable create whose token is on the fixed allowlist | When projected | Then the allowlisted token is the one copied into the public evidence

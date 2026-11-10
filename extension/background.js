@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.246";
+const H2W_SCRIPT_VERSION = "0.1.247";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -9004,7 +9004,12 @@ async function performBrowserPageLifecycleRequest(msg) {
     // we persist the live URL/document rather than treating normal navigation
     // latency as a storage failure.
     const readyTab = await waitForTabComplete(createdTab.id, 15000);
-    const page = readyTab
+    const loadCompleted = Boolean(
+      readyTab?.id
+      && readyTab?.url
+      && readyTab?.status === "complete",
+    );
+    const page = loadCompleted
       ? await rememberBrowserPage(
         endpointRef,
         readyTab,
@@ -9028,7 +9033,8 @@ async function performBrowserPageLifecycleRequest(msg) {
     }
     return {
       ok: false,
-      error: "browser_page_storage_unavailable",
+      error: loadCompleted ? "browser_page_storage_unavailable" : "browser_page_load_timeout",
+      ...(loadCompleted ? {} : { reason: "tab_load_fence_timeout" }),
       tab_opened: true,
       tab_closed: tabClosed,
       tab_cleanup_verified: tabCleanupVerified,
@@ -10053,9 +10059,23 @@ function h2wMainWorldInsertText(text, selector, append) {
       }
       el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
     } else {
+      const readNormalized = () => {
+        try {
+          if (typeof el.cloneNode === "function" && typeof el.querySelectorAll === "function") {
+            const clone = el.cloneNode(true);
+            for (const node of clone.querySelectorAll('a[href^="http://"], a[href^="https://"], [data-prompt-link-href^="http://"], [data-prompt-link-href^="https://"], [data-inline-selection-pill]')) {
+              const href = String(node.getAttribute("data-prompt-link-href") || node.getAttribute("href") || node.getAttribute("data-url") || "").trim();
+              if (/^https?:\/\/\S+$/i.test(href)) node.textContent = href;
+            }
+            return (clone.innerText || clone.textContent || "").replace(/[\u00a0\ufeff\u200b-\u200d\u2060]/g, " ").replace(/\s+/g, " ").trim();
+          }
+        } catch (_) {}
+        return (el.innerText || el.textContent || "").replace(/[\u00a0\ufeff\u200b-\u200d\u2060]/g, " ").replace(/\s+/g, " ").trim();
+      };
+      const beforeExec = readNormalized();
       ok = document.execCommand("insertText", false, text);
-      const afterExec = (el.innerText || el.textContent || "").replace(/[\u00a0\ufeff\u200b]/g, " ").replace(/\s+/g, " ").trim();
-      if (want !== "" && !afterExec.includes(want) && typeof DataTransfer === "function" && typeof ClipboardEvent === "function") {
+      const afterExec = readNormalized();
+      if (want !== "" && !afterExec.includes(want) && (afterExec === "" || afterExec === beforeExec) && typeof DataTransfer === "function" && typeof ClipboardEvent === "function") {
         try {
           const dt = new DataTransfer();
           dt.setData("text/plain", text);
@@ -10064,7 +10084,19 @@ function h2wMainWorldInsertText(text, selector, append) {
       }
       el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
     }
-    const got = (el.innerText || el.textContent || "").replace(/[\u00a0\ufeff\u200b]/g, " ").trim();
+    const got = (() => {
+      try {
+        if (typeof el.cloneNode === "function" && typeof el.querySelectorAll === "function") {
+          const clone = el.cloneNode(true);
+          for (const node of clone.querySelectorAll('a[href^="http://"], a[href^="https://"], [data-prompt-link-href^="http://"], [data-prompt-link-href^="https://"], [data-inline-selection-pill]')) {
+            const href = String(node.getAttribute("data-prompt-link-href") || node.getAttribute("href") || node.getAttribute("data-url") || "").trim();
+            if (/^https?:\/\/\S+$/i.test(href)) node.textContent = href;
+          }
+          return (clone.innerText || clone.textContent || "").replace(/[\u00a0\ufeff\u200b-\u200d\u2060]/g, " ").trim();
+        }
+      } catch (_) {}
+      return (el.innerText || el.textContent || "").replace(/[\u00a0\ufeff\u200b-\u200d\u2060]/g, " ").trim();
+    })();
     const committed = (!append && want === "") ? got === "" : (want !== "" && got.includes(want));
     return { ok: !!ok, committed, text: got.slice(0, 40) };
   } catch (e) { return { ok: false, error: String(e) }; }

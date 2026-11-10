@@ -443,11 +443,23 @@ class ChatGPTAdapter extends BaseAdapter {
     const input = this.getInputEl();
     if (!input) return '';
     const clone = input.cloneNode(true);
-    for (const node of clone.querySelectorAll('[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]')) {
+    for (const node of clone.querySelectorAll('[data-inline-selection-pill][data-symbol="ecosystemMention"], [data-inline-selection-pill][data-keyword], [data-inline-selection-pill-cursor-target]')) {
       node.remove();
     }
     for (const node of this.getInlineAppMentionNodes(clone)) node.remove();
-    return String(clone.textContent || '').replace(/\uFEFF/g, '').trim();
+    for (const node of clone.querySelectorAll('a[href^="http://"], a[href^="https://"], [data-prompt-link-href^="http://"], [data-prompt-link-href^="https://"], [data-inline-selection-pill]')) {
+      const href = String(
+        node.getAttribute('data-prompt-link-href')
+        || node.getAttribute('href')
+        || node.getAttribute('data-url')
+        || node.querySelector?.('a[href^="http://"], a[href^="https://"]')?.getAttribute?.('href')
+        || '',
+      ).trim();
+      if (/^https?:\/\/\S+$/i.test(href)) {
+        node.textContent = href;
+      }
+    }
+    return String(clone.textContent || '').replace(/[\u200b-\u200d\u2060\uFEFF]/g, '').trim();
   }
 
   composerHasOnlyAppPills(requiredApps = []) {

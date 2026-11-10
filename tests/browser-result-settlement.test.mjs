@@ -579,6 +579,31 @@ test("ChatGPT dispatch accepts only a changed exact DOM user message identity wh
     composer: "",
     selectedApps: [],
   }), true);
+  // #888: ProseMirror link node / autolink / scheme-stripped URL rendering matches exact submitted URL.
+  assert.equal(providerUserTextMatchesSubmitted(
+    "Inspect [https://www.doubao.com/chat/38452683015136514](https://www.doubao.com/chat/38452683015136514) now",
+    {
+      messageText: "Inspect https://www.doubao.com/chat/38452683015136514 now",
+      composer: "",
+      selectedApps: [],
+    },
+  ), true);
+  assert.equal(providerUserTextMatchesSubmitted(
+    "Inspect www.doubao.com/chat/38452683015136514 now",
+    {
+      messageText: "Inspect https://www.doubao.com/chat/38452683015136514 now",
+      composer: "",
+      selectedApps: [],
+    },
+  ), true);
+  assert.equal(providerUserTextMatchesSubmitted(
+    "Inspect https://www.doubao.com/chat/99999999999999999 now",
+    {
+      messageText: "Inspect https://www.doubao.com/chat/38452683015136514 now",
+      composer: "",
+      selectedApps: [],
+    },
+  ), false);
   assert.match(wakeSource, /serverAdvanced\s*\n?\s*\? afterServer\.userMessageId/);
   assert.doesNotMatch(wakeSource.slice(start, end), /slice\(0, 120\)/);
 });
