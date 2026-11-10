@@ -409,7 +409,7 @@ test("user continues a Grok chat after reload | Given a recorded user ref whose 
   assert.equal(h.adapter.getResultSettlementSnapshot(`grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:x`), null);
 });
 
-test("Grok adapter supports /bot/<uuid> session identity, combobox composer, and bot-entry assistant settlement (#886)", () => {
+test("user continues a Grok bot session | Given a /bot/<uuid> URL with a combobox composer and bot-entry reply | When session identity and settlement are read | Then the bot session and assistant reply settle", () => {
   const bot = harness("https://grok.com/bot/0c239da9-701e-476c-96bf-9cc7a86b1f79?rid=ignored");
   assert.equal(
     bot.adapter.getConversationKey(),
