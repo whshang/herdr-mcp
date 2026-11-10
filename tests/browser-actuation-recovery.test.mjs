@@ -7325,3 +7325,16 @@ test("user recovers from an unaccepted automation draft and reconciles DOM turns
     "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:4",
   );
 });
+
+test("user generates a Doubao image in the new skill-bar and AI-creation UI | Given skill_bar_button_more and skill-panel-v2 with a TipTap contenteditable composer | When performDoubaoImageGenerateRequest executes its page script | Then it dispatches pointer press events and fills the contenteditable composer", () => {
+  const start = backgroundSource.indexOf("async function performDoubaoImageGenerateRequest");
+  const end = backgroundSource.indexOf("async function performDoubaoImageStatusRequest", start);
+  const fnBody = backgroundSource.slice(start, end);
+  assert.match(fnBody, /\[data-testid="skill_bar_button_more"\]/);
+  assert.match(fnBody, /\[data-testid="skill-panel-v2"\]/);
+  assert.match(fnBody, /\^AI\\s\*创作\$/);
+  assert.match(fnBody, /\[data-testid="chat_input"\] \[contenteditable="true"\]/);
+  assert.match(fnBody, /isImageModeActive/);
+  assert.match(fnBody, /firePressClick/);
+  assert.match(fnBody, /new ClipboardEvent\("paste"/);
+});

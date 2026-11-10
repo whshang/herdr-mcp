@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.245";
+const H2W_SCRIPT_VERSION = "0.1.246";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -10501,6 +10501,7 @@ async function performDoubaoImageGenerateRequest(msg) {
         const composerSelectors = [
           'textarea[data-testid="chat_input_input"]',
           '[data-testid="chat_input"] textarea',
+          '[data-testid="chat_input"] [contenteditable="true"]',
           '.chat-input textarea',
           '.chat-input [contenteditable="true"]',
           '.chat-editor textarea',
@@ -10517,6 +10518,22 @@ async function performDoubaoImageGenerateRequest(msg) {
         const findComposer = () => composerSelectors
           .flatMap((selector) => [...document.querySelectorAll(selector)])
           .find((node) => visible(node) && !node.closest('[aria-hidden="true"]')) || null;
+        const firePressClick = (node) => {
+          if (!node) return;
+          const init = { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1 };
+          for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"]) {
+            try { node.dispatchEvent(new MouseEvent(type, init)); } catch (_) {}
+          }
+          try { node.click(); } catch (_) {}
+        };
+        const isImageModeActive = () => {
+          const placeholderNode = document.querySelector('[data-testid="chat_input"] [data-placeholder*="图片"]');
+          if (placeholderNode && visible(placeholderNode)) return true;
+          const chatInput = document.querySelector('[data-testid="chat_input"]');
+          if (!chatInput || !visible(chatInput)) return false;
+          const chatInputText = textOf(chatInput);
+          return /图像生成/.test(chatInputText) || (/比例/.test(chatInputText) && /风格/.test(chatInputText));
+        };
         const imageCandidates = () => [...document.images].filter((image) => {
           if (!visible(image)) return false;
           const rect = image.getBoundingClientRect();
@@ -10548,36 +10565,55 @@ async function performDoubaoImageGenerateRequest(msg) {
         }
 
         const findImageMode = () => {
-          const candidates = [...document.querySelectorAll('button, [role="button"], [role="menuitem"], a')]
-            .filter((node) => visible(node) && /图像生成/.test(textOf(node)));
+          const candidates = [
+            ...document.querySelectorAll(
+              '[data-testid="skill-panel-v2"] button, [data-testid="skill-panel-v2"] [role="button"], button, [role="button"], [role="menuitem"], a',
+            ),
+          ].filter((node) => visible(node) && !node.closest('[data-testid="chat_input"]') && /图像生成/.test(textOf(node)));
           return candidates.find((node) => /^图像生成$/.test(textOf(node))) || candidates[0] || null;
         };
-        let mode = findImageMode();
-        if (!mode && initialComposer) {
-          const composerRect = initialComposer.getBoundingClientRect();
-          const more = [...document.querySelectorAll('button, [role="button"]')]
-            .filter((node) => visible(node) && textOf(node) === "更多")
-            .map((node) => ({ node, rect: node.getBoundingClientRect() }))
-            .filter(({ rect }) => {
-              const centerY = rect.top + (rect.height / 2);
-              return centerY >= composerRect.top - 180 && centerY <= composerRect.bottom + 180;
-            })
-            .sort((left, right) => Math.abs(left.rect.top - composerRect.top) - Math.abs(right.rect.top - composerRect.top))[0]?.node || null;
-          if (more) {
-            more.click();
+        if (!isImageModeActive()) {
+          let mode = findImageMode();
+          if (!mode && initialComposer) {
+            const composerRect = initialComposer.getBoundingClientRect();
+            const skillMore = document.querySelector('[data-testid="skill_bar_button_more"]');
+            const more = (skillMore && visible(skillMore))
+              ? skillMore
+              : [...document.querySelectorAll('button, [role="button"]')]
+                .filter((node) => visible(node) && /^(技能|更多)$/.test(textOf(node)))
+                .map((node) => ({ node, rect: node.getBoundingClientRect() }))
+                .filter(({ rect }) => {
+                  const centerY = rect.top + (rect.height / 2);
+                  return centerY >= composerRect.top - 180 && centerY <= composerRect.bottom + 180;
+                })
+                .sort((left, right) => Math.abs(left.rect.top - composerRect.top) - Math.abs(right.rect.top - composerRect.top))[0]?.node || null;
+            if (more) {
+              firePressClick(more);
+              await new Promise((resolve) => setTimeout(resolve, 600));
+              mode = findImageMode();
+            }
+          }
+          if (!mode && !isImageModeActive()) {
+            const aiCreation = [...document.querySelectorAll('button, [role="button"], [role="menuitem"], a')]
+              .find((node) => visible(node) && /^AI\s*创作$/i.test(textOf(node))) || null;
+            if (aiCreation) {
+              firePressClick(aiCreation);
+              await new Promise((resolve) => setTimeout(resolve, 600));
+              mode = findImageMode();
+            }
+          }
+          if (!mode && !isImageModeActive()) {
+            return fail("doubao_image_mode_unavailable", {
+              delivery_state: "not_applied",
+              retry_safe: true,
+              mutation_submitted: false,
+            });
+          }
+          if (mode && !isImageModeActive()) {
+            firePressClick(mode);
             await new Promise((resolve) => setTimeout(resolve, 500));
-            mode = findImageMode();
           }
         }
-        if (!mode) {
-          return fail("doubao_image_mode_unavailable", {
-            delivery_state: "not_applied",
-            retry_safe: true,
-            mutation_submitted: false,
-          });
-        }
-        mode.click();
-        await new Promise((resolve) => setTimeout(resolve, 300));
         if (verificationDetected()) {
           return fail("doubao_verification_required", {
             delivery_state: "not_applied",
@@ -10603,12 +10639,39 @@ async function performDoubaoImageGenerateRequest(msg) {
           const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
           if (setter) setter.call(composer, requestedPrompt);
           else composer.value = requestedPrompt;
+          composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: requestedPrompt }));
+          composer.dispatchEvent(new Event("change", { bubbles: true }));
         } else {
-          composer.textContent = requestedPrompt;
+          try {
+            const sel = window.getSelection?.();
+            if (sel) {
+              sel.removeAllRanges();
+              const range = document.createRange();
+              range.selectNodeContents(composer);
+              sel.addRange(range);
+            }
+            document.execCommand("insertText", false, requestedPrompt);
+          } catch (_) {}
+          const afterExec = String(composer.innerText || composer.textContent || "").replace(/\r\n/g, "\n").trim();
+          if (afterExec !== normalizedPrompt) {
+            try {
+              const dt = new DataTransfer();
+              dt.setData("text/plain", requestedPrompt);
+              composer.dispatchEvent(new ClipboardEvent("paste", {
+                clipboardData: dt,
+                bubbles: true,
+                cancelable: true,
+              }));
+            } catch (_) {}
+          }
+          const afterPaste = String(composer.innerText || composer.textContent || "").replace(/\r\n/g, "\n").trim();
+          if (afterPaste !== normalizedPrompt) {
+            composer.textContent = requestedPrompt;
+            composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: requestedPrompt }));
+            composer.dispatchEvent(new Event("change", { bubbles: true }));
+          }
         }
-        composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: requestedPrompt }));
-        composer.dispatchEvent(new Event("change", { bubbles: true }));
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, 200));
         const composerText = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
           ? composer.value
           : (composer.innerText || composer.textContent || "");
