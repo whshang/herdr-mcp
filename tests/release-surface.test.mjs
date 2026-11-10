@@ -99,6 +99,9 @@ test("Actions consume the shared gate and keep Cloudflare deployment on the gate
   assert.match(edge, /environment: production/);
   assert.match(edge, /wranglerVersion: "4"/);
   assert.match(edge, /wrangler\.prod\.toml/);
+  const wranglerProd = await readFile(join(ROOT, "edge/cloudflare/wrangler.prod.toml"), "utf8");
+  const prodEdgeVersion = wranglerProd.match(/^EDGE_VERSION\s*=\s*"([^"]+)"$/m)?.[1];
+  assert.equal(prodEdgeVersion, pkg.version, "wrangler.prod.toml EDGE_VERSION must match package.json version");
   assert.match(edge, /!edge\/cloudflare\/\*\*\/\*\.md/, "Edge docs-only changes must not redeploy the production Worker");
   assert.doesNotMatch(edge, /cloudflared|DNS Write|Tunnel/);
 });
