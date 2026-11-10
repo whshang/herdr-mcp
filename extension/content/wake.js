@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.244";
+const H2W_CONTENT_VERSION = "0.1.245";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -895,9 +895,10 @@ function normalizeHerdrMentionAlias(value) {
       btn.getAttribute("data-testid") || "",
       btn.getAttribute("aria-label") || "",
       btn.innerText || "",
+      btn.getAttribute("type") || "",
     ].filter(Boolean).join(" ");
-    if (/stop|停止|generating|生成中|streaming|cancel/i.test(blob)) return false;
-    return /send|发送|submit|prompt/i.test(blob) || /send-button|composer-send/i.test(blob);
+    if (/stop|停止|generating|生成中|streaming|cancel|voice/i.test(blob)) return false;
+    return /send|发送|submit|提交|prompt/i.test(blob) || /send-button|composer-send|chat-submit/i.test(blob);
   }
 
   function findSendButton() {
