@@ -3969,11 +3969,34 @@ fn browser_dispatch_submit(
         return browser_store_error(error);
     }
 
+    let recoverable_digests = store_guard
+        .unaccepted_browser_dispatch_digests_for_session(session_ref, 8)
+        .unwrap_or_default();
     let mut actuation_params = params.clone();
     if let Some(object) = actuation_params.as_object_mut() {
         object.insert("provider".to_owned(), json!(actuation_provider));
         if let Some(canonical_url) = actuation_locator {
             object.insert("canonical_url".to_owned(), json!(canonical_url));
+        }
+        let raw_digests: Vec<String> = recoverable_digests
+            .iter()
+            .map(|(raw, _)| raw.clone())
+            .collect();
+        let canonical_digests: Vec<String> = recoverable_digests
+            .into_iter()
+            .filter_map(|(_, canonical)| canonical)
+            .collect();
+        if !raw_digests.is_empty() {
+            object.insert(
+                "recoverable_automation_draft_sha256s".to_owned(),
+                json!(raw_digests),
+            );
+        }
+        if !canonical_digests.is_empty() {
+            object.insert(
+                "recoverable_automation_draft_canonical_sha256s".to_owned(),
+                json!(canonical_digests),
+            );
         }
     }
     drop(store_guard);
@@ -4335,6 +4358,7 @@ fn browser_dispatch_status(
     dispatch_id: &str,
     actuator: Option<&dyn BrowserActuator>,
 ) -> Value {
+    let store_ref = store;
     let dispatch = {
         let Ok(store) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
@@ -4349,13 +4373,95 @@ fn browser_dispatch_status(
     if dispatch.delivery_state == BrowserDeliveryState::Uncertain
         && let Some(actuator) = actuator
     {
-        let evidence = match actuator
+        let mut evidence = match actuator
             .reconcile_dispatch(&dispatch.dispatch_id, dispatch.expected_generation)
         {
             Ok(Some(evidence)) => Some(evidence),
             Ok(None) => None,
             Err(error) => return browser_store_error(error),
         };
+        if evidence.is_none()
+            && dispatch.operation == "browser_dispatch.submit"
+            && actuator.endpoint_live(&dispatch.endpoint_ref) == Some(true)
+        {
+            let session_probe = store.lock().ok().and_then(|guard| {
+                let session = guard
+                    .browser_resource(&dispatch.target_session_ref)
+                    .ok()??;
+                if session.kind != "session"
+                    || session.endpoint_ref != dispatch.endpoint_ref
+                    || session.provider != dispatch.provider
+                    || session.observation_generation < dispatch.expected_generation
+                {
+                    return None;
+                }
+                let canonical_url = guard
+                    .browser_resource_locator(&dispatch.target_session_ref)
+                    .ok()
+                    .flatten()
+                    .map(|locator| locator.canonical_url);
+                Some((session.observation_generation, canonical_url))
+            });
+            if let Some((live_generation, canonical_url)) = session_probe {
+                let mut reconcile_params = json!({
+                    "session_ref": dispatch.target_session_ref,
+                    "provider": dispatch.provider,
+                    "dispatch_id": dispatch.dispatch_id,
+                    "dispatch_generation": dispatch.expected_generation,
+                    "message_sha256": dispatch.message_digest,
+                });
+                if let Some(object) = reconcile_params.as_object_mut() {
+                    if let Some(canonical) = dispatch.message_canonical_digest.as_deref() {
+                        object.insert("message_canonical_sha256".to_owned(), json!(canonical));
+                    }
+                    if let Some(url) = canonical_url {
+                        object.insert("canonical_url".to_owned(), json!(url));
+                    }
+                    if !dispatch.required_apps.is_empty() {
+                        object.insert("required_apps".to_owned(), json!(dispatch.required_apps));
+                    }
+                }
+                if let Ok(mut probe_evidence) = actuator.actuate_for_endpoint(
+                    "herdr_mcp.browser_dispatch.reconcile",
+                    &reconcile_params,
+                    live_generation,
+                    Some(&dispatch.endpoint_ref),
+                    None,
+                ) {
+                    let digest_params = match dispatch.message_canonical_digest.as_deref() {
+                        Some(canonical) => json!({
+                            "message_sha256": dispatch.message_digest,
+                            "message_canonical_sha256": canonical,
+                        }),
+                        None => json!({"message_sha256": dispatch.message_digest}),
+                    };
+                    if browser_delivery_state_from_postcondition(
+                        BrowserOperation::DispatchSubmit,
+                        &digest_params,
+                        live_generation,
+                        &probe_evidence,
+                    ) == Ok(BrowserDeliveryState::Applied)
+                        && let Ok(Some(accepted_ref)) =
+                            browser_evidence_accepted_user_message_ref(&probe_evidence)
+                    {
+                        let ref_unclaimed = store.lock().ok().and_then(|guard| {
+                            guard
+                                .browser_session_has_other_applied_dispatch_with_message_ref(
+                                    &dispatch.target_session_ref,
+                                    &dispatch.dispatch_id,
+                                    &accepted_ref,
+                                )
+                                .ok()
+                        }) == Some(false);
+                        if ref_unclaimed {
+                            probe_evidence.observed_generation = dispatch.expected_generation;
+                            probe_evidence.generation_owner = Some(dispatch.expected_generation);
+                            evidence = Some(probe_evidence);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(evidence) = evidence {
             let operation = match dispatch.operation.as_str() {
                 "browser_dispatch.submit" => BrowserOperation::DispatchSubmit,
@@ -4453,6 +4559,19 @@ fn browser_dispatch_status(
                 };
                 let work_memory_writeback =
                     browser_dispatch_work_memory_writeback(&mut store, &settled);
+                drop(store);
+                let settled = maybe_reconcile_browser_dispatch_result(store_ref, actuator, settled);
+                let work_memory_writeback = if settled.result_settled_at.is_some() {
+                    store_ref
+                        .lock()
+                        .ok()
+                        .map(|mut guard| {
+                            browser_dispatch_work_memory_writeback(&mut guard, &settled)
+                        })
+                        .unwrap_or(work_memory_writeback)
+                } else {
+                    work_memory_writeback
+                };
                 return json!({
                     "ok": true,
                     "dispatch": browser_dispatch_json(settled),
@@ -4471,12 +4590,79 @@ fn browser_dispatch_status(
         }
     }
 
+    let dispatch = if let Some(actuator) = actuator {
+        maybe_reconcile_browser_dispatch_result(store, actuator, dispatch)
+    } else {
+        dispatch
+    };
+
     json!({
         "ok": true,
         "dispatch": browser_dispatch_json(dispatch),
         "reconciled": false,
         "reconciliation_code": Value::Null,
     })
+}
+
+fn maybe_reconcile_browser_dispatch_result(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    actuator: &dyn BrowserActuator,
+    dispatch: crate::state_store::BrowserDispatchRecord,
+) -> crate::state_store::BrowserDispatchRecord {
+    if dispatch.delivery_state != BrowserDeliveryState::Applied
+        || dispatch.result_settled_at.is_some()
+        || dispatch.operation != "browser_dispatch.submit"
+        || dispatch.accepted_user_message_ref.is_none()
+        || actuator.endpoint_live(&dispatch.endpoint_ref) != Some(true)
+    {
+        return dispatch;
+    }
+    let session_probe = store.lock().ok().and_then(|guard| {
+        let session = guard
+            .browser_resource(&dispatch.target_session_ref)
+            .ok()??;
+        if session.kind != "session"
+            || session.endpoint_ref != dispatch.endpoint_ref
+            || session.provider != dispatch.provider
+            || session.observation_generation < dispatch.expected_generation
+        {
+            return None;
+        }
+        let canonical_url = guard
+            .browser_resource_locator(&dispatch.target_session_ref)
+            .ok()
+            .flatten()
+            .map(|locator| locator.canonical_url);
+        Some((session.observation_generation, canonical_url))
+    });
+    let Some((live_generation, canonical_url)) = session_probe else {
+        return dispatch;
+    };
+    let mut reconcile_params = json!({
+        "session_ref": dispatch.target_session_ref,
+        "provider": dispatch.provider,
+        "dispatch_id": dispatch.dispatch_id,
+        "dispatch_generation": dispatch.expected_generation,
+        "accepted_user_message_ref": dispatch.accepted_user_message_ref,
+        "settle_result": true,
+    });
+    if let Some(url) = canonical_url
+        && let Some(object) = reconcile_params.as_object_mut()
+    {
+        object.insert("canonical_url".to_owned(), json!(url));
+    }
+    let _ = actuator.actuate_for_endpoint(
+        "herdr_mcp.browser_dispatch.reconcile",
+        &reconcile_params,
+        live_generation,
+        Some(&dispatch.endpoint_ref),
+        None,
+    );
+    store
+        .lock()
+        .ok()
+        .and_then(|guard| guard.browser_dispatch(&dispatch.dispatch_id).ok().flatten())
+        .unwrap_or(dispatch)
 }
 
 fn browser_created_session_dispatch(
@@ -18769,6 +18955,161 @@ mod tests {
                 result: Some(accepted_result(self.rendered, "provider-user-canonical")),
             }))
         }
+    }
+
+    struct LiveDomReconcileActuator {
+        rendered: &'static str,
+        accepted_ref: &'static str,
+    }
+
+    impl BrowserActuator for LiveDomReconcileActuator {
+        fn endpoint_live(&self, _endpoint_ref: &str) -> Option<bool> {
+            Some(true)
+        }
+
+        fn actuate(
+            &self,
+            operation: &str,
+            _params: &Value,
+            expected_generation: i64,
+            _dispatch_id: Option<&str>,
+        ) -> Result<BrowserPostconditionEvidence, String> {
+            if operation == "herdr_mcp.browser_dispatch.reconcile" {
+                return Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: true,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                    endpoint_last_seen_age_ms: None,
+                    result: Some(accepted_result(self.rendered, self.accepted_ref)),
+                });
+            }
+            Ok(BrowserPostconditionEvidence::resource_unavailable(
+                expected_generation,
+            ))
+        }
+
+        fn reconcile_dispatch(
+            &self,
+            _dispatch_id: &str,
+            _expected_generation: i64,
+        ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn browser_dispatch_status_reconciles_uncertain_submit_via_live_dom_probe_without_claiming_prior_turn()
+     {
+        use crate::state_store::{BrowserDispatchReserveInput, BrowserDispatchUpdateInput};
+
+        let submitted = "Claude background prompt";
+        let canonical = browser_sha256(&browser_readback_text_canonical(submitted));
+        let (store, endpoint_ref, session_ref) = browser_dispatch_reconcile_fixture();
+        let first_dispatch = {
+            let mut guard = store.lock().unwrap();
+            let reservation = guard
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    operation: "browser_dispatch.submit",
+                    target_session_ref: &session_ref,
+                    request_digest: &browser_sha256("req-live-1"),
+                    message_digest: &browser_sha256(submitted),
+                    message_canonical_digest: Some(&canonical),
+                    reasoning_effort: None,
+                    required_apps: &[],
+                    expected_generation: 7,
+                    idempotency_key_digest: &browser_sha256("key-live-1"),
+                    parent_dispatch_id: None,
+                    authorization: None,
+                    work_chain_id: None,
+                    lane_id: None,
+                    created_at: 20,
+                })
+                .unwrap();
+            let crate::state_store::BrowserDispatchReservation::Reserved(dispatch) = reservation
+            else {
+                panic!("expected new dispatch");
+            };
+            guard
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &dispatch.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Uncertain,
+                    generation_owner: None,
+                    accepted_user_message_ref: None,
+                    updated_at: 21,
+                })
+                .unwrap()
+        };
+
+        let actuator = LiveDomReconcileActuator {
+            rendered: submitted,
+            accepted_ref: "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:4",
+        };
+        let status = browser_dispatch_status(&store, &first_dispatch.dispatch_id, Some(&actuator));
+        assert_eq!(status["reconciled"], true);
+        assert_eq!(status["dispatch"]["delivery_state"], "applied");
+        assert_eq!(
+            status["dispatch"]["accepted_user_message_ref"],
+            "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:4"
+        );
+
+        // A second uncertain dispatch with identical text must NOT adopt the
+        // accepted_user_message_ref already owned by first_dispatch.
+        let second_dispatch = {
+            let mut guard = store.lock().unwrap();
+            let reservation = guard
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    operation: "browser_dispatch.submit",
+                    target_session_ref: &session_ref,
+                    request_digest: &browser_sha256("req-live-2"),
+                    message_digest: &browser_sha256(submitted),
+                    message_canonical_digest: Some(&canonical),
+                    reasoning_effort: None,
+                    required_apps: &[],
+                    expected_generation: 7,
+                    idempotency_key_digest: &browser_sha256("key-live-2"),
+                    parent_dispatch_id: None,
+                    authorization: None,
+                    work_chain_id: None,
+                    lane_id: None,
+                    created_at: 30,
+                })
+                .unwrap();
+            let crate::state_store::BrowserDispatchReservation::Reserved(dispatch) = reservation
+            else {
+                panic!("expected second dispatch");
+            };
+            guard
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &dispatch.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Uncertain,
+                    generation_owner: None,
+                    accepted_user_message_ref: None,
+                    updated_at: 31,
+                })
+                .unwrap()
+        };
+        let second_status =
+            browser_dispatch_status(&store, &second_dispatch.dispatch_id, Some(&actuator));
+        assert_eq!(second_status["reconciled"], false);
+        assert_eq!(second_status["dispatch"]["delivery_state"], "uncertain");
     }
 
     #[test]

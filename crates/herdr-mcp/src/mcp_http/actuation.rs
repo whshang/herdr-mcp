@@ -389,6 +389,8 @@ impl BrowserActuator for BrowserActuationBroker {
 
         let timeout = if operation == "herdr_mcp.browser_session.create" {
             self.create_timeout
+        } else if operation == "herdr_mcp.browser_dispatch.reconcile" {
+            self.timeout.min(Duration::from_secs(6))
         } else {
             self.timeout
         };
@@ -555,6 +557,16 @@ impl BrowserActuator for BrowserActuationBroker {
             return Ok(None);
         };
         state.pending.remove(&actuation_id);
+        if !evidence.resource_available
+            && evidence
+                .result
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(Value::as_str)
+                == Some("browser_session_content_dispatch_failed")
+        {
+            return Ok(None);
+        }
         Ok(Some(evidence))
     }
 }

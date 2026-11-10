@@ -184,7 +184,22 @@ function normalizeHerdrMentionAlias(value) {
     updateQueuedInsertButton();
     return automationEnabled;
   }
-  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const wait = (ms) => new Promise((r) => {
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; r(); } };
+    setTimeout(done, ms);
+    if (typeof document !== "undefined" && document.hidden && runtimeAlive()) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "h2w_sleep", ms: Math.min(Math.max(0, Number(ms) || 0), 10000) },
+          (resp) => {
+            void chrome.runtime?.lastError;
+            if (resp?.slept === true) done();
+          },
+        );
+      } catch (_) {}
+    }
+  });
   const normText = (s) => String(s || "").replace(/\s+/g, " ").trim();
 
   function markConversationState(record) {
@@ -951,13 +966,16 @@ function normalizeHerdrMentionAlias(value) {
   async function clearAutomationDraft(message) {
     const canonical = canonicalAcceptanceText;
     const expected = canonical(message);
-    const ours = () => expected !== "" && canonical(ADAPTER.getComposerTextWithoutAppPills()) === expected;
-    if (!ours()) return ADAPTER.getComposerTextWithoutAppPills() === "" ? "empty" : "not_ours";
+    const currentText = () => typeof ADAPTER.getComposerTextWithoutAppPills === "function"
+      ? ADAPTER.getComposerTextWithoutAppPills()
+      : composerTextRaw().trim();
+    const ours = () => expected !== "" && canonical(currentText()) === expected;
+    if (!ours()) return currentText() === "" ? "empty" : "not_ours";
     await clearComposer();
     const deadline = Date.now() + 1500;
-    while (ADAPTER.getComposerTextWithoutAppPills() !== "" && Date.now() < deadline) await wait(100);
+    while (currentText() !== "" && Date.now() < deadline) await wait(100);
     await wait(300);
-    return ADAPTER.getComposerTextWithoutAppPills() === "" ? "cleared" : "clear_failed";
+    return currentText() === "" ? "cleared" : "clear_failed";
   }
 
   async function ensureRequiredComposerApps(requiredApps) {
@@ -1251,11 +1269,11 @@ function normalizeHerdrMentionAlias(value) {
     // ChatGPT is single-shot: exactly one dispatch primitive per invocation.
     if (ADAPTER.name === "chatgpt") return (await submitChatGptOnce()).ok === true;
     if (ADAPTER.needsMainWorldInsert) {
-      await waitForComposerIdle();
+      await waitForComposerIdle(2500);
       const postInsertMs = Math.min(1200, 350 + Math.floor((ADAPTER.getInputEl()?.innerText?.length || 0) / 40) * 50);
       await wait(postInsertMs);
-      for (let attempt = 0; attempt < 3; attempt++) {
-        for (let i = 0; i < 40; i++) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        for (let i = 0; i < 16; i++) {
           const btn = findSendButton();
           if (isSendButton(btn)) {
             if (ADAPTER.name === "chatgpt" && ADAPTER.inputHasContent()) {
@@ -1276,10 +1294,10 @@ function normalizeHerdrMentionAlias(value) {
         const enterBaseline = captureSubmitAckBaseline(findSendButton());
         dispatchEnterSubmit(el);
         if (await waitForSubmitAck(enterBaseline, 3000)) return true;
-        if (attempt < 2) {
+        if (attempt < 1) {
           console.warn(`[h2w] submit attempt ${attempt + 1} failed; retrying`);
           await wait(800);
-          await waitForComposerIdle(4000);
+          await waitForComposerIdle(2000);
         }
       }
       const afterPerm = await submitAfterPermissionClick();
@@ -2665,6 +2683,127 @@ function normalizeHerdrMentionAlias(value) {
       } while (Date.now() < deadline);
       return evidence;
     }
+    if (command?.operation === "herdr_mcp.browser_dispatch.reconcile") {
+      const params = command?.params && typeof command.params === "object" ? command.params : {};
+      const sessionRef = typeof params.session_ref === "string" ? params.session_ref : "";
+      if (!sessionRef || sessionRef !== registeredBrowserSessionRef) {
+        return browserUnavailableEvidence(evidence, "browser_reconcile_session_unavailable");
+      }
+      const currentConvKey = ADAPTER.getConversationKey();
+      if (!currentConvKey || currentConvKey !== registeredConvKey) {
+        return browserUnavailableEvidence(evidence, "browser_reconcile_conversation_unavailable");
+      }
+      if (!providerCanonicalConversationObserved()) {
+        return browserUnavailableEvidence(evidence, "browser_reconcile_canonical_url_unavailable");
+      }
+      const reconcileDispatchId = typeof command?.dispatch_id === "string"
+        ? command.dispatch_id
+        : (typeof params.dispatch_id === "string" ? params.dispatch_id : "");
+      const dispatchGeneration = Number.isSafeInteger(params.dispatch_generation)
+        && params.dispatch_generation >= 1
+        ? params.dispatch_generation
+        : expectedGeneration;
+      evidence.command_accepted = true;
+      evidence.resource_available = true;
+      evidence.stable_resource_ref_observed = true;
+      evidence.lifecycle_observed = true;
+      evidence.canonical_url_observed = true;
+      if (params.settle_result === true) {
+        const acceptedRef = typeof params.accepted_user_message_ref === "string"
+          ? params.accepted_user_message_ref
+          : "";
+        if (acceptedRef && /^bd_[0-9a-f]{64}$/.test(reconcileDispatchId)) {
+          const current = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+          if (!current || current.dispatchId === reconcileDispatchId || !current.dispatchId) {
+            acceptedDispatchAssignments.set(sessionRef, {
+              dispatchId: reconcileDispatchId,
+              generation: dispatchGeneration,
+              acceptedUserMessageRef: acceptedRef,
+              reportedAssistantRef: current?.dispatchId === reconcileDispatchId
+                ? (current.reportedAssistantRef || null)
+                : null,
+              unmatchedGraceUntil: null,
+            });
+          }
+        }
+        if (typeof observeBrowserResultSettlement === "function") {
+          await observeBrowserResultSettlement({ immediate: true }).catch(() => false);
+          if (registeredBrowserSessionRef
+              && !acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.reportedAssistantRef) {
+            await wait(1050);
+            await observeBrowserResultSettlement({ immediate: true }).catch(() => false);
+          }
+        }
+        return evidence;
+      }
+      const wantRawSha = typeof params.message_sha256 === "string" ? params.message_sha256 : "";
+      const wantCanonicalSha = typeof params.message_canonical_sha256 === "string"
+        ? params.message_canonical_sha256
+        : "";
+      const requiredApps = Array.isArray(params.required_apps) ? params.required_apps : [];
+      const afterServer = ADAPTER.name === "chatgpt"
+        ? await fetchChatGptConversationSnapshot(3000).catch(() => ({ ok: false }))
+        : { ok: false };
+      const afterDom = providerMessageSnapshot("user");
+      const afterAssistant = providerMessageSnapshot("assistant");
+      const serverRef = afterServer?.ok
+        && typeof afterServer.userMessageId === "string" && afterServer.userMessageId
+        ? afterServer.userMessageId : null;
+      const domRef = afterDom?.exactMessageId === true
+        && typeof afterDom.messageId === "string" && afterDom.messageId
+        ? afterDom.messageId : null;
+      const candidateRef = serverRef || domRef;
+      const candidateText = serverRef ? afterServer.userText : (domRef ? afterDom.text : "");
+      if (candidateRef && typeof candidateText === "string" && candidateText.trim()) {
+        const digests = await providerAcceptanceDigests(candidateText, requiredApps);
+        const rawMatches = Boolean(wantRawSha && digests.accepted_user_text_sha256 === wantRawSha);
+        const canonicalMatches = Boolean(
+          wantCanonicalSha && digests.accepted_user_text_canonical_sha256 === wantCanonicalSha,
+        );
+        if (rawMatches || canonicalMatches) {
+          globalThis.__H2W_LAST_AUTOMATION_DRAFT__ = null;
+          const acceptedApps = (ADAPTER.name === "chatgpt"
+            && typeof ADAPTER.getAcceptedUserAppIdentity === "function")
+            ? ADAPTER.getAcceptedUserAppIdentity(candidateRef)
+            : [];
+          evidence.accepted_message_observed = true;
+          evidence.message_baseline_advanced = true;
+          evidence.required_apps_readback = acceptedApps.map((app) => app.name);
+          evidence.result = {
+            accepted_user_message_ref: candidateRef,
+            ...(acceptedApps.length ? { accepted_user_apps: acceptedApps } : {}),
+            ...digests,
+          };
+          const assistantSettled = typeof ADAPTER.getResultSettlementSnapshot === "function"
+            ? Boolean(ADAPTER.getResultSettlementSnapshot(candidateRef)?.ok)
+            : false;
+          evidence.generation_status_observed = Boolean(
+            isTurnInProgress()
+            || assistantSettled
+            || (afterAssistant?.messageId && afterAssistant.count > 0)
+            || (afterServer?.ok && typeof afterServer.messageId === "string" && afterServer.messageId),
+          );
+          if (evidence.generation_status_observed) {
+            evidence.generation_owner = expectedGeneration;
+          }
+          if (/^bd_[0-9a-f]{64}$/.test(reconcileDispatchId) && registeredBrowserSessionRef) {
+            const current = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+            const reportedAssistantRef = current?.dispatchId === reconcileDispatchId
+              && current?.acceptedUserMessageRef === candidateRef
+              ? (current.reportedAssistantRef || null)
+              : null;
+            acceptedDispatchAssignments.set(sessionRef, {
+              dispatchId: reconcileDispatchId,
+              generation: dispatchGeneration,
+              acceptedUserMessageRef: candidateRef,
+              reportedAssistantRef,
+              unmatchedGraceUntil: null,
+            });
+          }
+        }
+      }
+      return evidence;
+    }
     if (!creatingSession && command?.operation !== "herdr_mcp.browser_dispatch.submit") {
       return browserRejectedEvidence(evidence, "browser_operation_unavailable");
     }
@@ -2734,6 +2873,43 @@ function normalizeHerdrMentionAlias(value) {
         return busy;
       }
     }
+    if (!creatingSession && !isTurnInProgress() && ADAPTER.inputHasContent()
+        && typeof clearComposer === "function") {
+      const rawDraft = (typeof ADAPTER.getComposerTextWithoutAppPills === "function"
+        ? ADAPTER.getComposerTextWithoutAppPills()
+        : (typeof composerTextRaw === "function"
+          ? composerTextRaw()
+          : String(ADAPTER.getInputEl()?.innerText || ADAPTER.getInputEl()?.textContent || ""))).trim();
+      if (rawDraft) {
+        const draftDigests = await providerAcceptanceDigests(rawDraft, requiredApps);
+        const recoverableRaw = new Set(
+          Array.isArray(params.recoverable_automation_draft_sha256s)
+            ? params.recoverable_automation_draft_sha256s
+            : [],
+        );
+        const recoverableCanonical = new Set(
+          Array.isArray(params.recoverable_automation_draft_canonical_sha256s)
+            ? params.recoverable_automation_draft_canonical_sha256s
+            : [],
+        );
+        try {
+          const stored = globalThis.__H2W_LAST_AUTOMATION_DRAFT__;
+          if (stored && stored.convKey === ADAPTER.getConversationKey()) {
+            if (typeof stored.raw_sha256 === "string") recoverableRaw.add(stored.raw_sha256);
+            if (typeof stored.canonical_sha256 === "string") recoverableCanonical.add(stored.canonical_sha256);
+          }
+        } catch (_) {}
+        if (recoverableRaw.has(draftDigests.accepted_user_text_sha256)
+            || recoverableCanonical.has(draftDigests.accepted_user_text_canonical_sha256)) {
+          try { await clearComposer(); } catch (_) {}
+          const clearDeadline = Date.now() + 1500;
+          while (ADAPTER.inputHasContent() && Date.now() < clearDeadline) await wait(100);
+          if (!ADAPTER.inputHasContent()) {
+            globalThis.__H2W_LAST_AUTOMATION_DRAFT__ = null;
+          }
+        }
+      }
+    }
     if ((!creatingSession && isTurnInProgress()) || ADAPTER.inputHasContent()) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
@@ -2784,6 +2960,16 @@ function normalizeHerdrMentionAlias(value) {
       return browserRejectedEvidence(evidence, chatGptDispatchBaselineRejectionReason(beforeServer));
     }
     const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
+    if (!creatingSession) {
+      try {
+        const outgoingDigests = await providerAcceptanceDigests(message, requiredApps);
+        globalThis.__H2W_LAST_AUTOMATION_DRAFT__ = {
+          convKey: ADAPTER.getConversationKey(),
+          raw_sha256: outgoingDigests.accepted_user_text_sha256,
+          canonical_sha256: outgoingDigests.accepted_user_text_canonical_sha256,
+        };
+      } catch (_) {}
+    }
     const result = await performWake({
       template: message,
       autoAllow: false,
@@ -2808,8 +2994,11 @@ function normalizeHerdrMentionAlias(value) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
       let draftCleanup = null;
-      if (ADAPTER.name === "chatgpt") {
+      if (typeof clearAutomationDraft === "function") {
         try { draftCleanup = await clearAutomationDraft(message); } catch (_) { draftCleanup = "clear_failed"; }
+      }
+      if (draftCleanup === "cleared" || draftCleanup === "empty") {
+        globalThis.__H2W_LAST_AUTOMATION_DRAFT__ = null;
       }
       const rejectedEvidence = browserRejectedEvidence(
         evidence,
@@ -2885,6 +3074,7 @@ function normalizeHerdrMentionAlias(value) {
           ? afterServer.userMessageId
           : (exactDomUserMessageRef || afterDom?.messageId || null));
       if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef) {
+        globalThis.__H2W_LAST_AUTOMATION_DRAFT__ = null;
         // The existing actuation evidence.result object carries the exact
         // provider user-message identity, the App identity of that same
         // provider message, and the digests of the accepted provider text, so
@@ -3170,7 +3360,8 @@ function normalizeHerdrMentionAlias(value) {
   // period while its synthesized dispatch is persisted; after that, three
   // explicit identity rejections stop probes until a new assignment.
   let browserResultProbeState = null;
-  async function observeBrowserResultSettlement() {
+  async function observeBrowserResultSettlement(options = {}) {
+    const immediate = options?.immediate === true;
     const convKey = ADAPTER.getConversationKey();
     const sessionRef = registeredBrowserSessionRef;
     const registrationGeneration = registeredBrowserGeneration;
@@ -3185,7 +3376,7 @@ function normalizeHerdrMentionAlias(value) {
       browserResultProbeState = { sessionRef, pending, nextAt: 0, inFlight: false, rejected: 0, retryMs: 5000 };
     }
     const probe = browserResultProbeState;
-    if (probe.rejected >= 3 || probe.inFlight || Date.now() < probe.nextAt) return false;
+    if (probe.rejected >= 3 || probe.inFlight || (!immediate && Date.now() < probe.nextAt)) return false;
     probe.inFlight = true;
     probe.nextAt = Date.now() + probe.retryMs;
     try {

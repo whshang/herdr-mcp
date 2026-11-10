@@ -351,3 +351,65 @@ test("user sends to an idle Claude chat | Given visible buttons whose aria-label
   assert.equal(h.adapter.getStopButtonCandidates().length, 1);
   assert.equal(h.adapter.isGenerationInProgress(), true);
 });
+
+test("user reads latest Claude message when virtualized rows are out of DOM order | Given highest data-index row is not last in DOM order | When getMessageSnapshot and getResultSettlementSnapshot run | Then the highest data-index turn wins and long-response unmounted userRow still settles", () => {
+  const h = harness();
+  const makeTranscriptMessage = ({ role, index, text, streaming = false }) => {
+    const article = element({ attrs: {
+      "aria-posinset": String(index + 1),
+      "aria-setsize": "20",
+    } });
+    const row = element({ attrs: {
+      "data-testid": "transcript-row",
+      "data-index": String(index),
+      "data-rs-index": String(index),
+      "data-perf-row": role === "user" ? "human" : "assistant",
+      "data-perf-row-streaming": streaming ? "true" : "false",
+    } });
+    const message = element({ text });
+    message.closest = (selector) => {
+      if (selector === '[data-testid="transcript-row"]') return row;
+      if (selector === '[role="article"]') return article;
+      return null;
+    };
+    row.querySelector = (selector) => {
+      if (role === "user" && selector.includes('data-testid="user-message"')) return message;
+      if (role === "assistant" && selector.includes('data-testid="assistant-message"')) return message;
+      return null;
+    };
+    return { article, row, message };
+  };
+
+  const newestUser = makeTranscriptMessage({ role: "user", index: 14, text: "latest prompt" });
+  const olderUser = makeTranscriptMessage({ role: "user", index: 2, text: "older prompt" });
+  h.set('[data-testid="user-message"]', [newestUser.message, olderUser.message]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.adapter.getMessageSnapshot("user"))),
+    {
+      messageId: "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:14",
+      text: "latest prompt",
+      count: 2,
+    },
+  );
+
+  // When a long response scrolls the virtualized viewport past userRow (index 14),
+  // only assistantRow (index 15) remains mounted; settlement still succeeds.
+  const assistant = makeTranscriptMessage({ role: "assistant", index: 15, text: "long final answer" });
+  h.set('[data-testid="transcript-row"]', [assistant.row]);
+  const acceptedRef = "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:14";
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.adapter.getResultSettlementSnapshot(acceptedRef))),
+    {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:15",
+      userMessageId: acceptedRef,
+      text: "long final answer",
+    },
+  );
+
+  // If an older row (index 2) is mounted while userRow (index 14) is missing, fail closed.
+  h.set('[data-testid="transcript-row"]', [olderUser.row, assistant.row]);
+  assert.equal(h.adapter.getResultSettlementSnapshot(acceptedRef), null);
+});

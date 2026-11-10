@@ -226,21 +226,31 @@ class ClaudeAdapter extends BaseAdapter {
     const assistantRow = rows.find((row) => (
       String(row.getAttribute?.("data-index") || "") === String(userIndex + 1)
     ));
-    if (!userRow || !assistantRow) return null;
-    const userElement = userRow.querySelector?.(
-      '[data-testid="user-message"], [data-testid="human-message"], .font-user-message',
-    ) || null;
+    if (!assistantRow) return null;
     const assistantElement = assistantRow.querySelector?.(
       '[data-testid="assistant-message"], .font-claude-response, .font-claude-message',
     ) || null;
-    if (!userElement || !assistantElement
-        || !this.elementVisible(userElement)
-        || !this.elementVisible(assistantElement)) {
+    if (!assistantElement || !this.elementVisible(assistantElement)) {
       return null;
     }
-    const userMessageRef = this.getTranscriptMessageRef(userElement, "user");
     const assistantMessageRef = this.getTranscriptMessageRef(assistantElement, "assistant");
-    if (userMessageRef !== acceptedUserMessageRef || !assistantMessageRef) return null;
+    if (!assistantMessageRef) return null;
+    let userMessageRef = null;
+    if (userRow) {
+      const userElement = userRow.querySelector?.(
+        '[data-testid="user-message"], [data-testid="human-message"], .font-user-message',
+      ) || null;
+      if (!userElement || !this.elementVisible(userElement)) return null;
+      userMessageRef = this.getTranscriptMessageRef(userElement, "user");
+      if (userMessageRef !== acceptedUserMessageRef) return null;
+    } else {
+      const userScrolledOffTop = rows.length > 0 && rows.every((row) => {
+        const rawIndex = String(row.getAttribute?.("data-index") || "").trim();
+        return /^(?:0|[1-9]\d*)$/.test(rawIndex) && Number(rawIndex) > userIndex;
+      });
+      if (!userScrolledOffTop) return null;
+      userMessageRef = acceptedUserMessageRef;
+    }
     if (assistantRow.getAttribute?.("data-perf-row-streaming") === "true") return null;
     const assistantText = String(
       assistantElement.innerText || assistantElement.textContent || "",
@@ -272,7 +282,18 @@ class ClaudeAdapter extends BaseAdapter {
       }
       if (nodes.length > 0) break;
     }
-    const element = nodes.at(-1) || null;
+    let element = nodes.at(-1) || null;
+    let highestIndex = -1;
+    for (const candidate of nodes) {
+      const row = candidate.closest?.('[data-testid="transcript-row"]') || null;
+      const rawIndex = String(row?.getAttribute?.("data-index") || "").trim();
+      if (!/^(?:0|[1-9]\d*)$/.test(rawIndex)) continue;
+      const idx = Number(rawIndex);
+      if (Number.isSafeInteger(idx) && idx >= highestIndex) {
+        highestIndex = idx;
+        element = candidate;
+      }
+    }
     if (!element) return { messageId: null, text: "", count: 0 };
     const messageId = element.getAttribute?.("data-message-id")
       || element.getAttribute?.("data-message-uuid")
