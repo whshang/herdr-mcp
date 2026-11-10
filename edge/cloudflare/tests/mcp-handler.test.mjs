@@ -2903,3 +2903,59 @@ test("user reads through a cold execution fence | Given a canonical seed device 
   assert.equal(d.calls[3].readDedupeKey, d.calls[1].readDedupeKey, "the retried forward used device B's read key");
   assert.equal(d.calls[3].routeDeviceId, REROUTE_DEVICE_B, "the control read routed to device B directly");
 });
+
+test("user Given a DEV connector hitting workstation_offline When tools/call returns Then retryable is false with stale DEV connector guidance (#881)", async () => {
+  const d = deps({
+    edgeEnv: "dev",
+    client: {
+      connectorId: "conn_stale_dev_12345",
+      grantGeneration: 1,
+    },
+    forward: async () => new Response(JSON.stringify({
+      status: "error",
+      error: {
+        ok: false,
+        code: "workstation_offline",
+        retryable: true,
+        retry_after_ms: 1000,
+        delivery_state: "not_delivered",
+      },
+    }), { status: 503, headers: { "content-type": "application/json" } }),
+  });
+  const res = await handleMcp(req("dev-offline-1", "tools/call", {
+    name: "herdr_since",
+    arguments: { device: "dev_01HZZZZZZZZZZZZZZZZZZZZZZZ" },
+  }), "w1", d.value);
+  const structured = res.body.result.structuredContent;
+  assert.equal(structured.code, "workstation_offline");
+  assert.equal(structured.retryable, false);
+  assert.equal(structured.retry_after_ms, undefined);
+  assert.equal(structured.edge_env, "dev");
+  assert.equal(structured.connector_id, "conn_stale_dev_12345");
+  assert.equal(structured.stale_dev_connector, true);
+  assert.equal(structured.reason, "stale_dev_connector_workstation_offline");
+});
+
+test("user Given an ambiguous device route When the caller connector holds grants on one device Then device_ambiguous includes recommended_device_id (#881)", async () => {
+  const d = deps({
+    client: {
+      connectorId: "conn_prod_12345678",
+      grantGeneration: 1,
+      pageAssistGrants: [{ device_id: "dev_01M1BDHFE8TJ2PZGQAAG4T1A3V", endpoint_ref: "ep_1" }],
+    },
+    resolveDevice: async () => ({
+      ok: false,
+      code: "device_ambiguous",
+      candidate_devices: ["dev_01M1BDHFE8TJ2PZGQAAG4T1A3V", "dev_01M1C13W9279KNGGJSF1E1ZXH2"],
+    }),
+  });
+  const res = await handleMcp(req("ambig-1", "tools/call", {
+    name: "herdr_since",
+    arguments: {},
+  }), "w1", d.value);
+  const structured = res.body.result.structuredContent;
+  assert.equal(structured.code, "device_ambiguous");
+  assert.equal(structured.connector_id, "conn_prod_12345678");
+  assert.deepEqual(structured.granted_device_ids, ["dev_01M1BDHFE8TJ2PZGQAAG4T1A3V"]);
+  assert.equal(structured.recommended_device_id, "dev_01M1BDHFE8TJ2PZGQAAG4T1A3V");
+});

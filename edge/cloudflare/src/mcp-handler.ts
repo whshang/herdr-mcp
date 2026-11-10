@@ -355,7 +355,15 @@ function routeErrorResponse(
   id: JsonRpcId,
   args: Record<string, unknown>,
   route: Extract<DeviceRouteResult, { ok: false }>,
+  client?: McpClientContext,
+  callerBrowserDevices?: ReadonlySet<string>,
 ): McpResponse {
+  const grantedDevices = callerBrowserDevices && callerBrowserDevices.size > 0
+    ? [...callerBrowserDevices]
+    : undefined;
+  const recommendedDeviceId = route.code === "device_ambiguous" && grantedDevices && grantedDevices.length === 1
+    ? grantedDevices[0]
+    : undefined;
   return rpcResult(id, callToolResult({
     ok: false,
     code: route.code,
@@ -365,8 +373,17 @@ function routeErrorResponse(
     requested_target: args.target ?? args.pane_id ?? args.pane ?? args.workspace_id ?? args.workspace ?? null,
     selected_device: route.selected_device ?? null,
     candidate_devices: route.candidate_devices ?? [],
+    ...(route.code === "device_ambiguous" && client?.connectorId
+      ? { connector_id: client.connectorId }
+      : {}),
+    ...(route.code === "device_ambiguous" && grantedDevices
+      ? { granted_device_ids: grantedDevices }
+      : {}),
+    ...(recommendedDeviceId ? { recommended_device_id: recommendedDeviceId } : {}),
     next_action: route.code === "device_ambiguous"
-      ? "retry with an explicit device selector or a device-aware ref"
+      ? (recommendedDeviceId
+          ? `retry with explicit device selector '${recommendedDeviceId}' (holds this connector's browser grants) or a device-aware ref`
+          : "retry with an explicit device selector or a device-aware ref")
       : "inspect device routing state and retry only after selecting an enrolled routable device",
   }, true));
 }
@@ -474,22 +491,43 @@ function privateMethodRoutePreflight(
   };
 }
 
-function relayErrorToolResult(error: RelayErrorResult, requestId: string, workstationId: string): Record<string, unknown> {
+function relayErrorToolResult(
+  error: RelayErrorResult,
+  requestId: string,
+  workstationId: string,
+  deps?: McpDeps,
+): Record<string, unknown> {
   const supersededDetails = error.code === "runtime_generation_superseded_before_dispatch" && isRecord(error.details)
     ? error.details
     : undefined;
+  const staleDevConnectorOffline = deps?.edgeEnv === "dev"
+    && error.code === "workstation_offline"
+    && Boolean(deps.client?.connectorId);
   return callToolResult(
     {
       ok: false,
       code: error.code,
-      retryable: error.retryable,
-      requires_human: error.requires_human ?? relayErrorRequiresHuman(error.code),
+      retryable: staleDevConnectorOffline ? false : error.retryable,
+      requires_human: staleDevConnectorOffline
+        ? true
+        : (error.requires_human ?? relayErrorRequiresHuman(error.code)),
       delivery_state: error.delivery_state,
-      retry_after_ms: error.retry_after_ms
-        ?? (supersededDetails ? GENERATION_SUPERSEDE_CLIENT_RETRY_AFTER_MS : undefined),
+      retry_after_ms: staleDevConnectorOffline
+        ? undefined
+        : (error.retry_after_ms
+          ?? (supersededDetails ? GENERATION_SUPERSEDE_CLIENT_RETRY_AFTER_MS : undefined)),
       recovery: error.recovery,
       message: error.message ?? null,
       details: error.details ?? null,
+      ...(staleDevConnectorOffline
+        ? {
+            edge_env: "dev",
+            connector_id: deps?.client?.connectorId ?? null,
+            stale_dev_connector: true,
+            reason: "stale_dev_connector_workstation_offline",
+            next_action: "stale DEV connector targets an offline workstation; switch to the production Herdr connector or revoke this stale DEV connector",
+          }
+        : {}),
       ...(supersededDetails
         ? {
             old_generation: supersededDetails.reserved_generation ?? null,
@@ -1410,7 +1448,7 @@ export async function handleMcp(
         callToolResult({ ok: false, code: "device_registry_unavailable", retryable: true }, true),
       );
     }
-    if (!route.ok) return routeErrorResponse(id, args, route);
+    if (!route.ok) return routeErrorResponse(id, args, route, deps.client, callerBrowserDeviceIds());
 
     // Capture the narrowed route identity before the retry loop mutates `route`;
     // callbacks below must not rely on TypeScript preserving a narrowing across
@@ -1684,7 +1722,7 @@ export async function handleMcp(
         } catch {
           return rpcResult(id, callToolResult({ ok: false, code: "device_registry_unavailable", retryable: true }, true));
         }
-        if (!authoritative.ok) return routeErrorResponse(id, args, authoritative);
+        if (!authoritative.ok) return routeErrorResponse(id, args, authoritative, deps.client, callerBrowserDeviceIds());
         const retryRequestId = newRequestId();
         deps.logger.warn("mcp.tools_call.route_fence_bootstrap", {
           requestId: activeRequestId,
@@ -1776,10 +1814,10 @@ export async function handleMcp(
       return rpcResult(id, annotateConnectorDenial(normalizeSuccessfulToolResult(wrapped, name, args), deps.client));
     }
     if (forwarded.status === "ok" && forwarded.completion?.status === "error") {
-      return rpcResult(id, annotateConnectorDenial(relayErrorToolResult(forwarded.completion.error, activeRequestId, route.workstation_id), deps.client));
+      return rpcResult(id, annotateConnectorDenial(relayErrorToolResult(forwarded.completion.error, activeRequestId, route.workstation_id, deps), deps.client));
     }
     if (forwarded.status === "error" && forwarded.error) {
-      return rpcResult(id, annotateConnectorDenial(relayErrorToolResult(forwarded.error, activeRequestId, route.workstation_id), deps.client));
+      return rpcResult(id, annotateConnectorDenial(relayErrorToolResult(forwarded.error, activeRequestId, route.workstation_id, deps), deps.client));
     }
     return rpcResult(
       id,

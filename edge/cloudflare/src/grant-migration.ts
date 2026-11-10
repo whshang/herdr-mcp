@@ -232,13 +232,17 @@ export function applyPlanIfFresh(
 
 const CONNECTOR_ID = /^conn_[A-Za-z0-9_-]{8,128}$/;
 
-export function listOrphans(record: OAuthConnectorGrantRecord | null | undefined): OrphanRow[] {
+export function listOrphans(
+  record: OAuthConnectorGrantRecord | null | undefined,
+  activeConnectorIds?: ReadonlySet<string>,
+): OrphanRow[] {
   if (!record || record.status !== "active" || typeof record.connector_id !== "string" || !record.connector_id) return [];
   const current = record.connector_id;
   const out: OrphanRow[] = [];
   for (const [kind, rows] of [["page_assist", record.page_assist ?? []], ["webchat_control", record.webchat_control ?? []]] as const) {
     for (const row of rows) {
       if (row.connector_id === current) continue;
+      if (activeConnectorIds?.has(row.connector_id)) continue;
       out.push({
         kind,
         client_id: record.client_id,
@@ -254,9 +258,40 @@ export function listOrphans(record: OAuthConnectorGrantRecord | null | undefined
   return out;
 }
 
-export function listAllOrphans(records: Iterable<OAuthConnectorGrantRecord | null | undefined>): OrphanRow[] {
+export function listAllOrphans(
+  records: Iterable<OAuthConnectorGrantRecord | null | undefined>,
+  activeConnectorIds?: ReadonlySet<string>,
+): OrphanRow[] {
   const out: OrphanRow[] = [];
-  for (const record of records) out.push(...listOrphans(record));
+  for (const record of records) out.push(...listOrphans(record, activeConnectorIds));
+  return out;
+}
+
+export function listActiveSiblingRows(
+  records: Iterable<OAuthConnectorGrantRecord | null | undefined>,
+  activeConnectorIds: ReadonlySet<string>,
+): OrphanRow[] {
+  if (activeConnectorIds.size === 0) return [];
+  const out: OrphanRow[] = [];
+  for (const record of records) {
+    if (!record || record.status !== "active" || typeof record.connector_id !== "string" || !record.connector_id) continue;
+    const current = record.connector_id;
+    for (const [kind, rows] of [["page_assist", record.page_assist ?? []], ["webchat_control", record.webchat_control ?? []]] as const) {
+      for (const row of rows) {
+        if (row.connector_id === current || !activeConnectorIds.has(row.connector_id)) continue;
+        out.push({
+          kind,
+          client_id: record.client_id,
+          current_connector_id: current,
+          connector_id: row.connector_id,
+          grant_generation: row.grant_generation,
+          device_id: row.device_id,
+          endpoint_ref: row.endpoint_ref,
+          ...("provider" in row ? { provider: row.provider, account_ref: row.account_ref } : {}),
+        });
+      }
+    }
+  }
   return out;
 }
 

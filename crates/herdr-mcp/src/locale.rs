@@ -300,12 +300,12 @@ fn worker_help(l: Locale) -> String {
 
 fn connector_help(l: Locale) -> String {
     format!(
-        "Herdr MCP — {}\n\n{}\n\n  herdr-mcp connector list [--all]\n  herdr-mcp connector approve <approval-request-id>\n  herdr-mcp connector cancel <approval-request-id>\n  herdr-mcp connector revoke <connector-id> --confirm\n  herdr-mcp connector revoke-client <client-id> --confirm\n  herdr-mcp connector label <connector-id> <platform-account> | <connector-id> --clear\n  herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm\n  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm\n  herdr-mcp connector webchat-control <allow-device|deny-device> <connector-id-or-platform-account> <device-id> --confirm\n  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm\n",
+        "Herdr MCP — {}\n\n{}\n\n  herdr-mcp connector list [--all]\n  herdr-mcp connector approve <approval-request-id>\n  herdr-mcp connector cancel <approval-request-id>\n  herdr-mcp connector revoke <connector-id> --confirm\n  herdr-mcp connector prune-stale [--dry-run | --confirm] [--idle-days <days>]\n  herdr-mcp connector revoke-client <client-id> --confirm\n  herdr-mcp connector label <connector-id> <platform-account> | <connector-id> --clear\n  herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm\n  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> [<account-ref>] --confirm\n  herdr-mcp connector webchat-control <allow-device|deny-device> <connector-id-or-platform-account> <device-id> --confirm\n  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm\n  herdr-mcp connector page-assist orphans [--device-id <device-id>]\n  herdr-mcp connector page-assist migrate --from <old-id> --to <new-id> [--confirm]\n",
         l.text("", "Connector 管理", "コネクター管理"),
         l.text(
             "",
-            "这些命令需要已注册设备凭据。审批码从终端/stdin 读取。--all 包含 revoked 审计记录；revoke-client 会使该 OAuth client 的全部授权失效。",
-            "登録済みデバイスの認証情報が必要です。承認コードは端末/stdin から読み取ります。--all は revoked の監査記録も含み、revoke-client はその OAuth client の全認可を無効化します。",
+            "这些命令需要已注册设备凭据。审批码从终端/stdin 读取。--all 包含 revoked 审计记录；revoke-client 会使该 OAuth client 的全部授权失效。page-assist allow 同时在转发时为该端点派生 provider `*` 的 webchat-control 授权，page-assist deny 会一并撤销。",
+            "登録済みデバイスの認証情報が必要です。承認コードは端末/stdin から読み取ります。--all は revoked の監査記録も含み、revoke-client はその OAuth client の全認可を無効化します。page-assist allow は転送時にそのエンドポイントの provider `*` webchat-control 認可も派生し、deny で両方取り消します。",
         )
     )
 }

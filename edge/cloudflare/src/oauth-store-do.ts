@@ -5,6 +5,7 @@ import {
   appendMigrateRejectAudit,
   applyPlanIfFresh,
   isMigrateRejectStage,
+  listActiveSiblingRows,
   listAllOrphans,
   listOrphans,
   migratePostconditionSatisfied,
@@ -915,8 +916,29 @@ export class OAuthStoreDO {
     // Records that fail normalization are never offered; report the count (fixed field).
     const invalidRecords = records.filter((r) => r === null).length;
     if (action === "list") {
-      const orphans = listAllOrphans(records).filter((row) => row.device_id === deviceId);
-      return json({ ok: true, orphans, invalid_records: invalidRecords });
+      const connectorEntries = await this.state.storage.list<OAuthConnectorRecord>({ prefix: CONNECTOR_PREFIX });
+      const activeConnectorIds = new Set<string>();
+      for (const raw of connectorEntries.values()) {
+        const conn = normalizeConnector(raw);
+        if (conn && conn.status === "active") activeConnectorIds.add(conn.connector_id);
+      }
+      const orphans = listAllOrphans(records, activeConnectorIds).filter((row) => row.device_id === deviceId);
+      const activeConnectorRows = listActiveSiblingRows(records, activeConnectorIds).filter((row) => row.device_id === deviceId);
+      return json({
+        ok: true,
+        orphans,
+        ...(activeConnectorRows.length > 0
+          ? {
+              active_connector_rows: activeConnectorRows,
+              orphan_accounting: {
+                stranded_orphan_count: orphans.length,
+                active_rotated_pointer_count: activeConnectorRows.length,
+                total_non_pointer_rows: orphans.length + activeConnectorRows.length,
+              },
+            }
+          : {}),
+        invalid_records: invalidRecords,
+      });
     }
     const plan = planMigration(records, body?.from, body?.to, deviceId);
     if (!plan.ok) return json({ ...plan, invalid_records: invalidRecords }, 409);

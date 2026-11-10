@@ -34,6 +34,12 @@ pub struct GrantRecord {
     pub connector_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_generation: Option<u64>,
+    /// Optional set of still-active sibling connector IDs for the same OAuth
+    /// client (#882). When populated, rows belonging to an active sibling
+    /// connector whose client-level pointer rotated to a newer approval are
+    /// accounted as active rotated-pointer rows rather than stranded orphans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_connector_ids: Vec<String>,
     #[serde(default)]
     pub page_assist: Vec<GrantRow>,
     #[serde(default)]
@@ -167,9 +173,192 @@ pub fn list_orphans(record: &GrantRecord) -> Vec<OrphanRow<'_>> {
         return Vec::new();
     };
     all_rows(record)
-        .filter(|(_, row)| row.connector_id != current)
+        .filter(|(_, row)| {
+            row.connector_id != current
+                && !record
+                    .active_connector_ids
+                    .iter()
+                    .any(|active| active == &row.connector_id)
+        })
         .map(|(kind, row)| OrphanRow { kind, row })
         .collect()
+}
+
+/// Annotate a grant row JSON value with derived `*` WebChat control metadata
+/// when `kind == "page_assist"` (#882).
+fn annotate_page_assist_derived_wildcard(row: &mut serde_json::Value) {
+    if row.get("kind").and_then(serde_json::Value::as_str) != Some("page_assist") {
+        return;
+    }
+    let endpoint_ref = row
+        .get("endpoint_ref")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if endpoint_ref.is_empty() || endpoint_ref == "*" {
+        return;
+    }
+    if let Some(obj) = row.as_object_mut() {
+        obj.entry("derived_webchat_control".to_owned())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "provider": "*",
+                    "account_ref": "*",
+                    "scope": "endpoint"
+                })
+            });
+    }
+}
+
+/// Reconcile `/connectors/page-assist/orphans` list output with the fleet's
+/// currently active connector IDs (#882):
+/// - Rows whose `connector_id` is still active on `/connectors` (for example a
+///   sibling ChatGPT connector whose OAuth client pointer rotated to a newer
+///   approval) are moved to `active_connector_rows` with
+///   `connector_status: "active_rotated_pointer"` and `effective_at_forward: true`.
+/// - `orphans` retains only rows bound to revoked or non-active connectors.
+/// - `page_assist` rows disclose `derived_webchat_control` (`provider: "*"`,
+///   `account_ref: "*"`, `scope: "endpoint"`).
+pub fn reconcile_orphan_list_response(
+    mut payload: serde_json::Value,
+    active_connector_ids: &std::collections::BTreeSet<String>,
+) -> serde_json::Value {
+    let Some(raw_orphans) = payload
+        .get_mut("orphans")
+        .and_then(serde_json::Value::as_array_mut)
+        .map(std::mem::take)
+    else {
+        return payload;
+    };
+
+    let mut stranded = Vec::new();
+    let mut active_rotated = payload
+        .get_mut("active_connector_rows")
+        .and_then(serde_json::Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+
+    for row in &mut active_rotated {
+        annotate_page_assist_derived_wildcard(row);
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert(
+                "connector_status".to_owned(),
+                serde_json::Value::String("active_rotated_pointer".to_owned()),
+            );
+            obj.insert(
+                "effective_at_forward".to_owned(),
+                serde_json::Value::Bool(true),
+            );
+        }
+    }
+
+    let mut existing_active_keys = std::collections::BTreeSet::new();
+    for row in &active_rotated {
+        let key = (
+            row.get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            row.get("connector_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            row.get("device_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            row.get("endpoint_ref")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            row.get("provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            row.get("account_ref")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+        );
+        existing_active_keys.insert(key);
+    }
+
+    for mut row in raw_orphans {
+        annotate_page_assist_derived_wildcard(&mut row);
+        let conn_id = row
+            .get("connector_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !conn_id.is_empty() && active_connector_ids.contains(conn_id) {
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert(
+                    "connector_status".to_owned(),
+                    serde_json::Value::String("active_rotated_pointer".to_owned()),
+                );
+                obj.insert(
+                    "effective_at_forward".to_owned(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            let key = (
+                row.get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                row.get("connector_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                row.get("device_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                row.get("endpoint_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                row.get("provider")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                row.get("account_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            );
+            if existing_active_keys.insert(key) {
+                active_rotated.push(row);
+            }
+        } else {
+            if let Some(obj) = row.as_object_mut() {
+                obj.entry("connector_status".to_owned()).or_insert_with(|| {
+                    serde_json::Value::String("stranded_inactive_connector".to_owned())
+                });
+                obj.entry("effective_at_forward".to_owned())
+                    .or_insert_with(|| serde_json::Value::Bool(false));
+            }
+            stranded.push(row);
+        }
+    }
+
+    let stranded_count = stranded.len();
+    let active_rotated_count = active_rotated.len();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("orphans".to_owned(), serde_json::Value::Array(stranded));
+        obj.insert(
+            "active_connector_rows".to_owned(),
+            serde_json::Value::Array(active_rotated),
+        );
+        obj.insert(
+            "orphan_accounting".to_owned(),
+            serde_json::json!({
+                "stranded_orphan_count": stranded_count,
+                "active_rotated_pointer_count": active_rotated_count,
+                "total_non_pointer_rows": stranded_count + active_rotated_count,
+                "note": "orphans lists only rows bound to revoked or inactive connectors; active_connector_rows lists rows bound to still-active sibling connectors whose client grant pointer rotated to a newer approval"
+            }),
+        );
+    }
+    payload
 }
 
 /// Dry run. Takes `&GrantRecord`, so it cannot write. Fails closed.
@@ -496,6 +685,7 @@ mod tests {
             status: "active".into(),
             connector_id: Some(NEW.into()),
             grant_generation: Some(1),
+            active_connector_ids: Vec::new(),
             page_assist: vec![
                 row(OLD, "d1", "e1"),
                 row(NEW, "d1", "e2"),
@@ -967,5 +1157,65 @@ mod tests {
             serde_json::to_string(&body).unwrap(),
             r#"{"code":"caller_grant_missing","ok":false,"retryable":false}"#
         );
+    }
+
+    #[test]
+    fn list_orphans_excludes_active_sibling_connectors_when_present() {
+        let mut rec = record();
+        rec.active_connector_ids = vec![OLD2.to_owned()];
+        let orphans = list_orphans(&rec);
+        assert!(orphans.iter().all(|o| o.row.connector_id == OLD));
+        assert_eq!(orphans.len(), 2);
+    }
+
+    #[test]
+    fn reconcile_orphan_list_response_separates_active_sibling_rows_and_discloses_derived_wildcard()
+    {
+        let raw = serde_json::json!({
+            "ok": true,
+            "orphans": [
+                {
+                    "kind": "page_assist",
+                    "client_id": "https://chatgpt.com/oauth/client.json",
+                    "current_connector_id": NEW,
+                    "connector_id": OLD,
+                    "grant_generation": 1,
+                    "device_id": "dev_01M1BDHFE8TJ2PZGQAAG4T1A3V",
+                    "endpoint_ref": "ep_1"
+                },
+                {
+                    "kind": "page_assist",
+                    "client_id": "https://chatgpt.com/oauth/client.json",
+                    "current_connector_id": NEW,
+                    "connector_id": OLD2,
+                    "grant_generation": 2,
+                    "device_id": "dev_01M1BDHFE8TJ2PZGQAAG4T1A3V",
+                    "endpoint_ref": "ep_2"
+                }
+            ],
+            "invalid_records": 0
+        });
+        let active = std::collections::BTreeSet::from([NEW.to_owned(), OLD2.to_owned()]);
+        let reconciled = reconcile_orphan_list_response(raw, &active);
+        let orphans = reconciled["orphans"].as_array().unwrap();
+        let active_rows = reconciled["active_connector_rows"].as_array().unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0]["connector_id"], OLD);
+        assert_eq!(
+            orphans[0]["connector_status"],
+            "stranded_inactive_connector"
+        );
+        assert_eq!(orphans[0]["derived_webchat_control"]["provider"], "*");
+        assert_eq!(active_rows.len(), 1);
+        assert_eq!(active_rows[0]["connector_id"], OLD2);
+        assert_eq!(active_rows[0]["connector_status"], "active_rotated_pointer");
+        assert_eq!(active_rows[0]["effective_at_forward"], true);
+        assert_eq!(active_rows[0]["derived_webchat_control"]["provider"], "*");
+        assert_eq!(reconciled["orphan_accounting"]["stranded_orphan_count"], 1);
+        assert_eq!(
+            reconciled["orphan_accounting"]["active_rotated_pointer_count"],
+            1
+        );
+        assert_eq!(reconciled["orphan_accounting"]["total_non_pointer_rows"], 2);
     }
 }

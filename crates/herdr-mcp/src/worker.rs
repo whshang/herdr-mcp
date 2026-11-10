@@ -205,7 +205,143 @@ fn render_device_inventory(mut payload: Value, now_ms: u64) -> Value {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+fn connector_platform_key(connector: &Value) -> String {
+    connector
+        .get("connector_name")
+        .and_then(Value::as_str)
+        .or_else(|| connector.get("client_name").and_then(Value::as_str))
+        .or_else(|| connector.get("client_id").and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .trim()
+        .to_lowercase()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+fn plan_stale_connector_prune(payload: &Value, now_ms: u64, idle_days: u64) -> Vec<Value> {
+    let idle_threshold_ms = idle_days.saturating_mul(24 * 60 * 60 * 1_000);
+    let Some(connectors) = payload.get("connectors").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut active_by_platform: std::collections::BTreeMap<String, Vec<&Value>> =
+        std::collections::BTreeMap::new();
+    for conn in connectors {
+        if conn.get("status").and_then(Value::as_str) == Some("active") {
+            active_by_platform
+                .entry(connector_platform_key(conn))
+                .or_default()
+                .push(conn);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (platform, mut group) in active_by_platform {
+        if group.len() <= 1 {
+            continue;
+        }
+        // Sort so the primary active connector is first: highest last_used_at_ms, then highest created_at_ms.
+        group.sort_by(|a, b| {
+            let a_used = a
+                .get("last_used_at_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let b_used = b
+                .get("last_used_at_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let a_created = a.get("created_at_ms").and_then(Value::as_u64).unwrap_or(0);
+            let b_created = b.get("created_at_ms").and_then(Value::as_u64).unwrap_or(0);
+            b_used.cmp(&a_used).then_with(|| b_created.cmp(&a_created))
+        });
+        let primary_id = group[0]
+            .get("connector_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        for conn in group.into_iter().skip(1) {
+            let Some(conn_id) = conn.get("connector_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let has_label = conn
+                .get("platform_account")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if has_label {
+                continue;
+            }
+            let created_ms = conn
+                .get("created_at_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(now_ms);
+            let last_used_ms = conn.get("last_used_at_ms").and_then(Value::as_u64);
+            let reference_ms = last_used_ms.unwrap_or(created_ms);
+            let idle_ms = now_ms.saturating_sub(reference_ms);
+            if idle_ms >= idle_threshold_ms {
+                candidates.push(json!({
+                    "connector_id": conn_id,
+                    "platform": platform,
+                    "primary_connector_id": primary_id,
+                    "usage_state": if last_used_ms.is_some() { "stale_duplicate" } else { "never_used_duplicate" },
+                    "idle_days": idle_ms / (24 * 60 * 60 * 1_000),
+                    "revoke_command": format!("herdr-mcp connector revoke {conn_id} --confirm"),
+                }));
+            }
+        }
+    }
+    candidates
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn render_connector_inventory(mut payload: Value, now_ms: u64, include_all: bool) -> Value {
+    let stale_candidates = plan_stale_connector_prune(&payload, now_ms, 14);
+    let stale_ids: std::collections::BTreeSet<String> = stale_candidates
+        .iter()
+        .filter_map(|c| {
+            c.get("connector_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+
+    let mut platform_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut primary_by_platform: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    if let Some(connectors) = payload.get("connectors").and_then(Value::as_array) {
+        let mut grouped: std::collections::BTreeMap<String, Vec<&Value>> =
+            std::collections::BTreeMap::new();
+        for conn in connectors {
+            if conn.get("status").and_then(Value::as_str) == Some("active") {
+                grouped
+                    .entry(connector_platform_key(conn))
+                    .or_default()
+                    .push(conn);
+            }
+        }
+        for (platform, mut group) in grouped {
+            platform_counts.insert(platform.clone(), group.len());
+            group.sort_by(|a, b| {
+                let a_used = a
+                    .get("last_used_at_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let b_used = b
+                    .get("last_used_at_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let a_created = a.get("created_at_ms").and_then(Value::as_u64).unwrap_or(0);
+                let b_created = b.get("created_at_ms").and_then(Value::as_u64).unwrap_or(0);
+                b_used.cmp(&a_used).then_with(|| b_created.cmp(&a_created))
+            });
+            if let Some(primary_id) = group
+                .first()
+                .and_then(|c| c.get("connector_id"))
+                .and_then(Value::as_str)
+            {
+                primary_by_platform.insert(platform, primary_id.to_owned());
+            }
+        }
+    }
+
     if let Some(connectors) = payload.get_mut("connectors").and_then(Value::as_array_mut) {
         if !include_all {
             connectors.retain(|connector| {
@@ -216,6 +352,45 @@ fn render_connector_inventory(mut payload: Value, now_ms: u64, include_all: bool
             let created = connector.get("created_at_ms").and_then(Value::as_u64);
             let last_used = connector.get("last_used_at_ms").and_then(Value::as_u64);
             annotate_inventory_entry(connector, created, last_used, now_ms, false);
+            if connector.get("status").and_then(Value::as_str) == Some("active") {
+                let platform = connector_platform_key(connector);
+                let count = platform_counts.get(&platform).copied().unwrap_or(1);
+                let conn_id = connector
+                    .get("connector_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let is_primary = primary_by_platform
+                    .get(&platform)
+                    .is_some_and(|p| p == &conn_id);
+                let is_stale_candidate = stale_ids.contains(&conn_id);
+                let hygiene_status = if count <= 1 {
+                    "single_active"
+                } else if is_primary {
+                    "primary_active"
+                } else if is_stale_candidate {
+                    "stale_duplicate_candidate"
+                } else {
+                    "active_sibling"
+                };
+                if let Some(obj) = connector.as_object_mut() {
+                    obj.insert(
+                        "routing_hygiene".to_owned(),
+                        json!({
+                            "status": hygiene_status,
+                            "platform_active_count": count,
+                            "prune_recommended": is_stale_candidate,
+                            "cleanup_hint": if is_stale_candidate {
+                                Value::String(format!("herdr-mcp connector revoke {conn_id} --confirm"))
+                            } else if count > 1 && !is_primary {
+                                Value::String(format!("herdr-mcp connector label {conn_id} <platform>-<account>"))
+                            } else {
+                                Value::Null
+                            }
+                        }),
+                    );
+                }
+            }
         }
     }
     if let Some(legacy) = payload
@@ -234,6 +409,18 @@ fn render_connector_inventory(mut payload: Value, now_ms: u64, include_all: bool
         }
     }
 
+    let duplicate_groups: Vec<Value> = platform_counts
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(platform, count)| {
+            json!({
+                "platform": platform,
+                "active_count": count,
+                "primary_connector_id": primary_by_platform.get(platform).cloned().unwrap_or_default(),
+            })
+        })
+        .collect();
+
     let listed_counts = displayed_connector_token_counts(&payload);
     if let Some(object) = payload.as_object_mut() {
         // Preserve the Edge aggregate for backward compatibility, but make its
@@ -251,6 +438,14 @@ fn render_connector_inventory(mut payload: Value, now_ms: u64, include_all: bool
         object.insert(
             "listed_token_counts_scope".to_owned(),
             json!("displayed_records"),
+        );
+        object.insert(
+            "routing_hygiene_summary".to_owned(),
+            json!({
+                "duplicate_platform_groups": duplicate_groups,
+                "stale_connector_candidates": stale_candidates,
+                "prune_command": "herdr-mcp connector prune-stale --dry-run",
+            }),
         );
     }
     payload
@@ -297,7 +492,10 @@ fn render_automation_inventory(mut payload: Value, now_ms: u64) -> Value {
 fn worker_command_requires_supported_workstation(command: &WorkerCommand) -> bool {
     !matches!(
         command,
-        WorkerCommand::List | WorkerCommand::ConnectorList { .. } | WorkerCommand::AutomationList
+        WorkerCommand::List
+            | WorkerCommand::ConnectorList { .. }
+            | WorkerCommand::ConnectorPruneStale { confirm: false, .. }
+            | WorkerCommand::AutomationList
     )
 }
 
@@ -356,6 +554,9 @@ pub fn run(command: WorkerCommand, language: Locale) -> Result<ExitCode, String>
         WorkerCommand::ConnectorCancel { request_id } => cancel_connector(&paths, &request_id),
         WorkerCommand::ConnectorList { include_all } => list_connectors(&paths, include_all),
         WorkerCommand::ConnectorRevoke { connector_id } => revoke_connector(&paths, &connector_id),
+        WorkerCommand::ConnectorPruneStale { confirm, idle_days } => {
+            prune_stale_connectors(&paths, confirm, idle_days)
+        }
         WorkerCommand::ConnectorClientRevoke { client_id } => {
             revoke_connector_client(&paths, &client_id)
         }
@@ -1540,16 +1741,34 @@ fn connector_page_assist_orphans(
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client_for_origin(&identity.edge_origin)?
+    let client = client_for_origin(&identity.edge_origin)?;
+    let response = client
         .post(endpoint(
             &identity.edge_origin,
             "/connectors/page-assist/orphans",
         )?)
-        .headers(headers)
+        .headers(headers.clone())
         .json(&body)
         .send()
         .map_err(|error| format!("cannot read Connector Page Assist orphans: {error}"))?;
-    let payload = parse_json_response(response, "connector Page Assist orphans")?;
+    let mut payload = parse_json_response(response, "connector Page Assist orphans")?;
+    if from.is_none() && to.is_none() {
+        let mut active_ids = std::collections::BTreeSet::new();
+        if let Ok(inv_url) = endpoint(&identity.edge_origin, "/connectors")
+            && let Ok(inv_resp) = client.get(inv_url).headers(headers).send()
+            && let Ok(inv_json) = parse_json_response(inv_resp, "connector inventory")
+            && let Some(conns) = inv_json.get("connectors").and_then(Value::as_array)
+        {
+            for conn in conns {
+                if conn.get("status").and_then(Value::as_str) == Some("active")
+                    && let Some(id) = conn.get("connector_id").and_then(Value::as_str)
+                {
+                    active_ids.insert(id.to_owned());
+                }
+            }
+        }
+        payload = crate::grant_migration::reconcile_orphan_list_response(payload, &active_ids);
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&payload).map_err(|error| format!(
@@ -2041,6 +2260,10 @@ fn set_connector_page_assist(
         .send()
         .map_err(|error| format!("cannot change Connector Page Assist grant: {error}"))?;
     let payload = parse_json_response(response, "connector Page Assist")?;
+    let effective_allowed = payload
+        .get("allowed")
+        .and_then(Value::as_bool)
+        .unwrap_or(allowed);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -2049,7 +2272,19 @@ fn set_connector_page_assist(
             "connector_id": connector_id,
             "device_id": device_id,
             "endpoint_ref": endpoint_ref,
-            "allowed": payload.get("allowed").cloned().unwrap_or(Value::Bool(allowed)),
+            "allowed": effective_allowed,
+            "derived_webchat_control": {
+                "device_id": device_id,
+                "endpoint_ref": endpoint_ref,
+                "provider": "*",
+                "account_ref": "*",
+                "effective_on_forward": effective_allowed,
+                "note": if effective_allowed {
+                    "Page Assist allow also derives endpoint-scoped WebChat control for provider '*' and account '*' at forward time (PR #595)."
+                } else {
+                    "Page Assist deny also revokes the derived endpoint-scoped WebChat control for provider '*' and account '*'."
+                }
+            }
         }))
         .map_err(|error| format!("cannot encode Connector Page Assist result: {error}"))?
     );
@@ -2088,6 +2323,86 @@ fn list_connectors(paths: &RuntimePaths, include_all: bool) -> Result<ExitCode, 
         "{}",
         serde_json::to_string_pretty(&payload)
             .map_err(|error| format!("cannot encode connector inventory: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn prune_stale_connectors(
+    _paths: &RuntimePaths,
+    _confirm: bool,
+    _idle_days: u64,
+) -> Result<ExitCode, String> {
+    Err(
+        "connector prune-stale is supported on macOS, Linux, and Windows enrolled devices; this platform has no supported enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn prune_stale_connectors(
+    paths: &RuntimePaths,
+    confirm: bool,
+    idle_days: u64,
+) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let client = client_for_origin(&identity.edge_origin)?;
+    let response = client
+        .get(endpoint(&identity.edge_origin, "/connectors")?)
+        .headers(headers.clone())
+        .send()
+        .map_err(|error| format!("cannot list Connectors: {error}"))?;
+    let inventory = parse_json_response(response, "connector inventory")?;
+    let candidates = plan_stale_connector_prune(&inventory, inventory_now_ms(), idle_days);
+    if !confirm {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "action": "connector_prune_stale_dry_run",
+                "dry_run": true,
+                "idle_days": idle_days,
+                "candidate_count": candidates.len(),
+                "candidates": candidates,
+                "confirm_command": format!("herdr-mcp connector prune-stale --confirm --idle-days {idle_days}"),
+            }))
+            .map_err(|error| format!("cannot encode connector prune-stale plan: {error}"))?
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut revoked = Vec::new();
+    for candidate in &candidates {
+        let Some(conn_id) = candidate.get("connector_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let revoke_resp = client
+            .post(endpoint(&identity.edge_origin, "/connectors/revoke")?)
+            .headers(headers.clone())
+            .json(&connector_revoke_request_body(conn_id))
+            .send()
+            .map_err(|error| format!("cannot revoke stale Connector {conn_id}: {error}"))?;
+        let _ = parse_json_response(revoke_resp, "connector revoke")?;
+        revoked.push(conn_id.to_owned());
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "connector_prune_stale",
+            "dry_run": false,
+            "idle_days": idle_days,
+            "revoked_count": revoked.len(),
+            "revoked": revoked,
+        }))
+        .map_err(|error| format!("cannot encode connector prune-stale result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -4865,5 +5180,68 @@ mod platform_account_selector_tests {
         assert!(select_active_connector_id("grokbot-owner@example.com", &inventory).is_err());
         assert!(select_active_connector_id("claude-missing@example.com", &inventory).is_err());
         assert!(select_active_connector_id("Cursor", &inventory).is_err());
+    }
+
+    #[test]
+    fn render_connector_inventory_reports_duplicate_platform_hygiene_and_stale_candidates() {
+        let now = 30 * 24 * 60 * 60 * 1_000_u64;
+        let twenty_days_ago = now - 20 * 24 * 60 * 60 * 1_000;
+        let one_hour_ago = now - 60 * 60 * 1_000;
+        let rendered = render_connector_inventory(
+            json!({
+                "ok": true,
+                "connectors": [
+                    {
+                        "connector_id": "conn_primary0001",
+                        "client_id": "https://chatgpt.com/oauth/client.json",
+                        "connector_name": "ChatGPT",
+                        "created_at_ms": twenty_days_ago,
+                        "last_used_at_ms": one_hour_ago,
+                        "status": "active"
+                    },
+                    {
+                        "connector_id": "conn_stale000002",
+                        "client_id": "https://chatgpt.com/oauth/client.json",
+                        "connector_name": "ChatGPT",
+                        "created_at_ms": twenty_days_ago,
+                        "last_used_at_ms": null,
+                        "status": "active"
+                    }
+                ]
+            }),
+            now,
+            false,
+        );
+        assert_eq!(
+            rendered["connectors"][0]["routing_hygiene"]["status"],
+            "primary_active"
+        );
+        assert_eq!(
+            rendered["connectors"][1]["routing_hygiene"]["status"],
+            "stale_duplicate_candidate"
+        );
+        assert_eq!(
+            rendered["connectors"][1]["routing_hygiene"]["prune_recommended"],
+            true
+        );
+        let summary = &rendered["routing_hygiene_summary"];
+        assert_eq!(
+            summary["duplicate_platform_groups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            summary["stale_connector_candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            summary["stale_connector_candidates"][0]["connector_id"],
+            "conn_stale000002"
+        );
     }
 }
