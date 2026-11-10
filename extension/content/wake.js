@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.246";
+const H2W_CONTENT_VERSION = "0.1.247";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -477,7 +477,9 @@ function normalizeHerdrMentionAlias(value) {
     const el = ADAPTER.getInputEl();
     if (!el) return false;
     // ProseMirror splits newlines into paragraphs, so compare normalized text.
-    return normText(el.innerText || el.textContent).includes(normText(text));
+    const target = normText(text);
+    if (normText(el.innerText || el.textContent).includes(target)) return true;
+    return normText(extractDomNodeTextWithHttpLinks(el)).includes(target);
   }
   async function ensureCommitted(text, maxAttempts = 3) {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -1146,7 +1148,7 @@ function normalizeHerdrMentionAlias(value) {
     // holds exactly the turn this submit inserted.
     const latestUser = latestTurnForRole("user");
     if (!latestUser || latestUser === baseline?.userTurn) return false;
-    const latestText = normText(latestUser.innerText || latestUser.textContent || "");
+    const latestText = normText(extractDomNodeTextWithHttpLinks(latestUser));
     if (!providerUserTextMatchesSubmitted(latestText, baseline)) return false;
     const convKey = ADAPTER.getConversationKey();
     if (baseline?.expectedConvKey) {
@@ -2017,6 +2019,78 @@ function normalizeHerdrMentionAlias(value) {
   // Exact submit acceptance. The provider user text must equal what was
   // submitted on the whitespace-canonical form; a short prefix overlap is never
   // enough because a foreign turn can occur inside the outgoing prompt.
+  function unwrapProseMirrorHttpLinks(text) {
+    const raw = String(text || "");
+    if (!raw.includes("http://") && !raw.includes("https://")) return raw;
+    return raw
+      .replace(/[\u200b-\u200d\u2060]+(?=(?:https?:\/\/|\[))/gi, "")
+      .replace(/(https?:\/\/\S+?)[\u200b-\u200d\u2060]+/gi, "$1")
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, (full, label, href) => {
+        const cleanLabel = String(label || "").replace(/[\u200b-\u200d\u2060\ufeff]/g, "").trim();
+        const cleanHref = String(href || "").replace(/[\u200b-\u200d\u2060\ufeff]/g, "").trim();
+        const bareLabel = cleanLabel.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+        const bareHref = cleanHref.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+        if (cleanLabel === cleanHref || (bareLabel && bareLabel === bareHref)) {
+          return cleanHref;
+        }
+        return full;
+      });
+  }
+
+  function extractDomNodeTextWithHttpLinks(root) {
+    if (!root) return "";
+    if (typeof root.cloneNode !== "function" || typeof root.querySelectorAll !== "function") {
+      return unwrapProseMirrorHttpLinks(String(root.innerText || root.textContent || ""));
+    }
+    try {
+      const clone = root.cloneNode(true);
+      for (const node of clone.querySelectorAll(
+        'a[href^="http://"], a[href^="https://"], [data-prompt-link-href^="http://"], [data-prompt-link-href^="https://"], [data-inline-selection-pill]',
+      )) {
+        if (node.getAttribute?.("data-symbol") === "ecosystemMention" || node.hasAttribute?.("data-keyword")) {
+          continue;
+        }
+        const href = String(
+          node.getAttribute?.("data-prompt-link-href")
+          || node.getAttribute?.("href")
+          || node.getAttribute?.("data-url")
+          || node.querySelector?.('a[href^="http://"], a[href^="https://"]')?.getAttribute?.("href")
+          || "",
+        ).trim();
+        if (!/^https?:\/\/\S+$/i.test(href)) continue;
+        const visible = String(node.textContent || "").replace(/[\u200b-\u200d\u2060\ufeff]/g, "").trim();
+        if (visible !== href) {
+          node.textContent = href;
+        }
+      }
+      return unwrapProseMirrorHttpLinks(String(clone.innerText || clone.textContent || ""));
+    } catch (_) {
+      return unwrapProseMirrorHttpLinks(String(root.innerText || root.textContent || ""));
+    }
+  }
+
+  function normalizeBareUrlsAgainstSubmitted(observed, submitted) {
+    const rawObserved = String(observed || "");
+    const rawSubmitted = String(submitted || "");
+    if (!rawObserved || !rawSubmitted || !/https?:\/\/\S+/i.test(rawSubmitted)) return rawObserved;
+    let next = unwrapProseMirrorHttpLinks(rawObserved);
+    const urls = rawSubmitted.match(/https?:\/\/\S+/gi) || [];
+    for (const rawUrl of urls) {
+      const cleanUrl = rawUrl.replace(/[),.;!?]+$/, "");
+      const bare = cleanUrl.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+      if (!bare) continue;
+      if (!next.includes(cleanUrl)) {
+        const withSlash = `${cleanUrl.replace(/\/+$/, "")}/`;
+        if (next.includes(withSlash)) {
+          next = next.split(withSlash).join(cleanUrl);
+        } else if (next.includes(bare)) {
+          next = next.split(bare).join(cleanUrl);
+        }
+      }
+    }
+    return next;
+  }
+
   function providerUserTextMatchesSubmitted(observedText, baseline) {
     if (!baseline) return false;
     const observed = canonicalAcceptanceText(observedText);
@@ -2026,7 +2100,9 @@ function normalizeHerdrMentionAlias(value) {
     if (submitted && observed === submitted) return true;
     if (composer && observed === composer) return true;
     if (!submitted) return false;
-    return canonicalAcceptanceText(stripLeadingAppMentionTokens(observedText, baseline.selectedApps)) === submitted;
+    const stripped = stripLeadingAppMentionTokens(observedText, baseline.selectedApps);
+    if (canonicalAcceptanceText(stripLeadingAppMentionTokens(observedText, baseline.selectedApps)) === submitted) return true;
+    return canonicalAcceptanceText(normalizeBareUrlsAgainstSubmitted(stripped, submitted)) === submitted;
   }
 
   // sha256 digests of the exact accepted provider user text so the runtime can
@@ -3001,11 +3077,30 @@ function normalizeHerdrMentionAlias(value) {
       if (draftCleanup === "cleared" || draftCleanup === "empty") {
         globalThis.__H2W_LAST_AUTOMATION_DRAFT__ = null;
       }
+      const submitStage = typeof result?.error === "string"
+        ? result.error
+        : (typeof result?.blocked === "string" ? result.blocked : "submit-unconfirmed");
       const rejectedEvidence = browserRejectedEvidence(
         evidence,
         creatingSession ? "browser_create_submit_failed" : "browser_dispatch_submit_failed",
       );
       if (draftCleanup) rejectedEvidence.result.automation_draft_cleanup = draftCleanup;
+      rejectedEvidence.result.submit_diagnostics = {
+        submission_surface: creatingSession ? "create_with_message" : "existing_session_send",
+        submit_stage: submitStage,
+        submit_attempted: result?.attempted === true,
+        baseline_server_ok: beforeServer?.ok === true,
+        baseline_user_count: Math.min(
+          Number.isSafeInteger(beforeDom?.count) && beforeDom.count >= 0 ? beforeDom.count : 0,
+          500,
+        ),
+        send_button_visible: typeof findSendButton === "function" ? Boolean(findSendButton()) : false,
+        composer_busy: typeof isComposerGenerating === "function"
+          ? Boolean(isComposerGenerating())
+          : (typeof isTurnInProgress === "function" ? Boolean(isTurnInProgress()) : false),
+        document_hidden: Boolean(typeof document !== "undefined" && document?.hidden),
+        has_bare_http_url: /https?:\/\/\S+/i.test(String(message || "")),
+      };
       return rejectedEvidence;
     }
     evidence.command_accepted = true;
@@ -3093,7 +3188,12 @@ function normalizeHerdrMentionAlias(value) {
           accepted_user_message_ref: acceptedUserMessageRef,
           ...(acceptedApps.length ? { accepted_user_apps: acceptedApps } : {}),
           ...(await providerAcceptanceDigests(
-            serverAdvanced ? afterServer.userText : afterDom.text,
+            typeof normalizeBareUrlsAgainstSubmitted === "function"
+              ? normalizeBareUrlsAgainstSubmitted(
+                  serverAdvanced ? afterServer.userText : afterDom.text,
+                  message,
+                )
+              : (serverAdvanced ? afterServer.userText : afterDom.text),
             requiredApps,
           )),
         };
@@ -4536,7 +4636,10 @@ function normalizeHerdrMentionAlias(value) {
     return {
       messageId,
       exactMessageId: Boolean(exactMessageId),
-      text: String(textRoot?.innerText || textRoot?.textContent || "").replace(/\s+/g, " ").trim(),
+      text: (role === "user" && typeof extractDomNodeTextWithHttpLinks === "function"
+        ? extractDomNodeTextWithHttpLinks(textRoot)
+        : String(textRoot?.innerText || textRoot?.textContent || "")
+      ).replace(/\s+/g, " ").trim(),
       messageAt: Number.isFinite(parsedTime) ? parsedTime : null,
       turnId,
     };
@@ -4583,7 +4686,10 @@ function normalizeHerdrMentionAlias(value) {
   function serverMessageText(message) {
     const parts = message?.content?.parts;
     if (!Array.isArray(parts)) return "";
-    return parts.map((part) => typeof part === "string" ? part : (part?.text || "")).join("\n").replace(/\s+/g, " ").trim();
+    const joined = parts.map((part) => typeof part === "string" ? part : (part?.text || "")).join("\n");
+    return (typeof unwrapProseMirrorHttpLinks === "function" ? unwrapProseMirrorHttpLinks(joined) : joined)
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   function boundedHandoffTranscript(rows, maxChars = 70000) {

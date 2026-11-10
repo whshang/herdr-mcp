@@ -488,6 +488,27 @@ test("user finalizes one owned generic page | Given open is retried across a ser
   assert.ok(capacityStorage.herdrBrowserPagesV1.every((record) => record.ownership === "owned"));
 });
 
+test("user opens a page that exceeds the 15s load completion fence | Given waitForTabComplete returns a still-loading tab | When BrowserPage open runs | Then it reports browser_page_load_timeout instead of browser_page_storage_unavailable and cleans up the tab (#883)", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({ sessionStorage, tabs, deferredCreate: true });
+  const origCreate = tabs.set.bind(tabs);
+  tabs.set = (id, tab) => origCreate(id, { ...tab, pendingUrl: null, url: "https://example.com/slow", status: "loading" });
+  const timedOut = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/slow",
+    idempotencyKey: "open-load-timeout-883",
+  });
+  assert.equal(timedOut.ok, false);
+  assert.equal(timedOut.error, "browser_page_load_timeout");
+  assert.equal(timedOut.reason, "tab_load_fence_timeout");
+  assert.equal(timedOut.tab_opened, true);
+  assert.equal(timedOut.tab_closed, true);
+  assert.equal(timedOut.tab_cleanup_verified, true);
+  assert.equal(tabs.size, 0);
+});
+
 test("user finalizes an owned page whose tab is already gone | Given another tab still shows the same URL | When finalize runs | Then cleanup is not reported verified and the remaining tab is counted", async () => {
   const sessionStorage = {};
   const tabs = new Map();
