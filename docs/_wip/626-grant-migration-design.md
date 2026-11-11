@@ -4,7 +4,7 @@
 - Status: design only. No code in this change implements this document.
 - Revision: rev 2, responds to the PI review on PR #630 (comment 6145101428).
   Source line references are against `origin/main` d193380a.
-- Incident (2026-10-13, qingxian-macbookair): ChatGPT `@herdr` 调用持续返回 `caller_grant_missing`。两个叠加原因之一是:重新授权 ChatGPT 生成了新的 `connector_id`,前任 connector 名下的 grant 行仍在记录里,但匹配不上新 connector,于是静默失效。所有者没有任何提示,需要重新手动 `connector page-assist allow`。
+- Incident (2026-10-13, macbook-air-uat): ChatGPT `@herdr` 调用持续返回 `caller_grant_missing`。两个叠加原因之一是:重新授权 ChatGPT 生成了新的 `connector_id`,前任 connector 名下的 grant 行仍在记录里,但匹配不上新 connector,于是静默失效。所有者没有任何提示,需要重新手动 `connector page-assist allow`。
 
 ## 0. Invariant
 

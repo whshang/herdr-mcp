@@ -108,12 +108,12 @@ Custom Domain がない場合は、まず `workers.dev` への直接接続を試
 - マシンが canonical な `dev_<ULID>` デバイス identity を持つ。
 - 認証済みの実際の MCP リクエストが、公開 origin からこのワークステーションへ往復して完了する。
 
-その後、ChatGPT の **Settings → Account security & login** を開いて **Developer mode** を有効にします。**Plugins → Browse plugins** で右上の **+ → Create APP** を選び、完全な `https://…workers.dev/mcp` を使って MCP App を作成し、OAuth を完了します。推奨例の App 名は `herdr` ですが、カスタム名も利用できます。ChatGPT の Project 内で作業し、新しいチャットの最初のメッセージでワークステーションへアクセスするとき、その App を `+` ボタンから選択または参照します。拡張が実際の provider-owned App keyword を学習し、後続の Herdr turn で再利用します。
+その後、ChatGPT の **Settings → Apps & Connectors**（旧 UI **Plugins → Browse plugins**）で **Developer mode** を有効にし、右上の **+ → Create APP** から完全な `https://…workers.dev/mcp` で MCP App を作成して OAuth とローカル承認を完了します。推奨名は `herdr`（カスタム名可）です。ChatGPT の Project 内で作業し、新しいチャットの最初のメッセージで `+` ボタンからその App を選択します。
 
-Chrome 拡張 / Native Messaging の経路は任意であり、コア Connector の前提条件ではありません。ユーザーがブラウザの連続性、引き継ぎ、Control Center を望むときにだけ、[拡張のガイド](extension.md)からインストールしてください。拡張の配布 / 開発の詳細はそのガイドに残します。
+Chrome 拡張 / Native Messaging は任意です。v1.1 の Control Center、次ターン予約、ID 不要の引き継ぎ、マルチ WebChat（`ChatGPT`、`Claude`、`Grok`、`Doubao`）、境界付き `browser-page`、ブラウザスキルが必要な場合のみ、[拡張のガイド](extension.md)と[WebChat ガイド](local-agent-webchat-control.md)に従いストア導入または `herdr-mcp extension standalone install` を実行します。
 
-## 8. クリーンアップと報告
+## 8. クリーンアップ、更新と報告
 
-`CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` を unset し、一時的な資格情報ファイルを削除します。報告するのは秘密でない事実だけです。runtime version、デバイス名 / id（必要なら表示用に短縮）、Worker 名、最終的な公開 origin、Link 状態、`/health`、OAuth、MCP E2E の結果です。
+`CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` を unset し、一時資格情報ファイルを削除します。秘密でない事実（runtime version、デバイス名/id、Worker 名、公開 origin、Link 状態、`/health`、OAuth、MCP E2E 結果）のみ報告します。v1.1 の日常更新は署名検証付きの `herdr-mcp update`（Worker 差分通知時のみ別途 `herdr-mcp worker update`、詳細は[自己更新ガイド](runtime-self-upgrade.md)）を使います。
 
-権限、ネットワーク、OAuth、既存 Worker の ownership、mutation の配信の不確実性が進行を妨げる場合は、[手動インストールガイド](install.md)または[トラブルシューティング](troubleshooting.md)の該当セクションを開いてください。メンテナー用の runbook 全体を事前に実行コンテキストへコピーしないでください。
+権限、ネットワーク、OAuth、既存 Worker の ownership、配信の不確実性で止まる場合は、[手動インストールガイド](install.md)または[トラブルシューティング](troubleshooting.md)の該当節だけを開いてください。

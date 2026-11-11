@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 400" role="img" aria-labelledby="arch-title arch-desc">
+  <title id="arch-title">Herdr-MCP 1.1 Two-Plane Architecture</title>
+  <desc id="arch-desc">Web AI reaches local herdr-mcp and persistent Herdr TUI worksites via Cloudflare Edge and an outbound WSS Link; the optional browser extension closes the loop over Native Messaging.</desc>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --frame: #e2e8f0;
+      --card: #ffffff;
+      --card-accent: #eef2ff;
+      --card-accent-stroke: #6366f1;
+      --card-opt: #f1f5f9;
+      --card-opt-stroke: #64748b;
+      --stroke: #cbd5e1;
+      --ink: #0f172a;
+      --muted: #475569;
+      --subtle: #64748b;
+      --accent: #4f46e5;
+      --emerald: #059669;
+      --pill-bg: #e0e7ff;
+      --pill-ink: #3730a3;
+      --tag-bg: #f1f5f9;
+      --tag-ink: #334155;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans", "Noto Sans CJK SC", sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b1120;
+        --frame: #1e293b;
+        --card: #111827;
+        --card-accent: #172036;
+        --card-accent-stroke: #818cf8;
+        --card-opt: #0f172a;
+        --card-opt-stroke: #64748b;
+        --stroke: #334155;
+        --ink: #f8fafc;
+        --muted: #94a3b8;
+        --subtle: #64748b;
+        --accent: #818cf8;
+        --emerald: #34d399;
+        --pill-bg: #1e1b4b;
+        --pill-ink: #c7d2fe;
+        --tag-bg: #1e293b;
+        --tag-ink: #cbd5e1;
+      }
+    }
+    text { font-family: var(--font); fill: var(--ink); }
+    .mono { font-family: var(--mono); }
+    .header-label { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; fill: var(--accent); }
+    .zone-label { font-size: 11px; font-weight: 600; fill: var(--subtle); }
+    .node-title { font-size: 14px; font-weight: 700; }
+    .node-sub { font-size: 11.5px; fill: var(--muted); }
+    .chip { font-size: 10.5px; font-family: var(--mono); fill: var(--tag-ink); }
+    .edge-label { font-size: 10.5px; font-family: var(--mono); font-weight: 600; fill: var(--pill-ink); }
+  </style>
+
+  <defs>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="var(--accent)"/>
+    </marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="var(--emerald)"/>
+    </marker>
+  </defs>
+
+  <!-- Outer Canvas -->
+  <rect x="4" y="4" width="952" height="392" rx="18" fill="var(--bg)" stroke="var(--frame)" stroke-width="1.5"/>
+
+  <!-- Top Eyebrow -->
+  <text x="32" y="34" class="header-label">HERDR-MCP 1.1 ARCHITECTURE · CORE MCP PLANE + OPTIONAL BROWSER LOOP</text>
+  <text x="928" y="34" text-anchor="end" class="zone-label mono">v1.1 · Zero Inbound Workstation Ports</text>
+
+  <!-- Local Workstation Boundary Zone -->
+  <rect x="476" y="48" width="456" height="326" rx="14" fill="none" stroke="var(--stroke)" stroke-width="1.25" stroke-dasharray="5 4"/>
+  <text x="494" y="70" class="zone-label">Your Computers / Enrolled Fleet (Inbound-Closed · Persistent State)</text>
+
+  <!-- Node 1: Web AI -->
+  <rect x="32" y="84" width="176" height="122" rx="12" fill="var(--card)" stroke="var(--stroke)" stroke-width="1.5"/>
+  <text x="48" y="112" class="node-title">Web AI Planner</text>
+  <text x="48" y="132" class="node-sub">Plan from your Web AI chat</text>
+  <text x="48" y="150" class="node-sub">Isolated per account & session</text>
+  <rect x="48" y="168" width="144" height="22" rx="6" fill="var(--tag-bg)"/>
+  <text x="120" y="183" text-anchor="middle" class="chip">ChatGPT · Claude · Grok</text>
+
+  <!-- Arrow 1: Web AI -> Cloudflare Edge -->
+  <line x1="208" y1="145" x2="262" y2="145" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrow-accent)"/>
+  <rect x="212" y="114" width="48" height="20" rx="5" fill="var(--pill-bg)"/>
+  <text x="236" y="128" text-anchor="middle" class="edge-label">/mcp</text>
+  <text x="236" y="164" text-anchor="middle" class="zone-label mono" style="font-size:10px">OAuth</text>
+
+  <!-- Node 2: Cloudflare Edge -->
+  <rect x="266" y="84" width="176" height="122" rx="12" fill="var(--card)" stroke="var(--stroke)" stroke-width="1.5"/>
+  <text x="282" y="112" class="node-title">Cloudflare Edge</text>
+  <text x="282" y="132" class="node-sub">Public HTTPS & OAuth entry</text>
+  <text x="282" y="150" class="node-sub">Explicit device routing & grace</text>
+  <rect x="282" y="168" width="144" height="22" rx="6" fill="var(--tag-bg)"/>
+  <text x="354" y="183" text-anchor="middle" class="chip">Workers Free · DO</text>
+
+  <!-- Arrow 2: Outbound WSS Link (Runtime -> Edge, bidirectional RPC) -->
+  <line x1="496" y1="145" x2="446" y2="145" stroke="var(--emerald)" stroke-width="2" marker-end="url(#arrow-emerald)"/>
+  <rect x="447" y="114" width="48" height="20" rx="5" fill="var(--pill-bg)"/>
+  <text x="471" y="128" text-anchor="middle" class="edge-label">WSS</text>
+  <text x="471" y="164" text-anchor="middle" class="zone-label" style="font-size:10px">Outbound</text>
+
+  <!-- Node 3: herdr-mcp Runtime -->
+  <rect x="498" y="84" width="188" height="122" rx="12" fill="var(--card-accent)" stroke="var(--card-accent-stroke)" stroke-width="1.75"/>
+  <text x="514" y="112" class="node-title">herdr-mcp Runtime</text>
+  <text x="514" y="132" class="node-sub">Fenced file, Git & exec tools</text>
+  <text x="514" y="150" class="node-sub">Attested release self-upgrade</text>
+  <rect x="514" y="168" width="156" height="22" rx="6" fill="var(--card)"/>
+  <text x="592" y="183" text-anchor="middle" class="chip">18 Tools · TCC Broker</text>
+
+  <!-- Arrow 3: Runtime -> Herdr TUI -->
+  <line x1="686" y1="145" x2="722" y2="145" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrow-accent)"/>
+
+  <!-- Node 4: Herdr TUI Persistent Worksite -->
+  <rect x="726" y="84" width="188" height="122" rx="12" fill="var(--card)" stroke="var(--stroke)" stroke-width="1.5"/>
+  <text x="742" y="112" class="node-title">Herdr TUI Worksite</text>
+  <text x="742" y="132" class="node-sub">Workspaces survive chat turns</text>
+  <text x="742" y="150" class="node-sub">Codex / Claude / Pi dispatch</text>
+  <rect x="742" y="168" width="156" height="22" rx="6" fill="var(--tag-bg)"/>
+  <text x="820" y="183" text-anchor="middle" class="chip">PTY · Git · Multi-Agent</text>
+
+  <!-- Bottom Return Plane: Browser Extension & 1.1 Adapter Platform -->
+  <rect x="266" y="254" width="420" height="100" rx="12" fill="var(--card-opt)" stroke="var(--card-opt-stroke)" stroke-width="1.4" stroke-dasharray="5 3"/>
+  <text x="284" y="280" class="node-title">Browser Extension & 1.1 Adapter Platform (Optional)</text>
+  <text x="284" y="301" class="node-sub">Control Center side panel · Queued turns · ID-free safe handoff</text>
+  <text x="284" y="320" class="node-sub">Multi-provider WebChat (ChatGPT / Claude / Grok / Doubao) & fenced BrowserPage</text>
+  <rect x="284" y="328" width="384" height="19" rx="5" fill="var(--card)"/>
+  <text x="476" y="341" text-anchor="middle" class="chip">Control Center · Handoff · BrowserPage · Project Browser Skills</text>
+
+  <!-- Native Messaging Connector: Runtime <-> Browser Extension -->
+  <path d="M 592 206 L 592 250" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-dasharray="4 3" marker-end="url(#arrow-accent)"/>
+  <rect x="526" y="218" width="132" height="19" rx="5" fill="var(--pill-bg)"/>
+  <text x="592" y="231" text-anchor="middle" class="edge-label">Native Messaging</text>
+
+  <!-- Closed-Loop Return Arc: Browser Extension -> Web AI -->
+  <path d="M 266 304 L 120 304 L 120 212" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-dasharray="5 3" marker-end="url(#arrow-accent)"/>
+  <rect x="56" y="246" width="128" height="20" rx="5" fill="var(--pill-bg)"/>
+  <text x="120" y="260" text-anchor="middle" class="edge-label">Continuity Loop</text>
+</svg>

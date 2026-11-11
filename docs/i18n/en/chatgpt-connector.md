@@ -212,10 +212,10 @@ A real ChatGPT integration should satisfy:
 
 ## Platform accounts
 
-`connector_id` remains the grant principal, together with `grant_generation`. `platform_account` is display metadata in `<platform>-<email>` form, for example `grokbot-whshang@gmail.com`. An OAuth `client_name` such as `Cursor` is not an account. The owner sets or clears the label by `connector_id`:
+`connector_id` remains the grant principal, together with `grant_generation`. `platform_account` is display metadata in `<platform>-<email>` form, for example `grokbot-user@example.com`. An OAuth `client_name` such as `Cursor` is not an account. The owner sets or clears the label by `connector_id`:
 
 ```bash
-herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> grokbot-user@example.com
 herdr-mcp connector label <connector-id> --clear
 ```
 

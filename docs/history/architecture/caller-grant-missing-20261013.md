@@ -1,13 +1,13 @@
 # caller_grant_missing 排查与修复进度（2026-10-13）
 
-范围：ChatGPT（@herdr 插件）→ Herdr MCP → qingxian-macbookair（dev_01M1BDHFE8TJ2PZGQAAG4T1A3V），Runtime 1.0.3-dev `9cd1e90b`，Chrome 154，扩展 0.1.202（从 `~/Documents/herdr-mcp-main/extension` 未打包加载）。跟进项见 #626。
+范围：ChatGPT（@herdr 插件）→ Herdr MCP → macbook-air-uat（dev_01ARZ3NDEKTSV4RRFFQ69G5FAV），Runtime 1.0.3-dev `9cd1e90b`，Chrome 154，扩展 0.1.202（从 `~/Documents/herdr-mcp-main/extension` 未打包加载）。跟进项见 #626。
 
 ## 已证实的根因
 
 两个配置问题叠加，代码没有缺陷：
 
 1. **native host 不认新扩展 ID。** 未打包的 0.1.202 没有 `key`，Chrome 给了新 ID `nfpapdlifleaejfjignibinjbahbcham`，而 native host 清单的 `allowed_origins` 只有旧 ID `iflileolljfdjhlaopdpgjnpdjcidlae`。新扩展连不上 native host，也就注册不了新端点。
-2. **当前 ChatGPT 连接器没有 grant。** grant 绑定 {connector_id, grant_generation, device_id, endpoint_ref}。ChatGPT 重新授权后会生成新的 connector_id，旧 grant 静默失效；当前连接器 `conn_uGpFPdf84BEd1zeNfLRXO1` 对任何在线端点都没有 Page Assist grant。
+2. **当前 ChatGPT 连接器没有 grant。** grant 绑定 {connector_id, grant_generation, device_id, endpoint_ref}。ChatGPT 重新授权后会生成新的 connector_id，旧 grant 静默失效；当前连接器 `conn_exampleRedacted00` 对任何在线端点都没有 Page Assist grant。
 
 拒绝位置：`mcp.rs:9849`（`9cd1e90b`；main 上在 `:9955`）的 caller grant 检查。
 
@@ -16,8 +16,8 @@
 ## 已修复（仅配置，未改代码）
 
 - native host `allowed_origins` 改为 `nfpapdlifleaejfjignibinjbahbcham`，原配置备份在 Air 的 `~/.herdr/backup/20261013-nativehost/`。旧 ID 已移出 allowlist。扩展自动重连，没有重载扩展，也没有重启 Chrome。
-- 新端点：`bep_ad8cf0cb9dc49ff4347df2a0ee9767741271e6c1380614d45fb84a388d6017ff`（0.1.202，18:59 UTC+8 注册）。
-- 签发 grant：`herdr-mcp connector page-assist allow conn_uGpFPdf84BEd1zeNfLRXO1 qingxian-macbookair bep_ad8cf0cb… --confirm`。
+- 新端点：`bep_0000000000000000000000000000000000000000000000000000000000000001`（0.1.202，18:59 UTC+8 注册）。
+- 签发 grant：`herdr-mcp connector page-assist allow conn_exampleRedacted00 macbook-air-uat bep_00000001… --confirm`。
 - 所有者 CLI 本地实测：open 返回 page_ref，observe 返回真实快照，finalize 后标签页已关闭；全程未点击、填写或提交。
 
 ## 验收状态

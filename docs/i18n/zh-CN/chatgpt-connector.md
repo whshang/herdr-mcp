@@ -272,10 +272,10 @@ Herdr Agent: working ... working ... done
 
 ## 平台账号
 
-`connector_id` 与 `grant_generation` 仍然是授权主体。`platform_account` 只是 `<platform>-<email>` 形式的显示元数据，例如 `grokbot-whshang@gmail.com`。OAuth 的 `client_name`（例如 `Cursor`）不是账号。所有者按 `connector_id` 设置或清除标签：
+`connector_id` 与 `grant_generation` 仍然是授权主体。`platform_account` 只是 `<platform>-<email>` 形式的显示元数据，例如 `grokbot-user@example.com`。OAuth 的 `client_name`（例如 `Cursor`）不是账号。所有者按 `connector_id` 设置或清除标签：
 
 ```bash
-herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> grokbot-user@example.com
 herdr-mcp connector label <connector-id> --clear
 ```
 

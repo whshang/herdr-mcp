@@ -2,55 +2,56 @@
 
 [简体中文](README.md) · [English](README.en.md) · **日本語**
 
-ChatGPT などの Web AI から、自分のコンピューター上のファイル、Git、コマンド、テスト、Coding Agent、複数マシンを継続して操作できます。
+ChatGPT・Claude・Grok などの Web AI を自分の開発マシン上で継続的に動かすためのブリッジ：ファイル操作、Git、コマンド・テスト実行、ローカル Coding Agent の並列委譲、複数ワークステーション制御、ブラウザ連続性を一つのループに統合します。
 
 **[ドキュメント](https://whshang.github.io/herdr-mcp/ja/)**
 
+![Herdr-MCP 1.1 アーキテクチャ](assets/architecture-ja.svg)
+
 ## 一文でインストール
 
-コンピューター上の Coding Agent に次の一文を渡します。
+対象コンピュータ上の Coding Agent に次の一文を送ってください：
 
 ```text
-https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/ja/agent-install.md に従って Herdr と herdr-mcp をインストール・設定してください。最新の Stable GitHub Release を使い、安全に自動化できる作業は続け、Cloudflare のログイン/認可、macOS のフルディスクアクセス、ChatGPT OAuth/Connector 承認で私の操作が必要なときだけ停止してください。
+https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/ja/agent-install.md に従って Herdr と herdr-mcp をインストール・設定してください。最新の Stable GitHub Release を使い、安全に自動化できる手順はすべて自動実行し、Cloudflare のサインイン/承認、macOS のフルディスクアクセス、ChatGPT OAuth/Connector 承認で私の操作が必要なときだけ一時停止してください。
 ```
 
-Agent が環境確認、Herdr / herdr-mcp のインストール、Worker 配備、workstation 接続、動作確認まで行います。
+Agent が環境確認、Herdr と herdr-mcp のインストール、Worker のデプロイ、ワークステーション接続、最終検証まで実行します。
 
-通常ユーザーは git clone、npm、Cargo、Wrangler、手動 Runtime インストールを必要としません。
+通常の利用では git clone、npm、Cargo、Wrangler、手動 Runtime インストールは不要です。
 
 ## Cloudflare 設定
 
-- Cloudflare Workers Free で十分です。支払い方法は不要です。
+- Cloudflare Workers Free で十分動作し、支払い方法の登録は不要です。
 - インストール Agent が `herdr-mcp worker bootstrap` を実行します。
-- ドメインがなくても `workers.dev` を使えます。
+- 独自ドメインがなくても `workers.dev` のまま利用できます。
 - 適切なドメインがある場合は、ChatGPT 認可前に専用 Custom Domain を設定できます。
-- ChatGPT に登録する MCP URL は `/mcp` で終わる必要があります。
+- ChatGPT に渡す MCP URL は必ず `/mcp` で終わる必要があります。
 
-[Cloudflare 設定](docs/i18n/ja/cloudflare-edge-deployment.md)
+[Cloudflare 設定ガイド](docs/i18n/ja/cloudflare-edge-deployment.md)
 
 ## ChatGPT 設定
 
-1. Plugins の **Developer mode** を有効にします。
-2. **Plugins → Browse plugins** を開きます。
-3. Herdr Connector を追加します。名前は **`herdr`** を推奨します。
-4. `https://herdr.example.com/mcp` のような完全な MCP URL を入力します。
-5. OAuth を完了します。
-6. ChatGPT Project 内で作業します。
-7. **新しい会話の最初のターンでは、手動で `herdr` を選択または @ 指定します。**
+1. ChatGPT の **設定 → Apps & Connectors**（旧 UI：**Plugins → Browse plugins**）で **Developer mode** を有効にします。
+2. カスタム MCP Connector を追加します（推奨名は **`herdr`**）。
+3. 完全な MCP URL（例：`https://herdr.example.com/mcp`）を入力します。
+4. OAuth を完了し、ローカル端末で 6 桁の検証コードを使って承認します。
+5. ChatGPT Project 内で作業します。
+6. **新しい会話の最初のターンでは、入力欄の `+` から `herdr` を選択または `@herdr` で参照します。**
 
-ChatGPT Project の instructions にローカルプロジェクトのフォルダーを書いておくことを推奨します。
+ChatGPT Project のプロジェクト指示にローカルフォルダを書いておくと確実です：
 
 ```text
-Local project: /Users/you/Documents/my-project
+ローカルプロジェクト: /Users/you/Documents/my-project
 ```
 
-ブラウザー拡張を使う場合は、Herdr Control Center から device / workspace / local folder の mapping を Project instructions に同期できます。実行前は live Herdr state を優先します。
+ブラウザ拡張を導入すると、Herdr Control Center からデバイス・workspace・フォルダ対応を Project 指示へ同期できます。実行前の最終判断は常にライブの Herdr 状態に基づきます。
 
-[ChatGPT 設定](docs/i18n/ja/chatgpt-connector.md)
+[ChatGPT 設定ガイド](docs/i18n/ja/chatgpt-connector.md)
 
-## 認可設定
+## 権限と認可
 
-macOS では必要な場合だけ stable broker にフルディスクアクセスを与えます。
+macOS では必要な場合のみ、安定 broker に一度だけフルディスクアクセスを付与します：
 
 ```bash
 herdr-mcp permissions status
@@ -58,73 +59,81 @@ herdr-mcp permissions setup
 herdr-mcp permissions verify
 ```
 
-`permissions status` が `needs_setup` のときだけ setup を実行し、**システム設定 → プライバシーとセキュリティ → フルディスクアクセス** で許可します。
+`permissions status` が `needs_setup` を返したときだけ setup を実行し、**システム設定 → プライバシーとセキュリティ → フルディスクアクセス** で承認してください。
 
-ChatGPT OAuth の初回接続では、承認ページに正確なローカル承認コマンドと 6 桁コードが表示されます。自分のターミナルで承認してください。Cloudflare Token や device credential などの secret をチャットへ貼らないでください。
+初回 ChatGPT OAuth 接続時には、承認ページに正確なローカル承認コマンドと 6 桁コードが表示されます。自分のターミナルで承認し、Cloudflare Token やデバイス資格情報などの秘密をチャットに貼り付けないでください。
 
 [インストールと認可](docs/i18n/ja/agent-install.md) · [トラブルシューティング](docs/i18n/ja/troubleshooting.md)
 
-## 主な特徴
+## 1.1 の主な特徴
 
-- **状態は自分のコンピューターに残ります。** workspace、terminal、Git、worktree、Agent、長時間タスクを会話終了後も維持します。
-- **1 つの ChatGPT から複数マシンを操作できます。** 1 Worker に複数 workstation を登録し、device を明示して routing します。
-- **複数アカウントから 1 台を利用できます。** 認可済み Connector / WebChat account は別 identity として扱い、browser control は provider / account / session ごとに分離します。
-- **既存の Coding Agent を利用できます。** 小さな作業は直接実行し、大きな作業は利用可能な Agent に委譲できます。
-- **mutation の再試行を安全に扱います。** delivered / not-delivered / uncertain を区別します。
-- **ブラウザー連続作業は任意です。** Chrome 拡張で Project binding、Control Center、次ターン queue、handoff を追加できます。
+- **作業現場が自分のマシンに残る。** Herdr TUI の workspace、PTY 端末、Git worktree、常駐サーバー、長時間タスクは Web 会話を閉じても消えません。
+- **受信ポート非公開の複数マシン制御。** 1 つの Cloudflare Worker に複数の macOS / Linux / Windows マシンを outbound WSS Link で登録し、明示的な `device_id` ルーティングで誤爆を防ぎます。
+- **複数アカウントと Connector の厳格な分離。** 認可済み Connector・WebChat アカウント・ブラウザ endpoint を独立して識別し、未認可・不一致セッションは fail-closed で拒否します。
+- **決定的ツール + 任意のローカル Coding Agent。** 読み書き・Patch・Git・テストは 18 個の MCP ツールで直接実行し、大きな作業は Codex、Claude Code、Pi、Cline、OpenCode などの利用可能な Agent に非同期委譲できます。
+- **マルチ WebChat 制御と引き継ぎ（1.1）。** ChatGPT（基準プランナー）、Claude、Grok セッションの作成・継続・停止・アーカイブ・次ターン予約・引き継ぎに加え、Doubao（豆包）画像生成フローに対応します。
+- **ブラウザアダプター基盤とサイト Skill（1.1）。** `page_generation` フェンス付きの `browser-page` 操作（`observe` / `click` / `fill` / `navigate`）と、再利用可能な `.agents/skills/herdr-browser-<slug>` スキルを提供します。
+- **明確な配信セマンティクスと署名検証付き自己更新（1.1）。** mutation は `applied` / `not_applied` / `uncertain` を明確に区別して盲目的な再実行を防止。`herdr-mcp update` は署名付き GitHub Release マニフェストと Sigstore 証明を検証して安全に更新します。
 
-## よく使う方法
+## よくある使い方
 
-### 1 つの Project
+### 1 つのプロジェクト
 
-ChatGPT Project instructions にローカルフォルダーを保存してから、そのまま作業を依頼します。
-
-```text
-このプロジェクトの Git 状態を確認し、現在のテスト失敗を修正してください。このプロジェクトだけを変更し、関連テストを実行してください。
-```
-
-### 複数マシン
+ChatGPT Project 指示にフォルダを保存しておけば、そのまま依頼できます：
 
 ```text
-Herdr device を一覧表示してください。macbook-main で backend を変更し、linux-lab で独立テストを実行してください。worktree を分離し、両方を検証してください。
+このプロジェクトの Git 状態を確認し、現在のテスト失敗を修正してください。変更はこのプロジェクトだけに限定し、最後に該当テストを実行してください。
 ```
 
-新しいコンピューターを追加する場合：
+### 複数コンピュータの連携
+
+```text
+Herdr デバイスを一覧表示して。バックエンド変更は macbook-main、独立テストは linux-lab を使い、分離した worktree で両方検証して。
+```
+
+新しいマシンを追加するときは、登録済みデバイスで次を実行します：
 
 ```bash
 herdr-mcp worker pair
 ```
 
-### 複数アカウントから 1 台を利用
+### 1 台のマシンを複数アカウントで利用
 
-1 台の workstation を複数の認可済み ChatGPT / WebChat account から利用できます。Connector、account、browser session の identity は分離されます。Browser control は Registry に登録済み・認可済みの session だけを操作します。
+1 台のワークステーションで複数の認可済み ChatGPT / WebChat アカウントを扱えます。Connector、アカウント、ブラウザセッションの identity は常に分離され、Registry で発見・認可されたセッションだけを操作します。
 
-### Local Agent と ChatGPT
+### ローカル Agent とマルチ WebChat の連携
 
-ローカル Coding Agent も herdr-mcp を通じて対応 WebChat session を作成・継続・handoff できます。別の Playwright / DOM automation は不要です。
+ローカル Coding Agent から `herdr-mcp webchat` や `herdr-mcp browser-page` を通じて対応 WebChat セッション（ChatGPT・Claude・Grok・Doubao）や管理対象タブを安全に操作でき、独自の Playwright / DOM 自動化を再構築する必要はありません。
 
-[Local Agent ↔ WebChat](docs/i18n/ja/local-agent-webchat-control.md)
+[ローカル Agent ↔ WebChat](docs/i18n/ja/local-agent-webchat-control.md)
 
-## ブラウザー拡張（任意）
+## ブラウザ拡張（任意）
 
-基本の ChatGPT → MCP → workstation 接続には拡張は不要です。
+基本の ChatGPT → MCP → ワークステーション接続に拡張は不要です。
 
-Project binding、Control Center、browser continuity、次ターン queue、WebChat handoff が必要な場合に公式拡張を追加します。
+Side Panel の Control Center、Project 連携、次ターン予約、ID 不要の引き継ぎ、マルチ WebChat 制御、`browser-page` 操作を使う場合は、ストアから導入するか、現在の Runtime と一致するローカル管理ビルドを配置します：
 
-[Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [拡張ガイド](docs/i18n/ja/extension.md) · [ブラウザー連続作業](docs/i18n/ja/browser-continuity.md)
+```bash
+herdr-mcp extension standalone install
+```
 
-## 状態確認
+[Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [拡張ガイド](docs/i18n/ja/extension.md) · [Control Center](docs/i18n/ja/browser-control-center.md) · [ブラウザー連続作業](docs/i18n/ja/browser-continuity.md)
+
+## 状態確認とアップデート
 
 ```bash
 herdr-mcp status
 herdr-mcp doctor
 herdr-mcp link status
 herdr-mcp device list
+herdr-mcp update
 ```
+
+`herdr-mcp update` は署名付き GitHub Release マニフェストと Sigstore ビルド証明を検証してロールバック可能な更新を適用します。Fleet Worker のバージョン差分が通知された場合は、別途 `herdr-mcp worker update` を実行します。
 
 macOS Apple Silicon、Linux x86_64、Linux ARM64 は Production。Windows x86_64 / ARM64 は現在 Candidate。WSL は未対応です。
 
-[Platform support](docs/i18n/ja/platform-support-matrix.md) · [CLI reference](docs/i18n/ja/cli-reference.md) · [全ドキュメント](https://whshang.github.io/herdr-mcp/ja/)
+[Platform support](docs/i18n/ja/platform-support-matrix.md) · [自己更新ガイド](docs/i18n/ja/runtime-self-upgrade.md) · [CLI reference](docs/i18n/ja/cli-reference.md) · [全ドキュメント](https://whshang.github.io/herdr-mcp/ja/)
 
 ## よくある質問
 
@@ -165,7 +174,7 @@ mutation では返された `delivery_state` / retry metadata に従い、delive
 
 ### Chrome 拡張は必須ですか？
 
-いいえ。基本の ChatGPT → MCP → workstation 接続には不要です。Project binding、Control Center、browser continuity、次ターン queue、WebChat handoff が必要な場合に追加します。
+いいえ。基本の ChatGPT → MCP → workstation 接続には不要です。Project binding、Control Center、browser continuity、次ターン queue、マルチ WebChat handoff、または `browser-page` 操作が必要な場合に追加します。
 
 ### 特定の Coding Agent が必須ですか？
 

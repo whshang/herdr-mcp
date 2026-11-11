@@ -2,9 +2,11 @@
 
 [简体中文](README.md) · **English** · [日本語](README.ja.md)
 
-Let ChatGPT and other Web AI work on your own computers: files, Git, commands, tests, coding agents, and multiple workstations.
+Let ChatGPT, Claude, Grok, and other Web AI work on your own computers: files, Git, commands, tests, local coding agents, multi-workstation routing, and closed-loop browser continuity.
 
 **[Documentation](https://whshang.github.io/herdr-mcp/)**
+
+![Herdr-MCP 1.1 Architecture](assets/architecture-en.svg)
 
 ## One-sentence install
 
@@ -20,7 +22,7 @@ Normal users do not need git clone, npm, Cargo, Wrangler, or a manual Runtime in
 
 ## Cloudflare
 
-- Cloudflare Workers Free is sufficient. No payment method is required.
+- Cloudflare Workers Free is sufficient. No payment method is required.\
 - The install agent runs `herdr-mcp worker bootstrap`.
 - `workers.dev` works without a domain.
 - If you already have a suitable domain, you can use a dedicated Custom Domain before ChatGPT authorization.
@@ -30,13 +32,12 @@ Normal users do not need git clone, npm, Cargo, Wrangler, or a manual Runtime in
 
 ## ChatGPT
 
-1. Enable **Developer mode** for Plugins.
-2. Open **Plugins → Browse plugins**.
-3. Add the Herdr Connector. The recommended name is **`herdr`**.
-4. Enter the full MCP URL, for example `https://herdr.example.com/mcp`.
-5. Complete OAuth.
-6. Work inside a ChatGPT Project.
-7. **On the first turn of every new conversation, manually select or @ `herdr`.**
+1. Open ChatGPT **Settings → Apps & Connectors** (legacy UI: **Plugins → Browse plugins**) and enable **Developer mode**.
+2. Create or add a custom MCP Connector. The recommended name is **`herdr`**.
+3. Enter the full MCP URL, for example `https://herdr.example.com/mcp`.
+4. Complete OAuth and approve the six-digit verification code in your local terminal.
+5. Work inside a ChatGPT Project.
+6. **On the first turn of every new conversation, select `@herdr` via the `+` menu.**
 
 Put the local project folder in the ChatGPT Project instructions, for example:
 
@@ -64,14 +65,15 @@ During the first ChatGPT OAuth connection, the approval page shows the exact loc
 
 [Install and authorization](docs/i18n/en/agent-install.md) · [Troubleshooting](docs/i18n/en/troubleshooting.md)
 
-## What it gives you
+## What 1.1 gives you
 
-- **State stays on your computers.** Workspaces, terminals, Git, worktrees, agents, and long tasks survive chat boundaries.
-- **One ChatGPT can control multiple computers.** One Worker can enroll multiple workstations with explicit device routing.
-- **Multiple accounts can use one computer.** Authorized Connectors/WebChat accounts keep separate identities; browser control is isolated by provider, account, and session.
-- **Use the coding agents you already have.** Small work can run directly; larger work can be delegated to available agents.
-- **Retries stay safe.** Delivered, not-delivered, and uncertain mutations are explicit.
-- **Browser continuity is optional.** The Chrome extension adds Project binding, Control Center, queued next turns, handoff, and supported WebChat control.
+- **State stays on your computers.** Herdr TUI workspaces, PTY terminals, Git worktrees, background servers, and long tasks survive chat boundaries.
+- **Inbound-closed multi-workstation fleet.** One Cloudflare Worker enrolls multiple macOS / Linux / Windows workstations over outbound WSS Links with explicit `device_id` routing and zero guessed targets.
+- **Strict multi-account & connector isolation.** Authorized Connectors, WebChat accounts, and browser endpoints keep independent identities; unauthorized or mismatched sessions fail closed.
+- **Deterministic tools + any local coding agent.** Run file/patch/Git/test work directly across 18 MCP tools, or dispatch larger tasks to Codex, Claude Code, Pi, Cline, OpenCode, and other local agents with durable async inboxes.
+- **Multi-provider WebChat orchestration (1.1).** Create, continue, stop, archive, queue next turns, and hand off across ChatGPT (reference planner), Claude, Grok, plus Doubao AI-creation image workflows.
+- **Browser Adapter Platform & project Skills (1.1).** Actuate owned or claimed tabs safely with `page_generation`-fenced `browser-page` commands (`observe` / `click` / `fill` / `navigate`) and reusable `.agents/skills/herdr-browser-<slug>` Skills.
+- **Explicit delivery safety & attested self-upgrade (1.1).** Mutations distinguish `applied`, `not_applied`, and `uncertain` without blind replay; `herdr-mcp update` verifies signed GitHub Release manifests and Sigstore attestations with rollback safety.
 
 ## Common usage
 
@@ -99,9 +101,9 @@ herdr-mcp worker pair
 
 One workstation can serve multiple authorized ChatGPT/WebChat accounts. Connector, account, and browser-session identity remain separate. Browser control only addresses sessions already discovered and authorized in the Registry.
 
-### Local agents and ChatGPT
+### Local agents and multi-provider WebChat
 
-Local coding agents can create, continue, and hand off supported WebChat sessions through herdr-mcp instead of building another Playwright/DOM automation stack.
+Local coding agents can create, continue, and hand off supported WebChat sessions (ChatGPT, Claude, Grok, Doubao) or drive fenced `browser-page` tabs through herdr-mcp instead of building another brittle Playwright/DOM automation stack.
 
 [Local agent ↔ WebChat](docs/i18n/en/local-agent-webchat-control.md)
 
@@ -109,22 +111,29 @@ Local coding agents can create, continue, and hand off supported WebChat session
 
 The core ChatGPT → MCP → workstation connection does not require the extension.
 
-Install it when you want Project binding, Control Center, browser continuity, queued next turns, or WebChat handoff:
+Install it from the Store—or stage the exact Runtime-matched unpacked build locally—when you want the Side Panel Control Center, Project binding, queued turns, ID-free handoff, multi-provider WebChat orchestration, or `browser-page` actuation:
 
-[Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [Extension guide](docs/i18n/en/extension.md) · [Browser continuity](docs/i18n/en/browser-continuity.md)
+```bash
+herdr-mcp extension standalone install
+```
 
-## Check status
+[Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [Extension guide](docs/i18n/en/extension.md) · [Control Center](docs/i18n/en/browser-control-center.md) · [Browser continuity](docs/i18n/en/browser-continuity.md)
+
+## Check status & upgrade
 
 ```bash
 herdr-mcp status
 herdr-mcp doctor
 herdr-mcp link status
 herdr-mcp device list
+herdr-mcp update
 ```
+
+`herdr-mcp update` verifies the signed GitHub Release manifest and Sigstore build provenance before committing a rollback-safe Runtime update; run `herdr-mcp worker update` separately when `update status` reports Fleet Worker drift.
 
 macOS Apple Silicon, Linux x86_64, and Linux ARM64 are Production. Windows x86_64 / ARM64 are currently Candidate. WSL is unsupported.
 
-[Platform support](docs/i18n/en/platform-support-matrix.md) · [CLI reference](docs/i18n/en/cli-reference.md) · [Full documentation](https://whshang.github.io/herdr-mcp/)
+[Platform support](docs/i18n/en/platform-support-matrix.md) · [Self-upgrade](docs/i18n/en/runtime-self-upgrade.md) · [CLI reference](docs/i18n/en/cli-reference.md) · [Full documentation](https://whshang.github.io/herdr-mcp/)
 
 ## FAQ
 
@@ -165,7 +174,7 @@ For mutations, follow the returned `delivery_state` / retry metadata and do not 
 
 ### Do I need the Chrome extension?
 
-No. The core ChatGPT → MCP → workstation connection works without it. Install the extension for Project binding, Control Center, browser continuity, queued next turns, or WebChat handoff.
+No. The core ChatGPT → MCP → workstation connection works without it. Install the extension for Project binding, Control Center, browser continuity, queued next turns, multi-provider WebChat handoff, or fenced `browser-page` tasks.
 
 ### Does Herdr-MCP require a specific coding agent?
 
@@ -173,17 +182,17 @@ No. Deterministic work can run directly, and complex work can be delegated to wh
 
 ## Related projects and acknowledgements
 
-Herdr-MCP builds on ideas demonstrated by several open projects:
+Herdr-MCP builds on ideas proven across several open projects:
 
-- [Herdr](https://github.com/herdrdev/herdr) — persistent workspace, terminal, and agent environment.
-- [coding-tools-mcp](https://github.com/xyTom/coding-tools-mcp) — focused deterministic coding-MCP tools.
-- [MCPX](https://github.com/opentokenz/mcpx) — durable remote MCP sessions and recovery ideas.
-- [AgenticGPT](https://github.com/slhaf/AgenticGPT) — remote-worker architecture and managed jobs.
+- [Herdr](https://github.com/herdrdev/herdr) — persistent workspaces, terminals, and agent environments.
+- [coding-tools-mcp](https://github.com/xyTom/coding-tools-mcp) — deterministic coding MCP tools.
+- [MCPX](https://github.com/opentokenz/mcpx) — persistent remote MCP sessions and recovery.
+- [AgenticGPT](https://github.com/slhaf/AgenticGPT) — remote Worker and managed jobs architecture.
 - [codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) — Web planner / Codex executor collaboration.
 - [codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) — Codex harness with Web-model inference.
-- [OpenAI tunnel-client](https://github.com/openai/tunnel-client) — secure exposure of MCP-compatible services to ChatGPT.
+- [OpenAI tunnel-client](https://github.com/openai/tunnel-client) — reference pattern for safely exposing MCP services to ChatGPT.
 
-These references acknowledge sources of ideas and ecosystem context; they do not imply dependency on Herdr-MCP or endorsement by the listed projects or authors. See [Ecosystem comparison](docs/i18n/en/herdr-vs-ecosystem.md) for architectural trade-offs.
+These references describe lineage and ecosystem context, not a dependency or endorsement by their authors. For architectural trade-offs, see [Ecosystem comparison](docs/i18n/en/herdr-vs-ecosystem.md).
 
 ## License
 

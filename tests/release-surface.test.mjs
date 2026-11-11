@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { access, readFile, stat } from "node:fs/promises";
+import { access, readFile, stat, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import { join } from "node:path";
 
@@ -537,4 +537,51 @@ test("local Cloudflare/Pages build state is excluded from the published package"
   assert.match(rootIgnore, /site-dist\//);
   assert.match(rootIgnore, /docs\/_wip\//);
   assert.match(edgeIgnore, /^\.wrangler\/$/m);
+});
+
+test("user keeps personal workstation identifiers out of public documentation and ships 1.1 architecture diagrams | Given tracked markdown files under docs/, CHANGELOG.md, and top-level READMEs | When release-surface hygiene checks documentation content | Then personal machine names, personal home paths, and personal email literals are absent while every locale README embeds its 1.1 architecture SVG", async () => {
+  async function collectMarkdown(dir, acc = []) {
+    const entries = await readdir(join(ROOT, dir), { withFileTypes: true });
+    for (const entry of entries) {
+      const rel = join(dir, entry.name);
+      if (entry.isDirectory()) await collectMarkdown(rel, acc);
+      else if (entry.isFile() && entry.name.endsWith(".md")) acc.push(rel);
+    }
+    return acc;
+  }
+  const mdFiles = [
+    ...(await collectMarkdown("docs")),
+    "README.md",
+    "README.en.md",
+    "README.ja.md",
+    "CHANGELOG.md",
+  ];
+  const forbiddenTokens = [
+    ["yitai", "diannao"].join(""),
+    ["qingxian", "-macbook"].join(""),
+    ["super", "grokbot"].join(""),
+    ["grokbot", "-edu"].join(""),
+    ["grokbot", "-asu"].join(""),
+    ["agentforme", ".cc.cd"].join(""),
+    ["/Users/", "qingxian"].join(""),
+    ["whshang", "@gmail.com"].join(""),
+  ];
+  for (const rel of mdFiles) {
+    const text = await readFile(join(ROOT, rel), "utf8");
+    for (const token of forbiddenTokens) {
+      assert.equal(text.includes(token), false, `${rel} must not expose personal identifier ${token}`);
+    }
+    assert.doesNotMatch(text, /\br5c\b/, `${rel} must not expose personal node alias`);
+  }
+  for (const [readme, svg] of [
+    ["README.md", "assets/architecture-zh.svg"],
+    ["README.en.md", "assets/architecture-en.svg"],
+    ["README.ja.md", "assets/architecture-ja.svg"],
+  ]) {
+    const text = await readFile(join(ROOT, readme), "utf8");
+    assert.ok(text.includes(svg), `${readme} must embed ${svg}`);
+    const svgContent = await readFile(join(ROOT, svg), "utf8");
+    assert.match(svgContent, /<svg\b/);
+    assert.match(svgContent, /prefers-color-scheme:\s*dark/);
+  }
 });
