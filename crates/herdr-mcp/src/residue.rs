@@ -18,10 +18,15 @@ use crate::instance::{
     DEFAULT_HEALTH_WATCHDOG_LABEL, DEFAULT_HERDR_SUPERVISOR_LABEL, DEFAULT_SERVICE_LABEL,
     DEFAULT_WATCHDOG_LABEL, InstanceId,
 };
-#[cfg(any(target_os = "macos", test))]
+use serde_json::{Value, json};
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs;
+use std::path::Path;
 #[cfg(any(target_os = "macos", test))]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[cfg(any(target_os = "macos", test))]
 pub const DEFAULT_LABELS: &[&str] = &[
@@ -403,6 +408,641 @@ pub fn status_line_from_report(report: &ResidueReport) -> String {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCandidateProcess {
+    pub pid: u32,
+    pub ppid: u32,
+    pub executable: String,
+    pub instance: Option<String>,
+    pub configured_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanCandidateProcess {
+    pub pid: u32,
+    pub ppid: u32,
+    pub executable: String,
+    pub instance: Option<String>,
+    pub configured_port: Option<u16>,
+    pub listening_ports: Vec<u16>,
+    pub ports: Vec<u16>,
+    pub reason: String,
+    pub advice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OrphanCandidateReport {
+    pub supported: bool,
+    pub probe_error: Option<String>,
+    pub orphans: Vec<OrphanCandidateProcess>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub fn parse_ps_candidate_processes(ps_output: &str) -> Vec<ParsedCandidateProcess> {
+    let mut results = Vec::new();
+    for raw_line in ps_output.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(pid_str) = parts.next() else {
+            continue;
+        };
+        let Some(ppid_str) = parts.next() else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid_str.parse::<u32>(), ppid_str.parse::<u32>()) else {
+            continue;
+        };
+        let tokens: Vec<&str> = parts.collect();
+        let Some(&executable) = tokens.first() else {
+            continue;
+        };
+        let exe_leaf = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+        if exe_leaf != "herdr-mcp" && exe_leaf != "herdr-mcp.exe" {
+            continue;
+        }
+
+        let mut instance: Option<String> = None;
+        let mut candidate_index: Option<usize> = None;
+        let mut idx = 1;
+        while idx < tokens.len() {
+            let token = tokens[idx];
+            if token == "--instance" {
+                if let Some(&name) = tokens.get(idx + 1) {
+                    instance = Some(name.to_owned());
+                    idx += 2;
+                    continue;
+                }
+                break;
+            } else if let Some(name) = token.strip_prefix("--instance=") {
+                if !name.is_empty() {
+                    instance = Some(name.to_owned());
+                }
+                idx += 1;
+                continue;
+            } else if matches!(token, "-v" | "--verbose" | "--json") {
+                idx += 1;
+                continue;
+            } else if token == "candidate" {
+                candidate_index = Some(idx);
+                break;
+            } else {
+                break;
+            }
+        }
+
+        let Some(sub_idx) = candidate_index else {
+            continue;
+        };
+
+        let mut configured_port: Option<u16> = None;
+        let mut arg_idx = sub_idx + 1;
+        while arg_idx < tokens.len() {
+            let token = tokens[arg_idx];
+            if token == "--port" {
+                if let Some(port_str) = tokens.get(arg_idx + 1)
+                    && let Ok(port) = port_str.parse::<u16>()
+                {
+                    configured_port = Some(port);
+                }
+                arg_idx += 2;
+            } else if let Some(port_str) = token.strip_prefix("--port=") {
+                if let Ok(port) = port_str.parse::<u16>() {
+                    configured_port = Some(port);
+                }
+                arg_idx += 1;
+            } else {
+                arg_idx += 1;
+            }
+        }
+
+        results.push(ParsedCandidateProcess {
+            pid,
+            ppid,
+            executable: executable.to_owned(),
+            instance,
+            configured_port,
+        });
+    }
+    results.sort_by_key(|entry| entry.pid);
+    results
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub fn parse_launchctl_server_pids(launchctl_output: &str) -> BTreeMap<u32, String> {
+    let mut map = BTreeMap::new();
+    for raw_line in launchctl_output.lines() {
+        let mut cols = raw_line.split_whitespace();
+        let Some(pid_col) = cols.next() else {
+            continue;
+        };
+        let Some(_status_col) = cols.next() else {
+            continue;
+        };
+        let Some(label) = cols.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_col.parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        if label == "dev.herdr-mcp.server"
+            || (label.starts_with("dev.herdr-mcp.") && label.ends_with(".server"))
+        {
+            map.insert(pid, label.to_owned());
+        }
+    }
+    map
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub fn parse_lsof_listening_ports(lsof_output: &str) -> BTreeMap<u32, Vec<u16>> {
+    let mut ports_by_pid: BTreeMap<u32, BTreeSet<u16>> = BTreeMap::new();
+    let mut current_pid: Option<u32> = None;
+    for raw_line in lsof_output.lines() {
+        let line = raw_line.trim();
+        if let Some(pid_str) = line.strip_prefix('p') {
+            current_pid = pid_str.parse::<u32>().ok();
+        } else if let Some(name_str) = line.strip_prefix('n')
+            && let Some(pid) = current_pid
+        {
+            let endpoint = name_str.split("->").next().unwrap_or(name_str);
+            if let Some((_, port_str)) = endpoint.rsplit_once(':')
+                && let Ok(port) = port_str.parse::<u16>()
+            {
+                ports_by_pid.entry(pid).or_default().insert(port);
+            }
+        }
+    }
+    ports_by_pid
+        .into_iter()
+        .map(|(pid, set)| (pid, set.into_iter().collect()))
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub fn scan_orphan_candidates_macos_with<PortsFn: Fn(&[u32]) -> BTreeMap<u32, Vec<u16>>>(
+    home: &Path,
+    ps_output: &str,
+    launchctl_output: &str,
+    listening_ports_fn: PortsFn,
+) -> OrphanCandidateReport {
+    let candidates = parse_ps_candidate_processes(ps_output);
+    let server_labels = parse_launchctl_server_pids(launchctl_output);
+    let launch_agents = home.join("Library/LaunchAgents");
+    let config_parent = home.join(".config");
+
+    let mut preliminary: Vec<(ParsedCandidateProcess, String, String)> = Vec::new();
+    for proc in candidates {
+        match server_labels.get(&proc.pid) {
+            Some(label) if label == "dev.herdr-mcp.server" => {
+                let plist = launch_agents.join("dev.herdr-mcp.server.plist");
+                let config_dir = config_parent.join("herdr-mcp");
+                let canonical_exec = config_dir.join("runtime/current/herdr-mcp");
+                if plist.is_file() && config_dir.is_dir() {
+                    if Path::new(&proc.executable) != canonical_exec {
+                        preliminary.push((
+                            proc.clone(),
+                            "noncanonical_launchd_binary".to_owned(),
+                            format!(
+                                "Reinstall the default service so launchd executes {} instead of {}",
+                                canonical_exec.display(),
+                                proc.executable
+                            ),
+                        ));
+                    }
+                } else {
+                    preliminary.push((
+                        proc.clone(),
+                        "stale_default_launchd_service".to_owned(),
+                        format!(
+                            "Unload stale LaunchAgent '{label}' or reinstall the default service, then verify PID {} exited",
+                            proc.pid
+                        ),
+                    ));
+                }
+            }
+            Some(label) => {
+                let instance_name = label
+                    .strip_prefix("dev.herdr-mcp.")
+                    .and_then(|rest| rest.strip_suffix(".server"));
+                match instance_name
+                    .and_then(|name| InstanceId::parse(name).ok().map(|id| (name, id)))
+                {
+                    Some((name, instance)) => {
+                        let plist =
+                            launch_agents.join(format!("dev.herdr-mcp.{name}.server.plist"));
+                        let config_dir = config_parent.join(instance.config_leaf());
+                        let canonical_exec = config_dir.join("runtime/current/herdr-mcp");
+                        if plist.is_file() && config_dir.is_dir() {
+                            if Path::new(&proc.executable) != canonical_exec {
+                                preliminary.push((
+                                    proc.clone(),
+                                    format!("noncanonical_named_instance_binary:{name}"),
+                                    format!(
+                                        "Reinstall named instance '{name}' so launchd executes {} instead of {}",
+                                        canonical_exec.display(),
+                                        proc.executable
+                                    ),
+                                ));
+                            }
+                        } else {
+                            preliminary.push((
+                                proc.clone(),
+                                format!("stale_named_launchd_service:{name}"),
+                                format!(
+                                    "Unload stale LaunchAgent '{label}' or run 'herdr-mcp instance uninstall --name {name}', then verify PID {} exited",
+                                    proc.pid
+                                ),
+                            ));
+                        }
+                    }
+                    None => {
+                        preliminary.push((
+                            proc.clone(),
+                            format!("invalid_named_launchd_service:{label}"),
+                            format!(
+                                "Unload unrecognized LaunchAgent '{label}' and stop PID {} manually: kill {}",
+                                proc.pid, proc.pid
+                            ),
+                        ));
+                    }
+                }
+            }
+            None => {
+                preliminary.push((
+                    proc.clone(),
+                    "unmanaged_candidate_process".to_owned(),
+                    format!(
+                        "Verify PID {} is not an active test/worktree session, then stop it manually: kill {}",
+                        proc.pid, proc.pid
+                    ),
+                ));
+            }
+        }
+    }
+
+    let orphan_pids: Vec<u32> = preliminary.iter().map(|(proc, _, _)| proc.pid).collect();
+    let listening_by_pid = if orphan_pids.is_empty() {
+        BTreeMap::new()
+    } else {
+        listening_ports_fn(&orphan_pids)
+    };
+
+    let orphans = preliminary
+        .into_iter()
+        .map(|(proc, reason, advice)| {
+            let listening_ports = listening_by_pid.get(&proc.pid).cloned().unwrap_or_default();
+            let mut merged_ports: BTreeSet<u16> = listening_ports.iter().copied().collect();
+            if let Some(port) = proc.configured_port {
+                merged_ports.insert(port);
+            }
+            OrphanCandidateProcess {
+                pid: proc.pid,
+                ppid: proc.ppid,
+                executable: proc.executable,
+                instance: proc.instance,
+                configured_port: proc.configured_port,
+                listening_ports,
+                ports: merged_ports.into_iter().collect(),
+                reason,
+                advice,
+            }
+        })
+        .collect();
+
+    OrphanCandidateReport {
+        supported: true,
+        probe_error: None,
+        orphans,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn query_lsof_listening_ports(pids: &[u32]) -> BTreeMap<u32, Vec<u16>> {
+    if pids.is_empty() {
+        return BTreeMap::new();
+    }
+    let pid_csv = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    for bin in ["/usr/sbin/lsof", "/usr/bin/lsof", "lsof"] {
+        if let Ok(output) = std::process::Command::new(bin)
+            .args(["-Pan", "-p", &pid_csv, "-iTCP", "-sTCP:LISTEN", "-Fn"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if !text.trim().is_empty() || output.status.success() {
+                return parse_lsof_listening_ports(&text);
+            }
+        }
+    }
+    BTreeMap::new()
+}
+
+pub fn scan_orphan_candidates(home: &Path) -> OrphanCandidateReport {
+    #[cfg(target_os = "macos")]
+    {
+        let ps_out = match std::process::Command::new("/bin/ps")
+            .args(["-axo", "pid=,ppid=,command="])
+            .output()
+        {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+            Ok(out) => {
+                return OrphanCandidateReport {
+                    supported: true,
+                    probe_error: Some(format!("ps exited with {}", out.status)),
+                    orphans: Vec::new(),
+                };
+            }
+            Err(err) => {
+                return OrphanCandidateReport {
+                    supported: true,
+                    probe_error: Some(format!("cannot spawn ps: {err}")),
+                    orphans: Vec::new(),
+                };
+            }
+        };
+        let launchctl_out = match std::process::Command::new("/bin/launchctl")
+            .arg("list")
+            .output()
+        {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+            Ok(out) => {
+                return OrphanCandidateReport {
+                    supported: true,
+                    probe_error: Some(format!("launchctl list exited with {}", out.status)),
+                    orphans: Vec::new(),
+                };
+            }
+            Err(err) => {
+                return OrphanCandidateReport {
+                    supported: true,
+                    probe_error: Some(format!("cannot spawn launchctl: {err}")),
+                    orphans: Vec::new(),
+                };
+            }
+        };
+        scan_orphan_candidates_macos_with(home, &ps_out, &launchctl_out, query_lsof_listening_ports)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let ps_out = match std::process::Command::new("ps")
+            .args(["-eo", "pid=,ppid=,args="])
+            .output()
+        {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+            Ok(out) => {
+                return OrphanCandidateReport {
+                    supported: true,
+                    probe_error: Some(format!("ps exited with {}", out.status)),
+                    orphans: Vec::new(),
+                };
+            }
+            Err(err) => {
+                return OrphanCandidateReport {
+                    supported: true,
+                    probe_error: Some(format!("cannot spawn ps: {err}")),
+                    orphans: Vec::new(),
+                };
+            }
+        };
+        let mut managed_pids = BTreeSet::new();
+        if let Ok(out) = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "herdr-mcp.service",
+                "-p",
+                "MainPID",
+                "--value",
+            ])
+            .output()
+            && out.status.success()
+            && let Ok(pid) = String::from_utf8_lossy(&out.stdout).trim().parse::<u32>()
+            && pid > 0
+        {
+            managed_pids.insert(pid);
+        }
+        let config_parent = home.join(".config");
+        if let Ok(entries) = fs::read_dir(&config_parent) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if name == "herdr-mcp" || name.starts_with("herdr-mcp-") {
+                    let proc_file = path.join("runtime/service-process.json");
+                    if let Ok(bytes) = fs::read(&proc_file)
+                        && let Ok(val) = serde_json::from_slice::<Value>(&bytes)
+                        && let Some(pid) = val
+                            .get("server_pid")
+                            .and_then(Value::as_u64)
+                            .and_then(|v| u32::try_from(v).ok())
+                        && pid > 0
+                    {
+                        managed_pids.insert(pid);
+                    }
+                }
+            }
+        }
+        let candidates = parse_ps_candidate_processes(&ps_out);
+        let preliminary: Vec<ParsedCandidateProcess> = candidates
+            .into_iter()
+            .filter(|proc| !managed_pids.contains(&proc.pid))
+            .collect();
+        let pids: Vec<u32> = preliminary.iter().map(|p| p.pid).collect();
+        let listening_by_pid = query_lsof_listening_ports(&pids);
+        let orphans = preliminary
+            .into_iter()
+            .map(|proc| {
+                let listening_ports = listening_by_pid.get(&proc.pid).cloned().unwrap_or_default();
+                let mut merged_ports: BTreeSet<u16> = listening_ports.iter().copied().collect();
+                if let Some(port) = proc.configured_port {
+                    merged_ports.insert(port);
+                }
+                OrphanCandidateProcess {
+                    pid: proc.pid,
+                    ppid: proc.ppid,
+                    executable: proc.executable,
+                    instance: proc.instance,
+                    configured_port: proc.configured_port,
+                    listening_ports,
+                    ports: merged_ports.into_iter().collect(),
+                    reason: "unmanaged_candidate_process".to_owned(),
+                    advice: format!(
+                        "Verify PID {} is not an active test/worktree session, then stop it manually: kill {}",
+                        proc.pid, proc.pid
+                    ),
+                }
+            })
+            .collect();
+        OrphanCandidateReport {
+            supported: true,
+            probe_error: None,
+            orphans,
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = home;
+        OrphanCandidateReport {
+            supported: false,
+            probe_error: None,
+            orphans: Vec::new(),
+        }
+    }
+}
+
+pub fn format_ports_csv(ports: &[u16]) -> String {
+    if ports.is_empty() {
+        "none".to_owned()
+    } else {
+        ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+pub fn orphan_candidates_doctor_line(report: &OrphanCandidateReport) -> String {
+    if !report.supported {
+        return format!(
+            "LAYER orphan-candidates not-applicable platform={}",
+            std::env::consts::OS
+        );
+    }
+    if let Some(error) = &report.probe_error {
+        return format!("LAYER orphan-candidates status=probe_failed detail={error}");
+    }
+    if report.orphans.is_empty() {
+        return "LAYER orphan-candidates status=clean count=0".to_owned();
+    }
+    let pids = report
+        .orphans
+        .iter()
+        .map(|entry| entry.pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut all_ports = BTreeSet::new();
+    for entry in &report.orphans {
+        for &port in &entry.ports {
+            all_ports.insert(port);
+        }
+    }
+    let ports_csv = if all_ports.is_empty() {
+        "none".to_owned()
+    } else {
+        all_ports
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "LAYER orphan-candidates status=orphans_detected count={} pids={pids} ports={ports_csv}",
+        report.orphans.len()
+    )
+}
+
+pub fn orphan_candidates_warning_lines(report: &OrphanCandidateReport) -> Vec<String> {
+    report
+        .orphans
+        .iter()
+        .map(|entry| {
+            format!(
+                "WARN orphan-candidate pid={} ppid={} ports={} executable={} reason={} advice=\"{}\"",
+                entry.pid,
+                entry.ppid,
+                format_ports_csv(&entry.ports),
+                entry.executable,
+                entry.reason,
+                entry.advice
+            )
+        })
+        .collect()
+}
+
+pub fn orphan_candidates_attention_lines(
+    report: &OrphanCandidateReport,
+    language: crate::locale::Locale,
+) -> Vec<String> {
+    report
+        .orphans
+        .iter()
+        .map(|entry| {
+            let ports = format_ports_csv(&entry.ports);
+            match language {
+                crate::locale::Locale::ZhCn => format!(
+                    "检测到未受管的 herdr-mcp candidate 孤儿进程 pid={} 端口={} ({}, 原因={}) · 建议（只读诊断，不自动杀进程）：{}",
+                    entry.pid, ports, entry.executable, entry.reason, entry.advice
+                ),
+                crate::locale::Locale::Ja => format!(
+                    "管理対象外の herdr-mcp candidate プロセスを検出 pid={} ポート={} ({}, 理由={}) · 推奨（自動終了しません）：{}",
+                    entry.pid, ports, entry.executable, entry.reason, entry.advice
+                ),
+                crate::locale::Locale::En => format!(
+                    "unmanaged herdr-mcp candidate process pid={} ports={} ({}, reason={}) · advice (read-only, never auto-killed): {}",
+                    entry.pid, ports, entry.executable, entry.reason, entry.advice
+                ),
+            }
+        })
+        .collect()
+}
+
+pub fn orphan_candidates_json(report: &OrphanCandidateReport) -> Value {
+    if !report.supported {
+        return json!({
+            "state": "not_supported",
+            "count": 0,
+            "processes": [],
+        });
+    }
+    if let Some(error) = &report.probe_error {
+        return json!({
+            "state": "probe_failed",
+            "count": 0,
+            "error": error,
+            "processes": [],
+        });
+    }
+    let processes: Vec<Value> = report
+        .orphans
+        .iter()
+        .map(|entry| {
+            json!({
+                "pid": entry.pid,
+                "ppid": entry.ppid,
+                "executable": entry.executable,
+                "instance": entry.instance,
+                "configured_port": entry.configured_port,
+                "listening_ports": entry.listening_ports,
+                "ports": entry.ports,
+                "reason": entry.reason,
+                "advice": entry.advice,
+            })
+        })
+        .collect();
+    json!({
+        "state": if processes.is_empty() { "clean" } else { "orphans_detected" },
+        "count": processes.len(),
+        "processes": processes,
+        "advice": if processes.is_empty() {
+            Value::Null
+        } else {
+            json!("Inspect unmanaged herdr-mcp candidate processes above and stop leftover processes manually (for example: kill <pid>). doctor never terminates processes automatically.")
+        },
+    })
+}
+
 #[cfg(test)]
 pub fn doctor_line_with<Loaded: Fn(&str) -> (LaunchdLoadState, String)>(
     launch_agents_dir: &Path,
@@ -646,6 +1286,131 @@ mod tests {
 
         let stat = status_line_with(&agents, &config, load_fn);
         assert!(stat.contains("residue detected"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orphan_candidate_scan_distinguishes_managed_instances_from_unmanaged_and_stale_processes() {
+        let root = temp_test_dir("orphan-candidates");
+        let agents = root.join("Library/LaunchAgents");
+        let config = root.join(".config");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(config.join("herdr-mcp/runtime/current")).unwrap();
+        fs::create_dir_all(config.join("herdr-mcp-dev698/runtime/current")).unwrap();
+        fs::write(agents.join("dev.herdr-mcp.server.plist"), b"<plist/>").unwrap();
+        fs::write(
+            agents.join("dev.herdr-mcp.dev698.server.plist"),
+            b"<plist/>",
+        )
+        .unwrap();
+
+        let default_bin = config.join("herdr-mcp/runtime/current/herdr-mcp");
+        let named_bin = config.join("herdr-mcp-dev698/runtime/current/herdr-mcp");
+        let ps_output = format!(
+            " 1033     1 {} herdr-supervisor run\n\
+             25012     1 {} candidate --port 8772\n\
+             25054     1 {} link run\n\
+             17380     1 {} candidate --port 8991\n\
+             48899     1 /bin/bash -c pkill -f \"herdr-mcp candidate --port 18731\"; /tmp/wt/target/debug/herdr-mcp candidate --port 18731\n\
+             48903 48899 /tmp/wt/target/debug/herdr-mcp candidate --port 18731\n\
+             49994     1 /tmp/wt/target/debug/herdr-mcp --instance=tmp candidate --port=59673\n\
+             51000     1 /Users/test/.config/herdr-mcp-ghost/runtime/current/herdr-mcp candidate --port 9110\n",
+            default_bin.display(),
+            default_bin.display(),
+            default_bin.display(),
+            named_bin.display(),
+        );
+        let launchctl_output = "\
+PID\tStatus\tLabel\n\
+17380\t0\tdev.herdr-mcp.dev698.server\n\
+-\t0\tdev.herdr-mcp.health-watchdog\n\
+25054\t0\tdev.herdr-mcp.link-prod\n\
+1033\t0\tdev.herdr-mcp.herdr-supervisor\n\
+25012\t0\tdev.herdr-mcp.server\n\
+51000\t0\tdev.herdr-mcp.ghost.server\n";
+        let lsof_output = "\
+p48903\n\
+f15\n\
+n127.0.0.1:18731\n\
+p49994\n\
+f17\n\
+n127.0.0.1:59673\n\
+n[::1]:59674\n\
+p51000\n\
+f18\n\
+n127.0.0.1:9110\n";
+
+        let report =
+            scan_orphan_candidates_macos_with(&root, &ps_output, launchctl_output, |pids| {
+                assert_eq!(pids, &[48903, 49994, 51000]);
+                parse_lsof_listening_ports(lsof_output)
+            });
+
+        assert!(report.supported);
+        assert_eq!(report.probe_error, None);
+        assert_eq!(report.orphans.len(), 3);
+
+        assert_eq!(report.orphans[0].pid, 48903);
+        assert_eq!(report.orphans[0].ppid, 48899);
+        assert_eq!(report.orphans[0].configured_port, Some(18731));
+        assert_eq!(report.orphans[0].listening_ports, vec![18731]);
+        assert_eq!(report.orphans[0].ports, vec![18731]);
+        assert_eq!(report.orphans[0].reason, "unmanaged_candidate_process");
+        assert!(report.orphans[0].advice.contains("kill 48903"));
+
+        assert_eq!(report.orphans[1].pid, 49994);
+        assert_eq!(report.orphans[1].instance.as_deref(), Some("tmp"));
+        assert_eq!(report.orphans[1].configured_port, Some(59673));
+        assert_eq!(report.orphans[1].listening_ports, vec![59673, 59674]);
+        assert_eq!(report.orphans[1].ports, vec![59673, 59674]);
+        assert_eq!(report.orphans[1].reason, "unmanaged_candidate_process");
+
+        assert_eq!(report.orphans[2].pid, 51000);
+        assert_eq!(report.orphans[2].ports, vec![9110]);
+        assert_eq!(
+            report.orphans[2].reason,
+            "stale_named_launchd_service:ghost"
+        );
+        assert!(
+            report.orphans[2]
+                .advice
+                .contains("herdr-mcp instance uninstall --name ghost")
+        );
+
+        let layer = orphan_candidates_doctor_line(&report);
+        assert_eq!(
+            layer,
+            "LAYER orphan-candidates status=orphans_detected count=3 pids=48903,49994,51000 ports=9110,18731,59673,59674"
+        );
+        let warnings = orphan_candidates_warning_lines(&report);
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[0].contains("WARN orphan-candidate pid=48903 ppid=48899 ports=18731"));
+        let attention = orphan_candidates_attention_lines(&report, crate::locale::Locale::ZhCn);
+        assert_eq!(attention.len(), 3);
+        assert!(attention[0].contains("不自动杀进程"));
+        let json_val = orphan_candidates_json(&report);
+        assert_eq!(json_val["state"], "orphans_detected");
+        assert_eq!(json_val["count"], 3);
+        assert_eq!(json_val["processes"][0]["pid"], 48903);
+        assert_eq!(json_val["processes"][0]["ports"], json!([18731]));
+
+        let clean_report = scan_orphan_candidates_macos_with(
+            &root,
+            &format!(
+                "25012 1 {} candidate --port 8772\n17380 1 {} candidate --port 8991\n",
+                default_bin.display(),
+                named_bin.display()
+            ),
+            launchctl_output,
+            |_| BTreeMap::new(),
+        );
+        assert!(clean_report.orphans.is_empty());
+        assert_eq!(
+            orphan_candidates_doctor_line(&clean_report),
+            "LAYER orphan-candidates status=clean count=0"
+        );
+        assert_eq!(orphan_candidates_json(&clean_report)["state"], "clean");
 
         let _ = fs::remove_dir_all(root);
     }

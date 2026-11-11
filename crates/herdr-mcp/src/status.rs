@@ -675,6 +675,17 @@ pub fn print_doctor(
     );
     println!("{}", continuity_journal_layer(&continuity_journal));
     println!("{}", webchat_grants.doctor_line(language));
+    let orphan_candidates = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| crate::residue::scan_orphan_candidates(&home))
+        .unwrap_or_default();
+    println!(
+        "{}",
+        crate::residue::orphan_candidates_doctor_line(&orphan_candidates)
+    );
+    for warn_line in crate::residue::orphan_candidates_warning_lines(&orphan_candidates) {
+        println!("{warn_line}");
+    }
     let remote = print_layer_ownership(paths, config, &report, verbose);
     println!(
         "LAYER authenticated-local-mcp {}",
@@ -714,6 +725,7 @@ pub fn print_doctor(
         "warnings": crate::herdr_core::warnings_json(&herdr_core),
         "webchat_grants": webchat_grants.as_json(),
         "continuity_journal": continuity_journal_json(&continuity_journal),
+        "orphan_candidates": crate::residue::orphan_candidates_json(&orphan_candidates),
         "overall": readiness.as_str(),
     });
     println!("DOCTOR_JSON {doctor_json}");
@@ -938,6 +950,10 @@ pub fn print_doctor(
                     .to_owned(),
             );
         }
+        attention.extend(crate::residue::orphan_candidates_attention_lines(
+            &orphan_candidates,
+            language,
+        ));
         if !attention.is_empty() {
             std::println!();
             std::println!("{}:", language.text("Attention", "需要处理", "要確認"));
@@ -2382,5 +2398,14 @@ mod tests {
         assert_eq!(grants_json["state"], "unknown");
         assert_eq!(grants_json["principals"], json!([]));
         assert_eq!(grants_json["endpoints"], json!([]));
+        let clean_orphans = crate::residue::OrphanCandidateReport {
+            supported: true,
+            probe_error: None,
+            orphans: Vec::new(),
+        };
+        let orphans_json = crate::residue::orphan_candidates_json(&clean_orphans);
+        assert_eq!(orphans_json["state"], "clean");
+        assert_eq!(orphans_json["count"], 0);
+        assert_eq!(orphans_json["processes"], json!([]));
     }
 }
