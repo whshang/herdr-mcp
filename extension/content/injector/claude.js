@@ -5,6 +5,8 @@ const CLAUDE_ADAPTER_CAPABILITIES = Object.freeze({
   browserActuation: true,
   stopGeneration: true,
 });
+const CLAUDE_STOP_TESTID_RE = /^(?:stop|stop-button|chat-input-stop|chat-stop|chat-stop-button|composer-stop|composer-stop-button|stop-generation|stop-generation-button|stop-response|stop-response-button|stop-streaming|stop-streaming-button)$/i;
+const CLAUDE_STOP_LABEL_RE = /^(?:stop|stop response|stop generating|stop streaming|stop output|stop reply|interrupt|interrupt response|停止|停止回应|停止响应|停止回答|停止生成|停止输出|停止回复|停止流式|停止流式传输|停止回應|停止響應|停止產生|停止輸出|停止回覆|中断|中断回应|中断响应|中断回答|中断生成|中斷|中斷回應|中斷產生|中止|中止回应|中止生成)$/i;
 
 class ClaudeAdapter extends BaseAdapter {
   get name() { return "claude"; }
@@ -109,9 +111,14 @@ class ClaudeAdapter extends BaseAdapter {
 
   getSendButtonCandidates() {
     const chains = [
+      'button[data-testid="chat-input-send"]',
+      '[role="button"][data-testid="chat-input-send"]',
       'button[aria-label="Send message"]',
       'button[data-testid="send-button"]',
       'button[aria-label*="Send" i]',
+      'button[aria-label*="发送"]',
+      'button[aria-label*="傳送"]',
+      'button[aria-label*="發送"]',
       'button[type="submit"]',
     ];
     const seen = new Set();
@@ -136,6 +143,19 @@ class ClaudeAdapter extends BaseAdapter {
     const count = (selector, root = document) => {
       try { return Math.min([...root.querySelectorAll(selector)].filter(visible).length, 50); } catch (_) { return -1; }
     };
+    const countAny = (selectors, root = document) => {
+      try {
+        const matched = new Set();
+        for (const selector of selectors) {
+          for (const el of root.querySelectorAll(selector)) {
+            if (visible(el)) matched.add(el);
+          }
+        }
+        return Math.min(matched.size, 50);
+      } catch (_) {
+        return -1;
+      }
+    };
     const rows = [...document.querySelectorAll('[data-testid="transcript-row"]')];
     let latest = null;
     let latestIndex = -1;
@@ -146,8 +166,28 @@ class ClaudeAdapter extends BaseAdapter {
     }
     const role = String(latest?.getAttribute?.("data-perf-row") || "");
     return {
-      claude_stop_aria_label_count: count('button[aria-label*="Stop" i]'),
-      claude_stop_testid_count: count('button[data-testid="stop-button"]'),
+      claude_stop_aria_label_count: countAny([
+        'button[aria-label*="Stop" i]',
+        '[role="button"][aria-label*="Stop" i]',
+        'button[aria-label*="Interrupt" i]',
+        '[role="button"][aria-label*="Interrupt" i]',
+        'button[aria-label*="停止"]',
+        '[role="button"][aria-label*="停止"]',
+        'button[aria-label*="中断"]',
+        '[role="button"][aria-label*="中断"]',
+        'button[aria-label*="中斷"]',
+        '[role="button"][aria-label*="中斷"]',
+        'button[aria-label*="中止"]',
+        '[role="button"][aria-label*="中止"]',
+      ]),
+      claude_stop_testid_count: countAny([
+        'button[data-testid="chat-input-stop"]',
+        '[role="button"][data-testid="chat-input-stop"]',
+        'button[data-testid="stop-button"]',
+        '[role="button"][data-testid="stop-button"]',
+        'button[data-testid*="stop" i]',
+        '[role="button"][data-testid*="stop" i]',
+      ]),
       claude_stop_candidate_count: Math.min(this.getStopButtonCandidates().length, 50),
       claude_transcript_row_count: Math.min(rows.length, 10000),
       claude_latest_row_index: latestIndex,
@@ -159,23 +199,66 @@ class ClaudeAdapter extends BaseAdapter {
     };
   }
 
+  isExplicitStopElement(element) {
+    if (!element || !this.elementVisible(element)) return false;
+    const testId = String(element.getAttribute?.("data-testid") || "").trim();
+    if (testId && CLAUDE_STOP_TESTID_RE.test(testId)) return true;
+    // `aria-label*="Stop"` also hits unrelated visible controls (2026-10-12
+    // probe: 2 such buttons on an idle chat made every submit composer_busy).
+    // Only an exact stop label or an exact stop test id counts.
+    const labels = [
+      element.getAttribute?.("aria-label"),
+      element.getAttribute?.("title"),
+      element.innerText,
+      element.textContent,
+    ];
+    for (const raw of labels) {
+      const normalized = String(raw || "").trim().replace(/\s+/g, " ");
+      if (normalized && CLAUDE_STOP_LABEL_RE.test(normalized)) return true;
+    }
+    return false;
+  }
+
   getStopButtonCandidates() {
     const chains = [
-      'button[aria-label*="Stop" i]',
+      'button[data-testid="chat-input-stop"]',
+      '[role="button"][data-testid="chat-input-stop"]',
       'button[data-testid="stop-button"]',
+      '[role="button"][data-testid="stop-button"]',
+      'button[data-testid*="stop" i]',
+      '[role="button"][data-testid*="stop" i]',
+      'button[aria-label*="Stop" i]',
+      '[role="button"][aria-label*="Stop" i]',
+      'button[aria-label*="Interrupt" i]',
+      '[role="button"][aria-label*="Interrupt" i]',
+      'button[aria-label*="停止"]',
+      '[role="button"][aria-label*="停止"]',
+      'button[aria-label*="中断"]',
+      '[role="button"][aria-label*="中断"]',
+      'button[aria-label*="中斷"]',
+      '[role="button"][aria-label*="中斷"]',
+      'button[aria-label*="中止"]',
+      '[role="button"][aria-label*="中止"]',
+      'button[title*="Stop" i]',
+      'button[title*="停止"]',
+      'button[title*="中断"]',
+      'button[title*="中斷"]',
+      'button[title*="中止"]',
     ];
     const seen = new Set();
     const out = [];
     for (const selector of chains) {
       for (const element of document.querySelectorAll(selector)) {
-        if (!this.elementVisible(element) || seen.has(element)) continue;
-        // `aria-label*="Stop"` also hits unrelated visible controls (2026-10-12
-        // probe: 2 such buttons on an idle chat made every submit composer_busy).
-        // Only an exact stop label or the stop-button test id counts.
-        if (selector.startsWith("button[aria-label")) {
-          const label = String(element.getAttribute?.("aria-label") || "").trim().replace(/\s+/g, " ");
-          if (!/^(?:stop|stop response|stop generating|stop streaming|停止|停止生成|停止回答)$/i.test(label)) continue;
-        }
+        if (seen.has(element) || !this.isExplicitStopElement(element)) continue;
+        seen.add(element);
+        out.push(element);
+      }
+    }
+    const input = this.getInputEl();
+    const composerScope = input?.closest?.("fieldset, form") || input?.parentElement?.parentElement || null;
+    if (composerScope && typeof composerScope.querySelectorAll === "function") {
+      for (const element of composerScope.querySelectorAll('button, [role="button"]')) {
+        if (seen.has(element) || !this.isExplicitStopElement(element)) continue;
         seen.add(element);
         out.push(element);
       }

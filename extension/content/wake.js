@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.247";
+const H2W_CONTENT_VERSION = "0.1.248";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -899,8 +899,9 @@ function normalizeHerdrMentionAlias(value) {
       btn.innerText || "",
       btn.getAttribute("type") || "",
     ].filter(Boolean).join(" ");
-    if (/stop|停止|generating|生成中|streaming|cancel|voice/i.test(blob)) return false;
-    return /send|发送|submit|提交|prompt/i.test(blob) || /send-button|composer-send|chat-submit/i.test(blob);
+    if (/stop|interrupt|停止|中断|中斷|中止|generating|生成中|streaming|cancel|voice/i.test(blob)) return false;
+    return /send|发送|傳送|發送|submit|提交|prompt/i.test(blob)
+      || /send-button|chat-input-send|composer-send|chat-submit/i.test(blob);
   }
 
   function findSendButton() {
@@ -1722,11 +1723,13 @@ function normalizeHerdrMentionAlias(value) {
   function explicitStopControl(el) {
     if (!el || !elementVisible(el)) return false;
     const testId = String(el.getAttribute("data-testid") || "").trim().toLowerCase();
-    if (testId === "stop-button") return true;
+    if (/^(?:stop|stop-button|chat-input-stop|chat-stop|chat-stop-button|composer-stop|composer-stop-button|stop-generation|stop-generation-button|stop-response|stop-response-button|stop-streaming|stop-streaming-button)$/.test(testId)) {
+      return true;
+    }
     const values = [el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.textContent]
       .map((value) => String(value || "").trim().replace(/\s+/g, " "))
       .filter(Boolean);
-    return values.some((value) => /^(?:stop|stop generating|stop streaming|stop response|停止|停止生成|停止流式|停止回答)$/i.test(value));
+    return values.some((value) => /^(?:stop|stop generating|stop streaming|stop response|stop output|stop reply|interrupt|interrupt response|停止|停止回应|停止响应|停止生成|停止流式|停止流式传输|停止回答|停止输出|停止回复|停止回應|停止響應|停止產生|停止輸出|停止回覆|中断|中断回应|中断响应|中断回答|中断生成|中斷|中斷回應|中斷產生|中止|中止回应|中止生成)$/i.test(value));
   }
 
   function stopButtons() {
@@ -2773,7 +2776,7 @@ function normalizeHerdrMentionAlias(value) {
       if (!providerCanonicalConversationObserved()) {
         return browserUnavailableEvidence(evidence, "browser_reconcile_canonical_url_unavailable");
       }
-      const reconcileDispatchId = typeof command?.dispatch_id === "string"
+      const reconcileDispatchId = typeof command?.dispatch_id === "string" && command.dispatch_id
         ? command.dispatch_id
         : (typeof params.dispatch_id === "string" ? params.dispatch_id : "");
       const dispatchGeneration = Number.isSafeInteger(params.dispatch_generation)

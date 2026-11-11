@@ -413,3 +413,163 @@ test("user reads latest Claude message when virtualized rows are out of DOM orde
   h.set('[data-testid="transcript-row"]', [olderUser.row, assistant.row]);
   assert.equal(h.adapter.getResultSettlementSnapshot(acceptedRef), null);
 });
+
+test("user stops a streaming Claude turn across testid and localized labels | Given Claude renders chat-input-stop or Chinese stop aria-labels or sr-only composer stop text | When stop candidates send candidates and busy probe details are inspected | Then only explicit stop controls match and loose Stop or 停止 labels stay idle", () => {
+  const h = harness();
+  const idleRow = element({ attrs: { "data-perf-row": "assistant", "data-perf-row-streaming": "false", "data-index": "4" } });
+  idleRow.querySelectorAll = () => [];
+  h.set('[data-testid="transcript-row"]', [idleRow]);
+  h.set('[data-is-streaming="true"]', []);
+
+  const stopWatch = element({ attrs: { "data-testid": "stopwatch-button", "aria-label": "Stopwatch tool" } });
+  const stopDictationZh = element({ attrs: { "aria-label": "停止听写" } });
+  h.set('button[data-testid*="stop" i]', [stopWatch]);
+  h.set('button[aria-label*="Stop" i]', [stopWatch]);
+  h.set('button[aria-label*="停止"]', [stopDictationZh]);
+  assert.equal(h.adapter.getStopButtonCandidates().length, 0);
+  assert.equal(h.adapter.isGenerationInProgress(), false);
+
+  const chatInputStop = element({ attrs: { "data-testid": "chat-input-stop" } });
+  h.set('button[data-testid="chat-input-stop"]', [chatInputStop]);
+  assert.equal(h.adapter.getStopButtonCandidates().length, 1);
+  assert.equal(h.adapter.getStopButtonCandidates()[0], chatInputStop);
+  assert.equal(h.adapter.isGenerationInProgress(), true);
+  const probeTestId = h.adapter.composerBusyProbeDetail();
+  assert.equal(probeTestId.claude_stop_testid_count, 2);
+  assert.equal(probeTestId.claude_stop_candidate_count, 1);
+
+  h.set('button[data-testid="chat-input-stop"]', []);
+  const zhStopResponse = element({ attrs: { "aria-label": "停止回应" } });
+  h.set('button[aria-label*="停止"]', [stopDictationZh, zhStopResponse]);
+  assert.equal(h.adapter.getStopButtonCandidates().length, 1);
+  assert.equal(h.adapter.getStopButtonCandidates()[0], zhStopResponse);
+  assert.equal(h.adapter.composerBusyProbeDetail().claude_stop_aria_label_count, 3);
+  assert.equal(h.adapter.composerBusyProbeDetail().claude_stop_candidate_count, 1);
+
+  h.set('button[aria-label*="停止"]', [stopDictationZh]);
+  const srOnlyStop = element({ text: "Stop response", attrs: { type: "button" } });
+  const modelButton = element({ text: "Sonnet 4.5", attrs: { type: "button" } });
+  const fieldset = {
+    querySelectorAll(selector) {
+      return selector === 'button, [role="button"]' ? [modelButton, srOnlyStop] : [];
+    },
+  };
+  const composer = element();
+  composer.closest = (selector) => (selector === "fieldset, form" ? fieldset : null);
+  h.set('[data-testid="chat-input"][contenteditable="true"]', [composer]);
+  assert.equal(h.adapter.getStopButtonCandidates().length, 1);
+  assert.equal(h.adapter.getStopButtonCandidates()[0], srOnlyStop);
+
+  const chatInputSend = element({ attrs: { "data-testid": "chat-input-send" } });
+  const zhSend = element({ attrs: { "aria-label": "发送消息" } });
+  h.set('button[data-testid="chat-input-send"]', [chatInputSend]);
+  h.set('button[aria-label*="发送"]', [zhSend]);
+  const sendCandidates = h.adapter.getSendButtonCandidates();
+  assert.equal(sendCandidates.length, 2);
+  assert.equal(sendCandidates[0], chatInputSend);
+  assert.equal(sendCandidates[1], zhSend);
+});
+
+test("user stops a streaming Claude dispatch and reconciles empty command dispatch_id | Given wake runs real ClaudeAdapter stop controls and reconcile with an empty command dispatch_id | When browser_dispatch.stop and browser_dispatch.reconcile execute | Then stop clicks chat-input-stop once to reach generation_stopped and reconcile falls back to params.dispatch_id", async () => {
+  const h = harness();
+  let streaming = true;
+  let clicks = 0;
+  const chatInputStop = {
+    visible: true,
+    disabled: false,
+    innerText: "",
+    textContent: "",
+    getAttribute(name) {
+      if (name === "data-testid") return "chat-input-stop";
+      if (name === "aria-label") return "停止回应";
+      if (name === "aria-disabled") return "false";
+      return null;
+    },
+    click() {
+      clicks += 1;
+      streaming = false;
+      h.set('button[data-testid="chat-input-stop"]', []);
+      h.set('button[aria-label*="停止"]', []);
+    },
+  };
+  h.set('button[data-testid="chat-input-stop"]', [chatInputStop]);
+  h.set('button[aria-label*="停止"]', [chatInputStop]);
+
+  const stopHelperStart = wakeSource.indexOf("  function explicitStopControl(");
+  const stopHelperEnd = wakeSource.indexOf("  function looksLikeSubstantiveReply(", stopHelperStart);
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const baselineHelperStart = wakeSource.indexOf("  function chatGptDispatchBaselineRejectionReason(");
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(stopHelperStart >= 0 && stopHelperEnd > stopHelperStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
+  assert.ok(baselineHelperStart >= 0 && commandStart > baselineHelperStart && commandEnd > commandStart);
+
+  const sessionRef = "br_" + "c".repeat(64);
+  const dispatchId = "bd_" + "d".repeat(64);
+  const acceptedRef = "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:8";
+  const assignments = new Map();
+
+  const runtime = new Function("env", `
+    const ADAPTER = env.adapter;
+    const elementVisible = (el) => ADAPTER.elementVisible(el);
+    const document = {
+      hidden: false,
+      querySelectorAll: () => [],
+    };
+    const location = env.location;
+    const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    let registeredBrowserSessionRef = env.sessionRef;
+    let registeredBrowserGeneration = 17;
+    let registeredConvKey = ADAPTER.getConversationKey();
+    const acceptedDispatchAssignments = env.assignments;
+    const providerCanonicalConversationObserved = () => true;
+    const wait = async () => {};
+    let observeCalls = 0;
+    const observeBrowserResultSettlement = async () => {
+      observeCalls += 1;
+      const entry = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+      if (entry) entry.reportedAssistantRef = "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:9";
+      return true;
+    };
+    ${wakeSource.slice(stopHelperStart, stopHelperEnd)}
+    ${wakeSource.slice(evidenceStart, evidenceEnd)}
+    ${wakeSource.slice(baselineHelperStart, commandEnd)}
+    return { performBrowserActuationCommand, stopButtons, getObserveCalls: () => observeCalls };
+  `)({ adapter: h.adapter, location: h.location, sessionRef, assignments });
+
+  assert.equal(runtime.stopButtons().length, 1);
+
+  const stopEvidence = await runtime.performBrowserActuationCommand({
+    operation: "herdr_mcp.browser_dispatch.stop",
+    expected_generation: 17,
+    params: { session_ref: sessionRef, provider: "claude" },
+  });
+  assert.equal(clicks, 1);
+  assert.equal(streaming, false);
+  assert.equal(stopEvidence.rejected, false);
+  assert.equal(stopEvidence.command_accepted, true);
+  assert.equal(stopEvidence.generation_owner, 17);
+  assert.equal(stopEvidence.generation_status_observed, true);
+  assert.equal(stopEvidence.generation_stopped, true);
+
+  const reconcileEvidence = await runtime.performBrowserActuationCommand({
+    operation: "herdr_mcp.browser_dispatch.reconcile",
+    dispatch_id: "",
+    expected_generation: 17,
+    params: {
+      session_ref: sessionRef,
+      provider: "claude",
+      dispatch_id: dispatchId,
+      dispatch_generation: 17,
+      accepted_user_message_ref: acceptedRef,
+      settle_result: true,
+    },
+  });
+  assert.equal(reconcileEvidence.command_accepted, true);
+  assert.equal(assignments.get(sessionRef)?.dispatchId, dispatchId);
+  assert.equal(assignments.get(sessionRef)?.acceptedUserMessageRef, acceptedRef);
+  assert.equal(runtime.getObserveCalls(), 1);
+});
