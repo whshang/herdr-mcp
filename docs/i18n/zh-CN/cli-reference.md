@@ -166,7 +166,7 @@ herdr_call(
 herdr-mcp connector approve <approval-request-id>
 herdr-mcp connector list
 herdr-mcp connector revoke <connector-id> --confirm
-herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> grokbot-user@example.com
 herdr-mcp connector label <connector-id> --clear
 herdr-mcp connector webchat-control allow-device <connector-id-or-platform-account> <device-id> --confirm
 herdr-mcp connector webchat-control deny-device <connector-id-or-platform-account> <device-id> --confirm

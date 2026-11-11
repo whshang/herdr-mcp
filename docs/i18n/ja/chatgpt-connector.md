@@ -212,10 +212,10 @@ Connector は Web AI がワークステーションに到達する問題を解�
 
 ## プラットフォームアカウント
 
-`connector_id` は `grant_generation` と組になって付与の主体のままです。`platform_account` は `<platform>-<email>` 形式の表示用メタデータです。例: `grokbot-whshang@gmail.com`。OAuth の `client_name`（たとえば `Cursor`）はアカウントではありません。所有者は `connector_id` でラベルを設定または消去します。
+`connector_id` は `grant_generation` と組になって付与の主体のままです。`platform_account` は `<platform>-<email>` 形式の表示用メタデータです。例: `grokbot-user@example.com`。OAuth の `client_name`（たとえば `Cursor`）はアカウントではありません。所有者は `connector_id` でラベルを設定または消去します。
 
 ```bash
-herdr-mcp connector label <connector-id> grokbot-whshang@gmail.com
+herdr-mcp connector label <connector-id> grokbot-user@example.com
 herdr-mcp connector label <connector-id> --clear
 ```
 

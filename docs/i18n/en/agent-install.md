@@ -108,12 +108,12 @@ Combine read-only checks into one final verification wave. Installation is compl
 - the machine has a canonical `dev_<ULID>` device identity;
 - one real authenticated MCP request completes from the public origin to this workstation and back.
 
-Then open ChatGPT **Settings → Account security & login** and enable **Developer mode**. Open **Plugins → Browse plugins**, click the top-right **+ → Create APP**, create an MCP app with the complete `https://…workers.dev/mcp` address, and finish OAuth. `herdr` is the recommended example App name; custom names are supported. Work inside a ChatGPT Project. In each new chat, use the `+` button in the first message that needs workstation access to select/reference that App. The extension learns its provider-owned keyword and reuses it for later Herdr turns.
+Then open ChatGPT **Settings → Apps & Connectors** (legacy **Plugins → Browse plugins**) and enable **Developer mode**. Click **+ → Create APP**, create an MCP app with `https://…workers.dev/mcp`, finish OAuth, and approve it locally. `herdr` is the recommended App name; custom names work. Work inside a ChatGPT Project, using the `+` button in the first message of each new chat to select that App.
 
-Chrome extension / Native Messaging is optional for browser continuity, handoff, and Control Center; see [extension guide](extension.md).
+Chrome extension / Native Messaging is optional for v1.1 Control Center, queued turns, no-ID handoff, multi-provider WebChat (`ChatGPT`, `Claude`, `Grok`, `Doubao`), fenced `browser-page`, and browser Skills; install from the Store or `herdr-mcp extension standalone install` per [extension guide](extension.md) and [WebChat guide](local-agent-webchat-control.md).
 
-## 8. Cleanup and report
+## 8. Cleanup, upgrades, and report
 
-Unset `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` and delete any temporary credential file. Report only non-secret facts: runtime version, device name/id (shortened for display if useful), Worker name, final public origin, Link status, `/health`, OAuth, and MCP E2E result.
+Unset `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` and delete temporary credential files. Report only non-secret facts: runtime version, device name/id, Worker name, final public origin, Link status, `/health`, OAuth, and MCP E2E result. Routine v1.1 upgrades use attested `herdr-mcp update` (and `herdr-mcp worker update` when Worker drift is reported; see [self-upgrade](runtime-self-upgrade.md)).
 
-If permissions, network, OAuth, existing-Worker ownership, or mutation-delivery uncertainty blocks progress, open the matching section of the [manual install guide](install.md) or [troubleshooting](troubleshooting.md). Do not copy the entire maintainer runbook into the execution context up front.
+If permissions, network, OAuth, existing-Worker ownership, or uncertain delivery blocks progress, open the matching section of [manual install guide](install.md) or [troubleshooting](troubleshooting.md); do not preload the full runbook.

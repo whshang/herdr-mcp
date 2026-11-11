@@ -2,9 +2,11 @@
 
 **简体中文** · [English](README.en.md) · [日本語](README.ja.md)
 
-让 ChatGPT 等 Web AI 在你自己的电脑上持续开发：读写文件、使用 Git、运行命令和测试、调用 Coding Agent，并在多台电脑之间调度任务。
+让 ChatGPT、Claude、Grok 等 Web AI 在你自己的电脑上持续开发：读写文件、使用 Git、运行命令和测试、并发调度本地 Coding Agent，并通过浏览器连续性与受控页面适配器在多台电脑之间闭环协作。
 
 **[文档站](https://whshang.github.io/herdr-mcp/zh-CN/)**
+
+![Herdr-MCP 1.1 系统架构](assets/architecture-zh.svg)
 
 ## 一句话安装
 
@@ -30,13 +32,12 @@ Agent 会检查环境、安装 Herdr 与 herdr-mcp、部署 Worker、连接工�
 
 ## ChatGPT 配置
 
-1. 在 ChatGPT 插件设置中开启 **Developer mode**。
-2. 打开 **插件 → 浏览插件**。
-3. 添加 Herdr Connector，名称建议使用 **`herdr`**。
-4. 填入完整 MCP 地址，例如 `https://herdr.example.com/mcp`。
-5. 完成 OAuth。
-6. 在 ChatGPT Project 中工作。
-7. **每个新对话第一次需要手动选择或 @ `herdr`。**
+1. 在 ChatGPT **设置 → 应用与连接器（Apps & Connectors）**（旧版界面为 **插件 → 浏览插件**）中开启 **Developer mode**。
+2. 点击新建 / 添加自定义 MCP Connector，名称建议使用 **`herdr`**。
+3. 填入完整 MCP 地址，例如 `https://herdr.example.com/mcp`。
+4. 完成 OAuth，并在本机终端用 6 位验证码批准该连接器。
+5. 在 ChatGPT Project 中工作。
+6. **每个新对话第一次需要通过输入框 `+` 选择或 `@herdr`。**
 
 建议在 ChatGPT Project 的项目指令里写清本地项目文件夹，例如：
 
@@ -64,14 +65,15 @@ ChatGPT OAuth 首次连接时，授权页会给出精确的本地批准命令和
 
 [安装与授权](docs/i18n/zh-CN/agent-install.md) · [故障排查](docs/i18n/zh-CN/troubleshooting.md)
 
-## 产品特点
+## 1.1 核心特性清单
 
-- **状态留在电脑上。** workspace、终端、Git、worktree、Agent 和长任务不会因为 ChatGPT 对话结束而消失。
-- **一套 ChatGPT 控多台电脑。** 一个 Worker 可以登记多台工作站，任务按明确设备路由。
-- **多个账号可控同一台电脑。** 已授权的 Connector / WebChat 账号独立识别；浏览器控制按 provider、account 和 session 隔离。
-- **支持多个 Coding Agent。** 小任务直接执行，大任务可分配给 Pi、Codex、Claude、Cline、OpenCode 等可用 Agent。
-- **安全处理重试。** mutation 的 delivered / not-delivered / uncertain 状态明确，不会在结果不确定时盲目重放。
-- **浏览器连续工作可选。** Chrome 扩展提供 Project 绑定、Control Center、排队下一轮、接力和 WebChat 控制。
+- **持久开发现场留在电脑上。** Herdr TUI 的 workspace、终端 PTY、Git worktree、后台服务和长任务不会因为网页对话关闭而消失。
+- **一套入口群控多台电脑。** 单个 Cloudflare Worker 可登记多台 macOS / Linux / Windows 工作站，本机保持零公网入站端口，按明确 `device_id` 路由且拒绝盲猜目标机。
+- **多账号与连接器强隔离。** 已授权的 Connector、WebChat 账号与浏览器端点独立识别；跨账号与未授权会话严格 fail-closed。
+- **确定性工具 + 多 Coding Agent 协同。** 读写、Patch、Git、测试直接走 18 个确定性 MCP 工具；复杂任务可派发给 Codex、Claude Code、Pi、Cline、OpenCode 等任意本机可用 Agent 并持久化异步收箱。
+- **多平台 WebChat 编排与接力（1.1）。** 本地 Agent 与扩展协同支持 ChatGPT（参考规划器）、Claude、Grok 会话的创建、续写、中断、归档、排队下一轮与跨会话接力，并支持豆包「AI 创作」生图工作流。
+- **浏览器适配器平台与站点 Skill（1.1）。** 提供带 `page_generation` 围栏的受控标签页操作（`browser-page` 的 `observe` / `click` / `fill` / `navigate`）与项目级可复用浏览器技能（`.agents/skills/herdr-browser-<slug>`）。
+- **明确交付语义与验签自更新（1.1）。** mutation 明确区分 `applied` / `not_applied` / `uncertain`，绝不在结果不确定时盲目重放；内置基于 GitHub Release Sigstore 证明校验的 `herdr-mcp update` 一键自更新与同 schema 回滚保护。
 
 ## 常用方式
 
@@ -107,9 +109,9 @@ herdr-mcp worker pair
 
 浏览器控制只会操作 Registry 中已经发现并授权的 session，不会猜账号或跨账号复用会话。
 
-### 本地 Agent 与 ChatGPT 协作
+### 本地 Agent 与多平台 WebChat 协作
 
-本地 Coding Agent 也可以通过 herdr-mcp 创建、继续和接力受支持的 WebChat 会话，不需要自己再搭一套 Playwright / DOM 自动化。
+本地 Coding Agent 也可以通过 `herdr-mcp webchat` 与 `herdr-mcp browser-page` 创建、继续、接力受支持的 WebChat 会话（ChatGPT、Claude、Grok、豆包）或操作受控网页，不需要自己再搭一套脆弱的 Playwright / DOM 自动化。
 
 [本地 Agent ↔ WebChat](docs/i18n/zh-CN/local-agent-webchat-control.md)
 
@@ -117,22 +119,29 @@ herdr-mcp worker pair
 
 核心 ChatGPT → MCP → 工作站连接不依赖浏览器扩展。
 
-需要 Project 绑定、Control Center、浏览器连续工作、排队下一轮或 WebChat 接力时，再安装官方扩展：
+需要 Chrome 侧边栏 Control Center、Project 绑定、排队下一轮、无 ID 跨会话接力、多平台 WebChat 编排或 `browser-page` 页面适配时，可从商店安装，或用 CLI 直接暂存与当前 Runtime 精确对齐的受管扩展：
 
-[Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [扩展说明](docs/i18n/zh-CN/extension.md) · [浏览器连续工作](docs/i18n/zh-CN/browser-continuity.md)
+```bash
+herdr-mcp extension standalone install
+```
 
-## 检查状态
+[Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [扩展说明](docs/i18n/zh-CN/extension.md) · [Control Center](docs/i18n/zh-CN/browser-control-center.md) · [浏览器连续工作](docs/i18n/zh-CN/browser-continuity.md)
+
+## 检查状态与日常升级
 
 ```bash
 herdr-mcp status
 herdr-mcp doctor
 herdr-mcp link status
 herdr-mcp device list
+herdr-mcp update
 ```
+
+`herdr-mcp update` 会自动验证 GitHub Release 签名清单与 Sigstore 构建证明并完成可回滚更新；若提示 Fleet Worker 版本落后，再单独运行 `herdr-mcp worker update` 原地同步 Worker。
 
 macOS Apple Silicon、Linux x86_64 和 Linux ARM64 为 Production。Windows x86_64 / ARM64 当前为 Candidate。WSL 不在支持范围。
 
-[平台支持](docs/i18n/zh-CN/platform-support-matrix.md) · [CLI 参考](docs/i18n/zh-CN/cli-reference.md) · [完整文档](https://whshang.github.io/herdr-mcp/zh-CN/)
+[平台支持](docs/i18n/zh-CN/platform-support-matrix.md) · [自更新说明](docs/i18n/zh-CN/runtime-self-upgrade.md) · [CLI 参考](docs/i18n/zh-CN/cli-reference.md) · [完整文档](https://whshang.github.io/herdr-mcp/zh-CN/)
 
 ## 常见问题
 
@@ -173,7 +182,7 @@ herdr-mcp doctor
 
 ### 必须安装 Chrome 扩展吗？
 
-不需要。核心 ChatGPT → MCP → 工作站连接可以独立使用。需要 Project 绑定、Control Center、浏览器连续工作、排队下一轮或 WebChat 接力时再安装。
+不需要。核心 ChatGPT → MCP → 工作站连接可以独立使用。需要 Project 绑定、Control Center、浏览器连续工作、排队下一轮、多平台 WebChat 接力或受控页面操作时再安装。
 
 ### Herdr-MCP 必须绑定某个 Coding Agent 吗？
 
