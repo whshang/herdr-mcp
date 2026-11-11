@@ -43,6 +43,21 @@ pub const LOCAL_MCP_MAX_TIMEOUT_MS: u64 = 120_000;
 /// Runtime execution contract epoch implemented by the local managed runtime.
 pub const LOCAL_MCP_CONTRACT_EPOCH: u64 = 5;
 
+pub fn default_endpoint_for_port(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/mcp")
+}
+
+pub fn default_endpoint_for_instance(instance: &crate::instance::InstanceId) -> String {
+    default_endpoint_for_port(instance.default_port())
+}
+
+pub fn endpoint_targets_port(endpoint: &str, target_port: u16) -> bool {
+    Url::parse(endpoint.trim())
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+        .is_some_and(|port| port == target_port)
+}
+
 const LOCAL_MCP_RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
 const EDGE_WEBCHAT_AUTHORIZATION_HEADER: &str = "x-herdr-edge-webchat-authorization";
@@ -102,8 +117,13 @@ pub struct LocalMcpConfig {
 
 impl LocalMcpConfig {
     pub fn new(bearer_token: impl Into<String>, contract_hash: impl Into<String>) -> Self {
+        let discovered = crate::paths::RuntimePaths::discover().ok();
+        let endpoint = discovered
+            .as_ref()
+            .map(|paths| default_endpoint_for_instance(&paths.instance))
+            .unwrap_or_else(|| LOCAL_MCP_DEFAULT_ENDPOINT.to_owned());
         Self {
-            endpoint: LOCAL_MCP_DEFAULT_ENDPOINT.to_owned(),
+            endpoint,
             bearer_token: bearer_token.into(),
             contract_hash: contract_hash.into(),
             contract_epoch: LOCAL_MCP_CONTRACT_EPOCH,
@@ -118,9 +138,7 @@ impl LocalMcpConfig {
             max_frame_bytes: LOCAL_MCP_DEFAULT_MAX_FRAME_BYTES,
             health_method: "server/discover".to_owned(),
             health_params: Value::Object(Map::new()),
-            trusted_ipc_socket: crate::paths::RuntimePaths::discover()
-                .ok()
-                .map(|paths| paths.config_dir.join("extension.sock")),
+            trusted_ipc_socket: discovered.map(|paths| paths.config_dir.join("extension.sock")),
         }
     }
 }

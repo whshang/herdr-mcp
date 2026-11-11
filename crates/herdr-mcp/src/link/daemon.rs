@@ -17,8 +17,11 @@ use tokio::sync::watch;
 
 use super::backoff::{BackoffOptions, ExponentialBackoff};
 use super::io_loop::{LinkIoConfig, LinkIoError, LinkIoLoop};
+#[cfg(test)]
+use super::local_mcp::LOCAL_MCP_DEFAULT_ENDPOINT;
 use super::local_mcp::{
-    LOCAL_MCP_CONTRACT_EPOCH, LOCAL_MCP_DEFAULT_ENDPOINT, LinkRuntimeTransport,
+    LOCAL_MCP_CONTRACT_EPOCH, LinkRuntimeTransport, default_endpoint_for_instance,
+    endpoint_targets_port,
 };
 use super::policy::LinkExitKind;
 use super::runner::{LinkRunnerCore, RunnerConfig};
@@ -114,6 +117,7 @@ impl std::error::Error for DaemonConfigError {}
 pub fn read_link_daemon_config(
     env_map: &HashMap<String, String>,
 ) -> Result<LinkDaemonConfig, DaemonConfigError> {
+    let instance = super::run::resolve_link_instance(env_map)?;
     let edge_url = required(env_map, "HERDR_EDGE_URL")?;
     let workstation_id = required(env_map, "HERDR_WORKSTATION_ID")?;
     let device_name = optional_trimmed(env_map, "HERDR_DEVICE_NAME")
@@ -121,7 +125,15 @@ pub fn read_link_daemon_config(
     let link_token = required(env_map, "HERDR_LINK_TOKEN")?;
     let runtime_token = required(env_map, "HERDR_MCP_TOKEN")?;
     let runtime_endpoint = optional_trimmed(env_map, "HERDR_MCP_ENDPOINT")
-        .unwrap_or_else(|| LOCAL_MCP_DEFAULT_ENDPOINT.to_owned());
+        .unwrap_or_else(|| default_endpoint_for_instance(&instance));
+    if let Some(instance_name) = instance.name()
+        && endpoint_targets_port(&runtime_endpoint, crate::instance::DEFAULT_RUNTIME_PORT)
+    {
+        return Err(DaemonConfigError::Message(format!(
+            "refusing to point named instance '{instance_name}' Link at production runtime port {} ({runtime_endpoint})",
+            crate::instance::DEFAULT_RUNTIME_PORT
+        )));
+    }
     let runtime_generation = optional_trimmed(env_map, "HERDR_RUNTIME_GENERATION")
         .unwrap_or_else(|| DEFAULT_RUNTIME_GENERATION.to_owned());
     let runtime_version = optional_trimmed(env_map, "HERDR_RUNTIME_VERSION");
@@ -137,7 +149,7 @@ pub fn read_link_daemon_config(
 
     let runtime_control_dir = optional_trimmed(env_map, "HERDR_RUNTIME_CONTROL_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(default_runtime_control_dir);
+        .unwrap_or_else(|| default_runtime_control_dir_for_instance(env_map, &instance));
     let runtime_control_path = optional_trimmed(env_map, "HERDR_RUNTIME_CONTROL_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| runtime_control_dir.join("runtime-control.json"));
@@ -149,6 +161,16 @@ pub fn read_link_daemon_config(
                 .map(|parent| parent.join("runtime-status.json"))
                 .unwrap_or_else(|| runtime_control_dir.join("runtime-status.json"))
         });
+    if let Some(instance_name) = instance.name()
+        && let Some(prod_dir) = default_prod_config_dir(env_map)
+        && (runtime_control_path.starts_with(&prod_dir)
+            || runtime_status_path.starts_with(&prod_dir))
+    {
+        return Err(DaemonConfigError::Message(format!(
+            "refusing to use production runtime-control/status directory {} for named instance '{instance_name}'",
+            prod_dir.display()
+        )));
+    }
     let poll_raw = optional_trimmed(env_map, "HERDR_RUNTIME_CONTROL_POLL_MS")
         .and_then(|raw| raw.parse::<u64>().ok());
     let runtime_control_poll_ms = match poll_raw {
@@ -429,18 +451,50 @@ fn valid_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
-fn default_runtime_control_dir() -> PathBuf {
-    if let Ok(path) = env::var("HERDR_MCP_CONFIG_DIR") {
-        return PathBuf::from(path);
+fn default_runtime_control_dir_for_instance(
+    env_map: &HashMap<String, String>,
+    instance: &crate::instance::InstanceId,
+) -> PathBuf {
+    if let Some(dir) = super::run::instance_config_dir(env_map, instance) {
+        return dir;
     }
-    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(xdg).join("herdr-mcp");
+    if let Ok(path) = env::var("HERDR_MCP_CONFIG_DIR")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path.trim());
+    }
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME")
+        && !xdg.trim().is_empty()
+    {
+        return PathBuf::from(xdg.trim()).join(instance.config_leaf());
     }
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config").join("herdr-mcp")
+    home.join(".config").join(instance.config_leaf())
+}
+
+fn default_prod_config_dir(env_map: &HashMap<String, String>) -> Option<PathBuf> {
+    if let Some(xdg) = optional_trimmed(env_map, "XDG_CONFIG_HOME").or_else(|| {
+        env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    }) {
+        return Some(PathBuf::from(xdg).join(crate::instance::DEFAULT_CONFIG_LEAF));
+    }
+    let home = optional_trimmed(env_map, "HOME")
+        .or_else(|| optional_trimmed(env_map, "USERPROFILE"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .or_else(|| env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+        })?;
+    Some(
+        home.join(".config")
+            .join(crate::instance::DEFAULT_CONFIG_LEAF),
+    )
 }
 
 fn new_boot_id() -> String {

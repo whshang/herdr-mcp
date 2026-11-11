@@ -11,11 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use crate::config::Config;
+use crate::instance::{DEFAULT_RUNTIME_PORT, InstanceId};
 use crate::paths::RuntimePaths;
 
 use super::daemon::{
     DaemonConfigError, LinkDaemonConfig, read_link_daemon_config, run_link_daemon,
 };
+use super::local_mcp::{default_endpoint_for_port, endpoint_targets_port};
 
 /// Default Keychain service for Rust Link soak/candidate (epoch-2 Edge).
 ///
@@ -109,41 +111,163 @@ fn env_map_from_process() -> HashMap<String, String> {
     env::vars().collect()
 }
 
+/// Resolve the target instance from `HERDR_MCP_INSTANCE` in `env_map` (falling
+/// back to the default production instance when unset/empty). Invalid instance
+/// names fail closed instead of silently falling back to default.
+pub(crate) fn resolve_link_instance(
+    env_map: &HashMap<String, String>,
+) -> Result<InstanceId, DaemonConfigError> {
+    match optional_trimmed(env_map, "HERDR_MCP_INSTANCE") {
+        Some(raw) => InstanceId::parse(&raw).map_err(DaemonConfigError::Message),
+        None => Ok(InstanceId::default_instance()),
+    }
+}
+
+pub(crate) fn instance_config_dir(
+    env_map: &HashMap<String, String>,
+    instance: &InstanceId,
+) -> Option<PathBuf> {
+    if let Some(dir) = optional_trimmed(env_map, "HERDR_MCP_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(xdg) = optional_trimmed(env_map, "XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg).join(instance.config_leaf()));
+    }
+    optional_trimmed(env_map, "HOME")
+        .or_else(|| optional_trimmed(env_map, "USERPROFILE"))
+        .map(PathBuf::from)
+        .or_else(home_dir)
+        .map(|home| home.join(".config").join(instance.config_leaf()))
+}
+
 /// Fill Edge/workstation defaults and resolve link/MCP secrets without printing them.
 fn enrich_macos_credentials(
     env_map: &mut HashMap<String, String>,
 ) -> Result<(), DaemonConfigError> {
-    let configured = RuntimePaths::discover()
-        .ok()
-        .and_then(|paths| Config::load_for_instance(&paths.config_file, &paths.instance).ok());
-    enrich_macos_credentials_with_config(env_map, configured.as_ref())
+    let instance = resolve_link_instance(env_map)?;
+    let configured = match instance_config_dir(env_map, &instance) {
+        Some(dir) => {
+            let config_file = dir.join("config.json");
+            match Config::load_for_instance(&config_file, &instance) {
+                Ok(config) => Some(config),
+                Err(error) if instance.is_named() => {
+                    return Err(DaemonConfigError::Message(error));
+                }
+                Err(_) => None,
+            }
+        }
+        None => None,
+    };
+    enrich_macos_credentials_for_instance(env_map, &instance, configured.as_ref())
 }
 
 fn enrich_macos_credentials_with_config(
     env_map: &mut HashMap<String, String>,
     configured: Option<&Config>,
 ) -> Result<(), DaemonConfigError> {
-    if optional_trimmed(env_map, "HERDR_EDGE_URL").is_none() {
-        let edge_url = configured
-            .and_then(|config| config.edge_ws_url().ok().flatten())
-            .unwrap_or_else(|| MACOS_DEFAULT_EDGE_URL.to_owned());
-        env_map.insert("HERDR_EDGE_URL".to_owned(), edge_url);
+    let instance = resolve_link_instance(env_map)?;
+    enrich_macos_credentials_for_instance(env_map, &instance, configured)
+}
+
+fn enrich_macos_credentials_for_instance(
+    env_map: &mut HashMap<String, String>,
+    instance: &InstanceId,
+    configured: Option<&Config>,
+) -> Result<(), DaemonConfigError> {
+    let runtime_port = configured
+        .map(|config| config.runtime_port)
+        .unwrap_or_else(|| instance.default_port());
+    if let Some(instance_name) = instance.name() {
+        if runtime_port == DEFAULT_RUNTIME_PORT {
+            return Err(DaemonConfigError::Message(format!(
+                "refusing to run Link for named instance '{instance_name}' on production runtime port {DEFAULT_RUNTIME_PORT}"
+            )));
+        }
+        if let Some(existing_endpoint) = optional_trimmed(env_map, "HERDR_MCP_ENDPOINT") {
+            if endpoint_targets_port(&existing_endpoint, DEFAULT_RUNTIME_PORT) {
+                return Err(DaemonConfigError::Message(format!(
+                    "refusing to point named instance '{instance_name}' Link at production runtime port {DEFAULT_RUNTIME_PORT} ({existing_endpoint})"
+                )));
+            }
+        } else {
+            env_map.insert(
+                "HERDR_MCP_ENDPOINT".to_owned(),
+                default_endpoint_for_port(runtime_port),
+            );
+        }
+
+        let Some(device_id) = configured.and_then(|config| config.edge_device_id.as_deref()) else {
+            return Err(DaemonConfigError::Message(format!(
+                "refusing to run Link for named instance '{instance_name}': missing edge.device_id; enroll a dedicated device identity for this instance and never fall back to the production link credential ({MACOS_LINK_KEYCHAIN_SERVICE})"
+            )));
+        };
+        if let Some(existing_workstation) = optional_trimmed(env_map, "HERDR_WORKSTATION_ID") {
+            if existing_workstation != device_id {
+                return Err(DaemonConfigError::Message(format!(
+                    "refusing to run Link for named instance '{instance_name}' with HERDR_WORKSTATION_ID='{existing_workstation}' (expected enrolled edge.device_id '{device_id}')"
+                )));
+            }
+        } else {
+            env_map.insert("HERDR_WORKSTATION_ID".to_owned(), device_id.to_owned());
+        }
+
+        if optional_trimmed(env_map, "HERDR_EDGE_URL").is_none() {
+            let Some(edge_url) = configured.and_then(|config| config.edge_ws_url().ok().flatten())
+            else {
+                return Err(DaemonConfigError::Message(format!(
+                    "refusing to run Link for named instance '{instance_name}' without a configured Edge origin; set edge.public_origin or HERDR_EDGE_URL instead of falling back to the production Edge ({MACOS_DEFAULT_EDGE_URL})"
+                )));
+            };
+            env_map.insert("HERDR_EDGE_URL".to_owned(), edge_url);
+        }
+
+        let expected_service = format!("herdr-edge-link-{device_id}");
+        if let Some(existing_service) = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE") {
+            if existing_service == MACOS_LINK_KEYCHAIN_SERVICE {
+                return Err(DaemonConfigError::Message(format!(
+                    "refusing to load the legacy production link credential ({MACOS_LINK_KEYCHAIN_SERVICE}) for named instance '{instance_name}'; use the instance's device-specific HERDR_LINK_KEYCHAIN_SERVICE ({expected_service})"
+                )));
+            }
+            if existing_service != expected_service {
+                return Err(DaemonConfigError::Message(format!(
+                    "refusing to run Link for named instance '{instance_name}' with mismatched HERDR_LINK_KEYCHAIN_SERVICE='{existing_service}' (expected '{expected_service}')"
+                )));
+            }
+        } else {
+            env_map.insert("HERDR_LINK_KEYCHAIN_SERVICE".to_owned(), expected_service);
+        }
+    } else {
+        if optional_trimmed(env_map, "HERDR_MCP_ENDPOINT").is_none()
+            && runtime_port != DEFAULT_RUNTIME_PORT
+        {
+            env_map.insert(
+                "HERDR_MCP_ENDPOINT".to_owned(),
+                default_endpoint_for_port(runtime_port),
+            );
+        }
+        if optional_trimmed(env_map, "HERDR_EDGE_URL").is_none() {
+            let edge_url = configured
+                .and_then(|config| config.edge_ws_url().ok().flatten())
+                .unwrap_or_else(|| MACOS_DEFAULT_EDGE_URL.to_owned());
+            env_map.insert("HERDR_EDGE_URL".to_owned(), edge_url);
+        }
+        if optional_trimmed(env_map, "HERDR_WORKSTATION_ID").is_none() {
+            let workstation_id = configured
+                .and_then(|config| config.edge_device_id.clone())
+                .unwrap_or_else(|| MACOS_DEFAULT_WORKSTATION_ID.to_owned());
+            env_map.insert("HERDR_WORKSTATION_ID".to_owned(), workstation_id);
+        }
+        if optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE").is_none()
+            && let Some(service) = configured.and_then(Config::edge_link_keychain_service)
+        {
+            env_map.insert("HERDR_LINK_KEYCHAIN_SERVICE".to_owned(), service);
+        }
     }
-    if optional_trimmed(env_map, "HERDR_WORKSTATION_ID").is_none() {
-        let workstation_id = configured
-            .and_then(|config| config.edge_device_id.clone())
-            .unwrap_or_else(|| MACOS_DEFAULT_WORKSTATION_ID.to_owned());
-        env_map.insert("HERDR_WORKSTATION_ID".to_owned(), workstation_id);
-    }
+
     if optional_trimmed(env_map, "HERDR_DEVICE_NAME").is_none()
         && let Some(name) = crate::device_name::system_device_display_name()
     {
         env_map.insert("HERDR_DEVICE_NAME".to_owned(), name);
-    }
-    if optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE").is_none()
-        && let Some(service) = configured.and_then(Config::edge_link_keychain_service)
-    {
-        env_map.insert("HERDR_LINK_KEYCHAIN_SERVICE".to_owned(), service);
     }
 
     if optional_trimmed(env_map, "HERDR_LINK_TOKEN").is_none() {
@@ -164,18 +288,33 @@ fn enrich_macos_credentials_with_config(
     }
 
     if optional_trimmed(env_map, "HERDR_MCP_TOKEN").is_none() {
-        let token = load_runtime_token_from_server_plist(env_map)?;
+        let token = load_runtime_token_from_server_plist(env_map, instance)?;
         env_map.insert("HERDR_MCP_TOKEN".to_owned(), token);
     }
 
     Ok(())
 }
 
-/// Service name whose secret the platform device store is asked for, defaulting
-/// to the historical production Link credential.
-fn resolved_link_keychain_service(env_map: &HashMap<String, String>) -> String {
-    optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
-        .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned())
+/// Resolve the Keychain service name to read for the Link token.
+///
+/// Fails closed before any device-credential read when:
+/// - the run targets the historical DEV Edge with the legacy production service
+///   (implicit or explicit `#867` fence); or
+/// - neither an enrolled `edge.device_id` nor an explicit
+///   `HERDR_LINK_KEYCHAIN_SERVICE` is present (`#870`: never fall back to
+///   `MACOS_LINK_KEYCHAIN_SERVICE` when device identity is missing).
+fn resolved_link_keychain_service(
+    env_map: &HashMap<String, String>,
+) -> Result<String, DaemonConfigError> {
+    let candidate = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE");
+    let effective = candidate.as_deref().unwrap_or(MACOS_LINK_KEYCHAIN_SERVICE);
+    fence_legacy_dev_edge_prod_credential(env_map, effective)?;
+    match candidate {
+        Some(service) => Ok(service),
+        None => Err(DaemonConfigError::Message(format!(
+            "refusing to fall back to the legacy production link credential ({MACOS_LINK_KEYCHAIN_SERVICE}) when edge.device_id is missing; configure edge.device_id or set a device-specific HERDR_LINK_KEYCHAIN_SERVICE"
+        ))),
+    }
 }
 
 /// True only for the exact legacy DEV Edge host: parsed as a URL, host-only,
@@ -211,8 +350,7 @@ fn fence_legacy_dev_edge_prod_credential(
 fn load_link_token_from_keychain(
     env_map: &HashMap<String, String>,
 ) -> Result<String, DaemonConfigError> {
-    let service = resolved_link_keychain_service(env_map);
-    fence_legacy_dev_edge_prod_credential(env_map, &service)?;
+    let service = resolved_link_keychain_service(env_map)?;
     #[cfg(target_os = "macos")]
     {
         let username = optional_trimmed(env_map, "USER").unwrap_or_else(current_username);
@@ -243,6 +381,7 @@ fn load_link_token_from_keychain(
 
 fn load_runtime_token_from_server_plist(
     env_map: &HashMap<String, String>,
+    instance: &InstanceId,
 ) -> Result<String, DaemonConfigError> {
     #[cfg(target_os = "macos")]
     {
@@ -254,7 +393,7 @@ fn load_runtime_token_from_server_plist(
                     "HOME is required to load local MCP credential".to_owned(),
                 )
             })?;
-        let plist = server_plist_path(&home);
+        let plist = server_plist_path_for_instance(&home, instance);
         command_text(
             "/usr/libexec/PlistBuddy",
             &[
@@ -269,6 +408,7 @@ fn load_runtime_token_from_server_plist(
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = instance;
         #[cfg(target_os = "linux")]
         {
             let _ = env_map;
@@ -294,7 +434,17 @@ fn load_runtime_token_from_server_plist(
 }
 
 fn server_plist_path(home: &Path) -> PathBuf {
-    home.join(SERVER_PLIST_REL)
+    server_plist_path_for_instance(home, &InstanceId::default_instance())
+}
+
+fn server_plist_path_for_instance(home: &Path, instance: &InstanceId) -> PathBuf {
+    if instance.is_default() {
+        home.join(SERVER_PLIST_REL)
+    } else {
+        home.join("Library")
+            .join("LaunchAgents")
+            .join(format!("{}.plist", instance.service_label()))
+    }
 }
 
 fn command_text(file: &str, args: &[&str], label: &str) -> Result<String, DaemonConfigError> {
@@ -559,5 +709,254 @@ mod tests {
             path,
             PathBuf::from("/Users/example/Library/LaunchAgents/dev.herdr-mcp.server.plist")
         );
+        let named = InstanceId::parse("dev698").unwrap();
+        assert_eq!(
+            server_plist_path_for_instance(Path::new("/Users/example"), &named),
+            PathBuf::from("/Users/example/Library/LaunchAgents/dev.herdr-mcp.dev698.server.plist")
+        );
+    }
+
+    #[test]
+    fn missing_device_id_without_explicit_service_refuses_prod_fallback() {
+        let mut env_map = fence_env("wss://edge.example/ws");
+        let config = Config::default();
+        let error = enrich_macos_credentials_with_config(&mut env_map, Some(&config))
+            .expect_err("missing edge.device_id must not fall back to prod keychain service");
+        let text = error.to_string();
+        assert!(text.contains("refusing to fall back to the legacy production link credential"));
+        assert!(text.contains(MACOS_LINK_KEYCHAIN_SERVICE));
+        assert!(!text.contains("unable to load workstation link credential"));
+        assert_eq!(env_map.get("HERDR_LINK_TOKEN"), None);
+        assert_eq!(env_map.get("HERDR_MCP_TOKEN"), None);
+    }
+
+    #[test]
+    fn named_instance_without_device_id_fails_before_keychain_and_plist() {
+        let named = InstanceId::parse("dev698").unwrap();
+        let config = Config {
+            runtime_port: named.default_port(),
+            edge_public_origin: Some("https://herdr-edge-dev.whshang.workers.dev".to_owned()),
+            edge_device_id: None,
+            ..Config::default()
+        };
+        let mut env_map = HashMap::from([
+            ("HERDR_MCP_INSTANCE".to_owned(), "dev698".to_owned()),
+            (
+                "USER".to_owned(),
+                "herdr-dev-prod-fence-nonexistent-account".to_owned(),
+            ),
+        ]);
+        let error = enrich_macos_credentials_with_config(&mut env_map, Some(&config))
+            .expect_err("named instance without edge.device_id must fail closed");
+        let text = error.to_string();
+        assert!(text.contains("named instance 'dev698'"));
+        assert!(text.contains("missing edge.device_id"));
+        assert!(text.contains(MACOS_LINK_KEYCHAIN_SERVICE));
+        assert_eq!(env_map.get("HERDR_LINK_TOKEN"), None);
+        assert_eq!(env_map.get("HERDR_MCP_TOKEN"), None);
+    }
+
+    #[test]
+    fn named_instance_refuses_prod_or_mismatched_keychain_service_and_port_8772() {
+        let named = InstanceId::parse("dev698").unwrap();
+        let device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let config = Config {
+            runtime_port: named.default_port(),
+            edge_public_origin: Some("https://herdr-edge-dev.whshang.workers.dev".to_owned()),
+            edge_device_id: Some(device_id.to_owned()),
+            ..Config::default()
+        };
+
+        // Explicit production Keychain service on a named instance must fail closed.
+        let mut prod_service_env = HashMap::from([
+            ("HERDR_MCP_INSTANCE".to_owned(), "dev698".to_owned()),
+            (
+                "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+                MACOS_LINK_KEYCHAIN_SERVICE.to_owned(),
+            ),
+            (
+                "USER".to_owned(),
+                "herdr-dev-prod-fence-nonexistent-account".to_owned(),
+            ),
+        ]);
+        let err = enrich_macos_credentials_with_config(&mut prod_service_env, Some(&config))
+            .expect_err("named instance with prod keychain service must fail");
+        assert!(err.to_string().contains(MACOS_LINK_KEYCHAIN_SERVICE));
+        assert_eq!(prod_service_env.get("HERDR_LINK_TOKEN"), None);
+
+        // Mismatched device keychain service must fail closed.
+        let mut wrong_service_env = HashMap::from([
+            ("HERDR_MCP_INSTANCE".to_owned(), "dev698".to_owned()),
+            (
+                "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+                "herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            ),
+            (
+                "USER".to_owned(),
+                "herdr-dev-prod-fence-nonexistent-account".to_owned(),
+            ),
+        ]);
+        let err = enrich_macos_credentials_with_config(&mut wrong_service_env, Some(&config))
+            .expect_err("named instance with mismatched service must fail");
+        assert!(
+            err.to_string()
+                .contains("mismatched HERDR_LINK_KEYCHAIN_SERVICE")
+        );
+
+        // Explicit production port 8772 endpoint on a named instance must fail closed.
+        let mut prod_port_env = HashMap::from([
+            ("HERDR_MCP_INSTANCE".to_owned(), "dev698".to_owned()),
+            (
+                "HERDR_MCP_ENDPOINT".to_owned(),
+                "http://127.0.0.1:8772/mcp".to_owned(),
+            ),
+            ("HERDR_LINK_TOKEN".to_owned(), "dev-link-secret".to_owned()),
+            (
+                "HERDR_MCP_TOKEN".to_owned(),
+                "dev-runtime-secret".to_owned(),
+            ),
+        ]);
+        let err = enrich_macos_credentials_with_config(&mut prod_port_env, Some(&config))
+            .expect_err("named instance targeting port 8772 must fail");
+        assert!(err.to_string().contains("production runtime port 8772"));
+    }
+
+    #[test]
+    fn named_instance_isolates_endpoint_plist_credentials_and_control_dir_from_prod() {
+        let named = InstanceId::parse("dev698").unwrap();
+        let expected_port = named.default_port();
+        assert_ne!(expected_port, DEFAULT_RUNTIME_PORT);
+        let device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let config = Config {
+            runtime_port: expected_port,
+            edge_public_origin: Some("https://herdr-edge-dev.whshang.workers.dev".to_owned()),
+            edge_device_id: Some(device_id.to_owned()),
+            ..Config::default()
+        };
+
+        let temp_home = std::env::temp_dir().join(format!(
+            "herdr-mcp-link-named-isolation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let launch_agents = temp_home.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&launch_agents).unwrap();
+
+        #[cfg(target_os = "macos")]
+        {
+            // Write both a production server plist and a named-instance server plist
+            // with distinct tokens so any fallback to production would be caught.
+            let write_plist = |label: &str, token: &str| {
+                let mut env_dict = plist::Dictionary::new();
+                env_dict.insert(
+                    "HERDR_MCP_TOKEN".to_owned(),
+                    plist::Value::String(token.to_owned()),
+                );
+                let mut root = plist::Dictionary::new();
+                root.insert("Label".to_owned(), plist::Value::String(label.to_owned()));
+                root.insert(
+                    "EnvironmentVariables".to_owned(),
+                    plist::Value::Dictionary(env_dict),
+                );
+                let path = launch_agents.join(format!("{label}.plist"));
+                plist::Value::Dictionary(root).to_file_xml(&path).unwrap();
+                path
+            };
+            write_plist("dev.herdr-mcp.server", "prod-runtime-secret-must-not-leak");
+            let named_plist =
+                write_plist("dev.herdr-mcp.dev698.server", "dev698-isolated-mcp-token");
+
+            let mut env_map = HashMap::from([
+                ("HERDR_MCP_INSTANCE".to_owned(), "dev698".to_owned()),
+                ("HOME".to_owned(), temp_home.to_string_lossy().into_owned()),
+                (
+                    "HERDR_LINK_TOKEN".to_owned(),
+                    "dev698-isolated-link-secret".to_owned(),
+                ),
+            ]);
+            enrich_macos_credentials_with_config(&mut env_map, Some(&config))
+                .expect("named instance enrich");
+            assert_eq!(
+                env_map.get("HERDR_MCP_TOKEN").map(String::as_str),
+                Some("dev698-isolated-mcp-token"),
+                "named instance must read its own server plist token and never the production token"
+            );
+
+            // Removing the named instance plist while leaving the production plist in
+            // place must fail closed instead of falling back to production.
+            std::fs::remove_file(&named_plist).unwrap();
+            let mut missing_named_plist_env = HashMap::from([
+                ("HERDR_MCP_INSTANCE".to_owned(), "dev698".to_owned()),
+                ("HOME".to_owned(), temp_home.to_string_lossy().into_owned()),
+                (
+                    "HERDR_LINK_TOKEN".to_owned(),
+                    "dev698-isolated-link-secret".to_owned(),
+                ),
+            ]);
+            assert!(
+                enrich_macos_credentials_with_config(&mut missing_named_plist_env, Some(&config))
+                    .is_err(),
+                "missing named-instance server plist must not fall back to dev.herdr-mcp.server.plist"
+            );
+        }
+
+        let mut env_map = HashMap::from([
+            ("HERDR_MCP_INSTANCE".to_owned(), "dev698".to_owned()),
+            ("HOME".to_owned(), temp_home.to_string_lossy().into_owned()),
+            (
+                "HERDR_LINK_TOKEN".to_owned(),
+                "dev698-isolated-link-secret".to_owned(),
+            ),
+            (
+                "HERDR_MCP_TOKEN".to_owned(),
+                "dev698-isolated-mcp-token".to_owned(),
+            ),
+        ]);
+        enrich_macos_credentials_with_config(&mut env_map, Some(&config))
+            .expect("named instance enrich");
+        assert_eq!(
+            env_map.get("HERDR_WORKSTATION_ID").map(String::as_str),
+            Some(device_id)
+        );
+        assert_eq!(
+            env_map
+                .get("HERDR_LINK_KEYCHAIN_SERVICE")
+                .map(String::as_str),
+            Some("herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        assert_eq!(
+            env_map.get("HERDR_MCP_ENDPOINT").map(String::as_str),
+            Some(format!("http://127.0.0.1:{expected_port}/mcp").as_str())
+        );
+
+        let daemon_cfg = read_link_daemon_config(&env_map).expect("daemon config");
+        assert_eq!(
+            daemon_cfg.runtime_endpoint,
+            format!("http://127.0.0.1:{expected_port}/mcp")
+        );
+        assert_eq!(
+            daemon_cfg.runtime_control_path,
+            temp_home.join(".config/herdr-mcp-dev698/runtime-control.json")
+        );
+        assert_eq!(
+            daemon_cfg.runtime_status_path,
+            temp_home.join(".config/herdr-mcp-dev698/runtime-status.json")
+        );
+
+        // Pointing runtime-control at the production config dir on a named instance must fail.
+        let mut bad_control_env = env_map.clone();
+        bad_control_env.insert(
+            "HERDR_RUNTIME_CONTROL_PATH".to_owned(),
+            temp_home
+                .join(".config/herdr-mcp/runtime-control.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(read_link_daemon_config(&bad_control_env).is_err());
+
+        let _ = std::fs::remove_dir_all(&temp_home);
     }
 }
