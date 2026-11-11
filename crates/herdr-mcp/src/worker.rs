@@ -4172,10 +4172,12 @@ mod tests {
             ..Config::default()
         };
         let err = resolve_enrolled_device_identity(&paths, &config)
-            .expect_err("named instance without edge.device_id must not read prod link plist");
+            .err()
+            .expect("named instance without edge.device_id must not read prod link plist");
         assert!(err.contains("no enrolled device identity"));
         let owner_err = resolve_owner_link_identity(&paths, &config)
-            .expect_err("named instance owner identity must not read prod link plist");
+            .err()
+            .expect("named instance owner identity must not read prod link plist");
         assert!(owner_err.contains("no enrolled device identity"));
     }
 
