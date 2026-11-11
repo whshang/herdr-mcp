@@ -132,6 +132,83 @@ pub enum OperationReservation {
     CapacityExhausted,
 }
 
+/// Admission limit for unresolved (`pending` + `unknown`) `browser_page.action`
+/// reservations in `operations`.
+pub const BROWSER_PAGE_UNRESOLVED_CAP: i64 = 2048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserPageReconcileVerdict {
+    Applied,
+    NotApplied,
+}
+
+impl BrowserPageReconcileVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::NotApplied => "not_applied",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "applied" => Ok(Self::Applied),
+            "not_applied" | "not-applied" => Ok(Self::NotApplied),
+            other => Err(format!(
+                "invalid reconcile verdict '{other}' (expected applied or not_applied)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserPageUnknownItem {
+    pub op_id: String,
+    pub idempotency_key: Option<String>,
+    pub state: String,
+    pub phase: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub expires_at: Option<i64>,
+    pub result_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserPageUnknownSummary {
+    pub unresolved_cap: i64,
+    pub unresolved_count: i64,
+    pub pending_count: i64,
+    pub expired_pending_count: i64,
+    pub unknown_count: i64,
+    pub reconciled_count: i64,
+    pub items: Vec<BrowserPageUnknownItem>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserPageReconcileInput<'a> {
+    pub op_id: &'a str,
+    pub verdict: BrowserPageReconcileVerdict,
+    pub operator: &'a str,
+    pub evidence: &'a str,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserPageReconcileOutcome {
+    pub op_id: String,
+    pub idempotency_key: Option<String>,
+    pub verdict: BrowserPageReconcileVerdict,
+    pub operator: String,
+    pub evidence: String,
+    pub reconciled_at_ms: i64,
+    pub audit_op_id: String,
+    pub idempotent_replay: bool,
+    pub unresolved_cap: i64,
+    pub unresolved_before: i64,
+    pub unresolved_after: i64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ContinuityTurnInput<'a> {
     pub continuity_id: &'a str,
@@ -1025,7 +1102,6 @@ impl StateStore {
             // newly inserted pending row. The action handler constructs these
             // op_ids with the stable prefix, allowing the existing primary-key
             // index to avoid a full operations-table scan.
-            const BROWSER_PAGE_UNRESOLVED_CAP: i64 = 2048;
             if kind == "browser_page.action" {
                 let unresolved_count: i64 = tx
                     .query_row(
@@ -1121,7 +1197,7 @@ impl StateStore {
 
     /// Mark one reserved operation complete with a durable unknown outcome.
     /// The row keeps the original op_id, never carries an expiry, and can only
-    /// be cleared by explicit operator reconciliation (not implemented here).
+    /// be cleared by explicit operator reconciliation.
     /// Unknown is terminal: the same (kind, idempotency_key) can never be
     /// re-reserved, so the mutation can never automatically re-actuate.
     pub fn complete_operation_unknown(
@@ -1152,6 +1228,372 @@ impl StateStore {
         }
         tx.commit()
             .map_err(|error| format!("cannot commit unknown completion: {error}"))
+    }
+
+    /// Read-only inspection of `browser_page.action` unknown reservations and
+    /// capacity usage against [`BROWSER_PAGE_UNRESOLVED_CAP`]. Never mutates or
+    /// prunes rows.
+    pub fn list_browser_page_unknown_operations(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<BrowserPageUnknownSummary, String> {
+        let bounded_limit = limit.clamp(1, BROWSER_PAGE_UNRESOLVED_CAP as usize);
+        let (
+            unresolved_count,
+            pending_count,
+            expired_pending_count,
+            unknown_count,
+            reconciled_count,
+        ): (i64, i64, i64, i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN state IN ('pending', 'unknown') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'pending' AND (expires_at IS NULL OR expires_at > ?1) THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'unknown' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'complete' AND phase = 'reconciled' THEN 1 ELSE 0 END), 0)
+                 FROM operations
+                 WHERE op_id GLOB 'op:browser_page_action:*'
+                   AND kind = 'browser_page.action'",
+                params![now_ms],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("cannot query browser_page.action unknown counts: {error}"))?;
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT op_id, idempotency_key, state, phase, created_at, updated_at, expires_at, result_json
+                 FROM operations
+                 WHERE op_id GLOB 'op:browser_page_action:*'
+                   AND kind = 'browser_page.action'
+                   AND state = 'unknown'
+                 ORDER BY created_at ASC, op_id ASC
+                 LIMIT ?1",
+            )
+            .map_err(|error| format!("cannot prepare browser_page.action unknown list: {error}"))?;
+        let items = stmt
+            .query_map(
+                params![i64::try_from(bounded_limit).unwrap_or(100)],
+                |row| {
+                    Ok(BrowserPageUnknownItem {
+                        op_id: row.get(0)?,
+                        idempotency_key: row.get(1)?,
+                        state: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        phase: row.get(3)?,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                        expires_at: row.get(6)?,
+                        result_json: row.get(7)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("cannot query browser_page.action unknown list: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser_page.action unknown row: {error}"))?;
+
+        Ok(BrowserPageUnknownSummary {
+            unresolved_cap: BROWSER_PAGE_UNRESOLVED_CAP,
+            unresolved_count,
+            pending_count,
+            expired_pending_count,
+            unknown_count,
+            reconciled_count,
+            items,
+        })
+    }
+
+    /// Manually reconcile and archive a single `kind = 'browser_page.action'`
+    /// operation that is currently in `state = 'unknown'`.
+    ///
+    /// - Never re-executes the page action and never deletes the idempotency
+    ///   reservation: the row transitions to `state = 'complete'`,
+    ///   `phase = 'reconciled'`, `expires_at = NULL`, so it no longer counts
+    ///   against [`BROWSER_PAGE_UNRESOLVED_CAP`] while remaining permanently
+    ///   non-retryable across current and rollback binaries (`rc.15` / `1.1.0`
+    ///   / `1.1.1`).
+    /// - Appends an immutable `browser_page.action.reconcile_audit` record in
+    ///   the same `Immediate` transaction.
+    /// - Idempotent when repeated with the same verdict; rejects a conflicting
+    ///   verdict or any row that is `pending`, ordinary `complete`, or another
+    ///   `kind`.
+    pub fn reconcile_browser_page_unknown_operation(
+        &mut self,
+        input: BrowserPageReconcileInput<'_>,
+    ) -> Result<BrowserPageReconcileOutcome, String> {
+        let op_id = input.op_id.trim();
+        let Some(suffix) = op_id.strip_prefix("op:browser_page_action:") else {
+            return Err(
+                "browser_page_reconcile_invalid_op_id: op_id must start with 'op:browser_page_action:'"
+                    .to_owned(),
+            );
+        };
+        if suffix.is_empty() || op_id.len() > 128 || op_id.chars().any(char::is_control) {
+            return Err(
+                "browser_page_reconcile_invalid_op_id: op_id must be non-empty and at most 128 non-control bytes"
+                    .to_owned(),
+            );
+        }
+        let operator = input.operator.trim();
+        if operator.is_empty() || operator.len() > 128 || operator.chars().any(char::is_control) {
+            return Err(
+                "browser_page_reconcile_invalid_operator: operator must be 1..=128 non-control bytes"
+                    .to_owned(),
+            );
+        }
+        let evidence = input.evidence.trim();
+        if evidence.is_empty() || evidence.len() > 2048 || evidence.chars().any(char::is_control) {
+            return Err(
+                "browser_page_reconcile_invalid_evidence: evidence must be 1..=2048 non-control bytes"
+                    .to_owned(),
+            );
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                format!("cannot begin browser_page unknown reconciliation: {error}")
+            })?;
+
+        let unresolved_before: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM operations
+                 WHERE op_id GLOB 'op:browser_page_action:*'
+                   AND kind = 'browser_page.action'
+                   AND state IN ('pending', 'unknown')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("cannot count unresolved browser_page operations: {error}"))?;
+
+        type ExistingRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let row: Option<ExistingRow> = tx
+            .query_row(
+                "SELECT kind, idempotency_key, phase, state, result_json
+                 FROM operations
+                 WHERE op_id = ?1",
+                params![op_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect operation {op_id}: {error}"))?;
+
+        let Some((kind, idempotency_key, phase, state, result_json)) = row else {
+            return Err(format!(
+                "browser_page_unknown_not_found: operation '{op_id}' does not exist"
+            ));
+        };
+        if kind != "browser_page.action" {
+            return Err(format!(
+                "browser_page_reconcile_unsupported_kind: operation '{op_id}' has kind '{kind}' (expected 'browser_page.action')"
+            ));
+        }
+
+        let audit_op_id = format!("op:browser_page_reconcile_audit:{suffix}");
+
+        match state.as_deref() {
+            Some("unknown") => {}
+            Some("complete") if phase.as_deref() == Some("reconciled") => {
+                let stored_value = result_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                let reconciliation = stored_value
+                    .get("reconciliation")
+                    .and_then(serde_json::Value::as_object);
+                let stored_verdict = reconciliation
+                    .and_then(|obj| obj.get("verdict"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|v| BrowserPageReconcileVerdict::parse(v).ok());
+                let Some(stored_verdict) = stored_verdict else {
+                    return Err(format!(
+                        "browser_page_reconcile_corrupt_record: operation '{op_id}' is marked reconciled without a valid verdict"
+                    ));
+                };
+                if stored_verdict != input.verdict {
+                    return Err(format!(
+                        "browser_page_reconcile_verdict_conflict: operation '{op_id}' was already reconciled as '{}', cannot re-reconcile as '{}'",
+                        stored_verdict.as_str(),
+                        input.verdict.as_str()
+                    ));
+                }
+                let stored_operator = reconciliation
+                    .and_then(|obj| obj.get("operator"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(operator)
+                    .to_owned();
+                let stored_evidence = reconciliation
+                    .and_then(|obj| obj.get("evidence"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(evidence)
+                    .to_owned();
+                let stored_at_ms = reconciliation
+                    .and_then(|obj| obj.get("reconciled_at_ms"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(input.now_ms);
+                let stored_audit_id = reconciliation
+                    .and_then(|obj| obj.get("audit_op_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&audit_op_id)
+                    .to_owned();
+                tx.commit().map_err(|error| {
+                    format!("cannot finish idempotent reconciliation lookup: {error}")
+                })?;
+                return Ok(BrowserPageReconcileOutcome {
+                    op_id: op_id.to_owned(),
+                    idempotency_key,
+                    verdict: stored_verdict,
+                    operator: stored_operator,
+                    evidence: stored_evidence,
+                    reconciled_at_ms: stored_at_ms,
+                    audit_op_id: stored_audit_id,
+                    idempotent_replay: true,
+                    unresolved_cap: BROWSER_PAGE_UNRESOLVED_CAP,
+                    unresolved_before,
+                    unresolved_after: unresolved_before,
+                });
+            }
+            Some("pending") => {
+                return Err(format!(
+                    "browser_page_reconcile_invalid_state: operation '{op_id}' is still 'pending'; only 'unknown' operations can be manually reconciled"
+                ));
+            }
+            Some(other) => {
+                return Err(format!(
+                    "browser_page_reconcile_invalid_state: operation '{op_id}' has state '{other}' (expected 'unknown')"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "browser_page_reconcile_invalid_state: operation '{op_id}' has no state"
+                ));
+            }
+        }
+
+        let prior_unknown_result = result_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let reconciled_result = serde_json::json!({
+            "ok": false,
+            "code": "browser_page_delivery_unknown",
+            "reason": "browser_page.action delivery was manually reconciled by local operator; automatic retry remains forbidden",
+            "op_id": op_id,
+            "delivery_state": "delivery_unknown",
+            "retryable": false,
+            "retry_safe": false,
+            "reconciled": true,
+            "reconciliation": {
+                "verdict": input.verdict.as_str(),
+                "operator": operator,
+                "evidence": evidence,
+                "reconciled_at_ms": input.now_ms,
+                "audit_op_id": audit_op_id,
+            },
+            "prior_unknown_result": prior_unknown_result,
+        });
+        let reconciled_result_json = serde_json::to_string(&reconciled_result)
+            .map_err(|error| format!("cannot serialize reconciled result: {error}"))?;
+
+        let changed = tx
+            .execute(
+                "UPDATE operations
+                 SET phase = 'reconciled',
+                     state = 'complete',
+                     expires_at = NULL,
+                     updated_at = ?1,
+                     result_json = ?2
+                 WHERE op_id = ?3
+                   AND kind = 'browser_page.action'
+                   AND state = 'unknown'",
+                params![input.now_ms, reconciled_result_json, op_id],
+            )
+            .map_err(|error| format!("cannot update unknown operation {op_id}: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "browser_page_reconcile_failed: expected 1 updated row for '{op_id}', updated {changed}"
+            ));
+        }
+
+        let unresolved_after: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM operations
+                 WHERE op_id GLOB 'op:browser_page_action:*'
+                   AND kind = 'browser_page.action'
+                   AND state IN ('pending', 'unknown')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                format!("cannot recount unresolved browser_page operations: {error}")
+            })?;
+
+        let audit_payload = serde_json::json!({
+            "event": "browser_page_unknown_reconciled",
+            "target_op_id": op_id,
+            "idempotency_key": idempotency_key,
+            "verdict": input.verdict.as_str(),
+            "operator": operator,
+            "evidence": evidence,
+            "reconciled_at_ms": input.now_ms,
+            "unresolved_cap": BROWSER_PAGE_UNRESOLVED_CAP,
+            "unresolved_before": unresolved_before,
+            "unresolved_after": unresolved_after,
+        });
+        let audit_json = serde_json::to_string(&audit_payload)
+            .map_err(|error| format!("cannot serialize reconciliation audit record: {error}"))?;
+        let audit_hash = sha256_text(&audit_json);
+        tx.execute(
+            "INSERT INTO operations (
+                op_id, kind, idempotency_key, request_hash, phase, state,
+                created_at, updated_at, expires_at, result_json
+             ) VALUES (?1, 'browser_page.action.reconcile_audit', ?2, ?3, 'recorded', 'complete', ?4, ?4, NULL, ?5)",
+            params![audit_op_id, op_id, audit_hash, input.now_ms, audit_json],
+        )
+        .map_err(|error| format!("cannot write reconciliation audit record: {error}"))?;
+
+        tx.commit().map_err(|error| {
+            format!("cannot commit browser_page unknown reconciliation: {error}")
+        })?;
+
+        Ok(BrowserPageReconcileOutcome {
+            op_id: op_id.to_owned(),
+            idempotency_key,
+            verdict: input.verdict,
+            operator: operator.to_owned(),
+            evidence: evidence.to_owned(),
+            reconciled_at_ms: input.now_ms,
+            audit_op_id,
+            idempotent_replay: false,
+            unresolved_cap: BROWSER_PAGE_UNRESOLVED_CAP,
+            unresolved_before,
+            unresolved_after,
+        })
     }
 
     pub fn release_operation_reservation(
