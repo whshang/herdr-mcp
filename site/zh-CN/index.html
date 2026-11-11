@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="herdr-mcp 通过 MCP、Cloudflare Edge 和本机出站 Link，把 ChatGPT 等 Web AI 接到持续存在的 Herdr 开发现场。">
+  <meta name="description" content="herdr-mcp 通过 MCP、Cloudflare Edge、本机出站 Link 与可选的 1.1 浏览器连续性回路，把 ChatGPT、Claude、Grok 等 Web AI 接到持久存在的本地 Herdr 开发现场。">
   <meta name="color-scheme" content="light dark">
   <link rel="icon" type="image/png" href="../favicon.png">
-  <title>herdr-mcp · 把 Web AI 接到持续存在的本机开发现场</title>
+  <title>herdr-mcp · 把 Web AI 接到持久存在的本地开发现场</title>
   <link rel="canonical" href="https://whshang.github.io/herdr-mcp/zh-CN/index.html">
   <link rel="alternate" hreflang="en" href="https://whshang.github.io/herdr-mcp/">
   <link rel="alternate" hreflang="zh-CN" href="https://whshang.github.io/herdr-mcp/zh-CN/index.html">
@@ -16,71 +16,97 @@
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../" aria-label="herdr-mcp 首页">herdr-mcp</a>
+    <div class="brand-cell"><a class="brand" href="../" aria-label="herdr-mcp 首页">herdr-mcp</a><!--HERDR_VERSION_BADGE--></div>
     <nav class="topnav" aria-label="Primary"><a href="../docs/zh-CN/">文档</a><a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome Store</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
     <div class="topbar-actions">
       <nav class="lang-switcher" data-lang-switch aria-label="切换语言"><a href="../" hreflang="en" data-locale="en">English</a><a href="../zh-CN/index.html" hreflang="zh-CN" data-locale="zh-CN" aria-current="true">简体中文</a><a href="../ja/index.html" hreflang="ja" data-locale="ja">日本語</a></nav>
-      <button class="theme-toggle" type="button" data-theme-toggle aria-label="切换颜色主题"><span data-theme-icon aria-hidden="true">◐</span></button>
+      <!--HERDR_SEARCH_TRIGGER-->
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="切换颜色主题"><span data-theme-icon aria-hidden="true">☾</span></button>
     </div>
   </header>
 
-  <main>
-    <header class="hero landing-hero">
-      <div class="eyebrow">Web AI 负责规划 · 本机现场持续存在 · 浏览器回路按需启用</div>
-      <h1>脑子留在浏览器里，工作留在你的电脑上。</h1>
-      <p class="lead">Herdr-MCP 让 ChatGPT 等 Web AI 安全调用真实文件、Git、命令、终端和 Coding Agent；Herdr 负责让开发现场跨会话、跨设备、跨长任务持续存在。</p>
-      <div class="actions">
-        <a class="primary" href="../docs/zh-CN/agent-install.html">一句话交给 Agent 安装</a>
-        <a href="../docs/zh-CN/">阅读文档</a>
-        <a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome 扩展</a>
-      </div>
-    </header>
+  <main class="landing-shell">
+    <section class="landing-hero-split">
+      <header class="hero landing-hero">
+        <div class="eyebrow">v1.1 · Web AI 规划入口 × 本地持久开发现场</div>
+        <h1>思考留在浏览器里，真实工程留在你的电脑上。</h1>
+        <p class="lead">Herdr-MCP 让 ChatGPT、Claude、Grok 等 Web AI 安全调用真实文件、Git、终端与本地 Coding Agent；Herdr 让开发现场跨对话、跨设备、跨长任务持续在线。</p>
+        <div class="actions">
+          <a class="primary" href="../docs/zh-CN/agent-install.html">一句话交给 Agent 安装</a>
+          <a href="../docs/zh-CN/">浏览文档中心</a>
+          <a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome 扩展</a>
+        </div>
+      </header>
 
-    <section class="landing-architecture" aria-label="herdr-mcp 产品架构">
-      <div class="diagram">
-        <div><strong>ChatGPT / Web AI</strong><br><small>规划与推理</small></div><span>→<br>MCP + OAuth</span>
-        <div><strong>Cloudflare Edge</strong><br><small>公网入口与设备协调</small></div><span>→<br>出站 Link</span>
-        <div><strong>herdr-mcp</strong><br><small>文件 · Git · 执行 · Agent</small></div><span>→</span>
-        <div><strong>Herdr</strong><br><small>Workspace · Pane · PTY · Events</small></div><span>↺</span>
-        <div><strong>Chrome 扩展</strong><br><small>可选连续性与接力</small></div>
-      </div>
-      <p class="architecture-note"><strong>各产品职责清楚分开。</strong>Web AI 负责规划；Cloudflare 提供稳定公网 MCP/OAuth 入口；herdr-mcp 负责本机访问边界；Herdr 保存持续运行的现场；浏览器扩展只在需要连续工作时补回程通道。</p>
+      <aside class="terminal-card" aria-label="一句话 Agent 自动安装">
+        <div class="terminal-card-bar">
+          <span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="terminal-card-title">一句话 Agent 自动部署</span>
+        </div>
+        <div class="terminal-card-body">
+          <p>复制给任意本机 Coding Agent——仅在 Cloudflare 与 ChatGPT 授权边界暂停由你确认：</p>
+          <pre class="agent-prompt" tabindex="0"><!--HERDR_COPY_BUTTON--><code>请帮我安装并配置 Herdr 和 herdr-mcp，请先完整阅读并严格按照这个指引执行：https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 。herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Cloudflare 登录/创建 API Token，以及 ChatGPT 添加 herdr Connector/应用这两类需要我本人操作的步骤暂停并指导我，其余步骤请自动完成并验证。</code></pre>
+          <div class="terminal-card-foot">
+            <a href="../docs/zh-CN/agent-install.html">Agent 安装协议 →</a>
+            <a href="../docs/zh-CN/install.html">手动安装指南 →</a>
+            <a href="../docs/zh-CN/existing-worker-connect.html">接入第二台电脑 →</a>
+          </div>
+        </div>
+      </aside>
     </section>
 
-    <section class="grid landing-value-grid">
-      <article><span class="eyebrow">推理</span><h2>继续用你已经在用的 Web AI</h2><p>ChatGPT 保持主要规划入口，不需要为了本机执行把所有任务再转交给另一套模型或 Agent 循环。</p></article>
-      <article><span class="eyebrow">持续</span><h2>对话结束，开发现场继续</h2><p>仓库、worktree、终端、服务和 Agent 可以继续运行，之后从另一个会话或设备重新接回。</p></article>
-      <article><span class="eyebrow">并行</span><h2>小任务直接做，大任务再派 Agent</h2><p>读取、Patch、Git、测试直接调用确定性工具；独立或长任务再分给可替换的本机 Coding Agent。</p></article>
+    <section class="landing-architecture" aria-label="herdr-mcp 1.1 双平面系统架构">
+      <div class="landing-section-header">
+        <span class="eyebrow">系统拓扑</span>
+        <h2>本机零公网入站端口，按需闭合浏览器双向回路</h2>
+        <p>所有开发机主动向你自己的 Cloudflare Worker 发起出站加密连接，无需公网 IP 或端口映射。</p>
+      </div>
+      <figure class="architecture-figure">
+        <!--HERDR_ARCH_SVG-->
+      </figure>
+      <p class="architecture-note">职责边界清晰：Web AI 负责规划；Cloudflare 提供稳定公网 OAuth / MCP 入口与多设备路由；herdr-mcp 执行确定性访问边界；Herdr TUI 持久保有现场；扩展按需提供浏览器控制中心（Browser Control Center）、排队下一轮与跨会话接力。</p>
     </section>
 
-    <section class="landing-install">
-      <div class="landing-section-copy"><span class="eyebrow">推荐安装方式</span><h2>把一句话发给 Coding Agent。</h2><p>Agent 会先读完整安装协议，再安装 Herdr 与原生 runtime、部署 Cloudflare Edge 和 Link。只有登录、Token、ChatGPT 授权这类必须本人完成的身份步骤才交给你。</p></div>
-      <pre class="agent-prompt" tabindex="0"><code>请帮我安装并配置 Herdr 和 herdr-mcp。先完整阅读并严格执行 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 。本机 herdr-mcp runtime 使用 GitHub Releases，不要 git clone。只在 Cloudflare 登录/API Token，以及 ChatGPT 添加 herdr 应用/Connector 授权这两类必须我本人操作的步骤暂停，其余步骤自动完成并验证。</code></pre>
-      <div class="actions"><a class="primary" href="../docs/zh-CN/agent-install.html">Agent 安装</a><a href="../docs/zh-CN/install.html">手动安装</a><a href="../docs/zh-CN/existing-worker-connect.html">添加第二台电脑</a></div>
+    <section aria-labelledby="bento-heading">
+      <div class="landing-section-header" style="margin-bottom:18px">
+        <span class="eyebrow">v1.1 核心能力</span>
+        <h2 id="bento-heading">面向长期真实开发的六项工程底座</h2>
+      </div>
+      <div class="grid landing-bento-grid">
+        <article><span class="eyebrow">持久现场</span><h3>对话关闭，现场不停</h3><p>Herdr TUI 的 workspace、终端 PTY、后台服务与运行中 Agent 跨对话留存，随时从新对话或另一台电脑接回。</p></article>
+        <article><span class="eyebrow">多机群控</span><h3>一套入口调度多台电脑</h3><p>单个免费 Cloudflare Worker 可登记多台 macOS、Linux、Windows 工作站，显式指定目标设备，绝不盲猜。</p></article>
+        <article><span class="eyebrow">多 Agent 协同</span><h3>18 个直接工具 + 任意本地 Agent</h3><p>读写、Patch、Git、测试直接执行；复杂任务并行派发给 Codex、Claude Code、Pi、Cline、OpenCode 等可用 Agent。</p></article>
+        <article><span class="eyebrow">WebChat 1.1</span><h3>多平台 WebChat 编排与接力</h3><p>支持 ChatGPT、Claude、Grok 会话创建/续写/停止/归档与接力，以及豆包生图工作流，按账号与连接器强隔离。</p></article>
+        <article><span class="eyebrow">适配器 1.1</span><h3>浏览器控制中心与受控页面</h3><p>侧边栏 Browser Control Center、排队下一轮、无 ID 接力、带代数围栏的 BrowserPage 操作与可复用项目浏览器技能。</p></article>
+        <article><span class="eyebrow">交付安全</span><h3>不盲目重放 + Sigstore 验签自更新</h3><p>明确区分 applied / uncertain 交付态防止重复副作用；一键校验构建证明完成可回滚原地升级。</p></article>
+      </div>
     </section>
 
     <section class="grid landing-links-grid">
-      <article><h2>ChatGPT</h2><p>账号或工作区启用 Developer Mode 后，从 ChatGPT 设置 → 应用 → 创建，添加 herdr MCP 应用/Connector。</p><p><a href="../docs/zh-CN/chatgpt-connector.html">ChatGPT 配置 →</a></p></article>
-      <article><h2>Cloudflare</h2><p>当前受支持的公网链路使用 Worker + Durable Object + 本机出站 Link，开发机无需开放入站端口。</p><p><a href="../docs/zh-CN/cloudflare-edge-deployment.html">Cloudflare 配置 →</a></p></article>
-      <article><h2>浏览器连续性</h2><p>基础 MCP 连接不依赖扩展。需要接力、排队下一轮、状态和 Browser Control Center 时再安装。</p><p><a href="../docs/zh-CN/extension.html">扩展说明 →</a></p></article>
+      <article><h2>ChatGPT 应用与连接器</h2><p>在 ChatGPT 设置 → 应用与连接器中开启开发者模式，填入 /mcp 地址并在 Project 中协作。</p><p><a href="../docs/zh-CN/chatgpt-connector.html">ChatGPT 配置 →</a></p></article>
+      <article><h2>Cloudflare 免费边缘部署</h2><p>使用 Cloudflare Workers Free（免绑卡），支持直接用 workers.dev 或绑定自有域名。</p><p><a href="../docs/zh-CN/cloudflare-edge-deployment.html">Cloudflare 配置 →</a></p></article>
+      <article><h2>浏览器连续工作（可选）</h2><p>按需安装扩展以启用 Browser Control Center、排队下一轮、跨会话接力与清晰的隐私边界。</p><p><a href="../docs/zh-CN/extension.html">扩展指南 →</a></p></article>
     </section>
 
     <section class="landing-research">
-      <div><span class="eyebrow">生态与架构</span><h2>已经有 Coding MCP、远程 Worker、tmux、ACP 和 Codex Bridge，为什么还要 Herdr-MCP？</h2><p>它们解决的入口和状态模型不同。Herdr-MCP 专注 Web-first planner + 持久、可观察、可人工接管的真实开发现场。</p></div>
+      <div>
+        <span class="eyebrow">架构定位</span>
+        <h2>已有各类 Coding MCP、云端沙盒与 Codex 桥接器，为什么还需要 Herdr-MCP？</h2>
+        <p>不同方案优化的控制平面不同。Herdr-MCP 专注解决「Web 对话作规划大脑 + 本机持久可接管真实开发现场」这一组合。</p>
+      </div>
       <a class="button" href="../docs/zh-CN/herdr-vs-ecosystem.html">查看生态对比 →</a>
     </section>
 
-    <footer>
+    <footer class="landing-footer">
       <span>herdr-mcp · MIT</span>
       <a href="../docs/zh-CN/">文档</a>
       <a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome Store</a>
       <a href="../docs/zh-CN/troubleshooting.html">故障排查</a>
-      <a href="../docs/zh-CN/privacy.html">隐私</a>
+      <a href="../docs/zh-CN/privacy.html">隐私说明</a>
       <a href="https://github.com/whshang/herdr-mcp">GitHub</a>
-      <a href="../" hreflang="en">English</a>
-      <a href="../ja/index.html" hreflang="ja">日本語</a>
+      <a href="../" hreflang="en">English</a><a href="../ja/index.html" hreflang="ja">日本語</a>
     </footer>
   </main>
-  <script src="../app.js" defer></script>
+  <!--HERDR_SEARCH_UI-->
 </body>
 </html>

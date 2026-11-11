@@ -23,10 +23,6 @@ const i18nDocsDir = join(rootPath, "docs", "i18n");
 const outDir = join(rootPath, "site-dist");
 
 const origin = (process.env[SITE_ORIGIN_ENV] || DEFAULT_ORIGIN).replace(/\/+$/, "");
-// package.json is build-tooling metadata whose version intentionally mirrors the
-// Runtime package identity. Keep the docs badge/release.json sourced from the
-// authoritative Rust runtime version defined by crates/herdr-mcp/Cargo.toml so
-// site generation cannot silently switch authorities later.
 const pkg = JSON.parse(await readFile(join(rootPath, "package.json"), "utf8"));
 const cargoManifest = await readFile(join(rootPath, "crates", "herdr-mcp", "Cargo.toml"), "utf8");
 const runtimeVersion = parseCargoPackageVersion(cargoManifest);
@@ -38,7 +34,6 @@ function parseCargoPackageVersion(source) {
   return version;
 }
 
-// Fail fast when someone adds a locale without translating every string.
 const uiKeys = Object.keys(UI[LOCALES[0]]).slice().sort();
 for (const locale of LOCALES) {
   const keys = Object.keys(UI[locale]).slice().sort();
@@ -88,10 +83,6 @@ function firstParagraph(markdown) {
   return value.length > 220 ? `${value.slice(0, 217)}...` : value;
 }
 
-// Markdown stylesheet links inside a locale dir:
-//   ./doc.md | doc.md           -> ./doc.html          (same logical doc, same locale)
-//   ../../../(README|CHANGELOG).md -> GitHub blob link  (repo-root files)
-// Any other ../ path is also treated as a repo-root reference.
 function rewriteDocLinks(html) {
   return html.replace(/href="(\.\/)?([^"#?]+)\.md(#[^"]*)?"/g, (_m, _dot, p1, hash = "") => {
     let clean = p1;
@@ -139,7 +130,6 @@ function renderMarkdown(source) {
 }
 
 function headMeta({ pre, locale, canonicalHref, alternates, xDefault, description, title }) {
-  const ui = UI[locale];
   const alternatesHtml = alternates
     .map(({ lang, href }) => `<link rel="alternate" hreflang="${lang}" href="${esc(href)}">`)
     .join("\n  ");
@@ -155,10 +145,6 @@ function headMeta({ pre, locale, canonicalHref, alternates, xDefault, descriptio
   <link rel="stylesheet" href="${pre}style.css">`;
 }
 
-// Language switcher: on article pages it maps the current slug to every other
-// locale's same slug; on locale index pages it maps to every other locale's
-// index. localePrefix is the prefix from the current page directory to the
-// docs root: "../" on /docs/<locale>/ pages.
 function langSwitcher({ locale, localePrefix, slug = null, current = null }) {
   const ui = UI[locale];
   const items = LOCALES.map((other) => {
@@ -169,19 +155,26 @@ function langSwitcher({ locale, localePrefix, slug = null, current = null }) {
   return `<nav class="lang-switcher" data-lang-switch aria-label="${esc(ui.langSwitcherAria)}">${items.join("")}</nav>`;
 }
 
+function versionBadgeMarkup(ui, version) {
+  if (!version) return "";
+  return `<a class="version-badge" href="https://github.com/whshang/herdr-mcp/releases" aria-label="${esc(ui.versionBadgeAria)}: v${esc(version)}">${esc(ui.versionBadgeAria)} v${esc(version)}</a>`;
+}
+
+function searchTriggerMarkup(ui) {
+  return `<button class="search-trigger" type="button" data-search-open aria-haspopup="dialog" aria-label="${esc(ui.searchTriggerAria)}"><span aria-hidden="true">⌕</span><span class="search-label">${esc(ui.searchLabel)}</span><kbd>⌘K</kbd></button>`;
+}
+
 function topbar({ pre, locale, drawer = false, slug = null, localePrefix, version = null }) {
   const ui = UI[locale];
-  const badge = version
-    ? `<a class="version-badge" href="https://github.com/whshang/herdr-mcp/releases" aria-label="${esc(ui.versionBadgeAria)}: v${esc(version)}">${esc(ui.versionBadgeAria)} v${esc(version)}</a>`
-    : "";
+  const badge = versionBadgeMarkup(ui, version);
   return `<header class="topbar${drawer ? " has-drawer" : ""}">
     ${drawer ? `<button class="nav-toggle" type="button" data-nav-toggle aria-label="${esc(ui.openNav)}" aria-controls="docs-sidebar" aria-expanded="false"><span aria-hidden="true">☰</span></button>` : ""}
     <div class="brand-cell"><a class="brand" href="${pre}" aria-label="${esc(ui.brandHomeAria)}">herdr-mcp</a>${badge}</div>
-    <nav class="topnav" aria-label="Primary"><a href="./" aria-current="location">${esc(ui.docsNav)}</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
+    <nav class="topnav" aria-label="Primary"><a href="./" aria-current="location">${esc(ui.docsNav)}</a><a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome Store</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
     <div class="topbar-actions">
       ${langSwitcher({ locale, localePrefix, slug, current: locale })}
-      <button class="search-trigger" type="button" data-search-open aria-haspopup="dialog" aria-label="${esc(ui.searchTriggerAria)}"><span aria-hidden="true">⌕</span><span class="search-label">${esc(ui.searchLabel)}</span><kbd>⌘K</kbd></button>
-      <button class="theme-toggle" type="button" data-theme-toggle aria-label="${esc(ui.themeToggleAria)}"><span data-theme-icon aria-hidden="true">◐</span></button>
+      ${searchTriggerMarkup(ui)}
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="${esc(ui.themeToggleAria)}"><span data-theme-icon aria-hidden="true">☾</span></button>
     </div>
   </header>`;
 }
@@ -227,11 +220,7 @@ function searchUi({ pre, locale, searchIndex }) {
   <script src="${pre}app.js" defer></script>`;
 }
 
-// A retired-but-URL-published logical doc redirects to its successor slug within
-// the same locale. This keeps old links (e.g. remote-coding-ecosystem-research)
-// resolving without re-publishing the withdrawn article as first-class content.
 function retiredRedirectShell({ locale, slug, target, targetTitle, ui, runtimeVersion }) {
-  const selfHref = `${origin}/docs/${locale}/${slug}.html`;
   const targetHref = `${origin}/docs/${locale}/${target}.html`;
   const alternates = LOCALES.map((lang) => ({ lang, href: `${origin}/docs/${lang}/${target}.html` }));
   return `<!doctype html>
@@ -258,15 +247,20 @@ function pageNav(docsBySlug, slug, ui) {
   </nav>`;
 }
 
+function groupLabelForSlug(locale, slug) {
+  const idx = NAV_GROUPS.findIndex((g) => g.slugs.includes(slug));
+  return idx >= 0 ? NAV_GROUP_LABELS[locale][idx] : UI[locale].docsNav;
+}
+
 function articleShell({ locale, doc, body, toc, docsBySlug, searchIndex, version }) {
   const pre = "../../";
   const ui = UI[locale];
   const selfHref = `${origin}/docs/${locale}/${doc.slug}.html`;
   const alternates = LOCALES.map((lang) => ({ lang, href: `${origin}/docs/${lang}/${doc.slug}.html` }));
   const xDefault = `${origin}/docs/${DEFAULT_LOCALE}/${doc.slug}.html`;
-  // Copy button for every code block, matching the reference docs' code UI.
   const copyButton = `<button type="button" class="code-copy" data-copy-code aria-label="${esc(ui.copyCode)}">${esc(ui.copyCode)}</button>`;
-  const bodyWithCopy = body.replace(/<pre(>|[ >])/g, (m, rest) => `<pre${rest}${copyButton}`);
+  const bodyWithCopy = body.replace(/<pre(>|[ >])/g, (_m, rest) => `<pre${rest}${copyButton}`);
+  const groupLabel = groupLabelForSlug(locale, doc.slug);
   return `<!doctype html>
 <html lang="${ui.htmlLang}">
 <head>
@@ -278,6 +272,7 @@ function articleShell({ locale, doc, body, toc, docsBySlug, searchIndex, version
   <div class="docs-layout">
     <aside class="sidebar" id="docs-sidebar" data-sidebar>${sidebarNav(docsBySlug, doc.slug, ui, locale)}</aside>
     <main class="article-column">
+      <div class="doc-eyebrow"><span class="eyebrow">${esc(groupLabel)}</span></div>
       <article class="doc-body" data-doc-slug="${esc(doc.slug)}">${bodyWithCopy}</article>
       ${doc.slug === READING_ORDER[0] ? agentIntroBlock(ui, pre) : ""}
       ${pageNav(docsBySlug, doc.slug, ui)}
@@ -292,25 +287,55 @@ function articleShell({ locale, doc, body, toc, docsBySlug, searchIndex, version
 
 function agentIntroBlock(ui, pre) {
   return `<section class="agent-intro" data-agent-intro>
-    <div class="agent-intro-head"><span class="eyebrow">👋</span><h2>${esc(ui.agentIntroTitle)}</h2><p>${esc(ui.agentIntroLead)}</p></div>
-    <pre class="agent-prompt" tabindex="0"><code>${esc(ui.agentPrompt)}</code></pre>
+    <div class="agent-intro-head"><span class="eyebrow">Quick Agent Bootstrap</span><h2>${esc(ui.agentIntroTitle)}</h2><p>${esc(ui.agentIntroLead)}</p></div>
+    <pre class="agent-prompt" tabindex="0"><button type="button" class="code-copy" data-copy-code aria-label="${esc(ui.copyCode)}">${esc(ui.copyCode)}</button><code>${esc(ui.agentPrompt)}</code></pre>
     <p class="agent-intro-note"><a href="${pre}herdr-mcp-SKILL.md">${esc(ui.agentSkillLink)}</a></p>
   </section>`;
 }
 
-// Real locale documentation homepage. It is intentionally user-first: the
-// primary path is Agent-assisted install, with the two human handoff points
-// called out before architecture/maintainer material.
+function archSvgFilename(locale) {
+  if (locale === "zh-CN") return "architecture-zh.svg";
+  if (locale === "ja") return "architecture-ja.svg";
+  return "architecture-en.svg";
+}
+
+function scopeInlineArchSvg(svgRaw, idSuffix) {
+  let scoped = svgRaw
+    .replace(/^<svg\b/, '<svg class="arch-svg"')
+    .replaceAll("arch-title", `arch-title-${idSuffix}`)
+    .replaceAll("arch-desc", `arch-desc-${idSuffix}`)
+    .replaceAll("arrow-accent", `arrow-accent-${idSuffix}`)
+    .replaceAll("arrow-emerald", `arrow-emerald-${idSuffix}`)
+    .replace(/@media\s*\(prefers-color-scheme:\s*dark\)\s*\{\s*:root\s*\{([\s\S]*?)\}\s*\}/, ":root[data-theme=\"dark\"] .arch-svg {$1}")
+    .replace(/:root\s*\{/, ".arch-svg {")
+    .replace(/--([a-z-]+):/g, "--arch-$1:")
+    .replace(/var\(--([a-z-]+)\)/g, "var(--arch-$1)");
+  return scoped;
+}
+
+function catalogDirectoryMarkup(docsBySlug, locale) {
+  const primaryGroups = NAV_GROUPS.map((group, index) => ({ group, label: NAV_GROUP_LABELS[locale][index] }))
+    .filter(({ group }) => !group.secondary && group.slugs.length > 0);
+  return `<div class="catalog-groups">${primaryGroups.map(({ group, label }) => {
+    const items = group.slugs.map((slug) => {
+      const doc = docsBySlug.get(slug);
+      return `<li><a href="./${esc(slug)}.html">→ ${esc(doc.title)}</a></li>`;
+    }).join("");
+    return `<article class="catalog-group-card"><h3>${esc(label)}</h3><ul>${items}</ul></article>`;
+  }).join("")}</div>`;
+}
+
 function localeEntryShell({ locale, docsBySlug, searchIndex, version }) {
   const pre = "../../";
   const ui = UI[locale];
   const selfHref = `${origin}/docs/${locale}/`;
   const alternates = LOCALES.map((lang) => ({ lang, href: `${origin}/docs/${lang}/` }));
   const xDefault = `${origin}/docs/${DEFAULT_LOCALE}/`;
+  const archSvgMarkup = archSvgByLocale.get(locale) || `<img src="${pre}assets/${archSvgFilename(locale)}" alt="${esc(ui.homeFlowTitle)}">`;
   return `<!doctype html>
 <html lang="${ui.htmlLang}">
 <head>
-  ${headMeta({ pre, locale, canonicalHref: selfHref, alternates, xDefault, description: ui.indexLead, title: `herdr-mcp ${ui.docsNav}` })}
+  ${headMeta({ pre, locale, canonicalHref: selfHref, alternates, xDefault, description: ui.indexLead, title: `herdr-mcp · ${ui.docsNav}` })}
 </head>
 <body class="docs-page docs-home-page">
   ${topbar({ pre, locale, drawer: true, localePrefix: "../", version })}
@@ -328,46 +353,63 @@ function localeEntryShell({ locale, docsBySlug, searchIndex, version }) {
             <a class="button" href="./overview.html">${esc(ui.indexCtaArchitecture)}</a>
           </div>
         </div>
-        <div class="home-system-map" aria-label="${esc(ui.homeFlowTitle)}">
-          <div class="system-node web"><strong>${esc(ui.homeFlowWeb)}</strong><span>${esc(ui.homeFlowWebBody)}</span></div>
-          <div class="system-arrow"><span>MCP</span>→</div>
-          <div class="system-node core"><strong>Herdr-MCP</strong><span>${esc(ui.homeFlowHerdrBody)}</span><div class="system-resources"><i>Workspace</i><i>PTY</i><i>Git / Files</i><i>Agent</i></div></div>
-          <div class="system-return"><span>↖</span><strong>${esc(ui.homeFlowReturn)}</strong><small>${esc(ui.homeFlowReturnBody)}</small></div>
+        <div class="home-arch-card" aria-label="${esc(ui.homeFlowTitle)}">
+          ${archSvgMarkup}
         </div>
       </section>
 
-      <div class="docs-paths home-product-story">
-        <section class="home-section" id="flow"><div class="index-group-heading"><span class="eyebrow">01</span><h2>${esc(ui.homeFlowTitle)}</h2><p>${esc(ui.homeFlowLead)}</p></div><div class="home-flow-grid"><article><b>1</b><strong>${esc(ui.homeFlowWeb)}</strong><p>${esc(ui.homeFlowWebBody)}</p></article><article><b>2</b><strong>${esc(ui.homeFlowMcp)}</strong><p>${esc(ui.homeFlowMcpBody)}</p></article><article><b>3</b><strong>${esc(ui.homeFlowHerdr)}</strong><p>${esc(ui.homeFlowHerdrBody)}</p></article><article class="optional"><b>↺</b><strong>${esc(ui.homeFlowReturn)}</strong><p>${esc(ui.homeFlowReturnBody)}</p></article></div></section>
-
-        <section class="home-section" id="value"><div class="index-group-heading"><span class="eyebrow">02</span><h2>${esc(ui.homeValueTitle)}</h2></div><div class="home-value-grid"><article><span>↗</span><h2>${esc(ui.homeValueReasoning)}</h2><p>${esc(ui.homeValueReasoningBody)}</p></article><article><span>□</span><h2>${esc(ui.homeValueWorksite)}</h2><p>${esc(ui.homeValueWorksiteBody)}</p></article><article><span>⇉</span><h2>${esc(ui.homeValueParallel)}</h2><p>${esc(ui.homeValueParallelBody)}</p></article><article><span>↻</span><h2>${esc(ui.homeValueLoop)}</h2><p>${esc(ui.homeValueLoopBody)}</p></article></div></section>
-
+      <div class="docs-paths">
         <section class="agent-intro home-install" data-agent-intro id="agent-install">
-          <div class="agent-intro-head"><span class="eyebrow">03 · ${esc(ui.homeAgentPathTitle)}</span><h2>${esc(ui.agentIntroTitle)}</h2><p>${esc(ui.agentIntroLead)}</p></div>
+          <div class="agent-intro-head"><span class="eyebrow">01 · ${esc(ui.homeAgentPathTitle)}</span><h2>${esc(ui.agentIntroTitle)}</h2><p>${esc(ui.agentIntroLead)}</p></div>
           <pre class="agent-prompt" tabindex="0"><button type="button" class="code-copy" data-copy-code aria-label="${esc(ui.copyCode)}">${esc(ui.copyCode)}</button><code>${esc(ui.agentPrompt)}</code></pre>
-          <p class="agent-intro-note"><a href="./agent-install.html">${esc(ui.agentSkillLink)}</a></p>
+          <p class="agent-intro-note"><a href="./agent-install.html">${esc(ui.agentSkillLink)} →</a></p>
         </section>
 
-        <section class="home-section" id="handoffs"><div class="index-group-heading"><span class="eyebrow">04</span><h2>${esc(ui.homeHandoffsTitle)}</h2></div><div class="docs-grid"><article class="doc-card handoff-card"><h2>${esc(ui.homeCloudflareTitle)}</h2><p>${esc(ui.homeCloudflareBody)}</p></article><article class="doc-card handoff-card"><h2>${esc(ui.homeChatgptTitle)}</h2><p>${esc(ui.homeChatgptBody)}</p></article></div></section>
+        <section class="home-section" id="catalog">
+          <div class="index-group-heading"><span class="eyebrow">02 · ${esc(ui.catalogEyebrow)}</span><h2>${esc(ui.catalogTitle)}</h2><p>${esc(ui.catalogLead)}</p></div>
+          ${catalogDirectoryMarkup(docsBySlug, locale)}
+        </section>
 
-        <section class="home-section" id="paths"><div class="index-group-heading"><span class="eyebrow">05</span><h2>${esc(ui.homePathsTitle)}</h2></div><div class="docs-grid home-three"><article class="doc-card"><h2><a href="./agent-install.html">${esc(ui.homeAgentPathTitle)}</a></h2><p>${esc(ui.homeAgentPathBody)}</p></article><article class="doc-card"><h2><a href="./install.html">${esc(ui.homeManualPathTitle)}</a></h2><p>${esc(ui.homeManualPathBody)}</p></article><article class="doc-card"><h2><a href="./extension.html">${esc(ui.homeBrowserPathTitle)}</a></h2><p>${esc(ui.homeBrowserPathBody)}</p></article></div></section>
+        <section class="home-section" id="paths">
+          <div class="index-group-heading"><span class="eyebrow">03</span><h2>${esc(ui.homePathsTitle)}</h2></div>
+          <div class="docs-grid home-three">
+            <article class="doc-card"><h2><a href="./agent-install.html">${esc(ui.homeAgentPathTitle)}</a></h2><p>${esc(ui.homeAgentPathBody)}</p></article>
+            <article class="doc-card"><h2><a href="./install.html">${esc(ui.homeManualPathTitle)}</a></h2><p>${esc(ui.homeManualPathBody)}</p></article>
+            <article class="doc-card"><h2><a href="./extension.html">${esc(ui.homeBrowserPathTitle)}</a></h2><p>${esc(ui.homeBrowserPathBody)}</p></article>
+          </div>
+        </section>
 
-        <section class="home-section home-research" id="research"><div><span class="eyebrow">06 · Landscape</span><h2>${esc(ui.homeResearchTitle)}</h2><p>${esc(ui.homeResearchBody)}</p></div><a class="button" href="./herdr-vs-ecosystem.html">${esc(ui.homeResearchLink)} →</a></section>
+        <section class="home-section" id="handoffs">
+          <div class="index-group-heading"><span class="eyebrow">04</span><h2>${esc(ui.homeHandoffsTitle)}</h2></div>
+          <div class="docs-grid">
+            <article class="doc-card handoff-card"><h2>${esc(ui.homeCloudflareTitle)}</h2><p>${esc(ui.homeCloudflareBody)}</p></article>
+            <article class="doc-card handoff-card"><h2>${esc(ui.homeChatgptTitle)}</h2><p>${esc(ui.homeChatgptBody)}</p></article>
+          </div>
+        </section>
 
-        <section class="home-section" id="support"><div class="index-group-heading"><span class="eyebrow">07</span><h2>${esc(ui.homeSupportTitle)}</h2></div><div class="docs-grid home-three"><article class="doc-card"><h2><a href="./troubleshooting.html">${esc(docsBySlug.get("troubleshooting").title)}</a></h2><p>${esc(docsBySlug.get("troubleshooting").description)}</p></article><article class="doc-card"><h2><a href="./architecture.html">${esc(docsBySlug.get("architecture").title)}</a></h2><p>${esc(docsBySlug.get("architecture").description)}</p></article><article class="doc-card"><h2><a href="https://github.com/whshang/herdr-mcp/tree/main/docs/history">${esc(ui.homeHistory)}</a></h2><p>${esc(ui.historyNav)}</p></article></div></section>
+        <section class="home-section home-research" id="research">
+          <div><span class="eyebrow">05 · Architecture</span><h2>${esc(ui.homeResearchTitle)}</h2><p>${esc(ui.homeResearchBody)}</p></div>
+          <a class="button" href="./herdr-vs-ecosystem.html">${esc(ui.homeResearchLink)} →</a>
+        </section>
+
+        <section class="home-section" id="support">
+          <div class="index-group-heading"><span class="eyebrow">06</span><h2>${esc(ui.homeSupportTitle)}</h2></div>
+          <div class="docs-grid home-three">
+            <article class="doc-card"><h2><a href="./troubleshooting.html">${esc(docsBySlug.get("troubleshooting").title)}</a></h2><p>${esc(docsBySlug.get("troubleshooting").description)}</p></article>
+            <article class="doc-card"><h2><a href="./architecture.html">${esc(docsBySlug.get("architecture").title)}</a></h2><p>${esc(docsBySlug.get("architecture").description)}</p></article>
+            <article class="doc-card"><h2><a href="https://github.com/whshang/herdr-mcp/tree/main/docs/history">${esc(ui.homeHistory)}</a></h2><p>${esc(ui.historyNav)}</p></article>
+          </div>
+        </section>
       </div>
       <footer class="docs-footer"><a href="https://github.com/whshang/herdr-mcp">GitHub</a><a href="./privacy.html">${esc(docsBySlug.get("privacy").title)}</a></footer>
     </main>
-    <aside class="toc" aria-label="${esc(ui.onThisPage)}"><div class="toc-inner"><h2>${esc(ui.onThisPage)}</h2><ol><li><a href="#flow">${esc(ui.homeFlowTitle)}</a></li><li><a href="#value">${esc(ui.homeValueTitle)}</a></li><li><a href="#agent-install">${esc(ui.homeAgentPathTitle)}</a></li><li><a href="#handoffs">${esc(ui.homeHandoffsTitle)}</a></li><li><a href="#research">${esc(ui.homeResearchTitle)}</a></li></ol></div></aside>
+    <aside class="toc" aria-label="${esc(ui.onThisPage)}"><div class="toc-inner"><h2>${esc(ui.onThisPage)}</h2><ol><li class="toc-depth-2"><a href="#agent-install">${esc(ui.homeAgentPathTitle)}</a></li><li class="toc-depth-2"><a href="#catalog">${esc(ui.catalogTitle)}</a></li><li class="toc-depth-2"><a href="#paths">${esc(ui.homePathsTitle)}</a></li><li class="toc-depth-2"><a href="#handoffs">${esc(ui.homeHandoffsTitle)}</a></li><li class="toc-depth-2"><a href="#research">${esc(ui.homeResearchTitle)}</a></li></ol></div></aside>
   </div>
   ${searchUi({ pre, locale, searchIndex })}
 </body>
 </html>`;
 }
 
-// Neutral /docs/ entry: no language chooser. Default locale is English, but a
-// zh or ja browser (without an explicit language pin) is routed to that locale's
-// docs, so the neutral entry never dumps a reader into the wrong language. An
-// explicit saved language choice always wins over browser detection.
 function docsRedirectShell() {
   const ui = UI[DEFAULT_LOCALE];
   const homes = Object.fromEntries(LOCALES.map((locale) => [locale, `./${locale}/`]));
@@ -416,6 +458,23 @@ await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
 await cp(siteDir, outDir, { recursive: true });
 await mkdir(join(outDir, "docs"), { recursive: true });
+await mkdir(join(outDir, "assets"), { recursive: true });
+
+for (const svgName of ["architecture-en.svg", "architecture-zh.svg", "architecture-ja.svg"]) {
+  const srcSvg = join(rootPath, "assets", svgName);
+  try {
+    await access(srcSvg);
+    await cp(srcSvg, join(outDir, "assets", svgName));
+  } catch { /* svg optional in synthetic minimal test fixtures */ }
+}
+
+const archSvgByLocale = new Map();
+for (const locale of LOCALES) {
+  try {
+    const raw = await readFile(join(rootPath, "assets", archSvgFilename(locale)), "utf8");
+    archSvgByLocale.set(locale, scopeInlineArchSvg(raw, `hub-${locale}`));
+  } catch { /* fallback to img when absent */ }
+}
 
 const byLocale = new Map();
 for (const locale of LOCALES) {
@@ -460,10 +519,6 @@ for (const locale of LOCALES) {
   byLocale.set(locale, { docsBySlug, rendered, searchIndex });
 }
 
-// Cross-language search: every item also carries the same document's title,
-// headings and blurb from every other locale, so a query typed in one language
-// finds the document from any side of the site. The number of locales is not
-// fixed: all non-current locales contribute aliases.
 function otherLocaleAliases({ byLocale, locale, slug }) {
   const aliases = [];
   for (const other of LOCALES) {
@@ -498,9 +553,6 @@ for (const locale of LOCALES) {
       articleShell({ locale, doc, body: page.html, toc: page.toc, docsBySlug, searchIndex, version: runtimeVersion })
     );
   }
-  // Backward-compatible URL pages for retired logical docs: meta-refresh to the
-  // successor slug within the same locale. They carry the same topbar so a human
-  // landing on an old link still sees the docs chrome while the page reloads.
   for (const [slug, target] of Object.entries(REDIRECTS)) {
     const targetTitle = docsBySlug.get(target)?.title ?? target;
     await writeFile(
@@ -511,10 +563,40 @@ for (const locale of LOCALES) {
   await writeFile(join(localeOut, "index.html"), localeEntryShell({ locale, docsBySlug, searchIndex, version: runtimeVersion }));
 }
 
+// Enrich landing pages with dynamic version badge, ⌘K search trigger/dialog, and copy buttons.
+for (const [locale, relFile, pre, docsBase] of [
+  ["en", "index.html", "./", "./docs/en/"],
+  ["zh-CN", "zh-CN/index.html", "../", "../docs/zh-CN/"],
+  ["ja", "ja/index.html", "../", "../docs/ja/"],
+]) {
+  const landingPath = join(outDir, relFile);
+  try {
+    let html = await readFile(landingPath, "utf8");
+    const ui = UI[locale];
+    const landingSearchIndex = byLocale.get(locale).searchIndex.map((item) => ({
+      ...item,
+      href: item.href.replace(/^\.\//, docsBase),
+    }));
+    html = html
+      .replace("<!--HERDR_VERSION_BADGE-->", versionBadgeMarkup(ui, runtimeVersion))
+      .replace("<!--HERDR_SEARCH_TRIGGER-->", searchTriggerMarkup(ui))
+      .replace(
+        "<!--HERDR_COPY_BUTTON-->",
+        `<button type="button" class="code-copy" data-copy-code aria-label="${esc(ui.copyCode)}">${esc(ui.copyCode)}</button>`
+      )
+      .replace("<!--HERDR_ARCH_SVG-->", () => {
+        const rawPath = join(rootPath, "assets", archSvgFilename(locale));
+        return archSvgByLocale.has(locale)
+          ? archSvgByLocale.get(locale).replaceAll(`hub-${locale}`, `landing-${locale}`)
+          : `<img src="${pre}assets/${archSvgFilename(locale)}" alt="herdr-mcp architecture">`;
+      })
+      .replace("<!--HERDR_SEARCH_UI-->", searchUi({ pre, locale, searchIndex: landingSearchIndex }));
+    await writeFile(landingPath, html);
+  } catch { /* skip if absent */ }
+}
+
 await writeFile(join(outDir, "docs", "index.html"), docsRedirectShell());
 
-// Explicit HERDR_SITE_COMMIT override wins over the ambient CI SHA; falling back
-// to the working-tree marker only when neither is set.
 const commit = process.env.HERDR_SITE_COMMIT || process.env.GITHUB_SHA || "working-tree";
 const skillSource = join(rootPath, "assets", "herdr-mcp-SKILL.md");
 let skill = null;
@@ -532,4 +614,11 @@ await writeFile(join(outDir, "release.json"), `${JSON.stringify({
 }, null, 2)}\n`);
 await writeFile(join(outDir, ".nojekyll"), "");
 
-console.log(JSON.stringify({ ok: true, output: "site-dist", locales: LOCALES.map((l) => `${l}*${DOC_ORDER.length}`), docs: DOC_ORDER.length, version: runtimeVersion, commit }));
+console.log(JSON.stringify({
+  ok: true,
+  output: "site-dist",
+  locales: LOCALES.map((l) => `${l}*${DOC_ORDER.length}`),
+  docs: DOC_ORDER.length,
+  version: runtimeVersion,
+  commit,
+}));
