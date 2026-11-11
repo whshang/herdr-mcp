@@ -20,7 +20,8 @@ use crate::instance::{
 };
 use serde_json::{Value, json};
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs;
 use std::path::Path;
