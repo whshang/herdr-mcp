@@ -4161,9 +4161,9 @@ mod tests {
     fn named_instance_fleet_identity_never_falls_back_to_production_link_plist() {
         let paths = RuntimePaths {
             instance: crate::instance::InstanceId::parse("dev698").unwrap(),
-            config_dir: PathBuf::from("/tmp/herdr-mcp-dev698"),
-            config_file: PathBuf::from("/tmp/herdr-mcp-dev698/config.json"),
-            dev_state_dir: PathBuf::from("/tmp/herdr-mcp-dev"),
+            config_dir: std::path::PathBuf::from("/tmp/herdr-mcp-dev698"),
+            config_file: std::path::PathBuf::from("/tmp/herdr-mcp-dev698/config.json"),
+            dev_state_dir: std::path::PathBuf::from("/tmp/herdr-mcp-dev"),
             herdr_socket: None,
         };
         let config = Config {
