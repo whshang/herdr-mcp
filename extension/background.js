@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.248";
+const H2W_SCRIPT_VERSION = "0.1.249";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -10328,7 +10328,10 @@ async function browserPageMainWorldFill(tabId, response, context = {}) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId }, world: "ISOLATED",
-      func: (sel) => { for (const el of document.querySelectorAll(sel)) el.removeAttribute("data-h2w-fill-token"); },
+      func: (sel) => {
+        for (const el of document.querySelectorAll(sel)) el.removeAttribute("data-h2w-fill-token");
+        try { window.H2W_BROWSER_PAGE_KERNEL?.invalidateGeneration?.(); } catch (_) {}
+      },
       args: [selector],
     });
   } catch (_) {}

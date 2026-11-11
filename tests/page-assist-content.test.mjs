@@ -1481,9 +1481,10 @@ test("user fills a rich-text composer | Given a contenteditable editor that may 
   assert.equal(fillOnly(plain).ok, true);
 });
 
-test("user fills a rich-text composer through the extension | Given the extension requests a MAIN-world fill | When fill targets a contenteditable editor | Then the kernel only tags the element and hands the value back without writing", () => {
+test("user fills a rich-text composer through the extension | Given the extension requests a MAIN-world fill | When fill targets a contenteditable editor | Then the kernel only tags the element and hands the value back without writing", async () => {
   const editor = createElement({ tag: "div", contentEditable: true, attrs: { "aria-label": "Prose editor" } });
-  const h = harness({ elements: [editor] });
+  const sendButton = createElement({ tag: "button", text: "Send" });
+  const h = harness({ elements: [editor, sendButton] });
   const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
   const handoff = h.send({
     type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
@@ -1494,6 +1495,39 @@ test("user fills a rich-text composer through the extension | Given the extensio
   assert.equal(handoff.value, "hello claude");
   assert.equal(editor.getAttribute("data-h2w-fill-token"), handoff.main_world_fill_token);
   assert.notEqual(editor.innerText, "hello claude");
+
+  // The MAIN-world rich-text fill must consume the observation generation just
+  // like ordinary fill, so reusing the pre-fill generation for a second fill,
+  // click, or scoped expect fails closed with stale_generation until a fresh
+  // observe is taken.
+  const staleRefill = h.send({
+    type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[0].ref, value: "second", mainWorldFill: true,
+  });
+  assert.equal(staleRefill.ok, false);
+  assert.equal(staleRefill.error, "stale_generation");
+
+  const staleClick = h.send({
+    type: "h2w_page_assist", action: "click", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[1].ref,
+  });
+  assert.equal(staleClick.ok, false);
+  assert.equal(staleClick.error, "stale_generation");
+
+  const staleExpect = await h.sendAsync({
+    type: "h2w_page_assist", action: "expect", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[1].ref, condition: "element_enabled",
+  });
+  assert.equal(staleExpect.ok, false);
+  assert.equal(staleExpect.error, "stale_generation");
+
+  const reobserved = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.notEqual(reobserved.generation, observed.generation);
+  const freshClick = h.send({
+    type: "h2w_page_assist", action: "click", expectedOrigin: "https://app.test",
+    generation: reobserved.generation, ref: reobserved.elements[1].ref,
+  });
+  assert.equal(freshClick.ok, true);
 });
 
 test("user verifies observed controls | Given a textarea and semantic radio | When ref-scoped expect reads their actual state | Then values and checked state are verified without returning field contents", async () => {
