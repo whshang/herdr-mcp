@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="herdr-mcp は MCP、Cloudflare Edge、本機からの outbound Link を通じて、ChatGPT などの Web AI を永続するローカルの Herdr 開発現場へ接続します。">
+  <meta name="description" content="herdr-mcp は MCP、Cloudflare Edge、本機からの outbound Link、任意の 1.1 ブラウザ連続性ループを通じて、ChatGPT・Claude・Grok などの Web AI を永続するローカル開発現場へ接続します。">
   <meta name="color-scheme" content="light dark">
   <link rel="icon" type="image/png" href="../favicon.png">
   <title>herdr-mcp · Web AI を、永続するローカル開発現場へ</title>
@@ -16,70 +16,97 @@
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../" aria-label="herdr-mcp ホーム">herdr-mcp</a>
+    <div class="brand-cell"><a class="brand" href="../" aria-label="herdr-mcp ホーム">herdr-mcp</a><!--HERDR_VERSION_BADGE--></div>
     <nav class="topnav" aria-label="Primary"><a href="../docs/ja/">ドキュメント</a><a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome Store</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
     <div class="topbar-actions">
       <nav class="lang-switcher" data-lang-switch aria-label="言語を切り替える"><a href="../" hreflang="en" data-locale="en">English</a><a href="../zh-CN/index.html" hreflang="zh-CN" data-locale="zh-CN">简体中文</a><a href="../ja/index.html" hreflang="ja" data-locale="ja" aria-current="true">日本語</a></nav>
-      <button class="theme-toggle" type="button" data-theme-toggle aria-label="カラーテーマを切り替える"><span data-theme-icon aria-hidden="true">◐</span></button>
+      <!--HERDR_SEARCH_TRIGGER-->
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="カラーテーマを切り替える"><span data-theme-icon aria-hidden="true">☾</span></button>
     </div>
   </header>
 
-  <main>
-    <header class="hero landing-hero">
-      <div class="eyebrow">Web AI が計画 · ローカル現場は永続 · ブラウザ経路は任意</div>
-      <h1>考える場所はブラウザに。作業はあなたのコンピュータに。</h1>
-      <p class="lead">Herdr-MCP は ChatGPT などの Web AI に、実在するファイル、Git、コマンド、ターミナル、coding Agent への境界付きアクセスを与えます。Herdr は会話、デバイス、長時間タスクをまたいで開発現場を生かし続けます。</p>
-      <div class="actions">
-        <a class="primary" href="../docs/ja/agent-install.html">Agent に一文でインストールさせる</a>
-        <a href="../docs/ja/">ドキュメントを読む</a>
-        <a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome 拡張</a>
-      </div>
-    </header>
+  <main class="landing-shell">
+    <section class="landing-hero-split">
+      <header class="hero landing-hero">
+        <div class="eyebrow">v1.1 · Web AI プランナー × 永続ローカル作業現場</div>
+        <h1>思考はブラウザのまま、実作業はあなたのマシン上で。</h1>
+        <p class="lead">Herdr-MCP は ChatGPT・Claude・Grok などの Web AI に実ファイル、Git、端末、ローカル Coding Agent への安全なアクセスを提供し、Herdr が会話やデバイスを跨いで開発現場を維持します。</p>
+        <div class="actions">
+          <a class="primary" href="../docs/ja/agent-install.html">一文で Agent インストール</a>
+          <a href="../docs/ja/">ドキュメントを見る</a>
+          <a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome 拡張</a>
+        </div>
+      </header>
 
-    <section class="landing-architecture" aria-label="herdr-mcp のプロダクト構成">
-      <div class="diagram">
-        <div><strong>ChatGPT / Web AI</strong><br><small>planner + 推論</small></div><span>→<br>MCP + OAuth</span>
-        <div><strong>Cloudflare Edge</strong><br><small>公開経路 + デバイス調整</small></div><span>→<br>outbound Link</span>
-        <div><strong>herdr-mcp</strong><br><small>files · Git · exec · agents</small></div><span>→</span>
-        <div><strong>Herdr</strong><br><small>workspace · pane · PTY · events</small></div><span>↺</span>
-        <div><strong>Chrome 拡張</strong><br><small>任意の連続性 + handoff</small></div>
-      </div>
-      <p class="architecture-note"><strong>プロダクトの境界は明示したままにします。</strong>Web AI が計画し、Cloudflare が安定した公開 MCP/OAuth 入口を提供し、herdr-mcp がワークステーションのアクセス境界を強制し、Herdr が永続 runtime 状態を所有します。拡張はブラウザ連続性が有用なときだけ戻り経路を追加します。</p>
+      <aside class="terminal-card" aria-label="一文による Agent 自動セットアップ">
+        <div class="terminal-card-bar">
+          <span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="terminal-card-title">1-Prompt Agent Bootstrap</span>
+        </div>
+        <div class="terminal-card-body">
+          <p>ローカルの Coding Agent に貼り付けるだけ（Cloudflare と ChatGPT の認可時のみ一時停止）：</p>
+          <pre class="agent-prompt" tabindex="0"><!--HERDR_COPY_BUTTON--><code>Herdr と herdr-mcp をインストールして設定してください。まず https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/ja/agent-install.md を最初から最後まで読み、そのとおりに実行してください。ローカルの herdr-mcp runtime は GitHub Releases からインストールし、git clone は使いません。私自身が Cloudflare へサインインして API Token を作成する場面と、ChatGPT に herdr Connector/アプリを追加する場面だけ停止してください。それ以外はすべて自動化して検証してください。</code></pre>
+          <div class="terminal-card-foot">
+            <a href="../docs/ja/agent-install.html">Agent 導入規約 →</a>
+            <a href="../docs/ja/install.html">手動インストール →</a>
+            <a href="../docs/ja/existing-worker-connect.html">2 台目を追加 →</a>
+          </div>
+        </div>
+      </aside>
     </section>
 
-    <section class="grid landing-value-grid">
-      <article><span class="eyebrow">推論の再利用</span><h2>すでに使っている Web AI をそのまま使う</h2><p>ChatGPT を主要な planning surface として維持し、ローカル実行のためだけに別のローカルモデルや Agent ループへ全タスクを通す必要はありません。</p></article>
-      <article><span class="eyebrow">永続性</span><h2>会話が終わっても現場は残る</h2><p>リポジトリ、worktree、ターミナル、サービス、Agent は会話が終わっても、別のデバイスが引き継いでも動き続けます。</p></article>
-      <article><span class="eyebrow">並列性</span><h2>小さな作業は直接ツール、大きな作業は Agent</h2><p>読み取り、patch、Git、テストは直接実行します。独立した作業や長時間の作業は交換可能なローカル coding Agent に任せます。</p></article>
+    <section class="landing-architecture" aria-label="herdr-mcp 1.1 2プレーン構成">
+      <div class="landing-section-header">
+        <span class="eyebrow">システム構成</span>
+        <h2>受信ポート非公開の中核経路と、任意のブラウザ双方向ループ</h2>
+        <p>各ワークステーションから自分の Cloudflare Worker へ外向き WSS 接続を張るため、ポート開放は不要です。</p>
+      </div>
+      <figure class="architecture-figure">
+        <!--HERDR_ARCH_SVG-->
+      </figure>
+      <p class="architecture-note">明確な責務分離：Web AI が計画し、Cloudflare が公開 OAuth / MCP とデバイスルーティングを担い、herdr-mcp が境界を強制し、Herdr TUI が現場を保持し、拡張が Browser Control Center・次ターン予約・引き継ぎを追加します。</p>
     </section>
 
-    <section class="landing-install">
-      <div class="landing-section-copy"><span class="eyebrow">推奨セットアップ</span><h2>coding Agent に一文を渡すだけ。</h2><p>Agent が権威あるインストールプロトコルを読み、Herdr とネイティブ runtime をインストールし、Cloudflare Edge と Link をデプロイします。停止するのは、あなた自身の操作が必要な identity 手順だけです。</p></div>
-      <pre class="agent-prompt" tabindex="0"><code>Herdr と herdr-mcp をインストールして設定してください。まず https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/ja/agent-install.md を最初から最後まで読み、そのとおりに実行してください。ローカルの herdr-mcp runtime は GitHub Releases からインストールし、git clone は使いません。私自身が Cloudflare へサインインして API Token を作成する場面と、ChatGPT に herdr Connector/アプリを追加する場面だけ停止してください。それ以外はすべて自動化して検証してください。</code></pre>
-      <div class="actions"><a class="primary" href="../docs/ja/agent-install.html">Agent インストール</a><a href="../docs/ja/install.html">手動インストール</a><a href="../docs/ja/existing-worker-connect.html">2 台目を追加する</a></div>
+    <section aria-labelledby="bento-heading">
+      <div class="landing-section-header" style="margin-bottom:18px">
+        <span class="eyebrow">v1.1 の主な機能</span>
+        <h2 id="bento-heading">継続的な開発を支える 6 つの基盤</h2>
+      </div>
+      <div class="grid landing-bento-grid">
+        <article><span class="eyebrow">永続性</span><h3>会話を閉じても現場は続く</h3><p>Herdr TUI の workspace、PTY 端末、サーバー、Agent はタブを閉じても動き続け、別の会話やマシンから再開できます。</p></article>
+        <article><span class="eyebrow">マルチマシン</span><h3>1 つの Worker で複数台を制御</h3><p>無料の Cloudflare Workers Free に macOS・Linux・Windows を登録し、明示的な device_id でルーティングします。</p></article>
+        <article><span class="eyebrow">並列 Agent</span><h3>18 個の直接ツール + 任意の Agent</h3><p>小さな変更は直接実行し、大きなタスクは Codex・Claude Code・Pi・Cline・OpenCode 等へ並列委譲します。</p></article>
+        <article><span class="eyebrow">WebChat 1.1</span><h3>マルチ WebChat 制御と引き継ぎ</h3><p>ChatGPT・Claude・Grok セッションの作成・継続・停止・引き継ぎと Doubao 画像生成をアカウント分離付きで制御します。</p></article>
+        <article><span class="eyebrow">アダプター 1.1</span><h3>Browser Control Center と BrowserPage</h3><p>サイドパネル制御、次ターン予約、ID 不要の引き継ぎ、世代フェンス付きタブ操作、再利用可能なブラウザスキル。</p></article>
+        <article><span class="eyebrow">安全性</span><h3>明示的配信状態と署名検証更新</h3><p>applied / uncertain を区別して盲目的な再実行を防止。Sigstore 証明を検証してロールバック可能な更新を適用します。</p></article>
+      </div>
     </section>
 
     <section class="grid landing-links-grid">
-      <article><h2>ChatGPT</h2><p>アカウントまたはワークスペースで Developer Mode を有効にしたあと、ChatGPT の Settings → Apps から herdr MCP アプリ/Connector を追加します。</p><p><a href="../docs/ja/chatgpt-connector.html">ChatGPT の設定 →</a></p></article>
-      <article><h2>Cloudflare</h2><p>サポートされる公開経路は Worker + Durable Object + 本機からの outbound Link を使い、開発機の inbound port は開いたままにしません。</p><p><a href="../docs/ja/cloudflare-edge-deployment.html">Cloudflare の設定 →</a></p></article>
-      <article><h2>ブラウザ連続性</h2><p>基本的な MCP アクセスに拡張は必須ではありません。handoff、キューされたターン、status、Browser Control Center が必要なときに追加します。</p><p><a href="../docs/ja/extension.html">拡張の説明 →</a></p></article>
+      <article><h2>ChatGPT Apps & Connectors</h2><p>ChatGPT の設定 → Apps & Connectors で Developer Mode を有効化し、/mcp エンドポイントを登録します。</p><p><a href="../docs/ja/chatgpt-connector.html">ChatGPT 設定 →</a></p></article>
+      <article><h2>Cloudflare Edge</h2><p>カード登録不要の Cloudflare Workers Free で動作。workers.dev でも独自ドメインでも利用可能です。</p><p><a href="../docs/ja/cloudflare-edge-deployment.html">Cloudflare 設定 →</a></p></article>
+      <article><h2>ブラウザ連続性（任意）</h2><p>Browser Control Center、次ターン予約、引き継ぎ、明確なプライバシー境界を必要に応じて追加します。</p><p><a href="../docs/ja/extension.html">拡張ガイド →</a></p></article>
     </section>
 
     <section class="landing-research">
-      <div><span class="eyebrow">アーキテクチャの風景</span><h2>Coding MCP、リモート Worker、tmux、ACP、Codex Bridge があるのに、なぜ Herdr-MCP なのか？</h2><p>それぞれが最適化している入口と状態モデルが違います。Herdr-MCP は Web-first の planning と、永続・観測可能・人間が引き継げる実際のワークステーションの組み合わせに集中します。</p></div>
+      <div>
+        <span class="eyebrow">アーキテクチャ比較</span>
+        <h2>既存の Coding MCP、クラウドサンドボックス、Codex ブリッジとの違いは？</h2>
+        <p>それぞれ最適化する制御プレーンが異なります。Herdr-MCP は Web 主導の計画と、永続・観測可能・人間がすぐ引き継げるローカル現場の統合に集中します。</p>
+      </div>
       <a class="button" href="../docs/ja/herdr-vs-ecosystem.html">エコシステムを比較する →</a>
     </section>
 
-    <footer>
+    <footer class="landing-footer">
       <span>herdr-mcp · MIT</span>
       <a href="../docs/ja/">ドキュメント</a>
       <a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome Store</a>
       <a href="../docs/ja/troubleshooting.html">トラブルシューティング</a>
       <a href="../docs/ja/privacy.html">プライバシー</a>
       <a href="https://github.com/whshang/herdr-mcp">GitHub</a>
-      <a href="../" hreflang="en">English</a>
+      <a href="../" hreflang="en">English</a><a href="../zh-CN/index.html" hreflang="zh-CN">简体中文</a>
     </footer>
   </main>
-  <script src="../app.js" defer></script>
+  <!--HERDR_SEARCH_UI-->
 </body>
 </html>

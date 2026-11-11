@@ -565,3 +565,30 @@ test("release.json, skill artifact and design invariants are preserved", async (
   assert.match(edgeReadme, /\.\.\/\.\.\/docs\/i18n\/en\/runtime-self-upgrade\.md/);
   assert.doesNotMatch(edgeReadme, /docs\/i18n\/zh-CN\//);
 });
+
+test("user gets unified search, version badge, copyable prompt, and theme-synced architecture diagram on landing and hub pages | Given the built documentation site across en, zh-CN, and ja | When a visitor opens a locale landing page or documentation hub | Then every landing page exposes the source-version badge, command-palette search index, prompt copy button, and theme-synced inline SVG diagram while the docs hub renders the five-track catalog directory and balanced CJK heading rules", async () => {
+  for (const [locale, rel, prefix] of [
+    ["en", "index.html", "./docs/en/"],
+    ["zh-CN", "zh-CN/index.html", "../docs/zh-CN/"],
+    ["ja", "ja/index.html", "../docs/ja/"],
+  ]) {
+    const landing = await readFile(join(OUT, rel), "utf8");
+    assert.match(landing, /class="version-badge"/, `landing (${locale}) must carry version badge`);
+    assert.match(landing, /data-search-open/, `landing (${locale}) must expose search trigger`);
+    assert.match(landing, /data-search-dialog/, `landing (${locale}) must embed search dialog`);
+    assert.match(landing, /data-copy-code/, `landing (${locale}) prompt must carry copy button`);
+    assert.match(landing, /<svg class="arch-svg"/, `landing (${locale}) must inline theme-synced architecture SVG`);
+    assert.match(landing, /:root\[data-theme="dark"\] \.arch-svg/, `landing (${locale}) SVG must react to data-theme=dark`);
+    const searchBlob = landing.match(/<script id="search-index" type="application\/json">([\s\S]*?)<\/script>/);
+    assert.ok(searchBlob, `landing (${locale}) must embed search index`);
+    const parsed = JSON.parse(searchBlob[1]);
+    assert.equal(parsed.length, DOC_ORDER.length);
+    assert.equal(parsed[0].href, `${prefix}${DOC_ORDER[0]}.html`);
+
+    const hub = await readFile(join(OUT, "docs", locale, "index.html"), "utf8");
+    assert.match(hub, /class="catalog-groups"/, `docs hub (${locale}) must render topic directory`);
+    assert.match(hub, /<svg class="arch-svg"/, `docs hub (${locale}) must inline theme-synced architecture SVG`);
+  }
+  const css = await readFile(join(OUT, "style.css"), "utf8");
+  assert.match(css, /text-wrap:\s*balance/, "headings must balance wrapping to prevent CJK widow characters");
+});

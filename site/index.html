@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="herdr-mcp connects ChatGPT and other Web AI to a persistent local Herdr development worksite through MCP, Cloudflare Edge, and an outbound workstation Link.">
+  <meta name="description" content="herdr-mcp connects ChatGPT, Claude, Grok, and other Web AI to a persistent local Herdr development worksite via MCP, Cloudflare Edge, an outbound Link, and an optional 1.1 browser continuity loop.">
   <meta name="color-scheme" content="light dark">
   <link rel="icon" type="image/png" href="./favicon.png">
-  <title>herdr-mcp · Web AI, connected to a persistent development worksite</title>
+  <title>herdr-mcp · Web AI connected to a persistent local development worksite</title>
   <link rel="canonical" href="https://whshang.github.io/herdr-mcp/">
   <link rel="alternate" hreflang="en" href="https://whshang.github.io/herdr-mcp/">
   <link rel="alternate" hreflang="zh-CN" href="https://whshang.github.io/herdr-mcp/zh-CN/index.html">
@@ -14,7 +14,6 @@
   <link rel="alternate" hreflang="x-default" href="https://whshang.github.io/herdr-mcp/">
   <link rel="stylesheet" href="./style.css">
   <script>
-    // An explicit saved language choice wins over browser detection.
     try {
       var langKey = "herdr-docs-lang";
       var saved = localStorage.getItem(langKey);
@@ -33,71 +32,97 @@
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="./" aria-label="herdr-mcp home">herdr-mcp</a>
+    <div class="brand-cell"><a class="brand" href="./" aria-label="herdr-mcp home">herdr-mcp</a><!--HERDR_VERSION_BADGE--></div>
     <nav class="topnav" aria-label="Primary"><a href="./docs/en/">Docs</a><a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome Store</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
     <div class="topbar-actions">
       <nav class="lang-switcher" data-lang-switch aria-label="Language"><a href="./" hreflang="en" data-locale="en" aria-current="true">English</a><a href="./zh-CN/index.html" hreflang="zh-CN" data-locale="zh-CN">简体中文</a><a href="./ja/index.html" hreflang="ja" data-locale="ja">日本語</a></nav>
-      <button class="theme-toggle" type="button" data-theme-toggle aria-label="Toggle color theme"><span data-theme-icon aria-hidden="true">◐</span></button>
+      <!--HERDR_SEARCH_TRIGGER-->
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="Toggle color theme"><span data-theme-icon aria-hidden="true">☾</span></button>
     </div>
   </header>
 
-  <main>
-    <header class="hero landing-hero">
-      <div class="eyebrow">Web AI planner · persistent local worksite · optional browser return path</div>
-      <h1>Keep the brain in the browser. Put the work on your machine.</h1>
-      <p class="lead">Herdr-MCP gives ChatGPT and other Web AI bounded access to real files, Git, commands, terminals, and coding agents while Herdr keeps the development worksite alive across turns, devices, and long-running tasks.</p>
-      <div class="actions">
-        <a class="primary" href="./docs/en/agent-install.html">Install with one prompt</a>
-        <a href="./docs/en/">Read the docs</a>
-        <a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome extension</a>
-      </div>
-    </header>
+  <main class="landing-shell">
+    <section class="landing-hero-split">
+      <header class="hero landing-hero">
+        <div class="eyebrow">v1.1 · Web AI Planner × Persistent Local Worksite</div>
+        <h1>Keep the brain in the browser. Run the real work on your machines.</h1>
+        <p class="lead">Herdr-MCP gives ChatGPT, Claude, and Grok bounded access to real files, Git, terminals, and local coding agents—while Herdr keeps your development worksite alive across chats, workstations, and long-running jobs.</p>
+        <div class="actions">
+          <a class="primary" href="./docs/en/agent-install.html">Install with one prompt</a>
+          <a href="./docs/en/">Explore docs</a>
+          <a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome extension</a>
+        </div>
+      </header>
 
-    <section class="landing-architecture" aria-label="herdr-mcp product architecture">
-      <div class="diagram">
-        <div><strong>ChatGPT / Web AI</strong><br><small>planner + reasoning</small></div><span>→<br>MCP + OAuth</span>
-        <div><strong>Cloudflare Edge</strong><br><small>public route + device coordination</small></div><span>→<br>outbound Link</span>
-        <div><strong>herdr-mcp</strong><br><small>files · Git · exec · agents</small></div><span>→</span>
-        <div><strong>Herdr</strong><br><small>workspace · pane · PTY · events</small></div><span>↺</span>
-        <div><strong>Chrome extension</strong><br><small>optional continuity + handoff</small></div>
-      </div>
-      <p class="architecture-note"><strong>Product boundaries stay explicit.</strong> Web AI plans. Cloudflare exposes a stable public MCP/OAuth endpoint. herdr-mcp enforces workstation access. Herdr owns persistent runtime state. The extension adds a return path only when browser continuity is useful.</p>
+      <aside class="terminal-card" aria-label="One-sentence Agent installer">
+        <div class="terminal-card-bar">
+          <span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="terminal-card-title">One-Sentence Agent Bootstrap</span>
+        </div>
+        <div class="terminal-card-body">
+          <p>Paste into any local coding agent—pauses only at Cloudflare & ChatGPT auth boundaries:</p>
+          <pre class="agent-prompt" tabindex="0"><!--HERDR_COPY_BUTTON--><code>Install and configure Herdr and herdr-mcp for me. Read and follow https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md end to end. Use GitHub Releases for the local herdr-mcp runtime. Pause only for Cloudflare sign-in/API-token steps and ChatGPT herdr app/Connector authorization; automate and verify everything else.</code></pre>
+          <div class="terminal-card-foot">
+            <a href="./docs/en/agent-install.html">Agent protocol →</a>
+            <a href="./docs/en/install.html">Manual install →</a>
+            <a href="./docs/en/existing-worker-connect.html">Add another machine →</a>
+          </div>
+        </div>
+      </aside>
     </section>
 
-    <section class="grid landing-value-grid">
-      <article><span class="eyebrow">Reasoning</span><h2>Reuse the Web AI you already have</h2><p>Keep ChatGPT as the primary planning surface instead of forcing every task through another local model or agent loop.</p></article>
-      <article><span class="eyebrow">Persistence</span><h2>The worksite survives the chat</h2><p>Repositories, worktrees, terminals, servers, and agents keep running even when a conversation ends or another device takes over.</p></article>
-      <article><span class="eyebrow">Parallelism</span><h2>Direct tools when small, agents when useful</h2><p>Read, patch, Git, and test directly. Delegate independent or long-running work to replaceable local coding agents.</p></article>
+    <section class="landing-architecture" aria-label="herdr-mcp 1.1 two-plane architecture">
+      <div class="landing-section-header">
+        <span class="eyebrow">System Topology</span>
+        <h2>Inbound-closed core plane, optional two-way browser loop</h2>
+        <p>Your workstations never open inbound ports: each machine dials outbound WSS to your own Cloudflare Worker.</p>
+      </div>
+      <figure class="architecture-figure">
+        <!--HERDR_ARCH_SVG-->
+      </figure>
+      <p class="architecture-note">Explicit boundaries: Web AI plans, Cloudflare coordinates public OAuth & device routing, herdr-mcp enforces deterministic workstation tools, Herdr TUI preserves live state, and the extension closes the loop for Browser Control Center, queued turns, and handoff.</p>
     </section>
 
-    <section class="landing-install">
-      <div class="landing-section-copy"><span class="eyebrow">Recommended setup</span><h2>Give one sentence to your coding agent.</h2><p>The Agent reads the authoritative install protocol, installs Herdr and the native runtime, deploys Cloudflare Edge and Link, and pauses only for identity steps that require you personally.</p></div>
-      <pre class="agent-prompt" tabindex="0"><code>Install and configure Herdr and herdr-mcp for me. Read and follow https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md end to end. Use GitHub Releases for the local herdr-mcp runtime. Pause only for Cloudflare sign-in/API-token steps and ChatGPT herdr app/Connector authorization; automate and verify everything else.</code></pre>
-      <div class="actions"><a class="primary" href="./docs/en/agent-install.html">Agent install</a><a href="./docs/en/install.html">Manual install</a><a href="./docs/en/existing-worker-connect.html">Add a second computer</a></div>
+    <section aria-labelledby="bento-heading">
+      <div class="landing-section-header" style="margin-bottom:18px">
+        <span class="eyebrow">What's in v1.1</span>
+        <h2 id="bento-heading">Six capabilities built for sustained engineering</h2>
+      </div>
+      <div class="grid landing-bento-grid">
+        <article><span class="eyebrow">Persistence</span><h3>Worksites survive the chat</h3><p>Herdr TUI workspaces, PTY terminals, servers, and background agents continue running even after a browser tab closes.</p></article>
+        <article><span class="eyebrow">Fleet</span><h3>One Worker, multiple machines</h3><p>Enroll macOS, Linux, and Windows workstations behind one Cloudflare Workers Free entry with explicit device routing.</p></article>
+        <article><span class="eyebrow">Agents</span><h3>18 direct tools + any local agent</h3><p>Execute fast file, patch, Git, and test steps directly, or fan out larger tasks to Codex, Claude Code, Pi, Cline, or OpenCode.</p></article>
+        <article><span class="eyebrow">WebChat 1.1</span><h3>Multi-provider WebChat control</h3><p>Create, continue, stop, archive, and hand off across ChatGPT, Claude, Grok, and Doubao image workflows with strict account isolation.</p></article>
+        <article><span class="eyebrow">Adapters 1.1</span><h3>Browser Control Center & BrowserPage</h3><p>Side Panel HUD, queued turns, ID-free continuity, generation-fenced tab actuation, and reusable project browser Skills.</p></article>
+        <article><span class="eyebrow">Safety</span><h3>Explicit delivery & attested updates</h3><p>Mutations distinguish applied vs uncertain without blind replay; updates verify Sigstore provenance before rollback-safe activation.</p></article>
+      </div>
     </section>
 
     <section class="grid landing-links-grid">
-      <article><h2>ChatGPT</h2><p>Create the herdr MCP app/Connector from ChatGPT Settings → Apps after Developer Mode is enabled for the account or workspace.</p><p><a href="./docs/en/chatgpt-connector.html">ChatGPT setup →</a></p></article>
-      <article><h2>Cloudflare</h2><p>The supported public path uses Worker + Durable Object + outbound Link, keeping inbound workstation ports closed.</p><p><a href="./docs/en/cloudflare-edge-deployment.html">Cloudflare setup →</a></p></article>
-      <article><h2>Browser continuity</h2><p>The Chrome extension is optional for basic MCP access. Add it for handoff, queued turns, status, and Browser Control Center.</p><p><a href="./docs/en/extension.html">Extension guide →</a></p></article>
+      <article><h2>ChatGPT Apps & Connectors</h2><p>Enable Developer Mode in ChatGPT Settings → Apps & Connectors, add your /mcp endpoint, and work inside Projects.</p><p><a href="./docs/en/chatgpt-connector.html">ChatGPT setup →</a></p></article>
+      <article><h2>Cloudflare Edge</h2><p>Runs on Cloudflare Workers Free with no credit card required—keep workers.dev or bind a custom domain.</p><p><a href="./docs/en/cloudflare-edge-deployment.html">Cloudflare setup →</a></p></article>
+      <article><h2>Browser Continuity (Optional)</h2><p>Add Browser Control Center, queued turns, multi-provider handoff, and transparent privacy boundaries.</p><p><a href="./docs/en/extension.html">Extension guide →</a></p></article>
     </section>
 
     <section class="landing-research">
-      <div><span class="eyebrow">Architecture landscape</span><h2>Why Herdr-MCP when coding MCPs, remote workers, tmux, ACP, and Codex bridges already exist?</h2><p>They optimize different entry points and state models. Herdr-MCP focuses on Web-first planning plus a persistent, observable, human-takeover-friendly workstation.</p></div>
+      <div>
+        <span class="eyebrow">Architecture Landscape</span>
+        <h2>Why Herdr-MCP alongside standalone MCPs, cloud sandboxes, and Codex bridges?</h2>
+        <p>Different tools optimize for different control planes. Herdr-MCP is purpose-built for Web-first planning paired with a persistent, observable, human-takeover-ready local workstation.</p>
+      </div>
       <a class="button" href="./docs/en/herdr-vs-ecosystem.html">Compare the ecosystem →</a>
     </section>
 
-    <footer>
+    <footer class="landing-footer">
       <span>herdr-mcp · MIT</span>
       <a href="./docs/en/">Docs</a>
       <a href="https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp">Chrome Store</a>
       <a href="./docs/en/troubleshooting.html">Troubleshooting</a>
       <a href="./docs/en/privacy.html">Privacy</a>
       <a href="https://github.com/whshang/herdr-mcp">GitHub</a>
-      <a href="./zh-CN/index.html" hreflang="zh-CN">简体中文</a>
-      <a href="./ja/index.html" hreflang="ja">日本語</a>
+      <a href="./zh-CN/index.html" hreflang="zh-CN">简体中文</a><a href="./ja/index.html" hreflang="ja">日本語</a>
     </footer>
   </main>
-  <script src="./app.js" defer></script>
+  <!--HERDR_SEARCH_UI-->
 </body>
 </html>
