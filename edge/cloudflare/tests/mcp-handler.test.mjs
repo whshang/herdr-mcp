@@ -2959,3 +2959,124 @@ test("user Given an ambiguous device route When the caller connector holds grant
   assert.deepEqual(structured.granted_device_ids, ["dev_01M1BDHFE8TJ2PZGQAAG4T1A3V"]);
   assert.equal(structured.recommended_device_id, "dev_01M1BDHFE8TJ2PZGQAAG4T1A3V");
 });
+
+test("user calls tools across client request shapes | Given namespaced tool names, stringified or null arguments, object params, misplaced params keys, and null device | When tools/call executes at Edge | Then valid shapes normalize and invalid shapes fail closed", async () => {
+  const d = deps({
+    devices: [{ device_id: DEVICE_A, name: "macbook" }],
+    resolveDevice: async (selector) => (selector === undefined || selector === DEVICE_A)
+      ? { ok: true, device_id: DEVICE_A, workstation_id: "w-a", routing_reason: selector ? "explicit_device" : "single_device_default" }
+      : { ok: false, code: "device_not_found" },
+  });
+
+  // 1. Namespaced tool name + string-serialized arguments + device: null on Edge-local herdr_devices
+  const devicesResp = await handleMcp(
+    req("matrix-1", "tools/call", {
+      name: "herdr-mcp/herdr_devices",
+      arguments: "{\"device\":null}",
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(devicesResp.body.result.isError, undefined);
+  assert.equal(devicesResp.body.result.structuredContent.ok, true);
+  assert.equal(devicesResp.body.result.structuredContent.devices.length, 1);
+
+  // 2. arguments: null and stringified arguments on workstation-routed tools + mcp__herdr-mcp__ prefix
+  for (const [idx, rawName, rawArgs] of [
+    ["matrix-2a", "herdr_inspect", null],
+    ["matrix-2b", "mcp__herdr-mcp__herdr_inspect", "{}"],
+    ["matrix-2c", "herdr_mcp/herdr_since", `{"device":"${DEVICE_A}","cursor":0}`],
+    ["matrix-2d", "herdr-mcp:herdr_inspect", "   "],
+  ]) {
+    const resp = await handleMcp(
+      req(idx, "tools/call", { name: rawName, arguments: rawArgs }),
+      "legacy-default",
+      d.value,
+    );
+    assert.equal(resp.body.result.isError, undefined, idx);
+  }
+  assert.equal(d.calls[0].op, "herdr_inspect");
+  assert.equal(d.calls[1].op, "herdr_inspect");
+  assert.equal(d.calls[2].op, "herdr_since");
+  assert.equal(Object.hasOwn(d.calls[2].args, "device"), false);
+
+  // Invalid stringified or non-object arguments still return JSON-RPC -32602
+  for (const badArgs of ["[1,2]", "{not-json", 42]) {
+    const badResp = await handleMcp(
+      req("matrix-2-bad", "tools/call", { name: "herdr_inspect", arguments: badArgs }),
+      "legacy-default",
+      d.value,
+    );
+    assert.equal(badResp.body.error.code, -32602);
+  }
+
+  // 3. herdr_call with object params: extracts herdr_ref_* device route, unwraps ref, caps wait timeout, and serializes params
+  const callsBeforeObj = d.calls.length;
+  const objParamsResp = await handleMcp(
+    req("matrix-3", "tools/call", {
+      name: "mcp__herdr-mcp__herdr_call",
+      arguments: {
+        method: "pane.wait_for_output",
+        device: null,
+        params: {
+          pane_id: encodeDeviceRef(DEVICE_A, undefined, "w1:p2"),
+          timeout_ms: 90_000,
+        },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(objParamsResp.body.result.isError, undefined);
+  assert.equal(d.calls.length, callsBeforeObj + 1);
+  const forwardedCall = d.calls[d.calls.length - 1];
+  assert.equal(forwardedCall.op, "herdr_call");
+  assert.equal(forwardedCall.routeDeviceId, DEVICE_A);
+  assert.equal(typeof forwardedCall.args.params, "string");
+  assert.deepEqual(JSON.parse(forwardedCall.args.params), {
+    pane_id: "w1:p2",
+    timeout_ms: 20_000,
+  });
+
+  // 4. herdr_call with non-object params or malformed JSON string fails closed before workstation routing
+  const callsBeforeInvalidParams = d.calls.length;
+  for (const badParams of [[1, 2], 42, true, "[1,2]"]) {
+    const resp = await handleMcp(
+      req("matrix-4a", "tools/call", {
+        name: "herdr_call",
+        arguments: { method: "session.snapshot", params: badParams },
+      }),
+      "legacy-default",
+      d.value,
+    );
+    assert.equal(resp.body.result.isError, true);
+    assert.equal(resp.body.result.structuredContent.code, "invalid_params");
+  }
+  const badJsonParamsResp = await handleMcp(
+    req("matrix-4b", "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "session.snapshot", params: "{bad-json" },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(badJsonParamsResp.body.result.isError, true);
+  assert.equal(badJsonParamsResp.body.result.structuredContent.code, "invalid_params_json");
+  assert.equal(d.calls.length, callsBeforeInvalidParams, "invalid herdr_call params must not forward");
+
+  // 5. Misplaced top-level params keys in herdr_call fail closed before workstation routing
+  const misplacedResp = await handleMcp(
+    req("matrix-5", "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "work.pickup",
+        worktree: "/repo",
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(misplacedResp.body.result.isError, true);
+  assert.equal(misplacedResp.body.result.structuredContent.code, "invalid_params");
+  assert.equal(d.calls.length, callsBeforeInvalidParams, "misplaced top-level keys must not forward");
+});

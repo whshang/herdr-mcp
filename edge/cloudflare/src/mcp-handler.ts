@@ -238,6 +238,58 @@ interface ForwardEnvelope {
 }
 
 const PUBLIC_TOOL_NAMES: ReadonlySet<string> = new Set<string>(PUBLIC_CONTRACT.tools.map((tool) => tool.name));
+const TOOL_NAMESPACE_PREFIXES = [
+  "mcp__herdr-mcp__",
+  "mcp__herdr_mcp__",
+  "mcp_herdr-mcp_",
+  "mcp_herdr_mcp_",
+  "herdr-mcp/",
+  "herdr_mcp/",
+  "herdr-mcp:",
+  "herdr_mcp:",
+  "herdr-mcp.",
+  "herdr_mcp.",
+] as const;
+
+function canonicalPublicToolName(rawName: unknown): string | null {
+  if (typeof rawName !== "string") return null;
+  if (PUBLIC_TOOL_NAMES.has(rawName)) return rawName;
+  for (const prefix of TOOL_NAMESPACE_PREFIXES) {
+    if (rawName.startsWith(prefix)) {
+      const candidate = rawName.slice(prefix.length);
+      if (PUBLIC_TOOL_NAMES.has(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function normalizeToolCallArguments(rawArgs: unknown): Record<string, unknown> | null {
+  if (rawArgs === undefined || rawArgs === null) return {};
+  let record: Record<string, unknown> | null = null;
+  if (isRecord(rawArgs)) {
+    record = { ...rawArgs };
+  } else if (typeof rawArgs === "string") {
+    const trimmed = rawArgs.trim();
+    if (trimmed.length === 0) {
+      record = {};
+    } else {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (isRecord(parsed)) {
+          record = { ...parsed };
+        }
+      } catch {
+        return null;
+      }
+    }
+  }
+  if (!record) return null;
+  if (record.device === null) {
+    delete record.device;
+  }
+  return record;
+}
+
 const GENERATION_SUPERSEDE_RETRY_BACKOFF_MS = [100, 400, 1_000, 1_500] as const;
 const GENERATION_SUPERSEDE_CLIENT_RETRY_AFTER_MS = 1_000;
 const TRANSIENT_EDGE_HTTP_RETRY_BACKOFF_MS = [100, 400] as const;
@@ -251,6 +303,24 @@ const TRANSIENT_EDGE_HTTP_RETRY_AFTER_MAX_MS = 2_000;
 const REMOTE_PANE_WAIT_TIMEOUT_MS = 20_000;
 
 function normalizeRemoteHerdrCallArgs(args: Record<string, unknown>): Record<string, unknown> {
+  if (args.params === null) {
+    const next = { ...args };
+    delete next.params;
+    return next;
+  }
+  if (isRecord(args.params)) {
+    const parsed = { ...args.params };
+    if (args.method === "pane.wait_for_output") {
+      const requested = parsed.timeout_ms;
+      if (typeof requested === "number" && Number.isFinite(requested) && requested > REMOTE_PANE_WAIT_TIMEOUT_MS) {
+        parsed.timeout_ms = REMOTE_PANE_WAIT_TIMEOUT_MS;
+      }
+    }
+    return {
+      ...args,
+      params: JSON.stringify(parsed),
+    };
+  }
   if (args.method !== "pane.wait_for_output" || typeof args.params !== "string") return args;
   try {
     const parsed = JSON.parse(args.params);
@@ -738,16 +808,16 @@ export async function handleMcp(
 
   if (request.method === "tools/call") {
     if (!isRecord(request.params)) return rpcError(id, -32602, "Invalid params");
-    const name = request.params.name;
-    if (typeof name !== "string" || !PUBLIC_TOOL_NAMES.has(name)) {
+    const name = canonicalPublicToolName(request.params.name);
+    if (name === null) {
       return rpcError(id, -32602, "Invalid params", { reason: `tool is not in public contract epoch ${publicContract.contract_epoch}` });
     }
     const openaiSession = openAiSessionFromToolCall(request.params);
-    const rawArgs = request.params.arguments;
-    if (rawArgs !== undefined && rawArgs !== null && !isRecord(rawArgs)) {
+    const normalizedArgs = normalizeToolCallArguments(request.params.arguments);
+    if (normalizedArgs === null) {
       return rpcError(id, -32602, "Invalid params", { reason: "arguments must be an object or null" });
     }
-    const args = rawArgs === null || rawArgs === undefined ? {} : { ...rawArgs };
+    const args = normalizedArgs;
     if (name === "herdr_call" && typeof args.method === "string") {
       args.method = canonicalHerdrCallMethod(args.method);
     }
@@ -1317,6 +1387,48 @@ export async function handleMcp(
           failure_layer: "edge_routing",
           message: `unknown top-level argument '${key}'; herdr_call only accepts 'method', 'params', optional 'device' and optional 'idempotency_key'`,
         }, true));
+      }
+      if (args.params !== undefined && args.params !== null) {
+        if (typeof args.params === "string") {
+          const trimmed = args.params.trim();
+          if (trimmed.length > 0) {
+            let parsedParams: unknown;
+            try {
+              parsedParams = JSON.parse(trimmed);
+            } catch (error) {
+              return rpcResult(id, callToolResult({
+                ok: false,
+                code: "invalid_params_json",
+                retryable: false,
+                delivery_state: "not_delivered",
+                failure_layer: "edge_routing",
+                field: "params",
+                message: error instanceof Error ? error.message : "herdr_call params must be valid JSON",
+              }, true));
+            }
+            if (!isRecord(parsedParams)) {
+              return rpcResult(id, callToolResult({
+                ok: false,
+                code: "invalid_params",
+                retryable: false,
+                delivery_state: "not_delivered",
+                failure_layer: "edge_routing",
+                field: "params",
+                message: "herdr_call params must decode to an object",
+              }, true));
+            }
+          }
+        } else if (!isRecord(args.params)) {
+          return rpcResult(id, callToolResult({
+            ok: false,
+            code: "invalid_params",
+            retryable: false,
+            delivery_state: "not_delivered",
+            failure_layer: "edge_routing",
+            field: "params",
+            message: "herdr_call params must decode to an object",
+          }, true));
+        }
       }
     }
     if (args.idempotency_key !== undefined && !validRelayIdempotencyKey(args.idempotency_key)) {
