@@ -149,26 +149,39 @@ function extractFromObject(args: Record<string, unknown>): { deviceId: string; f
     if (!refCandidate) refCandidate = { deviceId: decoded.d, field: key, raw: value };
   }
 
-  // Also check herdr_call params JSON string for embedded pane/workspace
-  if (typeof args.params === "string") {
-    try {
-      const parsed = JSON.parse(args.params as string) as Record<string, unknown>;
-      for (const [k, v] of Object.entries(parsed)) {
-        if (typeof v !== "string") continue;
-        if (!REF_FIELDS.has(k)) continue;
-        const decoded = decodeDeviceRef(v);
-        if (!decoded) {
-          if (v.startsWith(REF_PREFIX)) return { deviceId: "__malformed__", field: `params.${k}`, raw: v, kind: "ref" };
-          continue;
-        }
-        const expected = fieldRefKind(k);
-        const actual = refPayloadKind(decoded);
-        if (expected && actual && expected !== actual) {
-          return { deviceId: "__type_mismatch__", field: `params.${k}`, raw: v, kind: "ref" };
-        }
-        if (!refCandidate) refCandidate = { deviceId: decoded.d, field: `params.${k}`, raw: v };
+  // Also check herdr_call params (JSON string or object) for embedded pane/workspace
+  const parsedParams: Record<string, unknown> | null = (() => {
+    if (typeof args.params === "string") {
+      try {
+        const parsed = JSON.parse(args.params as string);
+        return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : null;
+      } catch {
+        return null;
       }
-    } catch { /* ignore non-JSON */ }
+    }
+    if (args.params !== null && typeof args.params === "object" && !Array.isArray(args.params)) {
+      return args.params as Record<string, unknown>;
+    }
+    return null;
+  })();
+  if (parsedParams) {
+    for (const [k, v] of Object.entries(parsedParams)) {
+      if (typeof v !== "string") continue;
+      if (!REF_FIELDS.has(k)) continue;
+      const decoded = decodeDeviceRef(v);
+      if (!decoded) {
+        if (v.startsWith(REF_PREFIX)) return { deviceId: "__malformed__", field: `params.${k}`, raw: v, kind: "ref" };
+        continue;
+      }
+      const expected = fieldRefKind(k);
+      const actual = refPayloadKind(decoded);
+      if (expected && actual && expected !== actual) {
+        return { deviceId: "__type_mismatch__", field: `params.${k}`, raw: v, kind: "ref" };
+      }
+      if (!refCandidate) refCandidate = { deviceId: decoded.d, field: `params.${k}`, raw: v };
+    }
   }
 
   if (refCandidate) {
@@ -180,15 +193,12 @@ function extractFromObject(args: Record<string, unknown>): { deviceId: string; f
       if (d) devices.add(d.d);
     }
     // Include params-embedded refs
-    if (typeof args.params === "string") {
-      try {
-        const parsed = JSON.parse(args.params as string) as Record<string, unknown>;
-        for (const [k, v] of Object.entries(parsed)) {
-          if (!REF_FIELDS.has(k) || typeof v !== "string") continue;
-          const d = decodeDeviceRef(v);
-          if (d) devices.add(d.d);
-        }
-      } catch {}
+    if (parsedParams) {
+      for (const [k, v] of Object.entries(parsedParams)) {
+        if (!REF_FIELDS.has(k) || typeof v !== "string") continue;
+        const d = decodeDeviceRef(v);
+        if (d) devices.add(d.d);
+      }
     }
     if (devices.size > 1) {
       // Conflicting refs fail closed as ambiguous before any routing
@@ -229,7 +239,7 @@ export function unwrapDeviceRefs(args: Record<string, unknown>): Record<string, 
     if (decoded.p) out[key] = decoded.p;
     // workspace payload in pane field is type-mismatch – do not coerce
   }
-  // Handle herdr_call params string with same strictness
+  // Handle herdr_call params (string or object) with same strictness
   if (typeof out.params === "string") {
     try {
       const parsed = JSON.parse(out.params as string) as Record<string, unknown>;
@@ -252,6 +262,23 @@ export function unwrapDeviceRefs(args: Record<string, unknown>): Record<string, 
       }
       if (changed) out.params = JSON.stringify(parsed);
     } catch {}
+  } else if (out.params !== null && typeof out.params === "object" && !Array.isArray(out.params)) {
+    const parsed: Record<string, unknown> = { ...(out.params as Record<string, unknown>) };
+    for (const k of WORKSPACE_REF_FIELDS) {
+      const v = parsed[k];
+      if (typeof v !== "string") continue;
+      const d = decodeDeviceRef(v);
+      if (!d || !d.w) continue;
+      parsed[k] = d.w;
+    }
+    for (const k of PANE_REF_FIELDS) {
+      const v = parsed[k];
+      if (typeof v !== "string") continue;
+      const d = decodeDeviceRef(v);
+      if (!d || !d.p) continue;
+      parsed[k] = d.p;
+    }
+    out.params = parsed;
   }
   // Strip legacy untrusted binding keys if present (caller-controlled, not trusted for routing)
   for (const k of ["binding_device_id", "__herdr_binding_device_id", "herdr_binding"]) {

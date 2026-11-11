@@ -892,21 +892,75 @@ fn discover_result() -> Value {
     })
 }
 
+fn canonical_tool_name(raw_name: &str) -> &str {
+    const NAMESPACE_PREFIXES: [&str; 10] = [
+        "mcp__herdr-mcp__",
+        "mcp__herdr_mcp__",
+        "mcp_herdr-mcp_",
+        "mcp_herdr_mcp_",
+        "herdr-mcp/",
+        "herdr_mcp/",
+        "herdr-mcp:",
+        "herdr_mcp:",
+        "herdr-mcp.",
+        "herdr_mcp.",
+    ];
+    if contract::tool_names().contains(&raw_name) || raw_name == "herdr_devices" {
+        return raw_name;
+    }
+    for prefix in NAMESPACE_PREFIXES {
+        if let Some(stripped) = raw_name.strip_prefix(prefix)
+            && (contract::tool_names().contains(&stripped) || stripped == "herdr_devices")
+        {
+            return stripped;
+        }
+    }
+    raw_name
+}
+
+fn normalize_tool_call_arguments(raw_arguments: Option<&Value>) -> Result<Value, Value> {
+    let mut map = match raw_arguments {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(map)) => map.clone(),
+        Some(Value::String(raw_text)) => {
+            let trimmed = raw_text.trim();
+            if trimmed.is_empty() {
+                serde_json::Map::new()
+            } else {
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(Value::Object(map)) => map,
+                    _ => {
+                        return Err(tool_result(
+                            json!({"ok": false, "code": "invalid_params", "message": "arguments must be an object"}),
+                            true,
+                        ));
+                    }
+                }
+            }
+        }
+        Some(_) => {
+            return Err(tool_result(
+                json!({"ok": false, "code": "invalid_params", "message": "arguments must be an object"}),
+                true,
+            ));
+        }
+    };
+    if matches!(map.get("device"), Some(Value::Null)) {
+        map.remove("device");
+    }
+    Ok(Value::Object(map))
+}
+
 fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, String> {
-    let name = request
+    let raw_name = request
         .pointer("/params/name")
         .and_then(Value::as_str)
         .ok_or_else(|| "tools/call requires params.name".to_owned())?;
-    let arguments = request
-        .pointer("/params/arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if !arguments.is_object() {
-        return Ok(tool_result(
-            json!({"ok": false, "code": "invalid_params", "message": "arguments must be an object"}),
-            true,
-        ));
-    }
+    let name = canonical_tool_name(raw_name);
+    let arguments = match normalize_tool_call_arguments(request.pointer("/params/arguments")) {
+        Ok(arguments) => arguments,
+        Err(invalid) => return Ok(invalid),
+    };
     let _work_capture = ToolCallCapture {
         name,
         arguments: &arguments,
@@ -932,26 +986,59 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             native_tools::since(context.cache, cursor, workspace, transition)
         }
         "herdr_call" => {
+            if let Some(arg_map) = arguments.as_object() {
+                for key in arg_map.keys() {
+                    if !matches!(
+                        key.as_str(),
+                        "method" | "params" | "device" | "idempotency_key"
+                    ) {
+                        return Ok(tool_result(
+                            json!({
+                                "ok": false,
+                                "code": "invalid_params",
+                                "retryable": false,
+                                "message": format!(
+                                    "unknown top-level argument '{key}'; herdr_call only accepts 'method', 'params', optional 'device' and optional 'idempotency_key'"
+                                ),
+                            }),
+                            true,
+                        ));
+                    }
+                }
+            }
             let method = arguments
                 .get("method")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "herdr_call requires arguments.method".to_owned())?;
-            let params_text = arguments
-                .get("params")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let params: Value = match serde_json::from_str::<Value>(params_text) {
-                Ok(value) if value.is_object() => value,
-                Ok(_) => {
+            let params: Value = match arguments.get("params") {
+                None | Some(Value::Null) => json!({}),
+                Some(Value::Object(map)) => Value::Object(map.clone()),
+                Some(Value::String(params_text)) => {
+                    let trimmed = params_text.trim();
+                    if trimmed.is_empty() {
+                        json!({})
+                    } else {
+                        match serde_json::from_str::<Value>(trimmed) {
+                            Ok(value) if value.is_object() => value,
+                            Ok(_) => {
+                                return Ok(tool_result(
+                                    json!({"ok": false, "code": "invalid_params", "message": "herdr_call params must decode to an object"}),
+                                    true,
+                                ));
+                            }
+                            Err(parse_error) => {
+                                return Ok(tool_result(
+                                    json!({"ok": false, "code": "invalid_params_json", "message": parse_error.to_string()}),
+                                    true,
+                                ));
+                            }
+                        }
+                    }
+                }
+                Some(_) => {
                     return Ok(tool_result(
                         json!({"ok": false, "code": "invalid_params", "message": "herdr_call params must decode to an object"}),
-                        false,
-                    ));
-                }
-                Err(parse_error) => {
-                    return Ok(tool_result(
-                        json!({"ok": false, "code": "invalid_params_json", "message": parse_error.to_string()}),
-                        false,
+                        true,
                     ));
                 }
             };
@@ -29291,5 +29378,295 @@ mod claude_composer_busy_probe_tests {
         let probe = browser_composer_busy_probe(&evidence);
         assert!(probe.get("busy_reason").is_none());
         assert_eq!(probe["stop_control"], true);
+    }
+}
+
+#[cfg(test)]
+mod client_request_shape_matrix_tests {
+    use super::*;
+    use crate::state_store::work_journal::WorkState;
+    use std::sync::{Arc, Mutex};
+
+    fn parse_tool_payload(response: &Value) -> Value {
+        let text = response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .expect("tool response must contain content[0].text");
+        serde_json::from_str(text).expect("tool response text must be valid JSON")
+    }
+
+    #[test]
+    fn client_request_shape_matrix_covers_object_params_null_or_string_arguments_namespaces_and_null_device()
+     {
+        let temp_root = std::env::temp_dir().join(format!(
+            "herdr-mcp-request-shape-matrix-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        let client = HerdrClient::new(temp_root.join("missing-herdr.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({"panes": [], "agents": []}));
+        let exec = ExecRegistry::new(temp_root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        state_store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "git:example/repo".to_owned(),
+                worktree: "/repo".to_owned(),
+                handoff_md: "# Ready from repo".to_owned(),
+                through_event_id: 7,
+                updated_at: 42,
+                ..WorkState::default()
+            })
+            .unwrap();
+
+        let context = RuntimeContext {
+            client: &client,
+            cache: &cache,
+            exec: &exec,
+            prompt: &prompt,
+            skill: &skill,
+            state_store: &state_store,
+            caller_webchat_control_grants: &[],
+            caller_webchat_authorization: None,
+            caller_browser_session: None,
+            caller_page_assist_grants: &[],
+            caller_browser_on_other_device: false,
+            browser_actuator: None,
+            browser_mutation_gate: None,
+            browser_mutation_admission: None,
+            trusted_local_ipc: false,
+        };
+
+        // 1. herdr_call params as JSON object vs JSON string vs null/omitted
+        let object_params_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": "work.pickup",
+                        "params": {"worktree": "/repo"}
+                    }
+                }
+            }),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(object_params_resp.pointer("/result/isError"), None);
+        let object_payload = parse_tool_payload(&object_params_resp);
+        assert_eq!(object_payload["ok"], true);
+        assert_eq!(object_payload["handoff_md"], "# Ready from repo");
+
+        let string_params_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": "work.pickup",
+                        "params": "{\"worktree\":\"/repo\"}"
+                    }
+                }
+            }),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(parse_tool_payload(&string_params_resp), object_payload);
+
+        let null_params_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": "work.pickup",
+                        "params": null
+                    }
+                }
+            }),
+            &context,
+        )
+        .unwrap();
+        let null_params_payload = parse_tool_payload(&null_params_resp);
+        assert_eq!(null_params_payload["ok"], true);
+        assert_eq!(null_params_payload["projects"][0]["worktree"], "/repo");
+
+        // Non-object herdr_call params fail closed instead of coercing to {}
+        for bad_params in [json!([1, 2]), json!(42), json!(true), json!("[1, 2]")] {
+            let bad_resp = handle(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "herdr_call",
+                        "arguments": {
+                            "method": "work.pickup",
+                            "params": bad_params
+                        }
+                    }
+                }),
+                &context,
+            )
+            .unwrap();
+            assert_eq!(bad_resp.pointer("/result/isError"), Some(&json!(true)));
+            assert_eq!(parse_tool_payload(&bad_resp)["code"], "invalid_params");
+        }
+
+        let bad_json_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": "work.pickup",
+                        "params": "{not-json"
+                    }
+                }
+            }),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(bad_json_resp.pointer("/result/isError"), Some(&json!(true)));
+        assert_eq!(
+            parse_tool_payload(&bad_json_resp)["code"],
+            "invalid_params_json"
+        );
+
+        // 2. arguments: null and string-serialized arguments
+        for raw_args in [
+            json!(null),
+            json!("{}"),
+            json!("   "),
+            json!("{\"cursor\":0,\"device\":null}"),
+        ] {
+            let resp = handle(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "herdr_since",
+                        "arguments": raw_args
+                    }
+                }),
+                &context,
+            )
+            .unwrap();
+            assert_eq!(resp.pointer("/result/isError"), None);
+            assert_eq!(parse_tool_payload(&resp)["ok"], true);
+        }
+
+        for invalid_args in [json!("[1,2]"), json!("{bad"), json!(123)] {
+            let resp = handle(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "herdr_since",
+                        "arguments": invalid_args
+                    }
+                }),
+                &context,
+            )
+            .unwrap();
+            assert_eq!(resp.pointer("/result/isError"), Some(&json!(true)));
+            assert_eq!(parse_tool_payload(&resp)["code"], "invalid_params");
+        }
+
+        // 3. Namespaced tool names + stringified arguments + device: null
+        for namespaced in [
+            "herdr-mcp/herdr_methods",
+            "herdr_mcp/herdr_methods",
+            "mcp__herdr-mcp__herdr_methods",
+            "mcp__herdr_mcp__herdr_methods",
+            "herdr-mcp:herdr_methods",
+            "herdr-mcp.herdr_methods",
+        ] {
+            let resp = handle(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "tools/call",
+                    "params": {
+                        "name": namespaced,
+                        "arguments": "{\"query\":\"work.pickup\",\"device\":null}"
+                    }
+                }),
+                &context,
+            )
+            .unwrap();
+            assert_eq!(resp.pointer("/result/isError"), None, "{namespaced}");
+            let payload = parse_tool_payload(&resp);
+            assert_eq!(payload["ok"], true, "{namespaced}");
+        }
+
+        for unknown_tool in ["other-server/herdr_methods", "herdr-mcp/not_a_real_tool"] {
+            let resp = handle(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": {
+                        "name": unknown_tool,
+                        "arguments": {}
+                    }
+                }),
+                &context,
+            )
+            .unwrap();
+            assert_eq!(resp.pointer("/result/isError"), Some(&json!(true)));
+            assert_eq!(parse_tool_payload(&resp)["code"], "unknown_tool");
+        }
+
+        // 4. Misplaced top-level params keys in herdr_call fail closed
+        let misplaced_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "mcp__herdr-mcp__herdr_call",
+                    "arguments": {
+                        "method": "work.pickup",
+                        "worktree": "/repo",
+                        "device": null
+                    }
+                }
+            }),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            misplaced_resp.pointer("/result/isError"),
+            Some(&json!(true))
+        );
+        let misplaced_payload = parse_tool_payload(&misplaced_resp);
+        assert_eq!(misplaced_payload["code"], "invalid_params");
+        assert!(
+            misplaced_payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown top-level argument 'worktree'")
+        );
+
+        std::fs::remove_dir_all(temp_root).ok();
     }
 }
