@@ -1,5 +1,6 @@
 use crate::cli::{
-    AgentCommand, BrowserPageCommand, ContinuityCommand, MemoryCommand, WebChatCommand,
+    AgentCommand, BrowserPageCommand, BrowserPageUnknownCommand, ContinuityCommand, MemoryCommand,
+    WebChatCommand,
 };
 use crate::link::local_mcp::{
     LinkRuntimeTransport, LocalMcpConfig, LocalMcpTransport, RuntimeToolResult,
@@ -218,6 +219,25 @@ pub(crate) fn run_browser_page(command: BrowserPageCommand) -> Result<ExitCode, 
         BrowserPageCommand::FastPath { params_json } => {
             (BROWSER_PAGE_FAST_PATH_METHOD, params_json)
         }
+        BrowserPageCommand::Unknown(unknown) => {
+            let paths = RuntimePaths::discover()?;
+            let state_dir = std::env::var_os("HERDR_MCP_STATE_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| paths.dev_state_dir.join("candidate"));
+            let mut store = crate::state_store::StateStore::open_in_dir(&state_dir, "state")?;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            let output = run_browser_page_unknown_in_store(&mut store, unknown, now_ms)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).map_err(|error| format!(
+                    "cannot encode browser-page unknown output: {error}"
+                ))?
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
     };
     let params: Value = serde_json::from_str(&params_json)
         .map_err(|error| format!("browser-page --params-json is invalid JSON: {error}"))?;
@@ -236,6 +256,96 @@ pub(crate) fn run_browser_page(command: BrowserPageCommand) -> Result<ExitCode, 
         endpoint_ref: endpoint_ref.to_owned(),
     };
     print_private_result(call_private_page_assist(method, params, &grant)?)
+}
+
+pub(crate) fn run_browser_page_unknown_in_store(
+    store: &mut crate::state_store::StateStore,
+    command: BrowserPageUnknownCommand,
+    now_ms: i64,
+) -> Result<Value, String> {
+    match command {
+        BrowserPageUnknownCommand::List { limit, json: _ } => {
+            let summary = store.list_browser_page_unknown_operations(now_ms, limit)?;
+            let items = summary
+                .items
+                .into_iter()
+                .map(|item| {
+                    let parsed_result = item
+                        .result_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .unwrap_or(Value::Null);
+                    json!({
+                        "op_id": item.op_id,
+                        "idempotency_key": item.idempotency_key,
+                        "state": item.state,
+                        "phase": item.phase,
+                        "created_at": item.created_at,
+                        "updated_at": item.updated_at,
+                        "expires_at": item.expires_at,
+                        "result": parsed_result,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "ok": true,
+                "action": "browser_page.unknown.list",
+                "unresolved_cap": summary.unresolved_cap,
+                "unresolved_count": summary.unresolved_count,
+                "pending_count": summary.pending_count,
+                "expired_pending_count": summary.expired_pending_count,
+                "unknown_count": summary.unknown_count,
+                "reconciled_count": summary.reconciled_count,
+                "items": items,
+            }))
+        }
+        BrowserPageUnknownCommand::Reconcile {
+            op_id,
+            verdict,
+            evidence,
+            operator,
+            json: _,
+        } => {
+            let resolved_operator = operator
+                .or_else(|| {
+                    std::env::var("USER")
+                        .ok()
+                        .or_else(|| std::env::var("LOGNAME").ok())
+                        .or_else(|| std::env::var("USERNAME").ok())
+                        .map(|value| value.trim().to_owned())
+                        .filter(|value| {
+                            !value.is_empty()
+                                && value.len() <= 128
+                                && !value.chars().any(char::is_control)
+                        })
+                })
+                .unwrap_or_else(|| "local-operator".to_owned());
+            let outcome = store.reconcile_browser_page_unknown_operation(
+                crate::state_store::BrowserPageReconcileInput {
+                    op_id: &op_id,
+                    verdict,
+                    operator: &resolved_operator,
+                    evidence: &evidence,
+                    now_ms,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "action": "browser_page.unknown.reconcile",
+                "op_id": outcome.op_id,
+                "idempotency_key": outcome.idempotency_key,
+                "verdict": outcome.verdict.as_str(),
+                "operator": outcome.operator,
+                "evidence": outcome.evidence,
+                "reconciled_at_ms": outcome.reconciled_at_ms,
+                "audit_op_id": outcome.audit_op_id,
+                "idempotent_replay": outcome.idempotent_replay,
+                "unresolved_cap": outcome.unresolved_cap,
+                "unresolved_before": outcome.unresolved_before,
+                "unresolved_after": outcome.unresolved_after,
+            }))
+        }
+    }
 }
 
 pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {

@@ -989,6 +989,14 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     context.caller_page_assist_grants,
                     context.browser_actuator,
                 )
+            } else if method.starts_with("herdr_mcp.browser_page.unknown") {
+                json!({
+                    "ok": false,
+                    "code": "local_cli_confirmation_required",
+                    "retryable": false,
+                    "retry_safe": false,
+                    "message": "browser_page.action unknown reconciliation is local-CLI-only; run `herdr-mcp browser-page unknown list` and `herdr-mcp browser-page unknown reconcile <op_id> --verdict <applied|not_applied> --evidence <text> --confirm` on the workstation",
+                })
             } else if method == BILIBILI_VIDEO_TRANSCRIPT_METHOD {
                 bilibili_video_transcript_call(
                     &params,
@@ -11653,7 +11661,7 @@ fn browser_page_action_call(
                     "retry_safe": false,
                     "delivery_state": "not_delivered",
                     "message": "pending and unknown BrowserPage reservations reached the admission limit; wait for safe settlement or operator reconciliation before new mutations",
-                    "reconciliation": "inspect current page state with read-only observe/expect and preserve the original op_id and key; investigate pending or unknown results manually; never auto-retry or auto-delete",
+                    "reconciliation": "inspect current page state with read-only observe/expect and preserve the original op_id and key; investigate pending or unknown results manually via `herdr-mcp browser-page unknown list` and `herdr-mcp browser-page unknown reconcile <op_id> --verdict <applied|not_applied> --evidence <text> --confirm`; never auto-retry or auto-delete",
                     "op_id": op_id,
                     "idempotent_replay": false,
                 });
@@ -25898,6 +25906,290 @@ mod tests {
             actuator.calls.load(Ordering::SeqCst),
             2,
             "expired noncontract/missing verdicts must never re-actuate"
+        );
+    }
+
+    #[test]
+    fn browser_page_unknown_cap_exhausted_reconciles_via_cli_and_recovers_capacity() {
+        use crate::cli::{BrowserPageCommand, Command, parse};
+        use crate::local_agent_cli::run_browser_page_unknown_in_store;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct ReconcileFlowActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for ReconcileFlowActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage action must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _endpoint_ref: Option<&str>,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                if call == 0 {
+                    // First call returns delivery_unknown.
+                    evidence.result = Some(json!({
+                        "ok": false,
+                        "code": "browser_page_delivery_unknown",
+                        "delivery_state": "delivery_unknown",
+                        "retry_safe": false,
+                    }));
+                } else {
+                    // Post-reconciliation new mutation succeeds.
+                    evidence.result = Some(json!({
+                        "ok": true,
+                        "action": "click",
+                        "delivery_state": "applied",
+                        "generation": "pa_gen_2_test",
+                    }));
+                }
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = ReconcileFlowActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let page_ref = format!("bp_{}", "a".repeat(64));
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "click",
+            "generation": "pa_gen_1_test",
+            "ref": "ref_pa_gen_1_test_0",
+            "idempotency_key": "page-click-unknown-reconcile-0",
+        });
+
+        // 1. Trigger an unknown delivery via browser_page_action_call.
+        let unknown = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(unknown["ok"], false, "{unknown}");
+        assert_eq!(unknown["code"], "browser_page_delivery_unknown");
+        assert_eq!(unknown["delivery_state"], "delivery_unknown");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        let first_op_id = unknown["op_id"].as_str().unwrap().to_owned();
+
+        // 2. Fill the remaining 2,047 slots to hit BROWSER_PAGE_UNRESOLVED_CAP (2048).
+        {
+            let guard = store.lock().unwrap();
+            let now = browser_epoch_ms();
+            let mut batch = String::from("BEGIN;\n");
+            for i in 0..2047 {
+                let digest = browser_sha256(&format!("reconcile-filler-{i}"));
+                batch.push_str(&format!(
+                    "INSERT INTO operations (
+                        op_id, kind, idempotency_key, request_hash, phase, state,
+                        created_at, updated_at, expires_at, result_json
+                     ) VALUES ('op:browser_page_action:{}', 'browser_page.action', '{d}', '{d}',
+                               'settled', 'unknown', {now}, {now}, NULL,
+                               '{{\"ok\":false,\"code\":\"browser_page_delivery_unknown\",\"delivery_state\":\"delivery_unknown\"}}');\n",
+                    &digest[..32],
+                    d = digest,
+                ));
+            }
+            batch.push_str("COMMIT;\n");
+            guard.execute_batch(&batch).unwrap();
+        }
+
+        // 3. New mutation is rejected with browser_page_unknown_capacity_exhausted.
+        let mut blocked_params = params.clone();
+        blocked_params["idempotency_key"] = json!("page-click-after-reconcile-1");
+        blocked_params["ref"] = json!("ref_pa_gen_1_test_1");
+        let blocked = browser_page_action_call(&store, &blocked_params, &grants, Some(&actuator));
+        assert_eq!(
+            blocked["code"], "browser_page_unknown_capacity_exhausted",
+            "{blocked}"
+        );
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            1,
+            "exhausted capacity must not actuate"
+        );
+
+        // 4. Read-only CLI `browser-page unknown list` reports 2048/2048 and does not mutate.
+        let Command::BrowserPage(BrowserPageCommand::Unknown(list_cmd)) = parse(
+            ["browser-page", "unknown", "list", "--limit", "5", "--json"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap()
+        .command
+        else {
+            panic!("expected BrowserPageUnknownCommand::List");
+        };
+        let list_out = {
+            let mut guard = store.lock().unwrap();
+            run_browser_page_unknown_in_store(&mut guard, list_cmd, browser_epoch_ms()).unwrap()
+        };
+        assert_eq!(list_out["ok"], true, "{list_out}");
+        assert_eq!(list_out["unresolved_cap"], 2048);
+        assert_eq!(list_out["unresolved_count"], 2048);
+        assert_eq!(list_out["unknown_count"], 2048);
+        assert_eq!(list_out["reconciled_count"], 0);
+        assert_eq!(list_out["items"].as_array().unwrap().len(), 5);
+
+        // 5. Manually reconcile the first unknown op via CLI with --confirm.
+        let Command::BrowserPage(BrowserPageCommand::Unknown(reconcile_cmd)) = parse(
+            [
+                "browser-page",
+                "unknown",
+                "reconcile",
+                first_op_id.as_str(),
+                "--verdict",
+                "not_applied",
+                "--evidence",
+                "Observed target page DOM; button remained unclicked",
+                "--operator",
+                "operator-uat",
+                "--confirm",
+                "--json",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .command
+        else {
+            panic!("expected BrowserPageUnknownCommand::Reconcile");
+        };
+        let now_reconcile = browser_epoch_ms();
+        let reconcile_out = {
+            let mut guard = store.lock().unwrap();
+            run_browser_page_unknown_in_store(&mut guard, reconcile_cmd, now_reconcile).unwrap()
+        };
+        assert_eq!(reconcile_out["ok"], true, "{reconcile_out}");
+        assert_eq!(reconcile_out["op_id"], first_op_id);
+        assert_eq!(reconcile_out["verdict"], "not_applied");
+        assert_eq!(reconcile_out["operator"], "operator-uat");
+        assert_eq!(reconcile_out["idempotent_replay"], false);
+        assert_eq!(reconcile_out["unresolved_before"], 2048);
+        assert_eq!(reconcile_out["unresolved_after"], 2047);
+        let audit_op_id = reconcile_out["audit_op_id"].as_str().unwrap().to_owned();
+        assert!(audit_op_id.starts_with("op:browser_page_reconcile_audit:"));
+
+        // Verify immutable audit row was persisted in operations.
+        {
+            let guard = store.lock().unwrap();
+            let audit_record = guard.operation_ledger(&audit_op_id).unwrap().unwrap();
+            assert_eq!(audit_record.kind, "browser_page.action.reconcile_audit");
+            assert_eq!(audit_record.state.as_deref(), Some("complete"));
+            assert_eq!(audit_record.expires_at, None);
+            let audit_json: Value =
+                serde_json::from_str(audit_record.result_json.as_deref().unwrap()).unwrap();
+            assert_eq!(audit_json["target_op_id"], first_op_id);
+            assert_eq!(audit_json["verdict"], "not_applied");
+            assert_eq!(audit_json["unresolved_before"], 2048);
+            assert_eq!(audit_json["unresolved_after"], 2047);
+        }
+
+        // 6. Repeating the exact same verdict is idempotent; conflicting verdict is rejected.
+        let Command::BrowserPage(BrowserPageCommand::Unknown(repeat_cmd)) = parse(
+            [
+                "browser-page",
+                "unknown",
+                "reconcile",
+                first_op_id.as_str(),
+                "--verdict",
+                "not_applied",
+                "--evidence",
+                "Repeat confirmation",
+                "--operator",
+                "operator-uat",
+                "--confirm",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .command
+        else {
+            panic!("expected BrowserPageUnknownCommand::Reconcile");
+        };
+        let repeat_out = {
+            let mut guard = store.lock().unwrap();
+            run_browser_page_unknown_in_store(&mut guard, repeat_cmd, now_reconcile + 1000).unwrap()
+        };
+        assert_eq!(repeat_out["idempotent_replay"], true, "{repeat_out}");
+        assert_eq!(repeat_out["unresolved_after"], 2047);
+
+        let Command::BrowserPage(BrowserPageCommand::Unknown(conflict_cmd)) = parse(
+            [
+                "browser-page",
+                "unknown",
+                "reconcile",
+                first_op_id.as_str(),
+                "--verdict",
+                "applied",
+                "--evidence",
+                "Conflicting verdict must fail",
+                "--confirm",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .command
+        else {
+            panic!("expected BrowserPageUnknownCommand::Reconcile");
+        };
+        let conflict_err = {
+            let mut guard = store.lock().unwrap();
+            run_browser_page_unknown_in_store(&mut guard, conflict_cmd, now_reconcile + 2000)
+                .unwrap_err()
+        };
+        assert!(
+            conflict_err.contains("browser_page_reconcile_verdict_conflict"),
+            "{conflict_err}"
+        );
+
+        // 7. Re-submitting the original reconciled idempotency_key replays without re-actuating!
+        let reconciled_replay = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(
+            reconciled_replay["idempotent_replay"], true,
+            "{reconciled_replay}"
+        );
+        assert_eq!(reconciled_replay["ok"], false);
+        assert_eq!(reconciled_replay["code"], "browser_page_delivery_unknown");
+        assert_eq!(reconciled_replay["reconciled"], true);
+        assert_eq!(
+            reconciled_replay["reconciliation"]["verdict"],
+            "not_applied"
+        );
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            1,
+            "reconciled unknown operation must never re-actuate"
+        );
+
+        // 8. Capacity is now 2047/2048, so the previously blocked new mutation succeeds!
+        let recovered = browser_page_action_call(&store, &blocked_params, &grants, Some(&actuator));
+        assert_eq!(recovered["ok"], true, "{recovered}");
+        assert_eq!(recovered["delivery_state"], "applied");
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            2,
+            "freed capacity admits the new mutation"
         );
     }
 

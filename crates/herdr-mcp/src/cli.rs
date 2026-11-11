@@ -394,6 +394,22 @@ pub enum BrowserPageCommand {
     Lifecycle { params_json: String },
     Action { params_json: String },
     FastPath { params_json: String },
+    Unknown(BrowserPageUnknownCommand),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BrowserPageUnknownCommand {
+    List {
+        limit: usize,
+        json: bool,
+    },
+    Reconcile {
+        op_id: String,
+        verdict: crate::state_store::BrowserPageReconcileVerdict,
+        evidence: String,
+        operator: Option<String>,
+        json: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1309,13 +1325,15 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
 }
 
 fn parse_browser_page(args: &[String]) -> Result<Command, String> {
-    const USAGE: &str =
-        "usage: herdr-mcp browser-page <lifecycle|action|fast-path> --params-json JSON";
+    const USAGE: &str = "usage: herdr-mcp browser-page <lifecycle|action|fast-path> --params-json JSON | herdr-mcp browser-page unknown <list|reconcile|archive> ...";
     let Some(kind) = args.first().map(String::as_str) else {
         return Err(USAGE.to_owned());
     };
     if matches!(kind, "help" | "--help" | "-h") {
         return Err(USAGE.to_owned());
+    }
+    if kind == "unknown" {
+        return parse_browser_page_unknown(&args[1..]).map(Command::BrowserPage);
     }
     if args.len() != 3 || args[1] != "--params-json" || args[2].trim().is_empty() {
         return Err(USAGE.to_owned());
@@ -1330,6 +1348,173 @@ fn parse_browser_page(args: &[String]) -> Result<Command, String> {
         "fast-path" => Ok(Command::BrowserPage(BrowserPageCommand::FastPath {
             params_json: args[2].clone(),
         })),
+        _ => Err(USAGE.to_owned()),
+    }
+}
+
+fn parse_browser_page_unknown(args: &[String]) -> Result<BrowserPageCommand, String> {
+    const USAGE: &str = "usage: herdr-mcp browser-page unknown list [--limit 1..2048] [--json] | herdr-mcp browser-page unknown <reconcile|archive> <op_id> --verdict <applied|not_applied> --evidence <text> [--operator <name>] --confirm [--json]";
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return Err(USAGE.to_owned());
+    };
+    match subcommand {
+        "list" => {
+            let mut limit = 100usize;
+            let mut json = false;
+            let mut index = 1usize;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--limit" => {
+                        let value = args
+                            .get(index + 1)
+                            .ok_or_else(|| "--limit requires a value".to_owned())?;
+                        limit = parse_bounded_usize(
+                            value,
+                            "--limit",
+                            1,
+                            crate::state_store::BROWSER_PAGE_UNRESOLVED_CAP as usize,
+                        )?;
+                        index += 2;
+                    }
+                    "--json" => {
+                        json = true;
+                        index += 1;
+                    }
+                    flag => {
+                        return Err(format!(
+                            "unknown browser-page unknown list option '{flag}' ({USAGE})"
+                        ));
+                    }
+                }
+            }
+            Ok(BrowserPageCommand::Unknown(
+                BrowserPageUnknownCommand::List { limit, json },
+            ))
+        }
+        "reconcile" | "archive" => {
+            let mut op_id: Option<String> = None;
+            let mut verdict: Option<crate::state_store::BrowserPageReconcileVerdict> = None;
+            let mut evidence: Option<String> = None;
+            let mut operator: Option<String> = None;
+            let mut confirm = false;
+            let mut json = false;
+            let mut index = 1usize;
+            while index < args.len() {
+                let token = args[index].as_str();
+                if !token.starts_with("--") {
+                    if op_id.replace(token.to_owned()).is_some() {
+                        return Err(format!(
+                            "duplicate positional <op_id> in browser-page unknown {subcommand}"
+                        ));
+                    }
+                    index += 1;
+                    continue;
+                }
+                match token {
+                    "--op-id" => {
+                        let value = dispatch_flag_value(args, index, token)?;
+                        if op_id.replace(value).is_some() {
+                            return Err("duplicate --op-id".to_owned());
+                        }
+                        index += 2;
+                    }
+                    "--verdict" => {
+                        let value = dispatch_flag_value(args, index, token)?;
+                        let parsed =
+                            crate::state_store::BrowserPageReconcileVerdict::parse(&value)?;
+                        if verdict.replace(parsed).is_some() {
+                            return Err("duplicate --verdict".to_owned());
+                        }
+                        index += 2;
+                    }
+                    "--evidence" | "--reason" => {
+                        let value = dispatch_flag_value(args, index, token)?;
+                        if evidence.replace(value).is_some() {
+                            return Err("duplicate --evidence/--reason".to_owned());
+                        }
+                        index += 2;
+                    }
+                    "--operator" => {
+                        let value = dispatch_flag_value(args, index, token)?;
+                        if operator.replace(value).is_some() {
+                            return Err("duplicate --operator".to_owned());
+                        }
+                        index += 2;
+                    }
+                    "--confirm" => {
+                        confirm = true;
+                        index += 1;
+                    }
+                    "--json" => {
+                        json = true;
+                        index += 1;
+                    }
+                    flag => {
+                        return Err(format!(
+                            "unknown browser-page unknown {subcommand} option '{flag}' ({USAGE})"
+                        ));
+                    }
+                }
+            }
+            if !confirm {
+                return Err(format!(
+                    "browser-page unknown {subcommand} requires --confirm after human verification of the page state"
+                ));
+            }
+            let op_id = op_id
+                .map(|value| value.trim().to_owned())
+                .filter(|value| {
+                    value
+                        .strip_prefix("op:browser_page_action:")
+                        .is_some_and(|suffix| !suffix.is_empty())
+                        && value.len() <= 128
+                        && !value.chars().any(char::is_control)
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "browser-page unknown {subcommand} requires a valid <op_id> starting with 'op:browser_page_action:'"
+                    )
+                })?;
+            let verdict = verdict.ok_or_else(|| {
+                format!(
+                    "browser-page unknown {subcommand} requires --verdict <applied|not_applied>"
+                )
+            })?;
+            let evidence = evidence
+                .map(|value| value.trim().to_owned())
+                .filter(|value| {
+                    !value.is_empty() && value.len() <= 2048 && !value.chars().any(char::is_control)
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "browser-page unknown {subcommand} requires non-empty --evidence <text> (1..=2048 non-control bytes)"
+                    )
+                })?;
+            let operator = match operator {
+                Some(raw) => {
+                    let trimmed = raw.trim().to_owned();
+                    if trimmed.is_empty()
+                        || trimmed.len() > 128
+                        || trimmed.chars().any(char::is_control)
+                    {
+                        return Err(
+                            "--operator must be 1..=128 non-control bytes when provided".to_owned()
+                        );
+                    }
+                    Some(trimmed)
+                }
+                None => None,
+            };
+            Ok(BrowserPageCommand::Unknown(
+                BrowserPageUnknownCommand::Reconcile {
+                    op_id,
+                    verdict,
+                    evidence,
+                    operator,
+                    json,
+                },
+            ))
+        }
         _ => Err(USAGE.to_owned()),
     }
 }
@@ -3682,6 +3867,140 @@ mod tests {
             vec!["browser-page", "action"],
             vec!["browser-page", "unknown", "--params-json", "{}"],
             vec!["browser-page", "action", "--params-json", ""],
+        ] {
+            assert!(parse(args(&invalid)).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn browser_page_unknown_cli_parses_list_and_confirmed_reconcile() {
+        assert_eq!(
+            parse(args(&["browser-page", "unknown", "list"]))
+                .unwrap()
+                .command,
+            Command::BrowserPage(BrowserPageCommand::Unknown(
+                BrowserPageUnknownCommand::List {
+                    limit: 100,
+                    json: false,
+                }
+            ))
+        );
+        assert_eq!(
+            parse(args(&[
+                "browser-page",
+                "unknown",
+                "list",
+                "--limit",
+                "25",
+                "--json"
+            ]))
+            .unwrap()
+            .command,
+            Command::BrowserPage(BrowserPageCommand::Unknown(
+                BrowserPageUnknownCommand::List {
+                    limit: 25,
+                    json: true,
+                }
+            ))
+        );
+        assert_eq!(
+            parse(args(&[
+                "browser-page",
+                "unknown",
+                "reconcile",
+                "op:browser_page_action:0123456789abcdef0123456789abcdef",
+                "--verdict",
+                "not_applied",
+                "--evidence",
+                "Confirmed button was not clicked on target tab",
+                "--operator",
+                "alice",
+                "--confirm",
+                "--json",
+            ]))
+            .unwrap()
+            .command,
+            Command::BrowserPage(BrowserPageCommand::Unknown(
+                BrowserPageUnknownCommand::Reconcile {
+                    op_id: "op:browser_page_action:0123456789abcdef0123456789abcdef".to_owned(),
+                    verdict: crate::state_store::BrowserPageReconcileVerdict::NotApplied,
+                    evidence: "Confirmed button was not clicked on target tab".to_owned(),
+                    operator: Some("alice".to_owned()),
+                    json: true,
+                }
+            ))
+        );
+        assert_eq!(
+            parse(args(&[
+                "browser-page",
+                "unknown",
+                "archive",
+                "--op-id",
+                "op:browser_page_action:abcdef",
+                "--verdict",
+                "applied",
+                "--reason",
+                "Verified submission landed",
+                "--confirm",
+            ]))
+            .unwrap()
+            .command,
+            Command::BrowserPage(BrowserPageCommand::Unknown(
+                BrowserPageUnknownCommand::Reconcile {
+                    op_id: "op:browser_page_action:abcdef".to_owned(),
+                    verdict: crate::state_store::BrowserPageReconcileVerdict::Applied,
+                    evidence: "Verified submission landed".to_owned(),
+                    operator: None,
+                    json: false,
+                }
+            ))
+        );
+
+        for invalid in [
+            vec!["browser-page", "unknown"],
+            vec!["browser-page", "unknown", "list", "--limit", "0"],
+            vec!["browser-page", "unknown", "list", "--limit", "2049"],
+            vec![
+                "browser-page",
+                "unknown",
+                "reconcile",
+                "op:browser_page_action:abcdef",
+                "--verdict",
+                "applied",
+                "--evidence",
+                "missing confirm flag",
+            ],
+            vec![
+                "browser-page",
+                "unknown",
+                "reconcile",
+                "op:other_kind:abcdef",
+                "--verdict",
+                "applied",
+                "--evidence",
+                "wrong prefix",
+                "--confirm",
+            ],
+            vec![
+                "browser-page",
+                "unknown",
+                "reconcile",
+                "op:browser_page_action:abcdef",
+                "--verdict",
+                "maybe",
+                "--evidence",
+                "invalid verdict",
+                "--confirm",
+            ],
+            vec![
+                "browser-page",
+                "unknown",
+                "reconcile",
+                "op:browser_page_action:abcdef",
+                "--verdict",
+                "applied",
+                "--confirm",
+            ],
         ] {
             assert!(parse(args(&invalid)).is_err(), "{invalid:?}");
         }
