@@ -1328,6 +1328,14 @@ fn valid_generation_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn runtime_token_service() -> Result<String, String> {
+    let runtime = RuntimePaths::discover()?;
+    Ok(match runtime.instance.name() {
+        None => RUNTIME_TOKEN_SERVICE.to_owned(),
+        Some(name) => format!("{RUNTIME_TOKEN_SERVICE}-{name}"),
+    })
+}
+
 fn ensure_runtime_token() -> Result<(), String> {
     if runtime_token().is_ok() {
         return Ok(());
@@ -1340,12 +1348,14 @@ fn ensure_runtime_token() -> Result<(), String> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let account = current_account()?;
-    crate::credential_store::store(RUNTIME_TOKEN_SERVICE, &account, &token)
+    let service = runtime_token_service()?;
+    crate::credential_store::store(&service, &account, &token)
 }
 
 fn runtime_token() -> Result<String, String> {
     let account = current_account()?;
-    crate::credential_store::load(RUNTIME_TOKEN_SERVICE, &account)
+    let service = runtime_token_service()?;
+    crate::credential_store::load(&service, &account)
 }
 
 fn current_account() -> Result<String, String> {

@@ -3140,9 +3140,12 @@ where
 
 #[cfg(target_os = "macos")]
 fn resolve_owner_link_identity(
-    _paths: &RuntimePaths,
+    paths: &RuntimePaths,
     config: &Config,
 ) -> Result<FleetLinkIdentity, String> {
+    if paths.instance.is_named() {
+        return resolve_enrolled_device_identity(paths, config);
+    }
     let plist_env = production_link_environment_if_present()?
         .ok_or_else(|| "owner authority requires the production Herdr Link identity".to_owned())?;
     let (workstation_id, credential_service, edge_origin) =
@@ -3177,8 +3180,8 @@ fn resolve_enrolled_device_identity(
     // origin in config, so it must not depend on a LaunchAgent plist merely to
     // create another short-lived pairing. Older installs may still need the
     // production Link environment as a compatibility fallback.
-    let needs_legacy_link_fallback =
-        config.edge_device_id.is_none() || config.edge_public_origin.is_none();
+    let needs_legacy_link_fallback = !paths.instance.is_named()
+        && (config.edge_device_id.is_none() || config.edge_public_origin.is_none());
     let plist_env = if needs_legacy_link_fallback {
         production_link_environment_if_present()?
     } else {
@@ -4152,6 +4155,30 @@ mod tests {
         assert_eq!(device_id, "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert_eq!(keychain_service, "legacy-owner-service");
         assert_eq!(origin, "https://edge.example");
+    }
+
+    #[test]
+    fn named_instance_fleet_identity_never_falls_back_to_production_link_plist() {
+        let paths = RuntimePaths {
+            instance: crate::instance::InstanceId::parse("dev698").unwrap(),
+            config_dir: std::path::PathBuf::from("/tmp/herdr-mcp-dev698"),
+            config_file: std::path::PathBuf::from("/tmp/herdr-mcp-dev698/config.json"),
+            dev_state_dir: std::path::PathBuf::from("/tmp/herdr-mcp-dev"),
+            herdr_socket: None,
+        };
+        let config = Config {
+            edge_public_origin: Some("https://herdr-edge-dev.whshang.workers.dev".to_owned()),
+            edge_device_id: None,
+            ..Config::default()
+        };
+        let err = resolve_enrolled_device_identity(&paths, &config)
+            .err()
+            .expect("named instance without edge.device_id must not read prod link plist");
+        assert!(err.contains("no enrolled device identity"));
+        let owner_err = resolve_owner_link_identity(&paths, &config)
+            .err()
+            .expect("named instance owner identity must not read prod link plist");
+        assert!(owner_err.contains("no enrolled device identity"));
     }
 
     #[test]

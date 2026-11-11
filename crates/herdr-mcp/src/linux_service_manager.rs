@@ -413,8 +413,8 @@ fn ensure_link_installed_with_restart(restart_existing: bool) -> Result<(), Stri
     }
     let generation = current_generation(&paths)
         .ok_or_else(|| "Linux runtime/current is missing before Link activation".to_owned())?;
-    let config_path = RuntimePaths::discover()?.config_file;
-    let config = Config::load(&config_path)?;
+    let runtime_paths = RuntimePaths::discover()?;
+    let config = Config::load_for_instance(&runtime_paths.config_file, &runtime_paths.instance)?;
     let device_id = config
         .edge_device_id
         .as_deref()
@@ -459,7 +459,7 @@ fn ensure_link_installed_with_restart(restart_existing: bool) -> Result<(), Stri
 
 pub fn install_link() -> Result<(), String> {
     let runtime_paths = RuntimePaths::discover()?;
-    let config = Config::load(&runtime_paths.config_file)?;
+    let config = Config::load_for_instance(&runtime_paths.config_file, &runtime_paths.instance)?;
     require_link_enrollment(&config)?;
     reconcile_link()
 }
@@ -476,7 +476,7 @@ pub fn reconcile_link() -> Result<(), String> {
     ensure_supported_linux_workstation("Link reconcile")?;
     let paths = LinuxPaths::discover()?;
     let runtime_paths = RuntimePaths::discover()?;
-    let config = Config::load(&runtime_paths.config_file)?;
+    let config = Config::load_for_instance(&runtime_paths.config_file, &runtime_paths.instance)?;
     if config.edge_device_id.is_none() {
         return Ok(());
     }
@@ -527,7 +527,7 @@ fn install_from(source: &Path) -> Result<(), String> {
     let paths = LinuxPaths::discover()?;
     let backend = backend_for_install(&paths)?;
     let runtime_paths = RuntimePaths::discover()?;
-    let config = Config::load(&runtime_paths.config_file)?;
+    let config = Config::load_for_instance(&runtime_paths.config_file, &runtime_paths.instance)?;
     ensure_secure_dir(&paths.config_dir, 0o700)?;
     ensure_secure_dir(&paths.runtime_root, 0o700)?;
     ensure_secure_dir(&paths.generations_dir, 0o700)?;
