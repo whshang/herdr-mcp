@@ -13,17 +13,19 @@
 //! - Non-loaded backup/temporary artifacts left under LaunchAgents.
 //! - Independent Herdr LaunchAgents (`dev.herdr.*`).
 
-use crate::instance::InstanceId;
 #[cfg(any(target_os = "macos", test))]
 use crate::instance::{
     DEFAULT_HEALTH_WATCHDOG_LABEL, DEFAULT_HERDR_SUPERVISOR_LABEL, DEFAULT_SERVICE_LABEL,
-    DEFAULT_WATCHDOG_LABEL,
+    DEFAULT_WATCHDOG_LABEL, InstanceId,
 };
 use serde_json::{Value, json};
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(target_os = "macos", test))]
+use std::path::PathBuf;
 
 #[cfg(any(target_os = "macos", test))]
 pub const DEFAULT_LABELS: &[&str] = &[
@@ -405,6 +407,7 @@ pub fn status_line_from_report(report: &ResidueReport) -> String {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCandidateProcess {
     pub pid: u32,
@@ -434,6 +437,7 @@ pub struct OrphanCandidateReport {
     pub orphans: Vec<OrphanCandidateProcess>,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn parse_ps_candidate_processes(ps_output: &str) -> Vec<ParsedCandidateProcess> {
     let mut results = Vec::new();
     for raw_line in ps_output.lines() {
@@ -526,6 +530,7 @@ pub fn parse_ps_candidate_processes(ps_output: &str) -> Vec<ParsedCandidateProce
     results
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn parse_launchctl_server_pids(launchctl_output: &str) -> BTreeMap<u32, String> {
     let mut map = BTreeMap::new();
     for raw_line in launchctl_output.lines() {
@@ -554,6 +559,7 @@ pub fn parse_launchctl_server_pids(launchctl_output: &str) -> BTreeMap<u32, Stri
     map
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn parse_lsof_listening_ports(lsof_output: &str) -> BTreeMap<u32, Vec<u16>> {
     let mut ports_by_pid: BTreeMap<u32, BTreeSet<u16>> = BTreeMap::new();
     let mut current_pid: Option<u32> = None;
@@ -578,6 +584,7 @@ pub fn parse_lsof_listening_ports(lsof_output: &str) -> BTreeMap<u32, Vec<u16>> 
         .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn scan_orphan_candidates_macos_with<PortsFn: Fn(&[u32]) -> BTreeMap<u32, Vec<u16>>>(
     home: &Path,
     ps_output: &str,
