@@ -24,3 +24,80 @@ test("user fills a rich-text composer | Given before/after editor readbacks | Wh
   assert.equal(browserPageFillVerdict({ before: empty, after: empty, want, result: { ok: true } }).error, "fill_not_applied");
   assert.equal(browserPageFillVerdict({ before: empty, after: empty, want, result: { ok: false, error: "fill_clear_not_applied" } }).error, "fill_clear_not_applied");
 });
+
+test("user cannot reuse stale refs after MAIN-world rich-text fill | Given browserPageMainWorldFill completes in background.js | When the ISOLATED cleanup runs | Then it strips data-h2w-fill-token and invalidates the page-assist kernel generation", async () => {
+  const normStart = source.indexOf("function browserPageFillNormalize(");
+  const normBody = source.slice(normStart, source.indexOf("\n}\n", normStart) + 2);
+  const mainStart = source.indexOf("async function browserPageMainWorldFill(");
+  const mainBody = source.slice(mainStart, source.indexOf("\n}\n", mainStart) + 2);
+
+  let invalidated = 0;
+  let removedToken = false;
+  const fakeChrome = {
+    scripting: {
+      executeScript: async ({ world, func, args }) => {
+        if (world === "ISOLATED") {
+          const fakeGlobal = {
+            document: {
+              querySelectorAll: () => [{
+                removeAttribute(attr) {
+                  if (attr === "data-h2w-fill-token") removedToken = true;
+                },
+              }],
+            },
+            window: {
+              H2W_BROWSER_PAGE_KERNEL: {
+                invalidateGeneration() {
+                  invalidated += 1;
+                },
+              },
+            },
+          };
+          const fnSrc = func.toString();
+          const runner = new Function("document", "window", `return (${fnSrc});`)(
+            fakeGlobal.document,
+            fakeGlobal.window,
+          );
+          runner(...(args || []));
+          return [{ result: null }];
+        }
+        return [{ result: { ok: true, committed: true } }];
+      },
+    },
+  };
+  let probeCall = 0;
+  const browserPageFillProbe = async () => {
+    probeCall += 1;
+    return { ok: true, text: probeCall === 1 ? "" : "hello rich editor" };
+  };
+  const browserPageTrustedFillAllowed = () => false;
+  const h2wMainWorldInsertText = () => {};
+
+  const browserPageMainWorldFill = new Function(
+    "chrome",
+    "browserPageFillProbe",
+    "browserPageTrustedFillAllowed",
+    "browserPageTrustedFill",
+    "h2wMainWorldInsertText",
+    `${normBody}\n${body}\n${mainBody}\nreturn browserPageMainWorldFill;`,
+  )(
+    fakeChrome,
+    browserPageFillProbe,
+    browserPageTrustedFillAllowed,
+    async () => ({ ok: false }),
+    h2wMainWorldInsertText,
+  );
+
+  const out = await browserPageMainWorldFill(7, {
+    ok: true,
+    ref: "e1",
+    generation: "gen_1",
+    main_world_fill_token: "f123abc",
+    value: "hello rich editor",
+  });
+  assert.equal(out.ok, true);
+  assert.equal(out.generation, "gen_1");
+  assert.equal(out.main_world_fill_token, undefined);
+  assert.equal(removedToken, true);
+  assert.equal(invalidated, 1);
+});

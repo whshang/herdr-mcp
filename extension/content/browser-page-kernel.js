@@ -971,8 +971,12 @@
         if (params.mainWorldFill === true) {
           // The extension commits rich editors from the MAIN world (same path
           // as WebChat composer insertion) and verifies the readback there.
+          // Consume the observation generation immediately just like ordinary
+          // fill/click/hover so callers must re-observe after the rich-editor
+          // mutation before reusing any ref.
           const token = `f${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
           el.setAttribute("data-h2w-fill-token", token);
+          invalidateGeneration();
           return { ok: true, ref, generation: gen, main_world_fill_token: token, value: fillValue };
         }
         const norm = (value) => String(value || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim();
