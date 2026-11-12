@@ -86,6 +86,119 @@ struct EventCacheProbe {
     error: Option<String>,
 }
 
+/// #926: read-only view of active single-writer `mutation_leases` (#923) for
+/// `herdr-mcp doctor` and `herdr-mcp status --verbose`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationLeaseView {
+    pub project_root: String,
+    pub lane_key: String,
+    pub holder_id: String,
+    pub lease_epoch: i64,
+    pub workspace_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub branch: Option<String>,
+    pub acquired_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationLeasesProbe {
+    /// `state.db` does not exist; doctor must not create it.
+    Absent,
+    /// The store predates #923 and has no `mutation_leases` table yet.
+    Uninitialized,
+    /// Rows exist but none is currently active (all expired or released).
+    Idle,
+    Active(Vec<MutationLeaseView>),
+    /// Present but unreadable; observational only, never fails doctor.
+    Unreadable,
+}
+
+impl MutationLeasesProbe {
+    pub fn state(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Uninitialized => "uninitialized",
+            Self::Idle => "idle",
+            Self::Active(_) => "active",
+            Self::Unreadable => "unreadable",
+        }
+    }
+
+    pub fn active_count(&self) -> usize {
+        match self {
+            Self::Active(leases) => leases.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// #926: observe active `mutation_leases` without creating, migrating or
+/// locking the state database for writes.
+///
+/// Mirrors `probe_continuity_journal` (#834): a missing file reports `Absent`
+/// (never created), a store without the auxiliary `mutation_leases` table
+/// (pre-#923 schema) reports `Uninitialized`, and any open/read failure stays
+/// a non-fatal `Unreadable`. Active rows are filtered with the same predicate
+/// the store uses (`released_at IS NULL AND expires_at > now_ms`) and bounded
+/// to 32 rows so a pathological lane explosion cannot flood doctor output.
+pub fn probe_mutation_leases(state_db_path: &Path, now_ms: i64) -> MutationLeasesProbe {
+    if !state_db_path.is_file() {
+        return MutationLeasesProbe::Absent;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        state_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return MutationLeasesProbe::Unreadable;
+    };
+    if conn.busy_timeout(Duration::from_millis(250)).is_err() {
+        return MutationLeasesProbe::Unreadable;
+    }
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mutation_leases')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return MutationLeasesProbe::Uninitialized;
+    }
+    let mut stmt = match conn.prepare(
+        "SELECT project_root, lane_key, holder_id, lease_epoch,
+                workspace_id, pane_id, branch, acquired_at, expires_at
+           FROM mutation_leases
+          WHERE released_at IS NULL AND expires_at > ?1
+          ORDER BY project_root, lane_key
+          LIMIT 32",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return MutationLeasesProbe::Unreadable,
+    };
+    let leases = match stmt.query_map([now_ms], |row| {
+        Ok(MutationLeaseView {
+            project_root: row.get(0)?,
+            lane_key: row.get(1)?,
+            holder_id: row.get(2)?,
+            lease_epoch: row.get(3)?,
+            workspace_id: row.get(4)?,
+            pane_id: row.get(5)?,
+            branch: row.get(6)?,
+            acquired_at: row.get(7)?,
+            expires_at: row.get(8)?,
+        })
+    }) {
+        Ok(rows) => rows.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(_) => return MutationLeasesProbe::Unreadable,
+    };
+    if leases.is_empty() {
+        MutationLeasesProbe::Idle
+    } else {
+        MutationLeasesProbe::Active(leases)
+    }
+}
+
 fn collect(paths: &RuntimePaths, config: &Config) -> StatusReport {
     StatusReport {
         runtime: probe_runtime(config.runtime_port),
@@ -312,6 +425,17 @@ fn print_status_verbose(paths: &RuntimePaths, config: &Config, language: crate::
         language.text("lifecycle residue", "生命周期残留", "ライフサイクル残留"),
         crate::residue::status_line()
     );
+    // #926: surface active single-writer mutation leases beside the other
+    // observational state lines. Read-only; never affects health verdicts.
+    let mutation_leases_state_dir = std::env::var_os("HERDR_MCP_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths.config_dir.clone());
+    let mutation_leases =
+        probe_mutation_leases(&mutation_leases_state_dir.join("state.db"), unix_now_ms());
+    println!(
+        "{}",
+        mutation_leases_status_line(&mutation_leases, language)
+    );
     println!(
         "{}: {}",
         language.text("relay pool", "Relay 池", "Relay プール"),
@@ -470,6 +594,11 @@ pub fn print_doctor(
         .unwrap_or_else(|| paths.config_dir.clone());
     let continuity_journal =
         crate::state_store::probe_continuity_journal(&continuity_state_dir.join("state.db"));
+    // #926: active single-writer mutation leases are invisible to operators
+    // without hand-querying state.db. Same read-only rule as the continuity
+    // journal probe above: doctor never creates or migrates state.
+    let mutation_leases =
+        probe_mutation_leases(&continuity_state_dir.join("state.db"), unix_now_ms());
     // Read-only herdr-core / Herdr app detection (#765) and WebChat grant
     // snapshot (#772). Neither affects Result.
     let herdr_core = crate::herdr_core::probe();
@@ -691,6 +820,7 @@ pub fn print_doctor(
         crate::webchat_grants::summary_line(&webchat_grants, language)
     );
     println!("{}", continuity_journal_layer(&continuity_journal));
+    println!("{}", mutation_leases_layer(&mutation_leases));
     println!("{}", webchat_grants.doctor_line(language));
     let orphan_candidates = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -747,6 +877,7 @@ pub fn print_doctor(
         },
         "webchat_grants": webchat_grants.as_json(),
         "continuity_journal": continuity_journal_json(&continuity_journal),
+        "mutation_leases": mutation_leases_json(&mutation_leases),
         "orphan_candidates": crate::residue::orphan_candidates_json(&orphan_candidates),
         "overall": readiness.as_str(),
     });
@@ -1068,6 +1199,13 @@ fn unix_now_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
 /// #834: one doctor line for the durable continuity journal.
 ///
 /// Only a live probe can show a stalled journal (the observed UAT symptom was
@@ -1126,6 +1264,90 @@ fn continuity_journal_timestamp(at_ms: Option<i64>) -> String {
                 .ok()
         })
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// #926: one doctor line for active single-writer mutation leases.
+///
+/// Purely observational: lease activity (or the inability to read it) must
+/// never flip `service_health` or `overall` readiness. The line carries no
+/// filesystem path or free-form error, matching the continuity journal layer.
+fn mutation_leases_layer(probe: &MutationLeasesProbe) -> String {
+    match probe {
+        MutationLeasesProbe::Absent => {
+            "LAYER mutation-leases state=absent active=0 reason=state_database_missing".to_owned()
+        }
+        MutationLeasesProbe::Uninitialized => {
+            "LAYER mutation-leases state=uninitialized active=0 reason=table_missing".to_owned()
+        }
+        MutationLeasesProbe::Unreadable => {
+            "LAYER mutation-leases state=unreadable active=0 reason=state_database_unreadable"
+                .to_owned()
+        }
+        MutationLeasesProbe::Idle | MutationLeasesProbe::Active(_) => format!(
+            "LAYER mutation-leases state={} active={}",
+            probe.state(),
+            probe.active_count()
+        ),
+    }
+}
+
+fn mutation_leases_json(probe: &MutationLeasesProbe) -> Value {
+    let leases = match probe {
+        MutationLeasesProbe::Active(leases) => leases
+            .iter()
+            .map(|lease| {
+                json!({
+                    "project_root": lease.project_root,
+                    "lane_key": lease.lane_key,
+                    "holder_id": lease.holder_id,
+                    "lease_epoch": lease.lease_epoch,
+                    "workspace_id": lease.workspace_id,
+                    "pane_id": lease.pane_id,
+                    "branch": lease.branch,
+                    "acquired_at": lease.acquired_at,
+                    "expires_at": lease.expires_at,
+                })
+            })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    json!({
+        "state": probe.state(),
+        "active_count": probe.active_count(),
+        "leases": leases,
+    })
+}
+
+/// Localized `herdr-mcp status --verbose` summary line for mutation leases.
+fn mutation_leases_status_line(
+    probe: &MutationLeasesProbe,
+    language: crate::locale::Locale,
+) -> String {
+    let state_label = match probe {
+        MutationLeasesProbe::Absent => language.text("absent", "不存在", "不在"),
+        MutationLeasesProbe::Uninitialized => {
+            language.text("uninitialized", "未初始化", "未初期化")
+        }
+        MutationLeasesProbe::Unreadable => language.text("unreadable", "不可读", "読み取り不可"),
+        MutationLeasesProbe::Idle => language.text("idle", "空闲", "アイドル"),
+        MutationLeasesProbe::Active(_) => language.text("active", "活跃", "アクティブ"),
+    };
+    let count_detail = match probe {
+        MutationLeasesProbe::Active(leases) => format!(
+            "{}: {}",
+            language.text("active count", "活跃数量", "アクティブ数"),
+            leases.len()
+        ),
+        _ => language
+            .text("no active leases", "无活跃租约", "アクティブなリースなし")
+            .to_owned(),
+    };
+    format!(
+        "{}: {} ({})",
+        language.text("mutation leases", "变更租约", "変更リース"),
+        state_label,
+        count_detail
+    )
 }
 
 fn format_herdr_layer(paths: &RuntimePaths, report: &StatusReport) -> String {
@@ -2429,5 +2651,187 @@ mod tests {
         assert_eq!(orphans_json["state"], "clean");
         assert_eq!(orphans_json["count"], 0);
         assert_eq!(orphans_json["processes"], json!([]));
+    }
+
+    /// user can see active mutation leases in doctor output | Given a state
+    /// database with active, expired and released leases | When the probe
+    /// renders | Then only active leases surface, the database is never
+    /// created or migrated by doctor, and the layer never fails readiness.
+    #[test]
+    fn mutation_leases_probe_reports_absent_uninitialized_and_active_states() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-doctor-leases-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Missing state.db: reported, never created.
+        let absent_db = dir.join("state.db");
+        let absent = probe_mutation_leases(&absent_db, 1_700_000_000_000);
+        assert_eq!(absent, MutationLeasesProbe::Absent);
+        assert!(!absent_db.exists(), "doctor must never create state.db");
+
+        // Pre-#923 database without the mutation_leases table.
+        {
+            let conn = rusqlite::Connection::open(dir.join("legacy.db")).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+        }
+        let uninitialized = probe_mutation_leases(&dir.join("legacy.db"), 1_700_000_000_000);
+        assert_eq!(uninitialized, MutationLeasesProbe::Uninitialized);
+        assert_eq!(
+            mutation_leases_layer(&uninitialized),
+            "LAYER mutation-leases state=uninitialized active=0 reason=table_missing"
+        );
+        assert_eq!(
+            mutation_leases_json(&uninitialized),
+            json!({"state": "uninitialized", "active_count": 0, "leases": []})
+        );
+
+        // Populated database with active, expired and released leases.
+        let now = 1_700_000_000_000_i64;
+        {
+            let conn = rusqlite::Connection::open(dir.join("state.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE mutation_leases (
+                    project_root TEXT NOT NULL,
+                    lane_key     TEXT NOT NULL DEFAULT '*',
+                    holder_id    TEXT NOT NULL,
+                    lease_epoch  INTEGER NOT NULL,
+                    workspace_id TEXT,
+                    pane_id      TEXT,
+                    branch       TEXT,
+                    acquired_at  INTEGER NOT NULL,
+                    updated_at   INTEGER NOT NULL,
+                    expires_at   INTEGER NOT NULL,
+                    released_at  INTEGER,
+                    PRIMARY KEY (project_root, lane_key),
+                    CHECK (lease_epoch >= 1)
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mutation_leases VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    "/Users/test/alpha",
+                    "*",
+                    "holder-a",
+                    1_i64,
+                    "w1",
+                    "p1",
+                    "feat/a",
+                    now - 5_000,
+                    now - 5_000,
+                    now + 300_000,
+                    Option::<i64>::None,
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mutation_leases VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    "/Users/test/beta",
+                    "fs-write",
+                    "holder-b",
+                    3_i64,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    now - 600_000,
+                    now - 600_000,
+                    now - 100_000,
+                    Option::<i64>::None,
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mutation_leases VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    "/Users/test/gamma",
+                    "*",
+                    "holder-c",
+                    2_i64,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    now - 900_000,
+                    now - 800_000,
+                    now + 300_000,
+                    now - 800_000,
+                ],
+            )
+            .unwrap();
+        }
+        let active = probe_mutation_leases(&dir.join("state.db"), now);
+        let MutationLeasesProbe::Active(leases) = &active else {
+            panic!("expected active leases, got {active:?}");
+        };
+        assert_eq!(leases.len(), 1, "expired and released rows are excluded");
+        assert_eq!(leases[0].project_root, "/Users/test/alpha");
+        assert_eq!(leases[0].lane_key, "*");
+        assert_eq!(leases[0].holder_id, "holder-a");
+        assert_eq!(leases[0].lease_epoch, 1);
+        assert_eq!(leases[0].workspace_id.as_deref(), Some("w1"));
+        assert_eq!(leases[0].pane_id.as_deref(), Some("p1"));
+        assert_eq!(leases[0].branch.as_deref(), Some("feat/a"));
+        assert_eq!(leases[0].acquired_at, now - 5_000);
+        assert_eq!(leases[0].expires_at, now + 300_000);
+        assert_eq!(
+            mutation_leases_layer(&active),
+            "LAYER mutation-leases state=active active=1"
+        );
+        assert_eq!(active.active_count(), 1);
+        assert_eq!(
+            mutation_leases_json(&active)["leases"][0],
+            json!({
+                "project_root": "/Users/test/alpha",
+                "lane_key": "*",
+                "holder_id": "holder-a",
+                "lease_epoch": 1,
+                "workspace_id": "w1",
+                "pane_id": "p1",
+                "branch": "feat/a",
+                "acquired_at": now - 5_000,
+                "expires_at": now + 300_000,
+            })
+        );
+        // Zero unexpired rows reports idle, not absent.
+        let idle = probe_mutation_leases(&dir.join("state.db"), now + 1_000_000);
+        assert_eq!(idle, MutationLeasesProbe::Idle);
+        assert_eq!(
+            mutation_leases_layer(&idle),
+            "LAYER mutation-leases state=idle active=0"
+        );
+        assert_eq!(
+            mutation_leases_json(&idle),
+            json!({"state": "idle", "active_count": 0, "leases": []})
+        );
+
+        // Localized verbose lines exist for every probed state, and an
+        // unreadable database never leaks a path.
+        for probe in [
+            MutationLeasesProbe::Absent,
+            MutationLeasesProbe::Uninitialized,
+            MutationLeasesProbe::Idle,
+            active.clone(),
+        ] {
+            assert!(!mutation_leases_status_line(&probe, crate::locale::Locale::En).is_empty());
+            assert!(
+                !mutation_leases_status_line(&probe, crate::locale::Locale::ZhCn)
+                    .contains("unknown")
+            );
+        }
+        assert!(mutation_leases_layer(&MutationLeasesProbe::Unreadable).contains("unreadable"));
+        assert_eq!(
+            mutation_leases_json(&MutationLeasesProbe::Unreadable),
+            json!({"state": "unreadable", "active_count": 0, "leases": []})
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
