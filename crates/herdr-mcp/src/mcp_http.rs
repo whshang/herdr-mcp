@@ -3762,6 +3762,246 @@ mod tests {
         }
     }
 
+    /// Serves the minimal herdr-core OpenRPC handshake used by the public-tool
+    /// admission gate: `hello` advertises only server/terminal methods, so the
+    /// TUI-only public tools must fail closed instead of silently running on the
+    /// TUI snapshot path (#922 review 5870137915).
+    #[cfg(unix)]
+    fn spawn_core_hello_fixture(socket: &std::path::Path) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let listener = UnixListener::bind(socket).unwrap();
+        thread::spawn(move || {
+            // One bounded burst is enough: admission does one handshake per tool
+            // call and the test makes at most a handful of calls.
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let id = request["id"].clone();
+                    let result = match request["method"].as_str().unwrap_or_default() {
+                        "hello" => json!({
+                            "generation": 1,
+                            "version": "fixture-1",
+                            "framed": false,
+                            "methods": [
+                                "hello",
+                                "server.status",
+                                "terminal.list",
+                                "terminal.get",
+                                "terminal.read",
+                                "terminal.run",
+                                "terminal.kill",
+                                "terminal.send",
+                                "machine.exec",
+                                "file.read",
+                                "file.write",
+                                "file.edit",
+                                "events.subscribe"
+                            ],
+                            "features": []
+                        }),
+                        "server.status" => json!({"live": 0, "finished": 0}),
+                        "terminal.list" => json!({"terminals": []}),
+                        other => json!({"code": "unexpected_fixture_method", "method": other}),
+                    };
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"jsonrpc": "2.0", "id": id, "result": result})
+                    )
+                    .unwrap();
+                    let _ = stream.flush();
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    async fn call_public_tool(app: &Router, name: &str, arguments: Value) -> Value {
+        let request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 922,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            })),
+            &[("user-agent", "openai-mcp/1.0")],
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        payload["result"]["content"][0]
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| serde_json::from_str(text).unwrap())
+            .unwrap_or_else(|| payload.clone())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_mcp_tools_fail_closed_when_selected_backend_lacks_or_forbids_them() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("runtime-backend-admission");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("tui-only-marker.txt"), "fixture\n").unwrap();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        // Unix socket paths must stay under SUN_LEN, so this fixture socket
+        // lives directly in /tmp instead of the longer test root.
+        let core_socket = std::path::PathBuf::from(format!(
+            "/tmp/herdr-922-core-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_file(&core_socket).ok();
+        spawn_core_hello_fixture(&core_socket);
+        std::fs::write(
+            config_dir.join("config.json"),
+            json!({
+                "runtime": {
+                    "backend": "herdr-core",
+                    "herdr_core_socket": core_socket.to_string_lossy(),
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let snapshot = json!({
+            "workspaces": [{"workspace_id": "w_fixture", "cwd": project.to_string_lossy()}],
+            "panes": [{"pane_id": "p_fixture", "workspace_id": "w_fixture", "cwd": project.to_string_lossy()}],
+            "agents": [],
+            "tabs": []
+        });
+        let app = candidate_router(test_state_with_snapshot(&root.join("tcp-core"), snapshot));
+
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+
+        // 1. Explicit herdr-core must not execute herdr_fs_list through the TUI snapshot.
+        // The environment guard is process-global, so this test drives the HTTP
+        // router on a current-thread runtime instead of holding the guard across
+        // an async test's awaits.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fs_list = call_public_tool(
+                &app,
+                "herdr_fs_list",
+                json!({"path": project.to_string_lossy()}),
+            )
+            .await;
+            assert_eq!(fs_list["ok"], false);
+            assert_eq!(fs_list["code"], "runtime_capability_unsupported");
+            assert_eq!(fs_list["runtime_backend"], "herdr-core");
+            assert_eq!(fs_list["retryable"], false);
+            assert_eq!(fs_list["delivery_state"], "not_delivered");
+            assert_eq!(fs_list["fallback_allowed"], false);
+
+            // Even when `hello` advertises overlapping file/machine/terminal
+            // methods, the TUI-bound in-process implementations must not run: the
+            // capability is necessary but no core route exists yet.
+            for (tool, arguments) in [
+                (
+                    "herdr_fs_read",
+                    json!({"path": project.join("tui-only-marker.txt").to_string_lossy()}),
+                ),
+                (
+                    "herdr_exec_start",
+                    json!({"root": project.to_string_lossy(), "command": "true"}),
+                ),
+            ] {
+                let rejected = call_public_tool(&app, tool, arguments).await;
+                assert_eq!(rejected["ok"], false, "{tool}");
+                assert_eq!(rejected["code"], "runtime_capability_unsupported", "{tool}");
+                assert_eq!(
+                    rejected["required_capability"], "public_tool_route",
+                    "{tool}"
+                );
+                assert_eq!(rejected["retryable"], false, "{tool}");
+                assert_eq!(rejected["delivery_state"], "not_delivered", "{tool}");
+            }
+
+            // The backend-aware inspect path is still served.
+            let inspect = call_public_tool(&app, "herdr_inspect", json!({})).await;
+            assert_eq!(inspect["ok"], true);
+            assert_eq!(inspect["runtime_backend"]["selected"], "herdr-core");
+
+            // Raw `herdr_call` forwarding to the TUI socket is not a fallback route.
+            let forwarded = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({"method": "pane.list", "params": {}}),
+            )
+            .await;
+            assert_eq!(forwarded["ok"], false);
+            assert_eq!(forwarded["code"], "runtime_capability_unsupported");
+            assert_eq!(forwarded["required_capability"], "tui_runtime_forward");
+            assert_eq!(forwarded["delivery_state"], "not_delivered");
+
+            // 2. An invalid backend selection fails closed at the same public entry.
+            unsafe { env::set_var("HERDR_MCP_RUNTIME_BACKEND", "auto") };
+            let invalid = call_public_tool(
+                &app,
+                "herdr_fs_list",
+                json!({"path": project.to_string_lossy()}),
+            )
+            .await;
+            assert_eq!(invalid["ok"], false);
+            assert_eq!(invalid["code"], "invalid_runtime_backend");
+            assert_eq!(invalid["retryable"], false);
+            assert_eq!(invalid["delivery_state"], "not_delivered");
+
+            // 3. Default TUI selection keeps the existing behavior byte-for-byte.
+            unsafe {
+                env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+                env::remove_var("HERDR_MCP_CONFIG_DIR");
+            }
+            let tui_list = call_public_tool(
+                &app,
+                "herdr_fs_list",
+                json!({"path": project.to_string_lossy()}),
+            )
+            .await;
+            assert_eq!(tui_list["ok"], true);
+            assert_eq!(tui_list["count"], 1);
+        });
+
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn extension_consent_serializes_with_browser_mutation_gate() {
         let root = test_root("browser-consent-mutation-gate");
