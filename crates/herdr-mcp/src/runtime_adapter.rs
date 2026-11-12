@@ -44,22 +44,6 @@ pub const HC_FILE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// never hold a tool call open for the `hc` default of 180 s.
 pub const HC_TERMINAL_WAIT_MAX_SECS: f64 = 20.0;
 
-/// Credential directories that `fs_security::denied_secret_path` does not model
-/// but that herdr-core can reach with no Herdr snapshot in front of it.
-const HC_EXTRA_SECRET_SEGMENTS: &[&str] = &[
-    ".ssh",
-    ".gnupg",
-    ".aws",
-    ".azure",
-    ".kube",
-    ".docker",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    ".git-credentials",
-    ".htpasswd",
-    ".password-store",
-];
 static NEXT_HC_RPC_ID: AtomicU64 = AtomicU64::new(1);
 
 const PROHIBITED_HC_METHODS: &[&str] = &[
@@ -1347,13 +1331,7 @@ fn hc_secret_like_path_guard(path: &str, cwd: Option<&Path>) -> Result<(), Herdr
 /// `fs_security::denied_secret_path` plus credential directories that the
 /// herdr-core file methods can reach without a Herdr snapshot in front of them.
 fn hc_secret_like_path(path: &Path) -> bool {
-    if crate::fs_security::denied_secret_path(path) {
-        return true;
-    }
-    path.components().any(|component| {
-        let segment = component.as_os_str().to_string_lossy().to_ascii_lowercase();
-        HC_EXTRA_SECRET_SEGMENTS.contains(&segment.as_str())
-    })
+    crate::fs_security::denied_home_credential_path(path)
 }
 
 /// Collapse `.` and `..` so `sub/../.env` is judged as `.env`.
@@ -2969,6 +2947,52 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             dir
+        }
+
+        #[test]
+        fn hc_file_reads_still_refuse_extended_credential_segments() {
+            let root = std::path::Path::new("/tmp").join(format!(
+                "herdr-hc-segments-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let client = HerdrCoreClient::new(root.join("missing.sock"));
+            for segment in [
+                ".ssh",
+                ".gnupg",
+                ".aws",
+                ".azure",
+                ".kube",
+                ".docker",
+                ".netrc",
+                ".npmrc",
+                ".pypirc",
+                ".git-credentials",
+                ".htpasswd",
+                ".password-store",
+            ] {
+                let path = format!("{segment}/fixture.txt");
+                assert_eq!(
+                    client
+                        .file_read(&path, Some(&root), None, None)
+                        .unwrap_err()
+                        .code,
+                    "secret_path_denied",
+                    "{segment}"
+                );
+            }
+            assert_eq!(
+                client
+                    .file_read("ordinary.txt", Some(&root), None, None)
+                    .unwrap_err()
+                    .code,
+                "herdr_core_unreachable"
+            );
+            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]

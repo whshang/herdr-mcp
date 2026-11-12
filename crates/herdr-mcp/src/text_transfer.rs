@@ -1,4 +1,4 @@
-use crate::fs_security::{denied_secret_path, path_within};
+use crate::fs_security::{denied_home_credential_path, path_within};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -232,7 +232,7 @@ pub(crate) fn safe_home_path(input: &str, allow_missing: bool) -> Result<PathBuf
     } else {
         home.join(candidate)
     };
-    if denied_secret_path(&candidate) {
+    if denied_home_credential_path(&candidate) {
         return Err(fail(
             "secret_path_denied",
             "text transfer refuses secret-like paths",
@@ -264,7 +264,7 @@ pub(crate) fn safe_home_path(input: &str, allow_missing: bool) -> Result<PathBuf
                 &candidate,
             ));
         }
-        if denied_secret_path(&real) {
+        if denied_home_credential_path(&real) {
             return Err(fail(
                 "secret_path_denied",
                 "text transfer refuses secret-like paths",
@@ -297,7 +297,7 @@ pub(crate) fn safe_home_path(input: &str, allow_missing: bool) -> Result<PathBuf
         )
     })?;
     let resolved = parent_real.join(name);
-    if denied_secret_path(&resolved) {
+    if denied_home_credential_path(&resolved) {
         return Err(fail(
             "secret_path_denied",
             "text transfer refuses secret-like paths",

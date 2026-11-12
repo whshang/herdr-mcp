@@ -32002,11 +32002,49 @@ mod text_transfer_safety_tests {
         }
     }
 
+    fn create_outside_fixture(path: &std::path::Path) -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, b"outside fixture")
+    }
+
+    #[test]
+    fn outside_fixture_creation_never_overwrites_or_removes_existing_symlink() {
+        let root = std::path::Path::new("/tmp").join(format!(
+            "herdr-outside-fixture-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let sentinel = root.join("sentinel");
+        std::fs::write(&sentinel, "unchanged").unwrap();
+        let collision = root.join("outside");
+        symlink(&sentinel, &collision).unwrap();
+        assert_eq!(
+            create_outside_fixture(&collision).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(
+            std::fs::symlink_metadata(&collision)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // HOME and mutation policy are process-global, so run the public MCP route in
     // fresh child processes with test-owned state and no inherited configuration.
     #[test]
     fn text_transfer_public_route_respects_readonly_and_resolved_paths() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::path::Path::new("/tmp").join(format!(
             "herdr-text-safety-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -32029,8 +32067,11 @@ mod text_transfer_safety_tests {
                     "mcp::text_transfer_safety_tests::text_transfer_child",
                     "--exact",
                     "--ignored",
+                    "--nocapture",
                 ])
                 .env_clear()
+                .env("HERDR_TEST_TEXT_TRANSFER_CHILD", "1")
+                .env("HERDR_TEST_TEXT_FIXTURE_ROOT", &root)
                 .env("HOME", &home)
                 .env("HERDR_MCP_RUNTIME_BACKEND", backend)
                 .current_dir(&root);
@@ -32048,7 +32089,9 @@ mod text_transfer_safety_tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(
-                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                String::from_utf8_lossy(&output.stdout).contains("1 passed")
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("text-transfer-fixture-started"),
                 "child probe did not run"
             );
         }
@@ -32058,7 +32101,7 @@ mod text_transfer_safety_tests {
     #[test]
     fn text_transfer_public_route_enforces_configured_write_roots() {
         use std::os::unix::ffi::OsStringExt;
-        let root = std::env::temp_dir().join(format!(
+        let root = std::path::Path::new("/tmp").join(format!(
             "herdr-roots-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -32093,8 +32136,11 @@ mod text_transfer_safety_tests {
                         "mcp::text_transfer_safety_tests::text_transfer_child",
                         "--exact",
                         "--ignored",
+                        "--nocapture",
                     ])
                     .env_clear()
+                    .env("HERDR_TEST_TEXT_TRANSFER_CHILD", "1")
+                    .env("HERDR_TEST_TEXT_FIXTURE_ROOT", &root)
                     .env("HOME", &home)
                     .env("HERDR_MCP_RUNTIME_BACKEND", backend)
                     .env("HERDR_TEST_WRITE_ROOTS_CASE", case)
@@ -32149,7 +32195,9 @@ mod text_transfer_safety_tests {
                     String::from_utf8_lossy(&output.stderr)
                 );
                 assert!(
-                    String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    String::from_utf8_lossy(&output.stdout).contains("1 passed")
+                        && String::from_utf8_lossy(&output.stdout)
+                            .contains("text-transfer-fixture-started"),
                     "child probe did not run"
                 );
             }
@@ -32158,10 +32206,149 @@ mod text_transfer_safety_tests {
     }
 
     #[test]
+    fn text_transfer_ignored_child_rejects_unmarked_or_foreign_home() {
+        let root = std::path::Path::new("/tmp").join(format!(
+            "herdr-text-safety-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let expected_home = root.join("herdr-core-false");
+        let foreign_home = root.join("foreign-home");
+        std::fs::create_dir(&expected_home).unwrap();
+        std::fs::create_dir(&foreign_home).unwrap();
+        let reject = |marker: bool, home: &std::path::Path| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "mcp::text_transfer_safety_tests::text_transfer_child",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HERDR_TEST_TEXT_FIXTURE_ROOT", &root)
+                .env("HOME", home)
+                .env("HERDR_MCP_RUNTIME_BACKEND", "herdr-core")
+                .env("HC_SOCKET", ".hc")
+                .current_dir(&root);
+            if marker {
+                command.env("HERDR_TEST_TEXT_TRANSFER_CHILD", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "invalid child invocation failed");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("1 passed"));
+            assert!(!stdout.contains("text-transfer-fixture-started"));
+        };
+        // The first two cases have empty HOMEs, so neither can pass merely
+        // because the separate nonempty-fixture guard rejected them.
+        reject(false, &expected_home);
+        assert_eq!(std::fs::read_dir(&expected_home).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&foreign_home).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+
+        reject(true, &foreign_home);
+        assert_eq!(std::fs::read_dir(&expected_home).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&foreign_home).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+
+        std::fs::write(expected_home.join("sentinel"), "unchanged").unwrap();
+        reject(true, &expected_home);
+        assert_eq!(
+            std::fs::read_to_string(expected_home.join("sentinel")).unwrap(),
+            "unchanged"
+        );
+        assert_eq!(std::fs::read_dir(&expected_home).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&foreign_home).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Reject an accidentally inherited marker unless every path is one of the
+    // parent-created empty fixture homes under a freshly named /tmp test root.
+    fn validated_fixture_home() -> Option<std::path::PathBuf> {
+        use std::path::{Path, PathBuf};
+        if std::env::var("HERDR_TEST_TEXT_TRANSFER_CHILD").as_deref() != Ok("1") {
+            return None;
+        }
+        let root = PathBuf::from(std::env::var_os("HERDR_TEST_TEXT_FIXTURE_ROOT")?);
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        let backend = std::env::var("HERDR_MCP_RUNTIME_BACKEND").ok()?;
+        if !matches!(backend.as_str(), "tui" | "herdr-core") {
+            return None;
+        }
+        if backend == "herdr-core" && std::env::var("HC_SOCKET").as_deref() != Ok(".hc") {
+            return None;
+        }
+        let root_name = root.file_name()?.to_str()?;
+        let case = std::env::var("HERDR_TEST_WRITE_ROOTS_CASE").ok();
+        let (prefix, home_name) = if let Some(case) = case {
+            if ![
+                "unset",
+                "empty",
+                "whitespace",
+                "all-empty",
+                "allowed",
+                "multi",
+                "linked",
+                "relative-valid",
+                "empty-entry",
+                "outside",
+                "relative-invalid",
+                "missing",
+                "valid-then-missing",
+                "file",
+                "nonunicode",
+            ]
+            .contains(&case.as_str())
+            {
+                return None;
+            }
+            ("herdr-roots-", format!("{backend}-{case}"))
+        } else {
+            let readonly = std::env::var("HERDR_MCP_READONLY").ok().as_deref() == Some("1");
+            ("herdr-text-safety-", format!("{backend}-{readonly}"))
+        };
+        let suffix = root_name.strip_prefix(prefix)?;
+        let (pid, timestamp) = suffix.split_once('-')?;
+        if pid.is_empty()
+            || timestamp.is_empty()
+            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+            || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
+            || root.parent()? != Path::new("/tmp")
+            || home != root.join(home_name)
+        {
+            return None;
+        }
+        let root_meta = std::fs::symlink_metadata(&root).ok()?;
+        let home_meta = std::fs::symlink_metadata(&home).ok()?;
+        if !root_meta.is_dir() || !home_meta.is_dir() {
+            return None;
+        }
+        let root_real = std::fs::canonicalize(&root).ok()?;
+        let home_real = std::fs::canonicalize(&home).ok()?;
+        if root_real.parent()? != std::fs::canonicalize("/tmp").ok()?
+            || home_real.parent()? != root_real
+            || std::env::current_dir().ok()? != root_real
+            || std::fs::read_dir(&home).ok()?.next().is_some()
+        {
+            return None;
+        }
+        Some(home)
+    }
+
+    #[test]
     #[ignore = "launched with isolated HOME by text transfer public route tests"]
     fn text_transfer_child() {
+        let Some(home) = validated_fixture_home() else {
+            return;
+        };
+        println!("text-transfer-fixture-started");
         let fake_core = FakeCore::start();
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
         let data = home.join("data");
         std::fs::create_dir(&data).unwrap();
         std::fs::write(data.join("existing.txt"), "original").unwrap();
@@ -32326,7 +32513,7 @@ mod text_transfer_safety_tests {
             "outside-{}",
             home.file_name().unwrap().to_string_lossy()
         ));
-        std::fs::write(&outside, "outside fixture").unwrap();
+        create_outside_fixture(&outside).unwrap();
         assert_eq!(
             write(outside.to_str().unwrap())["code"],
             "path_outside_home"
@@ -32354,6 +32541,66 @@ mod text_transfer_safety_tests {
             "synthetic fixture"
         );
         assert_eq!(std::fs::read_dir(&protected).unwrap().count(), 1);
+
+        // Credential directories must remain denied through both their own names
+        // and harmless parent aliases, for existing and missing text targets.
+        for (index, name) in [
+            ".ssh",
+            ".gnupg",
+            ".aws",
+            ".azure",
+            ".kube",
+            ".docker",
+            ".password-store",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let directory = home.join(name);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(directory.join("notes.txt"), "synthetic fixture").unwrap();
+            let alias = format!("fixture-alias-{index}");
+            symlink(&directory, home.join(&alias)).unwrap();
+            for path in [format!("{name}/notes.txt"), format!("{alias}/notes.txt")] {
+                let result = read(&path);
+                assert_eq!(result["code"], "secret_path_denied");
+                assert!(!result.to_string().contains("synthetic fixture"));
+                assert_eq!(write(&path)["code"], "secret_path_denied");
+            }
+            for path in [format!("{name}/new.txt"), format!("{alias}/new.txt")] {
+                assert_eq!(write(&path)["code"], "secret_path_denied");
+            }
+            assert_eq!(
+                std::fs::read_to_string(directory.join("notes.txt")).unwrap(),
+                "synthetic fixture"
+            );
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        }
+        assert_eq!(write(".SSH/new.txt")["code"], "secret_path_denied");
+        let nested = home.join("ordinary-folder");
+        std::fs::create_dir(&nested).unwrap();
+        for name in [
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            ".git-credentials",
+            ".htpasswd",
+        ] {
+            std::fs::write(home.join(name), "synthetic fixture").unwrap();
+            let result = read(name);
+            assert_eq!(result["code"], "secret_path_denied");
+            assert!(!result.to_string().contains("synthetic fixture"));
+            assert_eq!(write(name)["code"], "secret_path_denied");
+            assert_eq!(
+                write(&format!("ordinary-folder/{name}"))["code"],
+                "secret_path_denied"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join(name)).unwrap(),
+                "synthetic fixture"
+            );
+        }
+        assert_eq!(std::fs::read_dir(&nested).unwrap().count(), 0);
 
         // A parent alias to a safe directory remains supported.
         symlink(&data, home.join("safe-alias")).unwrap();
