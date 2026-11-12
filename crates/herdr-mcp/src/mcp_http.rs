@@ -55,11 +55,14 @@ const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
 const EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER: &str =
     "x-herdr-edge-caller-browser-on-other-device";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
+const LEASE_HOLDER_HEADER: &str = "x-herdr-lease-holder";
+const LEASE_EPOCH_HEADER: &str = "x-herdr-lease-epoch";
 const MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_EDGE_WEBCHAT_AUTHORIZATION_HEADER_BYTES: usize = 1024;
 const MAX_EDGE_BROWSER_CALLER_SESSION_HEADER_BYTES: usize = 1024;
 const MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER_BYTES: usize = 16;
+const MAX_LEASE_HEADER_BYTES: usize = 256;
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
@@ -2893,6 +2896,20 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             );
         }
     };
+    let (caller_lease_holder_id, caller_lease_epoch) = match caller_mutation_lease_headers(&headers)
+    {
+        Ok(pair) => pair,
+        Err(()) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid mutation lease header context"},
+                    "id": null
+                }),
+            );
+        }
+    };
     let request: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if !value.is_array() => value,
         Ok(_) => {
@@ -2950,6 +2967,8 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             caller_browser_session: caller_browser_session.as_ref(),
             caller_page_assist_grants: &caller_page_assist_grants,
             caller_browser_on_other_device,
+            caller_lease_holder_id: caller_lease_holder_id.as_deref(),
+            caller_lease_epoch,
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
@@ -3308,6 +3327,37 @@ fn trusted_edge_caller_browser_on_other_device(
         return Err(());
     }
     Ok(true)
+}
+
+fn caller_mutation_lease_headers(headers: &HeaderMap) -> Result<(Option<String>, Option<i64>), ()> {
+    let holder_id = match headers.get(LEASE_HOLDER_HEADER) {
+        None => None,
+        Some(raw) => {
+            let text = raw.to_str().map_err(|_| ())?.trim();
+            if text.is_empty()
+                || text.len() > MAX_LEASE_HEADER_BYTES
+                || text.chars().any(char::is_control)
+            {
+                return Err(());
+            }
+            Some(text.to_owned())
+        }
+    };
+    let lease_epoch = match headers.get(LEASE_EPOCH_HEADER) {
+        None => None,
+        Some(raw) => {
+            let text = raw.to_str().map_err(|_| ())?.trim();
+            if text.is_empty() || text.len() > 32 {
+                return Err(());
+            }
+            let epoch = text.parse::<i64>().map_err(|_| ())?;
+            if epoch < 1 {
+                return Err(());
+            }
+            Some(epoch)
+        }
+    };
+    Ok((holder_id, lease_epoch))
 }
 
 fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {

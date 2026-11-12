@@ -69,6 +69,10 @@ pub const X_THREAD_READ_METHOD: &str = "herdr_mcp.x.thread.read";
 pub const DOUBAO_IMAGE_GENERATE_METHOD: &str = "herdr_mcp.doubao.image.generate";
 pub const DOUBAO_IMAGE_STATUS_METHOD: &str = "herdr_mcp.doubao.image.status";
 pub const WORKSTATION_PREFLIGHT_METHOD: &str = "herdr_mcp.workstation.preflight";
+pub const ORCHESTRATION_LEASE_ACQUIRE_METHOD: &str = "herdr_mcp.orchestration.lease.acquire";
+pub const ORCHESTRATION_LEASE_RENEW_METHOD: &str = "herdr_mcp.orchestration.lease.renew";
+pub const ORCHESTRATION_LEASE_RELEASE_METHOD: &str = "herdr_mcp.orchestration.lease.release";
+pub const ORCHESTRATION_LEASE_LIST_METHOD: &str = "herdr_mcp.orchestration.lease.list";
 
 /// Task requirements the semantic layer may fill only when the planner left
 /// them unspecified. Semantic inference can add an advisory requirement, but

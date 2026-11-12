@@ -16,11 +16,12 @@ use super::{
     BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD, BROWSER_SPACE_OPEN_METHOD,
     CLEANUP_PREVIEW_METHOD, DOUBAO_IMAGE_GENERATE_METHOD, DOUBAO_IMAGE_STATUS_METHOD,
     EXEC_WAIT_METHOD, GITHUB_STATUS_METHOD, LOCAL_DESCRIBE_METHOD, LOCAL_LIST_METHOD,
-    LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD, TEXT_READ_METHOD, TEXT_WRITE_METHOD,
-    VALIDATION_ADVISE_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
-    WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, WORKSTATION_PREFLIGHT_METHOD,
-    X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
+    LOCAL_LOAD_METHOD, ORCHESTRATION_LEASE_ACQUIRE_METHOD, ORCHESTRATION_LEASE_LIST_METHOD,
+    ORCHESTRATION_LEASE_RELEASE_METHOD, ORCHESTRATION_LEASE_RENEW_METHOD, PLANNING_ADVISE_METHOD,
+    TEXT_READ_METHOD, TEXT_WRITE_METHOD, VALIDATION_ADVISE_METHOD,
+    WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD,
+    WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+    WORK_PICKUP_METHOD, WORKSTATION_PREFLIGHT_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
@@ -1101,6 +1102,76 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 },
                 "required": [],
                 "empty": false
+            }
+        }),
+        json!({
+            "method": ORCHESTRATION_LEASE_ACQUIRE_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "description": "Acquire or idempotently re-acquire a durable single-writer mutation lease on a canonicalized project_root (and optional lane_key, default '*'). Returns monotonic lease_epoch fencing token; returns single_writer_lease_conflict when held by another active owner.",
+            "params": {
+                "properties": {
+                    "project_root": {"type": "string", "maxLength": 4096},
+                    "lane_key": {"type": "string", "maxLength": 256, "default": "*"},
+                    "holder_id": {"type": "string", "maxLength": 256},
+                    "ttl_seconds": {"type": "integer", "minimum": 10, "maximum": 3600, "default": 300},
+                    "workspace_id": {"type": ["string", "null"], "maxLength": 256},
+                    "pane_id": {"type": ["string", "null"], "maxLength": 256},
+                    "branch": {"type": ["string", "null"], "maxLength": 256}
+                },
+                "required": ["project_root"],
+                "empty": false
+            }
+        }),
+        json!({
+            "method": ORCHESTRATION_LEASE_RENEW_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "description": "Extend an active mutation lease fenced on matching holder_id and lease_epoch.",
+            "params": {
+                "properties": {
+                    "project_root": {"type": "string", "maxLength": 4096},
+                    "lane_key": {"type": "string", "maxLength": 256, "default": "*"},
+                    "holder_id": {"type": "string", "maxLength": 256},
+                    "lease_epoch": {"type": "integer", "minimum": 1},
+                    "ttl_seconds": {"type": "integer", "minimum": 10, "maximum": 3600, "default": 300}
+                },
+                "required": ["project_root", "lease_epoch"],
+                "empty": false
+            }
+        }),
+        json!({
+            "method": ORCHESTRATION_LEASE_RELEASE_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "description": "Release an active mutation lease fenced on matching holder_id and lease_epoch.",
+            "params": {
+                "properties": {
+                    "project_root": {"type": "string", "maxLength": 4096},
+                    "lane_key": {"type": "string", "maxLength": 256, "default": "*"},
+                    "holder_id": {"type": "string", "maxLength": 256},
+                    "lease_epoch": {"type": "integer", "minimum": 1}
+                },
+                "required": ["project_root", "lease_epoch"],
+                "empty": false
+            }
+        }),
+        json!({
+            "method": ORCHESTRATION_LEASE_LIST_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "description": "List active non-expired mutation leases, optionally filtered by project_root and lane_key.",
+            "params": {
+                "properties": {
+                    "project_root": {"type": ["string", "null"], "maxLength": 4096},
+                    "lane_key": {"type": ["string", "null"], "maxLength": 256}
+                },
+                "required": [],
+                "empty": true
             }
         }),
     ];

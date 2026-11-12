@@ -20,10 +20,11 @@ use crate::progressive_skills::{
     BROWSER_SESSION_CREATE_METHOD, BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD,
     BROWSER_SOURCE_RESOLVE_METHOD, BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD,
     BROWSER_SPACE_OPEN_METHOD, DOUBAO_IMAGE_GENERATE_METHOD, DOUBAO_IMAGE_STATUS_METHOD,
-    EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
-    WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, WORKSTATION_PREFLIGHT_METHOD,
-    X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
+    EXEC_WAIT_METHOD, ORCHESTRATION_LEASE_ACQUIRE_METHOD, ORCHESTRATION_LEASE_LIST_METHOD,
+    ORCHESTRATION_LEASE_RELEASE_METHOD, ORCHESTRATION_LEASE_RENEW_METHOD, TEXT_WRITE_METHOD,
+    WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD,
+    WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+    WORK_PICKUP_METHOD, WORKSTATION_PREFLIGHT_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
 use crate::semantic::{
@@ -37,11 +38,13 @@ use crate::state_store::{
     BrowserDispatchReserveInput, BrowserDispatchUpdateInput, BrowserResourceResolveInput,
     BrowserSessionArchiveIntentReservation, BrowserSessionReservation,
     BrowserSessionReservationInput, BrowserSessionReservationRecord, ContinuitySearchInput,
-    OperationLedgerInput, OperationReservation, StateStore, WorkMemoryBindingInput,
-    WorkMemoryCheckpointInput, WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput,
-    WorkMemorySearchBoundary, WorkMemorySearchHit, WorkMemorySearchPage,
-    WorkMemorySearchPageOptions, WorkMemoryTurnInput, validate_browser_lane_id,
-    validate_browser_work_chain_id,
+    MutationLeaseAcquireInput, MutationLeaseAcquireOutcome, MutationLeaseEnforcementVerdict,
+    MutationLeaseRecord, MutationLeaseReleaseInput, MutationLeaseReleaseOutcome,
+    MutationLeaseRenewInput, MutationLeaseRenewOutcome, OperationLedgerInput, OperationReservation,
+    StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput, WorkMemoryEvidenceInput,
+    WorkMemoryPortableSourceInput, WorkMemorySearchBoundary, WorkMemorySearchHit,
+    WorkMemorySearchPage, WorkMemorySearchPageOptions, WorkMemoryTurnInput,
+    validate_browser_lane_id, validate_browser_work_chain_id,
 };
 use crate::tcc_broker;
 use crate::utility_exec;
@@ -212,6 +215,8 @@ pub struct RuntimeContext<'a> {
     /// the source-turn evidence for this dispatch cannot exist in this runtime.
     /// Never used to fail a dispatch; only to skip a futile lookup.
     pub caller_browser_on_other_device: bool,
+    pub caller_lease_holder_id: Option<&'a str>,
+    pub caller_lease_epoch: Option<i64>,
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
@@ -991,7 +996,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 for key in arg_map.keys() {
                     if !matches!(
                         key.as_str(),
-                        "method" | "params" | "device" | "idempotency_key"
+                        "method"
+                            | "params"
+                            | "device"
+                            | "idempotency_key"
+                            | "lease_holder_id"
+                            | "lease_epoch"
                     ) {
                         return Ok(tool_result(
                             json!({
@@ -1055,6 +1065,14 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 )
             } else if method == WORKSTATION_PREFLIGHT_METHOD {
                 workstation_preflight_call(context, &params)
+            } else if matches!(
+                method,
+                ORCHESTRATION_LEASE_ACQUIRE_METHOD
+                    | ORCHESTRATION_LEASE_RENEW_METHOD
+                    | ORCHESTRATION_LEASE_RELEASE_METHOD
+                    | ORCHESTRATION_LEASE_LIST_METHOD
+            ) {
+                orchestration_lease_call(context, method, &params, &arguments)
             } else if method == BROWSER_SOURCE_RESOLVE_METHOD {
                 browser_source_resolve(context.state_store, &params, context.trusted_local_ipc)
             } else if method == BROWSER_HANDOFF_PREPARE_METHOD {
@@ -1258,6 +1276,21 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 }
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
+            } else if method == TEXT_WRITE_METHOD {
+                if let Some(conflict) =
+                    check_mutating_tool_root_lease(context, method, &params, Some(&arguments))
+                {
+                    conflict
+                } else {
+                    let clean_params = strip_lease_credential_fields(&params);
+                    native_tools::call_with_local(
+                        context.client,
+                        context.skill,
+                        &context.cache.snapshot(),
+                        method,
+                        clean_params,
+                    )
+                }
             } else {
                 native_tools::call_with_local(
                     context.client,
@@ -1307,25 +1340,70 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 },
             );
         }
-        "herdr_fs_edit" => route_fs_git("fs_edit", &context.cache.snapshot(), &arguments),
-        "herdr_fs_write" => route_fs_git("fs_write", &context.cache.snapshot(), &arguments),
-        "herdr_fs_patch" => route_fs_git("fs_patch", &context.cache.snapshot(), &arguments),
+        "herdr_fs_edit" => {
+            if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_fs_edit", &arguments, None)
+            {
+                conflict
+            } else {
+                let clean = strip_lease_credential_fields(&arguments);
+                route_fs_git("fs_edit", &context.cache.snapshot(), &clean)
+            }
+        }
+        "herdr_fs_write" => {
+            if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_fs_write", &arguments, None)
+            {
+                conflict
+            } else {
+                let clean = strip_lease_credential_fields(&arguments);
+                route_fs_git("fs_write", &context.cache.snapshot(), &clean)
+            }
+        }
+        "herdr_fs_patch" => {
+            if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_fs_patch", &arguments, None)
+            {
+                conflict
+            } else {
+                let clean = strip_lease_credential_fields(&arguments);
+                route_fs_git("fs_patch", &context.cache.snapshot(), &clean)
+            }
+        }
         "herdr_git" => route_fs_git("git", &context.cache.snapshot(), &arguments),
-        "herdr_exec_start" => exec_tools::start(
-            context.client,
-            &context.cache.snapshot(),
-            context.exec,
-            &arguments,
-        ),
+        "herdr_exec_start" => {
+            if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_exec_start", &arguments, None)
+            {
+                conflict
+            } else {
+                let clean = strip_lease_credential_fields(&arguments);
+                exec_tools::start(
+                    context.client,
+                    &context.cache.snapshot(),
+                    context.exec,
+                    &clean,
+                )
+            }
+        }
         "herdr_exec_read" => exec_tools::read(context.exec, &arguments),
         "herdr_exec_kill" => exec_tools::kill(context.exec, &arguments),
-        "herdr_exec" => utility_exec::run_durable(
-            context.client,
-            &context.cache.snapshot(),
-            context.exec,
-            context.state_store,
-            &arguments,
-        ),
+        "herdr_exec" => {
+            if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_exec", &arguments, None)
+            {
+                conflict
+            } else {
+                let clean = strip_lease_credential_fields(&arguments);
+                utility_exec::run_durable(
+                    context.client,
+                    &context.cache.snapshot(),
+                    context.exec,
+                    context.state_store,
+                    &clean,
+                )
+            }
+        }
         "herdr_prompt" => {
             let parent_session_ref = prompt_parent_session_ref(context);
             let mut result = prompt::run_with_parent_session(
@@ -1689,6 +1767,735 @@ fn workstation_preflight_call(context: &RuntimeContext<'_>, params: &Value) -> V
         "agents_hidden": inspect_view.get("agents_hidden").cloned().unwrap_or_else(|| json!(0)),
         "browser_endpoints": browser_endpoints,
     })
+}
+
+fn mutation_lease_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn caller_bound_session_lease_holder(context: &RuntimeContext<'_>) -> Option<String> {
+    if let Some(session_ref) = prompt_parent_session_ref(context) {
+        return Some(session_ref);
+    }
+    context
+        .caller_browser_session
+        .map(|session| session.opaque_session_id.clone())
+}
+
+fn strip_lease_credential_fields(arguments: &Value) -> Value {
+    let Some(map) = arguments.as_object() else {
+        return arguments.clone();
+    };
+    if !map.contains_key("lease_holder_id") && !map.contains_key("lease_epoch") {
+        return arguments.clone();
+    }
+    let mut cleaned = map.clone();
+    cleaned.remove("lease_holder_id");
+    cleaned.remove("lease_epoch");
+    Value::Object(cleaned)
+}
+
+fn extract_caller_lease_credentials(
+    context: &RuntimeContext<'_>,
+    primary_args: &Value,
+    secondary_args: Option<&Value>,
+) -> Result<(Option<String>, Option<i64>, bool), Value> {
+    let extract_holder = |val: &Value| -> Result<Option<String>, Value> {
+        let Some(raw) = val.get("lease_holder_id").or_else(|| val.get("holder_id")) else {
+            return Ok(None);
+        };
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let Some(text) = raw.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+            return Err(json!({
+                "ok": false,
+                "code": "invalid_params",
+                "retryable": false,
+                "delivery_state": "not_delivered",
+                "message": "lease_holder_id must be a non-empty string",
+            }));
+        };
+        Ok(Some(text.to_owned()))
+    };
+    let extract_epoch = |val: &Value| -> Result<Option<i64>, Value> {
+        let Some(raw) = val.get("lease_epoch") else {
+            return Ok(None);
+        };
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let Some(epoch) = raw.as_i64().filter(|&n| n >= 1) else {
+            return Err(json!({
+                "ok": false,
+                "code": "invalid_params",
+                "retryable": false,
+                "delivery_state": "not_delivered",
+                "message": "lease_epoch must be a positive integer",
+            }));
+        };
+        Ok(Some(epoch))
+    };
+
+    let explicit_holder = match extract_holder(primary_args)? {
+        Some(holder) => Some(holder),
+        None => match secondary_args {
+            Some(sec) => extract_holder(sec)?,
+            None => None,
+        },
+    }
+    .or_else(|| context.caller_lease_holder_id.map(str::to_owned));
+
+    let explicit_epoch = match extract_epoch(primary_args)? {
+        Some(epoch) => Some(epoch),
+        None => match secondary_args {
+            Some(sec) => extract_epoch(sec)?,
+            None => None,
+        },
+    }
+    .or(context.caller_lease_epoch);
+
+    if let Some(holder) = explicit_holder {
+        return Ok((Some(holder), explicit_epoch, false));
+    }
+    if let Some(session_holder) = caller_bound_session_lease_holder(context) {
+        return Ok((Some(session_holder), explicit_epoch, true));
+    }
+    Ok((None, explicit_epoch, false))
+}
+
+fn format_mutation_lease_conflict(
+    conflict_reason: &str,
+    active_lease: Option<&MutationLeaseRecord>,
+) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("ok".to_owned(), json!(false));
+    payload.insert("code".to_owned(), json!("single_writer_lease_conflict"));
+    payload.insert("reason".to_owned(), json!("single_writer_lease_conflict"));
+    payload.insert("conflict_reason".to_owned(), json!(conflict_reason));
+    payload.insert("retryable".to_owned(), json!(false));
+    payload.insert("delivery_state".to_owned(), json!("not_delivered"));
+    if let Some(lease) = active_lease {
+        payload.insert("project_root".to_owned(), json!(lease.project_root));
+        payload.insert("lane_key".to_owned(), json!(lease.lane_key));
+        payload.insert("holder_id".to_owned(), json!(lease.holder_id));
+        payload.insert("lease_epoch".to_owned(), json!(lease.lease_epoch));
+        payload.insert("workspace_id".to_owned(), json!(lease.workspace_id));
+        payload.insert("pane_id".to_owned(), json!(lease.pane_id));
+        payload.insert("branch".to_owned(), json!(lease.branch));
+        payload.insert("acquired_at".to_owned(), json!(lease.acquired_at));
+        payload.insert("updated_at".to_owned(), json!(lease.updated_at));
+        payload.insert("expires_at".to_owned(), json!(lease.expires_at));
+        payload.insert("active_lease".to_owned(), json!(lease));
+        payload.insert("lease".to_owned(), json!(lease));
+        payload.insert(
+            "message".to_owned(),
+            json!(format!(
+                "single-writer mutation lease conflict ({conflict_reason}) on '{}' (lane '{}'): currently held by '{}' at epoch {} until {}",
+                lease.project_root,
+                lease.lane_key,
+                lease.holder_id,
+                lease.lease_epoch,
+                lease.expires_at
+            )),
+        );
+    } else {
+        payload.insert(
+            "message".to_owned(),
+            json!(format!(
+                "single-writer mutation lease operation rejected ({conflict_reason})"
+            )),
+        );
+    }
+    Value::Object(payload)
+}
+
+fn orchestration_lease_call(
+    context: &RuntimeContext<'_>,
+    method: &str,
+    params: &Value,
+    outer_arguments: &Value,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "retryable": false,
+            "message": "orchestration lease params must be an object",
+        });
+    };
+    let now_ms = mutation_lease_now_ms();
+    match method {
+        ORCHESTRATION_LEASE_ACQUIRE_METHOD => {
+            const ALLOWED: &[&str] = &[
+                "project_root",
+                "lane_key",
+                "holder_id",
+                "lease_holder_id",
+                "ttl_seconds",
+                "workspace_id",
+                "pane_id",
+                "branch",
+            ];
+            for key in object.keys() {
+                if !ALLOWED.contains(&key.as_str()) {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": format!("unknown parameter '{key}' for {ORCHESTRATION_LEASE_ACQUIRE_METHOD}"),
+                    });
+                }
+            }
+            let Some(project_root) = object
+                .get("project_root")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": "project_root is required",
+                });
+            };
+            let lane_key = match object.get("lane_key") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.as_str()),
+                Some(_) => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": "lane_key must be a string",
+                    });
+                }
+            };
+            let holder_id = match extract_caller_lease_credentials(
+                context,
+                params,
+                Some(outer_arguments),
+            ) {
+                Ok((Some(holder), _, _)) => holder,
+                Ok((None, _, _)) => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": "holder_id is required when caller has no bound session identity",
+                    });
+                }
+                Err(invalid) => return invalid,
+            };
+            let ttl_seconds = match object.get("ttl_seconds") {
+                None | Some(Value::Null) => None,
+                Some(value) => match value.as_u64() {
+                    Some(ttl) => Some(ttl),
+                    None => {
+                        return json!({
+                            "ok": false,
+                            "code": "invalid_params",
+                            "retryable": false,
+                            "message": "ttl_seconds must be an integer between 10 and 3600",
+                        });
+                    }
+                },
+            };
+            let optional_str_field = |field: &str| -> Result<Option<&str>, Value> {
+                match object.get(field) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(s)) => Ok(Some(s.as_str())),
+                    Some(_) => Err(json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": format!("{field} must be a string or null"),
+                    })),
+                }
+            };
+            let workspace_id = match optional_str_field("workspace_id") {
+                Ok(v) => v,
+                Err(err) => return err,
+            };
+            let pane_id = match optional_str_field("pane_id") {
+                Ok(v) => v,
+                Err(err) => return err,
+            };
+            let branch = match optional_str_field("branch") {
+                Ok(v) => v,
+                Err(err) => return err,
+            };
+            let Ok(mut store) = context.state_store.lock() else {
+                return json!({"ok": false, "code": "state_store_unavailable", "retryable": true});
+            };
+            match store.acquire_mutation_lease(MutationLeaseAcquireInput {
+                project_root,
+                lane_key,
+                holder_id: &holder_id,
+                ttl_seconds,
+                workspace_id,
+                pane_id,
+                branch,
+                now_ms,
+            }) {
+                Ok(MutationLeaseAcquireOutcome::Acquired { lease, reacquired }) => json!({
+                    "ok": true,
+                    "acquired": true,
+                    "reacquired": reacquired,
+                    "project_root": lease.project_root,
+                    "lane_key": lease.lane_key,
+                    "holder_id": lease.holder_id,
+                    "lease_epoch": lease.lease_epoch,
+                    "workspace_id": lease.workspace_id,
+                    "pane_id": lease.pane_id,
+                    "branch": lease.branch,
+                    "acquired_at": lease.acquired_at,
+                    "updated_at": lease.updated_at,
+                    "expires_at": lease.expires_at,
+                    "lease": lease,
+                }),
+                Ok(MutationLeaseAcquireOutcome::Conflict { active_lease }) => {
+                    format_mutation_lease_conflict("lease_held_by_other", Some(&active_lease))
+                }
+                Err(message) => json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": message,
+                }),
+            }
+        }
+        ORCHESTRATION_LEASE_RENEW_METHOD => {
+            const ALLOWED: &[&str] = &[
+                "project_root",
+                "lane_key",
+                "holder_id",
+                "lease_holder_id",
+                "lease_epoch",
+                "ttl_seconds",
+            ];
+            for key in object.keys() {
+                if !ALLOWED.contains(&key.as_str()) {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": format!("unknown parameter '{key}' for {ORCHESTRATION_LEASE_RENEW_METHOD}"),
+                    });
+                }
+            }
+            let Some(project_root) = object
+                .get("project_root")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": "project_root is required",
+                });
+            };
+            let lane_key = match object.get("lane_key") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.as_str()),
+                Some(_) => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": "lane_key must be a string",
+                    });
+                }
+            };
+            let (holder_opt, epoch_opt, _) =
+                match extract_caller_lease_credentials(context, params, Some(outer_arguments)) {
+                    Ok(creds) => creds,
+                    Err(invalid) => return invalid,
+                };
+            let Some(holder_id) = holder_opt else {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": "holder_id is required",
+                });
+            };
+            let Some(lease_epoch) = epoch_opt else {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": "lease_epoch is required",
+                });
+            };
+            let ttl_seconds = match object.get("ttl_seconds") {
+                None | Some(Value::Null) => None,
+                Some(value) => match value.as_u64() {
+                    Some(ttl) => Some(ttl),
+                    None => {
+                        return json!({
+                            "ok": false,
+                            "code": "invalid_params",
+                            "retryable": false,
+                            "message": "ttl_seconds must be an integer between 10 and 3600",
+                        });
+                    }
+                },
+            };
+            let Ok(mut store) = context.state_store.lock() else {
+                return json!({"ok": false, "code": "state_store_unavailable", "retryable": true});
+            };
+            match store.renew_mutation_lease(MutationLeaseRenewInput {
+                project_root,
+                lane_key,
+                holder_id: &holder_id,
+                lease_epoch,
+                ttl_seconds,
+                now_ms,
+            }) {
+                Ok(MutationLeaseRenewOutcome::Renewed(lease)) => json!({
+                    "ok": true,
+                    "renewed": true,
+                    "project_root": lease.project_root,
+                    "lane_key": lease.lane_key,
+                    "holder_id": lease.holder_id,
+                    "lease_epoch": lease.lease_epoch,
+                    "workspace_id": lease.workspace_id,
+                    "pane_id": lease.pane_id,
+                    "branch": lease.branch,
+                    "acquired_at": lease.acquired_at,
+                    "updated_at": lease.updated_at,
+                    "expires_at": lease.expires_at,
+                    "lease": lease,
+                }),
+                Ok(MutationLeaseRenewOutcome::Conflict {
+                    reason,
+                    active_lease,
+                }) => format_mutation_lease_conflict(reason, active_lease.as_ref()),
+                Err(message) => json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": message,
+                }),
+            }
+        }
+        ORCHESTRATION_LEASE_RELEASE_METHOD => {
+            const ALLOWED: &[&str] = &[
+                "project_root",
+                "lane_key",
+                "holder_id",
+                "lease_holder_id",
+                "lease_epoch",
+            ];
+            for key in object.keys() {
+                if !ALLOWED.contains(&key.as_str()) {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": format!("unknown parameter '{key}' for {ORCHESTRATION_LEASE_RELEASE_METHOD}"),
+                    });
+                }
+            }
+            let Some(project_root) = object
+                .get("project_root")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": "project_root is required",
+                });
+            };
+            let lane_key = match object.get("lane_key") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.as_str()),
+                Some(_) => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": "lane_key must be a string",
+                    });
+                }
+            };
+            let (holder_opt, epoch_opt, _) =
+                match extract_caller_lease_credentials(context, params, Some(outer_arguments)) {
+                    Ok(creds) => creds,
+                    Err(invalid) => return invalid,
+                };
+            let Some(holder_id) = holder_opt else {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": "holder_id is required",
+                });
+            };
+            let Some(lease_epoch) = epoch_opt else {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": "lease_epoch is required",
+                });
+            };
+            let Ok(mut store) = context.state_store.lock() else {
+                return json!({"ok": false, "code": "state_store_unavailable", "retryable": true});
+            };
+            match store.release_mutation_lease(MutationLeaseReleaseInput {
+                project_root,
+                lane_key,
+                holder_id: &holder_id,
+                lease_epoch,
+                now_ms,
+            }) {
+                Ok(MutationLeaseReleaseOutcome::Released {
+                    lease,
+                    released_at,
+                    idempotent_replay,
+                }) => json!({
+                    "ok": true,
+                    "released": true,
+                    "idempotent_replay": idempotent_replay,
+                    "released_at": released_at,
+                    "project_root": lease.project_root,
+                    "lane_key": lease.lane_key,
+                    "holder_id": lease.holder_id,
+                    "lease_epoch": lease.lease_epoch,
+                    "lease": lease,
+                }),
+                Ok(MutationLeaseReleaseOutcome::Conflict {
+                    reason,
+                    active_lease,
+                }) => format_mutation_lease_conflict(reason, active_lease.as_ref()),
+                Err(message) => json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": message,
+                }),
+            }
+        }
+        ORCHESTRATION_LEASE_LIST_METHOD => {
+            const ALLOWED: &[&str] = &["project_root", "lane_key"];
+            for key in object.keys() {
+                if !ALLOWED.contains(&key.as_str()) {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": format!("unknown parameter '{key}' for {ORCHESTRATION_LEASE_LIST_METHOD}"),
+                    });
+                }
+            }
+            let project_root = match object.get("project_root") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.as_str()),
+                Some(_) => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": "project_root must be a string or null",
+                    });
+                }
+            };
+            let lane_key = match object.get("lane_key") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.as_str()),
+                Some(_) => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "retryable": false,
+                        "message": "lane_key must be a string or null",
+                    });
+                }
+            };
+            let Ok(store) = context.state_store.lock() else {
+                return json!({"ok": false, "code": "state_store_unavailable", "retryable": true});
+            };
+            match store.list_active_mutation_leases(project_root, lane_key, now_ms) {
+                Ok(leases) => json!({
+                    "ok": true,
+                    "count": leases.len(),
+                    "leases": leases,
+                }),
+                Err(message) => json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "message": message,
+                }),
+            }
+        }
+        _ => json!({
+            "ok": false,
+            "code": "unknown_local_method",
+            "method": method,
+        }),
+    }
+}
+
+fn workspace_candidate_paths_from_snapshot(
+    snapshot: &Value,
+    workspace_target: &str,
+) -> Vec<String> {
+    let mut workspace_id = None;
+    let mut paths = Vec::new();
+    if let Some(workspaces) = snapshot.get("workspaces").and_then(Value::as_array) {
+        for item in workspaces {
+            let id = item
+                .get("workspace_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str);
+            let label = item
+                .get("label")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str);
+            if id == Some(workspace_target) || label == Some(workspace_target) {
+                workspace_id = id.map(str::to_owned);
+                if let Some(root) = item
+                    .pointer("/worktree/checkout_path")
+                    .or_else(|| item.pointer("/worktree/path"))
+                    .or_else(|| item.get("project_path"))
+                    .or_else(|| item.get("cwd"))
+                    .and_then(Value::as_str)
+                {
+                    paths.push(root.to_owned());
+                }
+                break;
+            }
+        }
+    }
+    let effective_ws_id = workspace_id.as_deref().unwrap_or(workspace_target);
+    for section in ["panes", "agents"] {
+        if let Some(items) = snapshot.get(section).and_then(Value::as_array) {
+            for item in items {
+                if item.get("workspace_id").and_then(Value::as_str) == Some(effective_ws_id)
+                    && let Some(cwd) = item
+                        .get("cwd")
+                        .or_else(|| item.get("foreground_cwd"))
+                        .and_then(Value::as_str)
+                {
+                    paths.push(cwd.to_owned());
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn check_mutating_tool_root_lease(
+    context: &RuntimeContext<'_>,
+    tool_or_method: &str,
+    arguments: &Value,
+    outer_arguments: Option<&Value>,
+) -> Option<Value> {
+    match tool_or_method {
+        "herdr_fs_patch"
+            if arguments
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            return None;
+        }
+        "herdr_exec" if arguments.get("intent").and_then(Value::as_str) == Some("read_only") => {
+            return None;
+        }
+        _ => {}
+    }
+
+    let now_ms = mutation_lease_now_ms();
+    // Fast path: if no root leases (`lane_key == "*"`) are active in the store,
+    // return `None` immediately with zero path canonicalization or snapshot work.
+    {
+        let Ok(store) = context.state_store.lock() else {
+            return None;
+        };
+        let Ok(active_roots) = store.list_active_mutation_leases(None, Some("*"), now_ms) else {
+            return None;
+        };
+        if active_roots.is_empty() {
+            return None;
+        }
+    }
+
+    let candidate_paths: Vec<String> = match tool_or_method {
+        "herdr_fs_edit" | "herdr_fs_write" | TEXT_WRITE_METHOD => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|s| vec![s.to_owned()])
+            .unwrap_or_default(),
+        "herdr_fs_patch" | "herdr_exec_start" => arguments
+            .get("root")
+            .and_then(Value::as_str)
+            .map(|s| vec![s.to_owned()])
+            .unwrap_or_default(),
+        "herdr_exec" => {
+            if let Some(root) = arguments
+                .get("project_root")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                vec![root.to_owned()]
+            } else if let Some(workspace) = arguments
+                .get("workspace")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                workspace_candidate_paths_from_snapshot(&context.cache.snapshot(), workspace)
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    if candidate_paths.is_empty() {
+        return None;
+    }
+
+    let (holder_opt, epoch_opt, session_bound) =
+        match extract_caller_lease_credentials(context, arguments, outer_arguments) {
+            Ok(creds) => creds,
+            Err(invalid) => return Some(invalid),
+        };
+
+    let Ok(store) = context.state_store.lock() else {
+        return None;
+    };
+    for path in &candidate_paths {
+        if let Ok(MutationLeaseEnforcementVerdict::Conflict {
+            reason,
+            active_lease,
+        }) = store.check_root_mutation_lease_for_path(
+            path,
+            holder_opt.as_deref(),
+            epoch_opt,
+            session_bound,
+            now_ms,
+        ) {
+            return Some(format_mutation_lease_conflict(reason, Some(&active_lease)));
+        }
+    }
+    None
 }
 
 fn work_pickup_call(
@@ -26279,6 +27086,8 @@ mod tests {
             caller_browser_session: None,
             caller_page_assist_grants: &[],
             caller_browser_on_other_device: false,
+            caller_lease_holder_id: None,
+            caller_lease_epoch: None,
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,
@@ -29758,6 +30567,8 @@ mod client_request_shape_matrix_tests {
             caller_browser_session: None,
             caller_page_assist_grants: &[],
             caller_browser_on_other_device: false,
+            caller_lease_holder_id: None,
+            caller_lease_epoch: None,
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,
@@ -29984,6 +30795,397 @@ mod client_request_shape_matrix_tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("unknown top-level argument 'worktree'")
+        );
+
+        std::fs::remove_dir_all(temp_root).ok();
+    }
+
+    #[test]
+    fn orchestration_mutation_leases_enforce_single_writer_and_preserve_unleased_roots() {
+        use crate::progressive_skills::{
+            ORCHESTRATION_LEASE_ACQUIRE_METHOD, ORCHESTRATION_LEASE_LIST_METHOD,
+            ORCHESTRATION_LEASE_RELEASE_METHOD, ORCHESTRATION_LEASE_RENEW_METHOD,
+        };
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "herdr-mcp-lease-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let repo_root = temp_root.join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        let target_file = repo_root.join("hello.txt");
+        std::fs::write(&target_file, "initial\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "hello.txt"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+
+        let client = HerdrClient::new(temp_root.join("missing.sock"));
+        let repo_str = repo_root.to_string_lossy().into_owned();
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [{"id": "w1", "workspace_id": "w1", "label": "main", "worktree": {"checkout_path": repo_str}}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": repo_str}],
+            "agents": []
+        }));
+        let exec = ExecRegistry::new(temp_root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store =
+            std::sync::Arc::new(std::sync::Mutex::new(StateStore::open(":memory:").unwrap()));
+
+        let make_ctx = |holder: Option<&'static str>, epoch: Option<i64>| -> RuntimeContext<'_> {
+            RuntimeContext {
+                client: &client,
+                cache: &cache,
+                exec: &exec,
+                prompt: &prompt,
+                skill: &skill,
+                state_store: &state_store,
+                caller_webchat_control_grants: &[],
+                caller_webchat_authorization: None,
+                caller_browser_session: None,
+                caller_page_assist_grants: &[],
+                caller_browser_on_other_device: false,
+                caller_lease_holder_id: holder,
+                caller_lease_epoch: epoch,
+                browser_actuator: None,
+                browser_mutation_gate: None,
+                browser_mutation_admission: None,
+                trusted_local_ipc: false,
+            }
+        };
+
+        let parse_tool_payload = |resp: &Value| -> Value {
+            let text = resp
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .expect("tool response text");
+            serde_json::from_str(text).expect("tool response json")
+        };
+
+        // 1. Discoverability via herdr_methods
+        let ctx_anon = make_ctx(None, None);
+        let methods_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_methods",
+                    "arguments": {"query": "orchestration.lease"}
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        let methods_payload = parse_tool_payload(&methods_resp);
+        assert_eq!(methods_payload["methods"].as_array().unwrap().len(), 4);
+
+        // 2. Unleased root: herdr_fs_write works with zero friction and no lease credentials
+        let unleased_write = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_fs_write",
+                    "arguments": {
+                        "path": target_file.to_string_lossy(),
+                        "content": "v1\n",
+                        "overwrite": true,
+                        "confirm_dirty": true
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        assert_eq!(parse_tool_payload(&unleased_write)["ok"], true);
+        assert_eq!(std::fs::read_to_string(&target_file).unwrap(), "v1\n");
+
+        // 3. Acquire root lease for lane-a -> epoch 1
+        let acq_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": ORCHESTRATION_LEASE_ACQUIRE_METHOD,
+                        "params": {
+                            "project_root": repo_str,
+                            "holder_id": "lane-a",
+                            "ttl_seconds": 120,
+                            "workspace_id": "w1",
+                            "pane_id": "w1:p1",
+                            "branch": "feat/920"
+                        }
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        let acq_payload = parse_tool_payload(&acq_resp);
+        assert_eq!(acq_payload["ok"], true);
+        assert_eq!(acq_payload["lease_epoch"], 1);
+
+        // 4. Conflicting acquire from lane-b fails closed with single_writer_lease_conflict
+        let conflict_acq = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": ORCHESTRATION_LEASE_ACQUIRE_METHOD,
+                        "params": {
+                            "project_root": repo_str,
+                            "holder_id": "lane-b",
+                            "ttl_seconds": 60
+                        }
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        let conflict_payload = parse_tool_payload(&conflict_acq);
+        assert_eq!(conflict_payload["ok"], false);
+        assert_eq!(conflict_payload["code"], "single_writer_lease_conflict");
+        assert_eq!(conflict_payload["holder_id"], "lane-a");
+        assert_eq!(conflict_payload["lease_epoch"], 1);
+
+        // 5. Mutating tools (herdr_fs_write, herdr_fs_edit, herdr_fs_patch, herdr_exec_start, herdr_exec)
+        // from lane-b or anonymous caller fail closed BEFORE touching disk/process
+        let ctx_lane_b = make_ctx(Some("lane-b"), Some(1));
+        for (req_id, tool_name, tool_args) in [
+            (
+                51,
+                "herdr_fs_write",
+                json!({
+                    "path": target_file.to_string_lossy(),
+                    "content": "hacked\n",
+                    "overwrite": true,
+                    "confirm_dirty": true
+                }),
+            ),
+            (
+                52,
+                "herdr_fs_edit",
+                json!({
+                    "path": target_file.to_string_lossy(),
+                    "old_string": "v1",
+                    "new_string": "hacked",
+                    "confirm_dirty": true
+                }),
+            ),
+            (
+                53,
+                "herdr_fs_patch",
+                json!({
+                    "root": repo_str,
+                    "patch": "*** Begin Patch\n*** Update File: hello.txt\n@@\n-v1\n+hacked\n*** End Patch",
+                    "confirm_dirty": true
+                }),
+            ),
+            (
+                54,
+                "herdr_exec_start",
+                json!({
+                    "root": repo_str,
+                    "command": "echo should-not-run > hacked.txt"
+                }),
+            ),
+            (
+                55,
+                "herdr_exec",
+                json!({
+                    "workspace": "w1",
+                    "project_root": repo_str,
+                    "command": "echo should-not-run > hacked.txt",
+                    "intent": "non_idempotent_write",
+                    "idempotency_key": "exec-conflict-1"
+                }),
+            ),
+        ] {
+            let blocked = handle(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": tool_name,
+                        "arguments": tool_args
+                    }
+                }),
+                &ctx_lane_b,
+            )
+            .unwrap();
+            let payload = parse_tool_payload(&blocked);
+            assert_eq!(payload["ok"], false, "{tool_name}");
+            assert_eq!(
+                payload["code"], "single_writer_lease_conflict",
+                "{tool_name}"
+            );
+            assert_eq!(payload["retryable"], false, "{tool_name}");
+            assert_eq!(payload["delivery_state"], "not_delivered", "{tool_name}");
+            assert_eq!(payload["holder_id"], "lane-a", "{tool_name}");
+            assert_eq!(payload["lease_epoch"], 1, "{tool_name}");
+        }
+        assert_eq!(std::fs::read_to_string(&target_file).unwrap(), "v1\n");
+        assert!(!repo_root.join("hacked.txt").exists());
+
+        // 6. Owner lane-a with matching (holder_id, lease_epoch) succeeds
+        let ctx_lane_a = make_ctx(Some("lane-a"), Some(1));
+        let owner_write = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_fs_write",
+                    "arguments": {
+                        "path": target_file.to_string_lossy(),
+                        "content": "v2-by-lane-a\n",
+                        "overwrite": true,
+                        "confirm_dirty": true
+                    }
+                }
+            }),
+            &ctx_lane_a,
+        )
+        .unwrap();
+        assert_eq!(parse_tool_payload(&owner_write)["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(&target_file).unwrap(),
+            "v2-by-lane-a\n"
+        );
+
+        // 7. Renew, list, and release via herdr_call
+        let renew_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": ORCHESTRATION_LEASE_RENEW_METHOD,
+                        "params": {
+                            "project_root": repo_str,
+                            "holder_id": "lane-a",
+                            "lease_epoch": 1,
+                            "ttl_seconds": 180
+                        }
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        assert_eq!(parse_tool_payload(&renew_resp)["ok"], true);
+
+        let list_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": ORCHESTRATION_LEASE_LIST_METHOD,
+                        "params": {"project_root": repo_str}
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        let list_payload = parse_tool_payload(&list_resp);
+        assert_eq!(list_payload["ok"], true);
+        assert_eq!(list_payload["count"], 1);
+
+        let release_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": ORCHESTRATION_LEASE_RELEASE_METHOD,
+                        "params": {
+                            "project_root": repo_str,
+                            "holder_id": "lane-a",
+                            "lease_epoch": 1
+                        }
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        assert_eq!(parse_tool_payload(&release_resp)["ok"], true);
+
+        // 8. After release, lane-b acquires epoch 2 and stale epoch 1 from lane-a is rejected
+        let acq_b = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": ORCHESTRATION_LEASE_ACQUIRE_METHOD,
+                        "params": {
+                            "project_root": repo_str,
+                            "holder_id": "lane-b",
+                            "ttl_seconds": 60
+                        }
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        let acq_b_payload = parse_tool_payload(&acq_b);
+        assert_eq!(acq_b_payload["ok"], true);
+        assert_eq!(acq_b_payload["lease_epoch"], 2);
+
+        let stale_owner_write = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_fs_write",
+                    "arguments": {
+                        "path": target_file.to_string_lossy(),
+                        "content": "stale\n",
+                        "overwrite": true,
+                        "confirm_dirty": true
+                    }
+                }
+            }),
+            &ctx_lane_a,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_tool_payload(&stale_owner_write)["code"],
+            "single_writer_lease_conflict"
         );
 
         std::fs::remove_dir_all(temp_root).ok();
