@@ -699,6 +699,60 @@ pub(super) fn ensure_browser_dispatch_auxiliary_schema(conn: &Connection) -> Res
     Ok(())
 }
 
+/// Forward-additive agent-task parent-session ledger and cross-device caller-session schema (#775 / #921).
+///
+/// Kept out of numbered `MIGRATIONS` so `SCHEMA_VERSION` stays at 16 for v1.1.x
+/// rollback compatibility. Existing rows with `parent_session_device_id IS NULL`
+/// denote local-device parent sessions.
+pub(super) fn ensure_agent_tasks_auxiliary_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_tasks (
+            task_id           TEXT PRIMARY KEY NOT NULL,
+            parent_session_ref TEXT,
+            updated_at        INTEGER NOT NULL DEFAULT 0
+        );",
+    )
+    .map_err(|error| format!("cannot create agent_tasks auxiliary table: {error}"))?;
+
+    let has_parent_session_device_id = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('agent_tasks') WHERE name = 'parent_session_device_id'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("cannot inspect agent_tasks auxiliary schema: {error}"))?;
+    if has_parent_session_device_id == 0 {
+        conn.execute(
+            "ALTER TABLE agent_tasks ADD COLUMN parent_session_device_id TEXT",
+            [],
+        )
+        .map_err(|error| format!("cannot extend agent_tasks auxiliary schema: {error}"))?;
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_agent_tasks_parent_session
+            ON agent_tasks(parent_session_ref, parent_session_device_id);
+         CREATE TABLE IF NOT EXISTS browser_cross_device_caller_sessions (
+            principal_ref           TEXT NOT NULL,
+            provider                TEXT NOT NULL,
+            caller_session_sha256   TEXT NOT NULL,
+            session_ref             TEXT NOT NULL,
+            owning_device_id        TEXT NOT NULL,
+            source_user_text_sha256 TEXT NOT NULL,
+            expected_generation     INTEGER NOT NULL,
+            first_bound_at          INTEGER NOT NULL,
+            last_bound_at           INTEGER NOT NULL,
+            PRIMARY KEY (principal_ref, provider, caller_session_sha256)
+        );
+         CREATE INDEX IF NOT EXISTS idx_browser_cross_device_caller_sessions_target
+            ON browser_cross_device_caller_sessions(owning_device_id, session_ref);",
+    )
+    .map_err(|error| {
+        format!("cannot create browser_cross_device_caller_sessions auxiliary table: {error}")
+    })?;
+    Ok(())
+}
+
 pub(super) fn migrate_to(
     conn: &mut Connection,
     target: i64,

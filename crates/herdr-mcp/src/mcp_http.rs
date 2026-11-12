@@ -9,7 +9,8 @@ use crate::extension_ipc::{
 use crate::herdr::HerdrClient;
 use crate::mcp::{
     self, BrowserCallerAuthorization, BrowserCallerGrant, BrowserCallerSessionIdentity,
-    BrowserMutationAdmission, BrowserPostconditionEvidence, PageAssistCallerGrant, RuntimeContext,
+    BrowserMutationAdmission, BrowserPostconditionEvidence, PageAssistCallerGrant,
+    RelayedSourceTurnEvidence, RuntimeContext,
 };
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
@@ -54,6 +55,7 @@ const EDGE_BROWSER_CALLER_SESSION_HEADER: &str = "x-herdr-edge-browser-caller-se
 const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
 const EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER: &str =
     "x-herdr-edge-caller-browser-on-other-device";
+const EDGE_RELAYED_SOURCE_TURN_HEADER: &str = "x-herdr-edge-relayed-source-turn";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const LEASE_HOLDER_HEADER: &str = "x-herdr-lease-holder";
 const LEASE_EPOCH_HEADER: &str = "x-herdr-lease-epoch";
@@ -62,6 +64,7 @@ const MAX_EDGE_WEBCHAT_AUTHORIZATION_HEADER_BYTES: usize = 1024;
 const MAX_EDGE_BROWSER_CALLER_SESSION_HEADER_BYTES: usize = 1024;
 const MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER_BYTES: usize = 16;
+const MAX_EDGE_RELAYED_SOURCE_TURN_HEADER_BYTES: usize = 2048;
 const MAX_LEASE_HEADER_BYTES: usize = 256;
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
@@ -440,7 +443,7 @@ async fn get_extension_agent_tasks(
     // must survive a long-running supervisor task before its first terminal
     // task exists. Every other caller keeps the terminal-only inbox.
     let include_running = query.get("include_running").map(String::as_str) == Some("1");
-    let value = if include_running {
+    let mut value = if include_running {
         state
             .prompt
             .task_inbox_with_running(workspace_id, parent_session_ref, limit)
@@ -454,6 +457,7 @@ async fn get_extension_agent_tasks(
             limit,
         )
     };
+    mcp::enrich_agent_task_parent_session_device_id_from_store(&state.state_store, &mut value);
     json_response(StatusCode::OK, &value)
 }
 
@@ -1196,10 +1200,32 @@ fn extension_browser_source_turn_observe(
         &user_text_sha256,
         observed_at,
     )?;
+    let relayed_source_turn_candidate = store
+        .relayed_source_turn_candidate(
+            &session_ref,
+            observed_at,
+            mcp::RELAYED_SOURCE_TURN_DEFAULT_TTL_MS,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            json!({
+                "session_ref": session_ref,
+                "endpoint_ref": session.endpoint_ref,
+                "provider": session.provider,
+                "user_text_sha256": user_text_sha256,
+                "observation_generation": expected_generation,
+                "expected_generation": expected_generation,
+                "observed_at": observed_at,
+                "expires_at": observed_at.saturating_add(mcp::RELAYED_SOURCE_TURN_DEFAULT_TTL_MS),
+                "ttl_ms": mcp::RELAYED_SOURCE_TURN_DEFAULT_TTL_MS,
+            })
+        });
     Ok(json!({
         "ok": true,
         "session_ref": session_ref,
         "expected_generation": expected_generation,
+        "relayed_source_turn_candidate": relayed_source_turn_candidate,
     }))
 }
 
@@ -2896,6 +2922,19 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             );
         }
     };
+    let caller_relayed_source_turn = match trusted_edge_relayed_source_turn(&state, &headers) {
+        Ok(relayed) => relayed,
+        Err(()) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid trusted caller relayed source turn context"},
+                    "id": null
+                }),
+            );
+        }
+    };
     let (caller_lease_holder_id, caller_lease_epoch) = match caller_mutation_lease_headers(&headers)
     {
         Ok(pair) => pair,
@@ -2967,6 +3006,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             caller_browser_session: caller_browser_session.as_ref(),
             caller_page_assist_grants: &caller_page_assist_grants,
             caller_browser_on_other_device,
+            caller_relayed_source_turn: caller_relayed_source_turn.as_ref(),
             caller_lease_holder_id: caller_lease_holder_id.as_deref(),
             caller_lease_epoch,
             browser_actuator: Some(&blocking_state.browser_actuation),
@@ -3329,6 +3369,103 @@ fn trusted_edge_caller_browser_on_other_device(
     Ok(true)
 }
 
+fn trusted_edge_relayed_source_turn(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<RelayedSourceTurnEvidence>, ()> {
+    // #775 / #921: ignored on TCP bearer listeners even if a client attempts to
+    // spoof the header; only the 0600 Unix IPC listener can admit it.
+    if !state.trusted_extension_ipc {
+        return Ok(None);
+    }
+    let Some(raw) = headers.get(EDGE_RELAYED_SOURCE_TURN_HEADER) else {
+        return Ok(None);
+    };
+    let text = raw.to_str().map_err(|_| ())?;
+    if text.len() > MAX_EDGE_RELAYED_SOURCE_TURN_HEADER_BYTES {
+        return Err(());
+    }
+    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
+    let object = value.as_object().ok_or(())?;
+    const ALLOWED_KEYS: &[&str] = &[
+        "owning_device_id",
+        "session_ref",
+        "user_text_sha256",
+        "expected_generation",
+        "observed_at",
+        "expires_at",
+        "provider",
+        "endpoint_ref",
+    ];
+    if object
+        .keys()
+        .any(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return Err(());
+    }
+    let owning_device_id = object
+        .get("owning_device_id")
+        .and_then(Value::as_str)
+        .filter(|v| valid_browser_grant_ref(v, 128) && *v == v.trim())
+        .ok_or(())?;
+    let session_ref = object
+        .get("session_ref")
+        .and_then(Value::as_str)
+        .filter(|v| valid_browser_grant_ref(v, 96) && *v == v.trim())
+        .ok_or(())?;
+    let user_text_sha256 = object
+        .get("user_text_sha256")
+        .and_then(Value::as_str)
+        .filter(|v| v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|v| v.to_ascii_lowercase())
+        .ok_or(())?;
+    let expected_generation = object
+        .get("expected_generation")
+        .and_then(Value::as_i64)
+        .filter(|v| *v > 0)
+        .ok_or(())?;
+    let observed_at = object
+        .get("observed_at")
+        .and_then(Value::as_i64)
+        .filter(|v| *v >= 0)
+        .ok_or(())?;
+    let expires_at = object
+        .get("expires_at")
+        .and_then(Value::as_i64)
+        .filter(|v| {
+            *v > 0
+                && *v >= observed_at
+                && v.saturating_sub(observed_at) <= mcp::RELAYED_SOURCE_TURN_MAX_TTL_MS
+        })
+        .ok_or(())?;
+    let provider = object
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|v| valid_browser_grant_provider(v))
+        .ok_or(())?;
+    let endpoint_ref = match object.get("endpoint_ref") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(ep))
+            if valid_browser_grant_ref(ep, 128)
+                && ep == ep.trim()
+                && ep != mcp::WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT =>
+        {
+            Some(ep.clone())
+        }
+        _ => return Err(()),
+    };
+    Ok(Some(RelayedSourceTurnEvidence {
+        owning_device_id: owning_device_id.to_owned(),
+        session_ref: session_ref.to_owned(),
+        user_text_sha256,
+        expected_generation,
+        observed_at,
+        expires_at,
+        provider: provider.to_owned(),
+        endpoint_ref,
+    }))
+}
+
 fn caller_mutation_lease_headers(headers: &HeaderMap) -> Result<(Option<String>, Option<i64>), ()> {
     let holder_id = match headers.get(LEASE_HOLDER_HEADER) {
         None => None,
@@ -3366,6 +3503,7 @@ fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) 
             && !headers.contains_key(EDGE_WEBCHAT_AUTHORIZATION_HEADER)
             && !headers.contains_key(EDGE_BROWSER_CALLER_SESSION_HEADER)
             && !headers.contains_key(EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER)
+            && !headers.contains_key(EDGE_RELAYED_SOURCE_TURN_HEADER)
             && !headers.contains_key(EDGE_PAGE_ASSIST_GRANTS_HEADER))
     {
         return Ok(());
@@ -10733,5 +10871,285 @@ mod tests {
         assert_eq!(bound["task"]["parent_session_ref"], session_ref);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn webchat_cross_device_relayed_source_turn_binds_and_preserves_n_minus_1_fallback() {
+        let root = test_root("webchat-cross-device-relayed-source-turn");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut script = Vec::new();
+        for index in 0..8 {
+            let seq = 4 + index * 2;
+            script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
+            script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
+        }
+        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let mut state = dispatch_test_state(&root, &socket);
+        state.trusted_extension_ipc = true;
+        let tcp_state = {
+            let mut s = state.clone();
+            s.trusted_extension_ipc = false;
+            s
+        };
+        let app = candidate_router(state);
+        let tcp_app = candidate_router(tcp_state);
+
+        // 1. Verify source_turn.observe returns relayed_source_turn_candidate summary
+        let (app, profile_seed, endpoint_ref, account_ref) =
+            register_chatgpt_endpoint(app, "cross-dev-source", now).await;
+        let (app, local_observed_session) = observe_chatgpt_session_source_turn(
+            app,
+            &profile_seed,
+            &endpoint_ref,
+            &account_ref,
+            "local-source-conv",
+            "本地观察的源回合",
+            now,
+        )
+        .await;
+        let observe_resp = app
+            .clone()
+            .oneshot(registry_request(json!({
+                "operation": "source_turn.observe",
+                "endpoint_ref": endpoint_ref,
+                "profile_seed": profile_seed,
+                "canonical_url": "https://chatgpt.com/c/dispatch-local-source-conv",
+                "user_text": "本地观察的源回合",
+                "observed_at": now,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(observe_resp.status(), StatusCode::OK);
+        let observe_body = observe_resp.into_body().collect().await.unwrap().to_bytes();
+        let observe_json: Value = serde_json::from_slice(&observe_body).unwrap();
+        assert_eq!(observe_json["ok"], true);
+        let candidate = &observe_json["relayed_source_turn_candidate"];
+        assert_eq!(candidate["session_ref"], local_observed_session);
+        assert_eq!(
+            candidate["user_text_sha256"],
+            mcp::source_turn_sha256("本地观察的源回合")
+        );
+        assert_eq!(candidate["provider"], "chatgpt");
+        assert_eq!(candidate["ttl_ms"], mcp::RELAYED_SOURCE_TURN_DEFAULT_TTL_MS);
+
+        // 2. Cross-device dispatch with valid relayed_source_turn binds remote session_ref & owning_device_id
+        let remote_session_ref = "br_remote_device_a_session_921";
+        let owning_device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let turn_text = "从 Air 浏览器派发到 MBP 的跨设备任务";
+        let turn_digest = mcp::source_turn_sha256(turn_text);
+        let base_headers = vec![
+            (
+                "x-herdr-edge-expected-runtime-generation",
+                "rust-caller-grant-proof".to_owned(),
+            ),
+            (
+                "x-herdr-edge-webchat-authorization",
+                json!({
+                    "principal_ref": "connector:conn_CrossDevice921",
+                    "connector_id": "conn_CrossDevice921",
+                    "grant_generation": 1,
+                })
+                .to_string(),
+            ),
+            (
+                "x-herdr-edge-browser-caller-session",
+                json!({"provider": "chatgpt", "opaque_session_id": "opaque-cross-device-921"})
+                    .to_string(),
+            ),
+            (
+                "x-herdr-edge-webchat-control-grants",
+                json!([{"endpoint_ref": "bep_remote_air", "provider": "chatgpt"}]).to_string(),
+            ),
+            (
+                "x-herdr-edge-caller-browser-on-other-device",
+                "true".to_owned(),
+            ),
+        ];
+        let mut cross_headers = base_headers.clone();
+        cross_headers.push((
+            "x-herdr-edge-relayed-source-turn",
+            json!({
+                "owning_device_id": owning_device_id,
+                "session_ref": remote_session_ref,
+                "user_text_sha256": turn_digest,
+                "expected_generation": 3,
+                "observed_at": now - 1_000,
+                "expires_at": now + 60_000,
+                "provider": "chatgpt",
+                "endpoint_ref": "bep_remote_air",
+            })
+            .to_string(),
+        ));
+
+        let bound = webchat_tool_call(
+            app.clone(),
+            &cross_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "run cross-device task",
+                "idempotency_key": "cross-dev-dispatch-1",
+                "current_user_message": turn_text,
+            }),
+        )
+        .await;
+        assert_eq!(bound["ok"], true, "{bound}");
+        assert_eq!(
+            bound["parent_session"],
+            json!({
+                "bound": true,
+                "session_ref": remote_session_ref,
+                "owning_device_id": owning_device_id,
+                "cross_device": true,
+            })
+        );
+        assert_eq!(bound["task"]["parent_session_ref"], remote_session_ref);
+        assert_eq!(bound["task"]["parent_session_device_id"], owning_device_id);
+        let task_id = bound["task"]["task_id"].as_str().unwrap().to_owned();
+
+        // 3. Idempotent replay preserves cross-device parent_session and parent_session_device_id
+        let replay = webchat_tool_call(
+            app.clone(),
+            &cross_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "run cross-device task",
+                "idempotency_key": "cross-dev-dispatch-1",
+                "current_user_message": turn_text,
+            }),
+        )
+        .await;
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(
+            replay["parent_session"],
+            json!({
+                "bound": true,
+                "session_ref": remote_session_ref,
+                "owning_device_id": owning_device_id,
+                "cross_device": true,
+            })
+        );
+        assert_eq!(replay["task"]["parent_session_device_id"], owning_device_id);
+
+        // 4. agent.task.status exposes parent_session_device_id for the cross-device bound caller
+        let status = webchat_tool_call(
+            app.clone(),
+            &cross_headers,
+            "herdr_mcp.agent.task.status",
+            json!({"task_id": task_id}),
+        )
+        .await;
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["task"]["parent_session_ref"], remote_session_ref);
+        assert_eq!(status["task"]["parent_session_device_id"], owning_device_id);
+
+        // 5. Digest mismatch, expired TTL, and missing grant fail closed
+        let digest_miss = webchat_tool_call(
+            app.clone(),
+            &cross_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "wrong turn text",
+                "idempotency_key": "cross-dev-dispatch-miss",
+                "current_user_message": "不匹配的文本",
+            }),
+        )
+        .await;
+        assert_eq!(digest_miss["parent_session"]["bound"], false);
+        assert_eq!(
+            digest_miss["parent_session"]["reason"],
+            "source_turn_not_found"
+        );
+
+        let mut expired_headers = base_headers.clone();
+        expired_headers.push((
+            "x-herdr-edge-relayed-source-turn",
+            json!({
+                "owning_device_id": owning_device_id,
+                "session_ref": remote_session_ref,
+                "user_text_sha256": turn_digest,
+                "expected_generation": 3,
+                "observed_at": now - 120_000,
+                "expires_at": now - 1_000,
+                "provider": "chatgpt",
+            })
+            .to_string(),
+        ));
+        let expired = webchat_tool_call(
+            app.clone(),
+            &expired_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "expired relayed turn",
+                "idempotency_key": "cross-dev-dispatch-expired",
+                "current_user_message": turn_text,
+            }),
+        )
+        .await;
+        assert_eq!(expired["parent_session"]["bound"], false);
+        assert_eq!(expired["parent_session"]["reason"], "source_turn_stale");
+
+        let mut no_grant_headers = cross_headers.clone();
+        no_grant_headers.retain(|(k, _)| *k != "x-herdr-edge-webchat-control-grants");
+        let missing_grant = webchat_tool_call(
+            app.clone(),
+            &no_grant_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "no grant",
+                "idempotency_key": "cross-dev-dispatch-nogrant",
+                "current_user_message": turn_text,
+            }),
+        )
+        .await;
+        assert_eq!(missing_grant["parent_session"]["bound"], false);
+        assert_eq!(missing_grant["parent_session"]["reason"], "grant_missing");
+
+        // 6. N-1 fallback: caller_browser_on_other_device == true with NO relayed_source_turn
+        let n_minus_1 = webchat_tool_call(
+            app.clone(),
+            &base_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "n-1 edge without relayed_source_turn",
+                "idempotency_key": "cross-dev-dispatch-n-minus-1",
+                "current_user_message": turn_text,
+            }),
+        )
+        .await;
+        assert_eq!(n_minus_1["ok"], true);
+        assert_eq!(n_minus_1["parent_session"]["bound"], false);
+        assert_eq!(
+            n_minus_1["parent_session"]["reason"],
+            "caller_browser_on_other_device"
+        );
+
+        // 7. Untrusted TCP bearer listener ignores spoofed x-herdr-edge-relayed-source-turn
+        let tcp_spoof = webchat_tool_call(
+            tcp_app,
+            &cross_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "tcp spoof attempt",
+                "idempotency_key": "cross-dev-dispatch-tcp-spoof",
+                "current_user_message": turn_text,
+            }),
+        )
+        .await;
+        assert_eq!(tcp_spoof["ok"], true);
+        assert!(tcp_spoof["task"]["parent_session_ref"].is_null());
+        assert!(tcp_spoof.get("parent_session").is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(socket);
     }
 }

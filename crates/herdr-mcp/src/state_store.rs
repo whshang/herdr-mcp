@@ -36,9 +36,10 @@ pub use mutation_leases::{
 use work_journal::ensure_work_journal_auxiliary_schema;
 
 use schema::{
-    META_SCHEMA_VERSION, db_file_name, ensure_browser_archive_auxiliary_schema,
-    ensure_browser_dispatch_auxiliary_schema, ensure_browser_source_turn_auxiliary_schema,
-    ensure_parent_dirs, migrate, open_connection, prepare_db_file, reject_symlink,
+    META_SCHEMA_VERSION, db_file_name, ensure_agent_tasks_auxiliary_schema,
+    ensure_browser_archive_auxiliary_schema, ensure_browser_dispatch_auxiliary_schema,
+    ensure_browser_source_turn_auxiliary_schema, ensure_parent_dirs, migrate, open_connection,
+    prepare_db_file, reject_symlink,
 };
 #[cfg(unix)]
 use schema::{secure_dir, set_mode};
@@ -841,6 +842,7 @@ impl StateStore {
             ensure_browser_source_turn_auxiliary_schema(&conn)?;
             ensure_work_journal_auxiliary_schema(&conn)?;
             ensure_mutation_leases_auxiliary_schema(&conn)?;
+            ensure_agent_tasks_auxiliary_schema(&conn)?;
             // Durable residue from an account identity change is cleaned before
             // this process serves any canonical-URL lookup.
             retire_stale_browser_session_locators_in(&conn)?;
@@ -862,6 +864,7 @@ impl StateStore {
         ensure_browser_source_turn_auxiliary_schema(&conn)?;
         ensure_work_journal_auxiliary_schema(&conn)?;
         ensure_mutation_leases_auxiliary_schema(&conn)?;
+        ensure_agent_tasks_auxiliary_schema(&conn)?;
         retire_stale_browser_session_locators_in(&conn)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
@@ -892,6 +895,7 @@ impl StateStore {
         ensure_browser_source_turn_auxiliary_schema(&conn)?;
         ensure_work_journal_auxiliary_schema(&conn)?;
         ensure_mutation_leases_auxiliary_schema(&conn)?;
+        ensure_agent_tasks_auxiliary_schema(&conn)?;
         retire_stale_browser_session_locators_in(&conn)?;
         Ok(Self {
             path: Some(path),
@@ -4598,6 +4602,21 @@ impl StateStore {
         {
             return Err("browser_caller_session_conflict".to_owned());
         }
+        let existing_cross_device = self
+            .conn
+            .query_row(
+                "SELECT session_ref FROM browser_cross_device_caller_sessions
+                 WHERE principal_ref = ?1 AND provider = ?2 AND caller_session_sha256 = ?3",
+                params![principal_ref, provider, caller_session_sha256],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                format!("cannot inspect cross-device browser caller session binding: {error}")
+            })?;
+        if existing_cross_device.is_some() {
+            return Err("browser_caller_session_conflict".to_owned());
+        }
         self.conn
             .execute(
                 "INSERT INTO browser_caller_sessions(
@@ -4699,6 +4718,20 @@ impl StateStore {
         }
 
         let caller_session_sha256 = sha256_text(caller_session_id);
+        let existing_cross_device = tx
+            .query_row(
+                "SELECT session_ref FROM browser_cross_device_caller_sessions
+                 WHERE principal_ref = ?1 AND provider = ?2 AND caller_session_sha256 = ?3",
+                params![principal_ref, provider, caller_session_sha256],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                format!("cannot inspect cross-device browser caller-session rebind: {error}")
+            })?;
+        if existing_cross_device.is_some() {
+            return Err("browser_caller_session_conflict".to_owned());
+        }
         tx.execute(
             "INSERT INTO browser_caller_sessions(
                 principal_ref, provider, caller_session_sha256, session_ref,
@@ -4721,17 +4754,38 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn resolve_browser_caller_session(
-        &self,
+    /// Persist or update a cross-device caller-session correlation backed by
+    /// verified `relayed_source_turn` evidence (#775 / #921).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rebind_cross_device_browser_caller_session(
+        &mut self,
         principal_ref: &str,
         provider: &str,
         caller_session_id: &str,
-    ) -> Result<Option<String>, String> {
+        session_ref: &str,
+        owning_device_id: &str,
+        source_user_text_sha256: &str,
+        expected_generation: i64,
+        observed_at: i64,
+    ) -> Result<(), String> {
         validate_browser_ref_text(principal_ref, 256, "caller_principal_ref")?;
         validate_browser_token(provider, 32, "provider")?;
         validate_browser_ref_text(caller_session_id, 256, "caller_session")?;
+        validate_browser_ref_text(session_ref, 96, "session_ref")?;
+        validate_browser_ref_text(owning_device_id, 128, "owning_device_id")?;
+        validate_browser_digest(source_user_text_sha256, "source_user_text_sha256")?;
+        if expected_generation < 1 || observed_at < 0 {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+
         let caller_session_sha256 = sha256_text(caller_session_id);
-        self.conn
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                format!("cannot begin cross-device browser caller-session rebind: {error}")
+            })?;
+        let existing_local = tx
             .query_row(
                 "SELECT session_ref FROM browser_caller_sessions
                  WHERE principal_ref = ?1 AND provider = ?2 AND caller_session_sha256 = ?3",
@@ -4739,7 +4793,252 @@ impl StateStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(|error| format!("cannot resolve browser caller session: {error}"))
+            .map_err(|error| {
+                format!("cannot inspect local browser caller-session binding: {error}")
+            })?;
+        if existing_local.is_some() {
+            return Err("browser_caller_session_conflict".to_owned());
+        }
+        let existing_cross = tx
+            .query_row(
+                "SELECT session_ref, owning_device_id, expected_generation
+                 FROM browser_cross_device_caller_sessions
+                 WHERE principal_ref = ?1 AND provider = ?2 AND caller_session_sha256 = ?3",
+                params![principal_ref, provider, caller_session_sha256],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                format!("cannot inspect cross-device browser caller-session binding: {error}")
+            })?;
+        if let Some((bound_session_ref, bound_device_id, bound_generation)) = existing_cross {
+            if bound_session_ref != session_ref || bound_device_id != owning_device_id {
+                return Err("browser_caller_session_conflict".to_owned());
+            }
+            if expected_generation < bound_generation {
+                return Err("browser_current_turn_stale".to_owned());
+            }
+        }
+        tx.execute(
+            "INSERT INTO browser_cross_device_caller_sessions(
+                principal_ref, provider, caller_session_sha256, session_ref,
+                owning_device_id, source_user_text_sha256, expected_generation,
+                first_bound_at, last_bound_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             ON CONFLICT(principal_ref, provider, caller_session_sha256) DO UPDATE SET
+                source_user_text_sha256 = excluded.source_user_text_sha256,
+                expected_generation = excluded.expected_generation,
+                last_bound_at = MAX(browser_cross_device_caller_sessions.last_bound_at, excluded.last_bound_at)",
+            params![
+                principal_ref,
+                provider,
+                caller_session_sha256,
+                session_ref,
+                owning_device_id,
+                source_user_text_sha256,
+                expected_generation,
+                observed_at,
+            ],
+        )
+        .map_err(|error| format!("cannot rebind cross-device browser caller session: {error}"))?;
+        tx.commit().map_err(|error| {
+            format!("cannot commit cross-device browser caller-session rebind: {error}")
+        })?;
+        Ok(())
+    }
+
+    pub fn resolve_browser_caller_session(
+        &self,
+        principal_ref: &str,
+        provider: &str,
+        caller_session_id: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(self
+            .resolve_browser_caller_session_qualified(principal_ref, provider, caller_session_id)?
+            .map(|(session_ref, _)| session_ref))
+    }
+
+    /// Resolve a caller-session mapping to `(session_ref, owning_device_id)`
+    /// where `owning_device_id == None` denotes a local-device browser session
+    /// and `Some(device_id)` denotes a cross-device browser session (#775 / #921).
+    pub fn resolve_browser_caller_session_qualified(
+        &self,
+        principal_ref: &str,
+        provider: &str,
+        caller_session_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, String> {
+        validate_browser_ref_text(principal_ref, 256, "caller_principal_ref")?;
+        validate_browser_token(provider, 32, "provider")?;
+        validate_browser_ref_text(caller_session_id, 256, "caller_session")?;
+        let caller_session_sha256 = sha256_text(caller_session_id);
+        if let Some(session_ref) = self
+            .conn
+            .query_row(
+                "SELECT session_ref FROM browser_caller_sessions
+                 WHERE principal_ref = ?1 AND provider = ?2 AND caller_session_sha256 = ?3",
+                params![principal_ref, provider, caller_session_sha256],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve browser caller session: {error}"))?
+        {
+            return Ok(Some((session_ref, None)));
+        }
+        self.conn
+            .query_row(
+                "SELECT session_ref, owning_device_id FROM browser_cross_device_caller_sessions
+                 WHERE principal_ref = ?1 AND provider = ?2 AND caller_session_sha256 = ?3",
+                params![principal_ref, provider, caller_session_sha256],
+                |row| Ok((row.get::<_, String>(0)?, Some(row.get::<_, String>(1)?))),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve cross-device browser caller session: {error}"))
+    }
+
+    /// Persist the device-qualified parent session for an agent task (#775 / #921).
+    /// `parent_session_device_id == None` means local device (backward-compatible NULL).
+    pub fn record_agent_task_parent_session(
+        &mut self,
+        task_id: &str,
+        parent_session_ref: Option<&str>,
+        parent_session_device_id: Option<&str>,
+        updated_at: i64,
+    ) -> Result<(), String> {
+        validate_browser_ref_text(task_id, 128, "task_id")?;
+        if let Some(session_ref) = parent_session_ref {
+            validate_browser_ref_text(session_ref, 96, "parent_session_ref")?;
+        }
+        if let Some(device_id) = parent_session_device_id {
+            validate_browser_ref_text(device_id, 128, "parent_session_device_id")?;
+        }
+        self.conn
+            .execute(
+                "INSERT INTO agent_tasks (
+                    task_id, parent_session_ref, parent_session_device_id, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(task_id) DO UPDATE SET
+                    parent_session_ref = excluded.parent_session_ref,
+                    parent_session_device_id = excluded.parent_session_device_id,
+                    updated_at = MAX(agent_tasks.updated_at, excluded.updated_at)",
+                params![
+                    task_id,
+                    parent_session_ref,
+                    parent_session_device_id,
+                    updated_at
+                ],
+            )
+            .map_err(|error| format!("cannot record agent task parent session: {error}"))?;
+        Ok(())
+    }
+
+    /// Read `(parent_session_ref, parent_session_device_id)` for one agent task.
+    #[allow(clippy::type_complexity)]
+    pub fn agent_task_parent_session(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, String> {
+        validate_browser_ref_text(task_id, 128, "task_id")?;
+        self.conn
+            .query_row(
+                "SELECT parent_session_ref, parent_session_device_id
+                 FROM agent_tasks
+                 WHERE task_id = ?1",
+                params![task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read agent task parent session: {error}"))
+    }
+
+    /// Read `parent_session_device_id` when a task was bound to a cross-device parent session.
+    pub fn agent_task_parent_session_device_id(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(self
+            .agent_task_parent_session(task_id)?
+            .and_then(|(_, device_id)| device_id))
+    }
+
+    /// Build a non-secret `relayed_source_turn_candidate` metadata projection for
+    /// one observed browser session turn so Phase 2 Edge relay (#775) can forward
+    /// bounded digest evidence without raw prompt text.
+    pub fn relayed_source_turn_candidate(
+        &mut self,
+        session_ref: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<Option<serde_json::Value>, String> {
+        validate_browser_resource_ref(session_ref)?;
+        if now_ms < 0 || ttl_ms <= 0 || ttl_ms > BROWSER_SOURCE_TURN_RETENTION_MS {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+        self.prune_browser_source_turns(now_ms)?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT r.provider, r.endpoint_ref, r.observation_generation,
+                        s.expected_generation,
+                        CASE WHEN s.canonical_user_text_sha256 = s.user_text_sha256
+                             THEN s.user_text_sha256 ELSE '' END,
+                        s.observed_at
+                 FROM browser_resources r
+                 JOIN browser_source_turns s ON s.session_ref = r.resource_ref
+                 WHERE r.resource_ref = ?1 AND r.kind = 'session' AND s.observed_at <= ?2",
+                params![session_ref, now_ms],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read relayed source turn candidate: {error}"))?;
+        let Some((
+            provider,
+            endpoint_ref,
+            resource_generation,
+            expected_generation,
+            user_text_sha256,
+            observed_at,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        if user_text_sha256.is_empty() || resource_generation != expected_generation {
+            return Ok(None);
+        }
+        let expires_at = observed_at.saturating_add(ttl_ms);
+        if now_ms > expires_at {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::json!({
+            "session_ref": session_ref,
+            "endpoint_ref": endpoint_ref,
+            "provider": provider,
+            "user_text_sha256": user_text_sha256,
+            "observation_generation": expected_generation,
+            "expected_generation": expected_generation,
+            "observed_at": observed_at,
+            "expires_at": expires_at,
+            "ttl_ms": ttl_ms,
+        })))
     }
 
     /// Persist the latest observed user turn for one browser session.
@@ -11398,7 +11697,9 @@ mod tests {
         assert_eq!(
             new_tables,
             vec![
+                "agent_tasks",
                 "browser_caller_sessions",
+                "browser_cross_device_caller_sessions",
                 "browser_dispatches",
                 "browser_resource_locators",
                 "browser_session_archive_intents",
@@ -15685,6 +15986,143 @@ mod tests {
         drop(store);
 
         // 6. Rollback compatibility: a pinned v1.1.x schema-16 binary opens the same DB cleanly
+        let mut pinned_v1_1_conn = open_connection(Some(&path)).unwrap();
+        migrate_to(&mut pinned_v1_1_conn, 16, &MIGRATIONS[..16]).unwrap();
+        drop(pinned_v1_1_conn);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn agent_tasks_parent_session_device_id_migrates_losslessly_and_supports_v16_rollback() {
+        let path = temp_db_path();
+        {
+            let mut conn = open_connection(Some(&path)).unwrap();
+            migrate(&mut conn).unwrap();
+            // Simulate a pre-existing agent_tasks table without parent_session_device_id
+            conn.execute_batch(
+                "CREATE TABLE agent_tasks (
+                    task_id TEXT PRIMARY KEY NOT NULL,
+                    parent_session_ref TEXT,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO agent_tasks (task_id, parent_session_ref, updated_at)
+                VALUES ('task_local_legacy', 'br_local_session', 100);",
+            )
+            .unwrap();
+        }
+
+        let mut store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        // Existing local row preserves parent_session_device_id IS NULL
+        assert_eq!(
+            store
+                .agent_task_parent_session("task_local_legacy")
+                .unwrap(),
+            Some((Some("br_local_session".to_owned()), None))
+        );
+        assert_eq!(
+            store
+                .agent_task_parent_session_device_id("task_local_legacy")
+                .unwrap(),
+            None
+        );
+
+        // Record a cross-device parent session
+        store
+            .record_agent_task_parent_session(
+                "task_cross_device",
+                Some("br_remote_session"),
+                Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                200,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .agent_task_parent_session("task_cross_device")
+                .unwrap(),
+            Some((
+                Some("br_remote_session".to_owned()),
+                Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned())
+            ))
+        );
+        assert_eq!(
+            store
+                .agent_task_parent_session_device_id("task_cross_device")
+                .unwrap(),
+            Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned())
+        );
+
+        // Cross-device caller-session binding and conflict fencing
+        let digest = sha256_text("cross-device turn");
+        store
+            .rebind_cross_device_browser_caller_session(
+                "connector:conn_1",
+                "chatgpt",
+                "caller-session-1",
+                "br_remote_session",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                &digest,
+                5,
+                200,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_browser_caller_session_qualified(
+                    "connector:conn_1",
+                    "chatgpt",
+                    "caller-session-1"
+                )
+                .unwrap(),
+            Some((
+                "br_remote_session".to_owned(),
+                Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned())
+            ))
+        );
+        assert_eq!(
+            store
+                .resolve_browser_caller_session("connector:conn_1", "chatgpt", "caller-session-1")
+                .unwrap(),
+            Some("br_remote_session".to_owned())
+        );
+        // Stale generation is rejected
+        assert_eq!(
+            store
+                .rebind_cross_device_browser_caller_session(
+                    "connector:conn_1",
+                    "chatgpt",
+                    "caller-session-1",
+                    "br_remote_session",
+                    "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    &digest,
+                    4,
+                    201,
+                )
+                .unwrap_err(),
+            "browser_current_turn_stale"
+        );
+        // Different session or device on the same caller session is rejected as conflict
+        assert_eq!(
+            store
+                .rebind_cross_device_browser_caller_session(
+                    "connector:conn_1",
+                    "chatgpt",
+                    "caller-session-1",
+                    "br_other_session",
+                    "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    &digest,
+                    6,
+                    202,
+                )
+                .unwrap_err(),
+            "browser_caller_session_conflict"
+        );
+        drop(store);
+
+        // Pinned v1.1.x schema-16 binary opens the DB cleanly after rollback
         let mut pinned_v1_1_conn = open_connection(Some(&path)).unwrap();
         migrate_to(&mut pinned_v1_1_conn, 16, &MIGRATIONS[..16]).unwrap();
         drop(pinned_v1_1_conn);

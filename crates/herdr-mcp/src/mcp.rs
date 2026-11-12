@@ -147,6 +147,22 @@ pub struct BrowserCallerSessionIdentity {
     pub opaque_session_id: String,
 }
 
+pub const RELAYED_SOURCE_TURN_DEFAULT_TTL_MS: i64 = 10 * 60 * 1000;
+pub const RELAYED_SOURCE_TURN_MAX_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayedSourceTurnEvidence {
+    pub owning_device_id: String,
+    pub session_ref: String,
+    pub user_text_sha256: String,
+    pub expected_generation: i64,
+    pub observed_at: i64,
+    pub expires_at: i64,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_ref: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageAssistCallerGrant {
     pub endpoint_ref: String,
@@ -215,6 +231,9 @@ pub struct RuntimeContext<'a> {
     /// the source-turn evidence for this dispatch cannot exist in this runtime.
     /// Never used to fail a dispatch; only to skip a futile lookup.
     pub caller_browser_on_other_device: bool,
+    /// #775 / #921: privacy-preserving relayed source-turn evidence forwarded by
+    /// Edge when the caller browser is on another enrolled device.
+    pub caller_relayed_source_turn: Option<&'a RelayedSourceTurnEvidence>,
     pub caller_lease_holder_id: Option<&'a str>,
     pub caller_lease_epoch: Option<i64>,
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
@@ -239,6 +258,12 @@ enum AgentTaskParentSession {
     NotAttempted,
     /// Explicit or source-turn evidence resolved to a registered session.
     Bound(String),
+    /// Verified `relayed_source_turn` evidence resolved to a session on another
+    /// enrolled device (#775 / #921).
+    BoundCrossDevice {
+        session_ref: String,
+        owning_device_id: String,
+    },
     /// Binding was attempted but must not stamp; the fact reports the reason.
     Unbound(&'static str),
     /// The idempotency key is already known, so this call is a pure replay:
@@ -259,6 +284,15 @@ fn agent_task_parent_session_fact(
     match binding {
         AgentTaskParentSession::NotAttempted => None,
         AgentTaskParentSession::Bound(_) => Some(json!({"bound": true})),
+        AgentTaskParentSession::BoundCrossDevice {
+            session_ref,
+            owning_device_id,
+        } => Some(json!({
+            "bound": true,
+            "session_ref": session_ref,
+            "owning_device_id": owning_device_id,
+            "cross_device": true,
+        })),
         AgentTaskParentSession::Unbound(reason) => {
             let mut fact = json!({"bound": false, "reason": reason});
             if *reason == "source_session_not_registered" {
@@ -283,12 +317,19 @@ fn agent_task_parent_session_fact(
             Some(fact)
         }
         AgentTaskParentSession::Replay => result.get("task").map(|task| {
-            if task
-                .get("parent_session_ref")
-                .and_then(Value::as_str)
-                .is_some()
-            {
-                json!({"bound": true})
+            if let Some(session_ref) = task.get("parent_session_ref").and_then(Value::as_str) {
+                if let Some(owning_device_id) =
+                    task.get("parent_session_device_id").and_then(Value::as_str)
+                {
+                    json!({
+                        "bound": true,
+                        "session_ref": session_ref,
+                        "owning_device_id": owning_device_id,
+                        "cross_device": true,
+                    })
+                } else {
+                    json!({"bound": true})
+                }
             } else {
                 json!({"bound": false, "reason": "idempotent_replay"})
             }
@@ -314,6 +355,7 @@ fn source_turn_unbound_diagnostic(
             | "grant_missing"
             | "provider_generation_unknown"
             | "session_account_unavailable"
+            | "relayed_source_turn_provider_mismatch"
             | "binding_failed"
     ) {
         return None;
@@ -350,7 +392,12 @@ fn source_turn_unbound_diagnostic(
             }
         }
         _ => None,
-    };
+    }
+    .or_else(|| {
+        context
+            .caller_relayed_source_turn
+            .map(|relayed| relayed.user_text_sha256.clone())
+    });
     // The model does not reliably surface the diagnostic it receives in the
     // tool result, so the workstation log keeps the same non-secret facts
     // (#777). Message text is never logged.
@@ -433,20 +480,26 @@ fn source_turn_unbound_reason_for_caller(
     source_turn_unbound_reason(error)
 }
 
-fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
+fn prompt_parent_session_qualified(
+    context: &RuntimeContext<'_>,
+) -> Option<(String, Option<String>)> {
     let authorization = context.caller_webchat_authorization?;
     let caller_session = context.caller_browser_session?;
     context
         .state_store
         .lock()
         .ok()?
-        .resolve_browser_caller_session(
+        .resolve_browser_caller_session_qualified(
             &authorization.principal_ref,
             &caller_session.provider,
             &caller_session.opaque_session_id,
         )
         .ok()
         .flatten()
+}
+
+fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
+    prompt_parent_session_qualified(context).map(|(session_ref, _)| session_ref)
 }
 
 /// The `parent_session` fact for one public `herdr_prompt` call (#770).
@@ -507,7 +560,31 @@ fn explicit_agent_task_parent_session(
     };
     let session = match store.browser_resource(session_ref) {
         Ok(Some(session)) => session,
-        Ok(None) => return AgentTaskParentSession::Unbound("explicit_parent_session_unknown_ref"),
+        Ok(None) => {
+            if let (Some(authorization), Some(caller_session)) = (
+                context.caller_webchat_authorization,
+                context.caller_browser_session,
+            ) && webchat_adapter_binds_parent_session(&caller_session.provider)
+                && let Ok(Some((existing_ref, Some(owning_device_id)))) = store
+                    .resolve_browser_caller_session_qualified(
+                        &authorization.principal_ref,
+                        &caller_session.provider,
+                        &caller_session.opaque_session_id,
+                    )
+                && existing_ref == session_ref
+                && context.caller_webchat_control_grants.iter().any(|grant| {
+                    grant.endpoint_ref != WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
+                        && (grant.provider == caller_session.provider
+                            || grant.provider == WEBCHAT_CONTROL_ANY_PROVIDER)
+                })
+            {
+                return AgentTaskParentSession::BoundCrossDevice {
+                    session_ref: session_ref.to_owned(),
+                    owning_device_id,
+                };
+            }
+            return AgentTaskParentSession::Unbound("explicit_parent_session_unknown_ref");
+        }
         Err(_) => return AgentTaskParentSession::Unbound("explicit_parent_session_binding_failed"),
     };
     if session.kind != "session" {
@@ -572,6 +649,83 @@ fn explicit_agent_task_parent_session(
     }
 }
 
+fn relayed_source_turn_grant_covers(
+    grant: &BrowserCallerGrant,
+    relayed: &RelayedSourceTurnEvidence,
+) -> bool {
+    if grant.endpoint_ref.is_empty() || grant.endpoint_ref == WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
+    {
+        return false;
+    }
+    if let Some(endpoint_ref) = relayed.endpoint_ref.as_deref()
+        && grant.endpoint_ref != endpoint_ref
+    {
+        return false;
+    }
+    grant.provider == relayed.provider || grant.provider == WEBCHAT_CONTROL_ANY_PROVIDER
+}
+
+fn relayed_agent_task_parent_session(
+    context: &RuntimeContext<'_>,
+    current_user_message: &str,
+    relayed: &RelayedSourceTurnEvidence,
+) -> AgentTaskParentSession {
+    let Some(authorization) = context.caller_webchat_authorization else {
+        return AgentTaskParentSession::NotAttempted;
+    };
+    let Some(caller_session) = context.caller_browser_session else {
+        return AgentTaskParentSession::Unbound("caller_session_absent");
+    };
+    if !webchat_adapter_binds_parent_session(&caller_session.provider) {
+        return AgentTaskParentSession::Unbound("caller_session_absent");
+    }
+    if !webchat_adapter_binds_parent_session(&relayed.provider)
+        || caller_session.provider != relayed.provider
+    {
+        return AgentTaskParentSession::Unbound("relayed_source_turn_provider_mismatch");
+    }
+    let source_user_text_sha256 = source_turn_sha256(current_user_message);
+    if !source_user_text_sha256.eq_ignore_ascii_case(&relayed.user_text_sha256) {
+        return AgentTaskParentSession::Unbound("source_turn_not_found");
+    }
+    let now = browser_epoch_ms();
+    if relayed.expected_generation <= 0
+        || relayed.observed_at < 0
+        || relayed.expires_at < relayed.observed_at
+        || relayed.expires_at.saturating_sub(relayed.observed_at) > RELAYED_SOURCE_TURN_MAX_TTL_MS
+        || now < relayed.observed_at
+        || now > relayed.expires_at
+    {
+        return AgentTaskParentSession::Unbound("source_turn_stale");
+    }
+    let granted = context
+        .caller_webchat_control_grants
+        .iter()
+        .any(|grant| relayed_source_turn_grant_covers(grant, relayed));
+    if !granted {
+        return AgentTaskParentSession::Unbound("grant_missing");
+    }
+    let Ok(mut store) = context.state_store.lock() else {
+        return AgentTaskParentSession::Unbound("state_store_unavailable");
+    };
+    match store.rebind_cross_device_browser_caller_session(
+        &authorization.principal_ref,
+        &caller_session.provider,
+        &caller_session.opaque_session_id,
+        &relayed.session_ref,
+        &relayed.owning_device_id,
+        &source_user_text_sha256,
+        relayed.expected_generation,
+        now,
+    ) {
+        Ok(()) => AgentTaskParentSession::BoundCrossDevice {
+            session_ref: relayed.session_ref.clone(),
+            owning_device_id: relayed.owning_device_id.clone(),
+        },
+        Err(error) => AgentTaskParentSession::Unbound(source_turn_unbound_reason(&error)),
+    }
+}
+
 /// Resolve the `parent_session_ref` for one WebChat task dispatch.
 ///
 /// `current_user_message` is optional evidence: without it the dispatch keeps
@@ -592,11 +746,15 @@ fn agent_task_dispatch_parent_session(
         Ok(None) => return AgentTaskParentSession::NotAttempted,
         Err(()) => return AgentTaskParentSession::Unbound("current_user_message_invalid"),
     };
+    if let Some(relayed) = context.caller_relayed_source_turn {
+        return relayed_agent_task_parent_session(context, current_user_message, relayed);
+    }
     // #774: the Edge knows which enrolled device hosts the caller's browser. When
-    // it says another device, the source turn was written to that device's
-    // runtime only, so the lookup below cannot succeed here. Report the
-    // actionable reason before touching the store instead of a misleading
-    // `source_turn_not_found`; absent or same-device keeps today's behavior.
+    // it says another device and no relayed_source_turn is present (N-1 Edge),
+    // the source turn was written to that device's runtime only, so the lookup
+    // below cannot succeed here. Report the actionable reason before touching the
+    // store instead of a misleading `source_turn_not_found`; absent or same-device
+    // keeps today's behavior.
     if context.caller_browser_on_other_device {
         return AgentTaskParentSession::Unbound("caller_browser_on_other_device");
     }
@@ -688,6 +846,62 @@ fn agent_task_dispatch_parent_session(
         Ok(()) => AgentTaskParentSession::Bound(session_ref),
         Err(error) => AgentTaskParentSession::Unbound(source_turn_unbound_reason(&error)),
     }
+}
+
+fn record_and_enrich_dispatched_agent_task_parent_session(
+    context: &RuntimeContext<'_>,
+    parent_session_ref: Option<&str>,
+    parent_session_device_id: Option<&str>,
+    result: &mut Value,
+) {
+    if let Some(task_id) = result.pointer("/task/task_id").and_then(Value::as_str)
+        && let Ok(mut store) = context.state_store.lock()
+    {
+        let _ = store.record_agent_task_parent_session(
+            task_id,
+            parent_session_ref,
+            parent_session_device_id,
+            browser_epoch_ms(),
+        );
+    }
+    enrich_agent_task_parent_session_device_id(context, result);
+}
+
+pub(crate) fn enrich_agent_task_parent_session_device_id_from_store(
+    state_store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    result: &mut Value,
+) {
+    let Ok(store) = state_store.lock() else {
+        return;
+    };
+    let enrich_task_obj = |task_obj: &mut serde_json::Map<String, Value>| {
+        if let Some(task_id) = task_obj.get("task_id").and_then(Value::as_str)
+            && let Ok(Some(device_id)) = store.agent_task_parent_session_device_id(task_id)
+        {
+            task_obj.insert("parent_session_device_id".to_owned(), json!(device_id));
+        }
+    };
+    if let Some(Value::Object(task_obj)) = result.get_mut("task") {
+        enrich_task_obj(task_obj);
+    }
+    if let Some(Value::Array(tasks)) = result.get_mut("tasks") {
+        for task in tasks {
+            if let Value::Object(task_obj) = task {
+                enrich_task_obj(task_obj);
+            }
+        }
+    }
+    if let Some(Value::Array(running_tasks)) = result.get_mut("running_tasks") {
+        for task in running_tasks {
+            if let Value::Object(task_obj) = task {
+                enrich_task_obj(task_obj);
+            }
+        }
+    }
+}
+
+fn enrich_agent_task_parent_session_device_id(context: &RuntimeContext<'_>, result: &mut Value) {
+    enrich_agent_task_parent_session_device_id_from_store(context.state_store, result);
 }
 
 /// #834: attach the durable continuity chain that owns the conversation a
@@ -1198,10 +1412,21 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 } else {
                     agent_task_dispatch_parent_session(context, &params)
                 };
-                let parent_session_ref = match &binding {
-                    AgentTaskParentSession::Bound(session_ref) => Some(session_ref.clone()),
-                    AgentTaskParentSession::Unbound(_) | AgentTaskParentSession::Replay => None,
-                    AgentTaskParentSession::NotAttempted => prompt_parent_session_ref(context),
+                let (parent_session_ref, parent_session_device_id) = match &binding {
+                    AgentTaskParentSession::Bound(session_ref) => (Some(session_ref.clone()), None),
+                    AgentTaskParentSession::BoundCrossDevice {
+                        session_ref,
+                        owning_device_id,
+                    } => (Some(session_ref.clone()), Some(owning_device_id.clone())),
+                    AgentTaskParentSession::Unbound(_) | AgentTaskParentSession::Replay => {
+                        (None, None)
+                    }
+                    AgentTaskParentSession::NotAttempted => {
+                        match prompt_parent_session_qualified(context) {
+                            Some((session_ref, device_id)) => (Some(session_ref), device_id),
+                            None => (None, None),
+                        }
+                    }
                 };
                 // The turn text is binding evidence only; it must never travel
                 // into the prompt path that retains or traces the arguments.
@@ -1216,6 +1441,16 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &prompt_params,
                     parent_session_ref.as_deref(),
                 );
+                if matches!(binding, AgentTaskParentSession::Replay) {
+                    enrich_agent_task_parent_session_device_id(context, &mut result);
+                } else {
+                    record_and_enrich_dispatched_agent_task_parent_session(
+                        context,
+                        parent_session_ref.as_deref(),
+                        parent_session_device_id.as_deref(),
+                        &mut result,
+                    );
+                }
                 // #834: a durable dispatch binding also owns a durable continuity
                 // chain, so 接力 works without a separate explicit panel bind.
                 if let Some(session_ref) = parent_session_ref.as_deref() {
@@ -1237,7 +1472,14 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 {
                     json!({"ok": false, "code": "worker_report_requires_trusted_local"})
                 } else {
-                    prompt::task_call_with_parent_session(context.prompt, method, &params, None)
+                    let mut result = prompt::task_call_with_parent_session(
+                        context.prompt,
+                        method,
+                        &params,
+                        None,
+                    );
+                    enrich_agent_task_parent_session_device_id(context, &mut result);
+                    result
                 }
             } else if method == prompt::decision_gates::RESOLVE {
                 // No MCP principal, including trusted IPC and browser actuation,
@@ -1254,12 +1496,14 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 {
                     json!({"ok": false, "code": "agent_task_parent_unbound"})
                 } else {
-                    prompt::task_call_with_parent_session(
+                    let mut result = prompt::task_call_with_parent_session(
                         context.prompt,
                         method,
                         &params,
                         parent_session_ref.as_deref(),
-                    )
+                    );
+                    enrich_agent_task_parent_session_device_id(context, &mut result);
+                    result
                 }
             } else if method == pane_width::SPLIT_METHOD {
                 // A horizontal split must not create a pane whose agent output
@@ -1405,12 +1649,22 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             }
         }
         "herdr_prompt" => {
-            let parent_session_ref = prompt_parent_session_ref(context);
+            let (parent_session_ref, parent_session_device_id) =
+                match prompt_parent_session_qualified(context) {
+                    Some((session_ref, device_id)) => (Some(session_ref), device_id),
+                    None => (None, None),
+                };
             let mut result = prompt::run_with_parent_session(
                 context.client,
                 context.prompt,
                 &arguments,
                 parent_session_ref.as_deref(),
+            );
+            record_and_enrich_dispatched_agent_task_parent_session(
+                context,
+                parent_session_ref.as_deref(),
+                parent_session_device_id.as_deref(),
+                &mut result,
             );
             // #770: a WebChat caller must never be left silently unbound. The
             // fact is added to the unchanged prompt result; it never changes
@@ -27086,6 +27340,7 @@ mod tests {
             caller_browser_session: None,
             caller_page_assist_grants: &[],
             caller_browser_on_other_device: false,
+            caller_relayed_source_turn: None,
             caller_lease_holder_id: None,
             caller_lease_epoch: None,
             browser_actuator: None,
@@ -30567,6 +30822,7 @@ mod client_request_shape_matrix_tests {
             caller_browser_session: None,
             caller_page_assist_grants: &[],
             caller_browser_on_other_device: false,
+            caller_relayed_source_turn: None,
             caller_lease_holder_id: None,
             caller_lease_epoch: None,
             browser_actuator: None,
@@ -30856,6 +31112,7 @@ mod client_request_shape_matrix_tests {
                 caller_browser_session: None,
                 caller_page_assist_grants: &[],
                 caller_browser_on_other_device: false,
+                caller_relayed_source_turn: None,
                 caller_lease_holder_id: holder,
                 caller_lease_epoch: epoch,
                 browser_actuator: None,
