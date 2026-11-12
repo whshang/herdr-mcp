@@ -24,8 +24,15 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 pub(crate) mod decision_gates;
+pub mod mutation_leases;
 mod schema;
 pub(crate) mod work_journal;
+use mutation_leases::ensure_mutation_leases_auxiliary_schema;
+pub use mutation_leases::{
+    MutationLeaseAcquireInput, MutationLeaseAcquireOutcome, MutationLeaseEnforcementVerdict,
+    MutationLeaseRecord, MutationLeaseReleaseInput, MutationLeaseReleaseOutcome,
+    MutationLeaseRenewInput, MutationLeaseRenewOutcome,
+};
 use work_journal::ensure_work_journal_auxiliary_schema;
 
 use schema::{
@@ -833,6 +840,7 @@ impl StateStore {
             ensure_browser_dispatch_auxiliary_schema(&conn)?;
             ensure_browser_source_turn_auxiliary_schema(&conn)?;
             ensure_work_journal_auxiliary_schema(&conn)?;
+            ensure_mutation_leases_auxiliary_schema(&conn)?;
             // Durable residue from an account identity change is cleaned before
             // this process serves any canonical-URL lookup.
             retire_stale_browser_session_locators_in(&conn)?;
@@ -853,6 +861,7 @@ impl StateStore {
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
         ensure_browser_source_turn_auxiliary_schema(&conn)?;
         ensure_work_journal_auxiliary_schema(&conn)?;
+        ensure_mutation_leases_auxiliary_schema(&conn)?;
         retire_stale_browser_session_locators_in(&conn)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
@@ -882,6 +891,7 @@ impl StateStore {
         ensure_browser_dispatch_auxiliary_schema(&conn)?;
         ensure_browser_source_turn_auxiliary_schema(&conn)?;
         ensure_work_journal_auxiliary_schema(&conn)?;
+        ensure_mutation_leases_auxiliary_schema(&conn)?;
         retire_stale_browser_session_locators_in(&conn)?;
         Ok(Self {
             path: Some(path),
@@ -11394,6 +11404,7 @@ mod tests {
                 "browser_session_archive_intents",
                 "browser_session_reservations",
                 "browser_source_turns",
+                "mutation_leases",
                 "task_decision_gates",
                 "work_events",
                 "work_state"
@@ -15459,6 +15470,224 @@ mod tests {
             resolve(&mut store, &stale_turn).unwrap_err(),
             "browser_current_turn_not_found"
         );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn mutation_leases_fencing_conflict_expiry_and_v1_1_rollback_compatibility() {
+        let path = temp_db_path();
+        let mut store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+
+        // 1. Acquire lease on /repo for holder-a -> epoch 1
+        let acq1 = store
+            .acquire_mutation_lease(MutationLeaseAcquireInput {
+                project_root: "/repo",
+                lane_key: None,
+                holder_id: "holder-a",
+                ttl_seconds: Some(60),
+                workspace_id: Some("w1"),
+                pane_id: Some("w1:p1"),
+                branch: Some("feat/a"),
+                now_ms: 1_000,
+            })
+            .unwrap();
+        let lease1 = match acq1 {
+            MutationLeaseAcquireOutcome::Acquired { lease, reacquired } => {
+                assert!(!reacquired);
+                assert_eq!(lease.lease_epoch, 1);
+                assert_eq!(lease.lane_key, "*");
+                assert_eq!(lease.expires_at, 61_000);
+                lease
+            }
+            other => panic!("expected Acquired, got {other:?}"),
+        };
+
+        // 2. Idempotent re-acquire by same holder keeps epoch 1 and extends expiry
+        let re_acq = store
+            .acquire_mutation_lease(MutationLeaseAcquireInput {
+                project_root: "/repo",
+                lane_key: Some("*"),
+                holder_id: "holder-a",
+                ttl_seconds: Some(120),
+                workspace_id: None,
+                pane_id: None,
+                branch: None,
+                now_ms: 5_000,
+            })
+            .unwrap();
+        match re_acq {
+            MutationLeaseAcquireOutcome::Acquired { lease, reacquired } => {
+                assert!(reacquired);
+                assert_eq!(lease.lease_epoch, 1);
+                assert_eq!(lease.expires_at, 125_000);
+                assert_eq!(lease.workspace_id.as_deref(), Some("w1"));
+            }
+            other => panic!("expected reacquired, got {other:?}"),
+        }
+
+        // 3. Another holder attempting acquire while active gets deterministic Conflict
+        let conflict = store
+            .acquire_mutation_lease(MutationLeaseAcquireInput {
+                project_root: "/repo",
+                lane_key: None,
+                holder_id: "holder-b",
+                ttl_seconds: Some(60),
+                workspace_id: Some("w2"),
+                pane_id: None,
+                branch: None,
+                now_ms: 10_000,
+            })
+            .unwrap();
+        match conflict {
+            MutationLeaseAcquireOutcome::Conflict { active_lease } => {
+                assert_eq!(active_lease.holder_id, "holder-a");
+                assert_eq!(active_lease.lease_epoch, 1);
+                assert_eq!(active_lease.workspace_id.as_deref(), Some("w1"));
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // 4. Renew fenced on (holder_id, lease_epoch)
+        let renew_wrong_holder = store
+            .renew_mutation_lease(MutationLeaseRenewInput {
+                project_root: "/repo",
+                lane_key: None,
+                holder_id: "holder-b",
+                lease_epoch: 1,
+                ttl_seconds: Some(60),
+                now_ms: 20_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            renew_wrong_holder,
+            MutationLeaseRenewOutcome::Conflict {
+                reason: "lease_held_by_other",
+                ..
+            }
+        ));
+
+        let renew_ok = store
+            .renew_mutation_lease(MutationLeaseRenewInput {
+                project_root: "/repo",
+                lane_key: None,
+                holder_id: "holder-a",
+                lease_epoch: 1,
+                ttl_seconds: Some(60),
+                now_ms: 100_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            renew_ok,
+            MutationLeaseRenewOutcome::Renewed(ref r) if r.expires_at == 160_000 && r.lease_epoch == 1
+        ));
+
+        // 5. Expiry releases lease; next acquire advances monotonic lease_epoch to 2
+        let acq2 = store
+            .acquire_mutation_lease(MutationLeaseAcquireInput {
+                project_root: "/repo",
+                lane_key: None,
+                holder_id: "holder-b",
+                ttl_seconds: Some(30),
+                workspace_id: Some("w2"),
+                pane_id: Some("w2:p1"),
+                branch: Some("feat/b"),
+                now_ms: 160_001,
+            })
+            .unwrap();
+        match acq2 {
+            MutationLeaseAcquireOutcome::Acquired { lease, reacquired } => {
+                assert!(!reacquired);
+                assert_eq!(lease.holder_id, "holder-b");
+                assert_eq!(lease.lease_epoch, 2);
+            }
+            other => panic!("expected Acquired epoch 2, got {other:?}"),
+        }
+
+        // Stale holder-a at epoch 1 is fenced out of renew, release, and root path check
+        let stale_check = store
+            .check_root_mutation_lease_for_path(
+                "/repo/src/lib.rs",
+                Some("holder-a"),
+                Some(lease1.lease_epoch),
+                false,
+                165_000,
+            )
+            .unwrap();
+        assert!(matches!(
+            stale_check,
+            MutationLeaseEnforcementVerdict::Conflict {
+                reason: "lease_held_by_other",
+                ref active_lease,
+            } if active_lease.holder_id == "holder-b" && active_lease.lease_epoch == 2
+        ));
+
+        // Active holder-b with epoch 2 is allowed
+        let active_check = store
+            .check_root_mutation_lease_for_path(
+                "/repo/src/lib.rs",
+                Some("holder-b"),
+                Some(2),
+                false,
+                165_000,
+            )
+            .unwrap();
+        assert!(matches!(
+            active_check,
+            MutationLeaseEnforcementVerdict::Allowed {
+                matched_lease: Some(ref m)
+            } if m.lease_epoch == 2
+        ));
+
+        // Release by holder-b at epoch 2, then re-acquire advances epoch to 3
+        let rel = store
+            .release_mutation_lease(MutationLeaseReleaseInput {
+                project_root: "/repo",
+                lane_key: None,
+                holder_id: "holder-b",
+                lease_epoch: 2,
+                now_ms: 170_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            rel,
+            MutationLeaseReleaseOutcome::Released {
+                idempotent_replay: false,
+                ..
+            }
+        ));
+        assert!(
+            store
+                .list_active_mutation_leases(Some("/repo"), None, 170_000)
+                .unwrap()
+                .is_empty()
+        );
+
+        let acq3 = store
+            .acquire_mutation_lease(MutationLeaseAcquireInput {
+                project_root: "/repo",
+                lane_key: None,
+                holder_id: "holder-a",
+                ttl_seconds: Some(30),
+                workspace_id: None,
+                pane_id: None,
+                branch: None,
+                now_ms: 171_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            acq3,
+            MutationLeaseAcquireOutcome::Acquired { ref lease, .. } if lease.lease_epoch == 3
+        ));
+        drop(store);
+
+        // 6. Rollback compatibility: a pinned v1.1.x schema-16 binary opens the same DB cleanly
+        let mut pinned_v1_1_conn = open_connection(Some(&path)).unwrap();
+        migrate_to(&mut pinned_v1_1_conn, 16, &MIGRATIONS[..16]).unwrap();
+        drop(pinned_v1_1_conn);
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
