@@ -237,6 +237,7 @@ pub struct RuntimeContext<'a> {
     pub caller_relayed_source_turn: Option<&'a RelayedSourceTurnEvidence>,
     pub caller_lease_holder_id: Option<&'a str>,
     pub caller_lease_epoch: Option<i64>,
+    pub caller_lease_token: Option<&'a str>,
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
@@ -1654,7 +1655,16 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 route_fs_git("fs_patch", &context.cache.snapshot(), &clean)
             }
         }
-        "herdr_git" => route_fs_git("git", &context.cache.snapshot(), &arguments),
+        "herdr_git" => {
+            if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_git", &arguments, None)
+            {
+                conflict
+            } else {
+                let clean = strip_lease_credential_fields(&arguments);
+                route_fs_git("git", &context.cache.snapshot(), &clean)
+            }
+        }
         "herdr_exec_start" => {
             if let Some(conflict) =
                 check_mutating_tool_root_lease(context, "herdr_exec_start", &arguments, None)
@@ -2098,20 +2108,26 @@ fn strip_lease_credential_fields(arguments: &Value) -> Value {
     let Some(map) = arguments.as_object() else {
         return arguments.clone();
     };
-    if !map.contains_key("lease_holder_id") && !map.contains_key("lease_epoch") {
+    if !map.contains_key("lease_holder_id")
+        && !map.contains_key("lease_epoch")
+        && !map.contains_key("lease_token")
+    {
         return arguments.clone();
     }
     let mut cleaned = map.clone();
     cleaned.remove("lease_holder_id");
     cleaned.remove("lease_epoch");
+    cleaned.remove("lease_token");
     Value::Object(cleaned)
 }
+
+type CallerLeaseCredentials = (Option<String>, Option<i64>, Option<String>, bool);
 
 fn extract_caller_lease_credentials(
     context: &RuntimeContext<'_>,
     primary_args: &Value,
     secondary_args: Option<&Value>,
-) -> Result<(Option<String>, Option<i64>, bool), Value> {
+) -> Result<CallerLeaseCredentials, Value> {
     let extract_holder = |val: &Value| -> Result<Option<String>, Value> {
         let Some(raw) = val.get("lease_holder_id").or_else(|| val.get("holder_id")) else {
             return Ok(None);
@@ -2148,6 +2164,28 @@ fn extract_caller_lease_credentials(
         };
         Ok(Some(epoch))
     };
+    let extract_token = |val: &Value| -> Result<Option<String>, Value> {
+        let Some(raw) = val.get("lease_token") else {
+            return Ok(None);
+        };
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let Some(text) = raw
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control))
+        else {
+            return Err(json!({
+                "ok": false,
+                "code": "invalid_params",
+                "retryable": false,
+                "delivery_state": "not_delivered",
+                "message": "lease_token must be a non-empty string up to 256 bytes",
+            }));
+        };
+        Ok(Some(text.to_owned()))
+    };
 
     let explicit_holder = match extract_holder(primary_args)? {
         Some(holder) => Some(holder),
@@ -2167,13 +2205,22 @@ fn extract_caller_lease_credentials(
     }
     .or(context.caller_lease_epoch);
 
+    let explicit_token = match extract_token(primary_args)? {
+        Some(token) => Some(token),
+        None => match secondary_args {
+            Some(sec) => extract_token(sec)?,
+            None => None,
+        },
+    }
+    .or_else(|| context.caller_lease_token.map(str::to_owned));
+
     if let Some(holder) = explicit_holder {
-        return Ok((Some(holder), explicit_epoch, false));
+        return Ok((Some(holder), explicit_epoch, explicit_token, false));
     }
     if let Some(session_holder) = caller_bound_session_lease_holder(context) {
-        return Ok((Some(session_holder), explicit_epoch, true));
+        return Ok((Some(session_holder), explicit_epoch, explicit_token, true));
     }
-    Ok((None, explicit_epoch, false))
+    Ok((None, explicit_epoch, explicit_token, false))
 }
 
 fn format_mutation_lease_conflict(
@@ -2244,6 +2291,7 @@ fn orchestration_lease_call(
                 "lane_key",
                 "holder_id",
                 "lease_holder_id",
+                "lease_token",
                 "ttl_seconds",
                 "workspace_id",
                 "pane_id",
@@ -2284,13 +2332,13 @@ fn orchestration_lease_call(
                     });
                 }
             };
-            let holder_id = match extract_caller_lease_credentials(
+            let (holder_id, token_opt) = match extract_caller_lease_credentials(
                 context,
                 params,
                 Some(outer_arguments),
             ) {
-                Ok((Some(holder), _, _)) => holder,
-                Ok((None, _, _)) => {
+                Ok((Some(holder), _, token_opt, _)) => (holder, token_opt),
+                Ok((None, _, _, _)) => {
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
@@ -2345,31 +2393,44 @@ fn orchestration_lease_call(
                 project_root,
                 lane_key,
                 holder_id: &holder_id,
+                lease_token: token_opt.as_deref(),
                 ttl_seconds,
                 workspace_id,
                 pane_id,
                 branch,
                 now_ms,
             }) {
-                Ok(MutationLeaseAcquireOutcome::Acquired { lease, reacquired }) => json!({
-                    "ok": true,
-                    "acquired": true,
-                    "reacquired": reacquired,
-                    "project_root": lease.project_root,
-                    "lane_key": lease.lane_key,
-                    "holder_id": lease.holder_id,
-                    "lease_epoch": lease.lease_epoch,
-                    "workspace_id": lease.workspace_id,
-                    "pane_id": lease.pane_id,
-                    "branch": lease.branch,
-                    "acquired_at": lease.acquired_at,
-                    "updated_at": lease.updated_at,
-                    "expires_at": lease.expires_at,
-                    "lease": lease,
-                }),
-                Ok(MutationLeaseAcquireOutcome::Conflict { active_lease }) => {
-                    format_mutation_lease_conflict("lease_held_by_other", Some(&active_lease))
+                Ok(MutationLeaseAcquireOutcome::Acquired {
+                    lease,
+                    lease_token,
+                    reacquired,
+                }) => {
+                    let mut lease_obj = serde_json::to_value(&lease).unwrap_or_else(|_| json!({}));
+                    if let Some(obj) = lease_obj.as_object_mut() {
+                        obj.insert("lease_token".to_owned(), json!(lease_token));
+                    }
+                    json!({
+                        "ok": true,
+                        "acquired": true,
+                        "reacquired": reacquired,
+                        "project_root": lease.project_root,
+                        "lane_key": lease.lane_key,
+                        "holder_id": lease.holder_id,
+                        "lease_epoch": lease.lease_epoch,
+                        "lease_token": lease_token,
+                        "workspace_id": lease.workspace_id,
+                        "pane_id": lease.pane_id,
+                        "branch": lease.branch,
+                        "acquired_at": lease.acquired_at,
+                        "updated_at": lease.updated_at,
+                        "expires_at": lease.expires_at,
+                        "lease": lease_obj,
+                    })
                 }
+                Ok(MutationLeaseAcquireOutcome::Conflict {
+                    reason,
+                    active_lease,
+                }) => format_mutation_lease_conflict(reason, Some(&active_lease)),
                 Err(message) => json!({
                     "ok": false,
                     "code": "invalid_params",
@@ -2385,6 +2446,7 @@ fn orchestration_lease_call(
                 "holder_id",
                 "lease_holder_id",
                 "lease_epoch",
+                "lease_token",
                 "ttl_seconds",
             ];
             for key in object.keys() {
@@ -2422,7 +2484,7 @@ fn orchestration_lease_call(
                     });
                 }
             };
-            let (holder_opt, epoch_opt, _) =
+            let (holder_opt, epoch_opt, token_opt, _) =
                 match extract_caller_lease_credentials(context, params, Some(outer_arguments)) {
                     Ok(creds) => creds,
                     Err(invalid) => return invalid,
@@ -2465,24 +2527,32 @@ fn orchestration_lease_call(
                 lane_key,
                 holder_id: &holder_id,
                 lease_epoch,
+                lease_token: token_opt.as_deref(),
                 ttl_seconds,
                 now_ms,
             }) {
-                Ok(MutationLeaseRenewOutcome::Renewed(lease)) => json!({
-                    "ok": true,
-                    "renewed": true,
-                    "project_root": lease.project_root,
-                    "lane_key": lease.lane_key,
-                    "holder_id": lease.holder_id,
-                    "lease_epoch": lease.lease_epoch,
-                    "workspace_id": lease.workspace_id,
-                    "pane_id": lease.pane_id,
-                    "branch": lease.branch,
-                    "acquired_at": lease.acquired_at,
-                    "updated_at": lease.updated_at,
-                    "expires_at": lease.expires_at,
-                    "lease": lease,
-                }),
+                Ok(MutationLeaseRenewOutcome::Renewed { lease, lease_token }) => {
+                    let mut lease_obj = serde_json::to_value(&lease).unwrap_or_else(|_| json!({}));
+                    if let Some(obj) = lease_obj.as_object_mut() {
+                        obj.insert("lease_token".to_owned(), json!(lease_token));
+                    }
+                    json!({
+                        "ok": true,
+                        "renewed": true,
+                        "project_root": lease.project_root,
+                        "lane_key": lease.lane_key,
+                        "holder_id": lease.holder_id,
+                        "lease_epoch": lease.lease_epoch,
+                        "lease_token": lease_token,
+                        "workspace_id": lease.workspace_id,
+                        "pane_id": lease.pane_id,
+                        "branch": lease.branch,
+                        "acquired_at": lease.acquired_at,
+                        "updated_at": lease.updated_at,
+                        "expires_at": lease.expires_at,
+                        "lease": lease_obj,
+                    })
+                }
                 Ok(MutationLeaseRenewOutcome::Conflict {
                     reason,
                     active_lease,
@@ -2502,6 +2572,7 @@ fn orchestration_lease_call(
                 "holder_id",
                 "lease_holder_id",
                 "lease_epoch",
+                "lease_token",
             ];
             for key in object.keys() {
                 if !ALLOWED.contains(&key.as_str()) {
@@ -2538,7 +2609,7 @@ fn orchestration_lease_call(
                     });
                 }
             };
-            let (holder_opt, epoch_opt, _) =
+            let (holder_opt, epoch_opt, token_opt, _) =
                 match extract_caller_lease_credentials(context, params, Some(outer_arguments)) {
                     Ok(creds) => creds,
                     Err(invalid) => return invalid,
@@ -2567,6 +2638,7 @@ fn orchestration_lease_call(
                 lane_key,
                 holder_id: &holder_id,
                 lease_epoch,
+                lease_token: token_opt.as_deref(),
                 now_ms,
             }) {
                 Ok(MutationLeaseReleaseOutcome::Released {
@@ -2712,34 +2784,41 @@ fn check_mutating_tool_root_lease(
     arguments: &Value,
     outer_arguments: Option<&Value>,
 ) -> Option<Value> {
-    match tool_or_method {
-        "herdr_fs_patch"
-            if arguments
-                .get("dry_run")
-                .and_then(Value::as_bool)
-                .unwrap_or(false) =>
-        {
+    if tool_or_method == "herdr_git" {
+        let action = arguments
+            .get("action")
+            .or_else(|| arguments.get("subcommand"))
+            .or_else(|| arguments.get("command"))
+            .and_then(Value::as_str)
+            .map(str::trim);
+        if matches!(action, Some("status" | "diff" | "log" | "identity")) {
             return None;
         }
-        "herdr_exec" if arguments.get("intent").and_then(Value::as_str) == Some("read_only") => {
-            return None;
-        }
-        _ => {}
     }
 
     let now_ms = mutation_lease_now_ms();
     // Fast path: if no root leases (`lane_key == "*"`) are active in the store,
     // return `None` immediately with zero path canonicalization or snapshot work.
-    {
+    // Any store lock or query failure MUST fail closed rather than allowing mutations.
+    let active_roots = {
         let Ok(store) = context.state_store.lock() else {
-            return None;
+            return Some(format_mutation_lease_conflict(
+                "lease_store_unavailable",
+                None,
+            ));
         };
-        let Ok(active_roots) = store.list_active_mutation_leases(None, Some("*"), now_ms) else {
-            return None;
-        };
-        if active_roots.is_empty() {
-            return None;
+        match store.list_active_mutation_leases(None, Some("*"), now_ms) {
+            Ok(roots) => roots,
+            Err(_) => {
+                return Some(format_mutation_lease_conflict(
+                    "lease_store_unavailable",
+                    None,
+                ));
+            }
         }
+    };
+    if active_roots.is_empty() {
+        return None;
     }
 
     let candidate_paths: Vec<String> = match tool_or_method {
@@ -2750,6 +2829,13 @@ fn check_mutating_tool_root_lease(
             .unwrap_or_default(),
         "herdr_fs_patch" | "herdr_exec_start" => arguments
             .get("root")
+            .and_then(Value::as_str)
+            .map(|s| vec![s.to_owned()])
+            .unwrap_or_default(),
+        "herdr_git" => arguments
+            .get("root")
+            .or_else(|| arguments.get("project_root"))
+            .or_else(|| arguments.get("path"))
             .and_then(Value::as_str)
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default(),
@@ -2776,30 +2862,46 @@ fn check_mutating_tool_root_lease(
     };
 
     if candidate_paths.is_empty() {
-        return None;
+        return Some(format_mutation_lease_conflict(
+            "lease_target_path_invalid",
+            active_roots.first(),
+        ));
     }
 
-    let (holder_opt, epoch_opt, session_bound) =
+    let (holder_opt, epoch_opt, token_opt, session_bound) =
         match extract_caller_lease_credentials(context, arguments, outer_arguments) {
             Ok(creds) => creds,
             Err(invalid) => return Some(invalid),
         };
 
     let Ok(store) = context.state_store.lock() else {
-        return None;
+        return Some(format_mutation_lease_conflict(
+            "lease_store_unavailable",
+            active_roots.first(),
+        ));
     };
     for path in &candidate_paths {
-        if let Ok(MutationLeaseEnforcementVerdict::Conflict {
-            reason,
-            active_lease,
-        }) = store.check_root_mutation_lease_for_path(
+        match store.check_root_mutation_lease_for_path(
             path,
             holder_opt.as_deref(),
             epoch_opt,
+            token_opt.as_deref(),
             session_bound,
             now_ms,
         ) {
-            return Some(format_mutation_lease_conflict(reason, Some(&active_lease)));
+            Ok(MutationLeaseEnforcementVerdict::Allowed { .. }) => {}
+            Ok(MutationLeaseEnforcementVerdict::Conflict {
+                reason,
+                active_lease,
+            }) => {
+                return Some(format_mutation_lease_conflict(reason, Some(&active_lease)));
+            }
+            Err(_) => {
+                return Some(format_mutation_lease_conflict(
+                    "lease_target_path_invalid",
+                    active_roots.first(),
+                ));
+            }
         }
     }
     None
@@ -27405,6 +27507,7 @@ mod tests {
             caller_relayed_source_turn: None,
             caller_lease_holder_id: None,
             caller_lease_epoch: None,
+            caller_lease_token: None,
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,
@@ -30970,6 +31073,7 @@ mod client_request_shape_matrix_tests {
             caller_relayed_source_turn: None,
             caller_lease_holder_id: None,
             caller_lease_epoch: None,
+            caller_lease_token: None,
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,
@@ -31244,28 +31348,30 @@ mod client_request_shape_matrix_tests {
         let state_store =
             std::sync::Arc::new(std::sync::Mutex::new(StateStore::open(":memory:").unwrap()));
 
-        let make_ctx = |holder: Option<&'static str>, epoch: Option<i64>| -> RuntimeContext<'_> {
-            RuntimeContext {
-                client: &client,
-                cache: &cache,
-                exec: &exec,
-                prompt: &prompt,
-                skill: &skill,
-                state_store: &state_store,
-                caller_webchat_control_grants: &[],
-                caller_webchat_authorization: None,
-                caller_browser_session: None,
-                caller_page_assist_grants: &[],
-                caller_browser_on_other_device: false,
-                caller_relayed_source_turn: None,
-                caller_lease_holder_id: holder,
-                caller_lease_epoch: epoch,
-                browser_actuator: None,
-                browser_mutation_gate: None,
-                browser_mutation_admission: None,
-                trusted_local_ipc: false,
-            }
-        };
+        let make_ctx =
+            |holder: Option<&'static str>, epoch: Option<i64>, token: Option<&'static str>| {
+                RuntimeContext {
+                    client: &client,
+                    cache: &cache,
+                    exec: &exec,
+                    prompt: &prompt,
+                    skill: &skill,
+                    state_store: &state_store,
+                    caller_webchat_control_grants: &[],
+                    caller_webchat_authorization: None,
+                    caller_browser_session: None,
+                    caller_page_assist_grants: &[],
+                    caller_browser_on_other_device: false,
+                    caller_relayed_source_turn: None,
+                    caller_lease_holder_id: holder,
+                    caller_lease_epoch: epoch,
+                    caller_lease_token: token,
+                    browser_actuator: None,
+                    browser_mutation_gate: None,
+                    browser_mutation_admission: None,
+                    trusted_local_ipc: false,
+                }
+            };
 
         let parse_tool_payload = |resp: &Value| -> Value {
             let text = resp
@@ -31276,7 +31382,7 @@ mod client_request_shape_matrix_tests {
         };
 
         // 1. Discoverability via herdr_methods
-        let ctx_anon = make_ctx(None, None);
+        let ctx_anon = make_ctx(None, None, None);
         let methods_resp = handle(
             &json!({
                 "jsonrpc": "2.0",
@@ -31315,7 +31421,7 @@ mod client_request_shape_matrix_tests {
         assert_eq!(parse_tool_payload(&unleased_write)["ok"], true);
         assert_eq!(std::fs::read_to_string(&target_file).unwrap(), "v1\n");
 
-        // 3. Acquire root lease for lane-a -> epoch 1
+        // 3. Acquire root lease for lane-a -> epoch 1 + unpredictable lease_token
         let acq_resp = handle(
             &json!({
                 "jsonrpc": "2.0",
@@ -31342,8 +31448,14 @@ mod client_request_shape_matrix_tests {
         let acq_payload = parse_tool_payload(&acq_resp);
         assert_eq!(acq_payload["ok"], true);
         assert_eq!(acq_payload["lease_epoch"], 1);
+        let lane_a_token = acq_payload["lease_token"]
+            .as_str()
+            .expect("acquire must return unpredictable lease_token")
+            .to_owned();
+        assert!(lane_a_token.starts_with("mlt_") && lane_a_token.len() == 68);
 
         // 4. Conflicting acquire from lane-b fails closed with single_writer_lease_conflict
+        // and NEVER leaks lease_token or lease_token_sha256
         let conflict_acq = handle(
             &json!({
                 "jsonrpc": "2.0",
@@ -31369,10 +31481,83 @@ mod client_request_shape_matrix_tests {
         assert_eq!(conflict_payload["code"], "single_writer_lease_conflict");
         assert_eq!(conflict_payload["holder_id"], "lane-a");
         assert_eq!(conflict_payload["lease_epoch"], 1);
+        assert!(conflict_payload.get("lease_token").is_none());
+        assert!(conflict_payload.get("lease_token_sha256").is_none());
+        assert!(
+            conflict_payload["active_lease"]
+                .get("lease_token")
+                .is_none()
+        );
+        assert!(!conflict_payload.to_string().contains(&lane_a_token));
 
-        // 5. Mutating tools (herdr_fs_write, herdr_fs_edit, herdr_fs_patch, herdr_exec_start, herdr_exec)
+        // 4b. P1-1 Replay attack prevention: attacker spoofing holder_id="lane-a" and lease_epoch=1
+        // (copied from conflict or lease.list) without lane_a_token is rejected on acquire, renew, release, and write!
+        let spoofed_reacquire = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": ORCHESTRATION_LEASE_ACQUIRE_METHOD,
+                        "params": {
+                            "project_root": repo_str,
+                            "holder_id": "lane-a",
+                            "ttl_seconds": 60
+                        }
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        let spoofed_reacquire_payload = parse_tool_payload(&spoofed_reacquire);
+        assert_eq!(spoofed_reacquire_payload["ok"], false);
+        assert_eq!(
+            spoofed_reacquire_payload["code"],
+            "single_writer_lease_conflict"
+        );
+        assert_eq!(
+            spoofed_reacquire_payload["conflict_reason"],
+            "lease_token_required"
+        );
+
+        let ctx_spoofed_lane_a = make_ctx(Some("lane-a"), Some(1), Some("mlt_forged_wrong_token"));
+        let spoofed_write = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_fs_write",
+                    "arguments": {
+                        "path": target_file.to_string_lossy(),
+                        "content": "forged\n",
+                        "overwrite": true,
+                        "confirm_dirty": true
+                    }
+                }
+            }),
+            &ctx_spoofed_lane_a,
+        )
+        .unwrap();
+        let spoofed_write_payload = parse_tool_payload(&spoofed_write);
+        assert_eq!(spoofed_write_payload["ok"], false);
+        assert_eq!(
+            spoofed_write_payload["code"],
+            "single_writer_lease_conflict"
+        );
+        assert_eq!(
+            spoofed_write_payload["conflict_reason"],
+            "lease_token_invalid"
+        );
+
+        // 5. Mutating tools (herdr_fs_write, herdr_fs_edit, herdr_fs_patch, herdr_exec_start, herdr_exec,
+        // including P1-2 `..` path traversal, P1-3 `herdr_exec intent=read_only`, and P1-3 `herdr_git` mutating actions)
         // from lane-b or anonymous caller fail closed BEFORE touching disk/process
-        let ctx_lane_b = make_ctx(Some("lane-b"), Some(1));
+        let traversal_target = format!("{repo_str}/sub/../hello.txt");
+        let ctx_lane_b = make_ctx(Some("lane-b"), Some(1), Some("mlt_b"));
         for (req_id, tool_name, tool_args) in [
             (
                 51,
@@ -31380,6 +31565,16 @@ mod client_request_shape_matrix_tests {
                 json!({
                     "path": target_file.to_string_lossy(),
                     "content": "hacked\n",
+                    "overwrite": true,
+                    "confirm_dirty": true
+                }),
+            ),
+            (
+                511,
+                "herdr_fs_write",
+                json!({
+                    "path": traversal_target,
+                    "content": "hacked-via-dotdot\n",
                     "overwrite": true,
                     "confirm_dirty": true
                 }),
@@ -31422,6 +31617,32 @@ mod client_request_shape_matrix_tests {
                     "idempotency_key": "exec-conflict-1"
                 }),
             ),
+            (
+                56,
+                "herdr_exec",
+                json!({
+                    "workspace": "w1",
+                    "project_root": repo_str,
+                    "command": "echo should-not-run > hacked.txt",
+                    "intent": "read_only"
+                }),
+            ),
+            (
+                57,
+                "herdr_git",
+                json!({
+                    "root": repo_str,
+                    "action": "commit"
+                }),
+            ),
+            (
+                58,
+                "herdr_git",
+                json!({
+                    "root": format!("{repo_str}/sub/.."),
+                    "action": "checkout"
+                }),
+            ),
         ] {
             let blocked = handle(
                 &json!({
@@ -31437,21 +31658,45 @@ mod client_request_shape_matrix_tests {
             )
             .unwrap();
             let payload = parse_tool_payload(&blocked);
-            assert_eq!(payload["ok"], false, "{tool_name}");
+            assert_eq!(payload["ok"], false, "{tool_name} ({req_id})");
             assert_eq!(
                 payload["code"], "single_writer_lease_conflict",
-                "{tool_name}"
+                "{tool_name} ({req_id})"
             );
-            assert_eq!(payload["retryable"], false, "{tool_name}");
-            assert_eq!(payload["delivery_state"], "not_delivered", "{tool_name}");
-            assert_eq!(payload["holder_id"], "lane-a", "{tool_name}");
-            assert_eq!(payload["lease_epoch"], 1, "{tool_name}");
+            assert_eq!(payload["retryable"], false, "{tool_name} ({req_id})");
+            assert_eq!(
+                payload["delivery_state"], "not_delivered",
+                "{tool_name} ({req_id})"
+            );
+            assert_eq!(payload["holder_id"], "lane-a", "{tool_name} ({req_id})");
+            assert_eq!(payload["lease_epoch"], 1, "{tool_name} ({req_id})");
+            assert!(payload.get("lease_token").is_none());
         }
         assert_eq!(std::fs::read_to_string(&target_file).unwrap(), "v1\n");
         assert!(!repo_root.join("hacked.txt").exists());
 
-        // 6. Owner lane-a with matching (holder_id, lease_epoch) succeeds
-        let ctx_lane_a = make_ctx(Some("lane-a"), Some(1));
+        // Read-only herdr_git (status) remains allowed without write lease credentials
+        let git_status_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 59,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_git",
+                    "arguments": {
+                        "root": repo_str,
+                        "action": "status"
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        assert_eq!(parse_tool_payload(&git_status_resp)["ok"], true);
+
+        // 6. Owner lane-a with matching (holder_id, lease_epoch, lease_token) succeeds
+        let lane_a_token_static: &'static str = Box::leak(lane_a_token.clone().into_boxed_str());
+        let ctx_lane_a = make_ctx(Some("lane-a"), Some(1), Some(lane_a_token_static));
         let owner_write = handle(
             &json!({
                 "jsonrpc": "2.0",
@@ -31476,11 +31721,11 @@ mod client_request_shape_matrix_tests {
             "v2-by-lane-a\n"
         );
 
-        // 7. Renew, list, and release via herdr_call
-        let renew_resp = handle(
+        // 7. Renew, list, and release via herdr_call (renew & release require lease_token; list never leaks it)
+        let renew_without_token = handle(
             &json!({
                 "jsonrpc": "2.0",
-                "id": 7,
+                "id": 70,
                 "method": "tools/call",
                 "params": {
                     "name": "herdr_call",
@@ -31498,7 +31743,36 @@ mod client_request_shape_matrix_tests {
             &ctx_anon,
         )
         .unwrap();
-        assert_eq!(parse_tool_payload(&renew_resp)["ok"], true);
+        assert_eq!(
+            parse_tool_payload(&renew_without_token)["conflict_reason"],
+            "lease_token_required"
+        );
+
+        let renew_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": ORCHESTRATION_LEASE_RENEW_METHOD,
+                        "params": {
+                            "project_root": repo_str,
+                            "holder_id": "lane-a",
+                            "lease_epoch": 1,
+                            "lease_token": lane_a_token,
+                            "ttl_seconds": 180
+                        }
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        let renew_payload = parse_tool_payload(&renew_resp);
+        assert_eq!(renew_payload["ok"], true);
+        assert_eq!(renew_payload["lease_token"], lane_a_token);
 
         let list_resp = handle(
             &json!({
@@ -31519,6 +31793,39 @@ mod client_request_shape_matrix_tests {
         let list_payload = parse_tool_payload(&list_resp);
         assert_eq!(list_payload["ok"], true);
         assert_eq!(list_payload["count"], 1);
+        assert!(list_payload["leases"][0].get("lease_token").is_none());
+        assert!(
+            list_payload["leases"][0]
+                .get("lease_token_sha256")
+                .is_none()
+        );
+        assert!(!list_payload.to_string().contains(&lane_a_token));
+
+        // Attacker trying to release lane-a's lease using leaked holder_id + lease_epoch without token fails closed
+        let spoofed_release = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 89,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": ORCHESTRATION_LEASE_RELEASE_METHOD,
+                        "params": {
+                            "project_root": repo_str,
+                            "holder_id": "lane-a",
+                            "lease_epoch": 1
+                        }
+                    }
+                }
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_tool_payload(&spoofed_release)["conflict_reason"],
+            "lease_token_required"
+        );
 
         let release_resp = handle(
             &json!({
@@ -31532,7 +31839,8 @@ mod client_request_shape_matrix_tests {
                         "params": {
                             "project_root": repo_str,
                             "holder_id": "lane-a",
-                            "lease_epoch": 1
+                            "lease_epoch": 1,
+                            "lease_token": lane_a_token
                         }
                     }
                 }
@@ -31566,6 +31874,8 @@ mod client_request_shape_matrix_tests {
         let acq_b_payload = parse_tool_payload(&acq_b);
         assert_eq!(acq_b_payload["ok"], true);
         assert_eq!(acq_b_payload["lease_epoch"], 2);
+        let lane_b_token = acq_b_payload["lease_token"].as_str().unwrap();
+        assert_ne!(lane_b_token, lane_a_token);
 
         let stale_owner_write = handle(
             &json!({

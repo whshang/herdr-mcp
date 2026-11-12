@@ -1,4 +1,5 @@
-//! Durable single-writer mutation leases with monotonic fencing tokens (#920 / #332).
+//! Durable single-writer mutation leases with monotonic fencing tokens and
+//! unpredictable capability tokens (#920 / #923 / #332).
 //!
 //! Uses a forward-additive auxiliary table (`mutation_leases`) so `SCHEMA_VERSION`
 //! remains unchanged and rollback to pinned v1.1.x binaries stays 100% compatible.
@@ -8,6 +9,8 @@
 use super::StateStore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 pub const DEFAULT_MUTATION_LEASE_LANE_KEY: &str = "*";
@@ -15,21 +18,23 @@ pub const MIN_MUTATION_LEASE_TTL_SECONDS: u64 = 10;
 pub const MAX_MUTATION_LEASE_TTL_SECONDS: u64 = 3600;
 pub const DEFAULT_MUTATION_LEASE_TTL_SECONDS: u64 = 300;
 pub const MAX_MUTATION_LEASE_ID_BYTES: usize = 256;
+pub const MAX_MUTATION_LEASE_TOKEN_BYTES: usize = 256;
 pub const MAX_MUTATION_LEASE_PATH_BYTES: usize = 4096;
 
 const MUTATION_LEASES_AUXILIARY_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS mutation_leases (
-    project_root TEXT NOT NULL,
-    lane_key     TEXT NOT NULL DEFAULT '*',
-    holder_id    TEXT NOT NULL,
-    lease_epoch  INTEGER NOT NULL,
-    workspace_id TEXT,
-    pane_id      TEXT,
-    branch       TEXT,
-    acquired_at  INTEGER NOT NULL,
-    updated_at   INTEGER NOT NULL,
-    expires_at   INTEGER NOT NULL,
-    released_at  INTEGER,
+    project_root       TEXT NOT NULL,
+    lane_key           TEXT NOT NULL DEFAULT '*',
+    holder_id          TEXT NOT NULL,
+    lease_epoch        INTEGER NOT NULL,
+    workspace_id       TEXT,
+    pane_id            TEXT,
+    branch             TEXT,
+    acquired_at        INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    expires_at         INTEGER NOT NULL,
+    released_at        INTEGER,
+    lease_token_sha256 TEXT,
     PRIMARY KEY (project_root, lane_key),
     CHECK (lease_epoch >= 1)
 );
@@ -40,15 +45,78 @@ CREATE INDEX IF NOT EXISTS idx_mutation_leases_active
 
 pub(super) fn ensure_mutation_leases_auxiliary_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(MUTATION_LEASES_AUXILIARY_SCHEMA)
-        .map_err(|error| format!("cannot ensure mutation leases auxiliary schema: {error}"))
+        .map_err(|error| format!("cannot ensure mutation leases auxiliary schema: {error}"))?;
+    let has_token_sha256: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('mutation_leases') WHERE name = 'lease_token_sha256'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("cannot inspect mutation_leases auxiliary schema: {error}"))?;
+    if has_token_sha256 == 0 {
+        conn.execute(
+            "ALTER TABLE mutation_leases ADD COLUMN lease_token_sha256 TEXT",
+            [],
+        )
+        .map_err(|error| format!("cannot extend mutation_leases auxiliary schema: {error}"))?;
+    }
+    Ok(())
+}
+
+pub fn sha256_hex(input: &str) -> String {
+    format!("{:x}", Sha256::digest(input.as_bytes()))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&a, &b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+fn generate_lease_token() -> Result<(String, String), String> {
+    let mut raw = [0u8; 32];
+    getrandom::fill(&mut raw)
+        .map_err(|error| format!("cannot generate unpredictable mutation lease token: {error}"))?;
+    let mut token = String::with_capacity(68);
+    token.push_str("mlt_");
+    for byte in raw {
+        let _ = write!(&mut token, "{byte:02x}");
+    }
+    let digest = sha256_hex(&token);
+    Ok((token, digest))
+}
+
+pub fn verify_lease_token_digest(stored_sha256: Option<&str>, candidate_token: &str) -> bool {
+    let Some(expected) = stored_sha256
+        .map(str::trim)
+        .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+    else {
+        return false;
+    };
+    let trimmed = candidate_token.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_MUTATION_LEASE_TOKEN_BYTES
+        || trimmed.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let actual = sha256_hex(trimmed);
+    constant_time_eq(actual.as_bytes(), expected.to_ascii_lowercase().as_bytes())
 }
 
 /// Canonicalize a project root or target filesystem path for lease scoping.
 ///
-/// Resolves existing symlinks (such as `/var` -> `/private/var` on macOS) even
-/// when the leaf path does not exist yet (e.g. a new file in `herdr_fs_write`),
-/// by canonicalizing the deepest existing ancestor and joining the remaining
-/// normal path components.
+/// Matches `fs_security::resolve_input` + `normalize_lexical` by:
+/// 1. Resolving relative paths against `std::env::current_dir()`,
+/// 2. Lexically folding `.` and `..` segments (`Component::ParentDir => pop()`),
+/// 3. Resolving existing symlinks (such as `/var` -> `/private/var` on macOS)
+///    by canonicalizing the path or its deepest existing ancestor and joining
+///    the remaining normal path components.
 pub fn canonicalize_lease_path(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -62,21 +130,28 @@ pub fn canonicalize_lease_path(raw: &str) -> Result<String, String> {
     if trimmed.contains('\0') {
         return Err("project_root must not contain NUL bytes".to_owned());
     }
-    let path = Path::new(trimmed);
-    if !path.is_absolute() {
-        return Err("project_root must be an absolute path".to_owned());
-    }
+    let raw_path = PathBuf::from(trimmed);
+    let resolved = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(raw_path))
+            .map_err(|error| format!("cannot resolve relative lease path: {error}"))?
+    };
     let mut normalized = PathBuf::new();
-    for component in path.components() {
+    for component in resolved.components() {
         match component {
             Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                return Err("project_root must not contain '..' traversal segments".to_owned());
+                normalized.pop();
             }
             Component::Normal(part) => normalized.push(part),
         }
+    }
+    if !normalized.is_absolute() {
+        return Err("project_root must resolve to an absolute path".to_owned());
     }
     if let Ok(canon) = std::fs::canonicalize(&normalized) {
         return Ok(canon.to_string_lossy().into_owned());
@@ -177,6 +252,7 @@ pub struct MutationLeaseRecord {
 struct StoredMutationLeaseRow {
     record: MutationLeaseRecord,
     released_at: Option<i64>,
+    lease_token_sha256: Option<String>,
 }
 
 impl StoredMutationLeaseRow {
@@ -190,6 +266,7 @@ pub struct MutationLeaseAcquireInput<'a> {
     pub project_root: &'a str,
     pub lane_key: Option<&'a str>,
     pub holder_id: &'a str,
+    pub lease_token: Option<&'a str>,
     pub ttl_seconds: Option<u64>,
     pub workspace_id: Option<&'a str>,
     pub pane_id: Option<&'a str>,
@@ -201,9 +278,11 @@ pub struct MutationLeaseAcquireInput<'a> {
 pub enum MutationLeaseAcquireOutcome {
     Acquired {
         lease: MutationLeaseRecord,
+        lease_token: String,
         reacquired: bool,
     },
     Conflict {
+        reason: &'static str,
         active_lease: MutationLeaseRecord,
     },
 }
@@ -214,13 +293,17 @@ pub struct MutationLeaseRenewInput<'a> {
     pub lane_key: Option<&'a str>,
     pub holder_id: &'a str,
     pub lease_epoch: i64,
+    pub lease_token: Option<&'a str>,
     pub ttl_seconds: Option<u64>,
     pub now_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutationLeaseRenewOutcome {
-    Renewed(MutationLeaseRecord),
+    Renewed {
+        lease: MutationLeaseRecord,
+        lease_token: String,
+    },
     Conflict {
         reason: &'static str,
         active_lease: Option<MutationLeaseRecord>,
@@ -233,6 +316,7 @@ pub struct MutationLeaseReleaseInput<'a> {
     pub lane_key: Option<&'a str>,
     pub holder_id: &'a str,
     pub lease_epoch: i64,
+    pub lease_token: Option<&'a str>,
     pub now_ms: i64,
 }
 
@@ -275,6 +359,7 @@ fn row_to_stored_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMutati
             expires_at: row.get(9)?,
         },
         released_at: row.get(10)?,
+        lease_token_sha256: row.get(11)?,
     })
 }
 
@@ -285,7 +370,7 @@ fn load_stored_lease(
 ) -> Result<Option<StoredMutationLeaseRow>, String> {
     conn.query_row(
         "SELECT project_root, lane_key, holder_id, lease_epoch, workspace_id, pane_id, branch,
-                acquired_at, updated_at, expires_at, released_at
+                acquired_at, updated_at, expires_at, released_at, lease_token_sha256
            FROM mutation_leases
           WHERE project_root = ?1 AND lane_key = ?2",
         params![project_root, lane_key],
@@ -318,6 +403,7 @@ impl StateStore {
         let existing = load_stored_lease(&tx, &project_root, &lane_key)?;
         let outcome = match existing {
             None => {
+                let (lease_token, lease_token_sha256) = generate_lease_token()?;
                 let record = MutationLeaseRecord {
                     project_root: project_root.clone(),
                     lane_key: lane_key.clone(),
@@ -334,8 +420,8 @@ impl StateStore {
                     "INSERT INTO mutation_leases (
                         project_root, lane_key, holder_id, lease_epoch,
                         workspace_id, pane_id, branch,
-                        acquired_at, updated_at, expires_at, released_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+                        acquired_at, updated_at, expires_at, released_at, lease_token_sha256
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)",
                     params![
                         record.project_root,
                         record.lane_key,
@@ -347,20 +433,40 @@ impl StateStore {
                         record.acquired_at,
                         record.updated_at,
                         record.expires_at,
+                        lease_token_sha256,
                     ],
                 )
                 .map_err(|error| format!("cannot insert mutation lease: {error}"))?;
                 MutationLeaseAcquireOutcome::Acquired {
                     lease: record,
+                    lease_token,
                     reacquired: false,
                 }
             }
             Some(stored) if stored.is_active(input.now_ms) => {
                 if stored.record.holder_id != holder_id {
                     MutationLeaseAcquireOutcome::Conflict {
+                        reason: "lease_held_by_other",
                         active_lease: stored.record,
                     }
                 } else {
+                    let Some(caller_token) =
+                        input.lease_token.map(str::trim).filter(|s| !s.is_empty())
+                    else {
+                        return Ok(MutationLeaseAcquireOutcome::Conflict {
+                            reason: "lease_token_required",
+                            active_lease: stored.record,
+                        });
+                    };
+                    if !verify_lease_token_digest(
+                        stored.lease_token_sha256.as_deref(),
+                        caller_token,
+                    ) {
+                        return Ok(MutationLeaseAcquireOutcome::Conflict {
+                            reason: "lease_token_invalid",
+                            active_lease: stored.record,
+                        });
+                    }
                     let updated = MutationLeaseRecord {
                         project_root: project_root.clone(),
                         lane_key: lane_key.clone(),
@@ -395,11 +501,13 @@ impl StateStore {
                     .map_err(|error| format!("cannot reacquire mutation lease: {error}"))?;
                     MutationLeaseAcquireOutcome::Acquired {
                         lease: updated,
+                        lease_token: caller_token.to_owned(),
                         reacquired: true,
                     }
                 }
             }
             Some(stored) => {
+                let (lease_token, lease_token_sha256) = generate_lease_token()?;
                 let next_epoch = stored.record.lease_epoch.saturating_add(1);
                 let record = MutationLeaseRecord {
                     project_root: project_root.clone(),
@@ -423,8 +531,9 @@ impl StateStore {
                             acquired_at = ?6,
                             updated_at = ?7,
                             expires_at = ?8,
+                            lease_token_sha256 = ?9,
                             released_at = NULL
-                      WHERE project_root = ?9 AND lane_key = ?10",
+                      WHERE project_root = ?10 AND lane_key = ?11",
                     params![
                         record.holder_id,
                         record.lease_epoch,
@@ -434,6 +543,7 @@ impl StateStore {
                         record.acquired_at,
                         record.updated_at,
                         record.expires_at,
+                        lease_token_sha256,
                         record.project_root,
                         record.lane_key,
                     ],
@@ -441,6 +551,7 @@ impl StateStore {
                 .map_err(|error| format!("cannot advance mutation lease epoch: {error}"))?;
                 MutationLeaseAcquireOutcome::Acquired {
                     lease: record,
+                    lease_token,
                     reacquired: false,
                 }
             }
@@ -499,6 +610,23 @@ impl StateStore {
                         active_lease: Some(stored.record),
                     }
                 } else {
+                    let Some(caller_token) =
+                        input.lease_token.map(str::trim).filter(|s| !s.is_empty())
+                    else {
+                        return Ok(MutationLeaseRenewOutcome::Conflict {
+                            reason: "lease_token_required",
+                            active_lease: Some(stored.record),
+                        });
+                    };
+                    if !verify_lease_token_digest(
+                        stored.lease_token_sha256.as_deref(),
+                        caller_token,
+                    ) {
+                        return Ok(MutationLeaseRenewOutcome::Conflict {
+                            reason: "lease_token_invalid",
+                            active_lease: Some(stored.record),
+                        });
+                    }
                     let mut updated = stored.record;
                     updated.updated_at = input.now_ms;
                     updated.expires_at = expires_at;
@@ -519,7 +647,10 @@ impl StateStore {
                         ],
                     )
                     .map_err(|error| format!("cannot renew mutation lease: {error}"))?;
-                    MutationLeaseRenewOutcome::Renewed(updated)
+                    MutationLeaseRenewOutcome::Renewed {
+                        lease: updated,
+                        lease_token: caller_token.to_owned(),
+                    }
                 }
             }
         };
@@ -563,6 +694,23 @@ impl StateStore {
                         active_lease: Some(stored.record),
                     }
                 } else {
+                    let Some(caller_token) =
+                        input.lease_token.map(str::trim).filter(|s| !s.is_empty())
+                    else {
+                        return Ok(MutationLeaseReleaseOutcome::Conflict {
+                            reason: "lease_token_required",
+                            active_lease: Some(stored.record),
+                        });
+                    };
+                    if !verify_lease_token_digest(
+                        stored.lease_token_sha256.as_deref(),
+                        caller_token,
+                    ) {
+                        return Ok(MutationLeaseReleaseOutcome::Conflict {
+                            reason: "lease_token_invalid",
+                            active_lease: Some(stored.record),
+                        });
+                    }
                     let mut updated = stored.record;
                     updated.updated_at = input.now_ms;
                     tx.execute(
@@ -589,9 +737,17 @@ impl StateStore {
                 }
             }
             Some(stored) => {
+                let token_valid = input
+                    .lease_token
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_some_and(|tok| {
+                        verify_lease_token_digest(stored.lease_token_sha256.as_deref(), tok)
+                    });
                 if let Some(released_at) = stored.released_at
                     && stored.record.holder_id == holder_id
                     && stored.record.lease_epoch == input.lease_epoch
+                    && token_valid
                 {
                     MutationLeaseReleaseOutcome::Released {
                         lease: stored.record,
@@ -599,8 +755,23 @@ impl StateStore {
                         idempotent_replay: true,
                     }
                 } else {
-                    let reason = if stored.record.lease_epoch != input.lease_epoch {
+                    let reason = if stored.record.holder_id != holder_id {
+                        if stored.released_at.is_some() {
+                            "lease_not_held"
+                        } else {
+                            "lease_expired"
+                        }
+                    } else if stored.record.lease_epoch != input.lease_epoch {
                         "lease_epoch_mismatch"
+                    } else if input
+                        .lease_token
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                    {
+                        "lease_token_required"
+                    } else if !token_valid {
+                        "lease_token_invalid"
                     } else if stored.released_at.is_some() {
                         "lease_not_held"
                     } else {
@@ -644,7 +815,7 @@ impl StateStore {
             .conn
             .prepare(
                 "SELECT project_root, lane_key, holder_id, lease_epoch, workspace_id, pane_id, branch,
-                        acquired_at, updated_at, expires_at, released_at
+                        acquired_at, updated_at, expires_at, released_at, lease_token_sha256
                    FROM mutation_leases
                   WHERE released_at IS NULL
                     AND expires_at > ?1
@@ -673,29 +844,22 @@ impl StateStore {
     ///
     /// When no active root lease covers `target_path`, returns `Allowed { matched_lease: None }`
     /// so unleased project roots experience zero friction.
+    /// When at least one active root lease exists and `target_path` cannot be canonicalized,
+    /// fails closed with `Conflict { reason: "lease_target_path_invalid", .. }`.
     pub fn check_root_mutation_lease_for_path(
         &self,
         target_path: &str,
         caller_holder_id: Option<&str>,
         caller_lease_epoch: Option<i64>,
-        caller_session_bound: bool,
+        caller_lease_token: Option<&str>,
+        _caller_session_bound: bool,
         now_ms: i64,
     ) -> Result<MutationLeaseEnforcementVerdict, String> {
-        let canonical_target = match canonicalize_lease_path(target_path) {
-            Ok(path) => path,
-            Err(_) => {
-                return Ok(MutationLeaseEnforcementVerdict::Allowed {
-                    matched_lease: None,
-                });
-            }
-        };
-        let target_as_path = Path::new(&canonical_target);
-
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT project_root, lane_key, holder_id, lease_epoch, workspace_id, pane_id, branch,
-                        acquired_at, updated_at, expires_at, released_at
+                        acquired_at, updated_at, expires_at, released_at, lease_token_sha256
                    FROM mutation_leases
                   WHERE lane_key = '*'
                     AND released_at IS NULL
@@ -707,21 +871,45 @@ impl StateStore {
             .query_map(params![now_ms], row_to_stored_lease)
             .map_err(|error| format!("cannot query root mutation leases: {error}"))?;
 
-        let mut matched: Option<MutationLeaseRecord> = None;
+        let mut active_rows = Vec::new();
         for row in rows {
-            let stored =
-                row.map_err(|error| format!("cannot decode root mutation lease: {error}"))?;
+            active_rows
+                .push(row.map_err(|error| format!("cannot decode root mutation lease: {error}"))?);
+        }
+
+        if active_rows.is_empty() {
+            return Ok(MutationLeaseEnforcementVerdict::Allowed {
+                matched_lease: None,
+            });
+        }
+
+        let canonical_target = match canonicalize_lease_path(target_path) {
+            Ok(path) => path,
+            Err(_) => {
+                // Fail-closed: never allow an unnormalizable path to bypass an active root lease.
+                return Ok(MutationLeaseEnforcementVerdict::Conflict {
+                    reason: "lease_target_path_invalid",
+                    active_lease: active_rows.into_iter().next().unwrap().record,
+                });
+            }
+        };
+        let target_as_path = Path::new(&canonical_target);
+
+        let mut matched: Option<StoredMutationLeaseRow> = None;
+        for stored in active_rows {
             if target_as_path.starts_with(Path::new(&stored.record.project_root)) {
-                matched = Some(stored.record);
+                matched = Some(stored);
                 break;
             }
         }
 
-        let Some(active_lease) = matched else {
+        let Some(stored) = matched else {
             return Ok(MutationLeaseEnforcementVerdict::Allowed {
                 matched_lease: None,
             });
         };
+        let expected_digest = stored.lease_token_sha256.clone();
+        let active_lease = stored.record;
 
         let Some(holder_id) = caller_holder_id
             .map(str::trim)
@@ -741,22 +929,40 @@ impl StateStore {
         }
 
         match caller_lease_epoch {
-            Some(epoch) if epoch == active_lease.lease_epoch => {
-                Ok(MutationLeaseEnforcementVerdict::Allowed {
-                    matched_lease: Some(active_lease),
-                })
+            Some(epoch) if epoch == active_lease.lease_epoch => {}
+            Some(_) => {
+                return Ok(MutationLeaseEnforcementVerdict::Conflict {
+                    reason: "lease_epoch_mismatch",
+                    active_lease,
+                });
             }
-            Some(_) => Ok(MutationLeaseEnforcementVerdict::Conflict {
-                reason: "lease_epoch_mismatch",
-                active_lease,
-            }),
-            None if caller_session_bound => Ok(MutationLeaseEnforcementVerdict::Allowed {
-                matched_lease: Some(active_lease),
-            }),
-            None => Ok(MutationLeaseEnforcementVerdict::Conflict {
-                reason: "lease_epoch_required",
-                active_lease,
-            }),
+            None => {
+                return Ok(MutationLeaseEnforcementVerdict::Conflict {
+                    reason: "lease_epoch_required",
+                    active_lease,
+                });
+            }
         }
+
+        let Some(token) = caller_lease_token
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(MutationLeaseEnforcementVerdict::Conflict {
+                reason: "lease_token_required",
+                active_lease,
+            });
+        };
+
+        if !verify_lease_token_digest(expected_digest.as_deref(), token) {
+            return Ok(MutationLeaseEnforcementVerdict::Conflict {
+                reason: "lease_token_invalid",
+                active_lease,
+            });
+        }
+
+        Ok(MutationLeaseEnforcementVerdict::Allowed {
+            matched_lease: Some(active_lease),
+        })
     }
 }
