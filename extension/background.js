@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.249";
+const H2W_SCRIPT_VERSION = "0.1.250";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -4009,6 +4009,7 @@ async function handleBrowserActuation(command) {
         elementOffset: params.element_offset,
         url: params.url,
         pageGeneration: params.page_generation,
+        includeObservation: params.include_observation === true,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -9820,6 +9821,48 @@ async function captureBrowserPageScreenshot(page, tab) {
   }, page);
 }
 
+async function maybeAttachBrowserPagePostObservation(envelope, page, tabId, includeObservation) {
+  if (!includeObservation || envelope?.ok !== true || envelope?.delivery_state !== "applied") {
+    return envelope;
+  }
+  const observePayload = {
+    type: "h2w_page_assist",
+    action: "observe",
+    expectedOrigin: page.origin,
+  };
+  let obs = null;
+  let errDetail = "";
+  try {
+    obs = await chrome.tabs.sendMessage(tabId, observePayload);
+  } catch (err) {
+    errDetail = String(err?.message || err || "");
+  }
+  if (!obs || typeof obs !== "object" || Array.isArray(obs) || typeof obs.ok !== "boolean") {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["content/browser-page-kernel.js", "content/page-assist.js"],
+        world: "ISOLATED",
+      });
+      obs = await chrome.tabs.sendMessage(tabId, observePayload);
+      errDetail = "";
+    } catch (err) {
+      errDetail = String(err?.message || err || "");
+    }
+  }
+  if (obs && typeof obs === "object" && !Array.isArray(obs) && obs.ok === true) {
+    return {
+      ...envelope,
+      post_observation: withBrowserPageIdentity(obs, page),
+    };
+  }
+  return {
+    ...envelope,
+    post_observation: null,
+    post_observation_error: String(obs?.error || errDetail || "post_observation_unavailable"),
+  };
+}
+
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
@@ -9871,8 +9914,10 @@ async function performBrowserPageActionRequest(msg) {
       : withBrowserPageIdentity(resolved, record);
   }
   const page = resolved.page;
+  const includeObservation = msg?.includeObservation === true;
   if (BROWSER_PAGE_NAVIGATION_ACTIONS.has(action)) {
-    return performBrowserPageNavigation(page, resolved.tab, action, msg);
+    const navEnvelope = await performBrowserPageNavigation(page, resolved.tab, action, msg);
+    return maybeAttachBrowserPagePostObservation(navEnvelope, page, resolved.tab.id, includeObservation);
   }
   if (action === "screenshot") {
     return captureBrowserPageScreenshot(page, resolved.tab);
@@ -9930,7 +9975,8 @@ async function performBrowserPageActionRequest(msg) {
         const hover = await browserPageTrustedHover(tabId, response.hover_point, {
           page, tab: resolved.tab, observedDocument,
         });
-        return browserPageMutationEnvelope(hover.result, page, hover.dispatched);
+        const hoverEnvelope = browserPageMutationEnvelope(hover.result, page, hover.dispatched);
+        return maybeAttachBrowserPagePostObservation(hoverEnvelope, page, tabId, includeObservation);
       }
       let mutationResponse = response;
       if (action === "fill" && response?.ok === true && typeof response?.main_world_fill_token === "string") {
@@ -9957,7 +10003,8 @@ async function performBrowserPageActionRequest(msg) {
           delete mutationResponse.navigation_url;
         }
       }
-      return browserPageMutationEnvelope(mutationResponse, page, true);
+      const appliedEnvelope = browserPageMutationEnvelope(mutationResponse, page, true);
+      return maybeAttachBrowserPagePostObservation(appliedEnvelope, page, tabId, includeObservation);
     }
     // A WebChat listener can yield with no response before Page Assist has
     // been injected. For read-only operations, treat an empty/non-envelope

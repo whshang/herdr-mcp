@@ -19,7 +19,8 @@ use super::{
     LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD, TEXT_READ_METHOD, TEXT_WRITE_METHOD,
     VALIDATION_ADVISE_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
     WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
+    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, WORKSTATION_PREFLIGHT_METHOD,
+    X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
@@ -901,6 +902,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "page_generation": {"type": ["integer", "null"], "minimum": 1, "description": "navigate/reload/back/forward only: current page_generation from the page view; the page record advances it after a verified navigation."},
                     "key": {"type": ["string", "null"], "enum": ["Enter", "Escape", "Tab", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Space", null]},
                     "objective": {"type": ["string", "null"], "maxLength": 1024},
+                    "include_observation": {"type": ["boolean", "null"], "description": "Mutation actions only: when true, run an immediate bounded post-action observe on the same page after an applied mutation and attach post_observation (with a fresh generation and refs) without altering the mutation delivery verdict."},
                 },
                 "required": ["endpoint_ref", "page_ref", "action"],
                 "oneOf": [
@@ -1085,6 +1087,19 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "op_id": {"type": "string", "maxLength": 96}
                 },
                 "required": ["endpoint_ref", "op_id"],
+                "empty": false
+            }
+        }),
+        json!({
+            "method": WORKSTATION_PREFLIGHT_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "endpoint_limit": {"type": ["integer", "null"], "minimum": 0, "maximum": 32, "description": "Maximum number of registered browser endpoints to include (default 8; 0 omits endpoint lookup)."}
+                },
+                "required": [],
                 "empty": false
             }
         }),
