@@ -68,6 +68,7 @@ pub const X_SEARCH_POSTS_METHOD: &str = "herdr_mcp.x.search.posts";
 pub const X_THREAD_READ_METHOD: &str = "herdr_mcp.x.thread.read";
 pub const DOUBAO_IMAGE_GENERATE_METHOD: &str = "herdr_mcp.doubao.image.generate";
 pub const DOUBAO_IMAGE_STATUS_METHOD: &str = "herdr_mcp.doubao.image.status";
+pub const WORKSTATION_PREFLIGHT_METHOD: &str = "herdr_mcp.workstation.preflight";
 
 /// Task requirements the semantic layer may fill only when the planner left
 /// them unspecified. Semantic inference can add an advisory requirement, but
@@ -4613,6 +4614,10 @@ mod tests {
                 .count(),
             10
         );
+        let preflight = local_method_schemas("workstation.preflight");
+        assert_eq!(preflight.len(), 1);
+        assert_eq!(preflight[0]["method"], WORKSTATION_PREFLIGHT_METHOD);
+        assert_eq!(preflight[0]["access"], "read_only");
         assert!(methods.iter().all(|method| {
             let name = method["method"].as_str().unwrap();
             !name.contains("consent") && !name.contains("observe") && !name.contains("register")

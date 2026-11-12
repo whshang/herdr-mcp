@@ -22,7 +22,8 @@ use crate::progressive_skills::{
     BROWSER_SPACE_OPEN_METHOD, DOUBAO_IMAGE_GENERATE_METHOD, DOUBAO_IMAGE_STATUS_METHOD,
     EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
     WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
+    WORK_MEMORY_SEARCH_METHOD, WORK_PICKUP_METHOD, WORKSTATION_PREFLIGHT_METHOD,
+    X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
 use crate::semantic::{
@@ -1052,6 +1053,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &params,
                     Some(&context.cache.snapshot()),
                 )
+            } else if method == WORKSTATION_PREFLIGHT_METHOD {
+                workstation_preflight_call(context, &params)
             } else if method == BROWSER_SOURCE_RESOLVE_METHOD {
                 browser_source_resolve(context.state_store, &params, context.trusted_local_ipc)
             } else if method == BROWSER_HANDOFF_PREPARE_METHOD {
@@ -1622,6 +1625,70 @@ fn browser_conversation_url_ref(
         )));
     }
     Ok(None)
+}
+
+fn workstation_preflight_call(context: &RuntimeContext<'_>, params: &Value) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": "workstation preflight params must be an object",
+        });
+    };
+    for key in object.keys() {
+        if key != "endpoint_limit" {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": format!("unknown workstation preflight parameter '{key}'"),
+            });
+        }
+    }
+    let endpoint_limit = match object.get("endpoint_limit") {
+        None | Some(Value::Null) => 8usize,
+        Some(value) => match value.as_u64() {
+            Some(limit) if limit <= 32 => limit as usize,
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "endpoint_limit must be an integer between 0 and 32",
+                });
+            }
+        },
+    };
+    let inspect_view =
+        native_tools::inspect(context.client, Some(context.cache), Some(context.exec));
+    let browser_endpoints = if endpoint_limit == 0 {
+        json!([])
+    } else {
+        match context.state_store.lock() {
+            Ok(store) => match store.browser_endpoints(endpoint_limit) {
+                Ok(endpoints) => Value::Array(
+                    endpoints
+                        .into_iter()
+                        .map(|endpoint| {
+                            browser_endpoint_json_with_liveness(endpoint, context.browser_actuator)
+                        })
+                        .collect(),
+                ),
+                Err(error) => return browser_store_error(error),
+            },
+            Err(_) => {
+                return json!({"ok": false, "code": "browser_registry_store_unavailable"});
+            }
+        }
+    };
+    json!({
+        "ok": true,
+        "runtime": inspect_view.get("build").cloned().unwrap_or(Value::Null),
+        "focused_workspace": inspect_view.get("focused_workspace").cloned().unwrap_or(Value::Null),
+        "focused_pane": inspect_view.get("focused_pane").cloned().unwrap_or(Value::Null),
+        "workspaces": inspect_view.get("workspaces").cloned().unwrap_or_else(|| json!([])),
+        "agents": inspect_view.get("agents").cloned().unwrap_or_else(|| json!([])),
+        "agents_hidden": inspect_view.get("agents_hidden").cloned().unwrap_or_else(|| json!(0)),
+        "browser_endpoints": browser_endpoints,
+    })
 }
 
 fn work_pickup_call(
@@ -10948,6 +11015,7 @@ fn browser_page_action_call(
         "expected_url",
         "url",
         "page_generation",
+        "include_observation",
     ];
     if let Some(key) = object
         .keys()
@@ -11066,6 +11134,29 @@ fn browser_page_action_call(
             | "back"
             | "forward"
     );
+    let include_observation = match object.get("include_observation") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => {
+            if !mutation {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": format!("include_observation is accepted only for mutation actions, not {action}"),
+                });
+            }
+            *flag
+        }
+        Some(_) => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "include_observation must be a boolean",
+            });
+        }
+    };
+    if include_observation {
+        bridge_params["include_observation"] = json!(true);
+    }
     let mut mutation_key: Option<&str> = None;
     let mut semantic_objective: Option<&str> = None;
 
@@ -11734,6 +11825,10 @@ fn browser_page_action_call(
             },
         })
     };
+    let mut request_hash_payload = request_hash_payload;
+    if include_observation && let Some(payload_obj) = request_hash_payload.as_object_mut() {
+        payload_obj.insert("include_observation".to_owned(), json!(true));
+    }
     let request_hash = browser_sha256(&request_hash_payload.to_string());
     let op_id = format!("op:browser_page_action:{}", &idempotency_digest[..32]);
     let now = browser_epoch_ms();
@@ -26044,6 +26139,180 @@ mod tests {
             2,
             "expired noncontract/missing verdicts must never re-actuate"
         );
+    }
+
+    #[test]
+    fn browser_page_action_include_observation_coalesces_fresh_snapshot_and_replays_idempotently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct CoalescingActuator {
+            calls: AtomicUsize,
+            last_include_observation: Mutex<Option<Value>>,
+        }
+        impl BrowserActuator for CoalescingActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage action must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                _endpoint_ref: Option<&str>,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                *self.last_include_observation.lock().unwrap() =
+                    params.get("include_observation").cloned();
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "delivery_state": "applied",
+                    "post_observation": {
+                        "ok": true,
+                        "generation": "pa_gen_2_fresh",
+                        "elements": [{"ref": "ref_pa_gen_2_fresh_0", "role": "button"}]
+                    }
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let endpoint_ref = format!("bep_{}", "d".repeat(64));
+        let page_ref = format!("bp_{}", "e".repeat(64));
+        let grants = vec![PageAssistCallerGrant {
+            endpoint_ref: endpoint_ref.clone(),
+        }];
+        let actuator = CoalescingActuator {
+            calls: AtomicUsize::new(0),
+            last_include_observation: Mutex::new(None),
+        };
+
+        let bad_read = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "page_ref": page_ref,
+                "action": "observe",
+                "include_observation": true
+            }),
+            &grants,
+            Some(&actuator),
+        );
+        assert_eq!(bad_read["ok"], false);
+        assert_eq!(bad_read["code"], "invalid_params");
+
+        let call_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "page_ref": page_ref,
+            "action": "fill",
+            "generation": "pa_gen_1_init",
+            "ref": "ref_pa_gen_1_init_0",
+            "value": "coalesced-hello",
+            "idempotency_key": "idem-coalesce-912-1",
+            "include_observation": true
+        });
+        let first = browser_page_action_call(&store, &call_params, &grants, Some(&actuator));
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["delivery_state"], "applied");
+        assert_eq!(first["post_observation"]["generation"], "pa_gen_2_fresh");
+        assert_eq!(
+            *actuator.last_include_observation.lock().unwrap(),
+            Some(json!(true))
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        let replay = browser_page_action_call(&store, &call_params, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["post_observation"]["generation"], "pa_gen_2_fresh");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        let mut without_obs = call_params.clone();
+        without_obs
+            .as_object_mut()
+            .unwrap()
+            .remove("include_observation");
+        let conflict = browser_page_action_call(&store, &without_obs, &grants, Some(&actuator));
+        assert_eq!(conflict["ok"], false);
+        assert_eq!(conflict["code"], "idempotency_key_conflict");
+    }
+
+    #[test]
+    fn workstation_preflight_aggregates_compact_inspect_and_endpoints_in_one_call() {
+        use std::sync::{Arc, Mutex};
+
+        let temp_root =
+            std::env::temp_dir().join(format!("herdr-preflight-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        let client = HerdrClient::new(temp_root.join("missing-herdr.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({"panes": [], "agents": []}));
+        let exec = ExecRegistry::new(temp_root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+
+        let context = RuntimeContext {
+            client: &client,
+            cache: &cache,
+            exec: &exec,
+            prompt: &prompt,
+            skill: &skill,
+            state_store: &state_store,
+            caller_webchat_control_grants: &[],
+            caller_webchat_authorization: None,
+            caller_browser_session: None,
+            caller_page_assist_grants: &[],
+            caller_browser_on_other_device: false,
+            browser_actuator: None,
+            browser_mutation_gate: None,
+            browser_mutation_admission: None,
+            trusted_local_ipc: true,
+        };
+
+        let resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 912,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_call",
+                    "arguments": {
+                        "method": WORKSTATION_PREFLIGHT_METHOD,
+                        "params": {"endpoint_limit": 4}
+                    }
+                }
+            }),
+            &context,
+        )
+        .unwrap();
+        let body: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["ok"], true, "{body}");
+        assert!(body.get("runtime").is_some(), "{body}");
+        assert!(body["workspaces"].is_array(), "{body}");
+        assert!(body["agents"].is_array(), "{body}");
+        assert!(body["browser_endpoints"].is_array(), "{body}");
+
+        let bad = workstation_preflight_call(&context, &json!({"endpoint_limit": 99}));
+        assert_eq!(bad["ok"], false);
+        assert_eq!(bad["code"], "invalid_params");
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
