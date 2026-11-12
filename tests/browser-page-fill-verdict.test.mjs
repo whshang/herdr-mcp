@@ -101,3 +101,74 @@ test("user cannot reuse stale refs after MAIN-world rich-text fill | Given brows
   assert.equal(removedToken, true);
   assert.equal(invalidated, 1);
 });
+
+test("user coalesces post-mutation observation in one browser_page.action call | Given an applied mutation envelope and includeObservation enabled | When maybeAttachBrowserPagePostObservation runs across ready, reinjected, and failing content scripts | Then applied mutations return fresh post_observation or preserve applied delivery_state on observation failure", async () => {
+  const idStart = source.indexOf("function withBrowserPageIdentity(");
+  const idBody = source.slice(idStart, source.indexOf("\n}\n", idStart) + 2);
+  const postStart = source.indexOf("async function maybeAttachBrowserPagePostObservation(");
+  const postBody = source.slice(postStart, source.indexOf("\n}\n", postStart) + 2);
+
+  let mode = "direct";
+  let injected = 0;
+  const fakeChrome = {
+    tabs: {
+      sendMessage: async (_tabId, payload) => {
+        assert.equal(payload.type, "h2w_page_assist");
+        assert.equal(payload.action, "observe");
+        if (mode === "direct") {
+          return { ok: true, generation: "pa_gen_after_1", url: "https://example.com/a", elements: [{ ref: "ref_pa_gen_after_1_0" }] };
+        }
+        if (mode === "reinject_once") {
+          if (injected === 0) throw new Error("Receiving end does not exist.");
+          return { ok: true, generation: "pa_gen_after_nav", url: "https://example.com/b", elements: [] };
+        }
+        throw new Error("tab navigated cross-origin");
+      },
+    },
+    scripting: {
+      executeScript: async ({ files }) => {
+        assert.deepEqual(files, ["content/browser-page-kernel.js", "content/page-assist.js"]);
+        injected += 1;
+      },
+    },
+  };
+
+  const maybeAttach = new Function(
+    "chrome",
+    `${idBody}\n${postBody}\nreturn maybeAttachBrowserPagePostObservation;`,
+  )(fakeChrome);
+
+  const page = {
+    page_ref: "bp_" + "a".repeat(64),
+    origin: "https://example.com",
+    canonical_url: "https://example.com/a",
+    ownership: "owned",
+    page_generation: 2,
+  };
+  const applied = { ok: true, delivery_state: "applied", page_ref: page.page_ref };
+
+  // 1. Disabled -> untouched
+  const untouched = await maybeAttach(applied, page, 11, false);
+  assert.deepEqual(untouched, applied);
+
+  // 2. Direct observe -> attaches post_observation with fresh generation
+  const withObs = await maybeAttach(applied, page, 11, true);
+  assert.equal(withObs.ok, true);
+  assert.equal(withObs.delivery_state, "applied");
+  assert.equal(withObs.post_observation.generation, "pa_gen_after_1");
+  assert.equal(withObs.post_observation.page_ref, page.page_ref);
+
+  // 3. Content script absent after same-origin nav -> injects once and observes
+  mode = "reinject_once";
+  const afterNav = await maybeAttach(applied, page, 11, true);
+  assert.equal(injected, 1);
+  assert.equal(afterNav.post_observation.generation, "pa_gen_after_nav");
+
+  // 4. Observation fails -> mutation verdict stays ok:true / delivery_state:applied
+  mode = "fail";
+  const degraded = await maybeAttach(applied, page, 11, true);
+  assert.equal(degraded.ok, true);
+  assert.equal(degraded.delivery_state, "applied");
+  assert.equal(degraded.post_observation, null);
+  assert.match(degraded.post_observation_error, /cross-origin/);
+});
