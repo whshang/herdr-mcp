@@ -280,6 +280,11 @@ fn print_status_verbose(paths: &RuntimePaths, config: &Config, language: crate::
     );
     println!(
         "{}: {}",
+        language.text("runtime backend", "运行时后端", "ランタイムバックエンド"),
+        crate::runtime_adapter::status_line(config)
+    );
+    println!(
+        "{}: {}",
         language.text("update channel", "更新通道", "更新チャネル"),
         config.update_channel.as_str()
     );
@@ -339,7 +344,10 @@ fn print_status_verbose(paths: &RuntimePaths, config: &Config, language: crate::
     }
     println!("{grants_hint}");
     let herdr_core = crate::herdr_core::probe();
-    if herdr_core.present {
+    let tui_selected = crate::runtime_adapter::resolve_backend_selection(config)
+        .map(|sel| sel.backend == crate::runtime_adapter::RuntimeBackend::Tui)
+        .unwrap_or(false);
+    if tui_selected && herdr_core.present {
         println!("{}", crate::herdr_core::warning_line(&herdr_core, language));
     }
 }
@@ -666,7 +674,16 @@ pub fn print_doctor(
         local_agent_skill.0,
     );
     println!("LAYER local-agent-skill {}", local_agent_skill.1);
-    if herdr_core.present {
+    let runtime_backend_json = crate::runtime_adapter::doctor_report_json(config);
+    let tui_backend_selected = runtime_backend_json["selected"].as_str() == Some("tui");
+    println!(
+        "LAYER runtime-backend selected={} source={} fallback=disabled",
+        runtime_backend_json["selected"]
+            .as_str()
+            .unwrap_or("invalid"),
+        runtime_backend_json["source"].as_str().unwrap_or("unknown")
+    );
+    if tui_backend_selected && herdr_core.present {
         println!("{}", crate::herdr_core::warning_line(&herdr_core, language));
     }
     println!(
@@ -720,9 +737,14 @@ pub fn print_doctor(
         "oauth_metadata": remote.oauth_state.as_str(),
         "mcp_surface": remote.mcp_surface_state.as_str(),
         "standalone_extension": standalone_browser.as_json(),
+        "runtime_backend": runtime_backend_json,
         "herdr_native": native_runtime,
         "herdr_core": crate::herdr_core::probe_json(&herdr_core),
-        "warnings": crate::herdr_core::warnings_json(&herdr_core),
+        "warnings": if tui_backend_selected {
+            crate::herdr_core::warnings_json(&herdr_core)
+        } else {
+            json!([])
+        },
         "webchat_grants": webchat_grants.as_json(),
         "continuity_journal": continuity_journal_json(&continuity_journal),
         "orphan_candidates": crate::residue::orphan_candidates_json(&orphan_candidates),
@@ -939,7 +961,7 @@ pub fn print_doctor(
                 local_agent_skill.1
             ));
         }
-        if herdr_core.present {
+        if tui_backend_selected && herdr_core.present {
             attention.push(
                 language
                     .text(

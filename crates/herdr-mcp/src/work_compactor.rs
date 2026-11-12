@@ -117,6 +117,7 @@ pub(crate) struct GitContext {
 const CHANGED_FILES_MAX: usize = 8;
 const WORK_GIT_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
 const WORK_GIT_CONTEXT_BUDGET: Duration = Duration::from_millis(1_500);
+const WORK_GIT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const WORK_GIT_OUTPUT_LIMIT: usize = 256 * 1024;
 
 fn normalize_lexical(path: &Path) -> PathBuf {
@@ -1932,7 +1933,7 @@ fn git_status_output(
         .env("GIT_TERMINAL_PROMPT", "0");
     crate::child_process::run_bounded_output(
         &mut command,
-        WORK_GIT_COMMAND_TIMEOUT,
+        WORK_GIT_STATUS_TIMEOUT,
         WORK_GIT_OUTPUT_LIMIT,
     )
     .ok()?
