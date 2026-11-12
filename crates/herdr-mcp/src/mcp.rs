@@ -1215,10 +1215,54 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         Err(rejection) => return Ok(tool_result(rejection, true)),
     };
     let herdr_core = route.herdr_core_client();
-    let _work_capture = ToolCallCapture {
-        name,
-        arguments: &arguments,
-        context,
+    // These local routes use TUI agent identities or topology, or expose TUI
+    // execution sessions. Reject before task binding, capture, or dispatch.
+    if herdr_core.is_some() {
+        let method = arguments
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // A refusal is conservative across spelling variants even though
+        // local dispatch itself only accepts exact method names.
+        let normalized_method = method.trim().to_ascii_lowercase();
+        let blocked = name == "herdr_skill"
+            || (name == "herdr_call"
+                && (normalized_method.starts_with("herdr_mcp.agent.task.")
+                    || matches!(
+                        normalized_method.as_str(),
+                        codex_history::RESUME_METHOD
+                            | codex_history::LIST_METHOD
+                            | codex_history::READ_METHOD
+                            | EXEC_WAIT_METHOD
+                            | WORK_PICKUP_METHOD
+                            | "artifact.import"
+                            | "herdr_mcp.skill.list"
+                            | "herdr_mcp.skill.describe"
+                            | "herdr_mcp.skill.load"
+                            | "herdr_mcp.planning.advise"
+                            | "herdr_mcp.github.status"
+                            | "herdr_mcp.cleanup.preview"
+                    )));
+        if blocked {
+            let operation = if name == "herdr_call" { method } else { name };
+            return Ok(tool_result(
+                crate::runtime_adapter::herdr_core_unsupported(
+                    operation,
+                    "tui_backend_isolation",
+                    "this operation depends on TUI state or execution and is unavailable on herdr-core",
+                ),
+                true,
+            ));
+        }
+    }
+    let _work_capture = if herdr_core.is_none() {
+        Some(ToolCallCapture {
+            name,
+            arguments: &arguments,
+            context,
+        })
+    } else {
+        None
     };
 
     let output = match name {
@@ -1569,7 +1613,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     }
                 }
             } else if method.starts_with("artifact.") {
-                artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
+                // Listing and inspecting cached artifacts do not require TUI topology.
+                let snapshot = if herdr_core.is_some() {
+                    json!({})
+                } else {
+                    context.cache.snapshot()
+                };
+                artifact_call(&config_dir(), &snapshot, method, &params)
             } else if method == TEXT_WRITE_METHOD {
                 if let Some(conflict) = check_mutating_tool_root_lease(
                     context,
@@ -1590,12 +1640,17 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     )
                 }
             } else if method.starts_with("herdr_mcp.") {
-                // herdr-mcp's own local registry never depends on the Herdr TUI
-                // socket, so it keeps working on every backend (#935).
+                // Snapshot-dependent local methods are refused above. Pure local
+                // methods receive no TUI snapshot on herdr-core.
+                let snapshot = if herdr_core.is_some() {
+                    json!({})
+                } else {
+                    context.cache.snapshot()
+                };
                 native_tools::call_with_local(
                     context.client,
                     context.skill,
-                    &context.cache.snapshot(),
+                    &snapshot,
                     method,
                     params,
                 )

@@ -4269,6 +4269,151 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn public_nested_tui_methods_fail_closed_on_herdr_core() {
+        // Backend selection is process-global; isolate the probe from parallel
+        // tests that may resolve the default TUI backend without an env lock.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "mcp_http::tests::public_nested_tui_methods_child_probe",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_remove("HERDR_MCP_CONFIG_DIR")
+            .env_remove("HERDR_MCP_RUNTIME_BACKEND")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "nested backend child probe failed: stdout={stdout} stderr={stderr}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child probe launched by public_nested_tui_methods_fail_closed_on_herdr_core"]
+    fn public_nested_tui_methods_child_probe() {
+        use std::os::unix::net::UnixListener;
+        let _guard = crate::test_env::lock();
+        let root = test_root("nested-backend-isolation");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let core_socket = std::path::PathBuf::from(format!(
+            "/tmp/hc-nested-{}-{unique}.sock",
+            std::process::id()
+        ));
+        let tui_socket = std::path::PathBuf::from(format!(
+            "/tmp/tui-nested-{}-{unique}.sock",
+            std::process::id()
+        ));
+        spawn_core_execution_fixture(&core_socket);
+        let listener = UnixListener::bind(&tui_socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::fs::write(config_dir.join("config.json"), json!({
+            "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+        }).to_string()).unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let mut state = test_state_with_snapshot(
+            &root.join("state"),
+            json!({
+                "workspaces": [{"workspace_id": "w1", "cwd": root.to_string_lossy()}],
+                "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root.to_string_lossy()}],
+                "agents": []
+            }),
+        );
+        state.client = HerdrClient::new(&tui_socket);
+        let app = candidate_router(state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (method, params) in [
+                ("herdr_mcp.agent.task.dispatch", json!({"target": "w1:p1", "text": "do work", "idempotency_key": "nested-dispatch"})),
+                ("herdr_mcp.codex_session.resume", json!({"project_root": root.to_string_lossy(), "session_id": "12345678-1234-1234-1234-123456789abc", "pane_id": "w1:p1", "name": "codex"})),
+                ("herdr_mcp.codex_session.list", json!({"project_root": root.to_string_lossy()})),
+                ("herdr_mcp.codex_session.read", json!({"project_root": root.to_string_lossy()})),
+                ("herdr_mcp.agent.task.status", json!({"task_id": "existing"})),
+                ("herdr_mcp.agent.task.inbox", json!({})),
+                ("herdr_mcp.agent.task.report", json!({"task_id": "existing"})),
+                ("herdr_mcp.agent.task.reconcile", json!({"task_id": "existing"})),
+                ("herdr_mcp.agent.task.gate.create", json!({"task_id": "existing"})),
+                ("herdr_mcp.agent.task.gate.status", json!({"gate_id": "existing"})),
+                ("herdr_mcp.agent.task.gate.resolve", json!({"gate_id": "existing"})),
+                ("herdr_mcp.agent.task.gate.cancel", json!({"gate_id": "existing"})),
+                ("herdr_mcp.exec.wait", json!({"session_id": "old"})),
+                ("artifact.import", json!({"artifact_id": "test", "path": root.join("output").to_string_lossy()})),
+                ("work.pickup", json!({"pane": "w1:p1"})),
+                ("herdr_mcp.skill.list", json!({})),
+                ("herdr_mcp.skill.describe", json!({})),
+                ("herdr_mcp.skill.load", json!({})),
+                ("herdr_mcp.planning.advise", json!({})),
+                ("herdr_mcp.github.status", json!({})),
+                ("herdr_mcp.cleanup.preview", json!({})),
+            ] {
+                let result = call_public_tool(&app, "herdr_call", json!({"method": method, "params": params})).await;
+                assert_eq!(result["code"], "runtime_capability_unsupported", "{method}: {result}");
+                assert_eq!(result["required_capability"], "tui_backend_isolation", "{method}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{method}: {result}");
+            }
+            for method in [
+                " herdr_mcp.agent.task.dispatch",
+                "herdr_mcp.agent.task.dispatch ",
+                "HERDR_MCP.AGENT.TASK.DISPATCH",
+                "herdr_mcp.Agent.task.dispatch",
+                " herdr_mcp.codex_session.resume ",
+                "HERDR_MCP.CODEX_SESSION.RESUME",
+                " artifact.import ",
+            ] {
+                let result = call_public_tool(&app, "herdr_call", json!({"method": method, "params": {"target": "w1:p1", "text": "do work"}})).await;
+                assert_eq!(result["ok"], false, "{method}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{method}: {result}");
+                assert!(matches!(result["code"].as_str(), Some("runtime_capability_unsupported" | "herdr_core_method_prohibited")), "{method}: {result}");
+            }
+            let skill = call_public_tool(&app, "herdr_skill", json!({})).await;
+            assert_eq!(skill["required_capability"], "tui_backend_isolation", "{skill}");
+            let list = call_public_tool(&app, "herdr_call", json!({"method": "artifact.list", "params": {}})).await;
+            assert_eq!(list["ok"], true, "{list}");
+            assert_eq!(list["artifacts"], json!([]));
+            let continuity = call_public_tool(&app, "herdr_call", json!({"method": "continuity.list", "params": {}})).await;
+            assert_eq!(continuity["ok"], true, "{continuity}");
+            assert_eq!(continuity["candidates"], json!([]));
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            unsafe { env::set_var("HERDR_MCP_RUNTIME_BACKEND", "tui") };
+            for method in ["herdr_mcp.agent.task.dispatch", "herdr_mcp.codex_session.resume"] {
+                let result = call_public_tool(&app, "herdr_call", json!({"method": method, "params": {}})).await;
+                assert_ne!(result["required_capability"], "tui_backend_isolation", "{method}: {result}");
+                assert_eq!(result["ok"], false, "{method}: {result}");
+            }
+        });
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_file(core_socket).ok();
+        std::fs::remove_file(tui_socket).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn public_mcp_tools_fail_closed_when_selected_backend_lacks_or_forbids_them() {
         let _guard = crate::test_env::lock();
         let root = test_root("runtime-backend-admission");
