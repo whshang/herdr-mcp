@@ -12,6 +12,23 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 pub fn inspect_core(client: &HerdrClient, cached_snapshot: Option<Value>) -> Value {
+    let backend_selection = match crate::runtime_adapter::resolve_process_backend_selection() {
+        Ok(selection) => selection,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "code": "invalid_runtime_backend",
+                "message": error,
+                "fallback_allowed": false,
+                "context": "herdr_inspect",
+                "failure_phase": "backend_selection",
+            });
+        }
+    };
+    if backend_selection.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore {
+        return crate::runtime_adapter::inspect_herdr_core(&backend_selection);
+    }
+
     let pong = match client.ping() {
         Ok(value) => value,
         Err(error) => {
@@ -61,7 +78,7 @@ pub fn inspect_core(client: &HerdrClient, cached_snapshot: Option<Value>) -> Val
         })
         .unwrap_or_default();
     let cli_probe = herdr_native::probe_cli();
-    project_snapshot(
+    let mut output = project_snapshot(
         &snapshot_result.value,
         &pong,
         snapshot_result.source,
@@ -69,7 +86,14 @@ pub fn inspect_core(client: &HerdrClient, cached_snapshot: Option<Value>) -> Val
         &inventory,
         inventory_scanned,
         &cli_probe,
-    )
+    );
+    if let Some(obj) = output.as_object_mut() {
+        obj.insert(
+            "runtime_backend".to_owned(),
+            backend_selection.summary_json(),
+        );
+    }
+    output
 }
 
 fn refresh_stale_binary_versions(inventory: &mut [AgentCapabilityRecord]) -> usize {

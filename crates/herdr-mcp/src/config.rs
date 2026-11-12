@@ -38,6 +38,8 @@ impl UpdateChannel {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Config {
     pub runtime_port: u16,
+    pub runtime_backend: crate::runtime_adapter::RuntimeBackend,
+    pub runtime_herdr_core_socket: Option<String>,
     pub dev_port: u16,
     pub update_channel: UpdateChannel,
     pub update_check: bool,
@@ -89,6 +91,8 @@ struct JsonConfigInput {
 #[serde(default, deny_unknown_fields)]
 struct JsonRuntimeInput {
     port: Option<u16>,
+    backend: Option<crate::runtime_adapter::RuntimeBackend>,
+    herdr_core_socket: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -114,7 +118,7 @@ struct JsonEdgeInput {
 
 #[derive(Serialize)]
 struct JsonConfigOutput<'a> {
-    runtime: JsonRuntimeOutput,
+    runtime: JsonRuntimeOutput<'a>,
     dev: JsonDevOutput,
     update: JsonUpdateOutput,
     edge: JsonEdgeOutput<'a>,
@@ -122,8 +126,12 @@ struct JsonConfigOutput<'a> {
 }
 
 #[derive(Serialize)]
-struct JsonRuntimeOutput {
+struct JsonRuntimeOutput<'a> {
     port: u16,
+    #[serde(skip_serializing_if = "crate::runtime_adapter::RuntimeBackend::is_default_tui")]
+    backend: crate::runtime_adapter::RuntimeBackend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    herdr_core_socket: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -164,6 +172,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             runtime_port: DEFAULT_RUNTIME_PORT,
+            runtime_backend: crate::runtime_adapter::RuntimeBackend::Tui,
+            runtime_herdr_core_socket: None,
             dev_port: DEFAULT_DEV_PORT,
             update_channel: UpdateChannel::Stable,
             update_check: true,
@@ -241,6 +251,8 @@ impl Config {
         let output = JsonConfigOutput {
             runtime: JsonRuntimeOutput {
                 port: self.runtime_port,
+                backend: self.runtime_backend,
+                herdr_core_socket: self.runtime_herdr_core_socket.as_deref(),
             },
             dev: JsonDevOutput {
                 port: self.dev_port,
@@ -347,6 +359,16 @@ fn parse_json(content: &str, instance: &InstanceId) -> Result<Config, String> {
             return Err("runtime.port must be greater than zero".to_owned());
         }
         config.runtime_port = port;
+    }
+    if let Some(backend) = input.runtime.backend {
+        config.runtime_backend = backend;
+    }
+    if let Some(socket) = input.runtime.herdr_core_socket {
+        let trimmed = socket.trim();
+        if trimmed.is_empty() {
+            return Err("runtime.herdr_core_socket cannot be empty".to_owned());
+        }
+        config.runtime_herdr_core_socket = Some(trimmed.to_owned());
     }
     if let Some(port) = input.dev.port {
         if port == 0 {
@@ -729,6 +751,8 @@ mod tests {
     fn rendered_config_round_trips() {
         let config = Config {
             runtime_port: 9000,
+            runtime_backend: crate::runtime_adapter::RuntimeBackend::Tui,
+            runtime_herdr_core_socket: None,
             dev_port: 9001,
             update_channel: UpdateChannel::Preview,
             update_check: false,
@@ -909,5 +933,35 @@ device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
         );
         assert!(normalize_device_id("dev_01ARZ3NDEKTSV4RRFFQ69G5FAI").is_err());
         assert!(normalize_device_id("dev_81ARZ3NDEKTSV4RRFFQ69G5FAV").is_err());
+    }
+
+    #[test]
+    fn runtime_backend_omits_default_tui_for_n_minus_1_rollback_and_persists_herdr_core() {
+        let default_cfg = Config::default();
+        let rendered_default = default_cfg.render();
+        assert!(
+            !rendered_default.contains("\"backend\""),
+            "default tui config must omit runtime.backend so 1.1.x deny_unknown_fields rollback succeeds: {rendered_default}"
+        );
+
+        let hc_cfg = Config {
+            runtime_backend: crate::runtime_adapter::RuntimeBackend::HerdrCore,
+            runtime_herdr_core_socket: Some("/tmp/hc-test/default.sock".to_owned()),
+            ..Config::default()
+        };
+        let rendered_hc = hc_cfg.render();
+        assert!(rendered_hc.contains("\"backend\": \"herdr-core\""));
+        assert_eq!(
+            parse_json(&rendered_hc, &InstanceId::default_instance()).unwrap(),
+            hc_cfg
+        );
+        assert!(
+            parse_json(
+                r#"{"runtime":{"backend":"auto"}}"#,
+                &InstanceId::default_instance()
+            )
+            .is_err(),
+            "unknown runtime.backend must fail closed without fallback"
+        );
     }
 }

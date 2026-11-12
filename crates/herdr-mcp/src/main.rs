@@ -71,6 +71,7 @@ mod qualification;
 mod relay;
 mod release_trust;
 mod residue;
+mod runtime_adapter;
 mod runtime_meta;
 mod schema;
 mod semantic;
