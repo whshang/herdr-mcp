@@ -4238,9 +4238,9 @@ mod tests {
             assert_eq!(inspect["ok"], true);
             assert_eq!(inspect["runtime_backend"]["selected"], "herdr-core");
 
-            // Raw `herdr_call` forwarding is decided by `hello.methods` under
-            // herdr-core, never by the TUI socket: `pane.list` is a TUI-only
-            // method and stays unsupported.
+            // Raw `herdr_call` forwarding is restricted to the read-only
+            // allowlist on herdr-core, never the TUI socket: `pane.list` is a
+            // TUI-only method and is refused before `hc` is contacted.
             let forwarded = call_public_tool(
                 &app,
                 "herdr_call",
@@ -4248,8 +4248,7 @@ mod tests {
             )
             .await;
             assert_eq!(forwarded["ok"], false);
-            assert_eq!(forwarded["code"], "runtime_capability_unsupported");
-            assert_eq!(forwarded["required_capability"], "herdr_core_method");
+            assert_eq!(forwarded["code"], "herdr_core_method_prohibited");
             assert_eq!(forwarded["runtime_backend"], "herdr-core");
             assert_eq!(forwarded["delivery_state"], "not_delivered");
 
@@ -4306,6 +4305,8 @@ mod tests {
         let root = test_root("herdr-core-execution-routes");
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
+        let unleased = root.join("unleased");
+        std::fs::create_dir_all(&unleased).unwrap();
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
         let core_socket = std::path::PathBuf::from(format!(
@@ -4513,8 +4514,10 @@ mod tests {
             assert!(names.contains(&"file.read"), "{methods}");
             assert!(names.contains(&"file.write"), "{methods}");
 
-            // 6. herdr_call forwards only advertised methods; machine.* stays
-            // reserved for the lease-checked herdr_exec route.
+            // 6. `herdr_call` raw forwarding is a precise read-only allowlist:
+            // every file/machine/terminal primitive is refused (including a
+            // whitespace-prefixed method name) so the raw channel can never
+            // bypass the root lease, readonly gate or secret-path denylist.
             let status = call_public_tool(
                 &app,
                 "herdr_call",
@@ -4524,14 +4527,41 @@ mod tests {
             assert_eq!(status["ok"], true, "{status}");
             assert_eq!(status["runtime_backend"], "herdr-core");
 
-            let machine = call_public_tool(
-                &app,
-                "herdr_call",
-                json!({"method": "machine.exec", "params": {"argv": ["true"]}}),
-            )
-            .await;
-            assert_eq!(machine["ok"], false, "{machine}");
-            assert_eq!(machine["code"], "herdr_core_method_prohibited", "{machine}");
+            for (method, params) in [
+                ("machine.exec", json!({"argv": ["true"]})),
+                (" machine.exec", json!({"argv": ["true"]})),
+                ("\tmachine.exec", json!({"argv": ["true"]})),
+                (
+                    "file.write",
+                    json!({"path": file.to_string_lossy(), "data": "forbidden"}),
+                ),
+                ("file.read", json!({"path": file.to_string_lossy()})),
+                (
+                    "file.edit",
+                    json!({"path": file.to_string_lossy(), "edits": []}),
+                ),
+                ("terminal.run", json!({"line": "printf forbidden"})),
+                ("terminal.kill", json!({"terminal": "t1"})),
+                (
+                    "terminal.send",
+                    json!({"terminal": "t1", "text": "forbidden"}),
+                ),
+            ] {
+                let refused = call_public_tool(
+                    &app,
+                    "herdr_call",
+                    json!({"method": method, "params": params}),
+                )
+                .await;
+                assert_eq!(refused["ok"], false, "{method}");
+                assert_eq!(
+                    refused["code"], "herdr_core_method_prohibited",
+                    "{method}: {refused}"
+                );
+                assert_eq!(refused["delivery_state"], "not_delivered", "{method}");
+            }
+            // None of the refused raw calls reached `hc`.
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
 
             // 7. A single-writer root lease blocks every mutating herdr-core
             // route before `hc` is contacted.
@@ -4595,6 +4625,52 @@ mod tests {
             }
             // Nothing was written while the lease was held.
             assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
+
+            // A relative path with an explicit `root` resolves through
+            // `root.join(path)` on `hc`, so the lease must refuse the same
+            // target instead of the herdr-mcp process cwd (#936 P1-3).
+            let relative_inside_lease = call_public_tool(
+                &app,
+                "herdr_fs_write",
+                json!({
+                    "path": "relative-inside-lease.txt",
+                    "root": project.to_string_lossy(),
+                    "content": "blocked\n",
+                }),
+            )
+            .await;
+            assert_eq!(
+                relative_inside_lease["ok"], false,
+                "{relative_inside_lease}"
+            );
+            assert_eq!(
+                relative_inside_lease["code"], "single_writer_lease_conflict",
+                "{relative_inside_lease}"
+            );
+            assert!(
+                !project.join("relative-inside-lease.txt").exists(),
+                "the leased root must not receive a relative-path write"
+            );
+
+            // `project_root` outside the lease must not shadow the `root` that
+            // `hc` actually executes in: every supplied cwd-like field is a
+            // lease candidate, not just the first one present (#936 P1-4).
+            let shadowed_exec = call_public_tool(
+                &app,
+                "herdr_exec",
+                json!({
+                    "project_root": unleased.to_string_lossy(),
+                    "root": project.to_string_lossy(),
+                    "command": "printf blocked",
+                }),
+            )
+            .await;
+            assert_eq!(shadowed_exec["ok"], false, "{shadowed_exec}");
+            assert_eq!(
+                shadowed_exec["code"], "single_writer_lease_conflict",
+                "{shadowed_exec}"
+            );
+            assert_eq!(shadowed_exec["delivery_state"], "not_delivered");
 
             // A caller presenting the lease credentials is allowed again.
             let owned = call_public_tool(

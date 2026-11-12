@@ -1571,9 +1571,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
             } else if method == TEXT_WRITE_METHOD {
-                if let Some(conflict) =
-                    check_mutating_tool_root_lease(context, method, &params, Some(&arguments))
-                {
+                if let Some(conflict) = check_mutating_tool_root_lease(
+                    context,
+                    method,
+                    &params,
+                    Some(&arguments),
+                    herdr_core.is_some(),
+                ) {
                     conflict
                 } else {
                     let clean_params = strip_lease_credential_fields(&params);
@@ -1656,9 +1660,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         "herdr_fs_edit" => {
             // #935 / Droid P2-928-c: the single-writer root lease is enforced
             // for the herdr-core backend too, before any `hc` mutation.
-            if let Some(conflict) =
-                check_mutating_tool_root_lease(context, "herdr_fs_edit", &arguments, None)
-            {
+            if let Some(conflict) = check_mutating_tool_root_lease(
+                context,
+                "herdr_fs_edit",
+                &arguments,
+                None,
+                herdr_core.is_some(),
+            ) {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
@@ -1669,9 +1677,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             }
         }
         "herdr_fs_write" => {
-            if let Some(conflict) =
-                check_mutating_tool_root_lease(context, "herdr_fs_write", &arguments, None)
-            {
+            if let Some(conflict) = check_mutating_tool_root_lease(
+                context,
+                "herdr_fs_write",
+                &arguments,
+                None,
+                herdr_core.is_some(),
+            ) {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
@@ -1682,9 +1694,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             }
         }
         "herdr_fs_patch" => {
-            if let Some(conflict) =
-                check_mutating_tool_root_lease(context, "herdr_fs_patch", &arguments, None)
-            {
+            if let Some(conflict) = check_mutating_tool_root_lease(
+                context,
+                "herdr_fs_patch",
+                &arguments,
+                None,
+                herdr_core.is_some(),
+            ) {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
@@ -1692,9 +1708,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             }
         }
         "herdr_git" => {
-            if let Some(conflict) =
-                check_mutating_tool_root_lease(context, "herdr_git", &arguments, None)
-            {
+            if let Some(conflict) = check_mutating_tool_root_lease(
+                context,
+                "herdr_git",
+                &arguments,
+                None,
+                herdr_core.is_some(),
+            ) {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
@@ -1702,9 +1722,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             }
         }
         "herdr_exec_start" => {
-            if let Some(conflict) =
-                check_mutating_tool_root_lease(context, "herdr_exec_start", &arguments, None)
-            {
+            if let Some(conflict) = check_mutating_tool_root_lease(
+                context,
+                "herdr_exec_start",
+                &arguments,
+                None,
+                herdr_core.is_some(),
+            ) {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
@@ -1728,9 +1752,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             None => exec_tools::kill(context.exec, &arguments),
         },
         "herdr_exec" => {
-            if let Some(conflict) =
-                check_mutating_tool_root_lease(context, "herdr_exec", &arguments, None)
-            {
+            if let Some(conflict) = check_mutating_tool_root_lease(
+                context,
+                "herdr_exec",
+                &arguments,
+                None,
+                herdr_core.is_some(),
+            ) {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
@@ -2834,11 +2862,65 @@ fn workspace_candidate_paths_from_snapshot(
     paths
 }
 
+/// Trimmed, non-empty string argument.
+fn trimmed_str_arg(arguments: &Value, key: &str) -> Option<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Every `cwd`-like directory a `herdr-core` exec route may resolve to.
+///
+/// All of them are returned, never just the first one that happens to exist:
+/// `herdr_call`-style ordering guesses are exactly how a lease check ends up
+/// validating `/outside` while `hc` executes in `/leased` (#936 P1-4).
+fn herdr_core_exec_candidate_roots(arguments: &Value) -> Vec<String> {
+    ["project_root", "root", "cwd"]
+        .iter()
+        .filter_map(|key| trimmed_str_arg(arguments, key))
+        .collect()
+}
+
+/// The lease candidates for `herdr_fs_write` / `herdr_fs_edit` on `herdr-core`.
+///
+/// `hc` resolves a relative `path` against the `cwd` it is given
+/// (`root` -> `project_root` -> `cwd`) and then applies its own secret-path
+/// denylist to that resolved target, so the lease must be checked against the
+/// same `cwd.join(path)` and against each explicit directory itself. Checking
+/// only the raw `path` would resolve it against the herdr-mcp process cwd
+/// (#936 P1-3).
+fn herdr_core_fs_candidate_paths(arguments: &Value) -> Vec<String> {
+    let roots = herdr_core_exec_candidate_roots(arguments);
+    let mut candidates = Vec::new();
+    match trimmed_str_arg(arguments, "path") {
+        Some(path) => {
+            if std::path::Path::new(&path).is_relative() {
+                for root in &roots {
+                    candidates.push(
+                        std::path::Path::new(root)
+                            .join(&path)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                candidates.extend(roots);
+            }
+            candidates.push(path);
+        }
+        None => candidates.extend(roots),
+    }
+    candidates
+}
+
 fn check_mutating_tool_root_lease(
     context: &RuntimeContext<'_>,
     tool_or_method: &str,
     arguments: &Value,
     outer_arguments: Option<&Value>,
+    herdr_core_active: bool,
 ) -> Option<Value> {
     if tool_or_method == "herdr_git" {
         let action = arguments
@@ -2878,17 +2960,37 @@ fn check_mutating_tool_root_lease(
     }
 
     let candidate_paths: Vec<String> = match tool_or_method {
+        // Under `herdr-core` the lease target is the `cwd.join(path)` that `hc`
+        // will resolve; the TUI route accepts no cwd/root and keeps the raw
+        // `path` (#936 P1-3).
+        "herdr_fs_edit" | "herdr_fs_write" if herdr_core_active => {
+            herdr_core_fs_candidate_paths(arguments)
+        }
         "herdr_fs_edit" | "herdr_fs_write" | TEXT_WRITE_METHOD => arguments
             .get("path")
             .and_then(Value::as_str)
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default(),
-        "herdr_fs_patch" | "herdr_exec_start" => arguments
+        // `herdr_fs_patch` is TUI-only: `root` is the only field the route
+        // honours, so the lease envelope stays byte-for-byte unchanged (#936
+        // P2-6). `herdr_exec_start` accepts `project_root`/`cwd` only on
+        // `herdr-core`; the TUI route keeps `root` alone for the same reason.
+        "herdr_fs_patch" => arguments
             .get("root")
-            .or_else(|| arguments.get("project_root"))
             .and_then(Value::as_str)
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default(),
+        "herdr_exec_start" => {
+            if herdr_core_active {
+                herdr_core_exec_candidate_roots(arguments)
+            } else {
+                arguments
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .map(|s| vec![s.to_owned()])
+                    .unwrap_or_default()
+            }
+        }
         "herdr_git" => arguments
             .get("root")
             .or_else(|| arguments.get("project_root"))
@@ -2896,26 +2998,19 @@ fn check_mutating_tool_root_lease(
             .and_then(Value::as_str)
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default(),
+        // Every supplied cwd-like field is checked and a `workspace` snapshot
+        // is merged in, never used as a fallback: `project_root=/outside` +
+        // `root=/leased` and a TUI `workspace=w1` shadowed by `root=/tmp` both
+        // stay blocked (#936 P1-4).
         "herdr_exec" => {
-            if let Some(root) = arguments
-                .get("project_root")
-                .or_else(|| arguments.get("root"))
-                .or_else(|| arguments.get("cwd"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                vec![root.to_owned()]
-            } else if let Some(workspace) = arguments
-                .get("workspace")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                workspace_candidate_paths_from_snapshot(&context.cache.snapshot(), workspace)
-            } else {
-                Vec::new()
+            let mut candidates = herdr_core_exec_candidate_roots(arguments);
+            if let Some(workspace) = trimmed_str_arg(arguments, "workspace") {
+                candidates.extend(workspace_candidate_paths_from_snapshot(
+                    &context.cache.snapshot(),
+                    &workspace,
+                ));
             }
+            candidates
         }
         _ => Vec::new(),
     };

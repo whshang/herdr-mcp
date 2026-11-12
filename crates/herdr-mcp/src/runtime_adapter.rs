@@ -71,6 +71,63 @@ const PROHIBITED_HC_METHODS: &[&str] = &[
     "server.restart",
 ];
 
+/// The only `herdr-core` methods `herdr_call` may forward verbatim.
+///
+/// This is deliberately a precise read-only allowlist, not a denylist of known
+/// mutation primitives: everything outside it (`file.read`, `file.write`,
+/// `file.edit`, `terminal.run`, `terminal.kill`, `terminal.send`, the rest of
+/// `terminal.*`, `machine.*`) owns its guards in the typed public tool route —
+/// the single-writer root lease, `HERDR_MCP_READONLY`, the `fs_security`
+/// secret-path denylist, the byte budget and the prompt human boundary. Raw
+/// forwarding would bypass every one of them (#936 P0-1 / P1-2).
+const HERDR_CALL_FORWARDABLE_HC_METHODS: &[&str] = &[
+    "doc.get",
+    "rpc.discover",
+    "server.status",
+    "templates.list",
+    "terminal.get",
+    "terminal.list",
+    "terminal.read",
+    "terminal.wait",
+];
+
+fn hc_forwardable_readonly_method(method: &str) -> bool {
+    HERDR_CALL_FORWARDABLE_HC_METHODS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(method))
+}
+
+/// Why raw `herdr_call` forwarding must refuse `method`, or `None` when it
+/// stays inside the read-only allowlist.
+///
+/// The caller passes the already-trimmed method name; whitespace is never part
+/// of any decision (#936 P1-2).
+fn hc_forwarding_refusal(method: &str) -> Option<String> {
+    if method.is_empty() {
+        return Some("herdr_call requires a non-empty method name".to_owned());
+    }
+    if PROHIBITED_HC_METHODS
+        .iter()
+        .any(|prohibited| prohibited.eq_ignore_ascii_case(method))
+    {
+        return Some(format!(
+            "herdr-core method '{method}' is prohibited by herdr-mcp runtime ownership rules"
+        ));
+    }
+    if method.to_ascii_lowercase().starts_with("machine.") {
+        return Some(format!(
+            "herdr-core method '{method}' is not forwardable through herdr_call; use herdr_exec (machine.exec) so the single-writer root lease and readonly gate are enforced"
+        ));
+    }
+    if !hc_forwardable_readonly_method(method) {
+        return Some(format!(
+            "herdr-core method '{method}' is not forwardable through herdr_call: raw forwarding is limited to the read-only allowlist [{}]; file, terminal and machine primitives must go through herdr_fs_read, herdr_fs_write, herdr_fs_edit, herdr_exec, herdr_exec_start, herdr_exec_kill or herdr_prompt so the single-writer root lease, HERDR_MCP_READONLY, the secret-path denylist and the delivery/human-boundary guards stay enforced",
+            HERDR_CALL_FORWARDABLE_HC_METHODS.join(", "),
+        ));
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RuntimeBackend {
     #[default]
@@ -685,9 +742,6 @@ impl HerdrCoreClient {
 
     /// `machine.exec` with a shell `line` instead of `argv`, so `herdr_exec`
     /// can forward a freeform `command` without re-splitting it locally.
-    ///
-    /// The global readonly gate is applied before any socket work, exactly like
-    /// every other mutating surface.
     pub fn machine_exec_line(
         &self,
         line: &str,
@@ -701,7 +755,6 @@ impl HerdrCoreClient {
                 message: "machine.exec line must not be empty".to_owned(),
             });
         }
-        hc_mutation_guard("herdr_exec")?;
         let mut params = Map::new();
         params.insert("line".to_owned(), json!(line));
         self.machine_exec_params(params, cwd, timeout_secs)
@@ -713,6 +766,11 @@ impl HerdrCoreClient {
         cwd: Option<&Path>,
         timeout_secs: Option<u64>,
     ) -> Result<Value, HerdrCoreError> {
+        // P2-5: the global readonly gate lives in the shared primitive, so both
+        // the `argv` (`machine_exec`) and shell (`machine_exec_line`) entrypoints
+        // refuse before any socket work even when a future caller reaches them
+        // without the typed `herdr_exec` wrapper.
+        hc_mutation_guard("herdr_exec")?;
         // The read/write budget must match the server-side execution window, or a
         // long `machine.exec` would be cut off by the 5 s handshake timeout while
         // the command keeps running on the host.
@@ -1199,29 +1257,27 @@ impl HerdrCoreClient {
     pub fn call_allowed_method(
         &self,
         method: &str,
-        mut params: Value,
+        params: Value,
     ) -> Result<Value, HerdrCoreError> {
         let method = method.trim();
-        if PROHIBITED_HC_METHODS.contains(&method) {
-            return Err(HerdrCoreError {
-                code: "herdr_core_method_prohibited".to_owned(),
-                kind: None,
-                message: format!(
-                    "herdr-core method '{method}' is prohibited by herdr-mcp runtime ownership rules"
-                ),
-            });
-        }
-        if method == "terminal.send"
-            && let Some(obj) = params.as_object_mut()
-        {
-            if obj.get("force").and_then(Value::as_bool) == Some(true) {
+        if let Some(message) = hc_forwarding_refusal(method) {
+            // `terminal.send` keeps its dedicated human-boundary code: with
+            // `force=true` the refusal is about the human boundary, not about
+            // the read-only allowlist.
+            if method.eq_ignore_ascii_case("terminal.send")
+                && params.get("force").and_then(Value::as_bool) == Some(true)
+            {
                 return Err(HerdrCoreError {
                     code: "human_boundary_prohibited".to_owned(),
                     kind: None,
                     message: "terminal.send force=true is prohibited (human boundary)".to_owned(),
                 });
             }
-            obj.insert("force".to_owned(), json!(false));
+            return Err(HerdrCoreError {
+                code: "herdr_core_method_prohibited".to_owned(),
+                kind: None,
+                message,
+            });
         }
         let call_timeout = self.timeout;
         self.with_negotiated_session(|hello, stream| {
@@ -2204,13 +2260,19 @@ pub fn herdr_core_prompt(client: &HerdrCoreClient, args: &Value) -> Value {
 
 /// `herdr_call` forwarding under `herdr-core`.
 ///
-/// Local `herdr_mcp.*` methods never reach here. Everything else is decided
-/// dynamically by `hello.methods`, so a TUI-only method such as `pane.list`
-/// fails closed with `runtime_capability_unsupported` instead of being forwarded
-/// to the live TUI socket. `machine.*` stays reserved for the lease-checked
-/// `herdr_exec` route, and `terminal.send` keeps `force=false`.
+/// Local `herdr_mcp.*` methods never reach here. The method name is trimmed
+/// before any decision, so leading whitespace cannot slip past the `machine.*`
+/// fence (#936 P1-2). Raw forwarding is then limited to the precise read-only
+/// allowlist in [`HERDR_CALL_FORWARDABLE_HC_METHODS`]; every file/machine/
+/// terminal primitive fails closed with `herdr_core_method_prohibited` and
+/// points at the guarded public tool, so `herdr_call` can never bypass the
+/// single-writer root lease, `HERDR_MCP_READONLY`, the secret-path denylist or
+/// the prompt human boundary (#936 P0-1). Methods that are allowlisted but not
+/// advertised by `hello.methods` still fail closed with
+/// `runtime_capability_unsupported`.
 pub fn herdr_core_call(client: &HerdrCoreClient, method: &str, params: Value) -> Value {
-    if method.starts_with("machine.") {
+    let method = method.trim();
+    if let Some(message) = hc_forwarding_refusal(method) {
         return json!({
             "ok": false,
             "code": "herdr_core_method_prohibited",
@@ -2219,9 +2281,7 @@ pub fn herdr_core_call(client: &HerdrCoreClient, method: &str, params: Value) ->
             "retryable": false,
             "fallback_allowed": false,
             "delivery_state": "not_delivered",
-            "message": format!(
-                "herdr-core method '{method}' is not forwardable through herdr_call; use herdr_exec (machine.exec) so the single-writer root lease and readonly gate are enforced"
-            ),
+            "message": message,
         });
     }
     match client.call_allowed_method(method, params) {
@@ -3448,6 +3508,22 @@ mod tests {
             );
             assert_eq!(
                 client.terminal_kill("t9").unwrap_err().code,
+                "readonly_mode"
+            );
+            // P2-5: the guard lives in the shared `machine.exec` primitive, so
+            // the `argv` and shell entrypoints refuse on their own.
+            assert_eq!(
+                client
+                    .machine_exec(&["true".to_owned()], None, Some(1))
+                    .unwrap_err()
+                    .code,
+                "readonly_mode"
+            );
+            assert_eq!(
+                client
+                    .machine_exec_line("true", None, Some(1))
+                    .unwrap_err()
+                    .code,
                 "readonly_mode"
             );
             // Reads and waits stay available in readonly mode: they only fail at the
