@@ -1304,9 +1304,17 @@ fn apply_inner(
                 });
             }
         };
-        let worker_pid_persisted = store
-            .set_update_worker_pid(&job_id, child.id(), now_ms_i64())
-            .is_ok();
+        let worker_pid_persisted = match child.pid() {
+            Some(pid) => store
+                .set_update_worker_pid(&job_id, pid, now_ms_i64())
+                .is_ok(),
+            None => store
+                .update_job(&job_id)
+                .ok()
+                .flatten()
+                .and_then(|record| record.worker_pid)
+                .is_some(),
+        };
 
         if progress.enabled {
             if let Some(job) = watch_update_job(&store, &job_id, &mut child, &mut progress)? {
@@ -1337,13 +1345,14 @@ fn apply_inner(
                 // in the same upgrade, so it only reports what was recorded.
                 let extension =
                     standalone_extension_report(&paths, Some(&plan.identity.source_commit));
+                let reported_worker_pid = job.worker_pid.or(child.pid()).unwrap_or(0);
                 let (mut payload, code) = runtime_update_succeeded_result(RuntimeUpdateOutcome {
                     target_version,
                     target: plan.asset.target.clone(),
                     asset: plan.asset.name.clone(),
                     job_id: job_id.clone(),
-                    worker_pid: child.id(),
-                    worker_pid_persisted,
+                    worker_pid: reported_worker_pid,
+                    worker_pid_persisted: worker_pid_persisted || job.worker_pid.is_some(),
                     job: public_job_view(&job),
                     migration: plan.state_schema_migration.as_ref(),
                     worker_update,
@@ -1366,6 +1375,12 @@ fn apply_inner(
             );
         }
 
+        let latest_pid = store
+            .update_job(&job_id)
+            .ok()
+            .flatten()
+            .and_then(|record| record.worker_pid)
+            .or(child.pid());
         print_json(&json!({
             "ok": true,
             "code": "update_queued",
@@ -1379,8 +1394,8 @@ fn apply_inner(
                 "reversible": migration.reversible,
             })),
             "warning": plan.state_schema_migration.as_ref().map(StateSchemaMigration::warning),
-            "worker_pid": child.id(),
-            "worker_pid_persisted": worker_pid_persisted,
+            "worker_pid": latest_pid.unwrap_or(0),
+            "worker_pid_persisted": worker_pid_persisted || latest_pid.is_some(),
             "worker_update": {
                 "state": "not_attempted",
                 "reason": "worker_update_is_a_separate_operator_step",
@@ -2477,6 +2492,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
                 job.state
             ));
         }
+        let _ = store.set_update_worker_pid(job_id, std::process::id(), now_ms_i64());
         let binary = PathBuf::from(&job.binary_path);
         if !binary_is_confined(&paths, &binary, job_id) {
             store.update_update_job(
@@ -2777,10 +2793,61 @@ fn download_asset<W: Write>(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+enum SpawnedUpdateWorker {
+    Direct(std::process::Child),
+    #[cfg(target_os = "macos")]
+    GuiLaunchAgent {
+        label: String,
+        plist_path: PathBuf,
+        pid: Option<u32>,
+    },
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl SpawnedUpdateWorker {
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Direct(child) => Some(child.id()),
+            #[cfg(target_os = "macos")]
+            Self::GuiLaunchAgent { pid, label, .. } => {
+                pid.or_else(|| crate::service_lifecycle::query_gui_worker_pid(label))
+            }
+        }
+    }
+
+    fn try_wait(&mut self) -> Result<bool, String> {
+        match self {
+            Self::Direct(child) => child
+                .try_wait()
+                .map(|status| status.is_some())
+                .map_err(|error| format!("cannot inspect update worker: {error}")),
+            #[cfg(target_os = "macos")]
+            Self::GuiLaunchAgent { label, pid, .. } => {
+                if pid.is_none() {
+                    *pid = crate::service_lifecycle::query_gui_worker_pid(label);
+                }
+                Ok(crate::service_lifecycle::gui_worker_has_exited(label))
+            }
+        }
+    }
+
+    fn cleanup_after_exit(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Self::GuiLaunchAgent {
+            label, plist_path, ..
+        } = self
+        {
+            let _ = crate::service_lifecycle::bootout_gui_worker_label(label);
+            let _ = fs::remove_file(&*plist_path);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn watch_update_job<W: Write>(
     store: &UpdateStore,
     job_id: &str,
-    child: &mut std::process::Child,
+    child: &mut SpawnedUpdateWorker,
     progress: &mut UpdateProgress<W>,
 ) -> Result<Option<UpdateJobRecord>, String> {
     let started = Instant::now();
@@ -2790,8 +2857,12 @@ fn watch_update_job<W: Write>(
         })?;
         progress.job(&job);
         match job.state.as_str() {
-            "succeeded" => return Ok(Some(job)),
+            "succeeded" => {
+                child.cleanup_after_exit();
+                return Ok(Some(job));
+            }
             "failed" => {
+                child.cleanup_after_exit();
                 return Err(format!(
                     "update job {job_id} failed: {}",
                     job.detail.as_deref().unwrap_or("no detail")
@@ -2799,6 +2870,7 @@ fn watch_update_job<W: Write>(
             }
             "queued" | "installing" => {}
             other => {
+                child.cleanup_after_exit();
                 return Err(format!(
                     "update job {job_id} entered unexpected state {other}"
                 ));
@@ -2808,12 +2880,9 @@ fn watch_update_job<W: Write>(
         if started.elapsed() >= UPDATE_WATCH_TIMEOUT {
             return Ok(None);
         }
-        if child
-            .try_wait()
-            .map_err(|error| format!("cannot inspect update worker: {error}"))?
-            .is_some()
-        {
+        if child.try_wait()? {
             std::thread::sleep(UPDATE_WATCH_POLL_INTERVAL);
+            child.cleanup_after_exit();
             let final_job = store
                 .update_job(job_id)?
                 .ok_or_else(|| format!("update job {job_id} disappeared after worker exit"))?;
@@ -2968,7 +3037,18 @@ fn spawn_worker(
     paths: &RuntimePaths,
     binary: &Path,
     job_id: &str,
-) -> Result<std::process::Child, String> {
+) -> Result<SpawnedUpdateWorker, String> {
+    #[cfg(target_os = "macos")]
+    if crate::service_lifecycle::caller_is_non_gui_ssh_session() {
+        let (label, plist_path, pid) =
+            crate::service_lifecycle::spawn_gui_domain_update_worker(paths, binary, job_id)?;
+        return Ok(SpawnedUpdateWorker::GuiLaunchAgent {
+            label,
+            plist_path,
+            pid,
+        });
+    }
+
     let mut command = Command::new(binary);
     command
         .arg("update")
@@ -2996,6 +3076,7 @@ fn spawn_worker(
     retry_text_file_busy(EXEC_BUSY_ATTEMPTS, EXEC_BUSY_RETRY_DELAY, || {
         command.spawn()
     })
+    .map(SpawnedUpdateWorker::Direct)
     .map_err(|error| format!("cannot spawn detached update worker: {error}"))
 }
 
@@ -3399,6 +3480,9 @@ fn cleanup_staging(binary: &Path) {
     let parent = binary.parent().map(Path::to_path_buf);
     let _ = fs::remove_file(binary);
     if let Some(parent) = parent {
+        let _ = fs::remove_file(parent.join("gui-worker.plist"));
+        let _ = fs::remove_file(parent.join("gui-worker.out.log"));
+        let _ = fs::remove_file(parent.join("gui-worker.err.log"));
         let _ = fs::remove_dir(parent);
     }
 }
@@ -5715,5 +5799,184 @@ mod tests {
                 json!("macos_documents_tcc_prompt")
             ]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ssh_update_apply_spawns_one_shot_gui_launch_agent_when_gui_domain_is_active() {
+        let _guard = crate::test_env::lock();
+        let root = env::temp_dir().join(format!(
+            "herdr-ssh-update-active-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        let config_dir = root.join("config");
+        let bin_dir = root.join("bin");
+        let job_id = "upd-20261112-913-active";
+        let job_dir = config_dir.join("update").join("jobs").join(job_id);
+        fs::create_dir_all(&job_dir).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        let candidate = job_dir.join("herdr-mcp-candidate");
+        fs::write(&candidate, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let fake_launchctl = bin_dir.join("launchctl");
+        let captured_plist = root.join("captured-update-worker.plist");
+        let script = format!(
+            "#!/bin/sh\n\
+             cmd=\"$1\"\n\
+             if [ \"$cmd\" = \"print\" ]; then\n\
+               printf 'pid = 5150\\nstate = running\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$cmd\" = \"bootstrap\" ]; then\n\
+               cp \"$3\" \"{}\"\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+            captured_plist.display()
+        );
+        fs::write(&fake_launchctl, script.as_bytes()).unwrap();
+        fs::set_permissions(&fake_launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let original_path = env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{original_path}", bin_dir.display());
+        let vars = [
+            (
+                "HERDR_MCP_CONFIG_DIR",
+                Some(config_dir.to_string_lossy().into_owned()),
+            ),
+            ("HERDR_MCP_INSTANCE", None),
+            ("HERDR_MCP_TEST_ALLOW_SSH_GUI_ROUTING", Some("1".to_owned())),
+            (
+                "SSH_CONNECTION",
+                Some("10.0.0.1 55555 10.0.0.2 22".to_owned()),
+            ),
+            ("HERDR_MCP_GUI_DOMAIN_WORKER", None),
+            (
+                "HERDR_MCP_GUI_DOMAIN_PROBE_OVERRIDE",
+                Some("active".to_owned()),
+            ),
+            ("PATH", Some(new_path)),
+        ];
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(k, v)| {
+                let prev = env::var_os(k);
+                unsafe {
+                    match v {
+                        Some(val) => env::set_var(k, val),
+                        None => env::remove_var(k),
+                    }
+                }
+                (*k, prev)
+            })
+            .collect();
+
+        let paths = RuntimePaths::discover().unwrap();
+        let mut spawned =
+            spawn_worker(&paths, &candidate, job_id).expect("GUI worker spawn must succeed");
+        assert_eq!(spawned.pid(), Some(5150));
+        assert!(captured_plist.is_file());
+        let parsed = plist::Value::from_file(&captured_plist).unwrap();
+        let dict = parsed.as_dictionary().unwrap();
+        assert_eq!(
+            dict.get("RunAtLoad").and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+        assert_eq!(
+            dict.get("KeepAlive").and_then(plist::Value::as_boolean),
+            Some(false)
+        );
+        spawned.cleanup_after_exit();
+        cleanup_staging(&candidate);
+        assert!(
+            !job_dir.exists(),
+            "cleanup_staging must remove job_dir and gui-worker.plist"
+        );
+
+        unsafe {
+            for (k, prev) in previous {
+                match prev {
+                    Some(val) => env::set_var(k, val),
+                    None => env::remove_var(k),
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ssh_update_apply_fails_closed_and_cleans_up_staging_when_gui_domain_is_inactive() {
+        let _guard = crate::test_env::lock();
+        let root = env::temp_dir().join(format!(
+            "herdr-ssh-update-inactive-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        let config_dir = root.join("config");
+        let job_id = "upd-20261112-913-inactive";
+        let job_dir = config_dir.join("update").join("jobs").join(job_id);
+        fs::create_dir_all(&job_dir).unwrap();
+        let candidate = job_dir.join("herdr-mcp-candidate");
+        fs::write(&candidate, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let vars = [
+            (
+                "HERDR_MCP_CONFIG_DIR",
+                Some(config_dir.to_string_lossy().into_owned()),
+            ),
+            ("HERDR_MCP_INSTANCE", None),
+            ("HERDR_MCP_TEST_ALLOW_SSH_GUI_ROUTING", Some("1".to_owned())),
+            (
+                "SSH_CONNECTION",
+                Some("10.0.0.1 55555 10.0.0.2 22".to_owned()),
+            ),
+            ("HERDR_MCP_GUI_DOMAIN_WORKER", None),
+            (
+                "HERDR_MCP_GUI_DOMAIN_PROBE_OVERRIDE",
+                Some("inactive".to_owned()),
+            ),
+        ];
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(k, v)| {
+                let prev = env::var_os(k);
+                unsafe {
+                    match v {
+                        Some(val) => env::set_var(k, val),
+                        None => env::remove_var(k),
+                    }
+                }
+                (*k, prev)
+            })
+            .collect();
+
+        let paths = RuntimePaths::discover().unwrap();
+        let error = match spawn_worker(&paths, &candidate, job_id) {
+            Ok(_) => panic!("inactive gui/<uid> domain must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains(crate::service_lifecycle::GUI_DOMAIN_INACTIVE_CODE),
+            "unexpected error: {error}"
+        );
+        cleanup_staging(&candidate);
+        assert!(
+            !job_dir.exists(),
+            "staging must be cleaned up on fail-closed exit"
+        );
+
+        unsafe {
+            for (k, prev) in previous {
+                match prev {
+                    Some(val) => env::set_var(k, val),
+                    None => env::remove_var(k),
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }
