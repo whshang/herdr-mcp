@@ -3,7 +3,9 @@ mod actuation;
 use crate::browser_control;
 use crate::exec_sessions::ExecRegistry;
 #[cfg(unix)]
-use crate::extension_ipc::ExtensionIpcSocket;
+use crate::extension_ipc::{
+    BoundedExtensionIpcListener, EXTENSION_IPC_FRAME_TIMEOUT, ExtensionIpcSocket,
+};
 use crate::herdr::HerdrClient;
 use crate::mcp::{
     self, BrowserCallerAuthorization, BrowserCallerGrant, BrowserCallerSessionIdentity,
@@ -301,11 +303,13 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
         #[cfg(unix)]
         let extension_ipc = if let Some(socket_path) = env::var_os("HERDR_EXTENSION_IPC_SOCKET") {
             let (extension_listener, guard) = ExtensionIpcSocket::bind(socket_path).await?;
+            let bounded_listener =
+                BoundedExtensionIpcListener::new(extension_listener, EXTENSION_IPC_FRAME_TIMEOUT)?;
             let mut extension_state = state.clone();
             extension_state.trusted_extension_ipc = true;
             let extension_app = candidate_router(extension_state);
             let task = tokio::spawn(async move {
-                axum::serve(extension_listener, extension_app)
+                axum::serve(bounded_listener, extension_app)
                     .await
                     .map_err(|error| format!("candidate extension IPC server failed: {error}"))
             });

@@ -115,17 +115,85 @@ pub(crate) struct GitContext {
 }
 
 const CHANGED_FILES_MAX: usize = 8;
+const WORK_GIT_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
+const WORK_GIT_CONTEXT_BUDGET: Duration = Duration::from_millis(1_500);
+const WORK_GIT_OUTPUT_LIMIT: usize = 256 * 1024;
 
-fn git_output(worktree: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+pub(crate) fn worktree_probes_protected_path(worktree: &Path) -> bool {
+    let normalized_worktree = normalize_lexical(worktree);
+    if crate::macos_permissions::runtime_must_not_probe(&normalized_worktree) {
+        return true;
+    }
+    let dot_git = worktree.join(".git");
+    let Ok(metadata) = fs::symlink_metadata(&dot_git) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    let Ok(marker) = fs::read_to_string(&dot_git) else {
+        return false;
+    };
+    let Some(raw) = marker.trim().strip_prefix("gitdir:") else {
+        return false;
+    };
+    let raw_path = PathBuf::from(raw.trim());
+    let git_dir = normalize_lexical(&if raw_path.is_absolute() {
+        raw_path
+    } else {
+        worktree.join(raw_path)
+    });
+    if crate::macos_permissions::runtime_must_not_probe(&git_dir) {
+        return true;
+    }
+    if let Ok(common_raw) = fs::read_to_string(git_dir.join("commondir")) {
+        let common_raw = common_raw.trim();
+        if !common_raw.is_empty() {
+            let common_path = PathBuf::from(common_raw);
+            let common_dir = normalize_lexical(&if common_path.is_absolute() {
+                common_path
+            } else {
+                git_dir.join(common_path)
+            });
+            if crate::macos_permissions::runtime_must_not_probe(&common_dir) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn git_output_bounded(worktree: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    if timeout.is_zero() || worktree_probes_protected_path(worktree) {
+        return None;
+    }
+    let mut command = std::process::Command::new("git");
+    command
         .arg("-C")
         .arg(worktree)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = crate::child_process::run_bounded_output(
+        &mut command,
+        timeout.min(WORK_GIT_COMMAND_TIMEOUT),
+        WORK_GIT_OUTPUT_LIMIT,
+    )
+    .ok()??;
     output.status.success().then(|| {
         String::from_utf8_lossy(&output.stdout)
             .trim_end()
@@ -133,20 +201,32 @@ fn git_output(worktree: &Path, args: &[&str]) -> Option<String> {
     })
 }
 
+fn git_output(worktree: &Path, args: &[&str]) -> Option<String> {
+    git_output_bounded(worktree, args, WORK_GIT_COMMAND_TIMEOUT)
+}
+
 /// Derive the git context of `worktree`; `None` when it is not a git work
 /// tree (or git is unavailable).
 pub(crate) fn git_context(worktree: &Path) -> Option<GitContext> {
-    if git_output(worktree, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
+    if worktree_probes_protected_path(worktree) {
         return None;
     }
-    let branch = git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+    let deadline = std::time::Instant::now() + WORK_GIT_CONTEXT_BUDGET;
+    let run_git = |args: &[&str]| {
+        git_output_bounded(
+            worktree,
+            args,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        )
+    };
+    if run_git(&["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
+        return None;
+    }
+    let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])
         .filter(|branch| !branch.is_empty())
         .unwrap_or_else(|| "(no commits)".to_owned());
-    let status = git_output(
-        worktree,
-        &["status", "--porcelain=v1", "--untracked-files=normal"],
-    )
-    .unwrap_or_default();
+    let status =
+        run_git(&["status", "--porcelain=v1", "--untracked-files=normal"]).unwrap_or_default();
     let mut files: Vec<String> = Vec::new();
     let push = |files: &mut Vec<String>, path: &str| {
         let path = path.trim().trim_matches('"');
@@ -160,33 +240,25 @@ pub(crate) fn git_context(worktree: &Path) -> Option<GitContext> {
         push(&mut files, path.rsplit(" -> ").next().unwrap_or(path));
     }
     // Committed changes on this branch vs the default branch.
-    let base = git_output(
-        worktree,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    )
-    .or_else(|| {
+    let base = run_git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).or_else(|| {
         ["main", "master"].into_iter().find_map(|name| {
-            git_output(worktree, &["rev-parse", "--verify", "--quiet", name])
-                .map(|_| name.to_owned())
+            run_git(&["rev-parse", "--verify", "--quiet", name]).map(|_| name.to_owned())
         })
     });
     let merge_base = base
         .as_deref()
-        .and_then(|base| git_output(worktree, &["merge-base", "HEAD", base]));
+        .and_then(|base| run_git(&["merge-base", "HEAD", base]));
     let mut ahead = 0;
     if let Some(merge_base) = merge_base.as_deref() {
-        for path in git_output(worktree, &["diff", "--name-only", merge_base, "HEAD"])
+        for path in run_git(&["diff", "--name-only", merge_base, "HEAD"])
             .unwrap_or_default()
             .lines()
         {
             push(&mut files, path);
         }
-        ahead = git_output(
-            worktree,
-            &["rev-list", "--count", &format!("{merge_base}..HEAD")],
-        )
-        .and_then(|count| count.trim().parse::<usize>().ok())
-        .unwrap_or(0);
+        ahead = run_git(&["rev-list", "--count", &format!("{merge_base}..HEAD")])
+            .and_then(|count| count.trim().parse::<usize>().ok())
+            .unwrap_or(0);
     }
     let next_step = if dirty > 0 {
         format!("verify and commit {dirty} uncommitted change(s) on {branch}")
@@ -1402,7 +1474,9 @@ fn reconcile_handoff_files(
             // migrated by compaction when new events arrive.
             None => recorded.clone(),
         };
-        if !worktree.is_dir() {
+        if crate::macos_permissions::runtime_must_not_probe(&normalize_lexical(worktree))
+            || !worktree.is_dir()
+        {
             let refreshed = render(None);
             if refreshed != recorded {
                 state.handoff_md = refreshed;
@@ -1476,6 +1550,9 @@ const HANDOFF_CONFLICT_ERROR: &str =
     "HANDOFF.md kept changing during compaction; write skipped to preserve agent edits";
 
 fn read_handoff_file(target: &Path) -> Option<String> {
+    if crate::macos_permissions::runtime_must_not_probe(&normalize_lexical(target)) {
+        return None;
+    }
     fs::read_to_string(target).ok()
 }
 
@@ -1513,7 +1590,9 @@ fn write_handoff_guarded(
 /// the HANDOFF.md content the handoff was rendered from; returns Ok(false)
 /// without writing when the file no longer matches it.
 fn write_handoff(worktree: &Path, handoff: &str, expected: Option<&str>) -> Result<bool, String> {
-    if !worktree.is_dir() {
+    if crate::macos_permissions::runtime_must_not_probe(&normalize_lexical(worktree))
+        || !worktree.is_dir()
+    {
         return Ok(true);
     }
     // Never drop a file into hidden/config folders (e.g. ~/.ssh) that became
@@ -1837,30 +1916,53 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-fn git_status_output(worktree: &Path, args: &[&str]) -> Option<std::process::Output> {
-    std::process::Command::new("git")
+fn git_status_output(
+    worktree: &Path,
+    args: &[&str],
+) -> Option<crate::child_process::BoundedOutput> {
+    if worktree_probes_protected_path(worktree) {
+        return None;
+    }
+    let mut command = std::process::Command::new("git");
+    command
         .arg("-C")
         .arg(worktree)
         .args(args)
-        .output()
-        .ok()
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    crate::child_process::run_bounded_output(
+        &mut command,
+        WORK_GIT_COMMAND_TIMEOUT,
+        WORK_GIT_OUTPUT_LIMIT,
+    )
+    .ok()?
 }
 
 /// Only write the local filter config when it is missing or different, so an
 /// unchanged repository costs one read per key per handoff write.
 fn set_git_local_config(worktree: &Path, key: &str, value: &str) -> Result<(), String> {
+    if worktree_probes_protected_path(worktree) {
+        return Ok(());
+    }
     if let Some(current) = git_status_output(worktree, &["config", "--local", "--get", key])
         && current.status.success()
         && String::from_utf8_lossy(&current.stdout).trim() == value
     {
         return Ok(());
     }
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .arg("-C")
         .arg(worktree)
         .args(["config", "--local", key, value])
-        .output()
-        .map_err(|error| format!("cannot run git config: {error}"))?;
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = crate::child_process::run_bounded_output(
+        &mut command,
+        WORK_GIT_COMMAND_TIMEOUT,
+        WORK_GIT_OUTPUT_LIMIT,
+    )
+    .map_err(|error| format!("cannot run git config: {error}"))?
+    .ok_or_else(|| format!("git config timed out setting {key}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -2023,6 +2125,9 @@ fn write_regular_file(path: &Path, content: &str, context: &str) -> Result<(), S
 }
 
 fn resolve_git_dir(worktree: &Path) -> Result<Option<PathBuf>, String> {
+    if crate::macos_permissions::runtime_must_not_probe(&normalize_lexical(worktree)) {
+        return Ok(None);
+    }
     let dot_git = worktree.join(".git");
     if dot_git.is_dir() {
         return Ok(Some(dot_git));
@@ -2036,11 +2141,15 @@ fn resolve_git_dir(worktree: &Path) -> Result<Option<PathBuf>, String> {
         return Err("linked-worktree .git file has no gitdir marker".to_owned());
     };
     let path = PathBuf::from(raw.trim());
-    Ok(Some(if path.is_absolute() {
+    let resolved = if path.is_absolute() {
         path
     } else {
         worktree.join(path)
-    }))
+    };
+    if crate::macos_permissions::runtime_must_not_probe(&normalize_lexical(&resolved)) {
+        return Ok(None);
+    }
+    Ok(Some(resolved))
 }
 
 /// Git reads `info/exclude` from the COMMON dir, which differs from the
@@ -2057,11 +2166,15 @@ fn resolve_git_common_dir(worktree: &Path) -> Result<Option<PathBuf>, String> {
                 return Err("Git commondir file is empty".to_owned());
             }
             let path = PathBuf::from(raw);
-            Ok(Some(if path.is_absolute() {
+            let resolved = if path.is_absolute() {
                 path
             } else {
                 git_dir.join(path)
-            }))
+            };
+            if crate::macos_permissions::runtime_must_not_probe(&normalize_lexical(&resolved)) {
+                return Ok(None);
+            }
+            Ok(Some(resolved))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(git_dir)),
         Err(error) => Err(format!("cannot read Git commondir file: {error}")),
@@ -4415,5 +4528,29 @@ mod tests {
         assert_eq!(folded.tasks.len(), 1);
         assert_eq!(folded.tasks[0].text, "open");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn git_context_skips_protected_worktree_and_linked_worktree_into_documents() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let protected_checkout = home.join("Documents/herdr-mcp-protected-probe-test");
+        assert!(worktree_probes_protected_path(&protected_checkout));
+        assert_eq!(git_context(&protected_checkout), None);
+
+        let linked_wt = temp_dir("linked-wt-into-documents");
+        let protected_gitdir = home.join("Documents/herdr-mcp/.git/worktrees/wt-probe");
+        fs::write(
+            linked_wt.join(".git"),
+            format!("gitdir: {}\n", protected_gitdir.display()),
+        )
+        .unwrap();
+        assert!(worktree_probes_protected_path(&linked_wt));
+        assert_eq!(git_context(&linked_wt), None);
+        assert_eq!(resolve_git_dir(&linked_wt).unwrap(), None);
+        assert_eq!(resolve_git_common_dir(&linked_wt).unwrap(), None);
+        fs::remove_dir_all(linked_wt).unwrap();
     }
 }
