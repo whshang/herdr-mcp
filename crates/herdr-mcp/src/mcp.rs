@@ -1208,9 +1208,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     // #922 review 5870137915: the frozen catalog is admitted per selected
     // backend. `tui` (default) is unchanged; `herdr-core` and invalid
     // selections fail closed here, before any TUI snapshot/socket execution.
-    if let Err(rejection) = crate::runtime_adapter::public_tool_admission(name) {
-        return Ok(tool_result(rejection, true));
-    }
+    // #935: the admitted route also carries the negotiated `herdr-core` client
+    // so the narrow `hc` primitives can be forwarded below.
+    let route = match crate::runtime_adapter::public_tool_route(name) {
+        Ok(route) => route,
+        Err(rejection) => return Ok(tool_result(rejection, true)),
+    };
+    let herdr_core = route.herdr_core_client();
     let _work_capture = ToolCallCapture {
         name,
         arguments: &arguments,
@@ -1220,7 +1224,10 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     let output = match name {
         "herdr_methods" => {
             let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
-            native_tools::methods(query)
+            match herdr_core {
+                Some(client) => crate::runtime_adapter::herdr_core_methods(client, query),
+                None => native_tools::methods(query),
+            }
         }
         "herdr_inspect" => {
             native_tools::inspect(context.client, Some(context.cache), Some(context.exec))
@@ -1543,17 +1550,23 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     result
                 }
             } else if method == pane_width::SPLIT_METHOD {
-                // A horizontal split must not create a pane whose agent output
-                // can only be captured as wrapping noise (#684).
-                match pane_width::guard_split(&context.cache.snapshot(), &params) {
-                    pane_width::SplitPlan::Forward(params) => native_tools::call_with_local(
-                        context.client,
-                        context.skill,
-                        &context.cache.snapshot(),
-                        method,
-                        params,
-                    ),
-                    pane_width::SplitPlan::Refuse(result) => result,
+                if let Some(client) = herdr_core {
+                    // `pane.split` is a TUI graph mutation; herdr-core has no
+                    // pane object, so this fails closed on `hello.methods`.
+                    crate::runtime_adapter::herdr_core_call(client, method, params)
+                } else {
+                    // A horizontal split must not create a pane whose agent output
+                    // can only be captured as wrapping noise (#684).
+                    match pane_width::guard_split(&context.cache.snapshot(), &params) {
+                        pane_width::SplitPlan::Forward(params) => native_tools::call_with_local(
+                            context.client,
+                            context.skill,
+                            &context.cache.snapshot(),
+                            method,
+                            params,
+                        ),
+                        pane_width::SplitPlan::Refuse(result) => result,
+                    }
                 }
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
@@ -1572,10 +1585,22 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                         clean_params,
                     )
                 }
-            } else if let Err(rejection) =
-                crate::runtime_adapter::forwarded_method_admission(method)
-            {
-                rejection
+            } else if method.starts_with("herdr_mcp.") {
+                // herdr-mcp's own local registry never depends on the Herdr TUI
+                // socket, so it keeps working on every backend (#935).
+                native_tools::call_with_local(
+                    context.client,
+                    context.skill,
+                    &context.cache.snapshot(),
+                    method,
+                    params,
+                )
+            } else if let Some(client) = herdr_core {
+                // #935: no blanket `tui_runtime_forward` refusal any more. The
+                // negotiated `hello.methods` plus the prohibited-method table
+                // decide dynamically; TUI-only methods such as `pane.list` are
+                // absent from `hello.methods` and still fail closed.
+                crate::runtime_adapter::herdr_core_call(client, method, params)
             } else {
                 native_tools::call_with_local(
                     context.client,
@@ -1586,7 +1611,10 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 )
             }
         }
-        "herdr_fs_read" => route_fs_git("fs_read", &context.cache.snapshot(), &arguments),
+        "herdr_fs_read" => match herdr_core {
+            Some(client) => crate::runtime_adapter::herdr_core_fs_read(client, &arguments),
+            None => route_fs_git("fs_read", &context.cache.snapshot(), &arguments),
+        },
         "herdr_fs_list" => route_fs_git("fs_list", &context.cache.snapshot(), &arguments),
         "herdr_fs_grep" => route_fs_git("fs_grep", &context.cache.snapshot(), &arguments),
         "herdr_fs_image" => {
@@ -1626,13 +1654,18 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             );
         }
         "herdr_fs_edit" => {
+            // #935 / Droid P2-928-c: the single-writer root lease is enforced
+            // for the herdr-core backend too, before any `hc` mutation.
             if let Some(conflict) =
                 check_mutating_tool_root_lease(context, "herdr_fs_edit", &arguments, None)
             {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                route_fs_git("fs_edit", &context.cache.snapshot(), &clean)
+                match herdr_core {
+                    Some(client) => crate::runtime_adapter::herdr_core_fs_edit(client, &clean),
+                    None => route_fs_git("fs_edit", &context.cache.snapshot(), &clean),
+                }
             }
         }
         "herdr_fs_write" => {
@@ -1642,7 +1675,10 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                route_fs_git("fs_write", &context.cache.snapshot(), &clean)
+                match herdr_core {
+                    Some(client) => crate::runtime_adapter::herdr_core_fs_write(client, &clean),
+                    None => route_fs_git("fs_write", &context.cache.snapshot(), &clean),
+                }
             }
         }
         "herdr_fs_patch" => {
@@ -1672,16 +1708,25 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                exec_tools::start(
-                    context.client,
-                    &context.cache.snapshot(),
-                    context.exec,
-                    &clean,
-                )
+                match herdr_core {
+                    Some(client) => crate::runtime_adapter::herdr_core_exec_start(client, &clean),
+                    None => exec_tools::start(
+                        context.client,
+                        &context.cache.snapshot(),
+                        context.exec,
+                        &clean,
+                    ),
+                }
             }
         }
-        "herdr_exec_read" => exec_tools::read(context.exec, &arguments),
-        "herdr_exec_kill" => exec_tools::kill(context.exec, &arguments),
+        "herdr_exec_read" => match herdr_core {
+            Some(client) => crate::runtime_adapter::herdr_core_exec_read(client, &arguments),
+            None => exec_tools::read(context.exec, &arguments),
+        },
+        "herdr_exec_kill" => match herdr_core {
+            Some(client) => crate::runtime_adapter::herdr_core_exec_kill(client, &arguments),
+            None => exec_tools::kill(context.exec, &arguments),
+        },
         "herdr_exec" => {
             if let Some(conflict) =
                 check_mutating_tool_root_lease(context, "herdr_exec", &arguments, None)
@@ -1689,56 +1734,67 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                utility_exec::run_durable(
-                    context.client,
-                    &context.cache.snapshot(),
-                    context.exec,
-                    context.state_store,
-                    &clean,
-                )
+                match herdr_core {
+                    Some(client) => crate::runtime_adapter::herdr_core_exec(client, &clean),
+                    None => utility_exec::run_durable(
+                        context.client,
+                        &context.cache.snapshot(),
+                        context.exec,
+                        context.state_store,
+                        &clean,
+                    ),
+                }
             }
         }
         "herdr_prompt" => {
-            let (mut parent_session_ref, parent_session_device_id) =
-                match prompt_parent_session_qualified(context) {
-                    Some((session_ref, device_id)) => (Some(session_ref), device_id),
-                    None => (None, None),
-                };
-            let mut result = prompt::run_with_parent_session(
-                context.client,
-                context.prompt,
-                &arguments,
-                parent_session_ref.as_deref(),
-            );
-            // #921: a replay carries this call's (possibly empty) browser
-            // context, which must never overwrite the durable parent session.
-            // Mirror the dispatch branch: replays only read/enrich existing rows.
-            if result.get("idempotent_replay").and_then(Value::as_bool) == Some(true) {
-                enrich_agent_task_parent_session_device_id(context, &mut result);
-            } else if record_and_enrich_dispatched_agent_task_parent_session(
-                context,
-                parent_session_ref.as_deref(),
-                parent_session_device_id.as_deref(),
-                &mut result,
-            )
-            .is_err()
-            {
-                parent_session_ref = None;
-                if let Some(Value::Object(task_obj)) = result.get_mut("task") {
-                    task_obj.insert("parent_session_ref".to_owned(), Value::Null);
-                    task_obj.remove("parent_session_device_id");
+            // #935: the narrow herdr-core route is `terminal.send` only, with
+            // `force` hard-locked and every TUI-only fence argument refused.
+            if let Some(client) = herdr_core {
+                crate::runtime_adapter::herdr_core_prompt(client, &arguments)
+            } else {
+                let (mut parent_session_ref, parent_session_device_id) =
+                    match prompt_parent_session_qualified(context) {
+                        Some((session_ref, device_id)) => (Some(session_ref), device_id),
+                        None => (None, None),
+                    };
+                let mut result = prompt::run_with_parent_session(
+                    context.client,
+                    context.prompt,
+                    &arguments,
+                    parent_session_ref.as_deref(),
+                );
+                // #921: a replay carries this call's (possibly empty) browser
+                // context, which must never overwrite the durable parent session.
+                // Mirror the dispatch branch: replays only read/enrich existing rows.
+                if result.get("idempotent_replay").and_then(Value::as_bool) == Some(true) {
+                    enrich_agent_task_parent_session_device_id(context, &mut result);
+                } else if record_and_enrich_dispatched_agent_task_parent_session(
+                    context,
+                    parent_session_ref.as_deref(),
+                    parent_session_device_id.as_deref(),
+                    &mut result,
+                )
+                .is_err()
+                {
+                    parent_session_ref = None;
+                    if let Some(Value::Object(task_obj)) = result.get_mut("task") {
+                        task_obj.insert("parent_session_ref".to_owned(), Value::Null);
+                        task_obj.remove("parent_session_device_id");
+                    }
                 }
+                // #770: a WebChat caller must never be left silently unbound. The
+                // fact is added to the unchanged prompt result; it never changes
+                // `ok` and never fails the prompt.
+                if let Some(fact) = herdr_prompt_parent_session_fact(
+                    context,
+                    &result,
+                    parent_session_ref.as_deref(),
+                ) && let Some(object) = result.as_object_mut()
+                {
+                    object.insert("parent_session".to_owned(), fact);
+                }
+                result
             }
-            // #770: a WebChat caller must never be left silently unbound. The
-            // fact is added to the unchanged prompt result; it never changes
-            // `ok` and never fails the prompt.
-            if let Some(fact) =
-                herdr_prompt_parent_session_fact(context, &result, parent_session_ref.as_deref())
-                && let Some(object) = result.as_object_mut()
-            {
-                object.insert("parent_session".to_owned(), fact);
-            }
-            result
         }
         "herdr_skill" => context
             .skill
@@ -2829,6 +2885,7 @@ fn check_mutating_tool_root_lease(
             .unwrap_or_default(),
         "herdr_fs_patch" | "herdr_exec_start" => arguments
             .get("root")
+            .or_else(|| arguments.get("project_root"))
             .and_then(Value::as_str)
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default(),
@@ -2842,6 +2899,8 @@ fn check_mutating_tool_root_lease(
         "herdr_exec" => {
             if let Some(root) = arguments
                 .get("project_root")
+                .or_else(|| arguments.get("root"))
+                .or_else(|| arguments.get("cwd"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())

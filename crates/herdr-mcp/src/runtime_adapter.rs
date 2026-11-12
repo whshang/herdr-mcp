@@ -678,6 +678,41 @@ impl HerdrCoreClient {
                 message: "machine.exec argv must not be empty".to_owned(),
             });
         }
+        let mut params = Map::new();
+        params.insert("argv".to_owned(), json!(argv));
+        self.machine_exec_params(params, cwd, timeout_secs)
+    }
+
+    /// `machine.exec` with a shell `line` instead of `argv`, so `herdr_exec`
+    /// can forward a freeform `command` without re-splitting it locally.
+    ///
+    /// The global readonly gate is applied before any socket work, exactly like
+    /// every other mutating surface.
+    pub fn machine_exec_line(
+        &self,
+        line: &str,
+        cwd: Option<&Path>,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, HerdrCoreError> {
+        if line.trim().is_empty() {
+            return Err(HerdrCoreError {
+                code: "invalid_params".to_owned(),
+                kind: None,
+                message: "machine.exec line must not be empty".to_owned(),
+            });
+        }
+        hc_mutation_guard("herdr_exec")?;
+        let mut params = Map::new();
+        params.insert("line".to_owned(), json!(line));
+        self.machine_exec_params(params, cwd, timeout_secs)
+    }
+
+    fn machine_exec_params(
+        &self,
+        mut params: Map<String, Value>,
+        cwd: Option<&Path>,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, HerdrCoreError> {
         // The read/write budget must match the server-side execution window, or a
         // long `machine.exec` would be cut off by the 5 s handshake timeout while
         // the command keeps running on the host.
@@ -691,8 +726,6 @@ impl HerdrCoreClient {
                     message: "herdr-core did not advertise machine.exec".to_owned(),
                 });
             }
-            let mut params = Map::new();
-            params.insert("argv".to_owned(), json!(argv));
             if let Some(cwd) = cwd {
                 params.insert("cwd".to_owned(), json!(cwd.to_string_lossy().into_owned()));
             }
@@ -1581,7 +1614,26 @@ fn parse_hello_result(raw: &Value) -> Result<HerdrCoreHello, HerdrCoreError> {
     })
 }
 
-/// Fail-closed admission for one frozen Epoch-5 public tool invocation (#922).
+/// The backend route admitted for one already-declared public tool call.
+///
+/// `Tui` keeps the historical in-process snapshot/socket implementation;
+/// `HerdrCore` carries the negotiated client so `mcp::tool_call` forwards the
+/// narrow `hc` primitives instead of running the TUI path (#935).
+pub enum PublicToolRoute {
+    Tui,
+    HerdrCore(HerdrCoreClient),
+}
+
+impl PublicToolRoute {
+    pub fn herdr_core_client(&self) -> Option<&HerdrCoreClient> {
+        match self {
+            Self::Tui => None,
+            Self::HerdrCore(client) => Some(client),
+        }
+    }
+}
+
+/// Fail-closed admission and routing for one frozen Epoch-5 public tool invocation (#922, #935).
 ///
 /// The tool catalog itself never changes: this gate decides only whether the
 /// *selected backend* may serve an already-declared tool. `tui` is the default
@@ -1589,12 +1641,12 @@ fn parse_hello_result(raw: &Value) -> Result<HerdrCoreHello, HerdrCoreError> {
 /// `hello` and applies the adapter's capability table. Any backend-selection
 /// error (for example `HERDR_MCP_RUNTIME_BACKEND=auto`) fails closed instead of
 /// falling back to the TUI path.
-pub fn public_tool_admission(tool_name: &str) -> Result<(), Value> {
+pub fn public_tool_route(tool_name: &str) -> Result<PublicToolRoute, Value> {
     let selection = resolve_process_backend_selection().map_err(|error| {
         invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
     })?;
     match selection.backend {
-        RuntimeBackend::Tui => Ok(()),
+        RuntimeBackend::Tui => Ok(PublicToolRoute::Tui),
         RuntimeBackend::HerdrCore => {
             let Some(socket_path) = selection.herdr_core_socket.as_deref() else {
                 return Err(json!({
@@ -1647,53 +1699,41 @@ pub fn public_tool_admission(tool_name: &str) -> Result<(), Value> {
                     ),
                 }));
             }
-            Ok(())
+            Ok(PublicToolRoute::HerdrCore(client))
         }
     }
 }
 
 /// Public tools whose only implementation is the TUI snapshot/socket path.
+///
+/// These six have no `hc` primitive at all (no listing, search, image, patch,
+/// git or event-cursor surface), so `herdr-core` keeps failing them closed with
+/// `runtime_capability_unsupported` (#935).
 const TUI_ROUTED_PUBLIC_TOOLS: &[&str] = &[
-    "herdr_fs_read",
     "herdr_fs_list",
     "herdr_fs_grep",
     "herdr_fs_image",
-    "herdr_fs_write",
-    "herdr_fs_edit",
     "herdr_fs_patch",
     "herdr_git",
-    "herdr_exec",
-    "herdr_exec_start",
-    "herdr_exec_read",
-    "herdr_exec_kill",
-    "herdr_prompt",
     "herdr_since",
 ];
 
-/// Admission for the `herdr_call` tail that forwards an unhandled method to the
-/// live Herdr TUI socket. Local `herdr_mcp.*` methods stay available; any
-/// non-TUI backend must not reach the TUI forwarding path (#922).
-pub fn forwarded_method_admission(method: &str) -> Result<(), Value> {
-    let selection = resolve_process_backend_selection()
-        .map_err(|error| invalid_runtime_backend_tool_error(method, &error, "backend_selection"))?;
-    if selection.backend == RuntimeBackend::Tui || method.starts_with("herdr_mcp.") {
-        return Ok(());
-    }
-    Err(json!({
+/// A public tool or forwarded method the selected `herdr-core` backend cannot
+/// serve, reported with the same fail-closed envelope as every other admission
+/// rejection.
+pub fn herdr_core_unsupported(operation: &str, required_capability: &str, message: &str) -> Value {
+    json!({
         "ok": false,
         "code": "runtime_capability_unsupported",
-        "operation": method,
-        "required_capability": "tui_runtime_forward",
-        "runtime_backend": selection.backend.as_str(),
+        "operation": operation,
+        "required_capability": required_capability,
+        "runtime_backend": RuntimeBackend::HerdrCore.as_str(),
         "fallback_allowed": false,
         "retryable": false,
         "delivery_state": "not_delivered",
         "failure_phase": "backend_capability",
-        "message": format!(
-            "'{method}' is forwarded to the live Herdr TUI socket, which the selected {} backend does not provide; no TUI fallback is allowed",
-            selection.backend.as_str()
-        ),
-    }))
+        "message": message,
+    })
 }
 
 fn invalid_runtime_backend_tool_error(tool_name: &str, error: &str, phase: &str) -> Value {
@@ -1707,6 +1747,768 @@ fn invalid_runtime_backend_tool_error(tool_name: &str, error: &str, phase: &str)
         "delivery_state": "not_delivered",
         "failure_phase": phase,
     })
+}
+
+// Narrow `herdr-core` tool routes (#935).
+//
+// Each route maps one already-admitted public tool onto a `HerdrCoreClient`
+// primitive. They return the same `{ok: false, code, ...}` envelope as the TUI
+// implementations so callers never have to branch on the backend, and every
+// refusal carries `retryable: false` plus an explicit delivery state.
+
+/// `herdr_methods` under `herdr-core`: the dynamically negotiated
+/// `hello.methods` plus the herdr-mcp local method registry, filtered by
+/// `query` (case-insensitive substring, matching the TUI inventory).
+pub fn herdr_core_methods(client: &HerdrCoreClient, query: &str) -> Value {
+    let hello = match client.handshake() {
+        Ok(hello) => hello,
+        Err(error) => {
+            return herdr_core_error_json(&error, "herdr_methods", "not_delivered");
+        }
+    };
+    let needle = query.trim().to_ascii_lowercase();
+    let mut methods: Vec<Value> = hello
+        .methods
+        .iter()
+        .filter(|method| needle.is_empty() || method.to_ascii_lowercase().contains(&needle))
+        .map(|method| {
+            json!({
+                "method": method,
+                "source": "herdr_core_hello",
+                "route": "herdr_core",
+            })
+        })
+        .collect();
+    let mut local: Vec<Value> = crate::progressive_skills::local_method_schemas(query)
+        .into_iter()
+        .map(|mut schema| {
+            if let Some(object) = schema.as_object_mut() {
+                object.insert("route".to_owned(), json!("workstation_local"));
+            }
+            schema
+        })
+        .collect();
+    methods.append(&mut local);
+    json!({
+        "ok": true,
+        "count": methods.len(),
+        "methods": methods,
+        "source": "herdr-core hello.methods (dynamically negotiated)",
+        "local_method_source": "herdr_mcp_local_registry",
+        "runtime_backend": "herdr-core",
+    })
+}
+
+/// `herdr_fs_read` -> `file.read`. Accepts the TUI aliases (`offset`/`start_line`,
+/// `limit`/`max_lines`, `end_line`) so one caller shape works on both backends.
+pub fn herdr_core_fs_read(client: &HerdrCoreClient, args: &Value) -> Value {
+    const OPERATION: &str = "herdr_fs_read";
+    let path = match hc_required_text(args, "path", OPERATION) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let cwd = match hc_arg_cwd(args) {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
+    };
+    let offset = match hc_first_u64(args, &["offset", "start_line"]) {
+        Ok(offset) => offset,
+        Err(error) => return error,
+    };
+    let mut limit = match hc_first_u64(args, &["limit", "max_lines"]) {
+        Ok(limit) => limit,
+        Err(error) => return error,
+    };
+    if limit.is_none()
+        && let Some(end_line) = args.get("end_line").and_then(Value::as_u64)
+    {
+        let start = offset.unwrap_or(1);
+        if end_line < start {
+            return hc_invalid_params_value("end_line must be >= start_line");
+        }
+        limit = Some(end_line.saturating_sub(start).saturating_add(1));
+    }
+    match client.file_read(path, cwd.as_deref(), offset, limit) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                let text = object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                object.insert("content".to_owned(), json!(text));
+            }
+            value
+        }
+        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, false)),
+    }
+}
+
+/// `herdr_fs_write` -> `file.write`. The root lease is enforced by the caller
+/// (`mcp::tool_call`) before this route runs.
+pub fn herdr_core_fs_write(client: &HerdrCoreClient, args: &Value) -> Value {
+    const OPERATION: &str = "herdr_fs_write";
+    let path = match hc_required_text(args, "path", OPERATION) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let content = match hc_required_raw_text(args, "content", OPERATION) {
+        Ok(content) => content,
+        Err(error) => return error,
+    };
+    let cwd = match hc_arg_cwd(args) {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
+    };
+    match client.file_write(path, cwd.as_deref(), content.as_bytes()) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("content_bytes".to_owned(), json!(content.len()));
+            }
+            value
+        }
+        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, true)),
+    }
+}
+
+/// `herdr_fs_edit` -> `file.edit`. Accepts `old_text`/`new_text`,
+/// `old_string`/`new_string`, or an `edits[]` array of either shape; every edit
+/// is all-or-none in `hc`.
+pub fn herdr_core_fs_edit(client: &HerdrCoreClient, args: &Value) -> Value {
+    const OPERATION: &str = "herdr_fs_edit";
+    let path = match hc_required_text(args, "path", OPERATION) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let cwd = match hc_arg_cwd(args) {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
+    };
+    let mut edits: Vec<(String, String)> = Vec::new();
+    match args.get("edits") {
+        None | Some(Value::Null) => {
+            let old = hc_first_text(args, &["old_text", "old_string"]);
+            let new = hc_first_text(args, &["new_text", "new_string"]);
+            match (old, new) {
+                (Some(old), Some(new)) => edits.push((old.to_owned(), new.to_owned())),
+                (None, _) => {
+                    return hc_invalid_params_value(
+                        "herdr_fs_edit requires old_text/old_string (or an edits array)",
+                    );
+                }
+                (Some(_), None) => {
+                    return hc_invalid_params_value(
+                        "herdr_fs_edit requires new_text/new_string next to old_text/old_string",
+                    );
+                }
+            }
+        }
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return hc_invalid_params_value("edits must contain at least one replacement");
+            }
+            for (index, item) in items.iter().enumerate() {
+                let old = hc_first_text(item, &["old", "old_text", "old_string"]);
+                let new = hc_first_text(item, &["new", "new_text", "new_string"]);
+                match (old, new) {
+                    (Some(old), Some(new)) => edits.push((old.to_owned(), new.to_owned())),
+                    _ => {
+                        return hc_invalid_params_value(format!(
+                            "edits[{index}] requires old/old_text and new/new_text"
+                        ));
+                    }
+                }
+            }
+        }
+        Some(_) => return hc_invalid_params_value("edits must be an array"),
+    }
+    if edits.iter().any(|(old, _)| old.is_empty()) {
+        return hc_invalid_params_value("old_text/old_string must not be empty");
+    }
+    match client.file_edit(path, cwd.as_deref(), &edits) {
+        Ok(value) => value,
+        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, true)),
+    }
+}
+
+/// `herdr_exec` -> `machine.exec` (`line` for a shell command, `argv` for a
+/// typed program). `root`/`project_root`/`cwd` becomes the `cwd`.
+pub fn herdr_core_exec(client: &HerdrCoreClient, args: &Value) -> Value {
+    const OPERATION: &str = "herdr_exec";
+    if let Err(error) = hc_mutation_guard(OPERATION) {
+        return herdr_core_error_json(&error, OPERATION, "not_delivered");
+    }
+    let invocation = match hc_exec_invocation(args, OPERATION) {
+        Ok(invocation) => invocation,
+        Err(error) => return error,
+    };
+    let cwd = match hc_arg_cwd(args) {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
+    };
+    let Some(cwd) = cwd else {
+        return hc_invalid_params_value(
+            "herdr-core herdr_exec requires root, project_root or cwd: the workspace/pane graph that resolves a cwd on the TUI backend does not exist on herdr-core",
+        );
+    };
+    let intent = match hc_exec_request_gate(args, OPERATION) {
+        Ok(intent) => intent,
+        Err(error) => return error,
+    };
+    let timeout_ms = match hc_arg_u64(args, "timeout_ms") {
+        Ok(timeout_ms) => timeout_ms.unwrap_or(30_000),
+        Err(error) => return error,
+    };
+    if !(1..=60_000).contains(&timeout_ms) {
+        return hc_invalid_params_value("timeout_ms must be an integer in 1..=60000");
+    }
+    let timeout_secs = timeout_ms.div_ceil(1000).clamp(1, 600);
+    let executed = match &invocation {
+        HcExecInvocation::Line(line) => {
+            client.machine_exec_line(line, Some(&cwd), Some(timeout_secs))
+        }
+        HcExecInvocation::Argv(argv) => client.machine_exec(argv, Some(&cwd), Some(timeout_secs)),
+    };
+    match executed {
+        Ok(mut value) => {
+            let stdout = value
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let stderr = value
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let output = if stderr.is_empty() {
+                stdout
+            } else {
+                format!("{stdout}{stderr}")
+            };
+            if let Some(object) = value.as_object_mut() {
+                object.insert("output".to_owned(), json!(output));
+                object.insert("command".to_owned(), json!(invocation.rendered()));
+                object.insert(
+                    "execution".to_owned(),
+                    json!({
+                        "method": "machine.exec",
+                        "mode": invocation.mode(),
+                        "cwd": cwd.to_string_lossy(),
+                        "timeout_secs": timeout_secs,
+                    }),
+                );
+                if let Some(intent) = intent {
+                    object.insert("intent".to_owned(), json!(intent));
+                }
+            }
+            value
+        }
+        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, true)),
+    }
+}
+
+/// `herdr_exec_start` -> `terminal.run`; the returned `session_id` is the
+/// terminal `address` used by `herdr_exec_read`/`herdr_exec_kill`.
+pub fn herdr_core_exec_start(client: &HerdrCoreClient, args: &Value) -> Value {
+    const OPERATION: &str = "herdr_exec_start";
+    let Some(root) = hc_first_trimmed(args, &["root", "project_root"]) else {
+        return hc_invalid_params_value(
+            "herdr_exec_start requires root (or project_root) as the exec cwd",
+        );
+    };
+    let invocation = match hc_exec_invocation(args, OPERATION) {
+        Ok(invocation) => invocation,
+        Err(error) => return error,
+    };
+    let cwd = match hc_arg_cwd(args) {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
+    };
+    let name = hc_first_trimmed(args, &["name"]);
+    let labels = match hc_arg_labels(args) {
+        Ok(labels) => labels,
+        Err(error) => return error,
+    };
+    let started = match &invocation {
+        HcExecInvocation::Line(line) => {
+            client.terminal_run(None, Some(line), cwd.as_deref(), name, labels.as_ref())
+        }
+        HcExecInvocation::Argv(argv) => {
+            client.terminal_run(Some(argv), None, cwd.as_deref(), name, labels.as_ref())
+        }
+    };
+    match started {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                let session_id = object.get("terminal").cloned().unwrap_or(Value::Null);
+                object.insert("session_id".to_owned(), session_id);
+                object.insert("root".to_owned(), json!(root));
+                object.insert("command".to_owned(), json!(invocation.rendered()));
+                object.insert(
+                    "hint".to_owned(),
+                    json!(
+                        "herdr-core session_id is the terminal address; use herdr_exec_read for screen output and herdr_exec_kill to end it"
+                    ),
+                );
+            }
+            value
+        }
+        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, true)),
+    }
+}
+
+/// `herdr_exec_read` -> `terminal.read`. `hc` returns screen/history text, not a
+/// byte cursor, so byte-cursor arguments are refused instead of ignored.
+pub fn herdr_core_exec_read(client: &HerdrCoreClient, args: &Value) -> Value {
+    const OPERATION: &str = "herdr_exec_read";
+    let session_id = match hc_required_text(args, "session_id", OPERATION) {
+        Ok(session_id) => session_id,
+        Err(error) => return error,
+    };
+    let mut cursor_args: Vec<&str> = Vec::new();
+    match hc_arg_u64(args, "offset") {
+        Ok(Some(offset)) if offset != 0 => cursor_args.push("offset"),
+        Ok(_) => {}
+        Err(error) => return error,
+    }
+    if args.get("limit").is_some_and(|value| !value.is_null()) {
+        cursor_args.push("limit");
+    }
+    if let Some(stream) = args.get("stream").and_then(Value::as_str)
+        && stream != "both"
+    {
+        cursor_args.push("stream");
+    }
+    if !cursor_args.is_empty() {
+        return herdr_core_unsupported(
+            OPERATION,
+            "exec_stream_cursor",
+            &format!(
+                "herdr-core terminal.read returns screen/history text with no byte cursor, so {} cannot be honoured; pass `lines` instead and treat the result as a screen snapshot",
+                cursor_args.join(", ")
+            ),
+        );
+    }
+    let lines = match hc_first_u64(args, &["lines", "max_lines"]) {
+        Ok(lines) => lines,
+        Err(error) => return error,
+    };
+    match client.terminal_read(session_id, lines) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("session_id".to_owned(), json!(session_id));
+            }
+            value
+        }
+        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, false)),
+    }
+}
+
+/// `herdr_exec_kill` -> `terminal.kill`.
+pub fn herdr_core_exec_kill(client: &HerdrCoreClient, args: &Value) -> Value {
+    const OPERATION: &str = "herdr_exec_kill";
+    let session_id = match hc_required_text(args, "session_id", OPERATION) {
+        Ok(session_id) => session_id,
+        Err(error) => return error,
+    };
+    match client.terminal_kill(session_id) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("session_id".to_owned(), json!(session_id));
+            }
+            value
+        }
+        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, true)),
+    }
+}
+
+/// TUI-only `herdr_prompt` arguments that have no `terminal.send` equivalent.
+const HC_TUI_ONLY_PROMPT_ARGS: &[&str] = &[
+    "spawn",
+    "workspace_id",
+    "max_concurrent",
+    "parent_target",
+    "stall_after_ms",
+    "inject_task_identity",
+    "wait",
+    "idempotency_key",
+    "steer",
+    "target_revision",
+];
+
+/// Narrow `herdr_prompt` -> `terminal.send` with `force` hard-locked `false`.
+///
+/// A `blocked` terminal (human permission/question/auth) is never answered by an
+/// automated caller; the TUI-only fencing arguments fail closed instead of being
+/// silently dropped.
+pub fn herdr_core_prompt(client: &HerdrCoreClient, args: &Value) -> Value {
+    const OPERATION: &str = "herdr_prompt";
+    let mut tui_only: Vec<&str> = HC_TUI_ONLY_PROMPT_ARGS
+        .iter()
+        .copied()
+        .filter(|key| match args.get(*key) {
+            None | Some(Value::Null) => false,
+            // `steer: false` is the default and carries no TUI-only intent.
+            Some(Value::Bool(false)) if *key == "steer" => false,
+            Some(_) => true,
+        })
+        .collect();
+    tui_only.sort_unstable();
+    if !tui_only.is_empty() {
+        return herdr_core_unsupported(
+            OPERATION,
+            "prompt_tui_fence",
+            &format!(
+                "herdr-core terminal.send has no {}, so this herdr_prompt is refused instead of dropping those arguments; call herdr_prompt with only target/text (and optional `if`) on the herdr-core backend",
+                tui_only.join(", ")
+            ),
+        );
+    }
+    if args.get("force").and_then(Value::as_bool) == Some(true) {
+        return json!({
+            "ok": false,
+            "code": "human_boundary_prohibited",
+            "operation": OPERATION,
+            "runtime_backend": "herdr-core",
+            "retryable": false,
+            "fallback_allowed": false,
+            "delivery_state": "not_delivered",
+            "message": "terminal.send force=true is prohibited (human boundary); a blocked terminal is never answered by an automated caller",
+        });
+    }
+    if let Err(error) = hc_mutation_guard(OPERATION) {
+        return herdr_core_error_json(&error, OPERATION, "not_delivered");
+    }
+    let target = match hc_required_text(args, "target", OPERATION) {
+        Ok(target) => target,
+        Err(error) => return error,
+    };
+    let text = match hc_required_raw_text(args, "text", OPERATION) {
+        Ok(text) => text,
+        Err(error) => return error,
+    };
+    let if_state = hc_first_trimmed(args, &["if", "if_state"]);
+    match client.terminal_send(target, text, if_state, false, None) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("target".to_owned(), json!(target));
+                object.insert("delivered".to_owned(), json!(true));
+                object.insert("force".to_owned(), json!(false));
+            }
+            value
+        }
+        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, true)),
+    }
+}
+
+/// `herdr_call` forwarding under `herdr-core`.
+///
+/// Local `herdr_mcp.*` methods never reach here. Everything else is decided
+/// dynamically by `hello.methods`, so a TUI-only method such as `pane.list`
+/// fails closed with `runtime_capability_unsupported` instead of being forwarded
+/// to the live TUI socket. `machine.*` stays reserved for the lease-checked
+/// `herdr_exec` route, and `terminal.send` keeps `force=false`.
+pub fn herdr_core_call(client: &HerdrCoreClient, method: &str, params: Value) -> Value {
+    if method.starts_with("machine.") {
+        return json!({
+            "ok": false,
+            "code": "herdr_core_method_prohibited",
+            "method": method,
+            "runtime_backend": "herdr-core",
+            "retryable": false,
+            "fallback_allowed": false,
+            "delivery_state": "not_delivered",
+            "message": format!(
+                "herdr-core method '{method}' is not forwardable through herdr_call; use herdr_exec (machine.exec) so the single-writer root lease and readonly gate are enforced"
+            ),
+        });
+    }
+    match client.call_allowed_method(method, params) {
+        Ok(result) => json!({
+            "ok": true,
+            "runtime_backend": "herdr-core",
+            "method": method,
+            "result": result,
+        }),
+        Err(error) => herdr_core_error_json(&error, method, hc_delivery_state(&error, true)),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum HcExecInvocation {
+    Line(String),
+    Argv(Vec<String>),
+}
+
+impl HcExecInvocation {
+    const fn mode(&self) -> &'static str {
+        match self {
+            Self::Line(_) => "line",
+            Self::Argv(_) => "argv",
+        }
+    }
+
+    fn rendered(&self) -> String {
+        match self {
+            Self::Line(line) => line.clone(),
+            Self::Argv(argv) => argv.join(" "),
+        }
+    }
+}
+
+fn hc_exec_invocation(args: &Value, operation: &str) -> Result<HcExecInvocation, Value> {
+    let command = hc_first_text(args, &["command"]);
+    let program = hc_first_text(args, &["program"]);
+    let raw_args = args.get("args");
+    if command.is_some() && (program.is_some() || raw_args.is_some()) {
+        return Err(hc_invalid_params_value(
+            "command and program/args modes are mutually exclusive",
+        ));
+    }
+    if let Some(command) = command {
+        if command.trim().is_empty() {
+            return Err(hc_invalid_params_value("command must not be empty"));
+        }
+        return Ok(HcExecInvocation::Line(command.to_owned()));
+    }
+    let Some(program) = program else {
+        if raw_args.is_some() {
+            return Err(hc_invalid_params_value(
+                "program is required when args is provided",
+            ));
+        }
+        return Err(hc_invalid_params_value(format!(
+            "{operation} requires command or program/args"
+        )));
+    };
+    if program.is_empty() || program.contains('\0') {
+        return Err(hc_invalid_params_value(
+            "program must be non-empty and contain no NUL",
+        ));
+    }
+    let mut argv = vec![program.to_owned()];
+    match raw_args {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(values)) => {
+            if values.len() > 128 {
+                return Err(hc_invalid_params_value(
+                    "args must contain at most 128 strings",
+                ));
+            }
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    return Err(hc_invalid_params_value("args must be an array of strings"));
+                };
+                if value.contains('\0') {
+                    return Err(hc_invalid_params_value(
+                        "args must contain only NUL-free strings",
+                    ));
+                }
+                argv.push(value.to_owned());
+            }
+        }
+        Some(_) => return Err(hc_invalid_params_value("args must be an array of strings")),
+    }
+    Ok(HcExecInvocation::Argv(argv))
+}
+
+/// `herdr_exec` intent/idempotency contract, validated explicitly under
+/// `herdr-core`. `hc machine.exec` has no durable replay store, so a write intent
+/// that would need one fails closed instead of pretending the key was honoured.
+fn hc_exec_request_gate(args: &Value, operation: &str) -> Result<Option<&'static str>, Value> {
+    let intent = match args.get("intent").and_then(Value::as_str) {
+        None => None,
+        Some("") => return Err(hc_invalid_params_value("intent must not be empty")),
+        Some(value) => match value {
+            "read_only" => Some("read_only"),
+            "idempotent_write" => Some("idempotent_write"),
+            "non_idempotent_write" => Some("non_idempotent_write"),
+            _ => {
+                return Err(hc_invalid_params_value(
+                    "intent must be one of read_only, idempotent_write, non_idempotent_write",
+                ));
+            }
+        },
+    };
+    let key = match args.get("idempotency_key") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(key)) if key.is_empty() => {
+            return Err(hc_invalid_params_value("idempotency_key must not be empty"));
+        }
+        Some(Value::String(key)) if key.chars().count() > 256 => {
+            return Err(hc_invalid_params_value(
+                "idempotency_key must be at most 256 characters",
+            ));
+        }
+        Some(Value::String(key)) => Some(key.as_str()),
+        Some(_) => return Err(hc_invalid_params_value("idempotency_key must be a string")),
+    };
+    match (intent, key) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(hc_invalid_params_value(
+            "idempotency_key requires an explicit intent (read_only, idempotent_write, or non_idempotent_write)",
+        )),
+        (Some(_), None) if intent != Some("read_only") => Err(hc_invalid_params_value(
+            "a write intent requires idempotency_key so the request can be replayed durably",
+        )),
+        (Some(_), Some(_)) => Err(herdr_core_unsupported(
+            operation,
+            "exec_durable_idempotency",
+            "herdr-core machine.exec has no durable idempotency store, so a keyed exec is refused instead of silently losing replay protection; omit intent/idempotency_key, or declare intent=read_only",
+        )),
+        (Some(intent), None) => Ok(Some(intent)),
+    }
+}
+
+fn hc_arg_text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(Value::as_str)
+}
+
+fn hc_first_text<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| hc_arg_text(args, key))
+}
+
+fn hc_first_trimmed<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|key| hc_arg_text(args, key))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
+fn hc_required_text<'a>(args: &'a Value, key: &str, operation: &str) -> Result<&'a str, Value> {
+    match hc_arg_text(args, key) {
+        Some(value) if !value.trim().is_empty() => Ok(value),
+        Some(_) => Err(hc_invalid_params_value(format!(
+            "{operation} requires a non-empty '{key}'"
+        ))),
+        None => Err(hc_invalid_params_value(format!(
+            "{operation} requires '{key}' as a string"
+        ))),
+    }
+}
+
+fn hc_required_raw_text<'a>(args: &'a Value, key: &str, operation: &str) -> Result<&'a str, Value> {
+    match hc_arg_text(args, key) {
+        Some(value) => Ok(value),
+        None => Err(hc_invalid_params_value(format!(
+            "{operation} requires '{key}' as a string"
+        ))),
+    }
+}
+
+fn hc_arg_u64(args: &Value, key: &str) -> Result<Option<u64>, Value> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            hc_invalid_params_value(format!("{key} must be a non-negative integer"))
+        }),
+    }
+}
+
+fn hc_first_u64(args: &Value, keys: &[&str]) -> Result<Option<u64>, Value> {
+    for key in keys {
+        if let Some(value) = hc_arg_u64(args, key)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn hc_arg_cwd(args: &Value) -> Result<Option<PathBuf>, Value> {
+    for key in ["root", "project_root", "cwd"] {
+        if let Some(value) = hc_first_trimmed(args, &[key]) {
+            return Ok(Some(PathBuf::from(value)));
+        }
+    }
+    if let Some(workspace) = hc_first_trimmed(args, &["workspace"]) {
+        return Err(hc_invalid_params_value(format!(
+            "herdr-core has no workspace graph, so workspace '{workspace}' cannot resolve a cwd; pass root, project_root or cwd"
+        )));
+    }
+    Ok(None)
+}
+
+fn hc_arg_labels(args: &Value) -> Result<Option<BTreeMap<String, String>>, Value> {
+    let Some(raw) = args.get("labels") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(object) = raw.as_object() else {
+        return Err(hc_invalid_params_value(
+            "labels must be an object of strings",
+        ));
+    };
+    let mut labels = BTreeMap::new();
+    for (key, value) in object {
+        let Some(value) = value.as_str() else {
+            return Err(hc_invalid_params_value(
+                "labels must be an object of strings",
+            ));
+        };
+        labels.insert(key.clone(), value.to_owned());
+    }
+    Ok(Some(labels))
+}
+
+fn hc_invalid_params_value(message: impl Into<String>) -> Value {
+    json!({
+        "ok": false,
+        "code": "invalid_params",
+        "runtime_backend": "herdr-core",
+        "retryable": false,
+        "fallback_allowed": false,
+        "delivery_state": "not_delivered",
+        "message": message.into(),
+    })
+}
+
+/// Error codes refused before anything is delivered to `hc`.
+const HC_PREFLIGHT_ERROR_CODES: &[&str] = &[
+    "invalid_params",
+    "runtime_capability_unsupported",
+    "readonly_mode",
+    "secret_path_denied",
+    "file_too_large",
+    "edit_too_large",
+    "herdr_core_method_prohibited",
+    "human_boundary_prohibited",
+    "human_boundary_blocked",
+];
+
+fn hc_delivery_state(error: &HerdrCoreError, mutating: bool) -> &'static str {
+    if !mutating || HC_PREFLIGHT_ERROR_CODES.contains(&error.code.as_str()) {
+        "not_delivered"
+    } else {
+        // A transport failure after the request left this process may already
+        // have been applied; never claim `not_delivered`.
+        "unknown"
+    }
+}
+
+fn herdr_core_error_json(error: &HerdrCoreError, operation: &str, delivery_state: &str) -> Value {
+    let mut payload = json!({
+        "ok": false,
+        "code": error.code,
+        "operation": operation,
+        "runtime_backend": "herdr-core",
+        "message": error.message,
+        "retryable": false,
+        "fallback_allowed": false,
+        "delivery_state": delivery_state,
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(kind) = &error.kind {
+            object.insert("kind".to_owned(), json!(kind));
+        }
+        if error.code == "runtime_capability_unsupported" {
+            object.insert("required_capability".to_owned(), json!("herdr_core_method"));
+            object.insert("failure_phase".to_owned(), json!("backend_capability"));
+        }
+    }
+    payload
 }
 
 pub fn inspect_herdr_core(selection: &RuntimeBackendSelection) -> Value {
