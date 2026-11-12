@@ -1181,6 +1181,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         Ok(arguments) => arguments,
         Err(invalid) => return Ok(invalid),
     };
+    // #922 review 5870137915: the frozen catalog is admitted per selected
+    // backend. `tui` (default) is unchanged; `herdr-core` and invalid
+    // selections fail closed here, before any TUI snapshot/socket execution.
+    if let Err(rejection) = crate::runtime_adapter::public_tool_admission(name) {
+        return Ok(tool_result(rejection, true));
+    }
     let _work_capture = ToolCallCapture {
         name,
         arguments: &arguments,
@@ -1535,6 +1541,10 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                         clean_params,
                     )
                 }
+            } else if let Err(rejection) =
+                crate::runtime_adapter::forwarded_method_admission(method)
+            {
+                rejection
             } else {
                 native_tools::call_with_local(
                     context.client,
