@@ -3932,16 +3932,43 @@ mod tests {
     }
 
     /// Serves the herdr-core line protocol for the narrow execution routes
-    /// (#935). It is stateful (real files, real `machine.exec`, a terminal
-    /// lifecycle) so `POST /mcp` can be driven end-to-end through the same
-    /// public tools the TUI backend serves.
+    /// (#935). It is stateful (real files, real `machine.exec`) so `POST /mcp`
+    /// can be driven end-to-end through the same public tools the TUI backend
+    /// serves. The terminal methods are still answered so a route that wrongly
+    /// created or addressed a terminal would not silently pass (#936).
     #[cfg(unix)]
     fn spawn_core_execution_fixture(socket: &std::path::Path) {
+        spawn_recording_core_fixture(socket, None);
+    }
+
+    /// Same fixture, but records every non-`hello` request and models a
+    /// herdr-core process cwd that is *not* the herdr-mcp process cwd, so a
+    /// regression that leaves path/cwd resolution to `hc` becomes observable.
+    ///
+    /// Returns the recorded `(method, params)` pairs.
+    #[cfg(unix)]
+    fn spawn_recording_core_fixture(
+        socket: &std::path::Path,
+        core_cwd: Option<&std::path::Path>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> {
+        spawn_inspect_core_fixture(socket, core_cwd, true)
+    }
+
+    #[cfg(unix)]
+    fn spawn_inspect_core_fixture(
+        socket: &std::path::Path,
+        core_cwd: Option<&std::path::Path>,
+        advertise_terminal_list: bool,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
         use std::thread;
 
         let listener = UnixListener::bind(socket).unwrap();
+        let recorded: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        let core_cwd = core_cwd.map(std::path::Path::to_path_buf);
         thread::spawn(move || {
             // One bounded burst is enough: each tool call negotiates one or two
             // connections (admission + route) and the test makes a few dozen.
@@ -3957,8 +3984,18 @@ mod tests {
                     }
                     let request: Value = serde_json::from_str(&line).unwrap();
                     let id = request["id"].clone();
-                    let method = request["method"].as_str().unwrap_or_default();
-                    let result = core_fixture_result(method, &request["params"]);
+                    let method = request["method"].as_str().unwrap_or_default().to_owned();
+                    let params = request["params"].clone();
+                    if method != "hello" {
+                        sink.lock().unwrap().push((method.clone(), params.clone()));
+                    }
+                    let mut result = core_fixture_result_at(&method, &params, core_cwd.as_deref());
+                    if method == "hello" && !advertise_terminal_list {
+                        result["methods"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|method| method.as_str() != Some("terminal.list"));
+                    }
                     writeln!(
                         stream,
                         "{}",
@@ -3969,11 +4006,27 @@ mod tests {
                 }
             }
         });
+        recorded
     }
 
-    /// Minimal but real `hc` behaviour for the routes under test.
+    /// Resolve a fixture-relative path against the *herdr-core* process cwd, the
+    /// way `hc` itself would. A route that sends a relative path therefore reads
+    /// or writes a different file than the one it validated.
     #[cfg(unix)]
-    fn core_fixture_result(method: &str, params: &Value) -> Value {
+    fn fixture_resolve(raw: &str, core_cwd: Option<&std::path::Path>) -> std::path::PathBuf {
+        let path = std::path::PathBuf::from(raw);
+        match (path.is_relative(), core_cwd) {
+            (true, Some(cwd)) => cwd.join(path),
+            _ => path,
+        }
+    }
+
+    #[cfg(unix)]
+    fn core_fixture_result_at(
+        method: &str,
+        params: &Value,
+        core_cwd: Option<&std::path::Path>,
+    ) -> Value {
         use base64::Engine as _;
         let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
         match method {
@@ -3998,11 +4051,14 @@ mod tests {
                 ],
                 "features": []
             }),
-            "server.status" => json!({"live": 0, "finished": 0}),
-            "terminal.list" => json!({"terminals": []}),
+            "server.status" => json!({"live": 7, "finished": 3}),
+            "terminal.list" => json!({"terminals": [{
+                "address": "unowned", "argv": ["sensitive-terminal-sentinel"],
+                "labels": {"secret": "sensitive-terminal-sentinel"}, "status": "private"
+            }]}),
             "file.read" => {
-                let path = params["path"].as_str().unwrap_or_default();
-                let text = std::fs::read_to_string(path).unwrap_or_default();
+                let path = fixture_resolve(params["path"].as_str().unwrap_or_default(), core_cwd);
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
                 let lines: Vec<&str> = text.split('\n').collect();
                 let offset = params["offset"].as_u64().unwrap_or(1).max(1) as usize;
                 let limit = params["limit"].as_u64().unwrap_or(2_000) as usize;
@@ -4016,26 +4072,28 @@ mod tests {
                 })
             }
             "file.write" => {
-                let path = params["path"].as_str().unwrap_or_default();
+                let path = fixture_resolve(params["path"].as_str().unwrap_or_default(), core_cwd);
                 let data = base64::engine::general_purpose::STANDARD
                     .decode(params["data"].as_str().unwrap_or_default())
                     .unwrap();
-                std::fs::write(path, &data).unwrap();
-                json!({"path": path, "bytes": data.len()})
+                std::fs::write(&path, &data).unwrap();
+                json!({"path": path.to_string_lossy(), "bytes": data.len()})
             }
             "file.edit" => {
-                let path = params["path"].as_str().unwrap_or_default();
-                let mut text = std::fs::read_to_string(path).unwrap();
+                let path = fixture_resolve(params["path"].as_str().unwrap_or_default(), core_cwd);
+                let mut text = std::fs::read_to_string(&path).unwrap();
                 for edit in params["edits"].as_array().cloned().unwrap_or_default() {
                     let old = edit["old"].as_str().unwrap_or_default();
                     let new = edit["new"].as_str().unwrap_or_default();
                     text = text.replacen(old, new, 1);
                 }
-                std::fs::write(path, &text).unwrap();
-                json!({"path": path, "bytes": text.len()})
+                std::fs::write(&path, &text).unwrap();
+                json!({"path": path.to_string_lossy(), "bytes": text.len()})
             }
             "machine.exec" => {
-                let cwd = params["cwd"].as_str().map(std::path::PathBuf::from);
+                let cwd = params["cwd"]
+                    .as_str()
+                    .map(|cwd| fixture_resolve(cwd, core_cwd));
                 let mut command = match params["line"].as_str() {
                     Some(line) => {
                         let mut command = std::process::Command::new("sh");
@@ -4124,6 +4182,89 @@ mod tests {
             .and_then(Value::as_str)
             .map(|text| serde_json::from_str(text).unwrap())
             .unwrap_or_else(|| payload.clone())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_inspect_hides_unowned_terminals_with_or_without_list_capability() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("inspect-terminal-privacy");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let app = candidate_router(test_state_with_snapshot(
+            &root.join("tcp"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for advertised in [true, false] {
+            let socket = std::path::PathBuf::from(format!(
+                "/tmp/herdr-inspect-{}-{}-{}.sock",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                advertised,
+            ));
+            let recorded = spawn_inspect_core_fixture(&socket, None, advertised);
+            std::fs::write(config_dir.join("config.json"), json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": socket.to_string_lossy()}
+            }).to_string()).unwrap();
+            runtime.block_on(async {
+                let inspected = call_public_tool(&app, "herdr_inspect", json!({})).await;
+                assert_eq!(inspected["ok"], true, "{inspected}");
+                assert_eq!(inspected["terminals"], json!([]));
+                assert_eq!(
+                    inspected["terminal_details"],
+                    "unavailable_without_ownership"
+                );
+                assert_eq!(inspected["herdr_core"]["live_terminals"], 7);
+                assert_eq!(inspected["herdr_core"]["finished_terminals"], 3);
+                assert_eq!(
+                    inspected["herdr_core"]["terminal_counts_scope"],
+                    "global, not visibility-filtered"
+                );
+                assert_eq!(
+                    inspected["herdr_core"]["capabilities"]["server_status"],
+                    true
+                );
+                assert!(
+                    !inspected
+                        .to_string()
+                        .contains("sensitive-terminal-sentinel")
+                );
+                let calls = recorded.lock().unwrap();
+                assert!(
+                    calls.iter().any(|(method, _)| method == "server.status"),
+                    "{calls:?}"
+                );
+                assert!(
+                    !calls.iter().any(|(method, _)| method == "terminal.list"),
+                    "{calls:?}"
+                );
+            });
+            std::fs::remove_file(socket).ok();
+        }
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[cfg(unix)]
@@ -4293,417 +4434,85 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// #935: `herdr-core` serves the narrow execution routes end-to-end through
-    /// the real `POST /mcp` entrypoint, and the single-writer root lease still
-    /// blocks every mutating route before `hc` is contacted (Droid P2-928-c).
+    /// The public route refuses operations whose policy or identity contracts
+    /// cannot be preserved and never delivers them to herdr-core.
     #[cfg(unix)]
     #[test]
-    fn herdr_core_serves_narrow_execution_routes_and_enforces_root_lease() {
-        use crate::state_store::{MutationLeaseAcquireInput, MutationLeaseAcquireOutcome};
-
+    fn herdr_core_public_routes_fail_closed_without_delivery() {
         let _guard = crate::test_env::lock();
-        let root = test_root("herdr-core-execution-routes");
+        let root = test_root("herdr-core-policy-contract");
         let project = root.join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let unleased = root.join("unleased");
-        std::fs::create_dir_all(&unleased).unwrap();
         let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&config_dir).unwrap();
+        let file = project.join("notes.txt");
+        std::fs::write(&file, "original\n").unwrap();
         let core_socket = std::path::PathBuf::from(format!(
-            "/tmp/herdr-935-core-{}-{}.sock",
+            "/tmp/herdr-contract-{}-{}.sock",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::remove_file(&core_socket).ok();
-        spawn_core_execution_fixture(&core_socket);
-        std::fs::write(
-            config_dir.join("config.json"),
-            json!({
-                "runtime": {
-                    "backend": "herdr-core",
-                    "herdr_core_socket": core_socket.to_string_lossy(),
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let snapshot = json!({
-            "workspaces": [{"workspace_id": "w_fixture", "cwd": project.to_string_lossy()}],
-            "panes": [{"pane_id": "p_fixture", "workspace_id": "w_fixture", "cwd": project.to_string_lossy()}],
-            "agents": [],
-            "tabs": []
-        });
-        let state = test_state_with_snapshot(&root.join("tcp-core"), snapshot);
-        let store = state.state_store.clone();
-        let app = candidate_router(state);
-
+        let recorded = spawn_recording_core_fixture(&core_socket, None);
+        std::fs::write(config_dir.join("config.json"), json!({
+            "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+        }).to_string()).unwrap();
+        let app = candidate_router(test_state_with_snapshot(
+            &root.join("tcp"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        ));
         let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
         let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
         unsafe {
             env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
             env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
         }
-
-        let file = project.join("notes.txt");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            // 1. file.write -> file.read -> file.edit through the public tools.
-            let written = call_public_tool(
-                &app,
-                "herdr_fs_write",
-                json!({"path": file.to_string_lossy(), "content": "alpha\n"}),
-            )
-            .await;
-            assert_eq!(written["ok"], true, "{written}");
-            assert_eq!(written["runtime_backend"], "herdr-core");
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
-
-            let read = call_public_tool(
-                &app,
-                "herdr_fs_read",
-                json!({"path": file.to_string_lossy()}),
-            )
-            .await;
-            assert_eq!(read["ok"], true, "{read}");
-            assert_eq!(read["content"], "alpha\n", "{read}");
-
-            let edited = call_public_tool(
-                &app,
-                "herdr_fs_edit",
-                json!({
-                    "path": file.to_string_lossy(),
-                    "old_string": "alpha",
-                    "new_string": "beta",
-                }),
-            )
-            .await;
-            assert_eq!(edited["ok"], true, "{edited}");
-            assert_eq!(edited["edits_applied"], 1);
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
-
-            let reread = call_public_tool(
-                &app,
-                "herdr_fs_read",
-                json!({"path": file.to_string_lossy(), "start_line": 1, "max_lines": 10}),
-            )
-            .await;
-            assert_eq!(reread["content"], "beta\n", "{reread}");
-
-            // 2. herdr_exec -> machine.exec, exact stdout/exit code.
-            let executed = call_public_tool(
-                &app,
-                "herdr_exec",
-                json!({
-                    "root": project.to_string_lossy(),
-                    "command": "printf hello",
-                    "timeout_ms": 5_000,
-                }),
-            )
-            .await;
-            assert_eq!(executed["ok"], true, "{executed}");
-            assert_eq!(executed["exit_code"], 0, "{executed}");
-            assert_eq!(executed["stdout"], "hello", "{executed}");
-            assert_eq!(executed["output"], "hello", "{executed}");
-            assert_eq!(executed["timed_out"], false);
-            assert_eq!(executed["execution"]["mode"], "line", "{executed}");
-            assert_eq!(executed["execution"]["timeout_secs"], 5, "{executed}");
-
-            // `workspace` has no cwd meaning on herdr-core and must not be
-            // silently ignored.
-            let no_cwd = call_public_tool(
-                &app,
-                "herdr_exec",
-                json!({"workspace": "w_fixture", "command": "true"}),
-            )
-            .await;
-            assert_eq!(no_cwd["ok"], false, "{no_cwd}");
-            assert_eq!(no_cwd["code"], "invalid_params", "{no_cwd}");
-
-            // A keyed write intent has no durable replay on `hc`.
-            let keyed = call_public_tool(
-                &app,
-                "herdr_exec",
-                json!({
-                    "root": project.to_string_lossy(),
-                    "command": "true",
-                    "intent": "idempotent_write",
-                    "idempotency_key": "fixture-key",
-                }),
-            )
-            .await;
-            assert_eq!(keyed["ok"], false, "{keyed}");
-            assert_eq!(keyed["code"], "runtime_capability_unsupported", "{keyed}");
-            assert_eq!(keyed["required_capability"], "exec_durable_idempotency");
-
-            // 3. terminal lifecycle: run -> read -> kill.
-            let started = call_public_tool(
-                &app,
-                "herdr_exec_start",
-                json!({"root": project.to_string_lossy(), "command": "printf run"}),
-            )
-            .await;
-            assert_eq!(started["ok"], true, "{started}");
-            let session_id = started["session_id"].as_str().unwrap().to_owned();
-            assert_eq!(session_id, "t1");
-
-            let screen =
-                call_public_tool(&app, "herdr_exec_read", json!({"session_id": session_id})).await;
-            assert_eq!(screen["ok"], true, "{screen}");
-            assert_eq!(screen["session_id"], "t1");
-            assert_eq!(screen["text"], "fixture-screen\n", "{screen}");
-
-            let cursor = call_public_tool(
-                &app,
-                "herdr_exec_read",
-                json!({"session_id": session_id, "offset": 10, "limit": 4096}),
-            )
-            .await;
-            assert_eq!(cursor["ok"], false, "{cursor}");
-            assert_eq!(cursor["required_capability"], "exec_stream_cursor");
-
-            let killed =
-                call_public_tool(&app, "herdr_exec_kill", json!({"session_id": session_id})).await;
-            assert_eq!(killed["ok"], true, "{killed}");
-            assert_eq!(killed["state"], "finished", "{killed}");
-
-            // 4. herdr_prompt is terminal.send only; TUI fences fail closed.
-            let prompt = call_public_tool(
-                &app,
-                "herdr_prompt",
+            for (tool, arguments) in [
+                ("herdr_fs_read", json!({"path": file.to_string_lossy()})),
+                ("herdr_fs_write", json!({"path": file.to_string_lossy(), "content": "changed"})),
+                ("herdr_fs_edit", json!({"path": file.to_string_lossy(), "old_string": "original", "new_string": "changed"})),
+                ("herdr_exec", json!({"root": project.to_string_lossy(), "command": "true", "steps": []})),
+            ] {
+                let result = call_public_tool(&app, tool, arguments).await;
+                assert_eq!(result["code"], "runtime_capability_unsupported", "{tool}: {result}");
+                assert_eq!(result["required_capability"], "public_tool_policy_parity", "{tool}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{tool}: {result}");
+            }
+            for (tool, arguments) in [
+                ("herdr_exec_start", json!({"root": project.to_string_lossy(), "command": "true"})),
+                ("herdr_exec_read", json!({"session_id": "t1", "offset": 10})),
+                ("herdr_exec_kill", json!({"session_id": "t1"})),
+            ] {
+                let result = call_public_tool(&app, tool, arguments).await;
+                assert_eq!(result["required_capability"], "exec_session_ownership", "{tool}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{tool}: {result}");
+            }
+            for arguments in [
                 json!({"target": "t1", "text": "continue"}),
-            )
-            .await;
-            assert_eq!(prompt["ok"], true, "{prompt}");
-            assert_eq!(prompt["delivered"], true, "{prompt}");
-            assert_eq!(prompt["force"], false, "{prompt}");
-
-            for (label, arguments) in [
-                ("steer", json!({"target": "t1", "text": "x", "steer": true})),
-                (
-                    "target_revision",
-                    json!({"target": "t1", "text": "x", "target_revision": "rev-1"}),
-                ),
-                (
-                    "spawn",
-                    json!({"target": "t1", "text": "x", "spawn": {"agent": "codex"}}),
-                ),
+                json!({"target": "t1", "text": "continue", "inject_task_identity": false}),
+                json!({"target": "t1", "text": "continue", "steer": true}),
             ] {
-                let refused = call_public_tool(&app, "herdr_prompt", arguments).await;
-                assert_eq!(refused["ok"], false, "{label}");
-                assert_eq!(
-                    refused["required_capability"], "prompt_tui_fence",
-                    "{label}"
-                );
+                let result = call_public_tool(&app, "herdr_prompt", arguments).await;
+                assert_eq!(result["required_capability"], "prompt_task_tracking_and_identity", "{result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{result}");
             }
-
-            // 5. herdr_methods merges negotiated hello.methods with the local registry.
-            let methods = call_public_tool(&app, "herdr_methods", json!({"query": "file."})).await;
-            assert_eq!(methods["ok"], true, "{methods}");
-            let names: Vec<&str> = methods["methods"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|method| method["method"].as_str())
-                .collect();
-            assert!(names.contains(&"file.read"), "{methods}");
-            assert!(names.contains(&"file.write"), "{methods}");
-
-            // 6. `herdr_call` raw forwarding is a precise read-only allowlist:
-            // every file/machine/terminal primitive is refused (including a
-            // whitespace-prefixed method name) so the raw channel can never
-            // bypass the root lease, readonly gate or secret-path denylist.
-            let status = call_public_tool(
-                &app,
-                "herdr_call",
-                json!({"method": "server.status", "params": {}}),
-            )
-            .await;
+            for method in ["doc.get", "terminal.get", "terminal.list", "terminal.read", "terminal.wait", " TERMINAL.READ ", "machine.exec", "file.read", "terminal.send"] {
+                let result = call_public_tool(&app, "herdr_call", json!({"method": method, "params": {"terminal": "t1", "path": file.to_string_lossy()}})).await;
+                assert_eq!(result["code"], "herdr_core_method_prohibited", "{method}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{method}: {result}");
+            }
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "original\n");
+            assert!(recorded.lock().unwrap().is_empty(), "refused calls must not reach herdr-core");
+            let status = call_public_tool(&app, "herdr_call", json!({"method": "server.status", "params": {}})).await;
             assert_eq!(status["ok"], true, "{status}");
-            assert_eq!(status["runtime_backend"], "herdr-core");
-
-            for (method, params) in [
-                ("machine.exec", json!({"argv": ["true"]})),
-                (" machine.exec", json!({"argv": ["true"]})),
-                ("\tmachine.exec", json!({"argv": ["true"]})),
-                (
-                    "file.write",
-                    json!({"path": file.to_string_lossy(), "data": "forbidden"}),
-                ),
-                ("file.read", json!({"path": file.to_string_lossy()})),
-                (
-                    "file.edit",
-                    json!({"path": file.to_string_lossy(), "edits": []}),
-                ),
-                ("terminal.run", json!({"line": "printf forbidden"})),
-                ("terminal.kill", json!({"terminal": "t1"})),
-                (
-                    "terminal.send",
-                    json!({"terminal": "t1", "text": "forbidden"}),
-                ),
-            ] {
-                let refused = call_public_tool(
-                    &app,
-                    "herdr_call",
-                    json!({"method": method, "params": params}),
-                )
-                .await;
-                assert_eq!(refused["ok"], false, "{method}");
-                assert_eq!(
-                    refused["code"], "herdr_core_method_prohibited",
-                    "{method}: {refused}"
-                );
-                assert_eq!(refused["delivery_state"], "not_delivered", "{method}");
-            }
-            // None of the refused raw calls reached `hc`.
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
-
-            // 7. A single-writer root lease blocks every mutating herdr-core
-            // route before `hc` is contacted.
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-            let (holder_id, lease_epoch, lease_token) = {
-                let project_root = project.to_string_lossy().into_owned();
-                let mut guard = store.lock().unwrap();
-                match guard
-                    .acquire_mutation_lease(MutationLeaseAcquireInput {
-                        project_root: &project_root,
-                        lane_key: Some("*"),
-                        holder_id: "other-agent",
-                        lease_token: None,
-                        ttl_seconds: Some(600),
-                        workspace_id: None,
-                        pane_id: None,
-                        branch: None,
-                        now_ms,
-                    })
-                    .unwrap()
-                {
-                    MutationLeaseAcquireOutcome::Acquired {
-                        lease, lease_token, ..
-                    } => (lease.holder_id, lease.lease_epoch, lease_token),
-                    other => panic!("expected an acquired root lease, got {other:?}"),
-                }
-            };
-
-            for (tool, arguments) in [
-                (
-                    "herdr_fs_write",
-                    json!({"path": file.to_string_lossy(), "content": "blocked\n"}),
-                ),
-                (
-                    "herdr_fs_edit",
-                    json!({
-                        "path": file.to_string_lossy(),
-                        "old_string": "beta",
-                        "new_string": "blocked",
-                    }),
-                ),
-                (
-                    "herdr_exec",
-                    json!({"root": project.to_string_lossy(), "command": "printf blocked"}),
-                ),
-                (
-                    "herdr_exec_start",
-                    json!({"root": project.to_string_lossy(), "command": "printf blocked"}),
-                ),
-            ] {
-                let blocked = call_public_tool(&app, tool, arguments).await;
-                assert_eq!(blocked["ok"], false, "{tool}");
-                assert_eq!(
-                    blocked["code"], "single_writer_lease_conflict",
-                    "{tool}: {blocked}"
-                );
-                assert_eq!(blocked["delivery_state"], "not_delivered", "{tool}");
-            }
-            // Nothing was written while the lease was held.
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\n");
-
-            // A relative path with an explicit `root` resolves through
-            // `root.join(path)` on `hc`, so the lease must refuse the same
-            // target instead of the herdr-mcp process cwd (#936 P1-3).
-            let relative_inside_lease = call_public_tool(
-                &app,
-                "herdr_fs_write",
-                json!({
-                    "path": "relative-inside-lease.txt",
-                    "root": project.to_string_lossy(),
-                    "content": "blocked\n",
-                }),
-            )
-            .await;
-            assert_eq!(
-                relative_inside_lease["ok"], false,
-                "{relative_inside_lease}"
-            );
-            assert_eq!(
-                relative_inside_lease["code"], "single_writer_lease_conflict",
-                "{relative_inside_lease}"
-            );
-            assert!(
-                !project.join("relative-inside-lease.txt").exists(),
-                "the leased root must not receive a relative-path write"
-            );
-
-            // `project_root` outside the lease must not shadow the `root` that
-            // `hc` actually executes in: every supplied cwd-like field is a
-            // lease candidate, not just the first one present (#936 P1-4).
-            let shadowed_exec = call_public_tool(
-                &app,
-                "herdr_exec",
-                json!({
-                    "project_root": unleased.to_string_lossy(),
-                    "root": project.to_string_lossy(),
-                    "command": "printf blocked",
-                }),
-            )
-            .await;
-            assert_eq!(shadowed_exec["ok"], false, "{shadowed_exec}");
-            assert_eq!(
-                shadowed_exec["code"], "single_writer_lease_conflict",
-                "{shadowed_exec}"
-            );
-            assert_eq!(shadowed_exec["delivery_state"], "not_delivered");
-
-            // A caller presenting the lease credentials is allowed again.
-            let owned = call_public_tool(
-                &app,
-                "herdr_fs_write",
-                json!({
-                    "path": file.to_string_lossy(),
-                    "content": "gamma\n",
-                    "lease_holder_id": holder_id,
-                    "lease_epoch": lease_epoch,
-                    "lease_token": lease_token,
-                }),
-            )
-            .await;
-            assert_eq!(owned["ok"], true, "{owned}");
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), "gamma\n");
-
-            // 8. The six genuinely unservable tools keep failing closed.
-            for (tool, arguments) in [
-                ("herdr_fs_list", json!({"path": project.to_string_lossy()})),
-                (
-                    "herdr_git",
-                    json!({"root": project.to_string_lossy(), "action": "status"}),
-                ),
-            ] {
-                let refused = call_public_tool(&app, tool, arguments).await;
-                assert_eq!(refused["ok"], false, "{tool}");
-                assert_eq!(refused["code"], "runtime_capability_unsupported", "{tool}");
-                assert_eq!(refused["runtime_backend"], "herdr-core", "{tool}");
-                assert_eq!(refused["delivery_state"], "not_delivered", "{tool}");
-            }
         });
-
         unsafe {
             match previous_config_dir {
                 Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),

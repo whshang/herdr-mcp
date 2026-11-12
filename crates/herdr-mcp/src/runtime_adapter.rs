@@ -71,25 +71,11 @@ const PROHIBITED_HC_METHODS: &[&str] = &[
     "server.restart",
 ];
 
-/// The only `herdr-core` methods `herdr_call` may forward verbatim.
-///
-/// This is deliberately a precise read-only allowlist, not a denylist of known
-/// mutation primitives: everything outside it (`file.read`, `file.write`,
-/// `file.edit`, `terminal.run`, `terminal.kill`, `terminal.send`, the rest of
-/// `terminal.*`, `machine.*`) owns its guards in the typed public tool route —
-/// the single-writer root lease, `HERDR_MCP_READONLY`, the `fs_security`
-/// secret-path denylist, the byte budget and the prompt human boundary. Raw
-/// forwarding would bypass every one of them (#936 P0-1 / P1-2).
-const HERDR_CALL_FORWARDABLE_HC_METHODS: &[&str] = &[
-    "doc.get",
-    "rpc.discover",
-    "server.status",
-    "templates.list",
-    "terminal.get",
-    "terminal.list",
-    "terminal.read",
-    "terminal.wait",
-];
+/// Raw forwarding is limited to metadata methods that do not expose files or
+/// terminals outside the public tools' access policies. File, document, machine,
+/// and terminal methods fail closed until equivalent safeguards are available.
+const HERDR_CALL_FORWARDABLE_HC_METHODS: &[&str] =
+    &["rpc.discover", "server.status", "templates.list"];
 
 fn hc_forwardable_readonly_method(method: &str) -> bool {
     HERDR_CALL_FORWARDABLE_HC_METHODS
@@ -116,12 +102,12 @@ fn hc_forwarding_refusal(method: &str) -> Option<String> {
     }
     if method.to_ascii_lowercase().starts_with("machine.") {
         return Some(format!(
-            "herdr-core method '{method}' is not forwardable through herdr_call; use herdr_exec (machine.exec) so the single-writer root lease and readonly gate are enforced"
+            "herdr-core method '{method}' is not forwardable through herdr_call; machine execution is unavailable on this backend"
         ));
     }
     if !hc_forwardable_readonly_method(method) {
         return Some(format!(
-            "herdr-core method '{method}' is not forwardable through herdr_call: raw forwarding is limited to the read-only allowlist [{}]; file, terminal and machine primitives must go through herdr_fs_read, herdr_fs_write, herdr_fs_edit, herdr_exec, herdr_exec_start, herdr_exec_kill or herdr_prompt so the single-writer root lease, HERDR_MCP_READONLY, the secret-path denylist and the delivery/human-boundary guards stay enforced",
+            "herdr-core method '{method}' is not forwardable through herdr_call: raw forwarding is limited to the read-only allowlist [{}]; file, document, terminal and machine operations are unavailable through this raw route",
             HERDR_CALL_FORWARDABLE_HC_METHODS.join(", "),
         ));
     }
@@ -670,32 +656,16 @@ impl HerdrCoreClient {
         let call_timeout = self.timeout;
         self.with_negotiated_session(|hello, stream| {
             let capabilities = RuntimeCapabilities::from_herdr_core_methods(&hello.methods);
-            if !capabilities.server_status || !hello.methods.contains("terminal.list") {
+            if !capabilities.server_status {
                 return Err(HerdrCoreError {
                     code: "runtime_capability_unsupported".to_owned(),
                     kind: None,
                     message:
-                        "herdr-core did not advertise server.status + terminal.list in hello.methods"
+                        "herdr-core did not advertise server.status in hello.methods"
                             .to_owned(),
                 });
             }
             let status = rpc_call_line(stream, &self.socket_path, "server.status", json!({}), call_timeout)?;
-            let list = rpc_call_line(
-                stream,
-                &self.socket_path,
-                "terminal.list",
-                json!({"all": false}),
-                call_timeout,
-            )?;
-            let terminals_raw = list
-                .get("terminals")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let terminals: Vec<Value> = terminals_raw
-                .into_iter()
-                .map(|term| project_herdr_core_terminal(&term))
-                .collect();
             let mut methods_vec: Vec<String> = hello.methods.iter().cloned().collect();
             methods_vec.sort();
             Ok(json!({
@@ -710,9 +680,14 @@ impl HerdrCoreClient {
                     "features": hello.features,
                     "live_terminals": status.get("live").and_then(Value::as_u64).unwrap_or(0),
                     "finished_terminals": status.get("finished").and_then(Value::as_u64).unwrap_or(0),
+                    "terminal_counts_scope": "global, not visibility-filtered",
                     "capabilities": capabilities.as_json(),
+                    "capabilities_scope": "advertised herdr-core methods, not public tool availability",
+                    "public_tools_policy_blocked": herdr_core_policy_blocked_tools(),
+                    "public_tools_policy_scope": "policy blocks only; other tools may be unavailable and herdr_call is method-restricted",
                 },
-                "terminals": terminals,
+                "terminals": [],
+                "terminal_details": "unavailable_without_ownership",
                 "workspaces": [],
                 "tabs": [],
                 "panes": [],
@@ -893,18 +868,19 @@ impl HerdrCoreClient {
         })
     }
 
-    /// `file.read`: same secret-path denylist as `fs_security`, refused before
-    /// the socket is contacted (fail-closed, no partial disclosure).
+    /// `file.read`: the caller passes the *already resolved absolute* target, so
+    /// `hc` cannot resolve it against a different process cwd. The same target is
+    /// what the secret-path denylist checks, before the socket is contacted
+    /// (fail-closed, no partial disclosure).
     #[allow(dead_code)]
     pub fn file_read(
         &self,
-        path: &str,
-        cwd: Option<&Path>,
+        target: &Path,
         offset_1based: Option<u64>,
         limit_lines: Option<u64>,
     ) -> Result<Value, HerdrCoreError> {
-        let path = hc_required_path(path, "file.read")?;
-        hc_secret_like_path_guard(path, cwd)?;
+        let path = hc_absolute_target(target, "file.read")?;
+        hc_secret_like_path_guard(Path::new(&path))?;
         if offset_1based == Some(0) {
             return Err(hc_invalid_params(
                 "file.read offset is 1-based; pass 1 or greater (omit for the start of the file)",
@@ -915,7 +891,6 @@ impl HerdrCoreClient {
             hc_require_method(&hello, "file.read")?;
             let mut params = Map::new();
             params.insert("path".to_owned(), json!(path));
-            hc_insert_cwd(&mut params, cwd);
             if let Some(offset) = offset_1based {
                 params.insert("offset".to_owned(), json!(offset));
             }
@@ -942,17 +917,13 @@ impl HerdrCoreClient {
     }
 
     /// `file.write`: readonly gate, secret-path refusal and the 8 MiB bound all
-    /// run before the socket is contacted; `data` is base64 per the OpenRPC schema.
+    /// run against the resolved absolute target before the socket is contacted;
+    /// `data` is base64 per the OpenRPC schema.
     #[allow(dead_code)]
-    pub fn file_write(
-        &self,
-        path: &str,
-        cwd: Option<&Path>,
-        data: &[u8],
-    ) -> Result<Value, HerdrCoreError> {
-        let path = hc_required_path(path, "file.write")?;
+    pub fn file_write(&self, target: &Path, data: &[u8]) -> Result<Value, HerdrCoreError> {
+        let path = hc_absolute_target(target, "file.write")?;
         hc_mutation_guard("herdr_fs_write")?;
-        hc_secret_like_path_guard(path, cwd)?;
+        hc_secret_like_path_guard(Path::new(&path))?;
         if data.len() > HC_FILE_MAX_BYTES {
             return Err(HerdrCoreError {
                 code: "file_too_large".to_owned(),
@@ -970,7 +941,6 @@ impl HerdrCoreClient {
             let mut params = Map::new();
             params.insert("path".to_owned(), json!(path));
             params.insert("data".to_owned(), json!(encoded));
-            hc_insert_cwd(&mut params, cwd);
             let raw = rpc_call_line(
                 stream,
                 &self.socket_path,
@@ -981,7 +951,7 @@ impl HerdrCoreClient {
             Ok(json!({
                 "ok": true,
                 "runtime_backend": "herdr-core",
-                "path": raw.get("path").and_then(Value::as_str).unwrap_or(path),
+                "path": raw.get("path").and_then(Value::as_str).unwrap_or(&path),
                 "bytes": raw.get("bytes").and_then(Value::as_u64).unwrap_or(data.len() as u64),
             }))
         })
@@ -989,21 +959,22 @@ impl HerdrCoreClient {
 
     /// `file.edit`: every `old` must match exactly once in the file as it was and
     /// `hc` applies all edits or none, so a failed call is never partially applied.
+    /// The caller passes the resolved absolute target, which is also what the
+    /// secret-path guard checks.
     #[allow(dead_code)]
     pub fn file_edit(
         &self,
-        path: &str,
-        cwd: Option<&Path>,
+        target: &Path,
         edits: &[(String, String)],
     ) -> Result<Value, HerdrCoreError> {
-        let path = hc_required_path(path, "file.edit")?;
+        let path = hc_absolute_target(target, "file.edit")?;
         if edits.is_empty() {
             return Err(hc_invalid_params(
                 "file.edit requires at least one (old, new) replacement",
             ));
         }
         hc_mutation_guard("herdr_fs_edit")?;
-        hc_secret_like_path_guard(path, cwd)?;
+        hc_secret_like_path_guard(Path::new(&path))?;
         // `edits` travels as one JSON array; bound the replacement text itself so a
         // call cannot allocate and send an arbitrarily large edit set.
         let total_edit_bytes = edits.iter().fold(0usize, |total, (old, new)| {
@@ -1028,7 +999,6 @@ impl HerdrCoreClient {
             let mut params = Map::new();
             params.insert("path".to_owned(), json!(path));
             params.insert("edits".to_owned(), Value::Array(payload));
-            hc_insert_cwd(&mut params, cwd);
             // `edit_failed`/`not_found`/`not_text` arrive as `herdr_core_<kind>`
             // with `kind` preserved, so callers never see a half-applied edit.
             let raw = rpc_call_line(
@@ -1041,7 +1011,7 @@ impl HerdrCoreClient {
             Ok(json!({
                 "ok": true,
                 "runtime_backend": "herdr-core",
-                "path": raw.get("path").and_then(Value::as_str).unwrap_or(path),
+                "path": raw.get("path").and_then(Value::as_str).unwrap_or(&path),
                 "bytes": raw.get("bytes").and_then(Value::as_u64),
                 "edits_applied": edits.len(),
             }))
@@ -1049,6 +1019,13 @@ impl HerdrCoreClient {
     }
 
     /// `terminal.run`: `argv` or `line` (never both), optional `cwd`/`name`/`labels`.
+    ///
+    /// No public herdr-mcp tool may call this yet (#936): `hc` terminals live in
+    /// one address namespace shared with unrelated agent terminals and carry no
+    /// runtime-scoped session id, so a started terminal could not be read or
+    /// ended by a public route without inventing ownership. Kept as the typed
+    /// wire mapping for a future owned-session design (`cwd` must already be the
+    /// resolved absolute directory — see [`herdr_core_absolute_directory`]).
     #[allow(dead_code)]
     pub fn terminal_run(
         &self,
@@ -1129,6 +1106,10 @@ impl HerdrCoreClient {
     }
 
     /// `terminal.read`: screen plus optional history lines, live or finished.
+    ///
+    /// Not reachable from any public tool (#936): the address may belong to an
+    /// unrelated agent terminal and there is no ownership or byte cursor, so
+    /// `herdr_exec_read` and `herdr_call` refuse instead of disclosing a screen.
     #[allow(dead_code)]
     pub fn terminal_read(
         &self,
@@ -1166,6 +1147,10 @@ impl HerdrCoreClient {
     }
 
     /// `terminal.kill`: ends the program and reports the observed terminal facts.
+    ///
+    /// Not reachable from any public tool (#936): the address may belong to an
+    /// unrelated agent terminal and there is no ownership proof, so
+    /// `herdr_exec_kill` and `herdr_call` refuse instead of killing that work.
     #[allow(dead_code)]
     pub fn terminal_kill(&self, terminal: &str) -> Result<Value, HerdrCoreError> {
         let terminal = hc_required_terminal(terminal, "terminal.kill")?;
@@ -1316,7 +1301,7 @@ impl HerdrCoreClient {
             "hello",
             json!({
                 "generation": HERDR_CORE_PROTOCOL_GENERATION,
-                "calls_you": false,
+                "calls_you": null,
                 "framed": false,
                 "core": {
                     "id": "herdr-mcp",
@@ -1401,36 +1386,119 @@ fn hc_mutation_guard(action: &str) -> Result<(), HerdrCoreError> {
 
 /// Fail-closed secret-path refusal, reusing the crate-wide `fs_security`
 /// denylist (`.env*`, `id_rsa*`, `*secret*`, `*.pem`, `*.key`, ...).
-/// Fail-closed secret-path refusal for a `cwd` + `path` pair, resolved the way
-/// `hc` will resolve it.
 ///
-/// Checking the caller's raw string is not enough: `notes.txt -> .env` hides the
-/// secret behind a harmless name, and `cwd=/work/.ssh` + `path=config` hides it in
-/// the working directory. So the guard checks (1) the lexically normalized
-/// combination of `cwd` and a relative `path`, and (2) the same path after
-/// following symlinks on disk, where a path that does not exist yet is resolved
-/// through its deepest existing ancestor plus the remaining leaf components.
-fn hc_secret_like_path_guard(path: &str, cwd: Option<&Path>) -> Result<(), HerdrCoreError> {
-    let raw = Path::new(path);
-    let candidate = match cwd {
-        Some(cwd) if !raw.is_absolute() => cwd.join(raw),
-        _ => raw.to_path_buf(),
-    };
-    let lexical = hc_lexical_normalize(&candidate);
-    let resolved = hc_symlink_resolved_path(&lexical, HC_SECRET_PATH_SYMLINK_HOPS);
-    for checked in [&lexical, &resolved] {
+/// Check the supplied absolute target and its currently resolved path. A
+/// harmless name can hide a secret behind a symlink or in a parent directory.
+/// Filesystem state may change after this check and before hc opens the path;
+/// path strings and repeated resolution do not prevent that race.
+fn hc_secret_like_path_guard(target: &Path) -> Result<(), HerdrCoreError> {
+    let resolved = hc_symlink_resolved_path(target, HC_SECRET_PATH_SYMLINK_HOPS)?;
+    for checked in [target, resolved.as_path()] {
         if hc_secret_like_path(checked) {
             return Err(HerdrCoreError {
                 code: "secret_path_denied".to_owned(),
                 kind: Some("secret_path_denied".to_owned()),
                 message: format!(
-                    "refusing secret-like path '{path}' (resolved '{}'): herdr-core file primitives apply the fs_security denylist after cwd join, lexical normalization and symlink resolution",
+                    "refusing secret-like path '{}' (checked '{}'): herdr-core file primitives apply the fs_security denylist to the supplied and currently resolved paths",
+                    target.display(),
                     checked.display()
                 ),
             });
         }
     }
     Ok(())
+}
+
+/// Resolve one caller-supplied `herdr-core` directory (`root`/`project_root`/`cwd`)
+/// to the absolute directory the operation will really use.
+///
+/// A relative value can never be honoured: `hc` resolves it against the
+/// herdr-core process cwd while herdr-mcp resolves it against its own, so the
+/// single-writer root lease, the secret-path denylist and the executed directory
+/// would name different places (#936). Equivalence cannot be guaranteed, so the
+/// call fails closed with `herdr_core_path_ambiguous`.
+pub fn herdr_core_absolute_directory(raw: &str) -> Result<PathBuf, HerdrCoreError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(hc_invalid_params("directory argument must not be empty"));
+    }
+    if trimmed.contains('\0') {
+        return Err(hc_invalid_params("directory argument must not contain NUL"));
+    }
+    let path = Path::new(trimmed);
+    if path.is_relative() {
+        return Err(hc_path_ambiguous(format!(
+            "herdr-core cannot honour the relative directory '{trimmed}': hc resolves it against the herdr-core process cwd while herdr-mcp resolves it against its own, so the root lease and the secret-path guard would check a different directory than the one executed; pass an absolute path"
+        )));
+    }
+    hc_resolved_absolute_path(path)
+}
+
+/// Resolve the one absolute file target a `herdr-core` `file.*` call will act on.
+///
+/// `cwd` must already be absolute ([`herdr_core_absolute_directory`]); a relative
+/// `path` without an absolute `cwd` fails closed because `hc` would resolve it
+/// against its own process cwd, which herdr-mcp cannot observe. The returned
+/// path is resolved at this instant; separate lease checks and later opens can
+/// observe different filesystem state. Public file routes remain blocked until
+/// the authorization and open can be safely coupled.
+pub fn herdr_core_absolute_file_target(
+    path: &str,
+    cwd: Option<&Path>,
+) -> Result<PathBuf, HerdrCoreError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(hc_invalid_params("path is required"));
+    }
+    if trimmed.contains('\0') {
+        return Err(hc_invalid_params("path must not contain NUL"));
+    }
+    let raw = Path::new(trimmed);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        let Some(cwd) = cwd else {
+            return Err(hc_path_ambiguous(format!(
+                "herdr-core cannot honour the relative path '{trimmed}' without an absolute cwd: hc would resolve it against the herdr-core process cwd, which herdr-mcp cannot observe, so the target could differ from the file this call validated; pass an absolute path (or an absolute root/project_root/cwd)"
+            )));
+        };
+        if cwd.is_relative() {
+            return Err(hc_path_ambiguous(
+                "herdr-core cannot resolve a relative path against a relative cwd; pass an absolute directory",
+            ));
+        }
+        cwd.join(raw)
+    };
+    hc_resolved_absolute_path(&candidate)
+}
+
+/// Resolve each component in filesystem order, including symlinks before `..`.
+fn hc_resolved_absolute_path(path: &Path) -> Result<PathBuf, HerdrCoreError> {
+    hc_symlink_resolved_path(path, HC_SECRET_PATH_SYMLINK_HOPS)
+}
+
+fn hc_path_ambiguous(message: impl Into<String>) -> HerdrCoreError {
+    HerdrCoreError {
+        code: "herdr_core_path_ambiguous".to_owned(),
+        kind: Some("herdr_core_path_ambiguous".to_owned()),
+        message: message.into(),
+    }
+}
+
+/// The exact UTF-8 path string put on the `hc` wire. A non-UTF-8 path cannot be
+/// represented as a JSON string, so it fails closed instead of being lossily
+/// rewritten into a different target.
+fn hc_absolute_target(target: &Path, method: &str) -> Result<String, HerdrCoreError> {
+    if !target.is_absolute() {
+        return Err(hc_path_ambiguous(format!(
+            "{method} requires an absolute resolved target; refusing to send a relative path to hc"
+        )));
+    }
+    target.to_str().map(str::to_owned).ok_or_else(|| {
+        hc_invalid_params(format!(
+            "{method} target is not valid UTF-8 and cannot be sent to hc as a JSON path"
+        ))
+    })
 }
 
 /// `fs_security::denied_secret_path` plus credential directories that the
@@ -1445,78 +1513,89 @@ fn hc_secret_like_path(path: &Path) -> bool {
     })
 }
 
-/// Collapse `.` and `..` so `sub/../.env` is judged as `.env`.
-fn hc_lexical_normalize(path: &Path) -> PathBuf {
-    let mut output = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                // Popping the root is a no-op, so absolute paths cannot escape `/`.
-                output.pop();
-            }
-            other => output.push(other.as_os_str()),
-        }
-    }
-    if output.as_os_str().is_empty() {
-        output.push(".");
-    }
-    output
-}
+/// Resolve components in filesystem order, including dangling symlinks. Missing
+/// leaf components are retained, but errors other than NotFound fail closed.
+fn hc_symlink_resolved_path(path: &Path, hops: usize) -> Result<PathBuf, HerdrCoreError> {
+    use std::collections::VecDeque;
+    use std::path::Component;
 
-/// Resolve symlinks on disk without requiring the final target to exist.
-///
-/// A dangling symlink counts as existing, so a link that points at a `.env` file
-/// nobody has created yet is still resolved and checked. Components that do not
-/// exist are kept and appended to the resolved ancestor.
-fn hc_symlink_resolved_path(path: &Path, hops: usize) -> PathBuf {
-    if hops == 0 {
-        return path.to_path_buf();
+    if !path.is_absolute() {
+        return Err(hc_path_ambiguous(
+            "path resolution requires an absolute path",
+        ));
     }
-    let mut probe = path;
-    let mut missing_leafs: Vec<std::ffi::OsString> = Vec::new();
-    while probe.symlink_metadata().is_err() {
-        let Some(parent) = probe.parent() else {
-            return path.to_path_buf();
-        };
-        if parent == probe {
-            return path.to_path_buf();
-        }
-        if let Some(name) = probe.file_name() {
-            missing_leafs.push(name.to_owned());
-        }
-        probe = parent;
-    }
-    let resolved = match std::fs::canonicalize(probe) {
-        Ok(real) => real,
-        Err(_) => match std::fs::read_link(probe) {
-            Ok(target) => {
-                let joined = if target.is_absolute() {
-                    target
-                } else {
-                    probe
-                        .parent()
-                        .map(|parent| parent.join(&target))
-                        .unwrap_or(target)
-                };
-                hc_symlink_resolved_path(&hc_lexical_normalize(&joined), hops - 1)
+    let mut pending: VecDeque<_> = path
+        .components()
+        .map(|part| part.as_os_str().to_owned())
+        .collect();
+    let mut resolved = PathBuf::from("/");
+    let mut followed = 0;
+    let mut missing = false;
+    while let Some(part) = pending.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::RootDir) => {
+                resolved = PathBuf::from("/");
+                missing = false;
             }
-            Err(_) => probe.to_path_buf(),
-        },
-    };
-    let mut output = resolved;
-    for name in missing_leafs.iter().rev() {
-        output.push(name);
+            Some(Component::CurDir) | None => {}
+            Some(Component::ParentDir) => {
+                if missing {
+                    return Err(hc_path_ambiguous(format!(
+                        "cannot resolve '..' through missing path '{}'",
+                        resolved.display()
+                    )));
+                }
+                resolved.pop();
+            }
+            Some(Component::Normal(_)) => {
+                resolved.push(&part);
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        if followed >= hops {
+                            return Err(hc_path_ambiguous(format!(
+                                "symlink resolution limit exceeded at '{}'",
+                                resolved.display()
+                            )));
+                        }
+                        followed += 1;
+                        let target = std::fs::read_link(&resolved).map_err(|error| {
+                            hc_path_ambiguous(format!(
+                                "cannot read symlink '{}': {error}",
+                                resolved.display()
+                            ))
+                        })?;
+                        resolved.pop();
+                        let parts: Vec<_> = target
+                            .components()
+                            .map(|part| part.as_os_str().to_owned())
+                            .collect();
+                        for part in parts.into_iter().rev() {
+                            pending.push_front(part);
+                        }
+                    }
+                    Ok(metadata) => {
+                        if !pending.is_empty() && !metadata.is_dir() {
+                            return Err(hc_path_ambiguous(format!(
+                                "path component '{}' is not a directory",
+                                resolved.display()
+                            )));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+                    Err(error) => {
+                        return Err(hc_path_ambiguous(format!(
+                            "cannot inspect path '{}': {error}",
+                            resolved.display()
+                        )));
+                    }
+                }
+            }
+            Some(Component::Prefix(_)) => {
+                return Err(hc_path_ambiguous("unsupported path prefix"));
+            }
+        }
     }
-    hc_lexical_normalize(&output)
-}
-
-fn hc_required_path<'a>(path: &'a str, method: &str) -> Result<&'a str, HerdrCoreError> {
-    let path = path.trim();
-    if path.is_empty() {
-        return Err(hc_invalid_params(format!("{method} path is required")));
-    }
-    Ok(path)
+    Ok(resolved)
 }
 
 fn hc_required_terminal<'a>(terminal: &'a str, method: &str) -> Result<&'a str, HerdrCoreError> {
@@ -1546,31 +1625,6 @@ fn hc_insert_cwd(params: &mut Map<String, Value>, cwd: Option<&Path>) {
     if let Some(cwd) = cwd {
         params.insert("cwd".to_owned(), json!(cwd.to_string_lossy().into_owned()));
     }
-}
-
-fn project_herdr_core_terminal(term: &Value) -> Value {
-    let reported = term
-        .get("reported")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    // OSC 7501 rule (#767 §3.1): never guess status from screen text; expose
-    // `osc7501_status` only when the program actually reported via 7501.
-    let osc7501_status = if reported {
-        term.get("status").cloned().unwrap_or(Value::Null)
-    } else {
-        Value::Null
-    };
-    json!({
-        "address": term.get("address").cloned().unwrap_or(Value::Null),
-        "state": term.get("state").cloned().unwrap_or(Value::Null),
-        "cwd": term.get("cwd").cloned().unwrap_or(Value::Null),
-        "argv": term.get("argv").cloned().unwrap_or_else(|| json!([])),
-        "labels": term.get("labels").cloned().unwrap_or_else(|| json!({})),
-        "parent": term.get("parent").cloned().unwrap_or(Value::Null),
-        "turn": term.get("turn").cloned().unwrap_or(Value::Null),
-        "reported": reported,
-        "osc7501_status": osc7501_status,
-    })
 }
 
 fn decode_hc_base64_field(raw: &Value, key: &str) -> Result<String, HerdrCoreError> {
@@ -1701,9 +1755,25 @@ pub fn public_tool_route(tool_name: &str) -> Result<PublicToolRoute, Value> {
     let selection = resolve_process_backend_selection().map_err(|error| {
         invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
     })?;
+    public_tool_route_for_selection(tool_name, &selection)
+}
+
+fn public_tool_route_for_selection(
+    tool_name: &str,
+    selection: &RuntimeBackendSelection,
+) -> Result<PublicToolRoute, Value> {
     match selection.backend {
         RuntimeBackend::Tui => Ok(PublicToolRoute::Tui),
         RuntimeBackend::HerdrCore => {
+            // These routes lack the TUI's access and mutation policies and result contract.
+            // Reject before even negotiating with hc, regardless of its capabilities.
+            if CORE_POLICY_RESTRICTED_PUBLIC_TOOLS.contains(&tool_name) {
+                return Err(herdr_core_unsupported(
+                    tool_name,
+                    "public_tool_policy_parity",
+                    "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
+                ));
+            }
             let Some(socket_path) = selection.herdr_core_socket.as_deref() else {
                 return Err(json!({
                     "ok": false,
@@ -1735,6 +1805,12 @@ pub fn public_tool_route(tool_name: &str) -> Result<PublicToolRoute, Value> {
                 rejection
             });
             capability_check?;
+            // #936: an advertised `terminal.run` is necessary but never
+            // sufficient for the `herdr_exec_*` session contract; see
+            // `EXEC_SESSION_UNSUPPORTED_PUBLIC_TOOLS`.
+            if EXEC_SESSION_UNSUPPORTED_PUBLIC_TOOLS.contains(&tool_name) {
+                return Err(herdr_core_exec_session_unsupported(tool_name));
+            }
             // A capability name in `hello` is necessary, never sufficient: the
             // in-process implementation of these tools still reads the live TUI
             // snapshot/socket, so admitting them would silently run on the TUI
@@ -1773,6 +1849,61 @@ const TUI_ROUTED_PUBLIC_TOOLS: &[&str] = &[
     "herdr_git",
     "herdr_since",
 ];
+
+/// Public tools whose `herdr-core` semantics cannot be preserved safely (#936).
+///
+/// `hc terminal.run` creates a pty terminal (`t7`, a name, or `machine/t7`) in a
+/// single address namespace that also holds every unrelated agent terminal, and
+/// `hc` exposes no runtime-scoped session id, no ownership marker, no byte
+/// cursor and no agent/repo binding. The public `herdr_exec_read` and
+/// `herdr_exec_kill` contracts address a session by a caller-supplied
+/// `session_id`, which is indistinguishable from another agent's terminal
+/// address: forwarding it would disclose or kill work herdr-mcp does not own.
+/// `herdr_exec_start` would create exactly such a session with no safe public
+/// way to read or end it, i.e. an orphan claiming unsupported functionality.
+///
+/// All three fail closed instead of inventing an identity that `hc`
+/// does not provide. One-shot `herdr_exec` is separately blocked until its
+/// public access and mutation policy can be enforced.
+const CORE_POLICY_RESTRICTED_PUBLIC_TOOLS: &[&str] = &[
+    "herdr_fs_read",
+    "herdr_fs_write",
+    "herdr_fs_edit",
+    "herdr_exec",
+];
+const EXEC_SESSION_UNSUPPORTED_PUBLIC_TOOLS: &[&str] =
+    &["herdr_exec_start", "herdr_exec_read", "herdr_exec_kill"];
+
+fn herdr_core_policy_blocked_tools() -> Vec<&'static str> {
+    CORE_POLICY_RESTRICTED_PUBLIC_TOOLS
+        .iter()
+        .chain(EXEC_SESSION_UNSUPPORTED_PUBLIC_TOOLS.iter())
+        .copied()
+        .chain(std::iter::once("herdr_prompt"))
+        .collect()
+}
+
+/// The single refusal envelope for the unowned `herdr_exec_*` session contract.
+///
+/// Shared by backend admission ([`public_tool_route`]) and the route-level
+/// shims, so neither layer can be changed into creating or addressing an `hc`
+/// terminal that herdr-mcp does not own.
+pub fn herdr_core_exec_session_unsupported(operation: &str) -> Value {
+    json!({
+        "ok": false,
+        "code": "runtime_capability_unsupported",
+        "operation": operation,
+        "required_capability": "exec_session_ownership",
+        "runtime_backend": RuntimeBackend::HerdrCore.as_str(),
+        "fallback_allowed": false,
+        "retryable": false,
+        "delivery_state": "not_delivered",
+        "failure_phase": "backend_capability",
+        "message": format!(
+            "'{operation}' is refused on the herdr-core backend: hc terminal addresses are one namespace shared with every unrelated agent terminal, and hc exposes no runtime-scoped session id, ownership marker or byte cursor, so a caller-supplied session_id could read or kill work herdr-mcp does not own (and starting a session would create one no public route can safely read or end); one-shot execution also remains unavailable on this backend until public tool policy parity is provided"
+        ),
+    })
+}
 
 /// A public tool or forwarded method the selected `herdr-core` backend cannot
 /// serve, reported with the same fail-closed envelope as every other admission
@@ -1832,6 +1963,7 @@ pub fn herdr_core_methods(client: &HerdrCoreClient, query: &str) -> Value {
                 "method": method,
                 "source": "herdr_core_hello",
                 "route": "herdr_core",
+                "forwardable": hc_forwarding_refusal(method.trim()).is_none(),
             })
         })
         .collect();
@@ -1857,15 +1989,23 @@ pub fn herdr_core_methods(client: &HerdrCoreClient, query: &str) -> Value {
 
 /// `herdr_fs_read` -> `file.read`. Accepts the TUI aliases (`offset`/`start_line`,
 /// `limit`/`max_lines`, `end_line`) so one caller shape works on both backends.
+///
+/// The `path`/`cwd` pair is resolved to one absolute target before the secret
+/// guard runs, and that target — not the caller's spelling of it — is what is
+/// sent to `hc` (#936).
 pub fn herdr_core_fs_read(client: &HerdrCoreClient, args: &Value) -> Value {
     const OPERATION: &str = "herdr_fs_read";
     let path = match hc_required_text(args, "path", OPERATION) {
         Ok(path) => path,
         Err(error) => return error,
     };
-    let cwd = match hc_arg_cwd(args) {
+    let cwd = match hc_arg_cwd(args, OPERATION) {
         Ok(cwd) => cwd,
         Err(error) => return error,
+    };
+    let target = match herdr_core_absolute_file_target(path, cwd.as_deref()) {
+        Ok(target) => target,
+        Err(error) => return herdr_core_error_json(&error, OPERATION, "not_delivered"),
     };
     let offset = match hc_first_u64(args, &["offset", "start_line"]) {
         Ok(offset) => offset,
@@ -1884,7 +2024,7 @@ pub fn herdr_core_fs_read(client: &HerdrCoreClient, args: &Value) -> Value {
         }
         limit = Some(end_line.saturating_sub(start).saturating_add(1));
     }
-    match client.file_read(path, cwd.as_deref(), offset, limit) {
+    match client.file_read(&target, offset, limit) {
         Ok(mut value) => {
             if let Some(object) = value.as_object_mut() {
                 let text = object
@@ -1900,8 +2040,8 @@ pub fn herdr_core_fs_read(client: &HerdrCoreClient, args: &Value) -> Value {
     }
 }
 
-/// `herdr_fs_write` -> `file.write`. The root lease is enforced by the caller
-/// (`mcp::tool_call`) before this route runs.
+/// `herdr_fs_write` -> `file.write`. The public route is currently blocked.
+/// Lease and target resolution occur at different times and path races remain.
 pub fn herdr_core_fs_write(client: &HerdrCoreClient, args: &Value) -> Value {
     const OPERATION: &str = "herdr_fs_write";
     let path = match hc_required_text(args, "path", OPERATION) {
@@ -1912,11 +2052,15 @@ pub fn herdr_core_fs_write(client: &HerdrCoreClient, args: &Value) -> Value {
         Ok(content) => content,
         Err(error) => return error,
     };
-    let cwd = match hc_arg_cwd(args) {
+    let cwd = match hc_arg_cwd(args, OPERATION) {
         Ok(cwd) => cwd,
         Err(error) => return error,
     };
-    match client.file_write(path, cwd.as_deref(), content.as_bytes()) {
+    let target = match herdr_core_absolute_file_target(path, cwd.as_deref()) {
+        Ok(target) => target,
+        Err(error) => return herdr_core_error_json(&error, OPERATION, "not_delivered"),
+    };
+    match client.file_write(&target, content.as_bytes()) {
         Ok(mut value) => {
             if let Some(object) = value.as_object_mut() {
                 object.insert("content_bytes".to_owned(), json!(content.len()));
@@ -1936,9 +2080,13 @@ pub fn herdr_core_fs_edit(client: &HerdrCoreClient, args: &Value) -> Value {
         Ok(path) => path,
         Err(error) => return error,
     };
-    let cwd = match hc_arg_cwd(args) {
+    let cwd = match hc_arg_cwd(args, OPERATION) {
         Ok(cwd) => cwd,
         Err(error) => return error,
+    };
+    let target = match herdr_core_absolute_file_target(path, cwd.as_deref()) {
+        Ok(target) => target,
+        Err(error) => return herdr_core_error_json(&error, OPERATION, "not_delivered"),
     };
     let mut edits: Vec<(String, String)> = Vec::new();
     match args.get("edits") {
@@ -1981,7 +2129,7 @@ pub fn herdr_core_fs_edit(client: &HerdrCoreClient, args: &Value) -> Value {
     if edits.iter().any(|(old, _)| old.is_empty()) {
         return hc_invalid_params_value("old_text/old_string must not be empty");
     }
-    match client.file_edit(path, cwd.as_deref(), &edits) {
+    match client.file_edit(&target, &edits) {
         Ok(value) => value,
         Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, true)),
     }
@@ -1998,7 +2146,7 @@ pub fn herdr_core_exec(client: &HerdrCoreClient, args: &Value) -> Value {
         Ok(invocation) => invocation,
         Err(error) => return error,
     };
-    let cwd = match hc_arg_cwd(args) {
+    let cwd = match hc_arg_cwd(args, OPERATION) {
         Ok(cwd) => cwd,
         Err(error) => return error,
     };
@@ -2064,198 +2212,45 @@ pub fn herdr_core_exec(client: &HerdrCoreClient, args: &Value) -> Value {
     }
 }
 
-/// `herdr_exec_start` -> `terminal.run`; the returned `session_id` is the
-/// terminal `address` used by `herdr_exec_read`/`herdr_exec_kill`.
-pub fn herdr_core_exec_start(client: &HerdrCoreClient, args: &Value) -> Value {
-    const OPERATION: &str = "herdr_exec_start";
-    let Some(root) = hc_first_trimmed(args, &["root", "project_root"]) else {
-        return hc_invalid_params_value(
-            "herdr_exec_start requires root (or project_root) as the exec cwd",
-        );
-    };
-    let invocation = match hc_exec_invocation(args, OPERATION) {
-        Ok(invocation) => invocation,
-        Err(error) => return error,
-    };
-    let cwd = match hc_arg_cwd(args) {
-        Ok(cwd) => cwd,
-        Err(error) => return error,
-    };
-    let name = hc_first_trimmed(args, &["name"]);
-    let labels = match hc_arg_labels(args) {
-        Ok(labels) => labels,
-        Err(error) => return error,
-    };
-    let started = match &invocation {
-        HcExecInvocation::Line(line) => {
-            client.terminal_run(None, Some(line), cwd.as_deref(), name, labels.as_ref())
-        }
-        HcExecInvocation::Argv(argv) => {
-            client.terminal_run(Some(argv), None, cwd.as_deref(), name, labels.as_ref())
-        }
-    };
-    match started {
-        Ok(mut value) => {
-            if let Some(object) = value.as_object_mut() {
-                let session_id = object.get("terminal").cloned().unwrap_or(Value::Null);
-                object.insert("session_id".to_owned(), session_id);
-                object.insert("root".to_owned(), json!(root));
-                object.insert("command".to_owned(), json!(invocation.rendered()));
-                object.insert(
-                    "hint".to_owned(),
-                    json!(
-                        "herdr-core session_id is the terminal address; use herdr_exec_read for screen output and herdr_exec_kill to end it"
-                    ),
-                );
-            }
-            value
-        }
-        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, true)),
-    }
-}
-
-/// `herdr_exec_read` -> `terminal.read`. `hc` returns screen/history text, not a
-/// byte cursor, so byte-cursor arguments are refused instead of ignored.
-pub fn herdr_core_exec_read(client: &HerdrCoreClient, args: &Value) -> Value {
-    const OPERATION: &str = "herdr_exec_read";
-    let session_id = match hc_required_text(args, "session_id", OPERATION) {
-        Ok(session_id) => session_id,
-        Err(error) => return error,
-    };
-    let mut cursor_args: Vec<&str> = Vec::new();
-    match hc_arg_u64(args, "offset") {
-        Ok(Some(offset)) if offset != 0 => cursor_args.push("offset"),
-        Ok(_) => {}
-        Err(error) => return error,
-    }
-    if args.get("limit").is_some_and(|value| !value.is_null()) {
-        cursor_args.push("limit");
-    }
-    if let Some(stream) = args.get("stream").and_then(Value::as_str)
-        && stream != "both"
-    {
-        cursor_args.push("stream");
-    }
-    if !cursor_args.is_empty() {
-        return herdr_core_unsupported(
-            OPERATION,
-            "exec_stream_cursor",
-            &format!(
-                "herdr-core terminal.read returns screen/history text with no byte cursor, so {} cannot be honoured; pass `lines` instead and treat the result as a screen snapshot",
-                cursor_args.join(", ")
-            ),
-        );
-    }
-    let lines = match hc_first_u64(args, &["lines", "max_lines"]) {
-        Ok(lines) => lines,
-        Err(error) => return error,
-    };
-    match client.terminal_read(session_id, lines) {
-        Ok(mut value) => {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("session_id".to_owned(), json!(session_id));
-            }
-            value
-        }
-        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, false)),
-    }
-}
-
-/// `herdr_exec_kill` -> `terminal.kill`.
-pub fn herdr_core_exec_kill(client: &HerdrCoreClient, args: &Value) -> Value {
-    const OPERATION: &str = "herdr_exec_kill";
-    let session_id = match hc_required_text(args, "session_id", OPERATION) {
-        Ok(session_id) => session_id,
-        Err(error) => return error,
-    };
-    match client.terminal_kill(session_id) {
-        Ok(mut value) => {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("session_id".to_owned(), json!(session_id));
-            }
-            value
-        }
-        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, true)),
-    }
-}
-
-/// TUI-only `herdr_prompt` arguments that have no `terminal.send` equivalent.
-const HC_TUI_ONLY_PROMPT_ARGS: &[&str] = &[
-    "spawn",
-    "workspace_id",
-    "max_concurrent",
-    "parent_target",
-    "stall_after_ms",
-    "inject_task_identity",
-    "wait",
-    "idempotency_key",
-    "steer",
-    "target_revision",
-];
-
-/// Narrow `herdr_prompt` -> `terminal.send` with `force` hard-locked `false`.
+/// `herdr_exec_start` is refused on `herdr-core` (#936).
 ///
-/// A `blocked` terminal (human permission/question/auth) is never answered by an
-/// automated caller; the TUI-only fencing arguments fail closed instead of being
-/// silently dropped.
-pub fn herdr_core_prompt(client: &HerdrCoreClient, args: &Value) -> Value {
-    const OPERATION: &str = "herdr_prompt";
-    let mut tui_only: Vec<&str> = HC_TUI_ONLY_PROMPT_ARGS
-        .iter()
-        .copied()
-        .filter(|key| match args.get(*key) {
-            None | Some(Value::Null) => false,
-            // `steer: false` is the default and carries no TUI-only intent.
-            Some(Value::Bool(false)) if *key == "steer" => false,
-            Some(_) => true,
-        })
-        .collect();
-    tui_only.sort_unstable();
-    if !tui_only.is_empty() {
-        return herdr_core_unsupported(
-            OPERATION,
-            "prompt_tui_fence",
-            &format!(
-                "herdr-core terminal.send has no {}, so this herdr_prompt is refused instead of dropping those arguments; call herdr_prompt with only target/text (and optional `if`) on the herdr-core backend",
-                tui_only.join(", ")
-            ),
-        );
-    }
-    if args.get("force").and_then(Value::as_bool) == Some(true) {
-        return json!({
-            "ok": false,
-            "code": "human_boundary_prohibited",
-            "operation": OPERATION,
-            "runtime_backend": "herdr-core",
-            "retryable": false,
-            "fallback_allowed": false,
-            "delivery_state": "not_delivered",
-            "message": "terminal.send force=true is prohibited (human boundary); a blocked terminal is never answered by an automated caller",
-        });
-    }
-    if let Err(error) = hc_mutation_guard(OPERATION) {
-        return herdr_core_error_json(&error, OPERATION, "not_delivered");
-    }
-    let target = match hc_required_text(args, "target", OPERATION) {
-        Ok(target) => target,
-        Err(error) => return error,
-    };
-    let text = match hc_required_raw_text(args, "text", OPERATION) {
-        Ok(text) => text,
-        Err(error) => return error,
-    };
-    let if_state = hc_first_trimmed(args, &["if", "if_state"]);
-    match client.terminal_send(target, text, if_state, false, None) {
-        Ok(mut value) => {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("target".to_owned(), json!(target));
-                object.insert("delivered".to_owned(), json!(true));
-                object.insert("force".to_owned(), json!(false));
-            }
-            value
-        }
-        Err(error) => herdr_core_error_json(&error, OPERATION, hc_delivery_state(&error, true)),
-    }
+/// `terminal.run` creates a pty terminal in one address namespace shared with
+/// every unrelated agent terminal, and `hc` offers no runtime-scoped session id,
+/// ownership marker or byte cursor. Starting one would create a session that no
+/// public route can safely read or end, so the route fails closed instead of
+/// inventing an identity. The one-shot `herdr_exec` route also fails closed
+/// until public tool policy and result contract parity is available.
+pub fn herdr_core_exec_start(_client: &HerdrCoreClient, _args: &Value) -> Value {
+    herdr_core_exec_session_unsupported("herdr_exec_start")
+}
+
+/// `herdr_exec_read` is refused on `herdr-core` (#936).
+///
+/// The public contract addresses a session by `session_id` and reads a byte
+/// cursor. `hc terminal.read` takes a bare terminal address — which may be an
+/// unrelated agent terminal — and returns screen/history text with no cursor, so
+/// neither ownership nor the cursor contract can be preserved.
+pub fn herdr_core_exec_read(_client: &HerdrCoreClient, _args: &Value) -> Value {
+    herdr_core_exec_session_unsupported("herdr_exec_read")
+}
+
+/// `herdr_exec_kill` is refused on `herdr-core` (#936).
+///
+/// `hc terminal.kill` accepts any address in the shared terminal namespace, so a
+/// caller-supplied `session_id` could end another agent's work. Ownership cannot
+/// be proven without inventing identity, so the route fails closed.
+pub fn herdr_core_exec_kill(_client: &HerdrCoreClient, _args: &Value) -> Value {
+    herdr_core_exec_session_unsupported("herdr_exec_kill")
+}
+
+/// The herdr-core transport cannot preserve prompt task tracking and identity.
+/// Refuse every prompt before attempting delivery.
+pub fn herdr_core_prompt(_client: &HerdrCoreClient, _args: &Value) -> Value {
+    herdr_core_unsupported(
+        "herdr_prompt",
+        "prompt_task_tracking_and_identity",
+        "herdr-core cannot preserve herdr_prompt task tracking and identity; the prompt was not delivered",
+    )
 }
 
 /// `herdr_call` forwarding under `herdr-core`.
@@ -2265,7 +2260,7 @@ pub fn herdr_core_prompt(client: &HerdrCoreClient, args: &Value) -> Value {
 /// fence (#936 P1-2). Raw forwarding is then limited to the precise read-only
 /// allowlist in [`HERDR_CALL_FORWARDABLE_HC_METHODS`]; every file/machine/
 /// terminal primitive fails closed with `herdr_core_method_prohibited` and
-/// points at the guarded public tool, so `herdr_call` can never bypass the
+/// cannot bypass the
 /// single-writer root lease, `HERDR_MCP_READONLY`, the secret-path denylist or
 /// the prompt human boundary (#936 P0-1). Methods that are allowlisted but not
 /// advertised by `hello.methods` still fail closed with
@@ -2318,6 +2313,13 @@ impl HcExecInvocation {
 }
 
 fn hc_exec_invocation(args: &Value, operation: &str) -> Result<HcExecInvocation, Value> {
+    if args.get("steps").is_some_and(|steps| !steps.is_null()) {
+        return Err(herdr_core_unsupported(
+            operation,
+            "exec_steps",
+            "herdr-core does not support exec steps; the request was not delivered",
+        ));
+    }
     let command = hc_first_text(args, &["command"]);
     let program = hc_first_text(args, &["program"]);
     let raw_args = args.get("args");
@@ -2475,11 +2477,30 @@ fn hc_first_u64(args: &Value, keys: &[&str]) -> Result<Option<u64>, Value> {
     Ok(None)
 }
 
-fn hc_arg_cwd(args: &Value) -> Result<Option<PathBuf>, Value> {
+/// Resolve the absolute `cwd` for a `herdr-core` route (`root` ->
+/// `project_root` -> `cwd`). The affected public routes are currently blocked;
+/// route and lease resolution occur at different times, so path races remain.
+///
+/// A relative directory is refused rather than forwarded: `hc` would resolve it
+/// against the herdr-core process cwd, not this process's (#936).
+fn hc_arg_cwd(args: &Value, operation: &str) -> Result<Option<PathBuf>, Value> {
+    // Every supplied directory is resolved, not only the winning one: a shadowed
+    // relative `cwd` is still ambiguous, and the root lease checks it too (#936).
+    let mut resolved: Option<PathBuf> = None;
     for key in ["root", "project_root", "cwd"] {
-        if let Some(value) = hc_first_trimmed(args, &[key]) {
-            return Ok(Some(PathBuf::from(value)));
+        let Some(value) = hc_first_trimmed(args, &[key]) else {
+            continue;
+        };
+        let directory = match herdr_core_absolute_directory(value) {
+            Ok(directory) => directory,
+            Err(error) => return Err(herdr_core_error_json(&error, operation, "not_delivered")),
+        };
+        if resolved.is_none() {
+            resolved = Some(directory);
         }
+    }
+    if resolved.is_some() {
+        return Ok(resolved);
     }
     if let Some(workspace) = hc_first_trimmed(args, &["workspace"]) {
         return Err(hc_invalid_params_value(format!(
@@ -2487,30 +2508,6 @@ fn hc_arg_cwd(args: &Value) -> Result<Option<PathBuf>, Value> {
         )));
     }
     Ok(None)
-}
-
-fn hc_arg_labels(args: &Value) -> Result<Option<BTreeMap<String, String>>, Value> {
-    let Some(raw) = args.get("labels") else {
-        return Ok(None);
-    };
-    if raw.is_null() {
-        return Ok(None);
-    }
-    let Some(object) = raw.as_object() else {
-        return Err(hc_invalid_params_value(
-            "labels must be an object of strings",
-        ));
-    };
-    let mut labels = BTreeMap::new();
-    for (key, value) in object {
-        let Some(value) = value.as_str() else {
-            return Err(hc_invalid_params_value(
-                "labels must be an object of strings",
-            ));
-        };
-        labels.insert(key.clone(), value.to_owned());
-    }
-    Ok(Some(labels))
 }
 
 fn hc_invalid_params_value(message: impl Into<String>) -> Value {
@@ -2531,6 +2528,7 @@ const HC_PREFLIGHT_ERROR_CODES: &[&str] = &[
     "runtime_capability_unsupported",
     "readonly_mode",
     "secret_path_denied",
+    "herdr_core_path_ambiguous",
     "file_too_large",
     "edit_too_large",
     "herdr_core_method_prohibited",
@@ -2548,7 +2546,11 @@ fn hc_delivery_state(error: &HerdrCoreError, mutating: bool) -> &'static str {
     }
 }
 
-fn herdr_core_error_json(error: &HerdrCoreError, operation: &str, delivery_state: &str) -> Value {
+pub(crate) fn herdr_core_error_json(
+    error: &HerdrCoreError,
+    operation: &str,
+    delivery_state: &str,
+) -> Value {
     let mut payload = json!({
         "ok": false,
         "code": error.code,
@@ -2888,6 +2890,60 @@ fn map_hc_io_error(error: std::io::Error, socket_path: &Path) -> HerdrCoreError 
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn public_core_policy_gaps_fail_closed_before_contact_and_tui_stays_admitted() {
+        use std::os::unix::net::UnixListener;
+
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-policy-admission-{}.sock",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let core = RuntimeBackendSelection {
+            backend: RuntimeBackend::HerdrCore,
+            source: "test",
+            herdr_core_socket: Some(socket.clone()),
+        };
+        let tui = RuntimeBackendSelection {
+            backend: RuntimeBackend::Tui,
+            source: "test",
+            herdr_core_socket: None,
+        };
+        for tool in [
+            "herdr_fs_read",
+            "herdr_fs_write",
+            "herdr_fs_edit",
+            "herdr_exec",
+        ] {
+            let rejection = match public_tool_route_for_selection(tool, &core) {
+                Err(rejection) => rejection,
+                Ok(_) => panic!("{tool} was admitted on herdr-core"),
+            };
+            assert_eq!(rejection["ok"], false);
+            assert_eq!(rejection["code"], "runtime_capability_unsupported");
+            assert_eq!(rejection["operation"], tool);
+            assert_eq!(
+                rejection["required_capability"],
+                "public_tool_policy_parity"
+            );
+            assert_eq!(rejection["delivery_state"], "not_delivered");
+            assert_eq!(rejection["retryable"], false);
+            assert_eq!(rejection["fallback_allowed"], false);
+            assert!(matches!(
+                public_tool_route_for_selection(tool, &tui),
+                Ok(PublicToolRoute::Tui)
+            ));
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
+    }
+
     #[test]
     fn explicit_backend_selection_never_falls_back_on_unknown_values() {
         assert_eq!(
@@ -3014,6 +3070,7 @@ mod tests {
                     match req["method"].as_str().unwrap() {
                         "hello" => {
                             assert_eq!(req["params"]["generation"], 1);
+                            assert!(req["params"]["calls_you"].is_null());
                             assert_eq!(req["params"]["framed"], false);
                             writeln!(
                                 stream,
@@ -3139,9 +3196,30 @@ mod tests {
         let inspected = client.inspect_terminals().unwrap();
         assert_eq!(inspected["ok"], true);
         assert_eq!(inspected["herdr_core"]["version"], "0.1.14");
-        assert_eq!(inspected["terminals"][0]["osc7501_status"]["state"], "idle");
-        // Unreported terminal never exposes guessed status (#767 §3.1)
-        assert_eq!(inspected["terminals"][1]["osc7501_status"], Value::Null);
+        assert_eq!(
+            inspected["herdr_core"]["capabilities_scope"],
+            "advertised herdr-core methods, not public tool availability"
+        );
+        let blocked = inspected["herdr_core"]["public_tools_policy_blocked"]
+            .as_array()
+            .unwrap();
+        for name in [
+            "herdr_fs_read",
+            "herdr_exec",
+            "herdr_exec_kill",
+            "herdr_prompt",
+        ] {
+            assert!(blocked.contains(&json!(name)), "missing {name}");
+        }
+        assert_eq!(inspected["terminals"], json!([]));
+        assert_eq!(
+            inspected["terminal_details"],
+            "unavailable_without_ownership"
+        );
+        assert_eq!(
+            inspected["herdr_core"]["terminal_counts_scope"],
+            "global, not visibility-filtered"
+        );
 
         let exec_res = client
             .machine_exec(
@@ -3341,27 +3419,59 @@ mod tests {
             }
         }
 
+        /// The absolute target that the resolvers produce for a caller's
+        /// `cwd` + relative `path`, used by the wire-level tests below.
+        fn target(cwd: &str, path: &str) -> PathBuf {
+            super::herdr_core_absolute_file_target(path, Some(Path::new(cwd))).unwrap()
+        }
+
+        #[test]
+        fn methods_distinguish_forwardable_from_advertised() {
+            let server = MockHcServer::start(
+                "methods-policy",
+                1,
+                &["hello", "server.status", "file.read"],
+                recorder(),
+                |_, _| panic!("inventory must not call a backend method"),
+            );
+            let result = super::herdr_core_methods(&server.client(), "");
+            let methods = result["methods"].as_array().unwrap();
+            for (name, expected) in [("server.status", true), ("file.read", false)] {
+                let entry = methods.iter().find(|item| item["method"] == name).unwrap();
+                assert_eq!(entry["forwardable"], expected, "{name}");
+            }
+            server.finish();
+        }
+
         #[test]
         fn file_write_encodes_base64_and_file_read_maps_line_window() {
             let seen = recorder();
+            // `/tmp` is `/private/tmp` on macOS, so the expectation is produced
+            // by the same resolver the route uses rather than hardcoded.
+            let expected = target("/tmp/work", "notes/demo.txt");
+            let expected_str = expected.to_str().unwrap().to_owned();
+            let wire = expected_str.clone();
             let server = MockHcServer::start(
                 "file-io",
                 2,
                 &["hello", "file.read", "file.write"],
                 seen.clone(),
-                |method, params| match method {
+                move |method, params| match method {
                     "file.write" => {
                         let encoded = params["data"].as_str().unwrap();
                         let decoded = base64::engine::general_purpose::STANDARD
                             .decode(encoded)
                             .unwrap();
                         assert_eq!(decoded, b"hello from herdr-core\n");
-                        assert_eq!(params["path"], "notes/demo.txt");
-                        assert_eq!(params["cwd"], "/tmp/work");
-                        Ok(json!({"path": "/tmp/work/notes/demo.txt", "bytes": 23}))
+                        // The wire carries the resolved absolute target and no
+                        // `cwd`, so `hc`'s own cwd cannot change the file (#936).
+                        assert_eq!(params["path"], wire);
+                        assert!(params.get("cwd").is_none(), "{params}");
+                        Ok(json!({"path": params["path"], "bytes": 23}))
                     }
                     "file.read" => {
-                        assert_eq!(params["path"], "notes/demo.txt");
+                        assert_eq!(params["path"], wire);
+                        assert!(params.get("cwd").is_none(), "{params}");
                         assert_eq!(params["offset"], 2);
                         assert_eq!(params["limit"], 3);
                         Ok(json!({
@@ -3377,25 +3487,15 @@ mod tests {
             let client = server.client();
 
             let written = client
-                .file_write(
-                    "notes/demo.txt",
-                    Some(Path::new("/tmp/work")),
-                    b"hello from herdr-core\n",
-                )
+                .file_write(&expected, b"hello from herdr-core\n")
                 .unwrap();
             assert_eq!(written["ok"], true);
             assert_eq!(written["runtime_backend"], "herdr-core");
-            assert_eq!(written["path"], "/tmp/work/notes/demo.txt");
+            assert_eq!(written["path"], expected_str);
+            assert!(expected.is_absolute(), "{}", expected.display());
             assert_eq!(written["bytes"], 23);
 
-            let read = client
-                .file_read(
-                    "notes/demo.txt",
-                    Some(Path::new("/tmp/work")),
-                    Some(2),
-                    Some(3),
-                )
-                .unwrap();
+            let read = client.file_read(&expected, Some(2), Some(3)).unwrap();
             assert_eq!(read["ok"], true);
             assert_eq!(read["runtime_backend"], "herdr-core");
             assert_eq!(read["text"], "line two\nline three\n");
@@ -3421,33 +3521,85 @@ mod tests {
                 "certs/server.pem",
                 "state/api-token.json",
             ] {
-                let read = client.file_read(path, None, None, None).unwrap_err();
+                let target = super::herdr_core_absolute_file_target(
+                    path,
+                    Some(Path::new("/tmp/herdr-core-secret-probe")),
+                )
+                .unwrap();
+                let read = client.file_read(&target, None, None).unwrap_err();
                 assert_eq!(read.code, "secret_path_denied", "file.read {path}");
                 assert_eq!(read.kind.as_deref(), Some("secret_path_denied"));
 
-                let write = client.file_write(path, None, b"x").unwrap_err();
+                let write = client.file_write(&target, b"x").unwrap_err();
                 assert_eq!(write.code, "secret_path_denied", "file.write {path}");
 
                 let edit = client
-                    .file_edit(path, None, &[("a".to_owned(), "b".to_owned())])
+                    .file_edit(&target, &[("a".to_owned(), "b".to_owned())])
                     .unwrap_err();
                 assert_eq!(edit.code, "secret_path_denied", "file.edit {path}");
             }
             // Control: a non-secret path on the same absent socket is reachable and
             // fails at the transport, proving the refusals above were pre-socket.
             let reachable = client
-                .file_read("notes/readme.md", None, None, None)
+                .file_read(
+                    Path::new("/tmp/herdr-core-probe/notes/readme.md"),
+                    None,
+                    None,
+                )
                 .unwrap_err();
             assert_eq!(reachable.code, "herdr_core_unreachable");
         }
 
         #[test]
+        fn relative_paths_and_directories_are_refused_before_any_file_access() {
+            // #936: a relative `path`/`cwd` resolves against the herdr-core
+            // process cwd, which is not this process's cwd, so neither the
+            // secret-path guard nor the root lease could name the executed file.
+            let client = HerdrCoreClient::new(absent_socket_path("ambiguous"));
+
+            let no_cwd =
+                super::herdr_core_absolute_file_target("notes/demo.txt", None).unwrap_err();
+            assert_eq!(no_cwd.code, "herdr_core_path_ambiguous");
+            assert_eq!(no_cwd.kind.as_deref(), Some("herdr_core_path_ambiguous"));
+
+            let relative_cwd =
+                super::herdr_core_absolute_directory("crates/herdr-mcp").unwrap_err();
+            assert_eq!(relative_cwd.code, "herdr_core_path_ambiguous");
+
+            // The primitives themselves refuse a relative target rather than
+            // sending it to `hc`.
+            for target in [Path::new("notes/demo.txt"), Path::new(".")] {
+                assert_eq!(
+                    client.file_read(target, None, None).unwrap_err().code,
+                    "herdr_core_path_ambiguous",
+                    "{}",
+                    target.display()
+                );
+                assert_eq!(
+                    client.file_write(target, b"x").unwrap_err().code,
+                    "herdr_core_path_ambiguous"
+                );
+                assert_eq!(
+                    client
+                        .file_edit(target, &[("a".to_owned(), "b".to_owned())])
+                        .unwrap_err()
+                        .code,
+                    "herdr_core_path_ambiguous"
+                );
+            }
+
+            // An absolute directory still resolves normally (control).
+            let resolved = super::herdr_core_absolute_directory("/tmp/work").unwrap();
+            assert!(resolved.is_absolute(), "{}", resolved.display());
+            assert!(resolved.ends_with("work"), "{}", resolved.display());
+        }
+
+        #[test]
         fn file_write_refuses_payloads_above_the_eight_mebibyte_bound() {
             let client = HerdrCoreClient::new(absent_socket_path("too-large"));
+            let target = Path::new("/tmp/herdr-core-big/notes/big.txt");
             let oversized = vec![b'a'; HC_FILE_MAX_BYTES + 1];
-            let refused = client
-                .file_write("notes/big.txt", None, &oversized)
-                .unwrap_err();
+            let refused = client.file_write(target, &oversized).unwrap_err();
             assert_eq!(refused.code, "file_too_large");
             assert_eq!(refused.kind.as_deref(), Some("file_too_large"));
             assert!(refused.message.contains("8388608"));
@@ -3455,7 +3607,7 @@ mod tests {
             // Exactly 8 MiB is admitted by the bound and then stops at the absent
             // socket, so the check is an exclusive ceiling rather than a guess.
             let at_bound = client
-                .file_write("notes/big.txt", None, &vec![b'a'; HC_FILE_MAX_BYTES])
+                .file_write(target, &vec![b'a'; HC_FILE_MAX_BYTES])
                 .unwrap_err();
             assert_eq!(at_bound.code, "herdr_core_unreachable");
         }
@@ -3487,14 +3639,17 @@ mod tests {
 
             assert_eq!(
                 client
-                    .file_write("notes/demo.txt", None, b"x")
+                    .file_write(Path::new("/tmp/work/notes/demo.txt"), b"x")
                     .unwrap_err()
                     .code,
                 "readonly_mode"
             );
             assert_eq!(
                 client
-                    .file_edit("notes/demo.txt", None, &[("a".to_owned(), "b".to_owned())])
+                    .file_edit(
+                        Path::new("/tmp/work/notes/demo.txt"),
+                        &[("a".to_owned(), "b".to_owned())]
+                    )
                     .unwrap_err()
                     .code,
                 "readonly_mode"
@@ -3530,7 +3685,7 @@ mod tests {
             // transport, never with `readonly_mode`.
             assert_eq!(
                 client
-                    .file_read("notes/demo.txt", None, None, None)
+                    .file_read(Path::new("/tmp/work/notes/demo.txt"), None, None)
                     .unwrap_err()
                     .code,
                 "herdr_core_unreachable"
@@ -3547,6 +3702,9 @@ mod tests {
         #[test]
         fn file_edit_sends_exact_once_edits_and_maps_edit_failed() {
             let seen = recorder();
+            let expected = target("/tmp/work", "src/lib.rs");
+            let expected_str = expected.to_str().unwrap().to_owned();
+            let expected_wire = expected_str.clone();
             let call = Arc::new(AtomicU64::new(0));
             let server = MockHcServer::start(
                 "file-edit",
@@ -3555,8 +3713,8 @@ mod tests {
                 seen.clone(),
                 move |method, params| {
                     assert_eq!(method, "file.edit");
-                    assert_eq!(params["path"], "src/lib.rs");
-                    assert_eq!(params["cwd"], "/tmp/work");
+                    assert_eq!(params["path"], expected_wire);
+                    assert!(params.get("cwd").is_none(), "{params}");
                     assert_eq!(
                         params["edits"],
                         json!([
@@ -3565,7 +3723,7 @@ mod tests {
                         ])
                     );
                     if call.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Ok(json!({"path": "/tmp/work/src/lib.rs", "bytes": 42}))
+                        Ok(json!({"path": params["path"], "bytes": 42}))
                     } else {
                         Err(json!({
                             "code": -32000,
@@ -3581,17 +3739,13 @@ mod tests {
                 ("fn b() {}".to_owned(), "fn b() { 2 }".to_owned()),
             ];
 
-            let applied = client
-                .file_edit("src/lib.rs", Some(Path::new("/tmp/work")), &edits)
-                .unwrap();
+            let applied = client.file_edit(&expected, &edits).unwrap();
             assert_eq!(applied["ok"], true);
-            assert_eq!(applied["path"], "/tmp/work/src/lib.rs");
+            assert_eq!(applied["path"], expected_str);
             assert_eq!(applied["bytes"], 42);
             assert_eq!(applied["edits_applied"], 2);
 
-            let failure = client
-                .file_edit("src/lib.rs", Some(Path::new("/tmp/work")), &edits)
-                .unwrap_err();
+            let failure = client.file_edit(&expected, &edits).unwrap_err();
             assert_eq!(failure.code, "herdr_core_edit_failed");
             assert_eq!(failure.kind.as_deref(), Some("edit_failed"));
 
@@ -3740,6 +3894,58 @@ mod tests {
             server.finish();
         }
 
+        /// #936: `herdr_exec_start`/`read`/`kill` have no safe `herdr-core`
+        /// semantics — `hc` terminal addresses are one namespace shared with
+        /// unrelated agent terminals, with no runtime-owned session id and no
+        /// byte cursor — so they fail closed without ever contacting `hc`.
+        /// The socket does not exist here, so a route that still created, read
+        /// or killed a terminal would report `herdr_core_unreachable` instead.
+        #[test]
+        fn exec_session_tools_fail_closed_without_touching_hc() {
+            let client = HerdrCoreClient::new(absent_socket_path("exec-session"));
+            for (operation, value) in [
+                (
+                    "herdr_exec_start",
+                    super::herdr_core_exec_start(
+                        &client,
+                        &json!({"root": "/tmp/work", "command": "printf orphan"}),
+                    ),
+                ),
+                (
+                    "herdr_exec_read",
+                    super::herdr_core_exec_read(&client, &json!({"session_id": "t1"})),
+                ),
+                (
+                    "herdr_exec_kill",
+                    super::herdr_core_exec_kill(&client, &json!({"session_id": "t1"})),
+                ),
+            ] {
+                assert_eq!(value["ok"], false, "{operation}: {value}");
+                assert_eq!(
+                    value["code"], "runtime_capability_unsupported",
+                    "{operation}: {value}"
+                );
+                assert_eq!(
+                    value["required_capability"], "exec_session_ownership",
+                    "{operation}: {value}"
+                );
+                assert_eq!(value["delivery_state"], "not_delivered", "{operation}");
+                assert_eq!(value["runtime_backend"], "herdr-core", "{operation}");
+                assert_eq!(value["fallback_allowed"], false, "{operation}");
+            }
+
+            // The raw read channel refuses the same unowned terminal addresses.
+            for method in ["terminal.read", "terminal.kill", "terminal.run"] {
+                let refused = client
+                    .call_allowed_method(method, json!({"terminal": "t1"}))
+                    .unwrap_err();
+                assert_eq!(refused.code, "herdr_core_method_prohibited", "{method}");
+            }
+            // Shared terminal metadata has no ownership check either.
+            assert!(super::hc_forwarding_refusal("terminal.list").is_some());
+            assert!(super::hc_forwarding_refusal("terminal.get").is_some());
+        }
+
         #[test]
         fn unadvertised_primitives_fail_closed_before_the_rpc() {
             // The mock refuses any non-hello method with a panic, so reaching the
@@ -3750,38 +3956,58 @@ mod tests {
                 });
             let client = server.client();
             let refused = client
-                .file_read("notes/readme.md", None, None, None)
+                .file_read(
+                    Path::new("/tmp/herdr-core-probe/notes/readme.md"),
+                    None,
+                    None,
+                )
                 .unwrap_err();
             assert_eq!(refused.code, "runtime_capability_unsupported");
             server.finish();
         }
 
         #[test]
+        fn exec_steps_are_rejected_before_command_mode_is_selected() {
+            for operation in ["herdr_exec", "herdr_exec_start"] {
+                for steps in [json!([]), json!([{"command": "echo second"}]), json!(false)] {
+                    for invocation in [
+                        json!({"command": "echo first"}),
+                        json!({"program": "echo", "args": ["first"]}),
+                    ] {
+                        let mut args = invocation;
+                        args["steps"] = steps.clone();
+                        let error = hc_exec_invocation(&args, operation).unwrap_err();
+                        assert_eq!(error["required_capability"], "exec_steps", "{args}");
+                        assert_eq!(error["operation"], operation);
+                        assert_eq!(error["delivery_state"], "not_delivered");
+                    }
+                }
+                for args in [
+                    json!({"command": "echo first"}),
+                    json!({"command": "echo first", "steps": null}),
+                ] {
+                    assert!(matches!(
+                        hc_exec_invocation(&args, operation),
+                        Ok(HcExecInvocation::Line(_))
+                    ));
+                }
+            }
+        }
+
+        #[test]
         fn invalid_primitive_arguments_are_refused_before_the_socket() {
             let client = HerdrCoreClient::new(absent_socket_path("invalid-args"));
+            let probe = Path::new("/tmp/herdr-core-probe/notes/readme.md");
             assert_eq!(
-                client.file_read("   ", None, None, None).unwrap_err().code,
+                client.file_read(probe, Some(0), None).unwrap_err().code,
                 "invalid_params"
             );
             assert_eq!(
-                client
-                    .file_read("notes/readme.md", None, Some(0), None)
-                    .unwrap_err()
-                    .code,
-                "invalid_params"
-            );
-            assert_eq!(
-                client
-                    .file_write("notes/readme.md", None, b"x")
-                    .unwrap_err()
-                    .code,
+                client.file_write(probe, b"x").unwrap_err().code,
                 "herdr_core_unreachable"
             );
             assert_eq!(
-                client
-                    .file_edit("notes/readme.md", None, &[])
-                    .unwrap_err()
-                    .code,
+                client.file_edit(probe, &[]).unwrap_err().code,
                 "invalid_params"
             );
             assert_eq!(
@@ -3850,8 +4076,75 @@ mod tests {
         }
 
         #[test]
+        fn dangling_symlink_chains_fail_closed_and_parent_follows_symlink() {
+            // Canonicalize the fixture root so platform temp-directory aliases
+            // do not consume the symlink budget intended for this chain.
+            let root = std::fs::canonicalize(unique_tmp_dir("symlink-chain")).unwrap();
+            let limit = super::HC_SECRET_PATH_SYMLINK_HOPS;
+            for index in 0..=limit {
+                let destination = if index == limit {
+                    ".env".to_owned()
+                } else {
+                    format!("link-{}", index + 1)
+                };
+                std::os::unix::fs::symlink(destination, root.join(format!("link-{index}")))
+                    .unwrap();
+            }
+            let client = HerdrCoreClient::new(absent_socket_path("symlink-chain"));
+            let too_long = root.join("link-0");
+            assert_eq!(
+                client.file_read(&too_long, None, None).unwrap_err().code,
+                "herdr_core_path_ambiguous"
+            );
+            assert_eq!(
+                client.file_write(&too_long, b"x").unwrap_err().code,
+                "herdr_core_path_ambiguous"
+            );
+            assert_eq!(
+                client
+                    .file_edit(&too_long, &[("a".to_owned(), "b".to_owned())])
+                    .unwrap_err()
+                    .code,
+                "herdr_core_path_ambiguous"
+            );
+            assert_eq!(
+                client
+                    .file_read(&root.join("link-1"), None, None)
+                    .unwrap_err()
+                    .code,
+                "secret_path_denied"
+            );
+
+            std::fs::create_dir_all(root.join("safe/nested")).unwrap();
+            std::fs::create_dir_all(root.join(".ssh/nested")).unwrap();
+            std::os::unix::fs::symlink("../.ssh/nested", root.join("safe/alias")).unwrap();
+            let path = root.join("safe/alias/../config");
+            let resolved =
+                super::herdr_core_absolute_file_target(path.to_str().unwrap(), None).unwrap();
+            assert_eq!(
+                resolved,
+                std::fs::canonicalize(root.join(".ssh"))
+                    .unwrap()
+                    .join("config")
+            );
+            assert_eq!(
+                client.file_read(&path, None, None).unwrap_err().code,
+                "secret_path_denied"
+            );
+            let missing_parent = root.join("missing/../readme");
+            assert_eq!(
+                super::herdr_core_absolute_file_target(missing_parent.to_str().unwrap(), None)
+                    .unwrap_err()
+                    .code,
+                "herdr_core_path_ambiguous"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         fn secret_paths_are_refused_through_symlinks_and_secret_working_directories() {
             let root = unique_tmp_dir("symlinks");
+            let root_str = root.to_str().unwrap();
             let env_file = root.join(".env");
             std::fs::write(&env_file, "TOKEN=1\n").unwrap();
             // A harmless name pointing at a real secret file.
@@ -3862,22 +4155,23 @@ mod tests {
             std::fs::create_dir_all(&ssh_dir).unwrap();
             std::fs::write(ssh_dir.join("config"), "Host *\n").unwrap();
             std::fs::write(root.join("readme.md"), "ok\n").unwrap();
+            std::fs::create_dir(root.join("sub")).unwrap();
 
             let client = HerdrCoreClient::new(absent_socket_path("symlinks"));
-            let notes_abs = root.join("notes.txt");
-            let notes_abs = notes_abs.to_str().unwrap();
+            let ssh_str = ssh_dir.to_str().unwrap();
 
-            // `notes.txt -> .env` with a relative path + cwd, and as an absolute path.
+            // `notes.txt -> .env` resolved from an absolute cwd, and spelled as
+            // an absolute path.
             assert_eq!(
                 client
-                    .file_read("notes.txt", Some(&root), None, None)
+                    .file_read(&target(root_str, "notes.txt"), None, None)
                     .unwrap_err()
                     .code,
                 "secret_path_denied"
             );
             assert_eq!(
                 client
-                    .file_read(notes_abs, None, None, None)
+                    .file_read(&root.join("notes.txt"), None, None)
                     .unwrap_err()
                     .code,
                 "secret_path_denied"
@@ -3885,7 +4179,7 @@ mod tests {
             // Dangling symlink to a not-yet-created `.env`.
             assert_eq!(
                 client
-                    .file_read("later.txt", Some(&root), None, None)
+                    .file_read(&target(root_str, "later.txt"), None, None)
                     .unwrap_err()
                     .code,
                 "secret_path_denied"
@@ -3893,7 +4187,7 @@ mod tests {
             // The secret hides in `cwd` while the leaf name looks clean.
             assert_eq!(
                 client
-                    .file_read("config", Some(&ssh_dir), None, None)
+                    .file_read(&target(ssh_str, "config"), None, None)
                     .unwrap_err()
                     .code,
                 "secret_path_denied"
@@ -3901,7 +4195,7 @@ mod tests {
             // `..` still resolves onto the refused target.
             assert_eq!(
                 client
-                    .file_read("sub/../.env", Some(&root), None, None)
+                    .file_read(&target(root_str, "sub/../.env"), None, None)
                     .unwrap_err()
                     .code,
                 "secret_path_denied"
@@ -3909,7 +4203,7 @@ mod tests {
             // Mutations run the same guard.
             assert_eq!(
                 client
-                    .file_write("notes.txt", Some(&root), b"x")
+                    .file_write(&target(root_str, "notes.txt"), b"x")
                     .unwrap_err()
                     .code,
                 "secret_path_denied"
@@ -3917,19 +4211,18 @@ mod tests {
             assert_eq!(
                 client
                     .file_edit(
-                        "notes.txt",
-                        Some(&root),
+                        &target(root_str, "notes.txt"),
                         &[("a".to_owned(), "b".to_owned())]
                     )
                     .unwrap_err()
                     .code,
                 "secret_path_denied"
             );
-            // Control: a benign relative file is not refused, so the guard did not
-            // start blanket-rejecting relative paths; it stops at the transport.
+            // Control: a benign absolute target is not refused, so the guard did
+            // not start blanket-rejecting resolved paths; it stops at the transport.
             assert_eq!(
                 client
-                    .file_read("readme.md", Some(&root), None, None)
+                    .file_read(&target(root_str, "readme.md"), None, None)
                     .unwrap_err()
                     .code,
                 "herdr_core_unreachable"
@@ -3942,7 +4235,7 @@ mod tests {
             let client = HerdrCoreClient::new(absent_socket_path("edit-too-large"));
             let edits = vec![("a".repeat(HC_FILE_MAX_BYTES), "b".to_owned())];
             let refused = client
-                .file_edit("notes/demo.txt", None, &edits)
+                .file_edit(Path::new("/tmp/work/notes/demo.txt"), &edits)
                 .unwrap_err();
             assert_eq!(refused.code, "edit_too_large");
             assert_eq!(refused.kind.as_deref(), Some("edit_too_large"));
@@ -4000,7 +4293,7 @@ mod tests {
 
             // Control: a plain call still stops at the 150 ms session budget.
             let late = client
-                .file_read("notes/readme.md", None, None, None)
+                .file_read(Path::new("/tmp/work/notes/readme.md"), None, None)
                 .unwrap_err();
             assert_eq!(late.code, "timeout");
 
@@ -4062,7 +4355,7 @@ mod tests {
             );
             let read = server
                 .client()
-                .file_read("notes/big.txt", None, None, None)
+                .file_read(Path::new("/tmp/work/notes/big.txt"), None, None)
                 .unwrap();
             assert_eq!(read["text"], expected);
             assert_eq!(read["text"].as_str().unwrap().len(), 32 * 1024);

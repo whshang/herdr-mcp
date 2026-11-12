@@ -1551,8 +1551,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 }
             } else if method == pane_width::SPLIT_METHOD {
                 if let Some(client) = herdr_core {
-                    // `pane.split` is a TUI graph mutation; herdr-core has no
-                    // pane object, so this fails closed on `hello.methods`.
+                    // `pane.split` is a TUI graph mutation and is refused by the
+                    // herdr-core raw forwarding allowlist before contacting hc.
                     crate::runtime_adapter::herdr_core_call(client, method, params)
                 } else {
                     // A horizontal split must not create a pane whose agent output
@@ -1600,10 +1600,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     params,
                 )
             } else if let Some(client) = herdr_core {
-                // #935: no blanket `tui_runtime_forward` refusal any more. The
-                // negotiated `hello.methods` plus the prohibited-method table
-                // decide dynamically; TUI-only methods such as `pane.list` are
-                // absent from `hello.methods` and still fail closed.
+                // Raw forwarding first requires an allowlisted read-only method;
+                // the method must also be advertised by herdr-core.
                 crate::runtime_adapter::herdr_core_call(client, method, params)
             } else {
                 native_tools::call_with_local(
@@ -2872,47 +2870,66 @@ fn trimmed_str_arg(arguments: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Every `cwd`-like directory a `herdr-core` exec route may resolve to.
+/// Resolve a lease candidate using the `herdr-core` route's resolver. This
+/// rejects ambiguous relative directories but does not prevent a filesystem
+/// change between the lease check and execution; those public routes remain
+/// blocked until that boundary can be enforced.
+fn herdr_core_absolute_candidate(raw: &str, operation: &str) -> Result<String, Value> {
+    crate::runtime_adapter::herdr_core_absolute_directory(raw)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| {
+            crate::runtime_adapter::herdr_core_error_json(&error, operation, "not_delivered")
+        })
+}
+
+/// Every `cwd`-like directory a `herdr-core` exec/file route may resolve to,
+/// in the precedence order the route uses (`root` -> `project_root` -> `cwd`).
+/// The first element reflects the directory selected at resolution time; it
+/// is not a guarantee against a later filesystem change.
 ///
 /// All of them are returned, never just the first one that happens to exist:
 /// `herdr_call`-style ordering guesses are exactly how a lease check ends up
-/// validating `/outside` while `hc` executes in `/leased` (#936 P1-4).
-fn herdr_core_exec_candidate_roots(arguments: &Value) -> Vec<String> {
-    ["project_root", "root", "cwd"]
+/// validating `/outside` while `hc` executes in `/leased` (#936 P1-4). A
+/// relative directory fails the whole check closed: `hc` and herdr-mcp would
+/// resolve it against different process cwds (#936).
+fn herdr_core_exec_candidate_roots(
+    arguments: &Value,
+    operation: &str,
+) -> Result<Vec<String>, Value> {
+    ["root", "project_root", "cwd"]
         .iter()
         .filter_map(|key| trimmed_str_arg(arguments, key))
+        .map(|raw| herdr_core_absolute_candidate(&raw, operation))
         .collect()
 }
 
 /// The lease candidates for `herdr_fs_write` / `herdr_fs_edit` on `herdr-core`.
 ///
-/// `hc` resolves a relative `path` against the `cwd` it is given
-/// (`root` -> `project_root` -> `cwd`) and then applies its own secret-path
-/// denylist to that resolved target, so the lease must be checked against the
-/// same `cwd.join(path)` and against each explicit directory itself. Checking
-/// only the raw `path` would resolve it against the herdr-mcp process cwd
-/// (#936 P1-3).
-fn herdr_core_fs_candidate_paths(arguments: &Value) -> Vec<String> {
-    let roots = herdr_core_exec_candidate_roots(arguments);
+/// `hc` receives the resolved absolute target, so the lease must be checked
+/// against exactly that target (plus each explicit directory itself). A relative
+/// `path` without an absolute `cwd`, or a relative directory, fails the check
+/// closed instead of being resolved against the herdr-mcp process cwd, which
+/// `hc` does not share (#936 P1-3).
+fn herdr_core_fs_candidate_paths(arguments: &Value, operation: &str) -> Result<Vec<String>, Value> {
+    let roots = herdr_core_exec_candidate_roots(arguments, operation)?;
     let mut candidates = Vec::new();
     match trimmed_str_arg(arguments, "path") {
         Some(path) => {
-            if std::path::Path::new(&path).is_relative() {
-                for root in &roots {
-                    candidates.push(
-                        std::path::Path::new(root)
-                            .join(&path)
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
-                }
-                candidates.extend(roots);
-            }
-            candidates.push(path);
+            let cwd = roots.first().map(std::path::Path::new);
+            let target = crate::runtime_adapter::herdr_core_absolute_file_target(&path, cwd)
+                .map_err(|error| {
+                    crate::runtime_adapter::herdr_core_error_json(
+                        &error,
+                        operation,
+                        "not_delivered",
+                    )
+                })?;
+            candidates.push(target.to_string_lossy().into_owned());
+            candidates.extend(roots);
         }
         None => candidates.extend(roots),
     }
-    candidates
+    Ok(candidates)
 }
 
 fn check_mutating_tool_root_lease(
@@ -2960,11 +2977,17 @@ fn check_mutating_tool_root_lease(
     }
 
     let candidate_paths: Vec<String> = match tool_or_method {
-        // Under `herdr-core` the lease target is the `cwd.join(path)` that `hc`
-        // will resolve; the TUI route accepts no cwd/root and keeps the raw
-        // `path` (#936 P1-3).
+        // Under `herdr-core` the lease target is the resolved absolute path the
+        // route sends to `hc`; the TUI route accepts no cwd/root and keeps the
+        // raw `path` (#936 P1-3).
         "herdr_fs_edit" | "herdr_fs_write" if herdr_core_active => {
-            herdr_core_fs_candidate_paths(arguments)
+            match herdr_core_fs_candidate_paths(arguments, tool_or_method) {
+                Ok(candidates) => candidates,
+                // The same refusal the route would produce: an ambiguous
+                // relative path/cwd can never be lease-checked for the target
+                // `hc` would execute (#936).
+                Err(refusal) => return Some(refusal),
+            }
         }
         "herdr_fs_edit" | "herdr_fs_write" | TEXT_WRITE_METHOD => arguments
             .get("path")
@@ -2980,17 +3003,14 @@ fn check_mutating_tool_root_lease(
             .and_then(Value::as_str)
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default(),
-        "herdr_exec_start" => {
-            if herdr_core_active {
-                herdr_core_exec_candidate_roots(arguments)
-            } else {
-                arguments
-                    .get("root")
-                    .and_then(Value::as_str)
-                    .map(|s| vec![s.to_owned()])
-                    .unwrap_or_default()
-            }
-        }
+        // `herdr_exec_start` is TUI-only: on `herdr-core` the backend admission
+        // refuses it before dispatch (#936), so `root` is the only field the
+        // reachable route honours.
+        "herdr_exec_start" => arguments
+            .get("root")
+            .and_then(Value::as_str)
+            .map(|s| vec![s.to_owned()])
+            .unwrap_or_default(),
         "herdr_git" => arguments
             .get("root")
             .or_else(|| arguments.get("project_root"))
@@ -3003,7 +3023,22 @@ fn check_mutating_tool_root_lease(
         // `root=/leased` and a TUI `workspace=w1` shadowed by `root=/tmp` both
         // stay blocked (#936 P1-4).
         "herdr_exec" => {
-            let mut candidates = herdr_core_exec_candidate_roots(arguments);
+            let mut candidates = if herdr_core_active {
+                match herdr_core_exec_candidate_roots(arguments, tool_or_method) {
+                    Ok(candidates) => candidates,
+                    // The same refusal the route would produce: an ambiguous
+                    // relative cwd can never be lease-checked for the directory
+                    // `hc` would execute in (#936).
+                    Err(refusal) => return Some(refusal),
+                }
+            } else {
+                // The TUI route keeps its historical raw candidate list so no
+                // TUI lease behaviour changes.
+                ["project_root", "root", "cwd"]
+                    .iter()
+                    .filter_map(|key| trimmed_str_arg(arguments, key))
+                    .collect()
+            };
             if let Some(workspace) = trimmed_str_arg(arguments, "workspace") {
                 candidates.extend(workspace_candidate_paths_from_snapshot(
                     &context.cache.snapshot(),
