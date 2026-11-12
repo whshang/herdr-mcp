@@ -220,12 +220,23 @@ pub fn write(params: &Value) -> Value {
     })
 }
 
+fn require_utf8_path(path: &Path) -> Result<(), Value> {
+    if path.to_str().is_none() {
+        return Err(
+            json!({"ok": false, "code": "invalid_path", "message": "text transfer requires UTF-8 paths"}),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn safe_home_path(input: &str, allow_missing: bool) -> Result<PathBuf, Value> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| json!({"ok": false, "code": "home_unavailable"}))?;
+    require_utf8_path(&home)?;
     let home =
         fs::canonicalize(&home).map_err(|error| io_fail("home_resolution_failed", &home, error))?;
+    require_utf8_path(&home)?;
     let candidate = PathBuf::from(input);
     let candidate = if candidate.is_absolute() {
         candidate
@@ -271,6 +282,7 @@ pub(crate) fn safe_home_path(input: &str, allow_missing: bool) -> Result<PathBuf
                 &candidate,
             ));
         }
+        require_utf8_path(&real)?;
         return Ok(real);
     }
     let parent = candidate.parent().ok_or_else(|| {
@@ -304,6 +316,7 @@ pub(crate) fn safe_home_path(input: &str, allow_missing: bool) -> Result<PathBuf
             &candidate,
         ));
     }
+    require_utf8_path(&resolved)?;
     Ok(resolved)
 }
 

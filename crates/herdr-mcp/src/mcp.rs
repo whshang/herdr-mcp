@@ -1562,7 +1562,11 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     let path = params.get("path").and_then(Value::as_str)
                         .filter(|path| !path.is_empty())
                         .ok_or_else(|| json!({"ok": false, "code": "invalid_params", "message": "path must be a non-empty string"}))?;
-                    crate::text_transfer::safe_home_path(path, true)
+                    crate::text_transfer::safe_home_path(path, true).and_then(|resolved| {
+                        resolved.to_str().map(str::to_owned).ok_or_else(|| json!({
+                            "ok": false, "code": "invalid_path", "message": "text transfer requires UTF-8 paths"
+                        }))
+                    })
                 }) {
                     Err(error) => error,
                     Ok(path) => {
@@ -32342,6 +32346,50 @@ mod text_transfer_safety_tests {
     }
 
     #[test]
+    #[ignore = "launched with synthetic non-UTF8 HOME by text_transfer_child"]
+    fn non_utf8_home_child() {
+        use std::os::unix::ffi::OsStrExt;
+        if std::env::var("HERDR_TEST_NON_UTF8_HOME").as_deref() != Ok("1") {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let Some(parent) = home.parent() else {
+            return;
+        };
+        let Some(root) = parent.parent() else {
+            return;
+        };
+        if home.file_name().map(|name| name.as_bytes()) != Some(&b"fixture-\xff"[..])
+            || !matches!(
+                parent.file_name().and_then(|name| name.to_str()),
+                Some("tui-false" | "herdr-core-false")
+            )
+            || !root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("herdr-text-safety-"))
+            || root.parent() != Some(std::path::Path::new("/tmp"))
+            || std::fs::canonicalize(parent).ok() != std::env::current_dir().ok()
+        {
+            return;
+        }
+        assert_eq!(
+            crate::text_transfer::read(&json!({"path": "existing.txt"}))["code"],
+            "invalid_path"
+        );
+        assert_eq!(
+            crate::text_transfer::write(&json!({
+                "path": "new.txt", "content": "hello",
+                "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            }))["code"],
+            "invalid_path"
+        );
+        println!("non-utf8-home-probe-passed");
+    }
+
+    #[test]
     #[ignore = "launched with isolated HOME by text transfer public route tests"]
     fn text_transfer_child() {
         let Some(home) = validated_fixture_home() else {
@@ -32606,6 +32654,58 @@ mod text_transfer_safety_tests {
         symlink(&data, home.join("safe-alias")).unwrap();
         assert_eq!(read("safe-alias/existing.txt")["content"], "hello");
         assert_eq!(write("safe-alias/another.txt")["ok"], true);
+
+        // A UTF-8 alias can resolve to a non-UTF8 directory. Refuse it before
+        // serializing paths or creating a backup, temporary file, or target.
+        use std::os::unix::ffi::OsStringExt;
+        let non_utf8 = home.join(std::ffi::OsString::from_vec(b"fixture-\xff".to_vec()));
+        match std::fs::create_dir(&non_utf8) {
+            Ok(()) => {
+                std::fs::write(non_utf8.join("existing.txt"), "synthetic fixture").unwrap();
+                symlink(&non_utf8, home.join("byte-alias")).unwrap();
+                assert_eq!(read("byte-alias/existing.txt")["code"], "invalid_path");
+                assert_eq!(write("byte-alias/existing.txt")["code"], "invalid_path");
+                assert_eq!(write("byte-alias/new.txt")["code"], "invalid_path");
+                assert_eq!(
+                    crate::text_transfer::write(&json!({
+                        "path": "byte-alias/existing.txt", "content": "hello",
+                        "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                        "overwrite": true
+                    }))["code"],
+                    "invalid_path"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(non_utf8.join("existing.txt")).unwrap(),
+                    "synthetic fixture"
+                );
+                assert_eq!(std::fs::read_dir(&non_utf8).unwrap().count(), 1);
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                println!(
+                    "filesystem rejected synthetic non-UTF8 directory; alias scenario skipped"
+                );
+            }
+            Err(error) => panic!("cannot create synthetic non-UTF8 fixture: {error}"),
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "mcp::text_transfer_safety_tests::non_utf8_home_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HERDR_TEST_NON_UTF8_HOME", "1")
+            .env("HOME", &non_utf8)
+            .current_dir(&home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "non-UTF8 HOME probe failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("non-utf8-home-probe-passed"));
 
         let lease = call(
             ORCHESTRATION_LEASE_ACQUIRE_METHOD,
