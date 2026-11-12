@@ -913,6 +913,134 @@ fn parse_hello_result(raw: &Value) -> Result<HerdrCoreHello, HerdrCoreError> {
     })
 }
 
+/// Fail-closed admission for one frozen Epoch-5 public tool invocation (#922).
+///
+/// The tool catalog itself never changes: this gate decides only whether the
+/// *selected backend* may serve an already-declared tool. `tui` is the default
+/// and admits everything without touching a socket; `herdr-core` re-negotiates
+/// `hello` and applies the adapter's capability table. Any backend-selection
+/// error (for example `HERDR_MCP_RUNTIME_BACKEND=auto`) fails closed instead of
+/// falling back to the TUI path.
+pub fn public_tool_admission(tool_name: &str) -> Result<(), Value> {
+    let selection = resolve_process_backend_selection().map_err(|error| {
+        invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
+    })?;
+    match selection.backend {
+        RuntimeBackend::Tui => Ok(()),
+        RuntimeBackend::HerdrCore => {
+            let Some(socket_path) = selection.herdr_core_socket.as_deref() else {
+                return Err(json!({
+                    "ok": false,
+                    "code": "herdr_core_socket_unconfigured",
+                    "operation": tool_name,
+                    "runtime_backend": selection.summary_json(),
+                    "fallback_allowed": false,
+                    "retryable": false,
+                    "delivery_state": "not_delivered",
+                    "failure_phase": "backend_selection",
+                    "message": "herdr-core backend selected without a resolved socket path",
+                }));
+            };
+            let client = HerdrCoreClient::new(socket_path);
+            let capability_check = client.check_tool_supported(tool_name).map_err(|mut rejection| {
+                if let Some(object) = rejection.as_object_mut() {
+                    object.insert("operation".to_owned(), json!(tool_name));
+                    object.insert("failure_phase".to_owned(), json!("backend_capability"));
+                    let message = match object.get("required_capability").and_then(Value::as_str) {
+                        Some(capability) => format!(
+                            "the selected herdr-core backend does not serve '{tool_name}' (required capability '{capability}'); no TUI fallback is allowed"
+                        ),
+                        None => format!(
+                            "the selected herdr-core backend cannot serve '{tool_name}'; no TUI fallback is allowed"
+                        ),
+                    };
+                    object.insert("message".to_owned(), json!(message));
+                }
+                rejection
+            });
+            capability_check?;
+            // A capability name in `hello` is necessary, never sufficient: the
+            // in-process implementation of these tools still reads the live TUI
+            // snapshot/socket, so admitting them would silently run on the TUI
+            // runtime the operator did not select (#922).
+            if TUI_ROUTED_PUBLIC_TOOLS.contains(&tool_name) {
+                return Err(json!({
+                    "ok": false,
+                    "code": "runtime_capability_unsupported",
+                    "operation": tool_name,
+                    "required_capability": "public_tool_route",
+                    "runtime_backend": selection.backend.as_str(),
+                    "fallback_allowed": false,
+                    "retryable": false,
+                    "delivery_state": "not_delivered",
+                    "failure_phase": "backend_capability",
+                    "message": format!(
+                        "'{tool_name}' is implemented on the Herdr TUI snapshot/socket and has no herdr-core route yet; it must not execute on the TUI backend when herdr-core is selected"
+                    ),
+                }));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Public tools whose only implementation is the TUI snapshot/socket path.
+const TUI_ROUTED_PUBLIC_TOOLS: &[&str] = &[
+    "herdr_fs_read",
+    "herdr_fs_list",
+    "herdr_fs_grep",
+    "herdr_fs_image",
+    "herdr_fs_write",
+    "herdr_fs_edit",
+    "herdr_fs_patch",
+    "herdr_git",
+    "herdr_exec",
+    "herdr_exec_start",
+    "herdr_exec_read",
+    "herdr_exec_kill",
+    "herdr_prompt",
+    "herdr_since",
+];
+
+/// Admission for the `herdr_call` tail that forwards an unhandled method to the
+/// live Herdr TUI socket. Local `herdr_mcp.*` methods stay available; any
+/// non-TUI backend must not reach the TUI forwarding path (#922).
+pub fn forwarded_method_admission(method: &str) -> Result<(), Value> {
+    let selection = resolve_process_backend_selection()
+        .map_err(|error| invalid_runtime_backend_tool_error(method, &error, "backend_selection"))?;
+    if selection.backend == RuntimeBackend::Tui || method.starts_with("herdr_mcp.") {
+        return Ok(());
+    }
+    Err(json!({
+        "ok": false,
+        "code": "runtime_capability_unsupported",
+        "operation": method,
+        "required_capability": "tui_runtime_forward",
+        "runtime_backend": selection.backend.as_str(),
+        "fallback_allowed": false,
+        "retryable": false,
+        "delivery_state": "not_delivered",
+        "failure_phase": "backend_capability",
+        "message": format!(
+            "'{method}' is forwarded to the live Herdr TUI socket, which the selected {} backend does not provide; no TUI fallback is allowed",
+            selection.backend.as_str()
+        ),
+    }))
+}
+
+fn invalid_runtime_backend_tool_error(tool_name: &str, error: &str, phase: &str) -> Value {
+    json!({
+        "ok": false,
+        "code": "invalid_runtime_backend",
+        "operation": tool_name,
+        "message": error,
+        "fallback_allowed": false,
+        "retryable": false,
+        "delivery_state": "not_delivered",
+        "failure_phase": phase,
+    })
+}
+
 pub fn inspect_herdr_core(selection: &RuntimeBackendSelection) -> Value {
     let Some(socket_path) = selection.herdr_core_socket.as_deref() else {
         return json!({
