@@ -17,7 +17,7 @@ use crate::paths::RuntimePaths;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +28,17 @@ pub const RUNTIME_BACKEND_ENV: &str = "HERDR_MCP_RUNTIME_BACKEND";
 
 const HC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const HC_EXEC_MAX_TIMEOUT: Duration = Duration::from_secs(60);
-const HC_MAX_LINE_BYTES: usize = 1024 * 1024;
+// `file.read` returns up to 8 MiB of text in one newline-delimited reply, and
+// JSON string escaping can inflate that, so the line cap must clear the file
+// payload bound instead of the historical 1 MiB control-message assumption.
+const HC_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Raw-byte bound `hc 0.1.20` enforces on `file.write` ("base64, at most 8 MB raw").
+pub const HC_FILE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// `terminal.wait` is a bounded check-in for an automated caller; a wait may
+/// never hold a tool call open for the `hc` default of 180 s.
+pub const HC_TERMINAL_WAIT_MAX_SECS: f64 = 20.0;
 static NEXT_HC_RPC_ID: AtomicU64 = AtomicU64::new(1);
 
 const PROHIBITED_HC_METHODS: &[&str] = &[
@@ -464,6 +474,57 @@ pub struct HerdrCoreSessionReport {
     pub finished_terminals: u64,
 }
 
+/// Typed `terminal.wait` outcome (`hc 0.1.20` `WaitResult`).
+///
+/// `ended: false` is a bounded check-in, never a failure: the terminal is still
+/// running and the caller decides whether to wait again.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct WaitResult {
+    pub ended: bool,
+    pub reason: String,
+    pub status: Option<String>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub turn: u64,
+}
+
+impl WaitResult {
+    /// Parse one `terminal.wait` result. Missing optional facts stay `None`
+    /// instead of being guessed from screen text (OSC 7501 rule, #767 §3.1).
+    pub fn from_hc_result(raw: &Value) -> Self {
+        Self {
+            ended: raw.get("ended").and_then(Value::as_bool).unwrap_or(false),
+            reason: raw
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unspecified")
+                .to_owned(),
+            status: raw.get("status").and_then(Value::as_str).map(str::to_owned),
+            exit_code: raw
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .and_then(|code| i32::try_from(code).ok()),
+            signal: raw
+                .get("signal")
+                .and_then(Value::as_i64)
+                .and_then(|signal| i32::try_from(signal).ok()),
+            turn: raw.get("turn").and_then(Value::as_u64).unwrap_or(0),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn as_json(&self) -> Value {
+        json!({
+            "ended": self.ended,
+            "reason": self.reason,
+            "status": self.status,
+            "exit_code": self.exit_code,
+            "signal": self.signal,
+            "turn": self.turn,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HerdrCoreClient {
     socket_path: PathBuf,
@@ -701,6 +762,336 @@ impl HerdrCoreClient {
         })
     }
 
+    /// `file.read`: same secret-path denylist as `fs_security`, refused before
+    /// the socket is contacted (fail-closed, no partial disclosure).
+    #[allow(dead_code)]
+    pub fn file_read(
+        &self,
+        path: &str,
+        cwd: Option<&Path>,
+        offset_1based: Option<u64>,
+        limit_lines: Option<u64>,
+    ) -> Result<Value, HerdrCoreError> {
+        let path = hc_required_path(path, "file.read")?;
+        hc_secret_like_path_guard(path)?;
+        if offset_1based == Some(0) {
+            return Err(hc_invalid_params(
+                "file.read offset is 1-based; pass 1 or greater (omit for the start of the file)",
+            ));
+        }
+        self.with_negotiated_session(|hello, stream| {
+            hc_require_method(&hello, "file.read")?;
+            let mut params = Map::new();
+            params.insert("path".to_owned(), json!(path));
+            hc_insert_cwd(&mut params, cwd);
+            if let Some(offset) = offset_1based {
+                params.insert("offset".to_owned(), json!(offset));
+            }
+            if let Some(limit) = limit_lines {
+                params.insert("limit".to_owned(), json!(limit));
+            }
+            let raw = rpc_call_line(
+                stream,
+                &self.socket_path,
+                "file.read",
+                Value::Object(params),
+            )?;
+            Ok(json!({
+                "ok": true,
+                "runtime_backend": "herdr-core",
+                "path": path,
+                "text": raw.get("text").and_then(Value::as_str).unwrap_or(""),
+                "first": raw.get("first").and_then(Value::as_u64).unwrap_or(0),
+                "last": raw.get("last").and_then(Value::as_u64).unwrap_or(0),
+                "lines": raw.get("lines").and_then(Value::as_u64).unwrap_or(0),
+            }))
+        })
+    }
+
+    /// `file.write`: readonly gate, secret-path refusal and the 8 MiB bound all
+    /// run before the socket is contacted; `data` is base64 per the OpenRPC schema.
+    #[allow(dead_code)]
+    pub fn file_write(
+        &self,
+        path: &str,
+        cwd: Option<&Path>,
+        data: &[u8],
+    ) -> Result<Value, HerdrCoreError> {
+        let path = hc_required_path(path, "file.write")?;
+        hc_mutation_guard("herdr_fs_write")?;
+        hc_secret_like_path_guard(path)?;
+        if data.len() > HC_FILE_MAX_BYTES {
+            return Err(HerdrCoreError {
+                code: "file_too_large".to_owned(),
+                kind: Some("file_too_large".to_owned()),
+                message: format!(
+                    "file.write payload is {} bytes; herdr-core accepts at most {HC_FILE_MAX_BYTES} bytes (8 MiB) per write",
+                    data.len()
+                ),
+            });
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+        self.with_negotiated_session(|hello, stream| {
+            hc_require_method(&hello, "file.write")?;
+            let mut params = Map::new();
+            params.insert("path".to_owned(), json!(path));
+            params.insert("data".to_owned(), json!(encoded));
+            hc_insert_cwd(&mut params, cwd);
+            let raw = rpc_call_line(
+                stream,
+                &self.socket_path,
+                "file.write",
+                Value::Object(params),
+            )?;
+            Ok(json!({
+                "ok": true,
+                "runtime_backend": "herdr-core",
+                "path": raw.get("path").and_then(Value::as_str).unwrap_or(path),
+                "bytes": raw.get("bytes").and_then(Value::as_u64).unwrap_or(data.len() as u64),
+            }))
+        })
+    }
+
+    /// `file.edit`: every `old` must match exactly once in the file as it was and
+    /// `hc` applies all edits or none, so a failed call is never partially applied.
+    #[allow(dead_code)]
+    pub fn file_edit(
+        &self,
+        path: &str,
+        cwd: Option<&Path>,
+        edits: &[(String, String)],
+    ) -> Result<Value, HerdrCoreError> {
+        let path = hc_required_path(path, "file.edit")?;
+        if edits.is_empty() {
+            return Err(hc_invalid_params(
+                "file.edit requires at least one (old, new) replacement",
+            ));
+        }
+        hc_mutation_guard("herdr_fs_edit")?;
+        hc_secret_like_path_guard(path)?;
+        let payload: Vec<Value> = edits
+            .iter()
+            .map(|(old, new)| json!({"old": old, "new": new}))
+            .collect();
+        self.with_negotiated_session(|hello, stream| {
+            hc_require_method(&hello, "file.edit")?;
+            let mut params = Map::new();
+            params.insert("path".to_owned(), json!(path));
+            params.insert("edits".to_owned(), Value::Array(payload));
+            hc_insert_cwd(&mut params, cwd);
+            // `edit_failed`/`not_found`/`not_text` arrive as `herdr_core_<kind>`
+            // with `kind` preserved, so callers never see a half-applied edit.
+            let raw = rpc_call_line(
+                stream,
+                &self.socket_path,
+                "file.edit",
+                Value::Object(params),
+            )?;
+            Ok(json!({
+                "ok": true,
+                "runtime_backend": "herdr-core",
+                "path": raw.get("path").and_then(Value::as_str).unwrap_or(path),
+                "bytes": raw.get("bytes").and_then(Value::as_u64),
+                "edits_applied": edits.len(),
+            }))
+        })
+    }
+
+    /// `terminal.run`: `argv` or `line` (never both), optional `cwd`/`name`/`labels`.
+    #[allow(dead_code)]
+    pub fn terminal_run(
+        &self,
+        argv: Option<&[String]>,
+        line: Option<&str>,
+        cwd: Option<&Path>,
+        name: Option<&str>,
+        labels: Option<&BTreeMap<String, String>>,
+    ) -> Result<Value, HerdrCoreError> {
+        let (argv, line) = match (argv, line) {
+            (Some(argv), None) => {
+                if argv.is_empty() {
+                    return Err(hc_invalid_params(
+                        "terminal.run argv must not be empty (omit it to send a line)",
+                    ));
+                }
+                (Some(argv), None)
+            }
+            (None, Some(line)) => {
+                if line.trim().is_empty() {
+                    return Err(hc_invalid_params("terminal.run line must not be empty"));
+                }
+                (None, Some(line))
+            }
+            (Some(_), Some(_)) => {
+                return Err(hc_invalid_params(
+                    "terminal.run takes argv or line, never both",
+                ));
+            }
+            (None, None) => {
+                return Err(hc_invalid_params(
+                    "terminal.run requires argv or line; an implicit shell is not started by a tool call",
+                ));
+            }
+        };
+        if let Some(name) = name {
+            hc_validate_terminal_name(name)?;
+        }
+        hc_mutation_guard("herdr_exec_start")?;
+        self.with_negotiated_session(|hello, stream| {
+            hc_require_method(&hello, "terminal.run")?;
+            let mut params = Map::new();
+            if let Some(argv) = argv {
+                params.insert("argv".to_owned(), json!(argv));
+            }
+            if let Some(line) = line {
+                params.insert("line".to_owned(), json!(line));
+            }
+            hc_insert_cwd(&mut params, cwd);
+            if let Some(name) = name {
+                params.insert("name".to_owned(), json!(name));
+            }
+            if let Some(labels) = labels {
+                params.insert("labels".to_owned(), json!(labels));
+            }
+            let raw = rpc_call_line(
+                stream,
+                &self.socket_path,
+                "terminal.run",
+                Value::Object(params),
+            )?;
+            Ok(json!({
+                "ok": true,
+                "runtime_backend": "herdr-core",
+                "terminal": raw.get("address").cloned().unwrap_or(Value::Null),
+                "state": raw.get("state").cloned().unwrap_or(Value::Null),
+                "cwd": raw.get("cwd").cloned().unwrap_or(Value::Null),
+                "argv": raw.get("argv").cloned().unwrap_or_else(|| json!([])),
+                "labels": raw.get("labels").cloned().unwrap_or_else(|| json!({})),
+                "name": raw.get("name").cloned().unwrap_or(Value::Null),
+                "parent": raw.get("parent").cloned().unwrap_or(Value::Null),
+                "turn": raw.get("turn").cloned().unwrap_or(Value::Null),
+                "created_ms": raw.get("created_ms").cloned().unwrap_or(Value::Null),
+            }))
+        })
+    }
+
+    /// `terminal.read`: screen plus optional history lines, live or finished.
+    #[allow(dead_code)]
+    pub fn terminal_read(
+        &self,
+        terminal: &str,
+        lines: Option<u64>,
+    ) -> Result<Value, HerdrCoreError> {
+        let terminal = hc_required_terminal(terminal, "terminal.read")?;
+        self.with_negotiated_session(|hello, stream| {
+            hc_require_method(&hello, "terminal.read")?;
+            let mut params = Map::new();
+            params.insert("terminal".to_owned(), json!(terminal));
+            if let Some(lines) = lines {
+                params.insert("lines".to_owned(), json!(lines));
+            }
+            let raw = rpc_call_line(
+                stream,
+                &self.socket_path,
+                "terminal.read",
+                Value::Object(params),
+            )?;
+            Ok(json!({
+                "ok": true,
+                "runtime_backend": "herdr-core",
+                "terminal": terminal,
+                "text": raw.get("text").and_then(Value::as_str).unwrap_or(""),
+                // `complete: false` with a `why` (working/blocked/error) means a
+                // full-screen program was not scrolled; never claim completeness.
+                "complete": raw.get("complete").and_then(Value::as_bool).unwrap_or(false),
+                "how": raw.get("how").and_then(Value::as_str).unwrap_or("screen"),
+                "why": raw.get("why").cloned().unwrap_or(Value::Null),
+            }))
+        })
+    }
+
+    /// `terminal.kill`: ends the program and reports the observed terminal facts.
+    #[allow(dead_code)]
+    pub fn terminal_kill(&self, terminal: &str) -> Result<Value, HerdrCoreError> {
+        let terminal = hc_required_terminal(terminal, "terminal.kill")?;
+        hc_mutation_guard("herdr_exec_kill")?;
+        self.with_negotiated_session(|hello, stream| {
+            hc_require_method(&hello, "terminal.kill")?;
+            let raw = rpc_call_line(
+                stream,
+                &self.socket_path,
+                "terminal.kill",
+                json!({"terminal": terminal}),
+            )?;
+            Ok(json!({
+                "ok": true,
+                "runtime_backend": "herdr-core",
+                "terminal": raw.get("address").cloned().unwrap_or_else(|| json!(terminal)),
+                "state": raw.get("state").cloned().unwrap_or(Value::Null),
+                "reason": raw.get("reason").cloned().unwrap_or(Value::Null),
+                "exit_code": raw.get("exit_code").cloned().unwrap_or(Value::Null),
+                "signal": raw.get("signal").cloned().unwrap_or(Value::Null),
+            }))
+        })
+    }
+
+    /// `terminal.wait`: bounded check-in (`<= 20 s`), optionally ending on an
+    /// `output` substring. `ended: false` means still running, not an error.
+    #[allow(dead_code)]
+    pub fn terminal_wait(
+        &self,
+        terminal: Option<&str>,
+        output: Option<&str>,
+        timeout_secs: Option<f64>,
+    ) -> Result<WaitResult, HerdrCoreError> {
+        let terminal = match terminal {
+            Some(terminal) => Some(hc_required_terminal(terminal, "terminal.wait")?),
+            None => None,
+        };
+        let output = match output {
+            Some(output) => {
+                if output.is_empty() {
+                    return Err(hc_invalid_params(
+                        "terminal.wait output match must not be empty (omit it to wait on status)",
+                    ));
+                }
+                Some(output)
+            }
+            None => None,
+        };
+        let bounded_timeout = match timeout_secs {
+            Some(seconds) => {
+                if !seconds.is_finite() || seconds <= 0.0 {
+                    return Err(hc_invalid_params(
+                        "terminal.wait timeout must be a positive number of seconds",
+                    ));
+                }
+                Some(seconds.min(HC_TERMINAL_WAIT_MAX_SECS))
+            }
+            None => None,
+        };
+        self.with_negotiated_session(|hello, stream| {
+            hc_require_method(&hello, "terminal.wait")?;
+            let mut params = Map::new();
+            if let Some(terminal) = terminal {
+                params.insert("terminal".to_owned(), json!(terminal));
+            }
+            if let Some(output) = output {
+                params.insert("output".to_owned(), json!(output));
+            }
+            if let Some(seconds) = bounded_timeout {
+                params.insert("timeout".to_owned(), json!(seconds));
+            }
+            let raw = rpc_call_line(
+                stream,
+                &self.socket_path,
+                "terminal.wait",
+                Value::Object(params),
+            )?;
+            Ok(WaitResult::from_hc_result(&raw))
+        })
+    }
+
     #[allow(dead_code)]
     pub fn call_allowed_method(
         &self,
@@ -798,6 +1189,91 @@ impl HerdrRuntimeAdapter for HerdrCoreClient {
                 "message": error.message,
             }),
         }
+    }
+}
+
+fn hc_invalid_params(message: impl Into<String>) -> HerdrCoreError {
+    HerdrCoreError {
+        code: "invalid_params".to_owned(),
+        kind: Some("invalid_params".to_owned()),
+        message: message.into(),
+    }
+}
+
+fn hc_require_method(hello: &HerdrCoreHello, method: &str) -> Result<(), HerdrCoreError> {
+    if hello.methods.contains(method) {
+        return Ok(());
+    }
+    Err(HerdrCoreError {
+        code: "runtime_capability_unsupported".to_owned(),
+        kind: None,
+        message: format!("herdr-core hello.methods did not advertise '{method}'"),
+    })
+}
+
+/// Global readonly gate (`HERDR_MCP_READONLY=1`) shared with every other mutating
+/// surface, applied before any socket work so a refusal never reaches `hc`.
+fn hc_mutation_guard(action: &str) -> Result<(), HerdrCoreError> {
+    crate::mutation::check_global(action).map_err(|refusal| HerdrCoreError {
+        code: "readonly_mode".to_owned(),
+        kind: Some("readonly_mode".to_owned()),
+        message: refusal
+            .get("hint")
+            .and_then(Value::as_str)
+            .unwrap_or("all mutating operations are disabled")
+            .to_owned(),
+    })
+}
+
+/// Fail-closed secret-path refusal, reusing the crate-wide `fs_security`
+/// denylist (`.env*`, `id_rsa*`, `*secret*`, `*.pem`, `*.key`, ...).
+fn hc_secret_like_path_guard(path: &str) -> Result<(), HerdrCoreError> {
+    if !crate::fs_security::denied_secret_path(Path::new(path)) {
+        return Ok(());
+    }
+    Err(HerdrCoreError {
+        code: "secret_path_denied".to_owned(),
+        kind: Some("secret_path_denied".to_owned()),
+        message: format!(
+            "refusing secret-like path '{path}': herdr-core file primitives apply the same denylist as fs_security"
+        ),
+    })
+}
+
+fn hc_required_path<'a>(path: &'a str, method: &str) -> Result<&'a str, HerdrCoreError> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(hc_invalid_params(format!("{method} path is required")));
+    }
+    Ok(path)
+}
+
+fn hc_required_terminal<'a>(terminal: &'a str, method: &str) -> Result<&'a str, HerdrCoreError> {
+    let terminal = terminal.trim();
+    if terminal.is_empty() {
+        return Err(hc_invalid_params(format!("{method} terminal is required")));
+    }
+    Ok(terminal)
+}
+
+fn hc_validate_terminal_name(name: &str) -> Result<(), HerdrCoreError> {
+    let valid = !name.is_empty()
+        && name.len() <= 32
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(hc_invalid_params(format!(
+            "invalid terminal name '{name}': herdr-core accepts 1..=32 of a-z 0-9 - _ ."
+        )))
+    }
+}
+
+fn hc_insert_cwd(params: &mut Map<String, Value>, cwd: Option<&Path>) {
+    if let Some(cwd) = cwd {
+        params.insert("cwd".to_owned(), json!(cwd.to_string_lossy().into_owned()));
     }
 }
 
@@ -1175,7 +1651,6 @@ fn rpc_call_line(
     })?;
 
     if let Some(error) = envelope.get("error") {
-        let rpc_code = error.get("code").and_then(Value::as_i64);
         let kind = error
             .get("data")
             .and_then(|d| d.get("kind"))
@@ -1187,8 +1662,10 @@ fn rpc_call_line(
             .and_then(Value::as_str)
             .unwrap_or("herdr-core RPC error")
             .to_owned();
-        let code = if rpc_code == Some(-32000) || kind.as_deref() == Some("unsupported_generation")
-        {
+        // `hc` reports every domain failure as code -32000 with a stable
+        // `data.kind`; the kind (not the numeric code) decides the typed error so
+        // `edit_failed`, `not_found`, `blocked`, ... stay distinguishable.
+        let code = if kind.as_deref() == Some("unsupported_generation") {
             "unsupported_generation".to_owned()
         } else if let Some(ref k) = kind {
             format!("herdr_core_{k}")
@@ -1542,5 +2019,614 @@ mod tests {
 
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
+    }
+
+    /// Typed `herdr-core` file/terminal primitives (#925) against a real Unix
+    /// OpenRPC socket fake: the adapter must speak the `hc 0.1.20` wire schema and
+    /// every guard must refuse before the socket is contacted.
+    #[cfg(unix)]
+    mod hc_primitives {
+        use super::*;
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        static NEXT_MOCK: AtomicU64 = AtomicU64::new(0);
+
+        type HcRecorder = Arc<Mutex<Vec<(String, Value)>>>;
+
+        fn recorder() -> HcRecorder {
+            Arc::new(Mutex::new(Vec::new()))
+        }
+
+        fn recorded(recorder: &HcRecorder, method: &str) -> Vec<Value> {
+            recorder
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name == method)
+                .map(|(_, params)| params.clone())
+                .collect()
+        }
+
+        /// A socket path that was never bound: any call that reaches it fails with
+        /// `herdr_core_unreachable`, which is how these tests prove a guard ran first.
+        fn absent_socket_path(tag: &str) -> PathBuf {
+            std::env::temp_dir().join(format!(
+                "herdr-core-absent-{tag}-{}-{}.sock",
+                std::process::id(),
+                NEXT_MOCK.fetch_add(1, Ordering::Relaxed)
+            ))
+        }
+
+        struct MockHcServer {
+            socket_path: PathBuf,
+            handle: thread::JoinHandle<()>,
+        }
+
+        impl MockHcServer {
+            fn start(
+                tag: &str,
+                sessions: usize,
+                methods: &[&str],
+                recorder: HcRecorder,
+                reply: impl Fn(&str, &Value) -> Result<Value, Value> + Send + 'static,
+            ) -> Self {
+                let socket_path = std::env::temp_dir().join(format!(
+                    "herdr-core-mock-{tag}-{}-{}.sock",
+                    std::process::id(),
+                    NEXT_MOCK.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).unwrap();
+                let methods: Vec<String> =
+                    methods.iter().map(|method| (*method).to_owned()).collect();
+                let handle = thread::spawn(move || {
+                    for _ in 0..sessions {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap() == 0 {
+                                break;
+                            }
+                            let request: Value = serde_json::from_str(&line).unwrap();
+                            let id = request["id"].clone();
+                            let method = request["method"].as_str().unwrap().to_owned();
+                            let params = request["params"].clone();
+                            let envelope = if method == "hello" {
+                                assert_eq!(params["generation"], HERDR_CORE_PROTOCOL_GENERATION);
+                                assert_eq!(params["framed"], false);
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "generation": HERDR_CORE_PROTOCOL_GENERATION,
+                                        "version": "0.1.20",
+                                        "core": { "id": "core_mock", "name": "mock-host" },
+                                        "framed": false,
+                                        "methods": methods,
+                                        "features": []
+                                    }
+                                })
+                            } else {
+                                recorder
+                                    .lock()
+                                    .unwrap()
+                                    .push((method.clone(), params.clone()));
+                                match reply(&method, &params) {
+                                    Ok(result) => json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": result
+                                    }),
+                                    Err(error) => json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "error": error
+                                    }),
+                                }
+                            };
+                            writeln!(stream, "{envelope}").unwrap();
+                        }
+                    }
+                });
+                Self {
+                    socket_path,
+                    handle,
+                }
+            }
+
+            fn client(&self) -> HerdrCoreClient {
+                HerdrCoreClient::new(&self.socket_path)
+            }
+
+            fn finish(self) {
+                self.handle.join().unwrap();
+                let _ = std::fs::remove_file(&self.socket_path);
+            }
+        }
+
+        #[test]
+        fn file_write_encodes_base64_and_file_read_maps_line_window() {
+            let seen = recorder();
+            let server = MockHcServer::start(
+                "file-io",
+                2,
+                &["hello", "file.read", "file.write"],
+                seen.clone(),
+                |method, params| match method {
+                    "file.write" => {
+                        let encoded = params["data"].as_str().unwrap();
+                        let decoded = base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .unwrap();
+                        assert_eq!(decoded, b"hello from herdr-core\n");
+                        assert_eq!(params["path"], "notes/demo.txt");
+                        assert_eq!(params["cwd"], "/tmp/work");
+                        Ok(json!({"path": "/tmp/work/notes/demo.txt", "bytes": 23}))
+                    }
+                    "file.read" => {
+                        assert_eq!(params["path"], "notes/demo.txt");
+                        assert_eq!(params["offset"], 2);
+                        assert_eq!(params["limit"], 3);
+                        Ok(json!({
+                            "text": "line two\nline three\n",
+                            "first": 2,
+                            "last": 3,
+                            "lines": 9
+                        }))
+                    }
+                    other => panic!("unexpected method {other}"),
+                },
+            );
+            let client = server.client();
+
+            let written = client
+                .file_write(
+                    "notes/demo.txt",
+                    Some(Path::new("/tmp/work")),
+                    b"hello from herdr-core\n",
+                )
+                .unwrap();
+            assert_eq!(written["ok"], true);
+            assert_eq!(written["runtime_backend"], "herdr-core");
+            assert_eq!(written["path"], "/tmp/work/notes/demo.txt");
+            assert_eq!(written["bytes"], 23);
+
+            let read = client
+                .file_read(
+                    "notes/demo.txt",
+                    Some(Path::new("/tmp/work")),
+                    Some(2),
+                    Some(3),
+                )
+                .unwrap();
+            assert_eq!(read["ok"], true);
+            assert_eq!(read["runtime_backend"], "herdr-core");
+            assert_eq!(read["text"], "line two\nline three\n");
+            assert_eq!(read["first"], 2);
+            assert_eq!(read["last"], 3);
+            assert_eq!(read["lines"], 9);
+
+            // The wire payload really was base64, not raw text.
+            let write_params = recorded(&seen, "file.write");
+            assert_eq!(write_params.len(), 1);
+            let sent = write_params[0]["data"].as_str().unwrap();
+            assert_eq!(sent, "aGVsbG8gZnJvbSBoZXJkci1jb3JlCg==");
+            server.finish();
+        }
+
+        #[test]
+        fn secret_like_paths_are_refused_before_the_socket_is_contacted() {
+            let client = HerdrCoreClient::new(absent_socket_path("secret"));
+            for path in [
+                ".env",
+                ".env.production",
+                "config/id_rsa",
+                "certs/server.pem",
+                "state/api-token.json",
+            ] {
+                let read = client.file_read(path, None, None, None).unwrap_err();
+                assert_eq!(read.code, "secret_path_denied", "file.read {path}");
+                assert_eq!(read.kind.as_deref(), Some("secret_path_denied"));
+
+                let write = client.file_write(path, None, b"x").unwrap_err();
+                assert_eq!(write.code, "secret_path_denied", "file.write {path}");
+
+                let edit = client
+                    .file_edit(path, None, &[("a".to_owned(), "b".to_owned())])
+                    .unwrap_err();
+                assert_eq!(edit.code, "secret_path_denied", "file.edit {path}");
+            }
+            // Control: a non-secret path on the same absent socket is reachable and
+            // fails at the transport, proving the refusals above were pre-socket.
+            let reachable = client
+                .file_read("notes/readme.md", None, None, None)
+                .unwrap_err();
+            assert_eq!(reachable.code, "herdr_core_unreachable");
+        }
+
+        #[test]
+        fn file_write_refuses_payloads_above_the_eight_mebibyte_bound() {
+            let client = HerdrCoreClient::new(absent_socket_path("too-large"));
+            let oversized = vec![b'a'; HC_FILE_MAX_BYTES + 1];
+            let refused = client
+                .file_write("notes/big.txt", None, &oversized)
+                .unwrap_err();
+            assert_eq!(refused.code, "file_too_large");
+            assert_eq!(refused.kind.as_deref(), Some("file_too_large"));
+            assert!(refused.message.contains("8388608"));
+
+            // Exactly 8 MiB is admitted by the bound and then stops at the absent
+            // socket, so the check is an exclusive ceiling rather than a guess.
+            let at_bound = client
+                .file_write("notes/big.txt", None, &vec![b'a'; HC_FILE_MAX_BYTES])
+                .unwrap_err();
+            assert_eq!(at_bound.code, "herdr_core_unreachable");
+        }
+
+        #[test]
+        fn readonly_mode_refuses_mutations_before_contacting_the_socket() {
+            // `HERDR_MCP_READONLY` is process-global and Rust tests share one
+            // process, so the probe runs in a child of this same test binary where
+            // the environment cannot leak into sibling tests.
+            let executable = std::env::current_exe().unwrap();
+            let output = std::process::Command::new(executable)
+                .args(["readonly_child_probe", "--ignored", "--nocapture"])
+                .env("HERDR_MCP_READONLY", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "readonly child probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        #[test]
+        #[ignore = "child probe launched by readonly_mode_refuses_mutations_before_contacting_the_socket"]
+        fn readonly_child_probe() {
+            assert_eq!(std::env::var("HERDR_MCP_READONLY").as_deref(), Ok("1"));
+            let client = HerdrCoreClient::new(absent_socket_path("readonly-child"));
+
+            assert_eq!(
+                client
+                    .file_write("notes/demo.txt", None, b"x")
+                    .unwrap_err()
+                    .code,
+                "readonly_mode"
+            );
+            assert_eq!(
+                client
+                    .file_edit("notes/demo.txt", None, &[("a".to_owned(), "b".to_owned())])
+                    .unwrap_err()
+                    .code,
+                "readonly_mode"
+            );
+            assert_eq!(
+                client
+                    .terminal_run(None, Some("true"), None, None, None)
+                    .unwrap_err()
+                    .code,
+                "readonly_mode"
+            );
+            assert_eq!(
+                client.terminal_kill("t9").unwrap_err().code,
+                "readonly_mode"
+            );
+            // Reads and waits stay available in readonly mode: they only fail at the
+            // transport, never with `readonly_mode`.
+            assert_eq!(
+                client
+                    .file_read("notes/demo.txt", None, None, None)
+                    .unwrap_err()
+                    .code,
+                "herdr_core_unreachable"
+            );
+            assert_eq!(
+                client
+                    .terminal_wait(Some("t9"), None, Some(5.0))
+                    .unwrap_err()
+                    .code,
+                "herdr_core_unreachable"
+            );
+        }
+
+        #[test]
+        fn file_edit_sends_exact_once_edits_and_maps_edit_failed() {
+            let seen = recorder();
+            let call = Arc::new(AtomicU64::new(0));
+            let server = MockHcServer::start(
+                "file-edit",
+                2,
+                &["hello", "file.edit"],
+                seen.clone(),
+                move |method, params| {
+                    assert_eq!(method, "file.edit");
+                    assert_eq!(params["path"], "src/lib.rs");
+                    assert_eq!(params["cwd"], "/tmp/work");
+                    assert_eq!(
+                        params["edits"],
+                        json!([
+                            {"old": "fn a() {}", "new": "fn a() { 1 }"},
+                            {"old": "fn b() {}", "new": "fn b() { 2 }"}
+                        ])
+                    );
+                    if call.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Ok(json!({"path": "/tmp/work/src/lib.rs", "bytes": 42}))
+                    } else {
+                        Err(json!({
+                            "code": -32000,
+                            "message": "'fn a() {}' is not unique",
+                            "data": { "kind": "edit_failed" }
+                        }))
+                    }
+                },
+            );
+            let client = server.client();
+            let edits = vec![
+                ("fn a() {}".to_owned(), "fn a() { 1 }".to_owned()),
+                ("fn b() {}".to_owned(), "fn b() { 2 }".to_owned()),
+            ];
+
+            let applied = client
+                .file_edit("src/lib.rs", Some(Path::new("/tmp/work")), &edits)
+                .unwrap();
+            assert_eq!(applied["ok"], true);
+            assert_eq!(applied["path"], "/tmp/work/src/lib.rs");
+            assert_eq!(applied["bytes"], 42);
+            assert_eq!(applied["edits_applied"], 2);
+
+            let failure = client
+                .file_edit("src/lib.rs", Some(Path::new("/tmp/work")), &edits)
+                .unwrap_err();
+            assert_eq!(failure.code, "herdr_core_edit_failed");
+            assert_eq!(failure.kind.as_deref(), Some("edit_failed"));
+
+            // Both edits travelled in one all-or-none request, never one-by-one.
+            assert_eq!(recorded(&seen, "file.edit").len(), 2);
+            server.finish();
+        }
+
+        #[test]
+        fn terminal_run_read_kill_and_wait_map_typed_results() {
+            let seen = recorder();
+            let server = MockHcServer::start(
+                "terminal",
+                4,
+                &[
+                    "hello",
+                    "terminal.run",
+                    "terminal.read",
+                    "terminal.kill",
+                    "terminal.wait",
+                ],
+                seen.clone(),
+                |method, params| match method {
+                    "terminal.run" => {
+                        assert_eq!(params["argv"], json!(["sleep", "30"]));
+                        assert!(params.get("line").is_none());
+                        assert_eq!(params["cwd"], "/tmp/work");
+                        assert_eq!(params["name"], "worker-1");
+                        assert_eq!(params["labels"], json!({"role": "worker"}));
+                        Ok(json!({
+                            "address": "t9",
+                            "state": "live",
+                            "cwd": "/tmp/work",
+                            "argv": ["sleep", "30"],
+                            "labels": {"role": "worker"},
+                            "name": "worker-1",
+                            "parent": "t1",
+                            "turn": 0,
+                            "created_ms": 1700000000000_u64,
+                            "screen": "exact",
+                            "cols": 200,
+                            "rows": 120
+                        }))
+                    }
+                    "terminal.read" => {
+                        assert_eq!(params["terminal"], "t9");
+                        assert_eq!(params["lines"], 40);
+                        Ok(json!({
+                            "text": "working...\n",
+                            "complete": false,
+                            "how": "screen",
+                            "why": "working"
+                        }))
+                    }
+                    "terminal.kill" => {
+                        assert_eq!(params["terminal"], "t9");
+                        Ok(json!({
+                            "address": "t9",
+                            "state": "finished",
+                            "reason": "killed",
+                            "exit_code": null,
+                            "signal": 15,
+                            "labels": {},
+                            "argv": ["sleep", "30"],
+                            "cwd": "/tmp/work",
+                            "created_ms": 1700000000000_u64,
+                            "screen": "exact",
+                            "cols": 200,
+                            "rows": 120
+                        }))
+                    }
+                    "terminal.wait" => {
+                        assert_eq!(params["terminal"], "t9");
+                        assert_eq!(params["output"], "READY");
+                        // A caller asking for 10 minutes still gets at most 20 s.
+                        assert_eq!(params["timeout"], HC_TERMINAL_WAIT_MAX_SECS);
+                        Ok(json!({
+                            "terminal": "t9",
+                            "ended": false,
+                            "reason": "timeout",
+                            "status": "working",
+                            "turn": 3,
+                            "children": []
+                        }))
+                    }
+                    other => panic!("unexpected method {other}"),
+                },
+            );
+            let client = server.client();
+
+            let mut labels = BTreeMap::new();
+            labels.insert("role".to_owned(), "worker".to_owned());
+            let argv = vec!["sleep".to_owned(), "30".to_owned()];
+            let started = client
+                .terminal_run(
+                    Some(&argv),
+                    None,
+                    Some(Path::new("/tmp/work")),
+                    Some("worker-1"),
+                    Some(&labels),
+                )
+                .unwrap();
+            assert_eq!(started["ok"], true);
+            assert_eq!(started["terminal"], "t9");
+            assert_eq!(started["state"], "live");
+            assert_eq!(started["name"], "worker-1");
+            assert_eq!(started["labels"], json!({"role": "worker"}));
+
+            let read = client.terminal_read("t9", Some(40)).unwrap();
+            assert_eq!(read["ok"], true);
+            assert_eq!(read["text"], "working...\n");
+            assert_eq!(read["complete"], false);
+            assert_eq!(read["how"], "screen");
+            assert_eq!(read["why"], "working");
+
+            let killed = client.terminal_kill("t9").unwrap();
+            assert_eq!(killed["ok"], true);
+            assert_eq!(killed["state"], "finished");
+            assert_eq!(killed["reason"], "killed");
+            assert_eq!(killed["signal"], 15);
+
+            let waited = client
+                .terminal_wait(Some("t9"), Some("READY"), Some(600.0))
+                .unwrap();
+            assert_eq!(
+                waited,
+                WaitResult {
+                    ended: false,
+                    reason: "timeout".to_owned(),
+                    status: Some("working".to_owned()),
+                    exit_code: None,
+                    signal: None,
+                    turn: 3,
+                }
+            );
+            assert_eq!(waited.as_json()["reason"], "timeout");
+            // Each terminal method went to its own RPC, never a shared fallback.
+            for method in [
+                "terminal.run",
+                "terminal.read",
+                "terminal.kill",
+                "terminal.wait",
+            ] {
+                assert_eq!(recorded(&seen, method).len(), 1, "{method}");
+            }
+            server.finish();
+        }
+
+        #[test]
+        fn unadvertised_primitives_fail_closed_before_the_rpc() {
+            // The mock refuses any non-hello method with a panic, so reaching the
+            // socket would fail loudly instead of silently downgrading.
+            let server =
+                MockHcServer::start("no-file", 1, &["hello"], recorder(), |method, _params| {
+                    panic!("unexpected method {method}")
+                });
+            let client = server.client();
+            let refused = client
+                .file_read("notes/readme.md", None, None, None)
+                .unwrap_err();
+            assert_eq!(refused.code, "runtime_capability_unsupported");
+            server.finish();
+        }
+
+        #[test]
+        fn invalid_primitive_arguments_are_refused_before_the_socket() {
+            let client = HerdrCoreClient::new(absent_socket_path("invalid-args"));
+            assert_eq!(
+                client.file_read("   ", None, None, None).unwrap_err().code,
+                "invalid_params"
+            );
+            assert_eq!(
+                client
+                    .file_read("notes/readme.md", None, Some(0), None)
+                    .unwrap_err()
+                    .code,
+                "invalid_params"
+            );
+            assert_eq!(
+                client
+                    .file_write("notes/readme.md", None, b"x")
+                    .unwrap_err()
+                    .code,
+                "herdr_core_unreachable"
+            );
+            assert_eq!(
+                client
+                    .file_edit("notes/readme.md", None, &[])
+                    .unwrap_err()
+                    .code,
+                "invalid_params"
+            );
+            assert_eq!(
+                client
+                    .terminal_run(Some(&[]), None, None, None, None)
+                    .unwrap_err()
+                    .code,
+                "invalid_params"
+            );
+            assert_eq!(
+                client
+                    .terminal_run(
+                        Some(&["sleep".to_owned()]),
+                        Some("sleep 1"),
+                        None,
+                        None,
+                        None
+                    )
+                    .unwrap_err()
+                    .code,
+                "invalid_params"
+            );
+            assert_eq!(
+                client
+                    .terminal_run(None, Some("sleep 1"), None, Some("Bad Name"), None)
+                    .unwrap_err()
+                    .code,
+                "invalid_params"
+            );
+            assert_eq!(
+                client.terminal_read("", None).unwrap_err().code,
+                "invalid_params"
+            );
+            assert_eq!(
+                client.terminal_kill("  ").unwrap_err().code,
+                "invalid_params"
+            );
+            for timeout in [0.0_f64, -1.0, f64::NAN, f64::INFINITY] {
+                assert_eq!(
+                    client
+                        .terminal_wait(Some("t9"), None, Some(timeout))
+                        .unwrap_err()
+                        .code,
+                    "invalid_params",
+                    "timeout {timeout}"
+                );
+            }
+            assert_eq!(
+                client
+                    .terminal_wait(Some("t9"), Some(""), Some(1.0))
+                    .unwrap_err()
+                    .code,
+                "invalid_params"
+            );
+        }
     }
 }
