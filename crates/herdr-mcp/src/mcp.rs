@@ -1558,19 +1558,31 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
             } else if method == TEXT_WRITE_METHOD {
-                if let Some(conflict) =
-                    check_mutating_tool_root_lease(context, method, &params, Some(&arguments))
-                {
-                    conflict
-                } else {
-                    let clean_params = strip_lease_credential_fields(&params);
-                    native_tools::call_with_local(
-                        context.client,
-                        context.skill,
-                        &context.cache.snapshot(),
-                        method,
-                        clean_params,
-                    )
+                match crate::mutation::check_global(TEXT_WRITE_METHOD).and_then(|()| {
+                    let path = params.get("path").and_then(Value::as_str)
+                        .filter(|path| !path.is_empty())
+                        .ok_or_else(|| json!({"ok": false, "code": "invalid_params", "message": "path must be a non-empty string"}))?;
+                    crate::text_transfer::safe_home_path(path, true)
+                }) {
+                    Err(error) => error,
+                    Ok(path) => {
+                        let mut resolved_params = params.clone();
+                        resolved_params["path"] = json!(path);
+                        if let Some(conflict) = check_mutating_tool_root_lease(
+                            context, method, &resolved_params, Some(&arguments),
+                        ) {
+                            conflict
+                        } else {
+                            let clean_params = strip_lease_credential_fields(&resolved_params);
+                            native_tools::call_with_local(
+                                context.client,
+                                context.skill,
+                                &context.cache.snapshot(),
+                                method,
+                                clean_params,
+                            )
+                        }
+                    }
                 }
             } else if let Err(rejection) =
                 crate::runtime_adapter::forwarded_method_admission(method)
@@ -31901,5 +31913,493 @@ mod client_request_shape_matrix_tests {
         );
 
         std::fs::remove_dir_all(temp_root).ok();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod text_transfer_safety_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeCore {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl FakeCore {
+        fn start() -> Option<Self> {
+            use std::io::{BufRead, BufReader, Write};
+            use std::os::unix::net::UnixListener;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::time::Duration;
+
+            if std::env::var("HERDR_MCP_RUNTIME_BACKEND").as_deref() != Ok("herdr-core") {
+                return None;
+            }
+            let listener = UnixListener::bind(".hc").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let server_stop = Arc::clone(&stop);
+            let server_requests = Arc::clone(&requests);
+            let server = std::thread::spawn(move || {
+                while !server_stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            // Accepted sockets may inherit the listener's nonblocking
+                            // mode; the per-session protocol uses bounded blocking I/O.
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut reader = BufReader::new(stream.try_clone().unwrap());
+                            let mut line = String::new();
+                            reader.read_line(&mut line).unwrap();
+                            let request: Value = serde_json::from_str(&line).unwrap();
+                            assert_eq!(request["method"], "hello", "unexpected HC operation");
+                            server_requests.fetch_add(1, Ordering::SeqCst);
+                            writeln!(stream, "{}", json!({
+                                "jsonrpc": "2.0", "id": request["id"],
+                                "result": {"generation": 1, "version": "0.1.14", "core": {"id": "test", "name": "test"}, "framed": false, "methods": ["hello"], "features": []}
+                            })).unwrap();
+                            // Keep the negotiated session alive until the client closes it.
+                            // The read timeout bounds failures, and any further RPC is unexpected.
+                            let mut extra = String::new();
+                            assert_eq!(
+                                reader
+                                    .read_line(&mut extra)
+                                    .expect("HC client did not close the test session"),
+                                0,
+                                "unexpected HC request after hello"
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::park_timeout(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("fake HC accept failed: {error}"),
+                    }
+                }
+            });
+            Some(Self {
+                stop,
+                requests,
+                server,
+            })
+        }
+
+        fn finish(self) {
+            use std::sync::atomic::Ordering;
+            self.stop.store(true, Ordering::SeqCst);
+            self.server.thread().unpark();
+            self.server.join().unwrap();
+            assert!(
+                self.requests.load(Ordering::SeqCst) > 0,
+                "HC handshake did not run"
+            );
+            std::fs::remove_file(".hc").unwrap();
+        }
+    }
+
+    // HOME and mutation policy are process-global, so run the public MCP route in
+    // fresh child processes with test-owned state and no inherited configuration.
+    #[test]
+    fn text_transfer_public_route_respects_readonly_and_resolved_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-text-safety-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        for (backend, readonly) in [
+            ("tui", true),
+            ("tui", false),
+            ("herdr-core", true),
+            ("herdr-core", false),
+        ] {
+            let home = root.join(format!("{backend}-{readonly}"));
+            std::fs::create_dir(&home).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "mcp::text_transfer_safety_tests::text_transfer_child",
+                    "--exact",
+                    "--ignored",
+                ])
+                .env_clear()
+                .env("HOME", &home)
+                .env("HERDR_MCP_RUNTIME_BACKEND", backend)
+                .current_dir(&root);
+            if backend == "herdr-core" {
+                command.env("HC_SOCKET", ".hc");
+            }
+            if readonly {
+                command.env("HERDR_MCP_READONLY", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child probe did not run"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn text_transfer_public_route_enforces_configured_write_roots() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = std::env::temp_dir().join(format!(
+            "herdr-roots-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        for backend in ["tui", "herdr-core"] {
+            for case in [
+                "unset",
+                "empty",
+                "whitespace",
+                "all-empty",
+                "allowed",
+                "multi",
+                "linked",
+                "relative-valid",
+                "empty-entry",
+                "outside",
+                "relative-invalid",
+                "missing",
+                "valid-then-missing",
+                "file",
+                "nonunicode",
+            ] {
+                let home = root.join(format!("{backend}-{case}"));
+                std::fs::create_dir(&home).unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "mcp::text_transfer_safety_tests::text_transfer_child",
+                        "--exact",
+                        "--ignored",
+                    ])
+                    .env_clear()
+                    .env("HOME", &home)
+                    .env("HERDR_MCP_RUNTIME_BACKEND", backend)
+                    .env("HERDR_TEST_WRITE_ROOTS_CASE", case)
+                    .current_dir(&root);
+                if backend == "herdr-core" {
+                    command.env("HC_SOCKET", ".hc");
+                }
+                let root_value = match case {
+                    "unset" => None,
+                    "empty" => Some(std::ffi::OsString::from("")),
+                    "whitespace" => Some(std::ffi::OsString::from("  \t ")),
+                    "all-empty" => Some(" ,  , ".into()),
+                    "allowed" => Some(home.join("data").into_os_string()),
+                    "multi" => Some(
+                        format!(
+                            "{},{}",
+                            home.join("other").display(),
+                            home.join("data").display()
+                        )
+                        .into(),
+                    ),
+                    "linked" => Some(home.join("root-alias").into_os_string()),
+                    "relative-valid" => Some(
+                        std::path::PathBuf::from(home.file_name().unwrap())
+                            .join("data")
+                            .into_os_string(),
+                    ),
+                    "outside" => Some(home.join("other").into_os_string()),
+                    "relative-invalid" => Some("missing-relative".into()),
+                    "missing" => Some(home.join("missing").into_os_string()),
+                    "valid-then-missing" => Some(
+                        format!(
+                            "{},{}",
+                            home.join("data").display(),
+                            home.join("missing").display()
+                        )
+                        .into(),
+                    ),
+                    "file" => Some(home.join("data/existing.txt").into_os_string()),
+                    "empty-entry" => Some(format!("{},", home.join("data").display()).into()),
+                    "nonunicode" => Some(std::ffi::OsString::from_vec(vec![0xff])),
+                    _ => unreachable!(),
+                };
+                if let Some(value) = root_value {
+                    command.env("HERDR_MCP_WRITE_ROOTS", value);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{backend}/{case} child failed: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "child probe did not run"
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "launched with isolated HOME by text transfer public route tests"]
+    fn text_transfer_child() {
+        let fake_core = FakeCore::start();
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let data = home.join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("existing.txt"), "original").unwrap();
+        let client = HerdrClient::new(home.join("missing.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({"panes": [], "agents": []}));
+        let exec = ExecRegistry::new(home.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let context = RuntimeContext {
+            client: &client,
+            cache: &cache,
+            exec: &exec,
+            prompt: &prompt,
+            skill: &skill,
+            state_store: &state_store,
+            caller_webchat_control_grants: &[],
+            caller_webchat_authorization: None,
+            caller_browser_session: None,
+            caller_page_assist_grants: &[],
+            caller_browser_on_other_device: false,
+            caller_relayed_source_turn: None,
+            caller_lease_holder_id: None,
+            caller_lease_epoch: None,
+            caller_lease_token: None,
+            browser_actuator: None,
+            browser_mutation_gate: None,
+            browser_mutation_admission: None,
+            trusted_local_ipc: false,
+        };
+        let call = |method: &str, params: Value| -> Value {
+            let response = handle(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "herdr_call", "arguments": {"method": method, "params": params}}
+            }), &context).unwrap();
+            serde_json::from_str(
+                response
+                    .pointer("/result/content/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let write = |path: &str| {
+            call(
+                "herdr_mcp.text.write",
+                json!({
+                    "path": path, "content": "hello", "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", "overwrite": true
+                }),
+            )
+        };
+        let read = |path: &str| call("herdr_mcp.text.read", json!({"path": path}));
+        if let Ok(case) = std::env::var("HERDR_TEST_WRITE_ROOTS_CASE") {
+            std::fs::create_dir(home.join("other")).unwrap();
+            std::fs::create_dir(home.join("data-other")).unwrap();
+            symlink(&data, home.join("root-alias")).unwrap();
+            let permitted = matches!(
+                case.as_str(),
+                "unset"
+                    | "empty"
+                    | "whitespace"
+                    | "allowed"
+                    | "multi"
+                    | "linked"
+                    | "relative-valid"
+                    | "empty-entry"
+            );
+            if permitted {
+                let existing_result = write("data/existing.txt");
+                let new_result = write("data/new.txt");
+                assert_eq!(existing_result["ok"], true, "{case}: {existing_result}");
+                assert_eq!(new_result["ok"], true, "{case}: {new_result}");
+                if matches!(
+                    case.as_str(),
+                    "allowed" | "multi" | "linked" | "relative-valid" | "empty-entry"
+                ) {
+                    symlink(home.join("data-other"), data.join("escape")).unwrap();
+                    assert_eq!(
+                        write("data-other/rejected.txt")["reason"],
+                        "root_not_whitelisted"
+                    );
+                    assert_eq!(
+                        write("data/escape/rejected.txt")["reason"],
+                        "root_not_whitelisted"
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(home.join("data-other")).unwrap().count(),
+                        0
+                    );
+                }
+            } else {
+                let expected = if case == "outside" {
+                    "root_not_whitelisted"
+                } else {
+                    "invalid_write_roots"
+                };
+                let existing_result = write("data/existing.txt");
+                let new_result = write("data/new.txt");
+                assert_eq!(
+                    existing_result["reason"], expected,
+                    "{case}: {existing_result}"
+                );
+                assert_eq!(new_result["reason"], expected, "{case}: {new_result}");
+                assert_eq!(
+                    std::fs::read_to_string(data.join("existing.txt")).unwrap(),
+                    "original"
+                );
+                assert_eq!(std::fs::read_dir(&data).unwrap().count(), 1);
+            }
+            if let Some(fake_core) = fake_core {
+                fake_core.finish();
+            }
+            return;
+        }
+        assert_eq!(read("data/existing.txt")["content"], "original");
+
+        if std::env::var_os("HERDR_MCP_READONLY").is_some() {
+            for path in ["data/existing.txt", "data/new.txt"] {
+                let result = write(path);
+                assert_eq!(result["ok"], false);
+                assert_eq!(result["reason"], "readonly_mode");
+                assert_eq!(result["action"], "herdr_mcp.text.write");
+            }
+            assert_eq!(
+                std::fs::read_to_string(data.join("existing.txt")).unwrap(),
+                "original"
+            );
+            let entries = std::fs::read_dir(&data).unwrap().count();
+            assert_eq!(
+                entries, 1,
+                "no new file, backup or temporary file should be created"
+            );
+            if let Some(fake_core) = fake_core {
+                fake_core.finish();
+            }
+            return;
+        }
+        let result = write("data/existing.txt");
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(data.join("existing.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(result["backup_path"].as_str().unwrap()).unwrap(),
+            "original"
+        );
+        assert_eq!(write("data/new.txt")["ok"], true);
+
+        symlink(data.join("existing.txt"), data.join("final-link.txt")).unwrap();
+        symlink(data.join("absent.txt"), data.join("dangling-link.txt")).unwrap();
+        for path in ["data/final-link.txt", "data/dangling-link.txt"] {
+            assert_eq!(read(path)["code"], "symlink_denied");
+            assert_eq!(write(path)["code"], "symlink_denied");
+        }
+        assert_eq!(
+            write("missing-parent/new.txt")["code"],
+            "parent_resolution_failed"
+        );
+        assert_eq!(write("")["code"], "invalid_params");
+        let outside = home.parent().unwrap().join(format!(
+            "outside-{}",
+            home.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&outside, "outside fixture").unwrap();
+        assert_eq!(
+            write(outside.to_str().unwrap())["code"],
+            "path_outside_home"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside fixture"
+        );
+        std::fs::remove_file(outside).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(data.join("existing.txt")).unwrap(),
+            "hello"
+        );
+        assert!(!data.join("absent.txt").exists());
+
+        let protected = home.join("secret-fixture");
+        std::fs::create_dir(&protected).unwrap();
+        std::fs::write(protected.join("notes.txt"), "synthetic fixture").unwrap();
+        symlink(&protected, home.join("alias")).unwrap();
+        assert_eq!(read("alias/notes.txt")["code"], "secret_path_denied");
+        assert_eq!(write("alias/notes.txt")["code"], "secret_path_denied");
+        assert_eq!(write("alias/new.txt")["code"], "secret_path_denied");
+        assert_eq!(
+            std::fs::read_to_string(protected.join("notes.txt")).unwrap(),
+            "synthetic fixture"
+        );
+        assert_eq!(std::fs::read_dir(&protected).unwrap().count(), 1);
+
+        // A parent alias to a safe directory remains supported.
+        symlink(&data, home.join("safe-alias")).unwrap();
+        assert_eq!(read("safe-alias/existing.txt")["content"], "hello");
+        assert_eq!(write("safe-alias/another.txt")["ok"], true);
+
+        let lease = call(
+            ORCHESTRATION_LEASE_ACQUIRE_METHOD,
+            json!({
+                "project_root": data, "holder_id": "test-holder", "ttl_seconds": 120
+            }),
+        );
+        assert_eq!(lease["ok"], true);
+        let token = lease["lease_token"].as_str().unwrap();
+        let entries_before = std::fs::read_dir(&data).unwrap().count();
+        for path in [
+            "data/existing.txt",
+            "data/blocked.txt",
+            "safe-alias/blocked.txt",
+        ] {
+            let refused = write(path);
+            assert_eq!(refused["code"], "single_writer_lease_conflict");
+            assert!(!refused.to_string().contains(token));
+        }
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), entries_before);
+        assert_eq!(
+            std::fs::read_to_string(data.join("existing.txt")).unwrap(),
+            "hello"
+        );
+        let allowed = call(
+            "herdr_mcp.text.write",
+            json!({
+                "path": "safe-alias/authorized.txt", "content": "hello",
+                "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                "holder_id": "test-holder", "lease_epoch": lease["lease_epoch"], "lease_token": token
+            }),
+        );
+        assert_eq!(allowed["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(data.join("authorized.txt")).unwrap(),
+            "hello"
+        );
+        std::fs::create_dir(home.join("unleased")).unwrap();
+        assert_eq!(write("unleased/new.txt")["ok"], true);
+        if let Some(fake_core) = fake_core {
+            fake_core.finish();
+        }
     }
 }

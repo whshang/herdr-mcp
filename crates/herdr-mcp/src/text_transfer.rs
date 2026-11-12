@@ -76,6 +76,10 @@ pub fn read(params: &Value) -> Value {
 }
 
 pub fn write(params: &Value) -> Value {
+    if let Err(error) = crate::mutation::check_global(crate::progressive_skills::TEXT_WRITE_METHOD)
+    {
+        return error;
+    }
     let path = match required_string(params, "path") {
         Ok(value) => value,
         Err(error) => return error,
@@ -124,6 +128,9 @@ pub fn write(params: &Value) -> Value {
         Ok(value) => value,
         Err(error) => return error,
     };
+    if let Err(error) = crate::mutation::check_text_write_root(&path) {
+        return error;
+    }
     let existing = match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return fail(
@@ -213,7 +220,7 @@ pub fn write(params: &Value) -> Value {
     })
 }
 
-fn safe_home_path(input: &str, allow_missing: bool) -> Result<PathBuf, Value> {
+pub(crate) fn safe_home_path(input: &str, allow_missing: bool) -> Result<PathBuf, Value> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| json!({"ok": false, "code": "home_unavailable"}))?;
@@ -257,6 +264,13 @@ fn safe_home_path(input: &str, allow_missing: bool) -> Result<PathBuf, Value> {
                 &candidate,
             ));
         }
+        if denied_secret_path(&real) {
+            return Err(fail(
+                "secret_path_denied",
+                "text transfer refuses secret-like paths",
+                &candidate,
+            ));
+        }
         return Ok(real);
     }
     let parent = candidate.parent().ok_or_else(|| {
@@ -282,7 +296,15 @@ fn safe_home_path(input: &str, allow_missing: bool) -> Result<PathBuf, Value> {
             &candidate,
         )
     })?;
-    Ok(parent_real.join(name))
+    let resolved = parent_real.join(name);
+    if denied_secret_path(&resolved) {
+        return Err(fail(
+            "secret_path_denied",
+            "text transfer refuses secret-like paths",
+            &candidate,
+        ));
+    }
+    Ok(resolved)
 }
 
 fn backup_name(path: &Path) -> PathBuf {
