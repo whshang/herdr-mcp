@@ -1203,6 +1203,7 @@ fn extension_browser_source_turn_observe(
     let relayed_source_turn_candidate = store
         .relayed_source_turn_candidate(
             &session_ref,
+            state.local_device_id.as_deref(),
             observed_at,
             mcp::RELAYED_SOURCE_TURN_DEFAULT_TTL_MS,
         )
@@ -1210,6 +1211,7 @@ fn extension_browser_source_turn_observe(
         .flatten()
         .unwrap_or_else(|| {
             json!({
+                "owning_device_id": state.local_device_id.as_deref(),
                 "session_ref": session_ref,
                 "endpoint_ref": session.endpoint_ref,
                 "provider": session.provider,
@@ -3163,11 +3165,15 @@ fn trusted_edge_webchat_control_grants(
     let mut grants = Vec::with_capacity(items.len());
     for item in items {
         let object = item.as_object().ok_or(())?;
-        // account_ref is optional: provider-scoped grants may omit it.
-        if !(object.len() == 3 || object.len() == 2)
-            || !object.contains_key("endpoint_ref")
+        // account_ref and device_id are optional: provider-scoped grants may
+        // omit account_ref, and cross-device grants include device_id.
+        const ALLOWED_GRANT_KEYS: &[&str] =
+            &["endpoint_ref", "provider", "account_ref", "device_id"];
+        if !object.contains_key("endpoint_ref")
             || !object.contains_key("provider")
-            || (object.len() == 3 && !object.contains_key("account_ref"))
+            || object
+                .keys()
+                .any(|key| !ALLOWED_GRANT_KEYS.contains(&key.as_str()))
         {
             return Err(());
         }
@@ -3179,6 +3185,13 @@ fn trusted_edge_webchat_control_grants(
         let account_ref = match object.get("account_ref") {
             None => crate::mcp::WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
             Some(value) => value.as_str().ok_or(())?,
+        };
+        let device_id = match object.get("device_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(raw)) if valid_browser_grant_ref(raw, 128) && raw == raw.trim() => {
+                Some(raw.clone())
+            }
+            _ => return Err(()),
         };
         // A wildcard endpoint is not per-endpoint authority. A pre-#713 Edge
         // still derives the `*/*/*` tuple from a wildcard Page Assist row, so
@@ -3199,6 +3212,7 @@ fn trusted_edge_webchat_control_grants(
             endpoint_ref: endpoint_ref.to_owned(),
             provider: provider.to_owned(),
             account_ref: account_ref.to_owned(),
+            device_id,
         });
     }
     Ok(grants)
@@ -11168,6 +11182,10 @@ mod tests {
         let observe_json: Value = serde_json::from_slice(&observe_body).unwrap();
         assert_eq!(observe_json["ok"], true);
         let candidate = &observe_json["relayed_source_turn_candidate"];
+        assert_eq!(
+            candidate["owning_device_id"],
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
         assert_eq!(candidate["session_ref"], local_observed_session);
         assert_eq!(
             candidate["user_text_sha256"],
@@ -11202,7 +11220,12 @@ mod tests {
             ),
             (
                 "x-herdr-edge-webchat-control-grants",
-                json!([{"endpoint_ref": "bep_remote_air", "provider": "chatgpt"}]).to_string(),
+                json!([{
+                    "endpoint_ref": "bep_remote_air",
+                    "provider": "chatgpt",
+                    "device_id": owning_device_id,
+                }])
+                .to_string(),
             ),
             (
                 "x-herdr-edge-caller-browser-on-other-device",
@@ -11400,6 +11423,35 @@ mod tests {
         .await;
         assert_eq!(missing_grant["parent_session"]["bound"], false);
         assert_eq!(missing_grant["parent_session"]["reason"], "grant_missing");
+
+        // Grant without device_id or with a mismatched device_id must also fail closed as grant_missing
+        let mut wrong_device_grant_headers = cross_headers.clone();
+        wrong_device_grant_headers.retain(|(k, _)| *k != "x-herdr-edge-webchat-control-grants");
+        wrong_device_grant_headers.push((
+            "x-herdr-edge-webchat-control-grants",
+            json!([
+                {"endpoint_ref": "bep_remote_air", "provider": "chatgpt"},
+                {"endpoint_ref": "bep_remote_air", "provider": "chatgpt", "device_id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FB0"}
+            ])
+            .to_string(),
+        ));
+        let wrong_device_grant = webchat_tool_call(
+            app.clone(),
+            &wrong_device_grant_headers,
+            "herdr_mcp.agent.task.dispatch",
+            json!({
+                "target": "w1:p1",
+                "text": "wrong device grant",
+                "idempotency_key": "cross-dev-dispatch-wrong-dev-grant",
+                "current_user_message": turn_text,
+            }),
+        )
+        .await;
+        assert_eq!(wrong_device_grant["parent_session"]["bound"], false);
+        assert_eq!(
+            wrong_device_grant["parent_session"]["reason"],
+            "grant_missing"
+        );
 
         // 6. N-1 fallback: caller_browser_on_other_device == true with NO relayed_source_turn
         let n_minus_1 = webchat_tool_call(

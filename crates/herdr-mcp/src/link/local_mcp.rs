@@ -67,7 +67,7 @@ const EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER: &str =
     "x-herdr-edge-caller-browser-on-other-device";
 const EDGE_RELAYED_SOURCE_TURN_HEADER: &str = "x-herdr-edge-relayed-source-turn";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
-const MAX_RELAYED_SOURCE_TURN_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+const MAX_RELAYED_SOURCE_TURN_TTL_MS: i64 = crate::mcp::RELAYED_SOURCE_TURN_MAX_TTL_MS;
 const LOCAL_MCP_MIN_FRAME_BYTES: usize = 64;
 const LOCAL_MCP_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -375,10 +375,14 @@ impl LocalMcpTransport {
         let mut normalized = Vec::with_capacity(items.len());
         for item in items {
             let object = item.as_object().ok_or(())?;
-            if object.len() != 3
-                || !object.contains_key("endpoint_ref")
+            const ALLOWED_GRANT_KEYS: &[&str] =
+                &["endpoint_ref", "provider", "account_ref", "device_id"];
+            if !object.contains_key("endpoint_ref")
                 || !object.contains_key("provider")
                 || !object.contains_key("account_ref")
+                || object
+                    .keys()
+                    .any(|key| !ALLOWED_GRANT_KEYS.contains(&key.as_str()))
             {
                 return Err(());
             }
@@ -391,6 +395,13 @@ impl LocalMcpTransport {
                 .get("account_ref")
                 .and_then(Value::as_str)
                 .ok_or(())?;
+            let device_id = match object.get("device_id") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(raw)) if valid_grant_ref(raw, 128) && raw == raw.trim() => {
+                    Some(raw.as_str())
+                }
+                _ => return Err(()),
+            };
             // A wildcard endpoint is not per-endpoint authority. A pre-#713
             // Edge derives the `*/*/*` tuple from a wildcard Page Assist row,
             // so drop the row here rather than forwarding it as device scope.
@@ -405,11 +416,17 @@ impl LocalMcpTransport {
             {
                 return Err(());
             }
-            normalized.push(json!({
+            let mut grant_obj = json!({
                 "endpoint_ref": endpoint_ref,
                 "provider": provider,
                 "account_ref": account_ref,
-            }));
+            });
+            if let Some(dev_id) = device_id
+                && let Some(map) = grant_obj.as_object_mut()
+            {
+                map.insert("device_id".to_owned(), json!(dev_id));
+            }
+            normalized.push(grant_obj);
         }
         serde_json::to_string(&normalized).map(Some).map_err(|_| ())
     }

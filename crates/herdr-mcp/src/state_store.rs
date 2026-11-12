@@ -4923,8 +4923,8 @@ impl StateStore {
                     task_id, parent_session_ref, parent_session_device_id, updated_at
                  ) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(task_id) DO UPDATE SET
-                    parent_session_ref = COALESCE(excluded.parent_session_ref, agent_tasks.parent_session_ref),
-                    parent_session_device_id = COALESCE(excluded.parent_session_device_id, agent_tasks.parent_session_device_id),
+                    parent_session_ref = COALESCE(agent_tasks.parent_session_ref, excluded.parent_session_ref),
+                    parent_session_device_id = COALESCE(agent_tasks.parent_session_device_id, excluded.parent_session_device_id),
                     updated_at = MAX(agent_tasks.updated_at, excluded.updated_at)",
                 params![
                     task_id,
@@ -4974,9 +4974,15 @@ impl StateStore {
     /// Build a non-secret `relayed_source_turn_candidate` metadata projection for
     /// one observed browser session turn so Phase 2 Edge relay (#775) can forward
     /// bounded digest evidence without raw prompt text.
+    ///
+    /// `owning_device_id` is populated from the local device's configured
+    /// `edge_device_id` (or the registered browser endpoint's `device_id`); when
+    /// neither is configured locally it is set to `null` so Edge can populate it
+    /// from the authenticated source-device Link session.
     pub fn relayed_source_turn_candidate(
         &mut self,
         session_ref: &str,
+        owning_device_id: Option<&str>,
         now_ms: i64,
         ttl_ms: i64,
     ) -> Result<Option<serde_json::Value>, String> {
@@ -4992,9 +4998,11 @@ impl StateStore {
                         s.expected_generation,
                         CASE WHEN s.canonical_user_text_sha256 = s.user_text_sha256
                              THEN s.user_text_sha256 ELSE '' END,
-                        s.observed_at
+                        s.observed_at,
+                        e.device_id
                  FROM browser_resources r
                  JOIN browser_source_turns s ON s.session_ref = r.resource_ref
+                 LEFT JOIN browser_endpoints e ON e.endpoint_ref = r.endpoint_ref
                  WHERE r.resource_ref = ?1 AND r.kind = 'session' AND s.observed_at <= ?2",
                 params![session_ref, now_ms],
                 |row| {
@@ -5005,6 +5013,7 @@ impl StateStore {
                         row.get::<_, i64>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
@@ -5017,6 +5026,7 @@ impl StateStore {
             expected_generation,
             user_text_sha256,
             observed_at,
+            endpoint_device_id,
         )) = row
         else {
             return Ok(None);
@@ -5028,7 +5038,16 @@ impl StateStore {
         if now_ms > expires_at {
             return Ok(None);
         }
+        let resolved_owning_device_id =
+            owning_device_id
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    endpoint_device_id
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                });
         Ok(Some(serde_json::json!({
+            "owning_device_id": resolved_owning_device_id,
             "session_ref": session_ref,
             "endpoint_ref": endpoint_ref,
             "provider": provider,
@@ -16053,6 +16072,19 @@ mod tests {
                 .agent_task_parent_session_device_id("task_cross_device")
                 .unwrap(),
             Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned())
+        );
+        // Subsequent unbound or different write must never overwrite an existing bound parent session with NULL
+        store
+            .record_agent_task_parent_session("task_cross_device", None, None, 300)
+            .unwrap();
+        assert_eq!(
+            store
+                .agent_task_parent_session("task_cross_device")
+                .unwrap(),
+            Some((
+                Some("br_remote_session".to_owned()),
+                Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned())
+            ))
         );
 
         // Cross-device caller-session binding and conflict fencing

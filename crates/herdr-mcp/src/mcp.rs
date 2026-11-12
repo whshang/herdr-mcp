@@ -74,11 +74,12 @@ const SUPPORTED_VERSIONS: [&str; 5] = [
 const BROWSER_ADAPTER_PROTOCOL_VERSION: i64 = 1;
 const BROWSER_ACCOUNT_MUTATION_RETRY_AFTER_MS: i64 = 250;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BrowserCallerGrant {
     pub endpoint_ref: String,
     pub provider: String,
     pub account_ref: String,
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +149,7 @@ pub struct BrowserCallerSessionIdentity {
 }
 
 pub const RELAYED_SOURCE_TURN_DEFAULT_TTL_MS: i64 = 10 * 60 * 1000;
-pub const RELAYED_SOURCE_TURN_MAX_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+pub const RELAYED_SOURCE_TURN_MAX_TTL_MS: i64 = 10 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayedSourceTurnEvidence {
@@ -573,7 +574,9 @@ fn explicit_agent_task_parent_session(
                     )
                 && existing_ref == session_ref
                 && context.caller_webchat_control_grants.iter().any(|grant| {
-                    grant.endpoint_ref != WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
+                    grant.device_id.as_deref() == Some(owning_device_id.as_str())
+                        && !grant.endpoint_ref.is_empty()
+                        && grant.endpoint_ref != WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
                         && (grant.provider == caller_session.provider
                             || grant.provider == WEBCHAT_CONTROL_ANY_PROVIDER)
                 })
@@ -653,6 +656,9 @@ fn relayed_source_turn_grant_covers(
     grant: &BrowserCallerGrant,
     relayed: &RelayedSourceTurnEvidence,
 ) -> bool {
+    if grant.device_id.as_deref() != Some(relayed.owning_device_id.as_str()) {
+        return false;
+    }
     if grant.endpoint_ref.is_empty() || grant.endpoint_ref == WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT
     {
         return false;
@@ -858,18 +864,30 @@ fn record_and_enrich_dispatched_agent_task_parent_session(
     parent_session_ref: Option<&str>,
     parent_session_device_id: Option<&str>,
     result: &mut Value,
-) {
-    if let Some(task_id) = result.pointer("/task/task_id").and_then(Value::as_str)
-        && let Ok(mut store) = context.state_store.lock()
-    {
-        let _ = store.record_agent_task_parent_session(
-            task_id,
-            parent_session_ref,
-            parent_session_device_id,
-            browser_epoch_ms(),
-        );
+) -> Result<(), ()> {
+    if let Some(task_id) = result.pointer("/task/task_id").and_then(Value::as_str) {
+        let Ok(mut store) = context.state_store.lock() else {
+            return if parent_session_ref.is_some() {
+                Err(())
+            } else {
+                Ok(())
+            };
+        };
+        if store
+            .record_agent_task_parent_session(
+                task_id,
+                parent_session_ref,
+                parent_session_device_id,
+                browser_epoch_ms(),
+            )
+            .is_err()
+            && parent_session_ref.is_some()
+        {
+            return Err(());
+        }
     }
     enrich_agent_task_parent_session_device_id(context, result);
+    Ok(())
 }
 
 pub(crate) fn enrich_agent_task_parent_session_device_id_from_store(
@@ -1418,12 +1436,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     .get("idempotency_key")
                     .and_then(Value::as_str)
                     .is_some_and(|key| context.prompt.dispatch_key_already_known(key));
-                let binding = if replayed {
+                let mut binding = if replayed {
                     AgentTaskParentSession::Replay
                 } else {
                     agent_task_dispatch_parent_session(context, &params)
                 };
-                let (parent_session_ref, parent_session_device_id) = match &binding {
+                let (mut parent_session_ref, parent_session_device_id) = match &binding {
                     AgentTaskParentSession::Bound(session_ref) => (Some(session_ref.clone()), None),
                     AgentTaskParentSession::BoundCrossDevice {
                         session_ref,
@@ -1454,13 +1472,20 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 );
                 if matches!(binding, AgentTaskParentSession::Replay) {
                     enrich_agent_task_parent_session_device_id(context, &mut result);
-                } else {
-                    record_and_enrich_dispatched_agent_task_parent_session(
-                        context,
-                        parent_session_ref.as_deref(),
-                        parent_session_device_id.as_deref(),
-                        &mut result,
-                    );
+                } else if record_and_enrich_dispatched_agent_task_parent_session(
+                    context,
+                    parent_session_ref.as_deref(),
+                    parent_session_device_id.as_deref(),
+                    &mut result,
+                )
+                .is_err()
+                {
+                    binding = AgentTaskParentSession::Unbound("binding_failed");
+                    parent_session_ref = None;
+                    if let Some(Value::Object(task_obj)) = result.get_mut("task") {
+                        task_obj.insert("parent_session_ref".to_owned(), Value::Null);
+                        task_obj.remove("parent_session_device_id");
+                    }
                 }
                 // #834: a durable dispatch binding also owns a durable continuity
                 // chain, so 接力 works without a separate explicit panel bind.
@@ -1664,7 +1689,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             }
         }
         "herdr_prompt" => {
-            let (parent_session_ref, parent_session_device_id) =
+            let (mut parent_session_ref, parent_session_device_id) =
                 match prompt_parent_session_qualified(context) {
                     Some((session_ref, device_id)) => (Some(session_ref), device_id),
                     None => (None, None),
@@ -1680,13 +1705,19 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             // Mirror the dispatch branch: replays only read/enrich existing rows.
             if result.get("idempotent_replay").and_then(Value::as_bool) == Some(true) {
                 enrich_agent_task_parent_session_device_id(context, &mut result);
-            } else {
-                record_and_enrich_dispatched_agent_task_parent_session(
-                    context,
-                    parent_session_ref.as_deref(),
-                    parent_session_device_id.as_deref(),
-                    &mut result,
-                );
+            } else if record_and_enrich_dispatched_agent_task_parent_session(
+                context,
+                parent_session_ref.as_deref(),
+                parent_session_device_id.as_deref(),
+                &mut result,
+            )
+            .is_err()
+            {
+                parent_session_ref = None;
+                if let Some(Value::Object(task_obj)) = result.get_mut("task") {
+                    task_obj.insert("parent_session_ref".to_owned(), Value::Null);
+                    task_obj.remove("parent_session_device_id");
+                }
             }
             // #770: a WebChat caller must never be left silently unbound. The
             // fact is added to the unchanged prompt result; it never changes
@@ -8907,6 +8938,7 @@ fn browser_test_grants(
             endpoint_ref: resource.endpoint_ref,
             provider: resource.provider,
             account_ref: resource.resource_ref,
+            device_id: None,
         })
         .collect()
 }
@@ -15764,6 +15796,7 @@ mod tests {
             endpoint_ref: initial_session.endpoint_ref.clone(),
             provider: "chatgpt".to_owned(),
             account_ref: initial_account_ref.clone(),
+            device_id: None,
         }];
         let authorization = BrowserCallerAuthorization {
             principal_ref: "connector:conn_current_chat_test".to_owned(),
@@ -20149,6 +20182,7 @@ mod tests {
             endpoint_ref: format!("be_{}", "9".repeat(64)),
             provider: "chatgpt".to_owned(),
             account_ref: account_ref.clone(),
+            device_id: None,
         }];
         assert_ne!(other_endpoint_grants[0].endpoint_ref, endpoint_ref);
         let wrong_endpoint = browser_operation_call_with_grants(
@@ -22680,6 +22714,7 @@ mod tests {
                 endpoint_ref: endpoint_ref.clone(),
                 provider: "gemini".to_owned(),
                 account_ref: gemini_account.resource_ref.clone(),
+                device_id: None,
             }];
             (gemini_session.resource_ref, grants)
         };
@@ -23876,6 +23911,7 @@ mod tests {
             endpoint_ref: endpoint_a.clone(),
             provider: "chatgpt".to_owned(),
             account_ref: account_a.clone(),
+            device_id: None,
         }];
         assert_eq!(
             browser_resource_actuation_decision(
@@ -25645,6 +25681,7 @@ mod tests {
             endpoint_ref: endpoint_ref.clone(),
             provider: "grok".to_owned(),
             account_ref: format!("br_{}", "e".repeat(64)),
+            device_id: None,
         }];
         let wrong_account = browser_operation_call_with_grants(
             &store,
@@ -25660,6 +25697,7 @@ mod tests {
             endpoint_ref: endpoint_ref.clone(),
             provider: "chatgpt".to_owned(),
             account_ref: account_ref.clone(),
+            device_id: None,
         }];
         let inspect = browser_operation_call_with_grants(
             &store,
@@ -25886,6 +25924,7 @@ mod tests {
             endpoint_ref: endpoint_ref.clone(),
             provider: "missing-provider".to_owned(),
             account_ref: unknown_resource_ref,
+            device_id: None,
         }];
         let capability_unknown = browser_resource_actuation_decision(
             &store.lock().unwrap(),
@@ -25997,6 +26036,7 @@ mod tests {
             endpoint_ref: endpoint.endpoint_ref.clone(),
             provider: "chatgpt".to_owned(),
             account_ref,
+            device_id: None,
         }];
         assert_eq!(
             browser_resource_actuation_decision(
@@ -30573,19 +30613,26 @@ mod webchat_control_provider_scope_tests {
             endpoint_ref: endpoint.to_owned(),
             provider: provider.to_owned(),
             account_ref: account.to_owned(),
+            device_id: None,
         }
     }
 
-    /// user owner | Given a relayed cross-device turn that omits its owning endpoint | When only a same-provider local-endpoint grant exists | Then the grant never covers the owning device
+    /// user owner | Given a relayed cross-device turn that omits its owning endpoint or device grant | When only a same-provider local-endpoint grant exists | Then the grant never covers the owning device
     #[test]
     fn relayed_source_turn_grant_requires_owning_endpoint_evidence() {
+        let owning_device = "dev_01M1E4VF6VGXAMGD0CN9WE8N7M";
         let local_grant = grant(
             "bep_local_device",
             "chatgpt",
             WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
         );
+        let mut owning_device_grant = local_grant.clone();
+        owning_device_grant.device_id = Some(owning_device.to_owned());
+        let mut wrong_device_grant = local_grant.clone();
+        wrong_device_grant.device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned());
+
         let relayed = |endpoint: Option<&str>, provider: &str| RelayedSourceTurnEvidence {
-            owning_device_id: "dev_01M1E4VF6VGXAMGD0CN9WE8N7M".to_owned(),
+            owning_device_id: owning_device.to_owned(),
             session_ref: "br_remote_927".to_owned(),
             user_text_sha256: "a".repeat(64),
             expected_generation: 3,
@@ -30598,25 +30645,35 @@ mod webchat_control_provider_scope_tests {
         // Omitted endpoint evidence cannot be tied to the owning device: the
         // unrelated local grant must not be promoted to owning-device evidence.
         assert!(!relayed_source_turn_grant_covers(
-            &local_grant,
+            &owning_device_grant,
             &relayed(None, "chatgpt")
         ));
-        // An explicitly different endpoint is likewise denied.
+        // A grant without device_id or with a mismatched device_id is denied even when endpoint matches.
         assert!(!relayed_source_turn_grant_covers(
-            &local_grant,
-            &relayed(Some("bep_remote_927"), "chatgpt")
-        ));
-        // The matching owning endpoint still authorizes the same provider.
-        assert!(relayed_source_turn_grant_covers(
             &local_grant,
             &relayed(Some("bep_local_device"), "chatgpt")
         ));
-        // A provider-scoped any-provider grant must match the endpoint too.
-        let any_provider = grant(
+        assert!(!relayed_source_turn_grant_covers(
+            &wrong_device_grant,
+            &relayed(Some("bep_local_device"), "chatgpt")
+        ));
+        // An explicitly different endpoint is likewise denied.
+        assert!(!relayed_source_turn_grant_covers(
+            &owning_device_grant,
+            &relayed(Some("bep_remote_927"), "chatgpt")
+        ));
+        // The matching owning device + endpoint authorizes the same provider.
+        assert!(relayed_source_turn_grant_covers(
+            &owning_device_grant,
+            &relayed(Some("bep_local_device"), "chatgpt")
+        ));
+        // A provider-scoped any-provider grant must match both owning_device_id and endpoint.
+        let mut any_provider = grant(
             "bep_local_device",
             WEBCHAT_CONTROL_ANY_PROVIDER,
             WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
         );
+        any_provider.device_id = Some(owning_device.to_owned());
         assert!(!relayed_source_turn_grant_covers(
             &any_provider,
             &relayed(None, "chatgpt")
@@ -30625,12 +30682,17 @@ mod webchat_control_provider_scope_tests {
             &any_provider,
             &relayed(Some("bep_remote_927"), "chatgpt")
         ));
+        assert!(relayed_source_turn_grant_covers(
+            &any_provider,
+            &relayed(Some("bep_local_device"), "chatgpt")
+        ));
         // Device-scope grants never authorize a relayed cross-device turn.
-        let device_scope = grant(
+        let mut device_scope = grant(
             WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT,
             WEBCHAT_CONTROL_ANY_PROVIDER,
             "acct_local",
         );
+        device_scope.device_id = Some(owning_device.to_owned());
         assert!(!relayed_source_turn_grant_covers(
             &device_scope,
             &relayed(Some(WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT), "chatgpt")
