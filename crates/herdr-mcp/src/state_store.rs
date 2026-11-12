@@ -4923,8 +4923,8 @@ impl StateStore {
                     task_id, parent_session_ref, parent_session_device_id, updated_at
                  ) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(task_id) DO UPDATE SET
-                    parent_session_ref = excluded.parent_session_ref,
-                    parent_session_device_id = excluded.parent_session_device_id,
+                    parent_session_ref = COALESCE(excluded.parent_session_ref, agent_tasks.parent_session_ref),
+                    parent_session_device_id = COALESCE(excluded.parent_session_device_id, agent_tasks.parent_session_device_id),
                     updated_at = MAX(agent_tasks.updated_at, excluded.updated_at)",
                 params![
                     task_id,

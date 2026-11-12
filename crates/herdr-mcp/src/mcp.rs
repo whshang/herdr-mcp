@@ -657,9 +657,14 @@ fn relayed_source_turn_grant_covers(
     {
         return false;
     }
-    if let Some(endpoint_ref) = relayed.endpoint_ref.as_deref()
-        && grant.endpoint_ref != endpoint_ref
-    {
+    // #921: the relayed turn must name the endpoint that owns it. Without that
+    // evidence a grant cannot be tied to `owning_device_id`, so a same-provider
+    // grant for an unrelated (for example local) device must never be promoted
+    // to owning-device authorization. Missing endpoint evidence fails closed.
+    let Some(relayed_endpoint_ref) = relayed.endpoint_ref.as_deref() else {
+        return false;
+    };
+    if relayed_endpoint_ref.is_empty() || grant.endpoint_ref != relayed_endpoint_ref {
         return false;
     }
     grant.provider == relayed.provider || grant.provider == WEBCHAT_CONTROL_ANY_PROVIDER
@@ -1670,12 +1675,19 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 &arguments,
                 parent_session_ref.as_deref(),
             );
-            record_and_enrich_dispatched_agent_task_parent_session(
-                context,
-                parent_session_ref.as_deref(),
-                parent_session_device_id.as_deref(),
-                &mut result,
-            );
+            // #921: a replay carries this call's (possibly empty) browser
+            // context, which must never overwrite the durable parent session.
+            // Mirror the dispatch branch: replays only read/enrich existing rows.
+            if result.get("idempotent_replay").and_then(Value::as_bool) == Some(true) {
+                enrich_agent_task_parent_session_device_id(context, &mut result);
+            } else {
+                record_and_enrich_dispatched_agent_task_parent_session(
+                    context,
+                    parent_session_ref.as_deref(),
+                    parent_session_device_id.as_deref(),
+                    &mut result,
+                );
+            }
             // #770: a WebChat caller must never be left silently unbound. The
             // fact is added to the unchanged prompt result; it never changes
             // `ok` and never fails the prompt.
@@ -30562,6 +30574,67 @@ mod webchat_control_provider_scope_tests {
             provider: provider.to_owned(),
             account_ref: account.to_owned(),
         }
+    }
+
+    /// user owner | Given a relayed cross-device turn that omits its owning endpoint | When only a same-provider local-endpoint grant exists | Then the grant never covers the owning device
+    #[test]
+    fn relayed_source_turn_grant_requires_owning_endpoint_evidence() {
+        let local_grant = grant(
+            "bep_local_device",
+            "chatgpt",
+            WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+        );
+        let relayed = |endpoint: Option<&str>, provider: &str| RelayedSourceTurnEvidence {
+            owning_device_id: "dev_01M1E4VF6VGXAMGD0CN9WE8N7M".to_owned(),
+            session_ref: "br_remote_927".to_owned(),
+            user_text_sha256: "a".repeat(64),
+            expected_generation: 3,
+            observed_at: 1_000,
+            expires_at: 61_000,
+            provider: provider.to_owned(),
+            endpoint_ref: endpoint.map(str::to_owned),
+        };
+
+        // Omitted endpoint evidence cannot be tied to the owning device: the
+        // unrelated local grant must not be promoted to owning-device evidence.
+        assert!(!relayed_source_turn_grant_covers(
+            &local_grant,
+            &relayed(None, "chatgpt")
+        ));
+        // An explicitly different endpoint is likewise denied.
+        assert!(!relayed_source_turn_grant_covers(
+            &local_grant,
+            &relayed(Some("bep_remote_927"), "chatgpt")
+        ));
+        // The matching owning endpoint still authorizes the same provider.
+        assert!(relayed_source_turn_grant_covers(
+            &local_grant,
+            &relayed(Some("bep_local_device"), "chatgpt")
+        ));
+        // A provider-scoped any-provider grant must match the endpoint too.
+        let any_provider = grant(
+            "bep_local_device",
+            WEBCHAT_CONTROL_ANY_PROVIDER,
+            WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+        );
+        assert!(!relayed_source_turn_grant_covers(
+            &any_provider,
+            &relayed(None, "chatgpt")
+        ));
+        assert!(!relayed_source_turn_grant_covers(
+            &any_provider,
+            &relayed(Some("bep_remote_927"), "chatgpt")
+        ));
+        // Device-scope grants never authorize a relayed cross-device turn.
+        let device_scope = grant(
+            WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT,
+            WEBCHAT_CONTROL_ANY_PROVIDER,
+            "acct_local",
+        );
+        assert!(!relayed_source_turn_grant_covers(
+            &device_scope,
+            &relayed(Some(WEBCHAT_CONTROL_DEVICE_SCOPE_ENDPOINT), "chatgpt")
+        ));
     }
 
     /// user owner | Given a provider-scoped grant (`*`) for endpoint+grok | When any Grok account on that endpoint is controlled | Then the grant authorizes it

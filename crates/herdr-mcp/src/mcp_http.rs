@@ -11129,13 +11129,14 @@ mod tests {
         let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
+        let store_for_assertions = state.state_store.clone();
         let tcp_state = {
             let mut s = state.clone();
             s.trusted_extension_ipc = false;
             s
         };
         let app = candidate_router(state);
-        let tcp_app = candidate_router(tcp_state);
+        let tcp_app = candidate_router(tcp_state.clone());
 
         // 1. Verify source_turn.observe returns relayed_source_turn_candidate summary
         let (app, profile_seed, endpoint_ref, account_ref) =
@@ -11274,6 +11275,54 @@ mod tests {
             })
         );
         assert_eq!(replay["task"]["parent_session_device_id"], owning_device_id);
+
+        // 3b. A public TCP herdr_prompt replay carries no browser context; it must
+        // read/enrich the stored parent session instead of overwriting it with NULL.
+        let prompt_replay = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 927,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_prompt",
+                    "arguments": {
+                        "target": "w1:p1",
+                        "text": "run cross-device task",
+                        "idempotency_key": "cross-dev-dispatch-1"
+                    }
+                }
+            })),
+            &[("user-agent", "openai-mcp/1.0.0")],
+        );
+        let response = candidate_router(tcp_state.clone())
+            .oneshot(prompt_replay)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = payload["result"]["content"][0]["text"].as_str().unwrap();
+        let prompt_replay: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(prompt_replay["idempotent_replay"], true, "{prompt_replay}");
+        assert_eq!(prompt_replay["task"]["task_id"], task_id);
+        assert_eq!(
+            prompt_replay["task"]["parent_session_device_id"], owning_device_id,
+            "replay must keep the durable device id"
+        );
+        assert_eq!(
+            store_for_assertions
+                .lock()
+                .unwrap()
+                .agent_task_parent_session(&task_id)
+                .unwrap(),
+            Some((
+                Some(remote_session_ref.to_owned()),
+                Some(owning_device_id.to_owned())
+            )),
+            "a replay without browser context must never erase the stored parent session"
+        );
 
         // 4. agent.task.status exposes parent_session_device_id for the cross-device bound caller
         let status = webchat_tool_call(
