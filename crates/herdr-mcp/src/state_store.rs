@@ -15799,15 +15799,41 @@ mod tests {
     #[test]
     fn mutation_leases_fencing_conflict_expiry_and_v1_1_rollback_compatibility() {
         let path = temp_db_path();
+        // Pre-seed a v16 database with the original 11-column mutation_leases table (before lease_token_sha256)
+        // to prove forward-additive ALTER TABLE migration works seamlessly.
+        {
+            let mut pre_conn = open_connection(Some(&path)).unwrap();
+            migrate(&mut pre_conn).unwrap();
+            pre_conn
+                .execute_batch(
+                    "CREATE TABLE mutation_leases (
+                        project_root TEXT NOT NULL,
+                        lane_key     TEXT NOT NULL DEFAULT '*',
+                        holder_id    TEXT NOT NULL,
+                        lease_epoch  INTEGER NOT NULL,
+                        workspace_id TEXT,
+                        pane_id      TEXT,
+                        branch       TEXT,
+                        acquired_at  INTEGER NOT NULL,
+                        updated_at   INTEGER NOT NULL,
+                        expires_at   INTEGER NOT NULL,
+                        released_at  INTEGER,
+                        PRIMARY KEY (project_root, lane_key),
+                        CHECK (lease_epoch >= 1)
+                    );",
+                )
+                .unwrap();
+        }
         let mut store = StateStore::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
-        // 1. Acquire lease on /repo for holder-a -> epoch 1
+        // 1. Acquire lease on /repo for holder-a -> epoch 1 + unpredictable lease_token
         let acq1 = store
             .acquire_mutation_lease(MutationLeaseAcquireInput {
                 project_root: "/repo",
                 lane_key: None,
                 holder_id: "holder-a",
+                lease_token: None,
                 ttl_seconds: Some(60),
                 workspace_id: Some("w1"),
                 pane_id: Some("w1:p1"),
@@ -15815,23 +15841,51 @@ mod tests {
                 now_ms: 1_000,
             })
             .unwrap();
-        let lease1 = match acq1 {
-            MutationLeaseAcquireOutcome::Acquired { lease, reacquired } => {
+        let (lease1, token1) = match acq1 {
+            MutationLeaseAcquireOutcome::Acquired {
+                lease,
+                lease_token,
+                reacquired,
+            } => {
                 assert!(!reacquired);
                 assert_eq!(lease.lease_epoch, 1);
                 assert_eq!(lease.lane_key, "*");
                 assert_eq!(lease.expires_at, 61_000);
-                lease
+                assert!(lease_token.starts_with("mlt_") && lease_token.len() == 68);
+                (lease, lease_token)
             }
             other => panic!("expected Acquired, got {other:?}"),
         };
 
-        // 2. Idempotent re-acquire by same holder keeps epoch 1 and extends expiry
+        // 2a. Spoofed re-acquire by same holder_id WITHOUT lease_token is rejected as Conflict
+        let spoof_re_acq = store
+            .acquire_mutation_lease(MutationLeaseAcquireInput {
+                project_root: "/repo",
+                lane_key: Some("*"),
+                holder_id: "holder-a",
+                lease_token: None,
+                ttl_seconds: Some(120),
+                workspace_id: None,
+                pane_id: None,
+                branch: None,
+                now_ms: 4_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            spoof_re_acq,
+            MutationLeaseAcquireOutcome::Conflict {
+                reason: "lease_token_required",
+                ..
+            }
+        ));
+
+        // 2b. Idempotent re-acquire by same holder with valid lease_token keeps epoch 1 and extends expiry
         let re_acq = store
             .acquire_mutation_lease(MutationLeaseAcquireInput {
                 project_root: "/repo",
                 lane_key: Some("*"),
                 holder_id: "holder-a",
+                lease_token: Some(&token1),
                 ttl_seconds: Some(120),
                 workspace_id: None,
                 pane_id: None,
@@ -15840,11 +15894,16 @@ mod tests {
             })
             .unwrap();
         match re_acq {
-            MutationLeaseAcquireOutcome::Acquired { lease, reacquired } => {
+            MutationLeaseAcquireOutcome::Acquired {
+                lease,
+                lease_token,
+                reacquired,
+            } => {
                 assert!(reacquired);
                 assert_eq!(lease.lease_epoch, 1);
                 assert_eq!(lease.expires_at, 125_000);
                 assert_eq!(lease.workspace_id.as_deref(), Some("w1"));
+                assert_eq!(lease_token, token1);
             }
             other => panic!("expected reacquired, got {other:?}"),
         }
@@ -15855,6 +15914,7 @@ mod tests {
                 project_root: "/repo",
                 lane_key: None,
                 holder_id: "holder-b",
+                lease_token: None,
                 ttl_seconds: Some(60),
                 workspace_id: Some("w2"),
                 pane_id: None,
@@ -15863,7 +15923,11 @@ mod tests {
             })
             .unwrap();
         match conflict {
-            MutationLeaseAcquireOutcome::Conflict { active_lease } => {
+            MutationLeaseAcquireOutcome::Conflict {
+                reason,
+                active_lease,
+            } => {
+                assert_eq!(reason, "lease_held_by_other");
                 assert_eq!(active_lease.holder_id, "holder-a");
                 assert_eq!(active_lease.lease_epoch, 1);
                 assert_eq!(active_lease.workspace_id.as_deref(), Some("w1"));
@@ -15871,13 +15935,14 @@ mod tests {
             other => panic!("expected Conflict, got {other:?}"),
         }
 
-        // 4. Renew fenced on (holder_id, lease_epoch)
+        // 4. Renew fenced on (holder_id, lease_epoch, lease_token)
         let renew_wrong_holder = store
             .renew_mutation_lease(MutationLeaseRenewInput {
                 project_root: "/repo",
                 lane_key: None,
                 holder_id: "holder-b",
                 lease_epoch: 1,
+                lease_token: Some(&token1),
                 ttl_seconds: Some(60),
                 now_ms: 20_000,
             })
@@ -15890,27 +15955,49 @@ mod tests {
             }
         ));
 
+        let renew_missing_token = store
+            .renew_mutation_lease(MutationLeaseRenewInput {
+                project_root: "/repo",
+                lane_key: None,
+                holder_id: "holder-a",
+                lease_epoch: 1,
+                lease_token: None,
+                ttl_seconds: Some(60),
+                now_ms: 20_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            renew_missing_token,
+            MutationLeaseRenewOutcome::Conflict {
+                reason: "lease_token_required",
+                ..
+            }
+        ));
+
         let renew_ok = store
             .renew_mutation_lease(MutationLeaseRenewInput {
                 project_root: "/repo",
                 lane_key: None,
                 holder_id: "holder-a",
                 lease_epoch: 1,
+                lease_token: Some(&token1),
                 ttl_seconds: Some(60),
                 now_ms: 100_000,
             })
             .unwrap();
         assert!(matches!(
             renew_ok,
-            MutationLeaseRenewOutcome::Renewed(ref r) if r.expires_at == 160_000 && r.lease_epoch == 1
+            MutationLeaseRenewOutcome::Renewed { ref lease, ref lease_token }
+                if lease.expires_at == 160_000 && lease.lease_epoch == 1 && lease_token == &token1
         ));
 
-        // 5. Expiry releases lease; next acquire advances monotonic lease_epoch to 2
+        // 5. Expiry releases lease; next acquire advances monotonic lease_epoch to 2 and rotates token
         let acq2 = store
             .acquire_mutation_lease(MutationLeaseAcquireInput {
                 project_root: "/repo",
                 lane_key: None,
                 holder_id: "holder-b",
+                lease_token: None,
                 ttl_seconds: Some(30),
                 workspace_id: Some("w2"),
                 pane_id: Some("w2:p1"),
@@ -15918,14 +16005,20 @@ mod tests {
                 now_ms: 160_001,
             })
             .unwrap();
-        match acq2 {
-            MutationLeaseAcquireOutcome::Acquired { lease, reacquired } => {
+        let token2 = match acq2 {
+            MutationLeaseAcquireOutcome::Acquired {
+                lease,
+                lease_token,
+                reacquired,
+            } => {
                 assert!(!reacquired);
                 assert_eq!(lease.holder_id, "holder-b");
                 assert_eq!(lease.lease_epoch, 2);
+                assert_ne!(lease_token, token1);
+                lease_token
             }
             other => panic!("expected Acquired epoch 2, got {other:?}"),
-        }
+        };
 
         // Stale holder-a at epoch 1 is fenced out of renew, release, and root path check
         let stale_check = store
@@ -15933,6 +16026,7 @@ mod tests {
                 "/repo/src/lib.rs",
                 Some("holder-a"),
                 Some(lease1.lease_epoch),
+                Some(&token1),
                 false,
                 165_000,
             )
@@ -15945,12 +16039,88 @@ mod tests {
             } if active_lease.holder_id == "holder-b" && active_lease.lease_epoch == 2
         ));
 
-        // Active holder-b with epoch 2 is allowed
+        // Path traversal (`/repo/sub/../src/lib.rs`) and unnormalizable path (`""`) fail closed!
+        let dotdot_check = store
+            .check_root_mutation_lease_for_path(
+                "/repo/sub/../src/lib.rs",
+                None,
+                None,
+                None,
+                false,
+                165_000,
+            )
+            .unwrap();
+        assert!(matches!(
+            dotdot_check,
+            MutationLeaseEnforcementVerdict::Conflict {
+                reason: "lease_credentials_required",
+                ref active_lease,
+            } if active_lease.holder_id == "holder-b" && active_lease.lease_epoch == 2
+        ));
+
+        let empty_path_check = store
+            .check_root_mutation_lease_for_path(
+                "",
+                Some("holder-b"),
+                Some(2),
+                Some(&token2),
+                false,
+                165_000,
+            )
+            .unwrap();
+        assert!(matches!(
+            empty_path_check,
+            MutationLeaseEnforcementVerdict::Conflict {
+                reason: "lease_target_path_invalid",
+                ..
+            }
+        ));
+
+        // Session-bound caller without lease_epoch is fenced out (P2 fix)
+        let session_bound_no_epoch = store
+            .check_root_mutation_lease_for_path(
+                "/repo/src/lib.rs",
+                Some("holder-b"),
+                None,
+                Some(&token2),
+                true,
+                165_000,
+            )
+            .unwrap();
+        assert!(matches!(
+            session_bound_no_epoch,
+            MutationLeaseEnforcementVerdict::Conflict {
+                reason: "lease_epoch_required",
+                ..
+            }
+        ));
+
+        // Active holder-b with epoch 2 but wrong token is rejected
+        let wrong_token_check = store
+            .check_root_mutation_lease_for_path(
+                "/repo/src/lib.rs",
+                Some("holder-b"),
+                Some(2),
+                Some(&token1),
+                false,
+                165_000,
+            )
+            .unwrap();
+        assert!(matches!(
+            wrong_token_check,
+            MutationLeaseEnforcementVerdict::Conflict {
+                reason: "lease_token_invalid",
+                ..
+            }
+        ));
+
+        // Active holder-b with epoch 2 AND valid token2 is allowed
         let active_check = store
             .check_root_mutation_lease_for_path(
                 "/repo/src/lib.rs",
                 Some("holder-b"),
                 Some(2),
+                Some(&token2),
                 false,
                 165_000,
             )
@@ -15962,13 +16132,14 @@ mod tests {
             } if m.lease_epoch == 2
         ));
 
-        // Release by holder-b at epoch 2, then re-acquire advances epoch to 3
+        // Release by holder-b at epoch 2 with token2, then re-acquire advances epoch to 3
         let rel = store
             .release_mutation_lease(MutationLeaseReleaseInput {
                 project_root: "/repo",
                 lane_key: None,
                 holder_id: "holder-b",
                 lease_epoch: 2,
+                lease_token: Some(&token2),
                 now_ms: 170_000,
             })
             .unwrap();
@@ -15991,6 +16162,7 @@ mod tests {
                 project_root: "/repo",
                 lane_key: None,
                 holder_id: "holder-a",
+                lease_token: None,
                 ttl_seconds: Some(30),
                 workspace_id: None,
                 pane_id: None,

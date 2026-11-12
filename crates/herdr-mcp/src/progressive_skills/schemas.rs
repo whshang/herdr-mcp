@@ -1109,12 +1109,13 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "source": "herdr_mcp_local",
             "schema_version": 1,
             "access": "mutation",
-            "description": "Acquire or idempotently re-acquire a durable single-writer mutation lease on a canonicalized project_root (and optional lane_key, default '*'). Returns monotonic lease_epoch fencing token; returns single_writer_lease_conflict when held by another active owner.",
+            "description": "Acquire or idempotently re-acquire a durable single-writer mutation lease on a canonicalized project_root (and optional lane_key, default '*'). Returns monotonic lease_epoch fencing token and unpredictable lease_token capability; returns single_writer_lease_conflict when held by another active owner.",
             "params": {
                 "properties": {
                     "project_root": {"type": "string", "maxLength": 4096},
                     "lane_key": {"type": "string", "maxLength": 256, "default": "*"},
                     "holder_id": {"type": "string", "maxLength": 256},
+                    "lease_token": {"type": ["string", "null"], "maxLength": 256},
                     "ttl_seconds": {"type": "integer", "minimum": 10, "maximum": 3600, "default": 300},
                     "workspace_id": {"type": ["string", "null"], "maxLength": 256},
                     "pane_id": {"type": ["string", "null"], "maxLength": 256},
@@ -1129,13 +1130,14 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "source": "herdr_mcp_local",
             "schema_version": 1,
             "access": "mutation",
-            "description": "Extend an active mutation lease fenced on matching holder_id and lease_epoch.",
+            "description": "Extend an active mutation lease fenced on matching holder_id, lease_epoch, and lease_token.",
             "params": {
                 "properties": {
                     "project_root": {"type": "string", "maxLength": 4096},
                     "lane_key": {"type": "string", "maxLength": 256, "default": "*"},
                     "holder_id": {"type": "string", "maxLength": 256},
                     "lease_epoch": {"type": "integer", "minimum": 1},
+                    "lease_token": {"type": "string", "maxLength": 256},
                     "ttl_seconds": {"type": "integer", "minimum": 10, "maximum": 3600, "default": 300}
                 },
                 "required": ["project_root", "lease_epoch"],
@@ -1147,13 +1149,14 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "source": "herdr_mcp_local",
             "schema_version": 1,
             "access": "mutation",
-            "description": "Release an active mutation lease fenced on matching holder_id and lease_epoch.",
+            "description": "Release an active mutation lease fenced on matching holder_id, lease_epoch, and lease_token.",
             "params": {
                 "properties": {
                     "project_root": {"type": "string", "maxLength": 4096},
                     "lane_key": {"type": "string", "maxLength": 256, "default": "*"},
                     "holder_id": {"type": "string", "maxLength": 256},
-                    "lease_epoch": {"type": "integer", "minimum": 1}
+                    "lease_epoch": {"type": "integer", "minimum": 1},
+                    "lease_token": {"type": "string", "maxLength": 256}
                 },
                 "required": ["project_root", "lease_epoch"],
                 "empty": false

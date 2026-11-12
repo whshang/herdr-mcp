@@ -59,6 +59,7 @@ const EDGE_RELAYED_SOURCE_TURN_HEADER: &str = "x-herdr-edge-relayed-source-turn"
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const LEASE_HOLDER_HEADER: &str = "x-herdr-lease-holder";
 const LEASE_EPOCH_HEADER: &str = "x-herdr-lease-epoch";
+const LEASE_TOKEN_HEADER: &str = "x-herdr-lease-token";
 const MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_EDGE_WEBCHAT_AUTHORIZATION_HEADER_BYTES: usize = 1024;
 const MAX_EDGE_BROWSER_CALLER_SESSION_HEADER_BYTES: usize = 1024;
@@ -2937,20 +2938,20 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             );
         }
     };
-    let (caller_lease_holder_id, caller_lease_epoch) = match caller_mutation_lease_headers(&headers)
-    {
-        Ok(pair) => pair,
-        Err(()) => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "error": {"code": -32600, "message": "Invalid mutation lease header context"},
-                    "id": null
-                }),
-            );
-        }
-    };
+    let (caller_lease_holder_id, caller_lease_epoch, caller_lease_token) =
+        match caller_mutation_lease_headers(&headers) {
+            Ok(triple) => triple,
+            Err(()) => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32600, "message": "Invalid mutation lease header context"},
+                        "id": null
+                    }),
+                );
+            }
+        };
     let request: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if !value.is_array() => value,
         Ok(_) => {
@@ -3011,6 +3012,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             caller_relayed_source_turn: caller_relayed_source_turn.as_ref(),
             caller_lease_holder_id: caller_lease_holder_id.as_deref(),
             caller_lease_epoch,
+            caller_lease_token: caller_lease_token.as_deref(),
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
@@ -3480,7 +3482,9 @@ fn trusted_edge_relayed_source_turn(
     }))
 }
 
-fn caller_mutation_lease_headers(headers: &HeaderMap) -> Result<(Option<String>, Option<i64>), ()> {
+type CallerMutationLeaseHeaders = (Option<String>, Option<i64>, Option<String>);
+
+fn caller_mutation_lease_headers(headers: &HeaderMap) -> Result<CallerMutationLeaseHeaders, ()> {
     let holder_id = match headers.get(LEASE_HOLDER_HEADER) {
         None => None,
         Some(raw) => {
@@ -3508,7 +3512,20 @@ fn caller_mutation_lease_headers(headers: &HeaderMap) -> Result<(Option<String>,
             Some(epoch)
         }
     };
-    Ok((holder_id, lease_epoch))
+    let lease_token = match headers.get(LEASE_TOKEN_HEADER) {
+        None => None,
+        Some(raw) => {
+            let text = raw.to_str().map_err(|_| ())?.trim();
+            if text.is_empty()
+                || text.len() > MAX_LEASE_HEADER_BYTES
+                || text.chars().any(char::is_control)
+            {
+                return Err(());
+            }
+            Some(text.to_owned())
+        }
+    };
+    Ok((holder_id, lease_epoch, lease_token))
 }
 
 fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
