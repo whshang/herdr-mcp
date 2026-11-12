@@ -1670,14 +1670,16 @@ fn work_pickup_call(
     if usize::from(worktree.is_some()) + usize::from(project_root.is_some()) > 1 {
         return json!({"ok": false, "code": "work_pickup_params_invalid"});
     }
-    let Ok(store) = store.lock() else {
-        return json!({"ok": false, "code": "work_store_unavailable"});
-    };
 
     if let Some(worktree) = worktree.or(project_root) {
-        let state = match pickup_state(&store, &worktree, project_ref.as_deref()) {
-            Ok(state) => state,
-            Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+        let state = {
+            let Ok(store) = store.lock() else {
+                return json!({"ok": false, "code": "work_store_unavailable"});
+            };
+            match pickup_state(&store, &worktree, project_ref.as_deref()) {
+                Ok(state) => state,
+                Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+            }
         };
         // Only inspect AGENTS.md/CLAUDE.md for a root the relay actually
         // recorded (capture validated it against the topology); never for an
@@ -1700,9 +1702,14 @@ fn work_pickup_call(
     }
     if !candidates.is_empty() {
         let resolved = pickup_resolve_root(snapshot, &candidates);
-        let states = match store.work_states() {
-            Ok(states) => states,
-            Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+        let states = {
+            let Ok(store) = store.lock() else {
+                return json!({"ok": false, "code": "work_store_unavailable"});
+            };
+            match store.work_states() {
+                Ok(states) => states,
+                Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+            }
         };
         // Prefer the topology-resolved root; fall back to the deepest recorded
         // handoff whose worktree contains the caller path (covers folders
@@ -1737,9 +1744,14 @@ fn work_pickup_call(
 
     // No selector at all: list projects that have a handoff so the caller can
     // present them or follow up with worktree/project_root.
-    let states = match store.work_states() {
-        Ok(states) => states,
-        Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+    let states = {
+        let Ok(store) = store.lock() else {
+            return json!({"ok": false, "code": "work_store_unavailable"});
+        };
+        match store.work_states() {
+            Ok(states) => states,
+            Err(_) => return json!({"ok": false, "code": "work_store_unavailable"}),
+        }
     };
     let mut projects = states
         .into_iter()
@@ -14257,6 +14269,44 @@ mod tests {
         assert_eq!(unknown["ok"], true);
         assert_eq!(unknown["handoff_md"], "");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn work_pickup_on_protected_path_does_not_probe_git_or_hold_store_lock() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let protected_wt = home
+            .join("Documents/herdr-mcp-protected-pickup-test")
+            .to_string_lossy()
+            .into_owned();
+        let store =
+            std::sync::Arc::new(std::sync::Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&crate::state_store::work_journal::WorkState {
+                project_ref: "proj_protected".to_owned(),
+                worktree: protected_wt.clone(),
+                handoff_md: "# Handoff\n\n## 当前状态\nin protected folder\n".to_owned(),
+                through_event_id: 9,
+                log_cursors_json: "{}".to_owned(),
+                updated_at: 2_000_000,
+            })
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let response = work_pickup_call(&store, &json!({"worktree": protected_wt}), None);
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["through_event_id"], 9);
+        assert_eq!(response["workspace"], Value::Null);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "work.pickup on protected path took too long: {:?}",
+            started.elapsed()
+        );
+        assert!(store.try_lock().is_ok());
     }
 
     /// Accepted-text evidence a real content script now reports alongside the
