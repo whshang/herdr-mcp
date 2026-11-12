@@ -115,9 +115,15 @@ pub(crate) struct GitContext {
 }
 
 const CHANGED_FILES_MAX: usize = 8;
+/// Budget for one ordinary bounded git query or index/config write. Kept tight so
+/// a single handoff tick cannot stall on a slow repository.
 const WORK_GIT_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
 const WORK_GIT_CONTEXT_BUDGET: Duration = Duration::from_millis(1_500);
-const WORK_GIT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Budget for `git hash-object --path=...` **only** (#931): that call runs the
+/// configured clean filter, i.e. an external `herdr-mcp git-filter
+/// strip-handoff` child process, so it needs room a plain query does not. Every
+/// other command stays on `WORK_GIT_COMMAND_TIMEOUT`.
+const WORK_GIT_FILTER_TIMEOUT: Duration = Duration::from_secs(5);
 const WORK_GIT_OUTPUT_LIMIT: usize = 256 * 1024;
 
 fn normalize_lexical(path: &Path) -> PathBuf {
@@ -178,17 +184,56 @@ pub(crate) fn worktree_probes_protected_path(worktree: &Path) -> bool {
     false
 }
 
-fn git_output_bounded(worktree: &Path, args: &[&str], timeout: Duration) -> Option<String> {
-    if timeout.is_zero() || worktree_probes_protected_path(worktree) {
-        return None;
+/// What one bounded git invocation is allowed to do (#931).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum GitInvocation {
+    /// Read-only query, so git may run with `GIT_OPTIONAL_LOCKS=0` and never takes
+    /// the index lock just to answer.
+    Query,
+    /// Intentional index/config write (`update-index`, `config --local <k> <v>`).
+    /// It must keep git's normal locking: suppressing the lock on a writer would
+    /// let a concurrent reader observe or race a half-written index/config.
+    Write,
+}
+
+impl GitInvocation {
+    /// Budget for this invocation. Only the clean-filter `hash-object` query gets
+    /// the larger filter budget; every other query and every write stays compact.
+    fn timeout(self, args: &[&str]) -> Duration {
+        match (self, args.first().copied()) {
+            (Self::Query, Some("hash-object")) => WORK_GIT_FILTER_TIMEOUT,
+            _ => WORK_GIT_COMMAND_TIMEOUT,
+        }
     }
+
+    const fn applies_optional_locks(self) -> bool {
+        matches!(self, Self::Query)
+    }
+}
+
+/// Build a bounded git command. The lock environment is derived from
+/// `invocation`, so a writer can never inherit `GIT_OPTIONAL_LOCKS=0`.
+fn git_command(worktree: &Path, args: &[&str], invocation: GitInvocation) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command
         .arg("-C")
         .arg(worktree)
         .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
+    if invocation.applies_optional_locks() {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
+    command
+}
+
+/// Read-only repository-metadata query (`rev-parse`, `status`, `diff`,
+/// `rev-list`, `log`, `branch`, ...). Never used for a command that writes the
+/// index/config or runs a clean filter.
+fn git_output_bounded(worktree: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    if timeout.is_zero() || worktree_probes_protected_path(worktree) {
+        return None;
+    }
+    let mut command = git_command(worktree, args, GitInvocation::Query);
     let output = crate::child_process::run_bounded_output(
         &mut command,
         timeout.min(WORK_GIT_COMMAND_TIMEOUT),
@@ -1636,7 +1681,7 @@ fn write_handoff(worktree: &Path, handoff: &str, expected: Option<&str>) -> Resu
     // Only files we created (plus HANDOFF.md) are excluded. Never commit
     // anything.
     let tracked_or_listed = |name: &str| {
-        git_status_output(worktree, &["ls-files", "--error-unmatch", name])
+        git_query_output(worktree, &["ls-files", "--error-unmatch", name])
             .is_some_and(|output| output.status.success())
     };
     created.retain(|name| *name == "HANDOFF.md" || !tracked_or_listed(name));
@@ -1917,26 +1962,31 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-fn git_status_output(
+fn git_status_output_with(
     worktree: &Path,
     args: &[&str],
+    invocation: GitInvocation,
 ) -> Option<crate::child_process::BoundedOutput> {
     if worktree_probes_protected_path(worktree) {
         return None;
     }
-    let mut command = std::process::Command::new("git");
-    command
-        .arg("-C")
-        .arg(worktree)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0");
+    let mut command = git_command(worktree, args, invocation);
     crate::child_process::run_bounded_output(
         &mut command,
-        WORK_GIT_STATUS_TIMEOUT,
+        invocation.timeout(args),
         WORK_GIT_OUTPUT_LIMIT,
     )
     .ok()?
+}
+
+/// Read-only git query (`ls-files`, `config --get`, `hash-object`, ...).
+fn git_query_output(worktree: &Path, args: &[&str]) -> Option<crate::child_process::BoundedOutput> {
+    git_status_output_with(worktree, args, GitInvocation::Query)
+}
+
+/// Intentional git write (`update-index`, `update-index --cacheinfo`, ...).
+fn git_write_output(worktree: &Path, args: &[&str]) -> Option<crate::child_process::BoundedOutput> {
+    git_status_output_with(worktree, args, GitInvocation::Write)
 }
 
 /// Only write the local filter config when it is missing or different, so an
@@ -1945,21 +1995,19 @@ fn set_git_local_config(worktree: &Path, key: &str, value: &str) -> Result<(), S
     if worktree_probes_protected_path(worktree) {
         return Ok(());
     }
-    if let Some(current) = git_status_output(worktree, &["config", "--local", "--get", key])
+    if let Some(current) = git_query_output(worktree, &["config", "--local", "--get", key])
         && current.status.success()
         && String::from_utf8_lossy(&current.stdout).trim() == value
     {
         return Ok(());
     }
-    let mut command = std::process::Command::new("git");
-    command
-        .arg("-C")
-        .arg(worktree)
-        .args(["config", "--local", key, value])
-        .env("GIT_TERMINAL_PROMPT", "0");
+    // A config write is an intentional mutation: it keeps git's normal locking
+    // and therefore never receives `GIT_OPTIONAL_LOCKS=0` (#931).
+    let config_args = ["config", "--local", key, value];
+    let mut command = git_command(worktree, &config_args, GitInvocation::Write);
     let output = crate::child_process::run_bounded_output(
         &mut command,
-        WORK_GIT_COMMAND_TIMEOUT,
+        GitInvocation::Write.timeout(&config_args),
         WORK_GIT_OUTPUT_LIMIT,
     )
     .map_err(|error| format!("cannot run git config: {error}"))?
@@ -1998,11 +2046,11 @@ fn refresh_index_stat(worktree: &Path, name: &str) {
         // leave the index alone so `git status`/`git diff` keep showing it.
         return;
     }
-    let _ = git_status_output(worktree, &["update-index", "--", name]);
+    let _ = git_write_output(worktree, &["update-index", "--", name]);
     if index_entry(worktree, name)
         .is_some_and(|(mode, blob)| mode != original_mode || blob != original_blob)
     {
-        let _ = git_status_output(
+        let _ = git_write_output(
             worktree,
             &[
                 "update-index",
@@ -2016,7 +2064,7 @@ fn refresh_index_stat(worktree: &Path, name: &str) {
 /// Stage-0 `(mode, blob)` of `name`, or `None` when the path is absent or has
 /// unmerged stages (never touch an entry in conflict).
 fn index_entry(worktree: &Path, name: &str) -> Option<(String, String)> {
-    let output = git_status_output(worktree, &["ls-files", "-s", "--", name])?;
+    let output = git_query_output(worktree, &["ls-files", "-s", "--", name])?;
     if !output.status.success() {
         return None;
     }
@@ -2036,9 +2084,12 @@ fn index_entry(worktree: &Path, name: &str) -> Option<(String, String)> {
 }
 
 fn filtered_worktree_blob(worktree: &Path, name: &str) -> Option<String> {
-    let output = git_status_output(
+    // The only herdr-core-path git call that spawns the external clean filter, so
+    // the only one that gets `WORK_GIT_FILTER_TIMEOUT` (#931).
+    let output = git_status_output_with(
         worktree,
         &["hash-object", &format!("--path={name}"), "--", name],
+        GitInvocation::Query,
     )?;
     output.status.success().then(|| {
         String::from_utf8_lossy(&output.stdout)
@@ -2865,6 +2916,149 @@ mod tests {
             shell_quote("/tmp/o'brien/herdr-mcp"),
             "'/tmp/o'\\''brien/herdr-mcp'"
         );
+    }
+
+    /// The environment a bounded git command would actually run with.
+    fn command_env(command: &std::process::Command, key: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn user_git_queries_skip_optional_locks_while_writes_keep_locking() {
+        let repo = Path::new("/repo");
+        // Every read-only query the compactor issues may skip optional locks.
+        for args in [
+            ["ls-files", "-s", "--", "AGENTS.md"].as_slice(),
+            ["ls-files", "--error-unmatch", "AGENTS.md"].as_slice(),
+            ["config", "--local", "--get", "filter.herdr-handoff.clean"].as_slice(),
+            ["hash-object", "--path=AGENTS.md", "--", "AGENTS.md"].as_slice(),
+            ["rev-parse", "--abbrev-ref", "HEAD"].as_slice(),
+            ["status", "--porcelain=v1"].as_slice(),
+            ["diff", "--name-only", "HEAD~1", "HEAD"].as_slice(),
+            ["rev-list", "--count", "HEAD~1..HEAD"].as_slice(),
+            ["merge-base", "HEAD", "origin/main"].as_slice(),
+        ] {
+            let command = git_command(repo, args, GitInvocation::Query);
+            assert_eq!(
+                command_env(&command, "GIT_OPTIONAL_LOCKS").as_deref(),
+                Some("0"),
+                "query {args:?} must not take the index lock"
+            );
+            assert_eq!(
+                command_env(&command, "GIT_TERMINAL_PROMPT").as_deref(),
+                Some("0"),
+                "query {args:?} must never prompt"
+            );
+        }
+        // Intentional index/config writes keep git's normal locking.
+        for args in [
+            ["update-index", "--", "AGENTS.md"].as_slice(),
+            ["update-index", "--cacheinfo", "100644,abc,AGENTS.md"].as_slice(),
+            [
+                "config",
+                "--local",
+                "filter.herdr-handoff.clean",
+                "herdr-mcp git-filter strip-handoff",
+            ]
+            .as_slice(),
+        ] {
+            let command = git_command(repo, args, GitInvocation::Write);
+            assert_eq!(
+                command_env(&command, "GIT_OPTIONAL_LOCKS"),
+                None,
+                "write {args:?} must keep optional locks enabled"
+            );
+            assert_eq!(
+                command_env(&command, "GIT_TERMINAL_PROMPT").as_deref(),
+                Some("0"),
+                "write {args:?} must never prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn user_clean_filter_timeout_applies_only_to_hash_object() {
+        // Only `hash-object` spawns the external `herdr-mcp git-filter
+        // strip-handoff` child process, so only it gets the 5 s budget.
+        assert_eq!(WORK_GIT_FILTER_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(WORK_GIT_COMMAND_TIMEOUT, Duration::from_millis(750));
+        assert_eq!(
+            GitInvocation::Query.timeout(&["hash-object", "--path=AGENTS.md", "--", "AGENTS.md"]),
+            WORK_GIT_FILTER_TIMEOUT
+        );
+        for args in [
+            ["ls-files", "-s", "--", "AGENTS.md"].as_slice(),
+            ["ls-files", "--error-unmatch", "AGENTS.md"].as_slice(),
+            ["config", "--local", "--get", "filter.herdr-handoff.clean"].as_slice(),
+        ] {
+            assert_eq!(
+                GitInvocation::Query.timeout(args),
+                WORK_GIT_COMMAND_TIMEOUT,
+                "query {args:?} must stay on the compact budget"
+            );
+        }
+        for args in [
+            ["update-index", "--", "AGENTS.md"].as_slice(),
+            ["update-index", "--cacheinfo", "100644,abc,AGENTS.md"].as_slice(),
+            [
+                "config",
+                "--local",
+                "filter.herdr-handoff.clean",
+                "herdr-mcp git-filter strip-handoff",
+            ]
+            .as_slice(),
+        ] {
+            assert_eq!(
+                GitInvocation::Write.timeout(args),
+                WORK_GIT_COMMAND_TIMEOUT,
+                "write {args:?} must stay on the compact budget"
+            );
+        }
+        // A write never inherits the filter budget, even if it named hash-object.
+        assert_eq!(
+            GitInvocation::Write.timeout(&["hash-object", "--path=AGENTS.md"]),
+            WORK_GIT_COMMAND_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn user_repository_write_paths_still_work_under_the_compact_budget() {
+        if !git_available() {
+            return;
+        }
+        let root = temp_dir("compact-budget-writes");
+        init_git_repo(&root);
+        fs::write(root.join("AGENTS.md"), "# Rules\n").unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "seed"]);
+
+        // `config --local <k> <v>` is a locked write and still lands at 750 ms.
+        set_git_local_config(&root, "herdr931.test", "value").unwrap();
+        assert_eq!(
+            git_stdout(&root, &["config", "--local", "--get", "herdr931.test"]),
+            "value"
+        );
+        // A repeat call is a read that already matches, so nothing is rewritten.
+        set_git_local_config(&root, "herdr931.test", "value").unwrap();
+        assert_eq!(
+            git_stdout(&root, &["config", "--local", "--get", "herdr931.test"]),
+            "value"
+        );
+
+        // The clean-filter blob query and the index write agree, so the worktree
+        // stays clean at the compact budgets.
+        let staged = index_entry(&root, "AGENTS.md").expect("stage-0 entry");
+        assert_eq!(
+            filtered_worktree_blob(&root, "AGENTS.md").as_deref(),
+            Some(staged.1.as_str())
+        );
+        refresh_index_stat(&root, "AGENTS.md");
+        assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
