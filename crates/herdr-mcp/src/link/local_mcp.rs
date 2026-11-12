@@ -65,7 +65,9 @@ const EDGE_BROWSER_CALLER_SESSION_HEADER: &str = "x-herdr-edge-browser-caller-se
 const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
 const EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER: &str =
     "x-herdr-edge-caller-browser-on-other-device";
+const EDGE_RELAYED_SOURCE_TURN_HEADER: &str = "x-herdr-edge-relayed-source-turn";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
+const MAX_RELAYED_SOURCE_TURN_TTL_MS: i64 = crate::mcp::RELAYED_SOURCE_TURN_MAX_TTL_MS;
 const LOCAL_MCP_MIN_FRAME_BYTES: usize = 64;
 const LOCAL_MCP_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -220,6 +222,7 @@ struct RoutedDispatchContext {
     authorization_header: Option<String>,
     browser_caller_session_header: Option<String>,
     caller_browser_on_other_device_header: Option<String>,
+    relayed_source_turn_header: Option<String>,
 }
 
 pub struct LocalMcpTransport {
@@ -372,10 +375,14 @@ impl LocalMcpTransport {
         let mut normalized = Vec::with_capacity(items.len());
         for item in items {
             let object = item.as_object().ok_or(())?;
-            if object.len() != 3
-                || !object.contains_key("endpoint_ref")
+            const ALLOWED_GRANT_KEYS: &[&str] =
+                &["endpoint_ref", "provider", "account_ref", "device_id"];
+            if !object.contains_key("endpoint_ref")
                 || !object.contains_key("provider")
                 || !object.contains_key("account_ref")
+                || object
+                    .keys()
+                    .any(|key| !ALLOWED_GRANT_KEYS.contains(&key.as_str()))
             {
                 return Err(());
             }
@@ -388,6 +395,13 @@ impl LocalMcpTransport {
                 .get("account_ref")
                 .and_then(Value::as_str)
                 .ok_or(())?;
+            let device_id = match object.get("device_id") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(raw)) if valid_grant_ref(raw, 128) && raw == raw.trim() => {
+                    Some(raw.as_str())
+                }
+                _ => return Err(()),
+            };
             // A wildcard endpoint is not per-endpoint authority. A pre-#713
             // Edge derives the `*/*/*` tuple from a wildcard Page Assist row,
             // so drop the row here rather than forwarding it as device scope.
@@ -402,11 +416,17 @@ impl LocalMcpTransport {
             {
                 return Err(());
             }
-            normalized.push(json!({
+            let mut grant_obj = json!({
                 "endpoint_ref": endpoint_ref,
                 "provider": provider,
                 "account_ref": account_ref,
-            }));
+            });
+            if let Some(dev_id) = device_id
+                && let Some(map) = grant_obj.as_object_mut()
+            {
+                map.insert("device_id".to_owned(), json!(dev_id));
+            }
+            normalized.push(grant_obj);
         }
         serde_json::to_string(&normalized).map(Some).map_err(|_| ())
     }
@@ -459,6 +479,106 @@ impl LocalMcpTransport {
             return Err(());
         }
         Ok(Some("true".to_owned()))
+    }
+
+    /// #775 / #921: privacy-preserving relayed source-turn evidence forwarded by
+    /// Edge when the caller browser is on another enrolled device. Never carries
+    /// raw prompt text; bounded TTL (`<= 24h`).
+    fn relayed_source_turn_header(
+        trace: Option<&Map<String, Value>>,
+    ) -> Result<Option<String>, ()> {
+        let Some(value) = trace.and_then(|trace| trace.get("relayed_source_turn")) else {
+            return Ok(None);
+        };
+        let object = value.as_object().ok_or(())?;
+        const ALLOWED_KEYS: &[&str] = &[
+            "owning_device_id",
+            "session_ref",
+            "user_text_sha256",
+            "expected_generation",
+            "observed_at",
+            "expires_at",
+            "provider",
+            "endpoint_ref",
+        ];
+        if object
+            .keys()
+            .any(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+        {
+            return Err(());
+        }
+        let valid_ref = |raw: &str, max_len: usize| -> bool {
+            !raw.is_empty()
+                && raw.len() <= max_len
+                && raw == raw.trim()
+                && !raw.chars().any(char::is_control)
+        };
+        let owning_device_id = object
+            .get("owning_device_id")
+            .and_then(Value::as_str)
+            .filter(|v| valid_ref(v, 128))
+            .ok_or(())?;
+        let session_ref = object
+            .get("session_ref")
+            .and_then(Value::as_str)
+            .filter(|v| valid_ref(v, 96))
+            .ok_or(())?;
+        let user_text_sha256 = object
+            .get("user_text_sha256")
+            .and_then(Value::as_str)
+            .filter(|v| v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|v| v.to_ascii_lowercase())
+            .ok_or(())?;
+        let expected_generation = object
+            .get("expected_generation")
+            .and_then(Value::as_i64)
+            .filter(|v| *v > 0)
+            .ok_or(())?;
+        let observed_at = object
+            .get("observed_at")
+            .and_then(Value::as_i64)
+            .filter(|v| *v >= 0)
+            .ok_or(())?;
+        let expires_at = object
+            .get("expires_at")
+            .and_then(Value::as_i64)
+            .filter(|v| {
+                *v > 0
+                    && *v >= observed_at
+                    && v.saturating_sub(observed_at) <= MAX_RELAYED_SOURCE_TURN_TTL_MS
+            })
+            .ok_or(())?;
+        let provider = object
+            .get("provider")
+            .and_then(Value::as_str)
+            .filter(|v| {
+                !v.is_empty()
+                    && v.len() <= 32
+                    && v.chars().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-')
+                    })
+            })
+            .ok_or(())?;
+        let endpoint_ref = match object.get("endpoint_ref") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(ep)) if valid_ref(ep, 128) && ep != "*" => Some(ep.as_str()),
+            _ => return Err(()),
+        };
+        let mut normalized = json!({
+            "owning_device_id": owning_device_id,
+            "session_ref": session_ref,
+            "user_text_sha256": user_text_sha256,
+            "expected_generation": expected_generation,
+            "observed_at": observed_at,
+            "expires_at": expires_at,
+            "provider": provider,
+        });
+        if let Some(ep) = endpoint_ref
+            && let Some(map) = normalized.as_object_mut()
+        {
+            map.insert("endpoint_ref".to_owned(), json!(ep));
+        }
+        serde_json::to_string(&normalized).map(Some).map_err(|_| ())
     }
 
     fn webchat_authorization_header(
@@ -622,6 +742,7 @@ impl LocalMcpTransport {
         let browser_caller_session_header = context.browser_caller_session_header.as_deref();
         let caller_browser_on_other_device_header =
             context.caller_browser_on_other_device_header.as_deref();
+        let relayed_source_turn_header = context.relayed_source_turn_header.as_deref();
         let Some(expected_generation) = self.runtime_generation.as_deref() else {
             return self.failure(
                 code::RUNTIME_GENERATION_MISMATCH,
@@ -685,6 +806,9 @@ impl LocalMcpTransport {
         if let Some(value) = caller_browser_on_other_device_header {
             request_builder =
                 request_builder.header(EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER, value);
+        }
+        if let Some(value) = relayed_source_turn_header {
+            request_builder = request_builder.header(EDGE_RELAYED_SOURCE_TURN_HEADER, value);
         }
         let request = match request_builder
             .header(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER, expected_generation)
@@ -840,6 +964,7 @@ impl LocalMcpTransport {
             || context.authorization_header.is_some()
             || context.browser_caller_session_header.is_some()
             || context.caller_browser_on_other_device_header.is_some()
+            || context.relayed_source_turn_header.is_some()
         {
             self.dispatch_trusted_ipc(body, rpc_id, &context).await
         } else {
@@ -964,6 +1089,18 @@ impl LocalMcpTransport {
                     );
                 }
             };
+        let relayed_source_turn_header =
+            match Self::relayed_source_turn_header(request.trace.as_ref()) {
+                Ok(value) => value,
+                Err(()) => {
+                    return self.failure(
+                        code::BAD_REQUEST,
+                        false,
+                        "invalid trusted caller relayed source turn context",
+                        None,
+                    );
+                }
+            };
         let body = match serde_json::to_string(&json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -1037,6 +1174,7 @@ impl LocalMcpTransport {
                     authorization_header,
                     browser_caller_session_header,
                     caller_browser_on_other_device_header,
+                    relayed_source_turn_header,
                 },
             ) => result,
         };
@@ -2146,5 +2284,58 @@ mod webchat_any_provider_link_tests {
                 "{marker} must be rejected"
             );
         }
+    }
+
+    /// user WebChat caller | Given Edge forwards valid relayed_source_turn digest metadata | When the link builds the trusted dispatch header | Then it normalizes and accepts the payload and rejects raw prompt text or unbounded TTL
+    #[test]
+    fn user_webchat_caller_given_relayed_source_turn_when_link_builds_header_then_validates_digest_and_ttl()
+     {
+        let valid_digest = "a".repeat(64);
+        let trace = json!({
+            "relayed_source_turn": {
+                "owning_device_id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "session_ref": "br_remote_session_1",
+                "user_text_sha256": valid_digest,
+                "expected_generation": 7,
+                "observed_at": 1_000,
+                "expires_at": 601_000,
+                "provider": "chatgpt"
+            }
+        });
+        let header = LocalMcpTransport::relayed_source_turn_header(trace.as_object())
+            .expect("valid relayed_source_turn accepted")
+            .expect("header present");
+        let parsed: Value = serde_json::from_str(&header).unwrap();
+        assert_eq!(parsed["owning_device_id"], "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(parsed["session_ref"], "br_remote_session_1");
+        assert_eq!(parsed["expected_generation"], 7);
+
+        // Raw prompt text key or excessive TTL (> 24h) is rejected fail-closed
+        let with_raw_text = json!({
+            "relayed_source_turn": {
+                "owning_device_id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "session_ref": "br_remote_session_1",
+                "user_text_sha256": valid_digest,
+                "user_text": "secret raw prompt text",
+                "expected_generation": 7,
+                "observed_at": 1_000,
+                "expires_at": 601_000,
+                "provider": "chatgpt"
+            }
+        });
+        assert!(LocalMcpTransport::relayed_source_turn_header(with_raw_text.as_object()).is_err());
+
+        let excessive_ttl = json!({
+            "relayed_source_turn": {
+                "owning_device_id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "session_ref": "br_remote_session_1",
+                "user_text_sha256": valid_digest,
+                "expected_generation": 7,
+                "observed_at": 1_000,
+                "expires_at": 1_000 + MAX_RELAYED_SOURCE_TURN_TTL_MS + 1,
+                "provider": "chatgpt"
+            }
+        });
+        assert!(LocalMcpTransport::relayed_source_turn_header(excessive_ttl.as_object()).is_err());
     }
 }

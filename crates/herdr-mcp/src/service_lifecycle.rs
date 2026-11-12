@@ -202,9 +202,13 @@ fn run_install(
     sidecars: PostCommitSidecarPolicy,
 ) -> Result<ExitCode, String> {
     #[cfg(target_os = "macos")]
-    if let Some(code) =
-        maybe_delegate_ssh_install_to_gui_domain(adopt_node, None, "herdr-mcp service install")?
-    {
+    if let Some(code) = maybe_delegate_ssh_service_mutation_to_gui_domain(
+        &GuiWorkerJob::Install {
+            adopt_node,
+            payload_binary: None,
+        },
+        "herdr-mcp service install",
+    )? {
         return Ok(code);
     }
 
@@ -239,9 +243,11 @@ pub(crate) fn run_install_from_payload(
 ) -> Result<ExitCode, String> {
     refuse_sidecar_mutation_inside_managed_exec()?;
     #[cfg(target_os = "macos")]
-    if let Some(code) = maybe_delegate_ssh_install_to_gui_domain(
-        adopt_node,
-        Some(payload_binary),
+    if let Some(code) = maybe_delegate_ssh_service_mutation_to_gui_domain(
+        &GuiWorkerJob::Install {
+            adopt_node,
+            payload_binary: Some(payload_binary.to_path_buf()),
+        },
         "herdr-mcp dev rollback",
     )? {
         return Ok(code);
@@ -523,7 +529,26 @@ fn finish_install_lifecycle(
 }
 
 fn run_rollback() -> Result<ExitCode, String> {
+    let outcome = run_rollback_inner();
+    #[cfg(target_os = "macos")]
+    record_gui_worker_result(&outcome);
+    outcome
+}
+
+fn run_rollback_inner() -> Result<ExitCode, String> {
     refuse_sidecar_mutation_inside_managed_exec()?;
+    // #930 (P2-8): route macOS non-GUI SSH `service rollback` through the
+    // same one-shot gui/<uid> worker as install (fail closed with
+    // `macos_gui_domain_inactive` when gui/<uid> is inactive). Inside the
+    // worker, `HERDR_MCP_GUI_DOMAIN_WORKER=1` keeps `caller_is_non_gui_ssh_session`
+    // false so the mutation itself never re-delegates.
+    #[cfg(target_os = "macos")]
+    if let Some(code) = maybe_delegate_ssh_service_mutation_to_gui_domain(
+        &GuiWorkerJob::Rollback,
+        "herdr-mcp service rollback",
+    )? {
+        return Ok(code);
+    }
     let mutation_lock = service_manager::acquire_mutation_lock()?;
     let before_supervisor = herdr_supervisor::capture_install_state_for_service()?;
     let target_supports_supervisor = match service_manager::rollback_target_runtime_binary()? {
@@ -732,6 +757,25 @@ pub(crate) fn format_gui_domain_inactive_error(command_label: &str, detail: &str
     )
 }
 
+/// #930 (P2-9): the fixed system security PATH every one-shot gui/<uid>
+/// worker runs with. Production always uses this constant; unit tests may
+/// prepend a fake-bin directory via `HERDR_MCP_TEST_GUI_WORKER_PATH_PREFIX`
+/// so `fake_launchctl` remains reachable inside the pinned PATH.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const GUI_WORKER_SYSTEM_PATH: &str =
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn deterministic_gui_worker_path() -> String {
+    #[cfg(test)]
+    if let Some(prefix) = std::env::var_os("HERDR_MCP_TEST_GUI_WORKER_PATH_PREFIX")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+    {
+        return format!("{}:{GUI_WORKER_SYSTEM_PATH}", prefix.to_string_lossy());
+    }
+    GUI_WORKER_SYSTEM_PATH.to_owned()
+}
+
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn encode_one_shot_gui_worker_plist(
     label: &str,
@@ -760,10 +804,17 @@ pub(crate) fn encode_one_shot_gui_worker_plist(
                 .collect(),
         ),
     );
+    // #930 (P2-9): pin a deterministic system security PATH inside the plist
+    // itself so an arbitrary non-GUI SSH session PATH can never propagate into
+    // gui/<uid>. This overrides any PATH the caller supplied and runs last.
     let mut env_dict = Dictionary::new();
     for (key, value) in environment {
         env_dict.insert(key.clone(), PlistValue::String(value.clone()));
     }
+    env_dict.insert(
+        "PATH".to_owned(),
+        PlistValue::String(deterministic_gui_worker_path()),
+    );
     env_dict.insert(
         GUI_DOMAIN_WORKER_ENV.to_owned(),
         PlistValue::String("1".to_owned()),
@@ -993,38 +1044,71 @@ fn record_gui_worker_result(outcome: &Result<ExitCode, String>) {
     }
 }
 
+/// Which service mutation a one-shot gui/<uid> worker executes (#930).
 #[cfg(target_os = "macos")]
-fn maybe_delegate_ssh_install_to_gui_domain(
-    adopt_node: bool,
-    payload_binary: Option<&Path>,
+#[derive(Debug, Clone)]
+enum GuiWorkerJob {
+    Install {
+        adopt_node: bool,
+        payload_binary: Option<PathBuf>,
+    },
+    Rollback,
+}
+
+#[cfg(target_os = "macos")]
+impl GuiWorkerJob {
+    fn worker_arguments(&self, exe: &Path) -> Vec<String> {
+        let mut args = vec![exe.to_string_lossy().into_owned(), "service".to_owned()];
+        match self {
+            Self::Install { adopt_node, .. } => {
+                args.push("install".to_owned());
+                if *adopt_node {
+                    args.push("--adopt-node".to_owned());
+                }
+            }
+            Self::Rollback => args.push("rollback".to_owned()),
+        }
+        args
+    }
+
+    fn payload_binary(&self) -> Option<&Path> {
+        match self {
+            Self::Install { payload_binary, .. } => payload_binary.as_deref(),
+            Self::Rollback => None,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_delegate_ssh_service_mutation_to_gui_domain(
+    job: &GuiWorkerJob,
     command_label: &str,
 ) -> Result<Option<ExitCode>, String> {
     if !caller_is_non_gui_ssh_session() {
         return Ok(None);
     }
+    // #930 (P2-7): a non-GUI SSH session must never run Keychain-creating
+    // service setup inline. `prewarm_existing_default` returns Ok(()) when no
+    // default credential exists yet, so its former success could not
+    // distinguish "boundary already proven" from "nothing to lose yet" and
+    // let a first install execute inside the SSH session. Delegate
+    // unconditionally instead; fail closed below when gui/<uid> is inactive.
     let paths = RuntimePaths::discover()?;
     crate::macos_permissions::preserve_or_install_broker(&paths.config_dir)
         .map_err(|error| format!("macOS TCC broker install preflight failed: {error}"))?;
     crate::macos_credential_helper::preserve_or_install(&paths.config_dir)
         .map_err(|error| format!("macOS credential helper install preflight failed: {error}"))?;
-    let forced_boundary = std::env::var_os("HERDR_MCP_FORCE_SSH_KEYCHAIN_BOUNDARY")
-        .is_some_and(|value| !value.is_empty());
-    let prewarm = crate::macos_credential_helper::prewarm_existing_default(&paths.config_dir);
-    if prewarm.is_ok() && !forced_boundary {
-        return Ok(None);
-    }
     let (active, detail) = probe_gui_domain_active()?;
     if !active {
         return Err(format_gui_domain_inactive_error(command_label, &detail));
     }
-    delegate_install_via_gui_domain(&paths, adopt_node, payload_binary, command_label).map(Some)
+    delegate_service_mutation_via_gui_domain(&paths, job, command_label).map(Some)
 }
 
 #[cfg(target_os = "macos")]
-fn delegate_install_via_gui_domain(
+fn delegate_service_mutation_via_gui_domain(
     paths: &RuntimePaths,
-    adopt_node: bool,
-    payload_binary: Option<&Path>,
+    job: &GuiWorkerJob,
     command_label: &str,
 ) -> Result<ExitCode, String> {
     let exe = std::env::current_exe()
@@ -1041,14 +1125,9 @@ fn delegate_install_via_gui_domain(
     let stderr_path = worker_dir.join(format!("{worker_id}.err.log"));
     let result_path = worker_dir.join(format!("{worker_id}.result.json"));
 
-    let mut args = vec![
-        exe.to_string_lossy().into_owned(),
-        "service".to_owned(),
-        "install".to_owned(),
-    ];
-    if adopt_node {
-        args.push("--adopt-node".to_owned());
-    }
+    // #930 (P2-9): no caller-supplied PATH enters the worker environment.
+    // `encode_one_shot_gui_worker_plist` pins the deterministic system PATH.
+    let args = job.worker_arguments(&exe);
     let mut env = BTreeMap::new();
     env.insert(
         "HERDR_MCP_CONFIG_DIR".to_owned(),
@@ -1058,7 +1137,7 @@ fn delegate_install_via_gui_domain(
         GUI_WORKER_RESULT_ENV.to_owned(),
         result_path.to_string_lossy().into_owned(),
     );
-    if let Some(payload) = payload_binary {
+    if let Some(payload) = job.payload_binary() {
         env.insert(
             GUI_WORKER_PAYLOAD_ENV.to_owned(),
             payload.to_string_lossy().into_owned(),
@@ -1076,11 +1155,6 @@ fn delegate_install_via_gui_domain(
         && !home.trim().is_empty()
     {
         env.insert("HOME".to_owned(), home);
-    }
-    if let Ok(path_env) = std::env::var("PATH")
-        && !path_env.trim().is_empty()
-    {
-        env.insert("PATH".to_owned(), path_env);
     }
 
     let plist_bytes =
@@ -1203,11 +1277,8 @@ pub(crate) fn spawn_gui_domain_update_worker(
     {
         env.insert("HOME".to_owned(), home);
     }
-    if let Ok(path_env) = std::env::var("PATH")
-        && !path_env.trim().is_empty()
-    {
-        env.insert("PATH".to_owned(), path_env);
-    }
+    // #930 (P2-9): the caller PATH never enters the worker; the plist pins
+    // the deterministic system PATH inside encode_one_shot_gui_worker_plist.
     let plist_bytes =
         encode_one_shot_gui_worker_plist(&label, &args, &env, &stdout_path, &stderr_path)?;
     write_private_file(&plist_path, &plist_bytes, 0o600)?;
@@ -1452,7 +1523,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn non_gui_ssh_install_routes_through_active_gui_domain_or_fails_closed_when_inactive() {
+    fn non_gui_ssh_service_mutations_route_through_active_gui_domain_or_fail_closed_when_inactive()
+    {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = crate::test_env::lock();
@@ -1510,10 +1582,6 @@ mod tests {
             ("HERDR_MCP_INSTANCE", None),
             ("HERDR_MCP_TEST_ALLOW_SSH_GUI_ROUTING", Some("1".to_owned())),
             (
-                "HERDR_MCP_FORCE_SSH_KEYCHAIN_BOUNDARY",
-                Some("1".to_owned()),
-            ),
-            (
                 "SSH_CONNECTION",
                 Some("10.0.0.1 54321 10.0.0.2 22".to_owned()),
             ),
@@ -1522,7 +1590,11 @@ mod tests {
                 "HERDR_MCP_GENERATION_TRIGGER",
                 Some("dev_rollback".to_owned()),
             ),
-            ("PATH", Some(new_path)),
+            (
+                "HERDR_MCP_TEST_GUI_WORKER_PATH_PREFIX",
+                Some(bin_dir.to_string_lossy().into_owned()),
+            ),
+            ("PATH", Some(new_path.clone())),
         ];
         let previous: Vec<_> = vars
             .iter()
@@ -1538,12 +1610,15 @@ mod tests {
             })
             .collect();
 
+        let install_job = GuiWorkerJob::Install {
+            adopt_node: false,
+            payload_binary: Some(config_dir.join("dev/prod-herdr-mcp")),
+        };
+
         // 1. Fail closed when gui/<uid> is inactive.
         unsafe { std::env::set_var("HERDR_MCP_GUI_DOMAIN_PROBE_OVERRIDE", "inactive") };
-        let payload_path = config_dir.join("dev/prod-herdr-mcp");
-        let err = maybe_delegate_ssh_install_to_gui_domain(
-            false,
-            Some(&payload_path),
+        let err = maybe_delegate_ssh_service_mutation_to_gui_domain(
+            &install_job,
             "herdr-mcp dev rollback",
         )
         .expect_err("inactive gui/<uid> domain must fail closed");
@@ -1554,11 +1629,23 @@ mod tests {
         assert!(err.contains("herdr-mcp dev rollback"));
         assert!(!captured_plist.exists());
 
+        // 1b. #930 (P2-8): rollback also fails closed when gui/<uid> is
+        // inactive, before any service mutation.
+        let rollback_err = maybe_delegate_ssh_service_mutation_to_gui_domain(
+            &GuiWorkerJob::Rollback,
+            "herdr-mcp service rollback",
+        )
+        .expect_err("rollback over non-GUI SSH with inactive gui/<uid> must fail closed");
+        assert!(
+            rollback_err.contains(GUI_DOMAIN_INACTIVE_CODE),
+            "unexpected rollback error: {rollback_err}"
+        );
+        assert!(rollback_err.contains("herdr-mcp service rollback"));
+
         // 2. Route through one-shot LaunchAgent in gui/<uid> when active.
         unsafe { std::env::set_var("HERDR_MCP_GUI_DOMAIN_PROBE_OVERRIDE", "active") };
-        let code = maybe_delegate_ssh_install_to_gui_domain(
-            false,
-            Some(&payload_path),
+        let code = maybe_delegate_ssh_service_mutation_to_gui_domain(
+            &install_job,
             "herdr-mcp dev rollback",
         )
         .expect("active gui/<uid> worker delegation must succeed")
@@ -1575,11 +1662,64 @@ mod tests {
             gui_domain_target()
         )));
 
+        // 2b. #930 (P2-9): the worker plist PATH is the pinned system PATH
+        // (plus the explicit test prefix), never the SSH session PATH.
+        let parsed = PlistValue::from_file(&captured_plist).unwrap();
+        let env_dict = parsed
+            .as_dictionary()
+            .unwrap()
+            .get("EnvironmentVariables")
+            .and_then(PlistValue::as_dictionary)
+            .unwrap();
+        assert_eq!(
+            env_dict.get("PATH").and_then(PlistValue::as_string),
+            Some(deterministic_gui_worker_path().as_str()),
+            "worker PATH must be the deterministic system PATH"
+        );
+        assert_ne!(
+            env_dict.get("PATH").and_then(PlistValue::as_string),
+            Some(new_path.as_str()),
+            "the arbitrary SSH session PATH must never reach gui/<uid>"
+        );
+        assert!(
+            env_dict
+                .get("PATH")
+                .and_then(PlistValue::as_string)
+                .unwrap()
+                .ends_with(GUI_WORKER_SYSTEM_PATH),
+            "the test prefix may only prepend to the pinned system PATH"
+        );
+
+        // 2c. #930 (P2-8): rollback delegates through the same one-shot
+        // gui/<uid> worker and its plist runs `service rollback`.
+        std::fs::remove_file(&captured_plist).ok();
+        let rollback_code = maybe_delegate_ssh_service_mutation_to_gui_domain(
+            &GuiWorkerJob::Rollback,
+            "herdr-mcp service rollback",
+        )
+        .expect("rollback worker delegation must succeed")
+        .expect("must delegate when in non-GUI SSH session");
+        assert_eq!(rollback_code, ExitCode::SUCCESS);
+        let rollback_plist = PlistValue::from_file(&captured_plist).unwrap();
+        let rollback_dict = rollback_plist.as_dictionary().unwrap();
+        let program_args: Vec<&str> = rollback_dict
+            .get("ProgramArguments")
+            .and_then(PlistValue::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(PlistValue::as_string)
+            .collect();
+        assert!(program_args.contains(&"service".to_owned().as_str()));
+        assert!(program_args.contains(&"rollback".to_owned().as_str()));
+        assert!(
+            !program_args.contains(&"install".to_owned().as_str()),
+            "rollback worker must not run install"
+        );
+
         // 3. Propagate credential guard failure from inside gui/<uid> (never bypass Keychain checks).
         unsafe { std::env::set_var("FAKE_GUI_WORKER_FAIL", "1") };
-        let guard_err = maybe_delegate_ssh_install_to_gui_domain(
-            false,
-            Some(&payload_path),
+        let guard_err = maybe_delegate_ssh_service_mutation_to_gui_domain(
+            &install_job,
             "herdr-mcp dev rollback",
         )
         .expect_err("Keychain guard failure inside gui/<uid> must fail closed");
@@ -1588,6 +1728,89 @@ mod tests {
         unsafe {
             std::env::remove_var("HERDR_MCP_GUI_DOMAIN_PROBE_OVERRIDE");
             std::env::remove_var("FAKE_GUI_WORKER_FAIL");
+            for (k, prev) in previous {
+                match prev {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// user cannot run Keychain-creating install inline over non-GUI SSH |
+    /// Given a first install with no default Keychain credential (prewarm
+    /// returns empty success) | When `service install` checks delegation |
+    /// Then it still delegates to gui/<uid> instead of running inline.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn first_install_with_empty_keychain_still_delegates_to_gui_domain() {
+        let _guard = crate::test_env::lock();
+        // Empty-keychain first install means `prewarm_existing_default`
+        // returns Ok(()) (no prewarm service configured). Delegation must not
+        // depend on that result: with no production Link environment at all
+        // (fresh HOME), prewarm succeeds vacuously, and delegation still has
+        // to happen. Drive the decision helper directly with a fresh HOME so
+        // the empty-keychain precondition is real.
+        let root = std::env::temp_dir().join(format!(
+            "herdr-gui-empty-keychain-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let vars = [
+            (
+                "HERDR_MCP_CONFIG_DIR",
+                Some(config_dir.to_string_lossy().into_owned()),
+            ),
+            ("HERDR_MCP_INSTANCE", None),
+            ("HERDR_MCP_TEST_ALLOW_SSH_GUI_ROUTING", Some("1".to_owned())),
+            (
+                "SSH_CONNECTION",
+                Some("10.0.0.1 54321 10.0.0.2 22".to_owned()),
+            ),
+            ("HERDR_MCP_GUI_DOMAIN_WORKER", None),
+            ("HOME", Some(root.to_string_lossy().into_owned())),
+        ];
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(k, v)| {
+                let prev = std::env::var_os(k);
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+                (*k, prev)
+            })
+            .collect();
+
+        // Empty Keychain precondition: no production Link env, so prewarm
+        // returns Ok(()) without touching any credential.
+        crate::macos_credential_helper::prewarm_existing_default(&config_dir)
+            .expect("prewarm must succeed vacuously with no default credential");
+        // The decision to delegate can no longer consult prewarm at all: the
+        // boundary check must fire before gui/<uid> probing, proving empty
+        // Keychain never keeps the mutation inline.
+        unsafe { std::env::set_var("HERDR_MCP_GUI_DOMAIN_PROBE_OVERRIDE", "inactive") };
+        let err = maybe_delegate_ssh_service_mutation_to_gui_domain(
+            &GuiWorkerJob::Install {
+                adopt_node: false,
+                payload_binary: None,
+            },
+            "herdr-mcp service install",
+        )
+        .expect_err("empty-keychain first install must still fail closed, not run inline");
+        assert!(err.contains(GUI_DOMAIN_INACTIVE_CODE));
+
+        unsafe {
+            std::env::remove_var("HERDR_MCP_GUI_DOMAIN_PROBE_OVERRIDE");
             for (k, prev) in previous {
                 match prev {
                     Some(val) => std::env::set_var(k, val),
