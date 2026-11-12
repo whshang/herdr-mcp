@@ -1657,3 +1657,72 @@ test("user observes only safe body text | Given hidden and sensitive descendants
   assert.equal(observed.text, "Visible tail");
   assert.doesNotMatch(observed.text, /SECRET_/);
 });
+
+test("user detects structured human handoff gates without leaking sensitive values | Given pages with visible vs hidden password, OTP, payment, and anti-bot challenge widgets | When inspect observes each page | Then human_handoff is omitted on ordinary or hidden-gate pages and surfaces deterministic reason codes on active gates", () => {
+  const ordinary = harness({
+    elements: [
+      createElement({ tag: "input", type: "email", attrs: { placeholder: "Email" } }),
+      createElement({ tag: "button", type: "submit", text: "Continue" }),
+    ],
+  }).send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(ordinary.ok, true);
+  assert.equal(Object.hasOwn(ordinary, "human_handoff"), false);
+
+  const inertContainer = {};
+  const inertPassword = createElement({ tag: "input", type: "password", value: "SUPER_SECRET_1" });
+  inertPassword.closest = (selector) => selector.includes("[inert]") ? inertContainer : null;
+  const hiddenTurnstile = createElement({ tag: "div", attrs: { class: "cf-turnstile" }, visible: false });
+  const disabledOtp = createElement({ tag: "input", type: "text", attrs: { autocomplete: "one-time-code" }, disabled: true });
+  const hiddenGates = harness({
+    elements: [
+      createElement({ tag: "button", text: "Browse" }),
+      inertPassword,
+      hiddenTurnstile,
+      disabledOtp,
+    ],
+  }).send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(hiddenGates.ok, true);
+  assert.equal(Object.hasOwn(hiddenGates, "human_handoff"), false);
+
+  const visibleChallengeIframe = createElement({
+    tag: "iframe",
+    attrs: { src: "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile" },
+  });
+  const visibleStripeIframe = createElement({
+    tag: "iframe",
+    attrs: { src: "https://js.stripe.com/v3/elements-inner-card-123.html" },
+  });
+  const visibleOtp = createElement({
+    tag: "input",
+    type: "text",
+    value: "849201",
+    attrs: { autocomplete: "one-time-code" },
+  });
+  const visiblePassword = createElement({
+    tag: "input",
+    type: "password",
+    value: "TOP_SECRET_PASS",
+    attrs: { autocomplete: "current-password" },
+  });
+  const email = createElement({ tag: "input", type: "email", attrs: { placeholder: "Work email" } });
+  const activeGate = harness({
+    elements: [visibleChallengeIframe, visibleStripeIframe, visibleOtp, visiblePassword, email],
+  }).send({ type: "h2w_page_assist", action: "inspect" });
+
+  assert.equal(activeGate.ok, true);
+  assert.equal(activeGate.elements.length, 1);
+  assert.equal(activeGate.elements[0].text, "Work email");
+  assert.deepEqual(JSON.parse(JSON.stringify(activeGate.human_handoff)), {
+    required: true,
+    reasons: [
+      "password_field",
+      "one_time_code_field",
+      "payment_field",
+      "antibot_challenge",
+    ],
+    recommended_action: "yield_to_user_in_browser",
+  });
+  const serialized = JSON.stringify(activeGate);
+  assert.equal(serialized.includes("TOP_SECRET_PASS"), false);
+  assert.equal(serialized.includes("849201"), false);
+});
