@@ -103,6 +103,16 @@
   const OBSERVABLE_CONTROL_SELECTOR =
     'button, a[href], input, textarea, select, option, table, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="option"], [role="group"], [role="listitem"], [tabindex], label, span, div[class], article, section[class], li[class], [contenteditable="true"]';
 
+  const HUMAN_HANDOFF_SIGNAL_SELECTOR =
+    'input, textarea, select, iframe, altcha-widget, .cf-turnstile, .g-recaptcha, .h-captcha, #challenge-running, #cf-challenge-running, #challenge-form';
+
+  const HUMAN_HANDOFF_REASON_ORDER = [
+    "password_field",
+    "one_time_code_field",
+    "payment_field",
+    "antibot_challenge",
+  ];
+
   let generationSeq = 0;
   let currentGenerationToken = "";
   const elementMap = new Map();
@@ -262,6 +272,99 @@
     return offset;
   }
 
+  function candidateHumanHandoffReasons(el) {
+    if (!el) return null;
+    const tag = (el.tagName || "").toLowerCase();
+    let matched = null;
+    const push = (reason) => {
+      if (!matched) matched = [];
+      matched.push(reason);
+    };
+
+    if (tag === "input" && String(el.type || "").toLowerCase() === "password") {
+      push("password_field");
+    }
+    const autocomplete = String(el.getAttribute?.("autocomplete") || "").trim().toLowerCase();
+    if (autocomplete) {
+      for (const token of autocomplete.split(/\s+/)) {
+        if (token === "current-password" || token === "new-password") {
+          push("password_field");
+        } else if (token === "one-time-code") {
+          push("one_time_code_field");
+        } else if (token === "cc-number" || token === "cc-csc") {
+          push("payment_field");
+        }
+      }
+    }
+
+    if (tag === "altcha-widget") {
+      push("antibot_challenge");
+    }
+
+    const id = String(el.getAttribute?.("id") || "").trim().toLowerCase();
+    if (id === "challenge-running" || id === "cf-challenge-running" || id === "challenge-form") {
+      push("antibot_challenge");
+    }
+
+    const classAttr = String(el.getAttribute?.("class") || "").trim().toLowerCase();
+    if (classAttr) {
+      for (const token of classAttr.split(/\s+/)) {
+        if (token === "cf-turnstile" || token === "g-recaptcha" || token === "h-captcha") {
+          push("antibot_challenge");
+        }
+      }
+    }
+
+    if (tag === "iframe") {
+      const rawSrc = String(el.getAttribute?.("src") || el.src || "").trim();
+      if (rawSrc) {
+        try {
+          const parsed = new URL(rawSrc, global.location?.href || "https://localhost/");
+          const host = parsed.hostname.toLowerCase();
+          const path = parsed.pathname.toLowerCase();
+          if (
+            host === "challenges.cloudflare.com"
+            || host === "hcaptcha.com"
+            || host.endsWith(".hcaptcha.com")
+            || ((host === "google.com" || host === "www.google.com" || host === "recaptcha.net" || host === "www.recaptcha.net")
+              && path.startsWith("/recaptcha/"))
+          ) {
+            push("antibot_challenge");
+          } else if (
+            host === "js.stripe.com"
+            || host === "hooks.stripe.com"
+            || host === "checkout.stripe.com"
+            || host === "pay.google.com"
+          ) {
+            push("payment_field");
+          }
+        } catch (_) {}
+      }
+    }
+    return matched;
+  }
+
+  function collectHumanHandoff(doc) {
+    if (!doc || typeof doc.querySelectorAll !== "function") return undefined;
+    const reasons = new Set();
+    const nodes = doc.querySelectorAll(HUMAN_HANDOFF_SIGNAL_SELECTOR) || [];
+    for (const el of nodes) {
+      const matched = candidateHumanHandoffReasons(el);
+      if (!matched) continue;
+      if (el.hidden === true || el.closest?.('[hidden], [aria-hidden="true"], [inert]')) continue;
+      const tag = (el.tagName || "").toLowerCase();
+      if ((tag === "input" || tag === "textarea" || tag === "select") && isElementDisabled(el)) continue;
+      if (isElementHidden(el)) continue;
+      for (const reason of matched) reasons.add(reason);
+    }
+    if (reasons.size === 0) return undefined;
+    return {
+      required: true,
+      reasons: HUMAN_HANDOFF_REASON_ORDER.filter((reason) => reasons.has(reason)),
+      recommended_action: "yield_to_user_in_browser",
+    };
+  }
+
   function scanDocument(options = {}) {
     if (isCrossOriginFrame()) {
       return { ok: false, error: "cross_origin_iframe_blocked" };
@@ -378,6 +481,7 @@
     const maxTextChars = Math.max(1, Math.min(Number(options.maxChars) || DEFAULT_MAX_CHARS, MAX_CHARS_CEILING));
     const rawBody = doc.body ? collectVisibleText(doc.body, maxTextChars + 1) : "";
     const text = cleanText(rawBody, maxTextChars);
+    const humanHandoff = collectHumanHandoff(doc);
 
     return {
       ok: true,
@@ -385,6 +489,7 @@
       origin: String(global.location ? global.location.origin : "").slice(0, 512),
       title: String(doc.title || "").slice(0, 512),
       generation: currentGenerationToken,
+      ...(humanHandoff ? { human_handoff: humanHandoff } : {}),
       ...(hasMoreElements || options.elementOffset !== undefined ? {
         element_offset: elementOffset,
         next_element_offset: hasMoreElements ? elementOffset + elements.length : null,
