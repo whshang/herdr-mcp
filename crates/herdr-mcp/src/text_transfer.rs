@@ -207,7 +207,7 @@ pub fn write(params: &Value) -> Value {
         let _ = fs::remove_file(&temp);
         return io_fail("permissions_failed", &temp, error);
     }
-    if let Err(error) = fs::rename(&temp, &path) {
+    if let Err(error) = publish_temp(&temp, &path, overwrite) {
         let _ = fs::remove_file(&temp);
         return io_fail("replace_failed", &path, error);
     }
@@ -347,6 +347,21 @@ fn copy_backup_exclusive(source: &Path, candidate: &Path) -> std::io::Result<()>
         let _ = fs::remove_file(candidate);
         return Err(error);
     }
+    Ok(())
+}
+
+/// Publishes the fully written temp file at `target`. `overwrite=true` renames
+/// over the target as before. `overwrite=false` hard-links instead, because a
+/// rename always replaces the destination entry; the link only succeeds while
+/// the target is still absent, so a competitor file or symlink created after the
+/// existence check stays untouched. Temp and target share one parent directory,
+/// so the link never crosses a filesystem boundary.
+fn publish_temp(temp: &Path, target: &Path, overwrite: bool) -> std::io::Result<()> {
+    if overwrite {
+        return fs::rename(temp, target);
+    }
+    fs::hard_link(temp, target)?;
+    let _ = fs::remove_file(temp);
     Ok(())
 }
 
@@ -617,6 +632,56 @@ mod tests {
         fs::write(&existing, "keep\n").unwrap();
         assert!(copy_backup_exclusive(&source, &existing).is_err());
         assert_eq!(fs::read_to_string(&existing).unwrap(), "keep\n");
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_transfer_publication_never_replaces_concurrent_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-text-publish-no-replace-{}",
+            std::process::id()
+        ));
+        let outside =
+            std::env::temp_dir().join(format!("herdr-text-publish-outside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let fresh_temp = root.join("fresh.tmp");
+        let fresh_target = root.join("fresh.txt");
+        fs::write(&fresh_temp, "fresh\n").unwrap();
+        publish_temp(&fresh_temp, &fresh_target, false).unwrap();
+        assert_eq!(fs::read_to_string(&fresh_target).unwrap(), "fresh\n");
+        assert!(!fresh_temp.exists());
+
+        let temp = root.join("target.txt.tmp");
+        let target = root.join("target.txt");
+        fs::write(&temp, "ours\n").unwrap();
+        fs::write(&target, "competitor\n").unwrap();
+        assert_eq!(
+            publish_temp(&temp, &target, false).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "competitor\n");
+
+        let sentinel = outside.join("sentinel.txt");
+        fs::write(&sentinel, "sentinel\n").unwrap();
+        let alias = root.join("alias.txt");
+        symlink(&sentinel, &alias).unwrap();
+        assert!(publish_temp(&temp, &alias, false).is_err());
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "sentinel\n");
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
