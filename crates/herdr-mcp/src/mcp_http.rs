@@ -10021,8 +10021,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn webchat_dispatch_binds_across_app_mention_rendering() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn webchat_dispatch_binds_across_app_mention_rendering() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(webchat_dispatch_binds_across_app_mention_rendering_body());
+    }
+
+    async fn webchat_dispatch_binds_across_app_mention_rendering_body() {
         // #741: ChatGPT renders an `@herdr-mcp` App mention chip differently in
         // the DOM bubble (observed by the extension) and in the model-visible
         // `current_user_message`. Both sides must reduce to one canonical text.
@@ -10724,8 +10735,21 @@ mod tests {
     /// When ChatGPT dispatches a task carrying that first message | Then the
     /// dispatch binds the created session and owns an `hc:auto:*` continuity
     /// chain, and a turn the runtime never delivered stays unbound.
-    #[tokio::test]
-    async fn webchat_dispatch_binds_from_an_applied_background_create() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    // Without the guard the create below is refused under another test's
+    // config window, so the unbounded broker wait never receives a command.
+    #[test]
+    fn webchat_dispatch_binds_from_an_applied_background_create() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(webchat_dispatch_binds_from_an_applied_background_create_body());
+    }
+
+    async fn webchat_dispatch_binds_from_an_applied_background_create_body() {
         async fn post_registry(app: axum::Router, payload: Value) -> Value {
             let response = app.oneshot(registry_request(payload)).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -11835,8 +11859,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn webchat_cross_device_relayed_source_turn_binds_and_preserves_n_minus_1_fallback() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn webchat_cross_device_relayed_source_turn_binds_and_preserves_n_minus_1_fallback() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(
+            webchat_cross_device_relayed_source_turn_binds_and_preserves_n_minus_1_fallback_body(),
+        );
+    }
+
+    async fn webchat_cross_device_relayed_source_turn_binds_and_preserves_n_minus_1_fallback_body()
+    {
         let root = test_root("webchat-cross-device-relayed-source-turn");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
