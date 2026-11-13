@@ -160,7 +160,7 @@ pub fn write(params: &Value) -> Value {
 
     let backup_path = if existing.is_some() && backup {
         let candidate = backup_name(&path);
-        if let Err(error) = fs::copy(&path, &candidate) {
+        if let Err(error) = copy_backup_exclusive(&path, &candidate) {
             return io_fail("backup_failed", &candidate, error);
         }
         Some(candidate)
@@ -326,6 +326,28 @@ fn backup_name(path: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("text");
     path.with_file_name(format!("{file_name}.herdr-backup-{}", now_ms()))
+}
+
+/// Copies the current target into a backup file created exclusively, so a
+/// pre-existing symlink or regular file at the predictable backup name can
+/// never receive the copied bytes. Source permissions are preserved like
+/// `fs::copy`, and a partially written backup is removed again.
+fn copy_backup_exclusive(source: &Path, candidate: &Path) -> std::io::Result<()> {
+    let mut source_file = fs::File::open(source)?;
+    let permissions = source_file.metadata()?.permissions();
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut backup_file = options.open(candidate)?;
+    if let Err(error) = std::io::copy(&mut source_file, &mut backup_file)
+        .and_then(|_| backup_file.set_permissions(permissions))
+    {
+        drop(backup_file);
+        let _ = fs::remove_file(candidate);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -548,6 +570,56 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_transfer_backup_creation_is_exclusive() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-text-backup-exclusive-{}",
+            std::process::id()
+        ));
+        let outside =
+            std::env::temp_dir().join(format!("herdr-text-backup-outside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let source = root.join("target.txt");
+        fs::write(&source, "old\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let fresh = root.join("target.txt.herdr-backup-fresh");
+        copy_backup_exclusive(&source, &fresh).unwrap();
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), "old\n");
+        assert_eq!(
+            fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        let sentinel = outside.join("sentinel.txt");
+        fs::write(&sentinel, "sentinel\n").unwrap();
+        let planted = root.join("target.txt.herdr-backup-planted");
+        symlink(&sentinel, &planted).unwrap();
+        assert!(copy_backup_exclusive(&source, &planted).is_err());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "sentinel\n");
+        assert!(
+            fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let existing = root.join("target.txt.herdr-backup-existing");
+        fs::write(&existing, "keep\n").unwrap();
+        assert!(copy_backup_exclusive(&source, &existing).is_err());
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "keep\n");
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]
