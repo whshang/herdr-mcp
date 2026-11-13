@@ -625,6 +625,30 @@ pub fn denied_secret_path(path: &Path) -> bool {
     })
 }
 
+/// Extended credential-path guard for HOME-wide text transfer and herdr-core
+/// file operations. This intentionally does not alter the shared project guard.
+pub(crate) fn denied_home_credential_path(path: &Path) -> bool {
+    const EXTRA_SEGMENTS: &[&str] = &[
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".azure",
+        ".kube",
+        ".docker",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".git-credentials",
+        ".htpasswd",
+        ".password-store",
+    ];
+    denied_secret_path(path)
+        || path.components().any(|component| {
+            let segment = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+            EXTRA_SEGMENTS.contains(&segment.as_str())
+        })
+}
+
 pub fn path_within(root: &Path, path: &Path) -> bool {
     path == root || path.starts_with(root)
 }
