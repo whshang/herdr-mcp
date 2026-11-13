@@ -51,7 +51,7 @@ Agent 会检查环境、安装 Herdr 与 herdr-mcp、部署 Worker、连接工�
 
 ## 授权配置
 
-macOS 只在需要时授权一次稳定 broker：
+macOS 在需要时授权稳定 broker：
 
 ```bash
 herdr-mcp permissions status
@@ -59,7 +59,7 @@ herdr-mcp permissions setup
 herdr-mcp permissions verify
 ```
 
-只在 `permissions status` 返回 `needs_setup` 时执行 setup，然后在 **系统设置 → 隐私与安全性 → 完全磁盘访问权限** 中授权。
+只在 `permissions status` 返回 `needs_setup` 时执行 setup，然后在 **系统设置 → 隐私与安全性 → 完全磁盘访问权限** 中授权。固定版本的 broker 可保留已有的文件访问授权；这与 Herdr TUI 的屏幕录制权限分开管理。若 Herdr 更新后无法录屏，参见 [macOS 权限排查](docs/i18n/zh-CN/troubleshooting.md#macos-文件访问与屏幕录制权限)。
 
 ChatGPT OAuth 首次连接时，授权页会给出精确的本地批准命令和 6 位验证码。按页面提示在自己的终端完成批准。不要把 Cloudflare Token、设备凭据或其他秘密发到聊天里。
 
@@ -155,7 +155,7 @@ Cloudflare 同时承担公网 MCP/OAuth 地址、设备路由、重连协调，�
 
 其它传输方式只有在同时提供公网 HTTPS MCP 地址、可信 TLS、认证/OAuth、安全设备路由、可靠重连和明确的 mutation 交付语义时，才可以完整替代当前路径。
 
-私网 IP 或仅 Tailscale 可见的地址无法直接被 ChatGPT 云端访问；裸端口映射会扩大暴露面。Cloudflare 是当前正式支持并完成验证的方案。
+私网 IP 或仅 Tailscale 可见的地址无法直接被 ChatGPT 云端访问；裸端口映射会扩大暴露面。Cloudflare 是当前正式支持并完成验证的方案。LAN / Tailscale 直连在 1.1 不支持，属于后续版本的评估方向，尚非现有能力，也未列入已确定范围；设计必须明确认证、加密、设备身份与授权、网络暴露和交付语义，面向 ChatGPT 云端时仍需可访问的公网入口。
 
 ### 支持哪个 Herdr？
 
