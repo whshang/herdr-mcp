@@ -1785,14 +1785,14 @@ impl PublicToolRoute {
 ///
 /// `admitted` is the backend this runtime process selected when it started and
 /// carried through `AppState`/`RuntimeContext` for the process lifetime. A
-/// request whose current env/config resolves to another backend or another
-/// admitted `herdr-core` socket fails closed with `invalid_runtime_backend` and
-/// requires a restart (#936). Without that check an already running TUI
-/// candidate would honour a later `runtime.backend = "herdr-core"` edit on its
-/// next request, although its state and background workers were only admitted
-/// for TUI. The comparison uses the single selection read that also feeds the
-/// route, so a concurrent config change cannot slip between the check and the
-/// dispatch.
+/// request whose current env/config resolves to another backend or, while on
+/// `herdr-core`, another admitted socket fails closed with
+/// `invalid_runtime_backend` and requires a restart (#936). Without that check
+/// an already running TUI candidate would honour a later
+/// `runtime.backend = "herdr-core"` edit on its next request, although its
+/// state and background workers were only admitted for TUI. The comparison uses
+/// the single selection read that also feeds the route, so a concurrent config
+/// change cannot slip between the check and the dispatch.
 pub fn public_tool_route(
     tool_name: &str,
     admitted: &RuntimeBackendSelection,
@@ -1800,9 +1800,12 @@ pub fn public_tool_route(
     let selection = resolve_process_backend_selection().map_err(|error| {
         invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
     })?;
-    if selection.backend != admitted.backend
-        || selection.herdr_core_socket != admitted.herdr_core_socket
-    {
+    // A `tui` runtime never opens `herdr_core_socket`, so an unrelated socket
+    // edit to a still-`tui` config is not a drift; only a `herdr-core` socket
+    // change moves an execution target. The backend is always compared (#936).
+    let socket_drift = selection.backend == RuntimeBackend::HerdrCore
+        && selection.herdr_core_socket != admitted.herdr_core_socket;
+    if selection.backend != admitted.backend || socket_drift {
         return Err(invalid_runtime_backend_tool_error(
             tool_name,
             &format!(

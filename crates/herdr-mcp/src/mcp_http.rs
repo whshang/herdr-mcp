@@ -4787,69 +4787,6 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// #936: a TUI-admitted router keeps serving TUI, then refuses a later
-    /// `herdr-core` config edit on the real `tools/call` route. The refusal
-    /// names neither the socket nor the bearer token, and no core listener
-    /// is required: reaching that socket would be a different error.
-    #[cfg(unix)]
-    #[test]
-    fn tui_admitted_router_refuses_later_core_config_switch() {
-        let _guard = crate::test_env::lock();
-        let root = test_root("backend-lifetime-pin");
-        let config_dir = root.join("config");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let config = config_dir.join("config.json");
-        std::fs::write(&config, r#"{"runtime":{"backend":"tui"}}"#).unwrap();
-        let core_socket = root.join("core-socket-must-not-leak.sock");
-        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
-        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
-        unsafe {
-            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
-            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
-        }
-        let app = candidate_router(test_state(&root.join("tcp")));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let steady = runtime.block_on(call_public_tool(&app, "herdr_inspect", json!({})));
-        assert_ne!(steady["code"], "invalid_runtime_backend", "{steady}");
-        std::fs::write(
-            &config,
-            json!({
-                "runtime": {
-                    "backend": "herdr-core",
-                    "herdr_core_socket": core_socket.to_string_lossy()
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let refused = runtime.block_on(call_public_tool(&app, "herdr_inspect", json!({})));
-        assert_eq!(refused["code"], "invalid_runtime_backend", "{refused}");
-        assert_eq!(refused["retryable"], false, "{refused}");
-        assert_eq!(refused["delivery_state"], "not_delivered", "{refused}");
-        let message = refused["message"].as_str().unwrap();
-        assert!(message.contains("admitted 'tui'"), "{refused}");
-        assert!(message.contains("now 'herdr-core'"), "{refused}");
-        assert!(message.contains("restart the runtime"), "{refused}");
-        assert!(
-            !message.contains("core-socket-must-not-leak") && !message.contains("test-token"),
-            "{refused}"
-        );
-        unsafe {
-            match previous_config_dir {
-                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
-                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
-            }
-            match previous_backend {
-                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
-                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
-            }
-        }
-        std::fs::remove_dir_all(root).ok();
-    }
-
     #[test]
     fn extension_consent_serializes_with_browser_mutation_gate() {
         let root = test_root("browser-consent-mutation-gate");
@@ -6761,8 +6698,24 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    #[tokio::test]
-    async fn herdr_call_local_skill_load_round_trips_through_rust_http_without_socket() {
+    // #936: `tools/call` re-resolves backend admission from process-global
+    // env/config, so this test holds the same crate-wide env guard the
+    // config-mutating tests use instead of observing their mutation window
+    // mid-dispatch. `#[test]` plus a current-thread runtime keeps the guard
+    // out of an `async fn` without suppressing a lint.
+    #[test]
+    fn herdr_call_local_skill_load_round_trips_through_rust_http_without_socket() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(
+            herdr_call_local_skill_load_round_trips_through_rust_http_without_socket_body(),
+        );
+    }
+
+    async fn herdr_call_local_skill_load_round_trips_through_rust_http_without_socket_body() {
         let root = test_root("local-skill-load");
         let app = candidate_router(test_state(&root));
         let request = rpc_request(
@@ -6796,8 +6749,21 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    #[tokio::test]
-    async fn herdr_call_continuity_resume_round_trips_through_rust_http_without_socket() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn herdr_call_continuity_resume_round_trips_through_rust_http_without_socket() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(
+            herdr_call_continuity_resume_round_trips_through_rust_http_without_socket_body(),
+        );
+    }
+
+    async fn herdr_call_continuity_resume_round_trips_through_rust_http_without_socket_body() {
         let root = test_root("local-continuity-resume");
         let state = test_state(&root);
         {
@@ -6857,8 +6823,21 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    #[tokio::test]
-    async fn herdr_call_continuity_search_round_trips_through_rust_http_without_socket() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn herdr_call_continuity_search_round_trips_through_rust_http_without_socket() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(
+            herdr_call_continuity_search_round_trips_through_rust_http_without_socket_body(),
+        );
+    }
+
+    async fn herdr_call_continuity_search_round_trips_through_rust_http_without_socket_body() {
         let root = test_root("local-continuity-search");
         let state = test_state(&root);
         {
@@ -8252,8 +8231,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn reparented_conversation_in_one_generation_observes_and_binds() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn reparented_conversation_in_one_generation_observes_and_binds() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(reparented_conversation_in_one_generation_observes_and_binds_body());
+    }
+
+    async fn reparented_conversation_in_one_generation_observes_and_binds_body() {
         // #740: the same conversation is first observed under a Project space
         // (inferred from a transient sidebar label) and then under the
         // account, both in generation 1. The newer parent must win so the
@@ -8402,8 +8392,19 @@ mod tests {
     /// conversation URL | Then the Runtime owns exactly one durable continuity
     /// chain that `/extension/continuity/resolve` finds by provider conversation
     /// id, and every later turn canonicalizes onto it.
-    #[tokio::test]
-    async fn dispatch_bind_attaches_one_durable_continuity_chain() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn dispatch_bind_attaches_one_durable_continuity_chain() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(dispatch_bind_attaches_one_durable_continuity_chain_body());
+    }
+
+    async fn dispatch_bind_attaches_one_durable_continuity_chain_body() {
         let root = test_root("dispatch-auto-continuity");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8606,8 +8607,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn reparented_conversation_with_prior_source_turn_stays_unambiguous() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn reparented_conversation_with_prior_source_turn_stays_unambiguous() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(reparented_conversation_with_prior_source_turn_stays_unambiguous_body());
+    }
+
+    async fn reparented_conversation_with_prior_source_turn_stays_unambiguous_body() {
         // #740 follow-up (Codex review): the conversation's turn is already
         // observed under the Project-space parent before it is re-observed
         // under the account. Retiring the old locator must also retire its

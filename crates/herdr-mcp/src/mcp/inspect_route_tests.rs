@@ -252,6 +252,25 @@ fn selection_drift_uses_admitted_backend_and_socket() {
             let route = crate::runtime_adapter::public_tool_route(name, &admitted)
                 .unwrap_or_else(|error| panic!("admission failed for {label}: {error}"));
             write_config(&config_path, &after);
+            // A later request in this admitted process must not re-admit the
+            // drifted selection: admission fails closed before any TUI or `hc`
+            // socket is contacted, so the next dispatch below still runs on the
+            // route this process admitted (#936).
+            let drift = match crate::runtime_adapter::public_tool_route(name, &admitted) {
+                Ok(_) => panic!("{label}, preflight={preflight}: drifted selection re-admitted"),
+                Err(drift) => drift,
+            };
+            assert_eq!(
+                drift["code"], "invalid_runtime_backend",
+                "{label}, preflight={preflight}: {drift}"
+            );
+            assert_eq!(drift["delivery_state"], "not_delivered", "{drift}");
+            assert_eq!(drift["retryable"], false, "{drift}");
+            // `b` is the drifted target and `tui` is admitted but unused here;
+            // the refusal reached neither, and `a` keeps only the admission
+            // hello the success assertion below already expects.
+            assert_eq!(tui.take_calls(), Vec::<String>::new(), "{label}: {drift}");
+            assert_eq!(b.take_calls(), Vec::<String>::new(), "{label}: {drift}");
             let result = dispatch_admitted_tool(name, arguments, &context, route).unwrap();
             let body: Value =
                 serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -302,6 +321,36 @@ fn selection_drift_uses_admitted_backend_and_socket() {
             assert_eq!(no_status.take_calls(), Vec::<String>::new());
         }
     }
+
+    // The complete public entry refuses a later `herdr-core` edit on the same
+    // admitted TUI context, without naming the socket it never opens (#936).
+    write_config(&config_path, &config("herdr-core", Some(&b_path)));
+    let refuse = json!({"params": {"name": "herdr_inspect", "arguments": {}}});
+    let refused = tool_call(&refuse, &context).unwrap();
+    let body: Value =
+        serde_json::from_str(refused["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["code"], "invalid_runtime_backend", "{body}");
+    assert_eq!(body["delivery_state"], "not_delivered", "{body}");
+    assert_eq!(refused["isError"], true, "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("admitted 'tui'"), "{body}");
+    assert!(message.contains("now 'herdr-core'"), "{body}");
+    assert!(
+        !message.contains("a.sock") && !message.contains("b.sock"),
+        "{body}"
+    );
+    assert!(!message.to_ascii_lowercase().contains("token"), "{body}");
+    assert_eq!(tui.take_calls(), Vec::<String>::new());
+    assert_eq!(a.take_calls(), Vec::<String>::new());
+    assert_eq!(b.take_calls(), Vec::<String>::new());
+
+    // A `tui` runtime never opens `herdr_core_socket`, so admitting one on an
+    // otherwise unchanged `tui` config must not refuse the runtime (#936).
+    write_config(&config_path, &config("tui", Some(&a_path)));
+    assert!(matches!(
+        crate::runtime_adapter::public_tool_route("herdr_inspect", &tui_backend),
+        Ok(crate::runtime_adapter::PublicToolRoute::Tui(_))
+    ));
 
     // Exercise the complete public entry as well: the HC fixture rewrites
     // config after selection, before returning the admission hello.
