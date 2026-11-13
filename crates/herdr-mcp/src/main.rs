@@ -335,8 +335,14 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Candidate { port } => {
             #[cfg(target_os = "windows")]
             windows_service_manager::prepare_candidate_environment(port)?;
-            eprintln!("{}", child_process::reap_confirmed_orphans_on_boot());
-            mcp_http::serve_candidate(port)
+            let selection = runtime_adapter::resolve_process_backend_selection();
+            candidate_startup(
+                selection,
+                || {
+                    eprintln!("{}", child_process::reap_confirmed_orphans_on_boot());
+                },
+                || mcp_http::serve_candidate(port),
+            )
         }
         cli::Command::Service(command) => {
             let refresh_agent_skill = matches!(
@@ -427,6 +433,73 @@ fn run() -> Result<ExitCode, String> {
                 link::run_link_migrate_runtime_control(mode)
             }
         },
+    }
+}
+
+// Until candidate state and its background workers support herdr-core, reject
+// that backend before orphan reaping, TUI client construction, or worker startup.
+fn candidate_startup<T>(
+    selection: Result<runtime_adapter::RuntimeBackendSelection, String>,
+    reap: impl FnOnce(),
+    serve: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let selection = selection?;
+    if selection.backend != runtime_adapter::RuntimeBackend::Tui {
+        return Err("candidate startup for herdr-core is unavailable: TUI background workers are not isolated".to_owned());
+    }
+    reap();
+    serve()
+}
+
+#[cfg(test)]
+mod candidate_startup_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn selection(
+        backend: runtime_adapter::RuntimeBackend,
+    ) -> runtime_adapter::RuntimeBackendSelection {
+        runtime_adapter::RuntimeBackendSelection {
+            backend,
+            source: "test",
+            herdr_core_socket: None,
+        }
+    }
+
+    #[test]
+    fn core_and_invalid_selection_stop_before_reap_and_serve() {
+        for selected in [
+            Ok(selection(runtime_adapter::RuntimeBackend::HerdrCore)),
+            Err("invalid backend".to_owned()),
+        ] {
+            let reaped = Cell::new(false);
+            let served = Cell::new(false);
+            let result = candidate_startup(
+                selected,
+                || reaped.set(true),
+                || {
+                    served.set(true);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert!(!reaped.get());
+            assert!(!served.get());
+        }
+    }
+
+    #[test]
+    fn tui_runs_reap_before_serve_and_preserves_result() {
+        let reaped = Cell::new(false);
+        let result = candidate_startup(
+            Ok(selection(runtime_adapter::RuntimeBackend::Tui)),
+            || reaped.set(true),
+            || {
+                assert!(reaped.get());
+                Ok(42)
+            },
+        );
+        assert_eq!(result.unwrap(), 42);
     }
 }
 

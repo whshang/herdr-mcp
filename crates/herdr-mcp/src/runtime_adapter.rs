@@ -171,22 +171,30 @@ impl RuntimeBackendSelection {
 pub struct EnvOverrides {
     pub runtime_backend: Option<String>,
     pub hc_socket: Option<PathBuf>,
-    pub hc_session: Option<String>,
+    pub hc_session: Option<std::ffi::OsString>,
     pub xdg_state_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
 }
 
 impl EnvOverrides {
-    pub fn from_process() -> Self {
-        Self {
-            runtime_backend: std::env::var(RUNTIME_BACKEND_ENV).ok(),
+    pub fn from_process() -> Result<Self, String> {
+        Ok(Self {
+            runtime_backend: optional_unicode_env(RUNTIME_BACKEND_ENV)?,
             hc_socket: std::env::var_os("HC_SOCKET").map(PathBuf::from),
-            hc_session: std::env::var("HC_SESSION").ok(),
+            hc_session: std::env::var_os("HC_SESSION"),
             xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
             home: std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(PathBuf::from),
-        }
+        })
+    }
+}
+
+fn optional_unicode_env(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid UTF-8")),
     }
 }
 
@@ -232,20 +240,30 @@ pub fn resolve_backend_selection_with_env(
 pub fn resolve_backend_selection(config: &Config) -> Result<RuntimeBackendSelection, String> {
     let explicit =
         config.runtime_backend != RuntimeBackend::Tui || config.runtime_herdr_core_socket.is_some();
-    resolve_backend_selection_with_env(Some(config), explicit, &EnvOverrides::from_process())
+    resolve_backend_selection_with_env(Some(config), explicit, &EnvOverrides::from_process()?)
 }
 
 pub fn resolve_process_backend_selection() -> Result<RuntimeBackendSelection, String> {
-    let env = EnvOverrides::from_process();
-    if let Ok(paths) = RuntimePaths::discover()
-        && paths.config_file.exists()
-    {
-        let cfg = Config::load(&paths.config_file)?;
-        let explicit =
-            cfg.runtime_backend != RuntimeBackend::Tui || cfg.runtime_herdr_core_socket.is_some();
-        return resolve_backend_selection_with_env(Some(&cfg), explicit, &env);
-    }
-    resolve_backend_selection_with_env(None, false, &env)
+    let paths = RuntimePaths::discover()?;
+    resolve_backend_selection_from_path(
+        &paths.config_file,
+        &paths.instance,
+        &EnvOverrides::from_process()?,
+    )
+}
+
+// Use the same instance and config formats as startup, but never migrate files
+// during admission. An unreadable config or path-discovery failure must not
+// silently select TUI. This read is not an atomic snapshot across later dispatch.
+fn resolve_backend_selection_from_path(
+    path: &Path,
+    instance: &crate::instance::InstanceId,
+    env: &EnvOverrides,
+) -> Result<RuntimeBackendSelection, String> {
+    let (cfg, _) = Config::read_only_for_instance(path, instance)?;
+    let explicit =
+        cfg.runtime_backend != RuntimeBackend::Tui || cfg.runtime_herdr_core_socket.is_some();
+    resolve_backend_selection_with_env(Some(&cfg), explicit, env)
 }
 
 pub fn resolve_herdr_core_socket_path(
@@ -267,6 +285,9 @@ pub fn resolve_herdr_core_socket_path(
     }
     let session = match env.hc_session.as_deref() {
         Some(raw) => {
+            let raw = raw
+                .to_str()
+                .ok_or_else(|| "HC_SESSION must be valid UTF-8".to_owned())?;
             let trimmed = raw.trim();
             // `.`/`..` would escape the session directory while keeping the fixed
             // `<state>/herdr-core/<session>/<session>.sock` shape.
@@ -2892,6 +2913,178 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn non_unicode_session_is_checked_only_when_socket_needs_it() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::Command;
+        const CHILD: &str = "HERDR_TEST_SESSION_PRIORITY";
+        if let Ok(case) = std::env::var(CHILD) {
+            let mut config = Config::default();
+            if case == "config-socket" {
+                config.runtime_herdr_core_socket = Some("/isolated/config.sock".to_owned());
+            }
+            let from_process = resolve_process_backend_selection();
+            let from_config = resolve_backend_selection(&config);
+            for result in [from_process, from_config] {
+                match case.as_str() {
+                    "tui" => assert_eq!(result.unwrap().backend, RuntimeBackend::Tui),
+                    "config-socket" => assert_eq!(
+                        result.unwrap().herdr_core_socket.as_deref(),
+                        Some(Path::new("/isolated/config.sock"))
+                    ),
+                    "env-socket" => assert_eq!(
+                        result.unwrap().herdr_core_socket.as_deref(),
+                        Some(Path::new("/isolated/env.sock"))
+                    ),
+                    "session-required" => assert!(
+                        result
+                            .unwrap_err()
+                            .contains("HC_SESSION must be valid UTF-8")
+                    ),
+                    _ => panic!("unexpected child case"),
+                }
+            }
+            return;
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-session-priority-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        for case in ["tui", "config-socket", "env-socket", "session-required"] {
+            let dir = root.join(case);
+            let config_dir = dir.join("config");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            if case == "config-socket" {
+                std::fs::write(config_dir.join("config.json"), r#"{"runtime":{"backend":"herdr-core","herdr_core_socket":"/isolated/config.sock"}}"#).unwrap();
+            }
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "runtime_adapter::tests::non_unicode_session_is_checked_only_when_socket_needs_it", "--nocapture"])
+                .env_clear()
+                .env("HOME", &dir)
+                .env("TMPDIR", &dir)
+                .env("HERDR_MCP_CONFIG_DIR", &config_dir)
+                .env(CHILD, case)
+                .env("HC_SESSION", OsString::from_vec(vec![0xff]));
+            if case != "tui" {
+                child.env(RUNTIME_BACKEND_ENV, "herdr-core");
+            }
+            if case == "config-socket" || case == "env-socket" {
+                child.env("HC_SOCKET", "/isolated/env.sock");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child for {case} failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child did not execute targeted test"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_runtime_overrides_are_rejected_by_process_resolvers() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::Command;
+        const CHILD: &str = "HERDR_TEST_NON_UNICODE_OVERRIDE";
+        if let Ok(name) = std::env::var(CHILD) {
+            let error = resolve_process_backend_selection().unwrap_err();
+            assert!(error.contains(&name), "unexpected error: {error}");
+            let error = resolve_backend_selection(&Config::default()).unwrap_err();
+            assert!(error.contains(&name), "unexpected error: {error}");
+            return;
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("herdr-invalid-env-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        for name in [RUNTIME_BACKEND_ENV, "HC_SESSION"] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "runtime_adapter::tests::non_unicode_runtime_overrides_are_rejected_by_process_resolvers", "--nocapture"])
+                .env_clear()
+                .env("HOME", &root)
+                .env("TMPDIR", &root)
+                .env("HERDR_MCP_CONFIG_DIR", root.join("config"))
+                .env(CHILD, name)
+                .env(name, OsString::from_vec(vec![0xff]));
+            if name == "HC_SESSION" {
+                child.env(RUNTIME_BACKEND_ENV, "herdr-core");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child for {name} failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child did not execute the targeted test"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_backed_selection_uses_real_files_and_fails_closed() {
+        use std::fs;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("herdr-selection-{}-{unique}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("config.json");
+        let legacy = root.join("config.toml");
+        let instance = crate::instance::InstanceId::parse("uat").unwrap();
+        let env = EnvOverrides::default();
+        let select = || resolve_backend_selection_from_path(&path, &instance, &env);
+        assert_eq!(select().unwrap().backend, RuntimeBackend::Tui);
+        fs::write(&legacy, "[runtime]\nport = 9000\n").unwrap();
+        assert_eq!(select().unwrap().backend, RuntimeBackend::Tui);
+        assert!(!path.exists(), "admission must not migrate legacy config");
+        fs::write(
+            &path,
+            r#"{"runtime":{"backend":"herdr-core","herdr_core_socket":"/test/one.sock"}}"#,
+        )
+        .unwrap();
+        let selected = select().unwrap();
+        assert_eq!(selected.backend, RuntimeBackend::HerdrCore);
+        assert_eq!(
+            selected.herdr_core_socket.as_deref(),
+            Some(Path::new("/test/one.sock"))
+        );
+        fs::write(&path, r#"{"runtime":{"backend":"auto"}}"#).unwrap();
+        assert!(
+            select().is_err(),
+            "invalid modern config cannot fall back to legacy TUI"
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(
+            select().is_err(),
+            "unreadable modern config cannot fall back to legacy TUI"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn public_core_policy_gaps_fail_closed_before_contact_and_tui_stays_admitted() {
         use std::os::unix::net::UnixListener;
 
@@ -2969,7 +3162,7 @@ mod tests {
     fn socket_resolution_honors_config_then_env_then_xdg_session() {
         let env = EnvOverrides {
             runtime_backend: Some("herdr-core".to_owned()),
-            hc_session: Some("uat768".to_owned()),
+            hc_session: Some("uat768".into()),
             xdg_state_home: Some(PathBuf::from("/tmp/xdg-state-test")),
             ..EnvOverrides::default()
         };
@@ -2984,7 +3177,7 @@ mod tests {
         for rejected_session in ["../escape", ".", "..", "./escape", ""] {
             let traversal = EnvOverrides {
                 runtime_backend: Some("herdr-core".to_owned()),
-                hc_session: Some(rejected_session.to_owned()),
+                hc_session: Some(rejected_session.into()),
                 xdg_state_home: Some(PathBuf::from("/tmp/xdg-state-test")),
                 ..EnvOverrides::default()
             };
