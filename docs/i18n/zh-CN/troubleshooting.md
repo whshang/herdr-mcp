@@ -24,6 +24,29 @@ browser continuity
 
 前一层不通，就先不要猜后一层。
 
+## macOS 文件访问与屏幕录制权限
+
+macOS 将桌面、文稿、下载等受保护位置的文件访问和完全磁盘访问权限，与屏幕录制权限分别管理。文件/Git 工具返回 `macos_tcc_access_blocked` 时，先运行 `herdr-mcp permissions status`；若显示 `needs_setup`，执行 `herdr-mcp permissions setup`，按提示在系统设置中授权 `herdr-mcp-broker`，再运行 `herdr-mcp permissions verify`。普通 `not_found` 并不代表 TCC 拦截。固定版本的 broker 可以保留已有文件访问授权；它不会替 Herdr TUI 授予屏幕录制权限。
+
+如果 Herdr TUI 的屏幕录制在更新后失效，先确认实际运行的可执行文件及链接指向：
+
+```bash
+command -v herdr
+ls -l "$(command -v herdr)"
+ls -l ~/.local/bin/herdr
+```
+
+若是符号链接，继续检查其目标，确认发起录制请求的主体；常见入口是 `~/.local/bin/herdr`，但实际安装与宿主可能不同。在 **系统设置 → 隐私与安全性 → 屏幕与系统音频录制** 中检查对应主体（不同 macOS 版本的名称略有差异）。如果实际请求主体是 `~/.local/bin/herdr` 且系统允许手动添加，可使用“+”选择该路径（如有链接，也应确认实际目标）并按需重新授权；再按系统提示重启相关程序并验证。若系统显示其他实际请求宿主，则检查该主体的授权。
+
+在一个本机安装样本的只读检查中，`herdr` CLI 为 ad-hoc 签名，designated requirement 包含 CDHash，其身份可能依赖该值。不同安装可能不同；可选用以下命令检查当前 `herdr` 的签名和 designated requirement：
+
+```bash
+codesign -dv --verbose=4 "$(command -v herdr)" 2>&1
+codesign -dr - "$(command -v herdr)" 2>&1
+```
+
+升级可能改变该身份，授权是否失效或重新提示须实测；结果取决于签名、请求宿主和 TCC 判定，并非每次 herdr-mcp 升级都会触发。未来可研究由稳定 Developer ID 签名的 Herdr.app 作为请求宿主，但这只是待验证的架构方向：只有该 app 真正发起请求，或系统认可其身份时才有意义，签名也不保证不再提示。herdr-mcp v1.1 当前支持的是 Herdr TUI，不支持独立的 Herdr app runtime。
+
 ## 30 秒快速定位
 
 ### 1. 本机 HTTP 在吗

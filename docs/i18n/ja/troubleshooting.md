@@ -24,6 +24,29 @@ browser continuity
 
 ある層が壊れているなら、後ろの層を再設定することから始めないでください。
 
+## macOS のファイルアクセスと画面収録の権限
+
+macOS はデスクトップ、書類、ダウンロードなどの保護された場所へのファイルアクセスやフルディスクアクセスと、画面収録の権限を別々に管理します。file/Git tool が `macos_tcc_access_blocked` を返した場合は `herdr-mcp permissions status` を確認し、`needs_setup` なら `herdr-mcp permissions setup` を実行して、指示に従いシステム設定で `herdr-mcp-broker` を許可した後、`herdr-mcp permissions verify` を実行します。通常の `not_found` は TCC の遮断を意味しません。固定された broker revision は既存のファイルアクセス許可を維持できますが、Herdr TUI の画面収録は許可しません。
+
+更新後に Herdr TUI の画面収録が動かなくなった場合は、まず使用中の実行ファイルとリンク先を確認します。
+
+```bash
+command -v herdr
+ls -l "$(command -v herdr)"
+ls -l ~/.local/bin/herdr
+```
+
+シンボリックリンクがある場合はその先も確認し、収録を要求する主体を特定します。`~/.local/bin/herdr` は一般的な入口ですが、インストール先や要求元のホストは異なる場合があります。**システム設定 → プライバシーとセキュリティ → 画面収録とシステムオーディオ収録**（名称は macOS のバージョンによって異なります）で該当する主体を確認します。実際の要求主体が `~/.local/bin/herdr` であり、システムが手動追加を許可する場合は、「+」ボタンでそのパスを選択し（リンクの場合は実際のリンク先も確認）、必要に応じて再承認します。システムの指示に従って関連プログラムを再起動し、検証してください。macOS が別の要求元を示す場合は、その権限を確認します。
+
+あるローカルインストールのサンプルを読み取り専用で確認したところ、`herdr` CLI は ad-hoc 署名され、その designated requirement に CDHash が含まれていました。identity はその値に依存する可能性があります。インストールによって異なるため、必要に応じて次のコマンドで現在の `herdr` の署名と designated requirement を確認できます。
+
+```bash
+codesign -dv --verbose=4 "$(command -v herdr)" 2>&1
+codesign -dr - "$(command -v herdr)" 2>&1
+```
+
+更新によって identity が変わる可能性がありますが、許可が無効になるか再確認が表示されるかは実測が必要です。結果は署名、要求元ホスト、TCC の判定に依存し、すべての herdr-mcp 更新で起きるわけではありません。安定した Developer ID 署名の Herdr.app を要求元にする案は今後検証するアーキテクチャであり、実装済みの解決策ではありません。app が実際に要求するか、macOS がその identity を認識する場合に意味があり、署名によって確認がなくなる保証もありません。herdr-mcp v1.1 が現在サポートするのは Herdr TUI であり、独立した Herdr app runtime ではありません。
+
 ## 30 秒トリアージ
 
 ### ローカル HTTP runtime は listen しているか
@@ -42,7 +65,7 @@ herdr-mcp logs
 herdr-mcp permissions status
 ```
 
-file/git の各 tool が `macos_tcc_access_blocked` を返す場合は、`herdr-mcp permissions setup` を実行し、`herdr-mcp-broker` にアクセスを付与してから `herdr-mcp permissions verify` を実行してください。通常の `not_found` エラーは無関係です。
+file/Git tool が `macos_tcc_access_blocked` を返す場合は、上記の macOS 権限の手順を参照してください。通常の `not_found` エラーは無関係です。
 
 ### Herdr 自体は利用可能か
 
