@@ -51,7 +51,7 @@ ChatGPT Project のプロジェクト指示にローカルフォルダを書い�
 
 ## 権限と認可
 
-macOS では必要な場合のみ、安定 broker に一度だけフルディスクアクセスを付与します：
+macOS では必要な場合に、安定 broker にフルディスクアクセスを付与します：
 
 ```bash
 herdr-mcp permissions status
@@ -59,7 +59,7 @@ herdr-mcp permissions setup
 herdr-mcp permissions verify
 ```
 
-`permissions status` が `needs_setup` を返したときだけ setup を実行し、**システム設定 → プライバシーとセキュリティ → フルディスクアクセス** で承認してください。
+`permissions status` が `needs_setup` を返したときだけ setup を実行し、**システム設定 → プライバシーとセキュリティ → フルディスクアクセス** で承認してください。固定された broker revision は既存のファイルアクセス許可を維持できます。Herdr TUI の画面収録は別の権限です。Herdr 更新後に収録できない場合は [macOS 権限のトラブルシューティング](docs/i18n/ja/troubleshooting.md#macos-のファイルアクセスと画面収録の権限)を参照してください。
 
 初回 ChatGPT OAuth 接続時には、承認ページに正確なローカル承認コマンドと 6 桁コードが表示されます。自分のターミナルで承認し、Cloudflare Token やデバイス資格情報などの秘密をチャットに貼り付けないでください。
 
@@ -147,7 +147,7 @@ Cloudflare は公開 MCP/OAuth endpoint、device routing、再接続調整、複
 
 代替 transport が完全な代替になるには、ChatGPT から到達できる公開 HTTPS MCP endpoint、信頼できる TLS、認証/OAuth、安全な device routing、確実な再接続、明確な mutation delivery semantics を同時に提供する必要があります。
 
-private IP や Tailscale-only address は ChatGPT cloud から直接到達できません。現時点で正式にサポート・検証している経路は Cloudflare です。
+private IP や Tailscale-only address は ChatGPT cloud から直接到達できません。現時点で正式にサポート・検証している経路は Cloudflare です。LAN / Tailscale 直接接続は 1.1 ではサポートされておらず、今後のリリースで評価中の項目です。現行機能ではなく、確定したスコープでもありません。設計には認証、暗号化、device identity と権限、ネットワーク公開範囲、配送セマンティクスが必要で、ChatGPT cloud 向けには到達可能な公開 endpoint も必要です。
 
 ### どの Herdr をサポートしていますか？
 

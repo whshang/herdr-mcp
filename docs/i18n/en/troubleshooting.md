@@ -24,6 +24,29 @@ browser continuity
 
 If one layer is broken, do not start by reconfiguring a later one.
 
+## macOS file access and screen recording permissions
+
+macOS manages access to protected locations such as Desktop, Documents and Downloads, and Full Disk Access, separately from Screen Recording. If file/Git tools return `macos_tcc_access_blocked`, run `herdr-mcp permissions status`; when it reports `needs_setup`, run `herdr-mcp permissions setup`, authorize `herdr-mcp-broker` in System Settings as directed, then run `herdr-mcp permissions verify`. A `not_found` result alone does not prove the file is absent: on a protected Desktop, Documents or Downloads path the rotating runtime cannot resolve the path by design, so the same access block can surface as `not_found`. Check `herdr-mcp permissions status` before treating such a path as missing. A fixed broker revision can retain its file-access grant; that grant does not authorize Herdr TUI to record the screen.
+
+If Herdr TUI screen recording stops working after an update, first identify the executable in use and where its links point:
+
+```bash
+command -v herdr
+ls -l "$(command -v herdr)"
+ls -l ~/.local/bin/herdr
+```
+
+Follow any symlink targets to identify the process requesting recording. `~/.local/bin/herdr` is a common entry point, but installations and requesting hosts vary. Check that identity under **System Settings → Privacy & Security → Screen & System Audio Recording** (the name varies by macOS version). If `~/.local/bin/herdr` is the actual requesting identity and macOS permits manual addition, use the “+” button to select that path (also confirm its actual target if it is a link), and reauthorize it as needed. Restart the relevant program if macOS requests it, and verify. If macOS identifies another requesting host, check that host's grant.
+
+In a read-only inspection of one local installation sample, the `herdr` CLI was ad-hoc signed and its designated requirement included a CDHash; its identity may depend on that value. Other installations may differ. Optionally inspect the current `herdr` signature and designated requirement with:
+
+```bash
+codesign -dv --verbose=4 "$(command -v herdr)" 2>&1
+codesign -dr - "$(command -v herdr)" 2>&1
+```
+
+An update may change that identity, but whether a grant stops applying or prompts recur must be tested. The outcome depends on signing, the requesting host and TCC's decision; not every herdr-mcp update causes this. A Herdr.app with stable Developer ID signing as the requesting host is a future architecture to validate, not an implemented solution. It only matters if the app actually makes the request or macOS recognizes its identity, and signing does not guarantee that prompts disappear. herdr-mcp v1.1 currently supports Herdr TUI, not the separate Herdr app runtime.
+
 ## 30-second triage
 
 ### Is the local HTTP runtime listening?
@@ -42,7 +65,7 @@ herdr-mcp logs
 herdr-mcp permissions status
 ```
 
-If file/git tools return `macos_tcc_access_blocked`, run `herdr-mcp permissions setup`, grant access to `herdr-mcp-broker`, then `herdr-mcp permissions verify`. Ordinary `not_found` errors are unrelated.
+For `macos_tcc_access_blocked` from file/Git tools, follow the macOS permissions steps above. A plain `not_found` is not by itself evidence of a TCC block, but on a protected Desktop, Documents or Downloads path confirm with `herdr-mcp permissions status` before treating the path as absent.
 
 ### Is Herdr itself available?
 
