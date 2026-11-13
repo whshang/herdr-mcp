@@ -341,7 +341,7 @@ fn run() -> Result<ExitCode, String> {
                 || {
                     eprintln!("{}", child_process::reap_confirmed_orphans_on_boot());
                 },
-                || mcp_http::serve_candidate(port),
+                |admitted| mcp_http::serve_candidate(port, admitted),
             )
         }
         cli::Command::Service(command) => {
@@ -438,17 +438,19 @@ fn run() -> Result<ExitCode, String> {
 
 // Until candidate state and its background workers support herdr-core, reject
 // that backend before orphan reaping, TUI client construction, or worker startup.
+// The admitted selection is handed to the server so later requests stay on it
+// (#936).
 fn candidate_startup<T>(
     selection: Result<runtime_adapter::RuntimeBackendSelection, String>,
     reap: impl FnOnce(),
-    serve: impl FnOnce() -> Result<T, String>,
+    serve: impl FnOnce(runtime_adapter::RuntimeBackendSelection) -> Result<T, String>,
 ) -> Result<T, String> {
     let selection = selection?;
     if selection.backend != runtime_adapter::RuntimeBackend::Tui {
         return Err("candidate startup for herdr-core is unavailable: TUI background workers are not isolated".to_owned());
     }
     reap();
-    serve()
+    serve(selection)
 }
 
 #[cfg(test)]
@@ -477,7 +479,7 @@ mod candidate_startup_tests {
             let result = candidate_startup(
                 selected,
                 || reaped.set(true),
-                || {
+                |_| {
                     served.set(true);
                     Ok(())
                 },
@@ -494,8 +496,9 @@ mod candidate_startup_tests {
         let result = candidate_startup(
             Ok(selection(runtime_adapter::RuntimeBackend::Tui)),
             || reaped.set(true),
-            || {
+            |admitted| {
                 assert!(reaped.get());
+                assert_eq!(admitted.backend, runtime_adapter::RuntimeBackend::Tui);
                 Ok(42)
             },
         );

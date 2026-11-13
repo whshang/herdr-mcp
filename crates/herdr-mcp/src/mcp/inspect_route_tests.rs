@@ -183,6 +183,10 @@ fn selection_drift_uses_admitted_backend_and_socket() {
     let prompt = PromptRegistry::new();
     let skill = SkillService::new();
     let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+    // #936: a started runtime admits one backend for its process lifetime. This
+    // context pins TUI; the `tool_call` sections below pin the backend each
+    // scenario actually admitted, exactly like a process that started on it.
+    let tui_backend = crate::test_env::tui_backend_selection();
     let context = RuntimeContext {
         client: &client,
         cache: &cache,
@@ -202,6 +206,7 @@ fn selection_drift_uses_admitted_backend_and_socket() {
         browser_actuator: None,
         browser_mutation_gate: None,
         browser_mutation_admission: None,
+        runtime_backend: &tui_backend,
         trusted_local_ipc: true,
     };
 
@@ -242,7 +247,9 @@ fn selection_drift_uses_admitted_backend_and_socket() {
             write_config(&config_path, &before);
             let name = request["params"]["name"].as_str().unwrap();
             let arguments = request["params"]["arguments"].clone();
-            let route = crate::runtime_adapter::public_tool_route(name)
+            let admitted = crate::runtime_adapter::resolve_process_backend_selection()
+                .unwrap_or_else(|error| panic!("selection failed for {label}: {error}"));
+            let route = crate::runtime_adapter::public_tool_route(name, &admitted)
                 .unwrap_or_else(|error| panic!("admission failed for {label}: {error}"));
             write_config(&config_path, &after);
             let result = dispatch_admitted_tool(name, arguments, &context, route).unwrap();
@@ -309,6 +316,11 @@ fn selection_drift_uses_admitted_backend_and_socket() {
         } else {
             json!({"params": {"name": "herdr_inspect", "arguments": {}}})
         };
+        let admitted = crate::runtime_adapter::resolve_process_backend_selection().unwrap();
+        let context = RuntimeContext {
+            runtime_backend: &admitted,
+            ..context
+        };
         let result = tool_call(&request, &context).unwrap();
         let body: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -348,6 +360,11 @@ fn selection_drift_uses_admitted_backend_and_socket() {
     // An HC hello without server.status must still reject herdr_inspect before
     // execution, while preflight's nested inspect must not call that method.
     write_config(&config_path, &config("herdr-core", Some(&no_status_path)));
+    let admitted = crate::runtime_adapter::resolve_process_backend_selection().unwrap();
+    let context = RuntimeContext {
+        runtime_backend: &admitted,
+        ..context
+    };
     let direct = json!({"params": {"name": "herdr_inspect", "arguments": {}}});
     let result = tool_call(&direct, &context).unwrap();
     let body: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();

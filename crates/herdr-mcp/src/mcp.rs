@@ -244,6 +244,10 @@ pub struct RuntimeContext<'a> {
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
+    /// #936: the runtime backend this process admitted at startup. A request
+    /// that resolves a different backend or `herdr-core` socket fails closed
+    /// before any TUI or `herdr-core` socket is contacted.
+    pub runtime_backend: &'a crate::runtime_adapter::RuntimeBackendSelection,
     pub trusted_local_ipc: bool,
 }
 
@@ -1213,7 +1217,9 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     // selections fail closed here, before any TUI snapshot/socket execution.
     // #935: the admitted route also carries the negotiated `herdr-core` client
     // so the narrow `hc` primitives can be forwarded below.
-    let route = match crate::runtime_adapter::public_tool_route(name) {
+    // #936: admission is pinned to the backend this process started with, so a
+    // later env/config switch cannot move a live candidate onto another backend.
+    let route = match crate::runtime_adapter::public_tool_route(name, context.runtime_backend) {
         Ok(route) => route,
         Err(rejection) => return Ok(tool_result(rejection, true)),
     };
@@ -27629,10 +27635,13 @@ mod tests {
     fn workstation_preflight_aggregates_compact_inspect_and_endpoints_in_one_call() {
         use std::sync::{Arc, Mutex};
 
+        let _env = crate::test_env::lock();
         let temp_root =
             std::env::temp_dir().join(format!("herdr-preflight-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_root);
         std::fs::create_dir_all(&temp_root).unwrap();
+        let _config = crate::test_env::TuiConfigGuard::install(&temp_root);
+        let runtime_backend = crate::test_env::tui_backend_selection();
 
         let client = HerdrClient::new(temp_root.join("missing-herdr.sock"));
         let cache = EventCache::from_snapshot_for_test(json!({"panes": [], "agents": []}));
@@ -27660,6 +27669,7 @@ mod tests {
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,
+            runtime_backend: &runtime_backend,
             trusted_local_ipc: true,
         };
 
@@ -31212,6 +31222,9 @@ mod client_request_shape_matrix_tests {
             })
             .unwrap();
 
+        let _env = crate::test_env::lock();
+        let _config = crate::test_env::TuiConfigGuard::install(&temp_root);
+        let runtime_backend = crate::test_env::tui_backend_selection();
         let context = RuntimeContext {
             client: &client,
             cache: &cache,
@@ -31231,6 +31244,7 @@ mod client_request_shape_matrix_tests {
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,
+            runtime_backend: &runtime_backend,
             trusted_local_ipc: false,
         };
 
@@ -31501,6 +31515,9 @@ mod client_request_shape_matrix_tests {
         let skill = SkillService::new();
         let state_store =
             std::sync::Arc::new(std::sync::Mutex::new(StateStore::open(":memory:").unwrap()));
+        let _env = crate::test_env::lock();
+        let _config = crate::test_env::TuiConfigGuard::install(&temp_root);
+        let backend = crate::test_env::tui_backend_selection();
 
         let make_ctx =
             |holder: Option<&'static str>, epoch: Option<i64>, token: Option<&'static str>| {
@@ -31523,6 +31540,7 @@ mod client_request_shape_matrix_tests {
                     browser_actuator: None,
                     browser_mutation_gate: None,
                     browser_mutation_admission: None,
+                    runtime_backend: &backend,
                     trusted_local_ipc: false,
                 }
             };

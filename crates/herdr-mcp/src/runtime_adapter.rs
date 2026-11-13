@@ -1774,7 +1774,7 @@ impl PublicToolRoute {
     }
 }
 
-/// Fail-closed admission and routing for one frozen Epoch-5 public tool invocation (#922, #935).
+/// Fail-closed admission and routing for one frozen Epoch-5 public tool invocation (#922, #935, #936).
 ///
 /// The tool catalog itself never changes: this gate decides only whether the
 /// *selected backend* may serve an already-declared tool. `tui` is the default
@@ -1782,10 +1782,37 @@ impl PublicToolRoute {
 /// `hello` and applies the adapter's capability table. Any backend-selection
 /// error (for example `HERDR_MCP_RUNTIME_BACKEND=auto`) fails closed instead of
 /// falling back to the TUI path.
-pub fn public_tool_route(tool_name: &str) -> Result<PublicToolRoute, Value> {
+///
+/// `admitted` is the backend this runtime process selected when it started and
+/// carried through `AppState`/`RuntimeContext` for the process lifetime. A
+/// request whose current env/config resolves to another backend or another
+/// admitted `herdr-core` socket fails closed with `invalid_runtime_backend` and
+/// requires a restart (#936). Without that check an already running TUI
+/// candidate would honour a later `runtime.backend = "herdr-core"` edit on its
+/// next request, although its state and background workers were only admitted
+/// for TUI. The comparison uses the single selection read that also feeds the
+/// route, so a concurrent config change cannot slip between the check and the
+/// dispatch.
+pub fn public_tool_route(
+    tool_name: &str,
+    admitted: &RuntimeBackendSelection,
+) -> Result<PublicToolRoute, Value> {
     let selection = resolve_process_backend_selection().map_err(|error| {
         invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
     })?;
+    if selection.backend != admitted.backend
+        || selection.herdr_core_socket != admitted.herdr_core_socket
+    {
+        return Err(invalid_runtime_backend_tool_error(
+            tool_name,
+            &format!(
+                "runtime backend selection changed after startup (admitted '{}', now '{}'); restart the runtime to switch backends",
+                admitted.backend.as_str(),
+                selection.backend.as_str()
+            ),
+            "backend_selection",
+        ));
+    }
     public_tool_route_for_selection(tool_name, &selection)
 }
 
