@@ -348,8 +348,6 @@ mod platform {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Component;
 
-    const TEMP_MODE: u16 = 0o600;
-
     /// A directory descriptor pinned by the walk plus the canonical path that
     /// was used to reach it. The path is only used to detect replacement; the
     /// descriptor is the authority for every mutation.
@@ -465,7 +463,7 @@ mod platform {
             &pinned.dir,
             &temp_name,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::from_bits_truncate(TEMP_MODE),
+            Mode::RUSR | Mode::WUSR,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -621,7 +619,7 @@ mod platform {
             dir,
             &backup_name,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::from_bits_truncate(TEMP_MODE),
+            Mode::RUSR | Mode::WUSR,
         ) {
             Ok(value) => value,
             Err(error) => {
