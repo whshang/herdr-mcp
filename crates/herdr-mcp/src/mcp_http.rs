@@ -239,9 +239,16 @@ struct AppState {
     browser_actuation: BrowserActuationBroker,
     browser_mutation_gate: Arc<RwLock<()>>,
     browser_mutation_admission: Arc<BrowserMutationAdmission>,
+    /// #936: backend admitted once at candidate startup. Every later request
+    /// must still resolve this selection or fail closed; the process is never
+    /// re-admitted onto another backend.
+    runtime_backend: crate::runtime_adapter::RuntimeBackendSelection,
 }
 
-pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
+pub fn serve_candidate(
+    port: u16,
+    runtime_backend: crate::runtime_adapter::RuntimeBackendSelection,
+) -> Result<ExitCode, String> {
     let token = env::var("HERDR_MCP_TOKEN")
         .ok()
         .filter(|value| !value.is_empty())
@@ -300,6 +307,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             browser_actuation: BrowserActuationBroker::default(),
             browser_mutation_gate: Arc::new(RwLock::new(())),
             browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
+            runtime_backend,
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -3016,6 +3024,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
+            runtime_backend: &blocking_state.runtime_backend,
             trusted_local_ipc: blocking_state.trusted_extension_ipc,
         };
         mcp::handle(&blocking_request, &context)
@@ -3928,6 +3937,7 @@ mod tests {
             browser_actuation: BrowserActuationBroker::default(),
             browser_mutation_gate: Arc::new(RwLock::new(())),
             browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
+            runtime_backend: crate::test_env::tui_backend_selection(),
         }
     }
 
@@ -4197,10 +4207,6 @@ mod tests {
             env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
             env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
         }
-        let app = candidate_router(test_state_with_snapshot(
-            &root.join("tcp"),
-            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
-        ));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4219,6 +4225,14 @@ mod tests {
             std::fs::write(config_dir.join("config.json"), json!({
                 "runtime": {"backend": "herdr-core", "herdr_core_socket": socket.to_string_lossy()}
             }).to_string()).unwrap();
+            // #936: each iteration models one candidate that admitted this
+            // herdr-core config at startup.
+            let mut state = test_state_with_snapshot(
+                &root.join("tcp"),
+                json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+            );
+            state.runtime_backend = crate::test_env::admitted_backend_selection();
+            let app = candidate_router(state);
             runtime.block_on(async {
                 let inspected = call_public_tool(&app, "herdr_inspect", json!({})).await;
                 assert_eq!(inspected["ok"], true, "{inspected}");
@@ -4333,6 +4347,8 @@ mod tests {
             }),
         );
         state.client = HerdrClient::new(&tui_socket);
+        // #936: this probe starts on the `herdr-core` config written above.
+        state.runtime_backend = crate::test_env::admitted_backend_selection();
         let app = candidate_router(state);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4390,12 +4406,20 @@ mod tests {
             assert_eq!(continuity["ok"], true, "{continuity}");
             assert_eq!(continuity["candidates"], json!([]));
             assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            // #936: a live runtime keeps its admitted backend. Switching the
+            // process env to `tui` after startup must not re-admit the request
+            // onto the TUI socket; it fails closed and asks for a restart.
             unsafe { env::set_var("HERDR_MCP_RUNTIME_BACKEND", "tui") };
             for method in ["herdr_mcp.agent.task.dispatch", "herdr_mcp.codex_session.resume"] {
                 let result = call_public_tool(&app, "herdr_call", json!({"method": method, "params": {}})).await;
-                assert_ne!(result["required_capability"], "tui_backend_isolation", "{method}: {result}");
-                assert_eq!(result["ok"], false, "{method}: {result}");
+                assert_eq!(result["code"], "invalid_runtime_backend", "{method}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{method}: {result}");
+                assert!(
+                    result["message"].as_str().unwrap().contains("restart the runtime"),
+                    "{method}: {result}"
+                );
             }
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         });
         unsafe {
             match previous_config_dir {
@@ -4451,14 +4475,17 @@ mod tests {
             "agents": [],
             "tabs": []
         });
-        let app = candidate_router(test_state_with_snapshot(&root.join("tcp-core"), snapshot));
-
         let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
         let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
         unsafe {
             env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
             env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
         }
+        // #936: this router admits the `herdr-core` selection configured above,
+        // exactly like a candidate that started with that config.
+        let mut state = test_state_with_snapshot(&root.join("tcp-core"), snapshot.clone());
+        state.runtime_backend = crate::test_env::admitted_backend_selection();
+        let app = candidate_router(state);
 
         // 1. Explicit herdr-core must not execute herdr_fs_list through the TUI snapshot.
         // The environment guard is process-global, so this test drives the HTTP
@@ -4551,13 +4578,34 @@ mod tests {
             assert_eq!(invalid["retryable"], false);
             assert_eq!(invalid["delivery_state"], "not_delivered");
 
-            // 3. Default TUI selection keeps the existing behavior byte-for-byte.
+            // 3. Default TUI selection keeps the existing behavior byte-for-byte,
+            //    but only for a runtime that admitted TUI: the live `herdr-core`
+            //    router must not follow the process back to TUI (#936).
             unsafe {
                 env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
                 env::remove_var("HERDR_MCP_CONFIG_DIR");
             }
-            let tui_list = call_public_tool(
+            let switched = call_public_tool(
                 &app,
+                "herdr_fs_list",
+                json!({"path": project.to_string_lossy()}),
+            )
+            .await;
+            assert_eq!(switched["ok"], false);
+            assert_eq!(switched["code"], "invalid_runtime_backend");
+            assert_eq!(switched["retryable"], false);
+            assert_eq!(switched["delivery_state"], "not_delivered");
+            assert!(
+                switched["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("restart the runtime"),
+                "{switched}"
+            );
+            let tui_app =
+                candidate_router(test_state_with_snapshot(&root.join("tcp-tui"), snapshot));
+            let tui_list = call_public_tool(
+                &tui_app,
                 "herdr_fs_list",
                 json!({"path": project.to_string_lossy()}),
             )
@@ -4604,16 +4652,19 @@ mod tests {
         std::fs::write(config_dir.join("config.json"), json!({
             "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
         }).to_string()).unwrap();
-        let app = candidate_router(test_state_with_snapshot(
-            &root.join("tcp"),
-            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
-        ));
         let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
         let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
         unsafe {
             env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
             env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
         }
+        // #936: this router admits the `herdr-core` config written above.
+        let mut state = test_state_with_snapshot(
+            &root.join("tcp"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        state.runtime_backend = crate::test_env::admitted_backend_selection();
+        let app = candidate_router(state);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4669,6 +4720,69 @@ mod tests {
             }
         }
         std::fs::remove_file(&core_socket).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// #936: a TUI-admitted router keeps serving TUI, then refuses a later
+    /// `herdr-core` config edit on the real `tools/call` route. The refusal
+    /// names neither the socket nor the bearer token, and no core listener
+    /// is required: reaching that socket would be a different error.
+    #[cfg(unix)]
+    #[test]
+    fn tui_admitted_router_refuses_later_core_config_switch() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("backend-lifetime-pin");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join("config.json");
+        std::fs::write(&config, r#"{"runtime":{"backend":"tui"}}"#).unwrap();
+        let core_socket = root.join("core-socket-must-not-leak.sock");
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let app = candidate_router(test_state(&root.join("tcp")));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let steady = runtime.block_on(call_public_tool(&app, "herdr_inspect", json!({})));
+        assert_ne!(steady["code"], "invalid_runtime_backend", "{steady}");
+        std::fs::write(
+            &config,
+            json!({
+                "runtime": {
+                    "backend": "herdr-core",
+                    "herdr_core_socket": core_socket.to_string_lossy()
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let refused = runtime.block_on(call_public_tool(&app, "herdr_inspect", json!({})));
+        assert_eq!(refused["code"], "invalid_runtime_backend", "{refused}");
+        assert_eq!(refused["retryable"], false, "{refused}");
+        assert_eq!(refused["delivery_state"], "not_delivered", "{refused}");
+        let message = refused["message"].as_str().unwrap();
+        assert!(message.contains("admitted 'tui'"), "{refused}");
+        assert!(message.contains("now 'herdr-core'"), "{refused}");
+        assert!(message.contains("restart the runtime"), "{refused}");
+        assert!(
+            !message.contains("core-socket-must-not-leak") && !message.contains("test-token"),
+            "{refused}"
+        );
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
