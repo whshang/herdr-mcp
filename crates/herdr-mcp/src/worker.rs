@@ -193,13 +193,80 @@ fn annotate_inventory_entry(
     }
 }
 
-fn render_device_inventory(mut payload: Value, now_ms: u64) -> Value {
+/// Scope label for the CLI-only `current_configured_device` annotation. It
+/// describes the local enrollment configuration, never physical identity or
+/// reachability.
+const CURRENT_CONFIGURED_DEVICE_SCOPE: &str = "configured_enrollment_not_physical_device";
+
+/// Local-annotation fields are owned by the CLI. A Worker (or any proxy in
+/// front of it) may not assert which inventory row belongs to this machine.
+const UNTRUSTED_LOCAL_DEVICE_ANNOTATION_FIELDS: [&str; 3] = [
+    "current_configured_device",
+    "current_configured_device_scope",
+    "is_current_device",
+];
+
+fn strip_untrusted_local_device_annotations(payload: &mut Value) {
+    if let Some(object) = payload.as_object_mut() {
+        for field in UNTRUSTED_LOCAL_DEVICE_ANNOTATION_FIELDS {
+            object.remove(field);
+        }
+    }
+    if let Some(devices) = payload.get_mut("devices").and_then(Value::as_array_mut) {
+        for device in devices {
+            let Some(object) = device.as_object_mut() else {
+                continue;
+            };
+            for field in UNTRUSTED_LOCAL_DEVICE_ANNOTATION_FIELDS {
+                object.remove(field);
+            }
+        }
+    }
+}
+
+fn unique_device_row_matches(payload: &Value, device_id: &str) -> bool {
+    let Some(devices) = payload.get("devices").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut matching = devices.iter().filter(|device| {
+        device
+            .get("device_id")
+            .and_then(Value::as_str)
+            .and_then(|value| crate::config::normalize_device_id(value).ok())
+            .as_deref()
+            == Some(device_id)
+    });
+    matching.next().is_some() && matching.next().is_none()
+}
+
+fn render_device_inventory(
+    mut payload: Value,
+    now_ms: u64,
+    current_configured_device_id: Option<&str>,
+) -> Value {
+    strip_untrusted_local_device_annotations(&mut payload);
     if let Some(devices) = payload.get_mut("devices").and_then(Value::as_array_mut) {
         for device in devices {
             let created = device.get("enrolled_at_ms").and_then(Value::as_u64);
             let last_used = device.get("last_seen_at_ms").and_then(Value::as_u64);
             annotate_inventory_entry(device, created, last_used, now_ms, false);
         }
+    }
+    // `true` only when the inventory contains exactly one row with the locally
+    // configured device id. Anything ambiguous or unproven stays `null`.
+    let current_configured_device = match current_configured_device_id {
+        Some(device_id) if unique_device_row_matches(&payload, device_id) => Value::Bool(true),
+        _ => Value::Null,
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "current_configured_device".to_owned(),
+            current_configured_device,
+        );
+        object.insert(
+            "current_configured_device_scope".to_owned(),
+            Value::String(CURRENT_CONFIGURED_DEVICE_SCOPE.to_owned()),
+        );
     }
     payload
 }
@@ -799,7 +866,7 @@ fn finalize_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, S
 }
 
 fn list_devices(paths: &RuntimePaths) -> Result<ExitCode, String> {
-    let payload = extension_fleet_snapshot(paths)?;
+    let (payload, current_configured_device_id) = cli_device_inventory(paths)?;
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         let code = payload
             .get("code")
@@ -807,7 +874,11 @@ fn list_devices(paths: &RuntimePaths) -> Result<ExitCode, String> {
             .unwrap_or("device_inventory_unavailable");
         return Err(format!("device inventory unavailable: {code}"));
     }
-    let payload = render_device_inventory(payload, inventory_now_ms());
+    let payload = render_device_inventory(
+        payload,
+        inventory_now_ms(),
+        current_configured_device_id.as_deref(),
+    );
     println!(
         "{}",
         serde_json::to_string_pretty(&payload)
@@ -817,28 +888,95 @@ fn list_devices(paths: &RuntimePaths) -> Result<ExitCode, String> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!({
-        "ok": false,
-        "code": "device_inventory_platform_unsupported",
-    }))
+fn cli_device_inventory(paths: &RuntimePaths) -> Result<(Value, Option<String>), String> {
+    Ok((extension_fleet_snapshot(paths)?, None))
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
+/// Fetch the device inventory for `device list` while keeping the exact local
+/// identity that authenticated the request. The annotation is derived from that
+/// same config/identity load, never from a second config read after HTTP.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn cli_device_inventory(paths: &RuntimePaths) -> Result<(Value, Option<String>), String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let owner = resolve_fleet_link_identity(paths, &config)?;
+    let configured_device_id = configured_enrollment_device_id(&config, &owner);
     let client = client_for_origin(&owner.edge_origin)?;
-    extension_fleet_snapshot_with_client(paths, &client)
+    let fetch = fetch_device_inventory(&owner, &client)?;
+    let configured_device_id = if fetch.ok
+        && fetch.requested_origin_matches_response()
+        && configured_device_id.is_some()
+    {
+        configured_device_id
+    } else {
+        None
+    };
+    if !fetch.ok {
+        return Ok((fetch.failure_payload(), None));
+    }
+    let local = local_inventory_context(paths, &config, &owner)?;
+    Ok((fetch.into_snapshot(local), configured_device_id))
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) fn extension_fleet_snapshot_with_client(
-    paths: &RuntimePaths,
+/// Canonical local enrollment loaded from the same config that produced the
+/// authenticated request. Missing, invalid, legacy, shared, or non-canonical
+/// values intentionally yield `None` instead of a best-effort guess.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn configured_enrollment_device_id(
+    config: &Config,
+    identity: &FleetLinkIdentity,
+) -> Option<String> {
+    let device_id = crate::config::normalize_device_id(config.edge_device_id.as_deref()?).ok()?;
+    let edge_origin = normalize_edge_origin(config.edge_public_origin.as_deref()?).ok()?;
+    let identity_origin = normalize_edge_origin(&identity.edge_origin).ok()?;
+    if identity_origin != edge_origin || identity.workstation_id != device_id {
+        return None;
+    }
+    Some(device_id)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+struct DeviceInventoryFetch {
+    payload: Value,
+    ok: bool,
+    http_status: u16,
+    requested_origin: String,
+    final_origin: Option<String>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+impl DeviceInventoryFetch {
+    /// A cross-origin redirect (or an unparseable final URL) means the CLI
+    /// cannot prove the inventory came from the configured Worker origin.
+    fn requested_origin_matches_response(&self) -> bool {
+        self.final_origin.as_deref() == Some(self.requested_origin.as_str())
+    }
+
+    fn failure_payload(&self) -> Value {
+        let code = self
+            .payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("device_inventory_unavailable");
+        json!({
+            "ok": false,
+            "code": code,
+            "http_status": self.http_status,
+        })
+    }
+
+    fn into_snapshot(self, local: Value) -> Value {
+        assemble_fleet_snapshot(&self.payload, local)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn fetch_device_inventory(
+    owner: &FleetLinkIdentity,
     client: &Client,
-) -> Result<Value, String> {
-    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let owner = resolve_fleet_link_identity(paths, &config)?;
+) -> Result<DeviceInventoryFetch, String> {
+    let request_url = endpoint(&owner.edge_origin, "/devices")?;
+    let requested_origin = canonical_origin(&request_url)
+        .ok_or_else(|| "cannot canonicalize the Worker device inventory origin".to_owned())?;
     let mut headers = bearer_headers(&owner.credential)?;
     headers.insert(
         "x-herdr-workstation",
@@ -846,85 +984,61 @@ pub(crate) fn extension_fleet_snapshot_with_client(
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
     let response = client
-        .get(endpoint(&owner.edge_origin, "/devices")?)
+        .get(request_url)
         .headers(headers)
         .send()
         .map_err(|error| format!("cannot read Worker device inventory: {error}"))?;
     let status = response.status();
+    let final_origin = canonical_origin(response.url());
     let payload: Value = response
         .json()
         .map_err(|_| format!("Worker device inventory returned non-JSON HTTP {status}"))?;
-    if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
-        let code = payload
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or("device_inventory_unavailable");
-        return Ok(json!({
-            "ok": false,
-            "code": code,
-            "http_status": status.as_u16(),
-        }));
-    }
-    #[cfg(target_os = "linux")]
-    let service = crate::linux_service_manager::doctor_status().unwrap_or_else(|_| json!({}));
-    #[cfg(target_os = "windows")]
-    let service = crate::windows_service_manager::doctor_status().unwrap_or_else(|_| json!({}));
-    Ok(json!({
+    let ok = status.is_success() && payload.get("ok").and_then(Value::as_bool) == Some(true);
+    Ok(DeviceInventoryFetch {
+        payload,
+        ok,
+        http_status: status.as_u16(),
+        requested_origin,
+        final_origin,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn canonical_origin(url: &Url) -> Option<String> {
+    normalize_edge_origin(url.origin().ascii_serialization().as_str()).ok()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn assemble_fleet_snapshot(payload: &Value, local: Value) -> Value {
+    json!({
         "ok": true,
         "devices": payload.get("devices").cloned().unwrap_or_else(|| json!([])),
         "observed_at_ms": payload.get("observed_at_ms").cloned().unwrap_or(Value::Null),
-        "local": {
-            "device_id": config.edge_device_id,
-            "runtime_version": crate::runtime_meta::runtime_version(),
-            "runtime_generation": service.get("generation").cloned().unwrap_or(Value::Null),
-            "link_loaded": service.get("link_loaded").cloned().unwrap_or(Value::Null),
-            "service_healthy": service.get("healthy").cloned().unwrap_or(Value::Null),
-        },
-    }))
+        "local": local,
+    })
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
-    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let owner = resolve_fleet_link_identity(paths, &config)?;
-    let client = client_for_origin(&owner.edge_origin)?;
-    extension_fleet_snapshot_with_client(paths, &client)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn extension_fleet_snapshot_with_client(
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn fleet_snapshot_with_identity(
     paths: &RuntimePaths,
+    config: &Config,
+    owner: &FleetLinkIdentity,
     client: &Client,
 ) -> Result<Value, String> {
-    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let owner = resolve_fleet_link_identity(paths, &config)?;
-    let mut headers = bearer_headers(&owner.credential)?;
-    headers.insert(
-        "x-herdr-workstation",
-        HeaderValue::from_str(&owner.workstation_id)
-            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
-    );
-    let response = client
-        .get(endpoint(&owner.edge_origin, "/devices")?)
-        .headers(headers)
-        .send()
-        .map_err(|error| format!("cannot read Worker device inventory: {error}"))?;
-    let status = response.status();
-    let payload: Value = response
-        .json()
-        .map_err(|_| format!("Worker device inventory returned non-JSON HTTP {status}"))?;
-    if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
-        let code = payload
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or("device_inventory_unavailable");
-        return Ok(json!({
-            "ok": false,
-            "code": code,
-            "http_status": status.as_u16(),
-        }));
+    let fetch = fetch_device_inventory(owner, client)?;
+    if !fetch.ok {
+        return Ok(fetch.failure_payload());
     }
+    let local = local_inventory_context(paths, config, owner)?;
+    Ok(fetch.into_snapshot(local))
+}
 
+#[cfg(target_os = "macos")]
+fn local_inventory_context(
+    paths: &RuntimePaths,
+    config: &Config,
+    owner: &FleetLinkIdentity,
+) -> Result<Value, String> {
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "HOME is required to inspect the production Link".to_owned())?;
@@ -939,21 +1053,60 @@ pub(crate) fn extension_fleet_snapshot_with_client(
             .starts_with("dev_")
             .then(|| owner.workstation_id.clone())
     });
-
     Ok(json!({
-        "ok": true,
-        "devices": payload.get("devices").cloned().unwrap_or_else(|| json!([])),
-        "observed_at_ms": payload.get("observed_at_ms").cloned().unwrap_or(Value::Null),
-        "local": {
-            "device_id": local_device_id,
-            "runtime_version": crate::runtime_meta::runtime_version(),
-            "runtime_generation": alignment.get("current_generation").cloned().unwrap_or(Value::Null),
-            "link_active_generation": alignment.get("active_generation").cloned().unwrap_or(Value::Null),
-            "link_loaded_generation": alignment.get("loaded_launchd_generation").cloned().unwrap_or(Value::Null),
-            "link_generation_stale": alignment.get("loaded_environment_stale").cloned().unwrap_or(Value::Null),
-            "link_owner": link.get("production_owner").cloned().unwrap_or(Value::Null),
-        },
+        "device_id": local_device_id,
+        "runtime_version": crate::runtime_meta::runtime_version(),
+        "runtime_generation": alignment.get("current_generation").cloned().unwrap_or(Value::Null),
+        "link_active_generation": alignment.get("active_generation").cloned().unwrap_or(Value::Null),
+        "link_loaded_generation": alignment.get("loaded_launchd_generation").cloned().unwrap_or(Value::Null),
+        "link_generation_stale": alignment.get("loaded_environment_stale").cloned().unwrap_or(Value::Null),
+        "link_owner": link.get("production_owner").cloned().unwrap_or(Value::Null),
     }))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn local_inventory_context(
+    _paths: &RuntimePaths,
+    config: &Config,
+    _owner: &FleetLinkIdentity,
+) -> Result<Value, String> {
+    #[cfg(target_os = "linux")]
+    let service = crate::linux_service_manager::doctor_status().unwrap_or_else(|_| json!({}));
+    #[cfg(target_os = "windows")]
+    let service = crate::windows_service_manager::doctor_status().unwrap_or_else(|_| json!({}));
+    Ok(json!({
+        "device_id": config.edge_device_id.clone(),
+        "runtime_version": crate::runtime_meta::runtime_version(),
+        "runtime_generation": service.get("generation").cloned().unwrap_or(Value::Null),
+        "link_loaded": service.get("link_loaded").cloned().unwrap_or(Value::Null),
+        "service_healthy": service.get("healthy").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "ok": false,
+        "code": "device_inventory_platform_unsupported",
+    }))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let owner = resolve_fleet_link_identity(paths, &config)?;
+    let client = client_for_origin(&owner.edge_origin)?;
+    extension_fleet_snapshot_with_client(paths, &client)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) fn extension_fleet_snapshot_with_client(
+    paths: &RuntimePaths,
+    client: &Client,
+) -> Result<Value, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let owner = resolve_fleet_link_identity(paths, &config)?;
+    fleet_snapshot_with_identity(paths, &config, &owner, client)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -4328,10 +4481,255 @@ mod tests {
                 }]
             }),
             now,
+            None,
         );
         assert_eq!(devices["devices"][0]["age"], "2d");
         assert_eq!(devices["devices"][0]["last_used"], "never used");
         assert_eq!(devices["devices"][0]["usage_state"], "never_used");
+        assert_eq!(devices["current_configured_device"], Value::Null);
+        assert_eq!(
+            devices["current_configured_device_scope"],
+            CURRENT_CONFIGURED_DEVICE_SCOPE
+        );
+    }
+
+    const LOCAL_CONTEXT_DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const LOCAL_CONTEXT_OTHER_DEVICE: &str = "dev_01BX5ZZKBKACTAV9WEVGEMMVRZ";
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn local_context_identity(origin: &str, device_id: &str) -> FleetLinkIdentity {
+        FleetLinkIdentity {
+            edge_origin: origin.to_owned(),
+            workstation_id: device_id.to_owned(),
+            credential: "test-credential-not-a-production-secret".to_owned(),
+        }
+    }
+
+    /// user agent | Given canonical enrolled config and the identity that authenticated the request | When deriving the local context | Then only an exact origin+device-id match is accepted
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn user_agent_given_canonical_enrollment_and_matching_identity_when_derived_then_context_is_exact()
+     {
+        let mut config = Config::default();
+        config.set_edge_device_id(LOCAL_CONTEXT_DEVICE).unwrap();
+        config
+            .set_edge_public_origin("https://edge.example")
+            .unwrap();
+        let identity = local_context_identity("https://edge.example", LOCAL_CONTEXT_DEVICE);
+        assert_eq!(
+            configured_enrollment_device_id(&config, &identity).as_deref(),
+            Some(LOCAL_CONTEXT_DEVICE)
+        );
+    }
+
+    /// user agent | Given missing, invalid, legacy, shared, or non-matching local enrollment values | When deriving the local context | Then it stays unknown instead of guessing
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn user_agent_given_unproven_local_enrollment_when_derived_then_context_is_unknown() {
+        let identity = local_context_identity("https://edge.example", LOCAL_CONTEXT_DEVICE);
+
+        let mut missing_id = Config::default();
+        missing_id
+            .set_edge_public_origin("https://edge.example")
+            .unwrap();
+        assert!(configured_enrollment_device_id(&missing_id, &identity).is_none());
+
+        let mut missing_origin = Config::default();
+        missing_origin
+            .set_edge_device_id(LOCAL_CONTEXT_DEVICE)
+            .unwrap();
+        assert!(configured_enrollment_device_id(&missing_origin, &identity).is_none());
+
+        let mut bad_origin = Config::default();
+        bad_origin.set_edge_device_id(LOCAL_CONTEXT_DEVICE).unwrap();
+        bad_origin.edge_public_origin = Some("http://edge.example".to_owned());
+        assert!(configured_enrollment_device_id(&bad_origin, &identity).is_none());
+
+        // Legacy/shared identities are not canonical `dev_` ULIDs.
+        let mut legacy_id = Config::default();
+        legacy_id
+            .set_edge_public_origin("https://edge.example")
+            .unwrap();
+        legacy_id.edge_device_id = Some("owner-workstation".to_owned());
+        assert!(configured_enrollment_device_id(&legacy_id, &identity).is_none());
+
+        let mut bad_ulid = Config::default();
+        bad_ulid
+            .set_edge_public_origin("https://edge.example")
+            .unwrap();
+        bad_ulid.edge_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FA".to_owned());
+        assert!(configured_enrollment_device_id(&bad_ulid, &identity).is_none());
+
+        // Same Worker, different configured/authenticated device id.
+        let mut config = Config::default();
+        config.set_edge_device_id(LOCAL_CONTEXT_DEVICE).unwrap();
+        config
+            .set_edge_public_origin("https://edge.example")
+            .unwrap();
+        let same_name_other_id =
+            local_context_identity("https://edge.example", LOCAL_CONTEXT_OTHER_DEVICE);
+        assert!(configured_enrollment_device_id(&config, &same_name_other_id).is_none());
+
+        // Config origin and the origin that authenticated the request differ
+        // (for example a plist/domain alias fallback): conservative unknown.
+        let alias_identity =
+            local_context_identity("https://edge-alias.example", LOCAL_CONTEXT_DEVICE);
+        assert!(configured_enrollment_device_id(&config, &alias_identity).is_none());
+    }
+
+    /// user agent | Given a canonical requested origin | When the response final URL is compared | Then cross-origin redirects and unparseable final URLs are not accepted
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn user_agent_given_redirected_inventory_request_when_response_is_classified_then_only_same_origin_counts()
+     {
+        let mut fetch = DeviceInventoryFetch {
+            payload: json!({"ok": true, "devices": []}),
+            ok: true,
+            http_status: 200,
+            requested_origin: "https://edge.example".to_owned(),
+            final_origin: Some("https://edge.example".to_owned()),
+        };
+        assert!(fetch.requested_origin_matches_response());
+
+        fetch.final_origin = Some("https://edge-alias.example".to_owned());
+        assert!(!fetch.requested_origin_matches_response());
+
+        fetch.final_origin = None;
+        assert!(!fetch.requested_origin_matches_response());
+
+        let requested = Url::parse("https://edge.example/devices").unwrap();
+        assert_eq!(
+            canonical_origin(&requested).as_deref(),
+            Some("https://edge.example")
+        );
+        let cross_origin = Url::parse("https://edge-alias.example/devices").unwrap();
+        assert_ne!(
+            canonical_origin(&requested),
+            canonical_origin(&cross_origin)
+        );
+        let insecure = Url::parse("http://edge.example/devices").unwrap();
+        assert_eq!(canonical_origin(&insecure), None);
+    }
+
+    /// user agent | Given one unique inventory row equals the proven configured id | When rendered | Then `current_configured_device` is true and the scope label denies physical identity
+    #[test]
+    fn user_agent_given_unique_matching_inventory_row_when_rendered_then_configured_device_is_true()
+    {
+        let rendered = render_device_inventory(
+            json!({"devices": [
+                {"device_id": LOCAL_CONTEXT_DEVICE, "name": "air", "enrolled_at_ms": 1_700_000_000_000u64, "last_seen_at_ms": null},
+                {"device_id": LOCAL_CONTEXT_OTHER_DEVICE, "name": "pro", "enrolled_at_ms": 1_700_000_000_000u64, "last_seen_at_ms": null}
+            ]}),
+            1_700_000_000_000,
+            Some(LOCAL_CONTEXT_DEVICE),
+        );
+        assert_eq!(rendered["current_configured_device"], Value::Bool(true));
+        assert_eq!(
+            rendered["current_configured_device_scope"],
+            CURRENT_CONFIGURED_DEVICE_SCOPE
+        );
+        assert_eq!(rendered["devices"][0]["age"], "0s");
+        assert!(
+            rendered["devices"][0]
+                .get("current_configured_device")
+                .is_none()
+        );
+    }
+
+    /// user agent | Given duplicate rows, a name-only match, or no matching id | When rendered | Then the annotation stays null
+    #[test]
+    fn user_agent_given_ambiguous_or_absent_inventory_match_when_rendered_then_annotation_is_null()
+    {
+        let duplicate = render_device_inventory(
+            json!({"devices": [
+                {"device_id": LOCAL_CONTEXT_DEVICE},
+                {"device_id": LOCAL_CONTEXT_DEVICE}
+            ]}),
+            0,
+            Some(LOCAL_CONTEXT_DEVICE),
+        );
+        assert_eq!(duplicate["current_configured_device"], Value::Null);
+
+        // A non-canonical case variant still names the same device id, so two
+        // such rows are ambiguous rather than a unique match.
+        let case_variant_duplicate = render_device_inventory(
+            json!({"devices": [
+                {"device_id": LOCAL_CONTEXT_DEVICE},
+                {"device_id": LOCAL_CONTEXT_DEVICE.to_lowercase()}
+            ]}),
+            0,
+            Some(LOCAL_CONTEXT_DEVICE),
+        );
+        assert_eq!(
+            case_variant_duplicate["current_configured_device"],
+            Value::Null
+        );
+
+        let name_only = render_device_inventory(
+            json!({"devices": [{"device_id": LOCAL_CONTEXT_OTHER_DEVICE, "name": "air"}]}),
+            0,
+            Some(LOCAL_CONTEXT_DEVICE),
+        );
+        assert_eq!(name_only["current_configured_device"], Value::Null);
+
+        let no_context = render_device_inventory(
+            json!({"devices": [{"device_id": LOCAL_CONTEXT_DEVICE}]}),
+            0,
+            None,
+        );
+        assert_eq!(no_context["current_configured_device"], Value::Null);
+
+        let missing_id = render_device_inventory(
+            json!({"devices": [{"name": "air"}]}),
+            0,
+            Some(LOCAL_CONTEXT_DEVICE),
+        );
+        assert_eq!(missing_id["current_configured_device"], Value::Null);
+    }
+
+    /// user agent | Given an upstream payload that asserts local annotations | When the CLI renders it | Then untrusted fields are stripped and only the locally proven value survives
+    #[test]
+    fn user_agent_given_spoofed_upstream_annotations_when_rendered_then_locally_recomputed_values_win()
+     {
+        let spoofed = json!({
+            "current_configured_device": true,
+            "is_current_device": true,
+            "current_configured_device_scope": "physical_device",
+            "devices": [
+                {"device_id": LOCAL_CONTEXT_DEVICE, "is_current_device": true, "current_configured_device": true, "current_configured_device_scope": "physical_device"},
+                {"device_id": LOCAL_CONTEXT_OTHER_DEVICE, "is_current_device": true}
+            ]
+        });
+
+        let unknown = render_device_inventory(spoofed.clone(), 0, None);
+        assert_eq!(unknown["current_configured_device"], Value::Null);
+        assert!(unknown.get("is_current_device").is_none());
+        assert_eq!(
+            unknown["current_configured_device_scope"],
+            CURRENT_CONFIGURED_DEVICE_SCOPE
+        );
+        for device in unknown["devices"].as_array().unwrap() {
+            assert!(device.get("is_current_device").is_none());
+            assert!(device.get("current_configured_device").is_none());
+            assert!(device.get("current_configured_device_scope").is_none());
+        }
+
+        let recomputed = render_device_inventory(spoofed, 0, Some(LOCAL_CONTEXT_DEVICE));
+        assert_eq!(recomputed["current_configured_device"], Value::Bool(true));
+    }
+
+    /// user agent | Given any supported platform | When the inventory renderer is compiled and used | Then the annotation contract has no platform-specific types
+    #[test]
+    fn user_agent_given_any_platform_when_rendering_inventory_then_annotation_contract_is_platform_independent()
+     {
+        let rendered = render_device_inventory(
+            json!({"ok": true, "devices": [{"device_id": LOCAL_CONTEXT_DEVICE, "enrolled_at_ms": 0, "last_seen_at_ms": 0}]}),
+            0,
+            Some(LOCAL_CONTEXT_DEVICE),
+        );
+        assert_eq!(rendered["ok"], Value::Bool(true));
+        assert_eq!(rendered["current_configured_device"], Value::Bool(true));
+        assert!(rendered["observed_at_ms"].is_null());
     }
 
     #[test]
