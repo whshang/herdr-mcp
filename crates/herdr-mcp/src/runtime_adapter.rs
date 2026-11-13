@@ -1747,19 +1747,25 @@ fn parse_hello_result(raw: &Value) -> Result<HerdrCoreHello, HerdrCoreError> {
 
 /// The backend route admitted for one already-declared public tool call.
 ///
-/// `Tui` keeps the historical in-process snapshot/socket implementation;
-/// `HerdrCore` carries the negotiated client so `mcp::tool_call` forwards the
-/// narrow `hc` primitives instead of running the TUI path (#935).
+/// `Tui` keeps the historical in-process snapshot/socket implementation.
+/// Both variants retain the selection admitted for this invocation; `HerdrCore`
+/// also carries the negotiated client for the narrow `hc` primitives (#935).
 pub enum PublicToolRoute {
-    Tui,
-    HerdrCore(HerdrCoreClient),
+    Tui(RuntimeBackendSelection),
+    HerdrCore(HerdrCoreClient, RuntimeBackendSelection),
 }
 
 impl PublicToolRoute {
     pub fn herdr_core_client(&self) -> Option<&HerdrCoreClient> {
         match self {
-            Self::Tui => None,
-            Self::HerdrCore(client) => Some(client),
+            Self::Tui(_) => None,
+            Self::HerdrCore(client, _) => Some(client),
+        }
+    }
+
+    pub fn selection(&self) -> &RuntimeBackendSelection {
+        match self {
+            Self::Tui(selection) | Self::HerdrCore(_, selection) => selection,
         }
     }
 }
@@ -1784,7 +1790,7 @@ fn public_tool_route_for_selection(
     selection: &RuntimeBackendSelection,
 ) -> Result<PublicToolRoute, Value> {
     match selection.backend {
-        RuntimeBackend::Tui => Ok(PublicToolRoute::Tui),
+        RuntimeBackend::Tui => Ok(PublicToolRoute::Tui(selection.clone())),
         RuntimeBackend::HerdrCore => {
             // These routes lack the TUI's access and mutation policies and result contract.
             // Reject before even negotiating with hc, regardless of its capabilities.
@@ -1852,7 +1858,7 @@ fn public_tool_route_for_selection(
                     ),
                 }));
             }
-            Ok(PublicToolRoute::HerdrCore(client))
+            Ok(PublicToolRoute::HerdrCore(client, selection.clone()))
         }
     }
 }
@@ -3126,7 +3132,7 @@ mod tests {
             assert_eq!(rejection["fallback_allowed"], false);
             assert!(matches!(
                 public_tool_route_for_selection(tool, &tui),
-                Ok(PublicToolRoute::Tui)
+                Ok(PublicToolRoute::Tui(_))
             ));
         }
         assert_eq!(

@@ -56,6 +56,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod result_projection;
 
+#[cfg(all(test, unix))]
+mod inspect_route_tests;
+
 use result_projection::{image_tool_result, model_visible_tool_output, tool_result};
 
 pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
@@ -1214,6 +1217,15 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         Ok(route) => route,
         Err(rejection) => return Ok(tool_result(rejection, true)),
     };
+    dispatch_admitted_tool(name, arguments, context, route)
+}
+
+fn dispatch_admitted_tool(
+    name: &str,
+    arguments: Value,
+    context: &RuntimeContext<'_>,
+    route: crate::runtime_adapter::PublicToolRoute,
+) -> Result<Value, String> {
     let herdr_core = route.herdr_core_client();
     // These local routes use TUI agent identities or topology, or expose TUI
     // execution sessions. Reject before task binding, capture, or dispatch.
@@ -1273,9 +1285,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 None => native_tools::methods(query),
             }
         }
-        "herdr_inspect" => {
-            native_tools::inspect(context.client, Some(context.cache), Some(context.exec))
-        }
+        "herdr_inspect" => native_tools::inspect_with_selection(
+            context.client,
+            Some(context.cache),
+            Some(context.exec),
+            route.selection(),
+        ),
         "herdr_since" => {
             let cursor = arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0);
             let workspace = arguments.get("workspace").and_then(Value::as_str);
@@ -1359,7 +1374,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     Some(&context.cache.snapshot()),
                 )
             } else if method == WORKSTATION_PREFLIGHT_METHOD {
-                workstation_preflight_call(context, &params)
+                workstation_preflight_call(context, &params, route.selection())
             } else if matches!(
                 method,
                 ORCHESTRATION_LEASE_ACQUIRE_METHOD
@@ -2159,7 +2174,11 @@ fn browser_conversation_url_ref(
     Ok(None)
 }
 
-fn workstation_preflight_call(context: &RuntimeContext<'_>, params: &Value) -> Value {
+fn workstation_preflight_call(
+    context: &RuntimeContext<'_>,
+    params: &Value,
+    selection: &crate::runtime_adapter::RuntimeBackendSelection,
+) -> Value {
     let Some(object) = params.as_object() else {
         return json!({
             "ok": false,
@@ -2189,8 +2208,12 @@ fn workstation_preflight_call(context: &RuntimeContext<'_>, params: &Value) -> V
             }
         },
     };
-    let inspect_view =
-        native_tools::inspect(context.client, Some(context.cache), Some(context.exec));
+    let inspect_view = native_tools::inspect_with_selection(
+        context.client,
+        Some(context.cache),
+        Some(context.exec),
+        selection,
+    );
     let browser_endpoints = if endpoint_limit == 0 {
         json!([])
     } else {
@@ -27782,7 +27805,12 @@ mod tests {
         assert!(body["agents"].is_array(), "{body}");
         assert!(body["browser_endpoints"].is_array(), "{body}");
 
-        let bad = workstation_preflight_call(&context, &json!({"endpoint_limit": 99}));
+        let selection = crate::runtime_adapter::RuntimeBackendSelection {
+            backend: crate::runtime_adapter::RuntimeBackend::Tui,
+            source: "test",
+            herdr_core_socket: None,
+        };
+        let bad = workstation_preflight_call(&context, &json!({"endpoint_limit": 99}), &selection);
         assert_eq!(bad["ok"], false);
         assert_eq!(bad["code"], "invalid_params");
         let _ = std::fs::remove_dir_all(&temp_root);

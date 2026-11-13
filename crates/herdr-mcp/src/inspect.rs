@@ -25,8 +25,16 @@ pub fn inspect_core(client: &HerdrClient, cached_snapshot: Option<Value>) -> Val
             });
         }
     };
+    inspect_core_with_selection(client, cached_snapshot, &backend_selection)
+}
+
+pub fn inspect_core_with_selection(
+    client: &HerdrClient,
+    cached_snapshot: Option<Value>,
+    backend_selection: &crate::runtime_adapter::RuntimeBackendSelection,
+) -> Value {
     if backend_selection.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore {
-        return crate::runtime_adapter::inspect_herdr_core(&backend_selection);
+        return crate::runtime_adapter::inspect_herdr_core(backend_selection);
     }
 
     let pong = match client.ping() {
