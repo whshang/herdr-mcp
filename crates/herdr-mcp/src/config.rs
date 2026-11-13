@@ -77,6 +77,13 @@ pub struct SemanticRouteConfig {
     pub max_tokens_per_second: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ReadOnlyConfigSource {
+    Absent,
+    Json,
+    Legacy,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct JsonConfigInput {
@@ -185,6 +192,42 @@ impl Default for Config {
     }
 }
 
+/// Read a configuration file without treating a dangling link as an absent file.
+/// Metadata checks are separate from the read and cannot form an atomic snapshot.
+fn read_optional_config(path: &Path, label: &str) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for (index, component) in path.ancestors().enumerate() {
+                match fs::symlink_metadata(component) {
+                    Ok(_) if index == 0 => {
+                        return Err(format!(
+                            "cannot read {label} {}: entry exists but its target was not found",
+                            path.display()
+                        ));
+                    }
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        fs::metadata(component).map_err(|error| {
+                            format!(
+                                "cannot read {label} {}: path component {}: {error}",
+                                path.display(),
+                                component.display()
+                            )
+                        })?;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!("cannot read {label} {}: {error}", path.display()));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        Err(error) => Err(format!("cannot read {label} {}: {error}", path.display())),
+    }
+}
+
 impl Config {
     /// Defaults used when config.json is absent. Alpha/prerelease binaries keep
     /// dogfood on `preview` so discovery still sees current GitHub alphas.
@@ -206,6 +249,33 @@ impl Config {
 
     pub fn load(path: &Path) -> Result<Self, String> {
         Self::load_for_instance(path, &InstanceId::default_instance())
+    }
+
+    /// Read the same formats and defaults as `load_for_instance`, without migrating
+    /// legacy configuration. The source records which file supplied it.
+    pub(crate) fn read_only_for_instance(
+        path: &Path,
+        instance: &InstanceId,
+    ) -> Result<(Self, ReadOnlyConfigSource), String> {
+        match read_optional_config(path, "config")? {
+            Some(content) => parse_json(&content, instance)
+                .map(|config| (config, ReadOnlyConfigSource::Json))
+                .map_err(|error| format!("invalid config {}: {error}", path.display())),
+            None => {
+                let legacy_path = path.with_file_name("config.toml");
+                match read_optional_config(&legacy_path, "legacy config")? {
+                    Some(content) => parse_legacy_toml(&content, instance)
+                        .map(|config| (config, ReadOnlyConfigSource::Legacy))
+                        .map_err(|error| {
+                            format!("invalid legacy config {}: {error}", legacy_path.display())
+                        }),
+                    None => Ok((
+                        Self::missing_file_default_for_instance(instance),
+                        ReadOnlyConfigSource::Absent,
+                    )),
+                }
+            }
+        }
     }
 
     pub fn load_for_instance(path: &Path, instance: &InstanceId) -> Result<Self, String> {
@@ -638,6 +708,79 @@ mod tests {
         assert!(Config::default().update_check);
         assert_eq!(Config::default().edge_public_origin, None);
         assert_eq!(Config::default().edge_device_id, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_config_rejects_dangling_links_without_migration() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-config-links-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let modern = root.join("config.json");
+        let legacy = root.join("config.toml");
+        let instance = InstanceId::parse("uat").unwrap();
+
+        let (default, source) = Config::read_only_for_instance(&modern, &instance).unwrap();
+        assert_eq!(source, ReadOnlyConfigSource::Absent);
+        assert_eq!(default.runtime_port, instance.default_port());
+        let (_, missing_dir_source) =
+            Config::read_only_for_instance(&root.join("absent-directory/config.json"), &instance)
+                .unwrap();
+        assert_eq!(missing_dir_source, ReadOnlyConfigSource::Absent);
+        assert!(!root.join("absent-directory").exists());
+
+        let legacy_text = "[runtime]\nport = 9000\n";
+        fs::write(&legacy, legacy_text).unwrap();
+        symlink(root.join("missing-json-target"), &modern).unwrap();
+        assert!(
+            Config::read_only_for_instance(&modern, &instance)
+                .unwrap_err()
+                .contains("cannot read config")
+        );
+        assert!(
+            fs::symlink_metadata(&modern)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), legacy_text);
+        fs::remove_file(&modern).unwrap();
+
+        fs::remove_file(&legacy).unwrap();
+        symlink(root.join("missing-legacy-target"), &legacy).unwrap();
+        fs::write(&modern, "{}").unwrap();
+        let (_, source) = Config::read_only_for_instance(&modern, &instance).unwrap();
+        assert_eq!(source, ReadOnlyConfigSource::Json);
+        fs::remove_file(&modern).unwrap();
+        assert!(
+            Config::read_only_for_instance(&modern, &instance)
+                .unwrap_err()
+                .contains("cannot read legacy config")
+        );
+        assert!(
+            fs::symlink_metadata(&legacy)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let dangling_parent = root.join("dangling-parent");
+        symlink(root.join("missing-parent-target"), &dangling_parent).unwrap();
+        assert!(
+            Config::read_only_for_instance(&dangling_parent.join("config.json"), &instance)
+                .unwrap_err()
+                .contains("cannot read config")
+        );
+        assert!(!root.join("missing-parent-target").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -239,9 +239,16 @@ struct AppState {
     browser_actuation: BrowserActuationBroker,
     browser_mutation_gate: Arc<RwLock<()>>,
     browser_mutation_admission: Arc<BrowserMutationAdmission>,
+    /// #936: backend admitted once at candidate startup. Every later request
+    /// must still resolve this selection or fail closed; the process is never
+    /// re-admitted onto another backend.
+    runtime_backend: crate::runtime_adapter::RuntimeBackendSelection,
 }
 
-pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
+pub fn serve_candidate(
+    port: u16,
+    runtime_backend: crate::runtime_adapter::RuntimeBackendSelection,
+) -> Result<ExitCode, String> {
     let token = env::var("HERDR_MCP_TOKEN")
         .ok()
         .filter(|value| !value.is_empty())
@@ -300,6 +307,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             browser_actuation: BrowserActuationBroker::default(),
             browser_mutation_gate: Arc::new(RwLock::new(())),
             browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
+            runtime_backend,
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -3016,6 +3024,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
+            runtime_backend: &blocking_state.runtime_backend,
             trusted_local_ipc: blocking_state.trusted_extension_ipc,
         };
         mcp::handle(&blocking_request, &context)
@@ -3928,24 +3937,52 @@ mod tests {
             browser_actuation: BrowserActuationBroker::default(),
             browser_mutation_gate: Arc::new(RwLock::new(())),
             browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
+            runtime_backend: crate::test_env::tui_backend_selection(),
         }
     }
 
-    /// Serves the minimal herdr-core OpenRPC handshake used by the public-tool
-    /// admission gate: `hello` advertises only server/terminal methods, so the
-    /// TUI-only public tools must fail closed instead of silently running on the
-    /// TUI snapshot path (#922 review 5870137915).
+    /// Serves the herdr-core line protocol for the narrow execution routes
+    /// (#935). It is stateful (real files, real `machine.exec`) so `POST /mcp`
+    /// can be driven end-to-end through the same public tools the TUI backend
+    /// serves. The terminal methods are still answered so a route that wrongly
+    /// created or addressed a terminal would not silently pass (#936).
     #[cfg(unix)]
-    fn spawn_core_hello_fixture(socket: &std::path::Path) {
+    fn spawn_core_execution_fixture(socket: &std::path::Path) {
+        spawn_recording_core_fixture(socket, None);
+    }
+
+    /// Same fixture, but records every non-`hello` request and models a
+    /// herdr-core process cwd that is *not* the herdr-mcp process cwd, so a
+    /// regression that leaves path/cwd resolution to `hc` becomes observable.
+    ///
+    /// Returns the recorded `(method, params)` pairs.
+    #[cfg(unix)]
+    fn spawn_recording_core_fixture(
+        socket: &std::path::Path,
+        core_cwd: Option<&std::path::Path>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> {
+        spawn_inspect_core_fixture(socket, core_cwd, true)
+    }
+
+    #[cfg(unix)]
+    fn spawn_inspect_core_fixture(
+        socket: &std::path::Path,
+        core_cwd: Option<&std::path::Path>,
+        advertise_terminal_list: bool,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
         use std::thread;
 
         let listener = UnixListener::bind(socket).unwrap();
+        let recorded: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        let core_cwd = core_cwd.map(std::path::Path::to_path_buf);
         thread::spawn(move || {
-            // One bounded burst is enough: admission does one handshake per tool
-            // call and the test makes at most a handful of calls.
-            for _ in 0..8 {
+            // One bounded burst is enough: each tool call negotiates one or two
+            // connections (admission + route) and the test makes a few dozen.
+            for _ in 0..256 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
@@ -3957,32 +3994,18 @@ mod tests {
                     }
                     let request: Value = serde_json::from_str(&line).unwrap();
                     let id = request["id"].clone();
-                    let result = match request["method"].as_str().unwrap_or_default() {
-                        "hello" => json!({
-                            "generation": 1,
-                            "version": "fixture-1",
-                            "framed": false,
-                            "methods": [
-                                "hello",
-                                "server.status",
-                                "terminal.list",
-                                "terminal.get",
-                                "terminal.read",
-                                "terminal.run",
-                                "terminal.kill",
-                                "terminal.send",
-                                "machine.exec",
-                                "file.read",
-                                "file.write",
-                                "file.edit",
-                                "events.subscribe"
-                            ],
-                            "features": []
-                        }),
-                        "server.status" => json!({"live": 0, "finished": 0}),
-                        "terminal.list" => json!({"terminals": []}),
-                        other => json!({"code": "unexpected_fixture_method", "method": other}),
-                    };
+                    let method = request["method"].as_str().unwrap_or_default().to_owned();
+                    let params = request["params"].clone();
+                    if method != "hello" {
+                        sink.lock().unwrap().push((method.clone(), params.clone()));
+                    }
+                    let mut result = core_fixture_result_at(&method, &params, core_cwd.as_deref());
+                    if method == "hello" && !advertise_terminal_list {
+                        result["methods"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|method| method.as_str() != Some("terminal.list"));
+                    }
                     writeln!(
                         stream,
                         "{}",
@@ -3993,6 +4016,158 @@ mod tests {
                 }
             }
         });
+        recorded
+    }
+
+    /// Resolve a fixture-relative path against the *herdr-core* process cwd, the
+    /// way `hc` itself would. A route that sends a relative path therefore reads
+    /// or writes a different file than the one it validated.
+    #[cfg(unix)]
+    fn fixture_resolve(raw: &str, core_cwd: Option<&std::path::Path>) -> std::path::PathBuf {
+        let path = std::path::PathBuf::from(raw);
+        match (path.is_relative(), core_cwd) {
+            (true, Some(cwd)) => cwd.join(path),
+            _ => path,
+        }
+    }
+
+    #[cfg(unix)]
+    fn core_fixture_result_at(
+        method: &str,
+        params: &Value,
+        core_cwd: Option<&std::path::Path>,
+    ) -> Value {
+        use base64::Engine as _;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        match method {
+            "hello" => json!({
+                "generation": 1,
+                "version": "fixture-1",
+                "framed": false,
+                "methods": [
+                    "hello",
+                    "server.status",
+                    "terminal.list",
+                    "terminal.get",
+                    "terminal.read",
+                    "terminal.run",
+                    "terminal.kill",
+                    "terminal.send",
+                    "machine.exec",
+                    "file.read",
+                    "file.write",
+                    "file.edit",
+                    "events.subscribe"
+                ],
+                "features": []
+            }),
+            "server.status" => json!({"live": 7, "finished": 3}),
+            "terminal.list" => json!({"terminals": [{
+                "address": "unowned", "argv": ["sensitive-terminal-sentinel"],
+                "labels": {"secret": "sensitive-terminal-sentinel"}, "status": "private"
+            }]}),
+            "file.read" => {
+                let path = fixture_resolve(params["path"].as_str().unwrap_or_default(), core_cwd);
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let lines: Vec<&str> = text.split('\n').collect();
+                let offset = params["offset"].as_u64().unwrap_or(1).max(1) as usize;
+                let limit = params["limit"].as_u64().unwrap_or(2_000) as usize;
+                let start = (offset - 1).min(lines.len());
+                let end = start.saturating_add(limit).min(lines.len());
+                json!({
+                    "text": lines[start..end].join("\n"),
+                    "first": if end > start { offset } else { 0 },
+                    "last": if end > start { (offset + (end - start) - 1) as u64 } else { 0 },
+                    "lines": lines.len(),
+                })
+            }
+            "file.write" => {
+                let path = fixture_resolve(params["path"].as_str().unwrap_or_default(), core_cwd);
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(params["data"].as_str().unwrap_or_default())
+                    .unwrap();
+                std::fs::write(&path, &data).unwrap();
+                json!({"path": path.to_string_lossy(), "bytes": data.len()})
+            }
+            "file.edit" => {
+                let path = fixture_resolve(params["path"].as_str().unwrap_or_default(), core_cwd);
+                let mut text = std::fs::read_to_string(&path).unwrap();
+                for edit in params["edits"].as_array().cloned().unwrap_or_default() {
+                    let old = edit["old"].as_str().unwrap_or_default();
+                    let new = edit["new"].as_str().unwrap_or_default();
+                    text = text.replacen(old, new, 1);
+                }
+                std::fs::write(&path, &text).unwrap();
+                json!({"path": path.to_string_lossy(), "bytes": text.len()})
+            }
+            "machine.exec" => {
+                let cwd = params["cwd"]
+                    .as_str()
+                    .map(|cwd| fixture_resolve(cwd, core_cwd));
+                let mut command = match params["line"].as_str() {
+                    Some(line) => {
+                        let mut command = std::process::Command::new("sh");
+                        command.arg("-c").arg(line);
+                        command
+                    }
+                    None => {
+                        let argv: Vec<String> = params["argv"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_owned))
+                            .collect();
+                        let mut command = std::process::Command::new(&argv[0]);
+                        command.args(&argv[1..]);
+                        command
+                    }
+                };
+                if let Some(cwd) = cwd {
+                    command.current_dir(cwd);
+                }
+                match command.output() {
+                    Ok(output) => json!({
+                        "code": output.status.code(),
+                        "stdout": encode(&output.stdout),
+                        "stderr": encode(&output.stderr),
+                        "timed_out": false,
+                        "truncated": false,
+                        "ms": 1,
+                    }),
+                    Err(error) => json!({
+                        "code": 127,
+                        "stdout": "",
+                        "stderr": encode(error.to_string().as_bytes()),
+                        "timed_out": false,
+                        "truncated": false,
+                        "ms": 1,
+                    }),
+                }
+            }
+            "terminal.run" => json!({
+                "address": "t1",
+                "state": "live",
+                "cwd": params["cwd"].clone(),
+                "argv": params["argv"].clone(),
+                "labels": {},
+                "name": params["name"].clone(),
+                "parent": Value::Null,
+                "turn": 0,
+                "created_ms": 1,
+            }),
+            "terminal.read" => {
+                json!({"text": "fixture-screen\n", "complete": true, "how": "screen"})
+            }
+            "terminal.kill" => json!({
+                "address": "t1",
+                "state": "finished",
+                "reason": "killed",
+                "signal": 1,
+            }),
+            "terminal.send" => json!({"terminal": params["terminal"].clone(), "turn": 1}),
+            other => json!({"code": "unexpected_fixture_method", "method": other}),
+        }
     }
 
     #[cfg(unix)]
@@ -4021,6 +4196,312 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn public_inspect_hides_unowned_terminals_with_or_without_list_capability() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("inspect-terminal-privacy");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for advertised in [true, false] {
+            let socket = std::path::PathBuf::from(format!(
+                "/tmp/herdr-inspect-{}-{}-{}.sock",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                advertised,
+            ));
+            let recorded = spawn_inspect_core_fixture(&socket, None, advertised);
+            std::fs::write(config_dir.join("config.json"), json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": socket.to_string_lossy()}
+            }).to_string()).unwrap();
+            // #936: each iteration models one candidate that admitted this
+            // herdr-core config at startup.
+            let mut state = test_state_with_snapshot(
+                &root.join("tcp"),
+                json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+            );
+            state.runtime_backend = crate::test_env::admitted_backend_selection();
+            let app = candidate_router(state);
+            runtime.block_on(async {
+                let inspected = call_public_tool(&app, "herdr_inspect", json!({})).await;
+                assert_eq!(inspected["ok"], true, "{inspected}");
+                assert_eq!(inspected["terminals"], json!([]));
+                assert_eq!(
+                    inspected["terminal_details"],
+                    "unavailable_without_ownership"
+                );
+                assert_eq!(inspected["herdr_core"]["live_terminals"], 7);
+                assert_eq!(inspected["herdr_core"]["finished_terminals"], 3);
+                assert_eq!(
+                    inspected["herdr_core"]["terminal_counts_scope"],
+                    "global, not visibility-filtered"
+                );
+                assert_eq!(
+                    inspected["herdr_core"]["capabilities"]["server_status"],
+                    true
+                );
+                assert!(
+                    !inspected
+                        .to_string()
+                        .contains("sensitive-terminal-sentinel")
+                );
+                let calls = recorded.lock().unwrap();
+                assert!(
+                    calls.iter().any(|(method, _)| method == "server.status"),
+                    "{calls:?}"
+                );
+                assert!(
+                    !calls.iter().any(|(method, _)| method == "terminal.list"),
+                    "{calls:?}"
+                );
+            });
+            std::fs::remove_file(socket).ok();
+        }
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_nested_tui_methods_fail_closed_on_herdr_core() {
+        // Backend selection is process-global; isolate the probe from parallel
+        // tests that may resolve the default TUI backend without an env lock.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "mcp_http::tests::public_nested_tui_methods_child_probe",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_remove("HERDR_MCP_CONFIG_DIR")
+            .env_remove("HERDR_MCP_RUNTIME_BACKEND")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "nested backend child probe failed: stdout={stdout} stderr={stderr}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child probe launched by public_nested_tui_methods_fail_closed_on_herdr_core"]
+    fn public_nested_tui_methods_child_probe() {
+        use std::os::unix::net::UnixListener;
+        let _guard = crate::test_env::lock();
+        let root = test_root("nested-backend-isolation");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let core_socket = std::path::PathBuf::from(format!(
+            "/tmp/hc-nested-{}-{unique}.sock",
+            std::process::id()
+        ));
+        let tui_socket = std::path::PathBuf::from(format!(
+            "/tmp/tui-nested-{}-{unique}.sock",
+            std::process::id()
+        ));
+        spawn_core_execution_fixture(&core_socket);
+        let listener = UnixListener::bind(&tui_socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::fs::write(config_dir.join("config.json"), json!({
+            "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+        }).to_string()).unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let mut state = test_state_with_snapshot(
+            &root.join("state"),
+            json!({
+                "workspaces": [{"workspace_id": "w1", "cwd": root.to_string_lossy()}],
+                "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root.to_string_lossy()}],
+                "agents": []
+            }),
+        );
+        state.client = HerdrClient::new(&tui_socket);
+        // #936: this probe starts on the `herdr-core` config written above.
+        state.runtime_backend = crate::test_env::admitted_backend_selection();
+        let app = candidate_router(state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (method, params) in [
+                ("herdr_mcp.agent.task.dispatch", json!({"target": "w1:p1", "text": "do work", "idempotency_key": "nested-dispatch"})),
+                ("herdr_mcp.codex_session.resume", json!({"project_root": root.to_string_lossy(), "session_id": "12345678-1234-1234-1234-123456789abc", "pane_id": "w1:p1", "name": "codex"})),
+                ("herdr_mcp.codex_session.list", json!({"project_root": root.to_string_lossy()})),
+                ("herdr_mcp.codex_session.read", json!({"project_root": root.to_string_lossy()})),
+                ("herdr_mcp.agent.task.status", json!({"task_id": "existing"})),
+                ("herdr_mcp.agent.task.inbox", json!({})),
+                ("herdr_mcp.agent.task.report", json!({"task_id": "existing"})),
+                ("herdr_mcp.agent.task.reconcile", json!({"task_id": "existing"})),
+                ("herdr_mcp.agent.task.gate.create", json!({"task_id": "existing"})),
+                ("herdr_mcp.agent.task.gate.status", json!({"gate_id": "existing"})),
+                ("herdr_mcp.agent.task.gate.resolve", json!({"gate_id": "existing"})),
+                ("herdr_mcp.agent.task.gate.cancel", json!({"gate_id": "existing"})),
+                ("herdr_mcp.exec.wait", json!({"session_id": "old"})),
+                ("artifact.import", json!({"artifact_id": "test", "path": root.join("output").to_string_lossy()})),
+                ("work.pickup", json!({"pane": "w1:p1"})),
+                ("herdr_mcp.skill.list", json!({})),
+                ("herdr_mcp.skill.describe", json!({})),
+                ("herdr_mcp.skill.load", json!({})),
+                ("herdr_mcp.planning.advise", json!({})),
+                ("herdr_mcp.github.status", json!({})),
+                ("herdr_mcp.cleanup.preview", json!({})),
+            ] {
+                let result = call_public_tool(&app, "herdr_call", json!({"method": method, "params": params})).await;
+                assert_eq!(result["code"], "runtime_capability_unsupported", "{method}: {result}");
+                assert_eq!(result["required_capability"], "tui_backend_isolation", "{method}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{method}: {result}");
+            }
+            for method in [
+                " herdr_mcp.agent.task.dispatch",
+                "herdr_mcp.agent.task.dispatch ",
+                "HERDR_MCP.AGENT.TASK.DISPATCH",
+                "herdr_mcp.Agent.task.dispatch",
+                " herdr_mcp.codex_session.resume ",
+                "HERDR_MCP.CODEX_SESSION.RESUME",
+                " artifact.import ",
+            ] {
+                let result = call_public_tool(&app, "herdr_call", json!({"method": method, "params": {"target": "w1:p1", "text": "do work"}})).await;
+                assert_eq!(result["ok"], false, "{method}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{method}: {result}");
+                assert!(matches!(result["code"].as_str(), Some("runtime_capability_unsupported" | "herdr_core_method_prohibited")), "{method}: {result}");
+            }
+            let skill = call_public_tool(&app, "herdr_skill", json!({})).await;
+            assert_eq!(skill["required_capability"], "tui_backend_isolation", "{skill}");
+            let text_write_target = root.join("home").join("core-blocked-write.txt");
+            for text_write_method in [
+                "herdr_mcp.text.write",
+                " herdr_mcp.text.write ",
+                "HERDR_MCP.TEXT.WRITE",
+            ] {
+                let text_write = call_public_tool(
+                    &app,
+                    "herdr_call",
+                    json!({
+                        "method": text_write_method,
+                        "params": {
+                            "path": text_write_target.to_string_lossy(),
+                            "content": "hello",
+                            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                        }
+                    }),
+                )
+                .await;
+                assert_eq!(text_write["ok"], false, "{text_write_method}: {text_write}");
+                assert_eq!(
+                    text_write["code"], "runtime_capability_unsupported",
+                    "{text_write_method}: {text_write}"
+                );
+                assert_eq!(
+                    text_write["required_capability"], "public_tool_policy_parity",
+                    "{text_write_method}: {text_write}"
+                );
+                assert_eq!(
+                    text_write["delivery_state"], "not_delivered",
+                    "{text_write_method}: {text_write}"
+                );
+            }
+            assert!(
+                !text_write_target.exists(),
+                "refused herdr_mcp.text.write must not touch the filesystem"
+            );
+            let methods = call_public_tool(&app, "herdr_methods", json!({})).await;
+            assert_eq!(methods["ok"], true, "{methods}");
+            let method_rows = methods["methods"].as_array().unwrap();
+            for blocked_local in [
+                "herdr_mcp.skill.list",
+                "herdr_mcp.planning.advise",
+                "herdr_mcp.github.status",
+                "herdr_mcp.cleanup.preview",
+                "herdr_mcp.exec.wait",
+                "herdr_mcp.text.write",
+            ] {
+                let row = method_rows
+                    .iter()
+                    .find(|entry| entry["method"] == blocked_local)
+                    .unwrap_or_else(|| panic!("missing local schema {blocked_local}: {methods}"));
+                assert_eq!(row["servable"], false, "{blocked_local}: {row}");
+                assert_eq!(row["blocked_on_backend"], true, "{blocked_local}: {row}");
+            }
+            let text_read_row = method_rows
+                .iter()
+                .find(|entry| entry["method"] == "herdr_mcp.text.read")
+                .unwrap_or_else(|| panic!("missing herdr_mcp.text.read schema: {methods}"));
+            assert_eq!(text_read_row["servable"], true, "{text_read_row}");
+            assert_eq!(
+                text_read_row["blocked_on_backend"], false,
+                "{text_read_row}"
+            );
+            let list = call_public_tool(&app, "herdr_call", json!({"method": "artifact.list", "params": {}})).await;
+            assert_eq!(list["ok"], true, "{list}");
+            assert_eq!(list["artifacts"], json!([]));
+            let continuity = call_public_tool(&app, "herdr_call", json!({"method": "continuity.list", "params": {}})).await;
+            assert_eq!(continuity["ok"], true, "{continuity}");
+            assert_eq!(continuity["candidates"], json!([]));
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            // #936: a live runtime keeps its admitted backend. Switching the
+            // process env to `tui` after startup must not re-admit the request
+            // onto the TUI socket; it fails closed and asks for a restart.
+            unsafe { env::set_var("HERDR_MCP_RUNTIME_BACKEND", "tui") };
+            for method in ["herdr_mcp.agent.task.dispatch", "herdr_mcp.codex_session.resume"] {
+                let result = call_public_tool(&app, "herdr_call", json!({"method": method, "params": {}})).await;
+                assert_eq!(result["code"], "invalid_runtime_backend", "{method}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{method}: {result}");
+                assert!(
+                    result["message"].as_str().unwrap().contains("restart the runtime"),
+                    "{method}: {result}"
+                );
+            }
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        });
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_file(core_socket).ok();
+        std::fs::remove_file(tui_socket).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn public_mcp_tools_fail_closed_when_selected_backend_lacks_or_forbids_them() {
         let _guard = crate::test_env::lock();
         let root = test_root("runtime-backend-admission");
@@ -4040,7 +4521,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::remove_file(&core_socket).ok();
-        spawn_core_hello_fixture(&core_socket);
+        spawn_core_execution_fixture(&core_socket);
         std::fs::write(
             config_dir.join("config.json"),
             json!({
@@ -4058,14 +4539,17 @@ mod tests {
             "agents": [],
             "tabs": []
         });
-        let app = candidate_router(test_state_with_snapshot(&root.join("tcp-core"), snapshot));
-
         let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
         let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
         unsafe {
             env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
             env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
         }
+        // #936: this router admits the `herdr-core` selection configured above,
+        // exactly like a candidate that started with that config.
+        let mut state = test_state_with_snapshot(&root.join("tcp-core"), snapshot.clone());
+        state.runtime_backend = crate::test_env::admitted_backend_selection();
+        let app = candidate_router(state);
 
         // 1. Explicit herdr-core must not execute herdr_fs_list through the TUI snapshot.
         // The environment guard is process-global, so this test drives the HTTP
@@ -4090,25 +4574,38 @@ mod tests {
             assert_eq!(fs_list["fallback_allowed"], false);
 
             // Even when `hello` advertises overlapping file/machine/terminal
-            // methods, the TUI-bound in-process implementations must not run: the
-            // capability is necessary but no core route exists yet.
-            for (tool, arguments) in [
+            // methods, the TUI-only public tools must not run: they have no
+            // herdr-core primitive at all (#935).
+            for (tool, arguments, capability) in [
                 (
-                    "herdr_fs_read",
+                    "herdr_fs_grep",
+                    json!({"path": project.to_string_lossy(), "pattern": "fixture"}),
+                    "fs_list_grep_image_patch",
+                ),
+                (
+                    "herdr_fs_image",
                     json!({"path": project.join("tui-only-marker.txt").to_string_lossy()}),
+                    "fs_list_grep_image_patch",
                 ),
                 (
-                    "herdr_exec_start",
-                    json!({"root": project.to_string_lossy(), "command": "true"}),
+                    "herdr_fs_patch",
+                    json!({"root": project.to_string_lossy(), "patch": ""}),
+                    "fs_list_grep_image_patch",
                 ),
+                (
+                    "herdr_git",
+                    json!({"root": project.to_string_lossy(), "action": "status"}),
+                    "structured_git",
+                ),
+                // `events.subscribe` is advertised by the fixture, so this one
+                // reaches the explicit TUI-route gate instead of the
+                // capability table.
+                ("herdr_since", json!({"cursor": 0}), "public_tool_route"),
             ] {
                 let rejected = call_public_tool(&app, tool, arguments).await;
                 assert_eq!(rejected["ok"], false, "{tool}");
                 assert_eq!(rejected["code"], "runtime_capability_unsupported", "{tool}");
-                assert_eq!(
-                    rejected["required_capability"], "public_tool_route",
-                    "{tool}"
-                );
+                assert_eq!(rejected["required_capability"], capability, "{tool}");
                 assert_eq!(rejected["retryable"], false, "{tool}");
                 assert_eq!(rejected["delivery_state"], "not_delivered", "{tool}");
             }
@@ -4118,7 +4615,9 @@ mod tests {
             assert_eq!(inspect["ok"], true);
             assert_eq!(inspect["runtime_backend"]["selected"], "herdr-core");
 
-            // Raw `herdr_call` forwarding to the TUI socket is not a fallback route.
+            // Raw `herdr_call` forwarding is restricted to the read-only
+            // allowlist on herdr-core, never the TUI socket: `pane.list` is a
+            // TUI-only method and is refused before `hc` is contacted.
             let forwarded = call_public_tool(
                 &app,
                 "herdr_call",
@@ -4126,8 +4625,8 @@ mod tests {
             )
             .await;
             assert_eq!(forwarded["ok"], false);
-            assert_eq!(forwarded["code"], "runtime_capability_unsupported");
-            assert_eq!(forwarded["required_capability"], "tui_runtime_forward");
+            assert_eq!(forwarded["code"], "herdr_core_method_prohibited");
+            assert_eq!(forwarded["runtime_backend"], "herdr-core");
             assert_eq!(forwarded["delivery_state"], "not_delivered");
 
             // 2. An invalid backend selection fails closed at the same public entry.
@@ -4143,13 +4642,34 @@ mod tests {
             assert_eq!(invalid["retryable"], false);
             assert_eq!(invalid["delivery_state"], "not_delivered");
 
-            // 3. Default TUI selection keeps the existing behavior byte-for-byte.
+            // 3. Default TUI selection keeps the existing behavior byte-for-byte,
+            //    but only for a runtime that admitted TUI: the live `herdr-core`
+            //    router must not follow the process back to TUI (#936).
             unsafe {
                 env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
                 env::remove_var("HERDR_MCP_CONFIG_DIR");
             }
-            let tui_list = call_public_tool(
+            let switched = call_public_tool(
                 &app,
+                "herdr_fs_list",
+                json!({"path": project.to_string_lossy()}),
+            )
+            .await;
+            assert_eq!(switched["ok"], false);
+            assert_eq!(switched["code"], "invalid_runtime_backend");
+            assert_eq!(switched["retryable"], false);
+            assert_eq!(switched["delivery_state"], "not_delivered");
+            assert!(
+                switched["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("restart the runtime"),
+                "{switched}"
+            );
+            let tui_app =
+                candidate_router(test_state_with_snapshot(&root.join("tcp-tui"), snapshot));
+            let tui_list = call_public_tool(
+                &tui_app,
                 "herdr_fs_list",
                 json!({"path": project.to_string_lossy()}),
             )
@@ -4168,6 +4688,102 @@ mod tests {
                 None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
             }
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The public route refuses operations whose policy or identity contracts
+    /// cannot be preserved and never delivers them to herdr-core.
+    #[cfg(unix)]
+    #[test]
+    fn herdr_core_public_routes_fail_closed_without_delivery() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("herdr-core-policy-contract");
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let file = project.join("notes.txt");
+        std::fs::write(&file, "original\n").unwrap();
+        let core_socket = std::path::PathBuf::from(format!(
+            "/tmp/herdr-contract-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let recorded = spawn_recording_core_fixture(&core_socket, None);
+        std::fs::write(config_dir.join("config.json"), json!({
+            "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+        }).to_string()).unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        // #936: this router admits the `herdr-core` config written above.
+        let mut state = test_state_with_snapshot(
+            &root.join("tcp"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        state.runtime_backend = crate::test_env::admitted_backend_selection();
+        let app = candidate_router(state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (tool, arguments) in [
+                ("herdr_fs_read", json!({"path": file.to_string_lossy()})),
+                ("herdr_fs_write", json!({"path": file.to_string_lossy(), "content": "changed"})),
+                ("herdr_fs_edit", json!({"path": file.to_string_lossy(), "old_string": "original", "new_string": "changed"})),
+                ("herdr_exec", json!({"root": project.to_string_lossy(), "command": "true", "steps": []})),
+            ] {
+                let result = call_public_tool(&app, tool, arguments).await;
+                assert_eq!(result["code"], "runtime_capability_unsupported", "{tool}: {result}");
+                assert_eq!(result["required_capability"], "public_tool_policy_parity", "{tool}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{tool}: {result}");
+            }
+            for (tool, arguments) in [
+                ("herdr_exec_start", json!({"root": project.to_string_lossy(), "command": "true"})),
+                ("herdr_exec_read", json!({"session_id": "t1", "offset": 10})),
+                ("herdr_exec_kill", json!({"session_id": "t1"})),
+            ] {
+                let result = call_public_tool(&app, tool, arguments).await;
+                assert_eq!(result["required_capability"], "exec_session_ownership", "{tool}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{tool}: {result}");
+            }
+            for arguments in [
+                json!({"target": "t1", "text": "continue"}),
+                json!({"target": "t1", "text": "continue", "inject_task_identity": false}),
+                json!({"target": "t1", "text": "continue", "steer": true}),
+            ] {
+                let result = call_public_tool(&app, "herdr_prompt", arguments).await;
+                assert_eq!(result["required_capability"], "prompt_task_tracking_and_identity", "{result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{result}");
+            }
+            for method in ["doc.get", "terminal.get", "terminal.list", "terminal.read", "terminal.wait", " TERMINAL.READ ", "machine.exec", "file.read", "terminal.send"] {
+                let result = call_public_tool(&app, "herdr_call", json!({"method": method, "params": {"terminal": "t1", "path": file.to_string_lossy()}})).await;
+                assert_eq!(result["code"], "herdr_core_method_prohibited", "{method}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{method}: {result}");
+            }
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "original\n");
+            assert!(recorded.lock().unwrap().is_empty(), "refused calls must not reach herdr-core");
+            let status = call_public_tool(&app, "herdr_call", json!({"method": "server.status", "params": {}})).await;
+            assert_eq!(status["ok"], true, "{status}");
+        });
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_file(&core_socket).ok();
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6082,8 +6698,24 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    #[tokio::test]
-    async fn herdr_call_local_skill_load_round_trips_through_rust_http_without_socket() {
+    // #936: `tools/call` re-resolves backend admission from process-global
+    // env/config, so this test holds the same crate-wide env guard the
+    // config-mutating tests use instead of observing their mutation window
+    // mid-dispatch. `#[test]` plus a current-thread runtime keeps the guard
+    // out of an `async fn` without suppressing a lint.
+    #[test]
+    fn herdr_call_local_skill_load_round_trips_through_rust_http_without_socket() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(
+            herdr_call_local_skill_load_round_trips_through_rust_http_without_socket_body(),
+        );
+    }
+
+    async fn herdr_call_local_skill_load_round_trips_through_rust_http_without_socket_body() {
         let root = test_root("local-skill-load");
         let app = candidate_router(test_state(&root));
         let request = rpc_request(
@@ -6117,8 +6749,21 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    #[tokio::test]
-    async fn herdr_call_continuity_resume_round_trips_through_rust_http_without_socket() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn herdr_call_continuity_resume_round_trips_through_rust_http_without_socket() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(
+            herdr_call_continuity_resume_round_trips_through_rust_http_without_socket_body(),
+        );
+    }
+
+    async fn herdr_call_continuity_resume_round_trips_through_rust_http_without_socket_body() {
         let root = test_root("local-continuity-resume");
         let state = test_state(&root);
         {
@@ -6178,8 +6823,21 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    #[tokio::test]
-    async fn herdr_call_continuity_search_round_trips_through_rust_http_without_socket() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn herdr_call_continuity_search_round_trips_through_rust_http_without_socket() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(
+            herdr_call_continuity_search_round_trips_through_rust_http_without_socket_body(),
+        );
+    }
+
+    async fn herdr_call_continuity_search_round_trips_through_rust_http_without_socket_body() {
         let root = test_root("local-continuity-search");
         let state = test_state(&root);
         {
@@ -7573,8 +8231,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn reparented_conversation_in_one_generation_observes_and_binds() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn reparented_conversation_in_one_generation_observes_and_binds() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(reparented_conversation_in_one_generation_observes_and_binds_body());
+    }
+
+    async fn reparented_conversation_in_one_generation_observes_and_binds_body() {
         // #740: the same conversation is first observed under a Project space
         // (inferred from a transient sidebar label) and then under the
         // account, both in generation 1. The newer parent must win so the
@@ -7723,8 +8392,19 @@ mod tests {
     /// conversation URL | Then the Runtime owns exactly one durable continuity
     /// chain that `/extension/continuity/resolve` finds by provider conversation
     /// id, and every later turn canonicalizes onto it.
-    #[tokio::test]
-    async fn dispatch_bind_attaches_one_durable_continuity_chain() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn dispatch_bind_attaches_one_durable_continuity_chain() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(dispatch_bind_attaches_one_durable_continuity_chain_body());
+    }
+
+    async fn dispatch_bind_attaches_one_durable_continuity_chain_body() {
         let root = test_root("dispatch-auto-continuity");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -7927,8 +8607,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn reparented_conversation_with_prior_source_turn_stays_unambiguous() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn reparented_conversation_with_prior_source_turn_stays_unambiguous() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(reparented_conversation_with_prior_source_turn_stays_unambiguous_body());
+    }
+
+    async fn reparented_conversation_with_prior_source_turn_stays_unambiguous_body() {
         // #740 follow-up (Codex review): the conversation's turn is already
         // observed under the Project-space parent before it is re-observed
         // under the account. Retiring the old locator must also retire its
@@ -9330,8 +10021,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn webchat_dispatch_binds_across_app_mention_rendering() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn webchat_dispatch_binds_across_app_mention_rendering() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(webchat_dispatch_binds_across_app_mention_rendering_body());
+    }
+
+    async fn webchat_dispatch_binds_across_app_mention_rendering_body() {
         // #741: ChatGPT renders an `@herdr-mcp` App mention chip differently in
         // the DOM bubble (observed by the extension) and in the model-visible
         // `current_user_message`. Both sides must reduce to one canonical text.
@@ -10033,8 +10735,21 @@ mod tests {
     /// When ChatGPT dispatches a task carrying that first message | Then the
     /// dispatch binds the created session and owns an `hc:auto:*` continuity
     /// chain, and a turn the runtime never delivered stays unbound.
-    #[tokio::test]
-    async fn webchat_dispatch_binds_from_an_applied_background_create() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    // Without the guard the create below is refused under another test's
+    // config window, so the unbounded broker wait never receives a command.
+    #[test]
+    fn webchat_dispatch_binds_from_an_applied_background_create() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(webchat_dispatch_binds_from_an_applied_background_create_body());
+    }
+
+    async fn webchat_dispatch_binds_from_an_applied_background_create_body() {
         async fn post_registry(app: axum::Router, payload: Value) -> Value {
             let response = app.oneshot(registry_request(payload)).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -11144,8 +11859,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn webchat_cross_device_relayed_source_turn_binds_and_preserves_n_minus_1_fallback() {
+    // #936: same process-global env guard as
+    // `herdr_call_local_skill_load_round_trips_through_rust_http_without_socket`.
+    #[test]
+    fn webchat_cross_device_relayed_source_turn_binds_and_preserves_n_minus_1_fallback() {
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(
+            webchat_cross_device_relayed_source_turn_binds_and_preserves_n_minus_1_fallback_body(),
+        );
+    }
+
+    async fn webchat_cross_device_relayed_source_turn_binds_and_preserves_n_minus_1_fallback_body()
+    {
         let root = test_root("webchat-cross-device-relayed-source-turn");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
