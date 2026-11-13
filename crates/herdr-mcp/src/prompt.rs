@@ -5858,6 +5858,11 @@ mod tests {
                     }
                     Err(_) => break,
                 };
+                // Accepted streams can inherit the listener's nonblocking mode on macOS.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut line)

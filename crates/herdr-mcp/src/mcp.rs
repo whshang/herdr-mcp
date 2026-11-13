@@ -56,6 +56,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod result_projection;
 
+#[cfg(all(test, unix))]
+mod inspect_route_tests;
+
 use result_projection::{image_tool_result, model_visible_tool_output, tool_result};
 
 pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
@@ -241,6 +244,10 @@ pub struct RuntimeContext<'a> {
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
+    /// #936: the runtime backend this process admitted at startup. A request
+    /// that resolves a different backend or `herdr-core` socket fails closed
+    /// before any TUI or `herdr-core` socket is contacted.
+    pub runtime_backend: &'a crate::runtime_adapter::RuntimeBackendSelection,
     pub trusted_local_ipc: bool,
 }
 
@@ -1208,23 +1215,79 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     // #922 review 5870137915: the frozen catalog is admitted per selected
     // backend. `tui` (default) is unchanged; `herdr-core` and invalid
     // selections fail closed here, before any TUI snapshot/socket execution.
-    if let Err(rejection) = crate::runtime_adapter::public_tool_admission(name) {
-        return Ok(tool_result(rejection, true));
+    // #935: the admitted route also carries the negotiated `herdr-core` client
+    // so the narrow `hc` primitives can be forwarded below.
+    // #936: admission is pinned to the backend this process started with, so a
+    // later env/config switch cannot move a live candidate onto another backend.
+    let route = match crate::runtime_adapter::public_tool_route(name, context.runtime_backend) {
+        Ok(route) => route,
+        Err(rejection) => return Ok(tool_result(rejection, true)),
+    };
+    dispatch_admitted_tool(name, arguments, context, route)
+}
+
+fn dispatch_admitted_tool(
+    name: &str,
+    arguments: Value,
+    context: &RuntimeContext<'_>,
+    route: crate::runtime_adapter::PublicToolRoute,
+) -> Result<Value, String> {
+    let herdr_core = route.herdr_core_client();
+    // These local routes use TUI agent identities or topology, or expose TUI
+    // execution sessions. Reject before task binding, capture, or dispatch.
+    if herdr_core.is_some() {
+        let method = arguments
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if name == "herdr_skill" {
+            return Ok(tool_result(
+                crate::runtime_adapter::herdr_core_unsupported(
+                    name,
+                    "tui_backend_isolation",
+                    "this operation depends on TUI state or execution and is unavailable on herdr-core",
+                ),
+                true,
+            ));
+        }
+        if name == "herdr_call"
+            && let Some((required_capability, message)) =
+                crate::runtime_adapter::herdr_core_local_method_refusal(method)
+        {
+            return Ok(tool_result(
+                crate::runtime_adapter::herdr_core_unsupported(
+                    method,
+                    required_capability,
+                    message,
+                ),
+                true,
+            ));
+        }
     }
-    let _work_capture = ToolCallCapture {
-        name,
-        arguments: &arguments,
-        context,
+    let _work_capture = if herdr_core.is_none() {
+        Some(ToolCallCapture {
+            name,
+            arguments: &arguments,
+            context,
+        })
+    } else {
+        None
     };
 
     let output = match name {
         "herdr_methods" => {
             let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
-            native_tools::methods(query)
+            match herdr_core {
+                Some(client) => crate::runtime_adapter::herdr_core_methods(client, query),
+                None => native_tools::methods(query),
+            }
         }
-        "herdr_inspect" => {
-            native_tools::inspect(context.client, Some(context.cache), Some(context.exec))
-        }
+        "herdr_inspect" => native_tools::inspect_with_selection(
+            context.client,
+            Some(context.cache),
+            Some(context.exec),
+            route.selection(),
+        ),
         "herdr_since" => {
             let cursor = arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0);
             let workspace = arguments.get("workspace").and_then(Value::as_str);
@@ -1308,7 +1371,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     Some(&context.cache.snapshot()),
                 )
             } else if method == WORKSTATION_PREFLIGHT_METHOD {
-                workstation_preflight_call(context, &params)
+                workstation_preflight_call(context, &params, route.selection())
             } else if matches!(
                 method,
                 ORCHESTRATION_LEASE_ACQUIRE_METHOD
@@ -1543,22 +1606,40 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     result
                 }
             } else if method == pane_width::SPLIT_METHOD {
-                // A horizontal split must not create a pane whose agent output
-                // can only be captured as wrapping noise (#684).
-                match pane_width::guard_split(&context.cache.snapshot(), &params) {
-                    pane_width::SplitPlan::Forward(params) => native_tools::call_with_local(
-                        context.client,
-                        context.skill,
-                        &context.cache.snapshot(),
-                        method,
-                        params,
-                    ),
-                    pane_width::SplitPlan::Refuse(result) => result,
+                if let Some(client) = herdr_core {
+                    // `pane.split` is a TUI graph mutation and is refused by the
+                    // herdr-core raw forwarding allowlist before contacting hc.
+                    crate::runtime_adapter::herdr_core_call(client, method, params)
+                } else {
+                    // A horizontal split must not create a pane whose agent output
+                    // can only be captured as wrapping noise (#684).
+                    match pane_width::guard_split(&context.cache.snapshot(), &params) {
+                        pane_width::SplitPlan::Forward(params) => native_tools::call_with_local(
+                            context.client,
+                            context.skill,
+                            &context.cache.snapshot(),
+                            method,
+                            params,
+                        ),
+                        pane_width::SplitPlan::Refuse(result) => result,
+                    }
                 }
             } else if method.starts_with("artifact.") {
-                artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
+                // Listing and inspecting cached artifacts do not require TUI topology.
+                let snapshot = if herdr_core.is_some() {
+                    json!({})
+                } else {
+                    context.cache.snapshot()
+                };
+                artifact_call(&config_dir(), &snapshot, method, &params)
             } else if method == TEXT_WRITE_METHOD {
-                if let Some(conflict) =
+                if herdr_core.is_some() {
+                    crate::runtime_adapter::herdr_core_unsupported(
+                        TEXT_WRITE_METHOD,
+                        "public_tool_policy_parity",
+                        "herdr_mcp.text.write cannot run locally while the herdr-core backend is selected",
+                    )
+                } else if let Some(conflict) =
                     check_mutating_tool_root_lease(context, method, &params, Some(&arguments))
                 {
                     conflict
@@ -1572,10 +1653,25 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                         clean_params,
                     )
                 }
-            } else if let Err(rejection) =
-                crate::runtime_adapter::forwarded_method_admission(method)
-            {
-                rejection
+            } else if method.starts_with("herdr_mcp.") {
+                // Snapshot-dependent local methods are refused above. Pure local
+                // methods receive no TUI snapshot on herdr-core.
+                let snapshot = if herdr_core.is_some() {
+                    json!({})
+                } else {
+                    context.cache.snapshot()
+                };
+                native_tools::call_with_local(
+                    context.client,
+                    context.skill,
+                    &snapshot,
+                    method,
+                    params,
+                )
+            } else if let Some(client) = herdr_core {
+                // Raw forwarding first requires an allowlisted read-only method;
+                // the method must also be advertised by herdr-core.
+                crate::runtime_adapter::herdr_core_call(client, method, params)
             } else {
                 native_tools::call_with_local(
                     context.client,
@@ -1586,7 +1682,17 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 )
             }
         }
-        "herdr_fs_read" => route_fs_git("fs_read", &context.cache.snapshot(), &arguments),
+        "herdr_fs_read" => {
+            if herdr_core.is_some() {
+                crate::runtime_adapter::herdr_core_unsupported(
+                    "herdr_fs_read",
+                    "public_tool_policy_parity",
+                    "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
+                )
+            } else {
+                route_fs_git("fs_read", &context.cache.snapshot(), &arguments)
+            }
+        }
         "herdr_fs_list" => route_fs_git("fs_list", &context.cache.snapshot(), &arguments),
         "herdr_fs_grep" => route_fs_git("fs_grep", &context.cache.snapshot(), &arguments),
         "herdr_fs_image" => {
@@ -1626,7 +1732,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             );
         }
         "herdr_fs_edit" => {
-            if let Some(conflict) =
+            if herdr_core.is_some() {
+                crate::runtime_adapter::herdr_core_unsupported(
+                    "herdr_fs_edit",
+                    "public_tool_policy_parity",
+                    "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
+                )
+            } else if let Some(conflict) =
                 check_mutating_tool_root_lease(context, "herdr_fs_edit", &arguments, None)
             {
                 conflict
@@ -1636,7 +1748,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             }
         }
         "herdr_fs_write" => {
-            if let Some(conflict) =
+            if herdr_core.is_some() {
+                crate::runtime_adapter::herdr_core_unsupported(
+                    "herdr_fs_write",
+                    "public_tool_policy_parity",
+                    "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
+                )
+            } else if let Some(conflict) =
                 check_mutating_tool_root_lease(context, "herdr_fs_write", &arguments, None)
             {
                 conflict
@@ -1672,18 +1790,33 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                exec_tools::start(
-                    context.client,
-                    &context.cache.snapshot(),
-                    context.exec,
-                    &clean,
-                )
+                match herdr_core {
+                    Some(client) => crate::runtime_adapter::herdr_core_exec_start(client, &clean),
+                    None => exec_tools::start(
+                        context.client,
+                        &context.cache.snapshot(),
+                        context.exec,
+                        &clean,
+                    ),
+                }
             }
         }
-        "herdr_exec_read" => exec_tools::read(context.exec, &arguments),
-        "herdr_exec_kill" => exec_tools::kill(context.exec, &arguments),
+        "herdr_exec_read" => match herdr_core {
+            Some(client) => crate::runtime_adapter::herdr_core_exec_read(client, &arguments),
+            None => exec_tools::read(context.exec, &arguments),
+        },
+        "herdr_exec_kill" => match herdr_core {
+            Some(client) => crate::runtime_adapter::herdr_core_exec_kill(client, &arguments),
+            None => exec_tools::kill(context.exec, &arguments),
+        },
         "herdr_exec" => {
-            if let Some(conflict) =
+            if herdr_core.is_some() {
+                crate::runtime_adapter::herdr_core_unsupported(
+                    "herdr_exec",
+                    "public_tool_policy_parity",
+                    "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
+                )
+            } else if let Some(conflict) =
                 check_mutating_tool_root_lease(context, "herdr_exec", &arguments, None)
             {
                 conflict
@@ -1699,46 +1832,54 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             }
         }
         "herdr_prompt" => {
-            let (mut parent_session_ref, parent_session_device_id) =
-                match prompt_parent_session_qualified(context) {
-                    Some((session_ref, device_id)) => (Some(session_ref), device_id),
-                    None => (None, None),
-                };
-            let mut result = prompt::run_with_parent_session(
-                context.client,
-                context.prompt,
-                &arguments,
-                parent_session_ref.as_deref(),
-            );
-            // #921: a replay carries this call's (possibly empty) browser
-            // context, which must never overwrite the durable parent session.
-            // Mirror the dispatch branch: replays only read/enrich existing rows.
-            if result.get("idempotent_replay").and_then(Value::as_bool) == Some(true) {
-                enrich_agent_task_parent_session_device_id(context, &mut result);
-            } else if record_and_enrich_dispatched_agent_task_parent_session(
-                context,
-                parent_session_ref.as_deref(),
-                parent_session_device_id.as_deref(),
-                &mut result,
-            )
-            .is_err()
-            {
-                parent_session_ref = None;
-                if let Some(Value::Object(task_obj)) = result.get_mut("task") {
-                    task_obj.insert("parent_session_ref".to_owned(), Value::Null);
-                    task_obj.remove("parent_session_device_id");
+            // #935: the narrow herdr-core route is `terminal.send` only, with
+            // `force` hard-locked and every TUI-only fence argument refused.
+            if let Some(client) = herdr_core {
+                crate::runtime_adapter::herdr_core_prompt(client, &arguments)
+            } else {
+                let (mut parent_session_ref, parent_session_device_id) =
+                    match prompt_parent_session_qualified(context) {
+                        Some((session_ref, device_id)) => (Some(session_ref), device_id),
+                        None => (None, None),
+                    };
+                let mut result = prompt::run_with_parent_session(
+                    context.client,
+                    context.prompt,
+                    &arguments,
+                    parent_session_ref.as_deref(),
+                );
+                // #921: a replay carries this call's (possibly empty) browser
+                // context, which must never overwrite the durable parent session.
+                // Mirror the dispatch branch: replays only read/enrich existing rows.
+                if result.get("idempotent_replay").and_then(Value::as_bool) == Some(true) {
+                    enrich_agent_task_parent_session_device_id(context, &mut result);
+                } else if record_and_enrich_dispatched_agent_task_parent_session(
+                    context,
+                    parent_session_ref.as_deref(),
+                    parent_session_device_id.as_deref(),
+                    &mut result,
+                )
+                .is_err()
+                {
+                    parent_session_ref = None;
+                    if let Some(Value::Object(task_obj)) = result.get_mut("task") {
+                        task_obj.insert("parent_session_ref".to_owned(), Value::Null);
+                        task_obj.remove("parent_session_device_id");
+                    }
                 }
+                // #770: a WebChat caller must never be left silently unbound. The
+                // fact is added to the unchanged prompt result; it never changes
+                // `ok` and never fails the prompt.
+                if let Some(fact) = herdr_prompt_parent_session_fact(
+                    context,
+                    &result,
+                    parent_session_ref.as_deref(),
+                ) && let Some(object) = result.as_object_mut()
+                {
+                    object.insert("parent_session".to_owned(), fact);
+                }
+                result
             }
-            // #770: a WebChat caller must never be left silently unbound. The
-            // fact is added to the unchanged prompt result; it never changes
-            // `ok` and never fails the prompt.
-            if let Some(fact) =
-                herdr_prompt_parent_session_fact(context, &result, parent_session_ref.as_deref())
-                && let Some(object) = result.as_object_mut()
-            {
-                object.insert("parent_session".to_owned(), fact);
-            }
-            result
         }
         "herdr_skill" => context
             .skill
@@ -2022,7 +2163,11 @@ fn browser_conversation_url_ref(
     Ok(None)
 }
 
-fn workstation_preflight_call(context: &RuntimeContext<'_>, params: &Value) -> Value {
+fn workstation_preflight_call(
+    context: &RuntimeContext<'_>,
+    params: &Value,
+    selection: &crate::runtime_adapter::RuntimeBackendSelection,
+) -> Value {
     let Some(object) = params.as_object() else {
         return json!({
             "ok": false,
@@ -2052,8 +2197,12 @@ fn workstation_preflight_call(context: &RuntimeContext<'_>, params: &Value) -> V
             }
         },
     };
-    let inspect_view =
-        native_tools::inspect(context.client, Some(context.cache), Some(context.exec));
+    let inspect_view = native_tools::inspect_with_selection(
+        context.client,
+        Some(context.cache),
+        Some(context.exec),
+        selection,
+    );
     let browser_endpoints = if endpoint_limit == 0 {
         json!([])
     } else {
@@ -2778,6 +2927,16 @@ fn workspace_candidate_paths_from_snapshot(
     paths
 }
 
+/// Trimmed, non-empty string argument.
+fn trimmed_str_arg(arguments: &Value, key: &str) -> Option<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 fn check_mutating_tool_root_lease(
     context: &RuntimeContext<'_>,
     tool_or_method: &str,
@@ -2839,24 +2998,20 @@ fn check_mutating_tool_root_lease(
             .and_then(Value::as_str)
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default(),
+        // Every supplied cwd-like field is checked and a `workspace` snapshot
+        // is merged in, never used as a fallback (#936 P1-4).
         "herdr_exec" => {
-            if let Some(root) = arguments
-                .get("project_root")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                vec![root.to_owned()]
-            } else if let Some(workspace) = arguments
-                .get("workspace")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                workspace_candidate_paths_from_snapshot(&context.cache.snapshot(), workspace)
-            } else {
-                Vec::new()
+            let mut candidates: Vec<String> = ["project_root", "root", "cwd"]
+                .iter()
+                .filter_map(|key| trimmed_str_arg(arguments, key))
+                .collect();
+            if let Some(workspace) = trimmed_str_arg(arguments, "workspace") {
+                candidates.extend(workspace_candidate_paths_from_snapshot(
+                    &context.cache.snapshot(),
+                    &workspace,
+                ));
             }
+            candidates
         }
         _ => Vec::new(),
     };
@@ -27480,10 +27635,13 @@ mod tests {
     fn workstation_preflight_aggregates_compact_inspect_and_endpoints_in_one_call() {
         use std::sync::{Arc, Mutex};
 
+        let _env = crate::test_env::lock();
         let temp_root =
             std::env::temp_dir().join(format!("herdr-preflight-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_root);
         std::fs::create_dir_all(&temp_root).unwrap();
+        let _config = crate::test_env::TuiConfigGuard::install(&temp_root);
+        let runtime_backend = crate::test_env::tui_backend_selection();
 
         let client = HerdrClient::new(temp_root.join("missing-herdr.sock"));
         let cache = EventCache::from_snapshot_for_test(json!({"panes": [], "agents": []}));
@@ -27511,6 +27669,7 @@ mod tests {
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,
+            runtime_backend: &runtime_backend,
             trusted_local_ipc: true,
         };
 
@@ -27538,7 +27697,12 @@ mod tests {
         assert!(body["agents"].is_array(), "{body}");
         assert!(body["browser_endpoints"].is_array(), "{body}");
 
-        let bad = workstation_preflight_call(&context, &json!({"endpoint_limit": 99}));
+        let selection = crate::runtime_adapter::RuntimeBackendSelection {
+            backend: crate::runtime_adapter::RuntimeBackend::Tui,
+            source: "test",
+            herdr_core_socket: None,
+        };
+        let bad = workstation_preflight_call(&context, &json!({"endpoint_limit": 99}), &selection);
         assert_eq!(bad["ok"], false);
         assert_eq!(bad["code"], "invalid_params");
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -31058,6 +31222,9 @@ mod client_request_shape_matrix_tests {
             })
             .unwrap();
 
+        let _env = crate::test_env::lock();
+        let _config = crate::test_env::TuiConfigGuard::install(&temp_root);
+        let runtime_backend = crate::test_env::tui_backend_selection();
         let context = RuntimeContext {
             client: &client,
             cache: &cache,
@@ -31077,6 +31244,7 @@ mod client_request_shape_matrix_tests {
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,
+            runtime_backend: &runtime_backend,
             trusted_local_ipc: false,
         };
 
@@ -31347,6 +31515,9 @@ mod client_request_shape_matrix_tests {
         let skill = SkillService::new();
         let state_store =
             std::sync::Arc::new(std::sync::Mutex::new(StateStore::open(":memory:").unwrap()));
+        let _env = crate::test_env::lock();
+        let _config = crate::test_env::TuiConfigGuard::install(&temp_root);
+        let backend = crate::test_env::tui_backend_selection();
 
         let make_ctx =
             |holder: Option<&'static str>, epoch: Option<i64>, token: Option<&'static str>| {
@@ -31369,6 +31540,7 @@ mod client_request_shape_matrix_tests {
                     browser_actuator: None,
                     browser_mutation_gate: None,
                     browser_mutation_admission: None,
+                    runtime_backend: &backend,
                     trusted_local_ipc: false,
                 }
             };
