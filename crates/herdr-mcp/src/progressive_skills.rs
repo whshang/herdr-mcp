@@ -793,7 +793,7 @@ impl ProgressiveSkillService {
             GITHUB_STATUS_METHOD => crate::github_status::status(params, snapshot),
             CLEANUP_PREVIEW_METHOD => crate::cleanup_preview::preview(params, snapshot),
             TEXT_READ_METHOD => crate::text_transfer::read(params),
-            TEXT_WRITE_METHOD => crate::text_transfer::write(params),
+            TEXT_WRITE_METHOD => crate::text_transfer::fenced_route_required(),
             _ => json!({
                 "ok": false,
                 "code": "unknown_local_method",

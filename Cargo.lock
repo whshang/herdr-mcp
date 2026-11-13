@@ -768,6 +768,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "rustix",
  "rustls",
  "ryu-js",
  "security-framework",

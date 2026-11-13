@@ -1577,14 +1577,20 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                         ) {
                             conflict
                         } else {
-                            let clean_params = strip_lease_credential_fields(&resolved_params);
-                            native_tools::call_with_local(
-                                context.client,
-                                context.skill,
-                                &context.cache.snapshot(),
-                                method,
-                                clean_params,
-                            )
+                            // Admission is not the commit: the same lease authority is
+                            // consulted again through this fence immediately before the
+                            // publish rename.
+                            match text_write_commit_fence(
+                                context,
+                                &resolved_params,
+                                Some(&arguments),
+                            ) {
+                                Err(invalid) => invalid,
+                                Ok(fence) => crate::text_transfer::write_fenced(
+                                    &strip_lease_credential_fields(&resolved_params),
+                                    &fence,
+                                ),
+                            }
                         }
                     }
                 }
@@ -2102,7 +2108,7 @@ fn workstation_preflight_call(context: &RuntimeContext<'_>, params: &Value) -> V
     })
 }
 
-fn mutation_lease_now_ms() -> i64 {
+pub(crate) fn mutation_lease_now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2239,7 +2245,7 @@ fn extract_caller_lease_credentials(
     Ok((None, explicit_epoch, explicit_token, false))
 }
 
-fn format_mutation_lease_conflict(
+pub(crate) fn format_mutation_lease_conflict(
     conflict_reason: &str,
     active_lease: Option<&MutationLeaseRecord>,
 ) -> Value {
@@ -2921,6 +2927,28 @@ fn check_mutating_tool_root_lease(
         }
     }
     None
+}
+
+/// Build the commit fence handed to `text_transfer::write_fenced`.
+///
+/// The fence carries the existing lease store plus the caller's lease
+/// credentials so the text-transfer commit path can re-validate the *same*
+/// lease authority after the temporary file is written and before the publish
+/// rename. Malformed lease credentials fail closed instead of being ignored.
+fn text_write_commit_fence(
+    context: &RuntimeContext<'_>,
+    arguments: &Value,
+    outer_arguments: Option<&Value>,
+) -> Result<crate::text_transfer::CommitFence, Value> {
+    let (holder_id, lease_epoch, lease_token, session_bound) =
+        extract_caller_lease_credentials(context, arguments, outer_arguments)?;
+    Ok(crate::text_transfer::CommitFence {
+        store: std::sync::Arc::clone(context.state_store),
+        holder_id,
+        lease_epoch,
+        lease_token,
+        session_bound,
+    })
 }
 
 fn work_pickup_call(
