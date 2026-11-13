@@ -1234,34 +1234,25 @@ fn dispatch_admitted_tool(
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or("");
-        // A refusal is conservative across spelling variants even though
-        // local dispatch itself only accepts exact method names.
-        let normalized_method = method.trim().to_ascii_lowercase();
-        let blocked = name == "herdr_skill"
-            || (name == "herdr_call"
-                && (normalized_method.starts_with("herdr_mcp.agent.task.")
-                    || matches!(
-                        normalized_method.as_str(),
-                        codex_history::RESUME_METHOD
-                            | codex_history::LIST_METHOD
-                            | codex_history::READ_METHOD
-                            | EXEC_WAIT_METHOD
-                            | WORK_PICKUP_METHOD
-                            | "artifact.import"
-                            | "herdr_mcp.skill.list"
-                            | "herdr_mcp.skill.describe"
-                            | "herdr_mcp.skill.load"
-                            | "herdr_mcp.planning.advise"
-                            | "herdr_mcp.github.status"
-                            | "herdr_mcp.cleanup.preview"
-                    )));
-        if blocked {
-            let operation = if name == "herdr_call" { method } else { name };
+        if name == "herdr_skill" {
             return Ok(tool_result(
                 crate::runtime_adapter::herdr_core_unsupported(
-                    operation,
+                    name,
                     "tui_backend_isolation",
                     "this operation depends on TUI state or execution and is unavailable on herdr-core",
+                ),
+                true,
+            ));
+        }
+        if name == "herdr_call"
+            && let Some((required_capability, message)) =
+                crate::runtime_adapter::herdr_core_local_method_refusal(method)
+        {
+            return Ok(tool_result(
+                crate::runtime_adapter::herdr_core_unsupported(
+                    method,
+                    required_capability,
+                    message,
                 ),
                 true,
             ));
@@ -1636,13 +1627,15 @@ fn dispatch_admitted_tool(
                 };
                 artifact_call(&config_dir(), &snapshot, method, &params)
             } else if method == TEXT_WRITE_METHOD {
-                if let Some(conflict) = check_mutating_tool_root_lease(
-                    context,
-                    method,
-                    &params,
-                    Some(&arguments),
-                    herdr_core.is_some(),
-                ) {
+                if herdr_core.is_some() {
+                    crate::runtime_adapter::herdr_core_unsupported(
+                        TEXT_WRITE_METHOD,
+                        "public_tool_policy_parity",
+                        "herdr_mcp.text.write cannot run locally while the herdr-core backend is selected",
+                    )
+                } else if let Some(conflict) =
+                    check_mutating_tool_root_lease(context, method, &params, Some(&arguments))
+                {
                     conflict
                 } else {
                     let clean_params = strip_lease_credential_fields(&params);
@@ -1683,10 +1676,17 @@ fn dispatch_admitted_tool(
                 )
             }
         }
-        "herdr_fs_read" => match herdr_core {
-            Some(client) => crate::runtime_adapter::herdr_core_fs_read(client, &arguments),
-            None => route_fs_git("fs_read", &context.cache.snapshot(), &arguments),
-        },
+        "herdr_fs_read" => {
+            if herdr_core.is_some() {
+                crate::runtime_adapter::herdr_core_unsupported(
+                    "herdr_fs_read",
+                    "public_tool_policy_parity",
+                    "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
+                )
+            } else {
+                route_fs_git("fs_read", &context.cache.snapshot(), &arguments)
+            }
+        }
         "herdr_fs_list" => route_fs_git("fs_list", &context.cache.snapshot(), &arguments),
         "herdr_fs_grep" => route_fs_git("fs_grep", &context.cache.snapshot(), &arguments),
         "herdr_fs_image" => {
@@ -1726,49 +1726,41 @@ fn dispatch_admitted_tool(
             );
         }
         "herdr_fs_edit" => {
-            // #935 / Droid P2-928-c: the single-writer root lease is enforced
-            // for the herdr-core backend too, before any `hc` mutation.
-            if let Some(conflict) = check_mutating_tool_root_lease(
-                context,
-                "herdr_fs_edit",
-                &arguments,
-                None,
-                herdr_core.is_some(),
-            ) {
+            if herdr_core.is_some() {
+                crate::runtime_adapter::herdr_core_unsupported(
+                    "herdr_fs_edit",
+                    "public_tool_policy_parity",
+                    "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
+                )
+            } else if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_fs_edit", &arguments, None)
+            {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                match herdr_core {
-                    Some(client) => crate::runtime_adapter::herdr_core_fs_edit(client, &clean),
-                    None => route_fs_git("fs_edit", &context.cache.snapshot(), &clean),
-                }
+                route_fs_git("fs_edit", &context.cache.snapshot(), &clean)
             }
         }
         "herdr_fs_write" => {
-            if let Some(conflict) = check_mutating_tool_root_lease(
-                context,
-                "herdr_fs_write",
-                &arguments,
-                None,
-                herdr_core.is_some(),
-            ) {
+            if herdr_core.is_some() {
+                crate::runtime_adapter::herdr_core_unsupported(
+                    "herdr_fs_write",
+                    "public_tool_policy_parity",
+                    "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
+                )
+            } else if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_fs_write", &arguments, None)
+            {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                match herdr_core {
-                    Some(client) => crate::runtime_adapter::herdr_core_fs_write(client, &clean),
-                    None => route_fs_git("fs_write", &context.cache.snapshot(), &clean),
-                }
+                route_fs_git("fs_write", &context.cache.snapshot(), &clean)
             }
         }
         "herdr_fs_patch" => {
-            if let Some(conflict) = check_mutating_tool_root_lease(
-                context,
-                "herdr_fs_patch",
-                &arguments,
-                None,
-                herdr_core.is_some(),
-            ) {
+            if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_fs_patch", &arguments, None)
+            {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
@@ -1776,13 +1768,9 @@ fn dispatch_admitted_tool(
             }
         }
         "herdr_git" => {
-            if let Some(conflict) = check_mutating_tool_root_lease(
-                context,
-                "herdr_git",
-                &arguments,
-                None,
-                herdr_core.is_some(),
-            ) {
+            if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_git", &arguments, None)
+            {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
@@ -1790,13 +1778,9 @@ fn dispatch_admitted_tool(
             }
         }
         "herdr_exec_start" => {
-            if let Some(conflict) = check_mutating_tool_root_lease(
-                context,
-                "herdr_exec_start",
-                &arguments,
-                None,
-                herdr_core.is_some(),
-            ) {
+            if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_exec_start", &arguments, None)
+            {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
@@ -1820,26 +1804,25 @@ fn dispatch_admitted_tool(
             None => exec_tools::kill(context.exec, &arguments),
         },
         "herdr_exec" => {
-            if let Some(conflict) = check_mutating_tool_root_lease(
-                context,
-                "herdr_exec",
-                &arguments,
-                None,
-                herdr_core.is_some(),
-            ) {
+            if herdr_core.is_some() {
+                crate::runtime_adapter::herdr_core_unsupported(
+                    "herdr_exec",
+                    "public_tool_policy_parity",
+                    "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
+                )
+            } else if let Some(conflict) =
+                check_mutating_tool_root_lease(context, "herdr_exec", &arguments, None)
+            {
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                match herdr_core {
-                    Some(client) => crate::runtime_adapter::herdr_core_exec(client, &clean),
-                    None => utility_exec::run_durable(
-                        context.client,
-                        &context.cache.snapshot(),
-                        context.exec,
-                        context.state_store,
-                        &clean,
-                    ),
-                }
+                utility_exec::run_durable(
+                    context.client,
+                    &context.cache.snapshot(),
+                    context.exec,
+                    context.state_store,
+                    &clean,
+                )
             }
         }
         "herdr_prompt" => {
@@ -2948,74 +2931,11 @@ fn trimmed_str_arg(arguments: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Resolve a lease candidate using the `herdr-core` route's resolver. This
-/// rejects ambiguous relative directories but does not prevent a filesystem
-/// change between the lease check and execution; those public routes remain
-/// blocked until that boundary can be enforced.
-fn herdr_core_absolute_candidate(raw: &str, operation: &str) -> Result<String, Value> {
-    crate::runtime_adapter::herdr_core_absolute_directory(raw)
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(|error| {
-            crate::runtime_adapter::herdr_core_error_json(&error, operation, "not_delivered")
-        })
-}
-
-/// Every `cwd`-like directory a `herdr-core` exec/file route may resolve to,
-/// in the precedence order the route uses (`root` -> `project_root` -> `cwd`).
-/// The first element reflects the directory selected at resolution time; it
-/// is not a guarantee against a later filesystem change.
-///
-/// All of them are returned, never just the first one that happens to exist:
-/// `herdr_call`-style ordering guesses are exactly how a lease check ends up
-/// validating `/outside` while `hc` executes in `/leased` (#936 P1-4). A
-/// relative directory fails the whole check closed: `hc` and herdr-mcp would
-/// resolve it against different process cwds (#936).
-fn herdr_core_exec_candidate_roots(
-    arguments: &Value,
-    operation: &str,
-) -> Result<Vec<String>, Value> {
-    ["root", "project_root", "cwd"]
-        .iter()
-        .filter_map(|key| trimmed_str_arg(arguments, key))
-        .map(|raw| herdr_core_absolute_candidate(&raw, operation))
-        .collect()
-}
-
-/// The lease candidates for `herdr_fs_write` / `herdr_fs_edit` on `herdr-core`.
-///
-/// `hc` receives the resolved absolute target, so the lease must be checked
-/// against exactly that target (plus each explicit directory itself). A relative
-/// `path` without an absolute `cwd`, or a relative directory, fails the check
-/// closed instead of being resolved against the herdr-mcp process cwd, which
-/// `hc` does not share (#936 P1-3).
-fn herdr_core_fs_candidate_paths(arguments: &Value, operation: &str) -> Result<Vec<String>, Value> {
-    let roots = herdr_core_exec_candidate_roots(arguments, operation)?;
-    let mut candidates = Vec::new();
-    match trimmed_str_arg(arguments, "path") {
-        Some(path) => {
-            let cwd = roots.first().map(std::path::Path::new);
-            let target = crate::runtime_adapter::herdr_core_absolute_file_target(&path, cwd)
-                .map_err(|error| {
-                    crate::runtime_adapter::herdr_core_error_json(
-                        &error,
-                        operation,
-                        "not_delivered",
-                    )
-                })?;
-            candidates.push(target.to_string_lossy().into_owned());
-            candidates.extend(roots);
-        }
-        None => candidates.extend(roots),
-    }
-    Ok(candidates)
-}
-
 fn check_mutating_tool_root_lease(
     context: &RuntimeContext<'_>,
     tool_or_method: &str,
     arguments: &Value,
     outer_arguments: Option<&Value>,
-    herdr_core_active: bool,
 ) -> Option<Value> {
     if tool_or_method == "herdr_git" {
         let action = arguments
@@ -3055,36 +2975,12 @@ fn check_mutating_tool_root_lease(
     }
 
     let candidate_paths: Vec<String> = match tool_or_method {
-        // Under `herdr-core` the lease target is the resolved absolute path the
-        // route sends to `hc`; the TUI route accepts no cwd/root and keeps the
-        // raw `path` (#936 P1-3).
-        "herdr_fs_edit" | "herdr_fs_write" if herdr_core_active => {
-            match herdr_core_fs_candidate_paths(arguments, tool_or_method) {
-                Ok(candidates) => candidates,
-                // The same refusal the route would produce: an ambiguous
-                // relative path/cwd can never be lease-checked for the target
-                // `hc` would execute (#936).
-                Err(refusal) => return Some(refusal),
-            }
-        }
         "herdr_fs_edit" | "herdr_fs_write" | TEXT_WRITE_METHOD => arguments
             .get("path")
             .and_then(Value::as_str)
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default(),
-        // `herdr_fs_patch` is TUI-only: `root` is the only field the route
-        // honours, so the lease envelope stays byte-for-byte unchanged (#936
-        // P2-6). `herdr_exec_start` accepts `project_root`/`cwd` only on
-        // `herdr-core`; the TUI route keeps `root` alone for the same reason.
-        "herdr_fs_patch" => arguments
-            .get("root")
-            .and_then(Value::as_str)
-            .map(|s| vec![s.to_owned()])
-            .unwrap_or_default(),
-        // `herdr_exec_start` is TUI-only: on `herdr-core` the backend admission
-        // refuses it before dispatch (#936), so `root` is the only field the
-        // reachable route honours.
-        "herdr_exec_start" => arguments
+        "herdr_fs_patch" | "herdr_exec_start" => arguments
             .get("root")
             .and_then(Value::as_str)
             .map(|s| vec![s.to_owned()])
@@ -3097,26 +2993,12 @@ fn check_mutating_tool_root_lease(
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default(),
         // Every supplied cwd-like field is checked and a `workspace` snapshot
-        // is merged in, never used as a fallback: `project_root=/outside` +
-        // `root=/leased` and a TUI `workspace=w1` shadowed by `root=/tmp` both
-        // stay blocked (#936 P1-4).
+        // is merged in, never used as a fallback (#936 P1-4).
         "herdr_exec" => {
-            let mut candidates = if herdr_core_active {
-                match herdr_core_exec_candidate_roots(arguments, tool_or_method) {
-                    Ok(candidates) => candidates,
-                    // The same refusal the route would produce: an ambiguous
-                    // relative cwd can never be lease-checked for the directory
-                    // `hc` would execute in (#936).
-                    Err(refusal) => return Some(refusal),
-                }
-            } else {
-                // The TUI route keeps its historical raw candidate list so no
-                // TUI lease behaviour changes.
-                ["project_root", "root", "cwd"]
-                    .iter()
-                    .filter_map(|key| trimmed_str_arg(arguments, key))
-                    .collect()
-            };
+            let mut candidates: Vec<String> = ["project_root", "root", "cwd"]
+                .iter()
+                .filter_map(|key| trimmed_str_arg(arguments, key))
+                .collect();
             if let Some(workspace) = trimmed_str_arg(arguments, "workspace") {
                 candidates.extend(workspace_candidate_paths_from_snapshot(
                     &context.cache.snapshot(),

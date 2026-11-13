@@ -11,6 +11,9 @@ use crate::workstation;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
+/// Diagnostics-only inspection entrypoint that resolves backend selection from
+/// live config/environment. Never call from a public request path that has
+/// already admitted a selection; request paths must use [`inspect_core_with_selection`].
 pub fn inspect_core(client: &HerdrClient, cached_snapshot: Option<Value>) -> Value {
     let backend_selection = match crate::runtime_adapter::resolve_process_backend_selection() {
         Ok(selection) => selection,

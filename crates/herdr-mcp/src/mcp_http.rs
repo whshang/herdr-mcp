@@ -4383,6 +4383,70 @@ mod tests {
             }
             let skill = call_public_tool(&app, "herdr_skill", json!({})).await;
             assert_eq!(skill["required_capability"], "tui_backend_isolation", "{skill}");
+            let text_write_target = root.join("home").join("core-blocked-write.txt");
+            for text_write_method in [
+                "herdr_mcp.text.write",
+                " herdr_mcp.text.write ",
+                "HERDR_MCP.TEXT.WRITE",
+            ] {
+                let text_write = call_public_tool(
+                    &app,
+                    "herdr_call",
+                    json!({
+                        "method": text_write_method,
+                        "params": {
+                            "path": text_write_target.to_string_lossy(),
+                            "content": "hello",
+                            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                        }
+                    }),
+                )
+                .await;
+                assert_eq!(text_write["ok"], false, "{text_write_method}: {text_write}");
+                assert_eq!(
+                    text_write["code"], "runtime_capability_unsupported",
+                    "{text_write_method}: {text_write}"
+                );
+                assert_eq!(
+                    text_write["required_capability"], "public_tool_policy_parity",
+                    "{text_write_method}: {text_write}"
+                );
+                assert_eq!(
+                    text_write["delivery_state"], "not_delivered",
+                    "{text_write_method}: {text_write}"
+                );
+            }
+            assert!(
+                !text_write_target.exists(),
+                "refused herdr_mcp.text.write must not touch the filesystem"
+            );
+            let methods = call_public_tool(&app, "herdr_methods", json!({})).await;
+            assert_eq!(methods["ok"], true, "{methods}");
+            let method_rows = methods["methods"].as_array().unwrap();
+            for blocked_local in [
+                "herdr_mcp.skill.list",
+                "herdr_mcp.planning.advise",
+                "herdr_mcp.github.status",
+                "herdr_mcp.cleanup.preview",
+                "herdr_mcp.exec.wait",
+                "herdr_mcp.text.write",
+            ] {
+                let row = method_rows
+                    .iter()
+                    .find(|entry| entry["method"] == blocked_local)
+                    .unwrap_or_else(|| panic!("missing local schema {blocked_local}: {methods}"));
+                assert_eq!(row["servable"], false, "{blocked_local}: {row}");
+                assert_eq!(row["blocked_on_backend"], true, "{blocked_local}: {row}");
+            }
+            let text_read_row = method_rows
+                .iter()
+                .find(|entry| entry["method"] == "herdr_mcp.text.read")
+                .unwrap_or_else(|| panic!("missing herdr_mcp.text.read schema: {methods}"));
+            assert_eq!(text_read_row["servable"], true, "{text_read_row}");
+            assert_eq!(
+                text_read_row["blocked_on_backend"], false,
+                "{text_read_row}"
+            );
             let list = call_public_tool(&app, "herdr_call", json!({"method": "artifact.list", "params": {}})).await;
             assert_eq!(list["ok"], true, "{list}");
             assert_eq!(list["artifacts"], json!([]));
