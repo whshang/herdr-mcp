@@ -2605,7 +2605,20 @@ fn hc_peer_effective_uid(
             )
         };
         if rc == 0 {
-            // SAFETY: `getsockopt` succeeded and filled a `ucred` of `len` bytes.
+            if !hc_peer_credential_is_complete(len) {
+                // A truncated `SO_PEERCRED` reply must never be read as a uid.
+                return Err(hc_peer_uid_unverified(
+                    socket_path,
+                    &std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "SO_PEERCRED returned {len} bytes, expected {}",
+                            std::mem::size_of::<libc::ucred>()
+                        ),
+                    ),
+                ));
+            }
+            // SAFETY: `getsockopt` succeeded and filled a complete `ucred`.
             return Ok(unsafe { credential.assume_init() }.uid);
         }
         Err(hc_peer_uid_unverified(
@@ -2622,6 +2635,12 @@ fn hc_peer_effective_uid(
             "no peer credential query on this platform",
         ),
     ))
+}
+
+/// A `SO_PEERCRED` reply shorter than `struct ucred` is not a credential.
+#[cfg(target_os = "linux")]
+fn hc_peer_credential_is_complete(len: libc::socklen_t) -> bool {
+    usize::try_from(len).is_ok_and(|len| len == std::mem::size_of::<libc::ucred>())
 }
 
 #[cfg(unix)]
@@ -3443,6 +3462,17 @@ mod tests {
                 hc_current_effective_uid()
             );
             std::fs::remove_file(&socket).ok();
+        }
+
+        /// A truncated `SO_PEERCRED` reply is not a credential at all, so it is
+        /// refused before any uid (including 0) is read out of it.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn refuses_a_truncated_linux_peer_credential() {
+            let full = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            assert!(hc_peer_credential_is_complete(full));
+            assert!(!hc_peer_credential_is_complete(full - 1));
+            assert!(!hc_peer_credential_is_complete(0));
         }
 
         /// A peer running as another effective UID is refused with a stable code

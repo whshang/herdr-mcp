@@ -2274,26 +2274,11 @@ fn push_events_response(
         opened_at,
     };
     let events = stream::unfold(state, |mut state| async move {
-        // #768: re-check admission at every stream tick boundary. This stream
-        // outlives the initial connection, so the entrypoint check alone would
-        // keep publishing browser actuation and pane views on a backend this
-        // process never admitted.
+        // The `hello` frame is admitted by the router entrypoint. Every later
+        // frame re-checks admission after its wake (see the loop below), so a
+        // drifted runtime is fenced here once and then ends the stream.
         if state.fenced {
             return None;
-        }
-        if let Err(message) = crate::runtime_adapter::verify_admitted_backend_config(
-            &state.admitted,
-            &state.admitted_config,
-        ) {
-            state.fenced = true;
-            let code = crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE;
-            return Some((
-                Ok::<Bytes, Infallible>(Bytes::from(sse_event(
-                    "error",
-                    &json!({"ok": false, "code": code, "message": message}),
-                ))),
-                state,
-            ));
         }
         if state.first {
             state.first = false;
@@ -2359,6 +2344,26 @@ fn push_events_response(
                     }
                 }
                 _ = tokio::time::sleep(heartbeat_wait) => {}
+            }
+            // #768: the wait above can span a config change, and the wake may be
+            // a queued browser command. Re-check admission after every wake,
+            // before reading the digest, the pane view or the command queue, so
+            // a drifted runtime publishes neither actuation nor pane state. This
+            // is one small config-file read per wake/heartbeat (at most one per
+            // 15 s while idle), the same read the request entrypoint performs.
+            if let Err(message) = crate::runtime_adapter::verify_admitted_backend_config(
+                &state.admitted,
+                &state.admitted_config,
+            ) {
+                state.fenced = true;
+                let code = crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE;
+                return Some((
+                    Ok::<Bytes, Infallible>(Bytes::from(sse_event(
+                        "error",
+                        &json!({"ok": false, "code": code, "message": message}),
+                    ))),
+                    state,
+                ));
             }
             let digest = state.cache.digest_since(state.cursor);
             state.cursor = digest.cursor;
@@ -12525,6 +12530,100 @@ mod tests {
             }
         });
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// #768: a browser command queued while an SSE stream is already open must
+    /// not escape after the runtime's pinned config switches backends.
+    ///
+    /// The stream is opened before the drift, so only the post-wake check can
+    /// fence it. A real broker command wakes the stream from its `select!`; a
+    /// regression that publishes on wake delivers `browser_actuation` instead of
+    /// the `invalid_runtime_backend` fence.
+    #[cfg(unix)]
+    #[test]
+    fn open_push_stream_never_delivers_a_queued_browser_command_after_drift() {
+        use futures_util::StreamExt;
+
+        let root = test_root("push-stream-backend-drift");
+        let config_file = root.join("config.json");
+        let mut state = test_state_with_snapshot(
+            &root,
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        // A real cache keeps its cursor watch sender alive, so the stream stays
+        // open after the `hello` frame instead of ending on a dropped sender.
+        state.cache = Arc::new(EventCache::start(HerdrClient::new(
+            root.join("missing-herdr.sock"),
+        )));
+        state.client = HerdrClient::new(root.join("missing-herdr.sock"));
+        state.trusted_extension_ipc = true;
+        let broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+        broker.note_extension_poll(None);
+        state.browser_actuation = broker.clone();
+        let app = candidate_router(state);
+        let core_config =
+            br#"{"runtime":{"backend":"herdr-core","herdr_core_socket":"/tmp/herdr-core-stream-drift.sock"}}"#;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = app
+                .oneshot(rpc_request(Method::GET, "/push/events", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            let hello = tokio::time::timeout(Duration::from_secs(2), body.next())
+                .await
+                .expect("hello frame arrived")
+                .expect("stream is live")
+                .expect("hello frame bytes");
+            assert!(
+                String::from_utf8_lossy(&hello).contains("event: hello"),
+                "stream must open healthy"
+            );
+
+            // The operator edits the backend while this stream stays open, then a
+            // real browser command wakes the stream from its `select!`.
+            std::fs::write(&config_file, core_config).unwrap();
+            let dispatch = {
+                let broker = broker.clone();
+                std::thread::spawn(move || {
+                    broker.actuate("herdr_mcp.browser_dispatch", &json!({}), 1, None)
+                })
+            };
+
+            let next = tokio::time::timeout(Duration::from_secs(2), body.next())
+                .await
+                .expect("fenced frame arrived")
+                .expect("stream is still live")
+                .expect("fenced frame bytes");
+            let next = String::from_utf8_lossy(&next).into_owned();
+            assert!(next.contains("event: error"), "{next}");
+            assert!(
+                next.contains(crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE),
+                "{next}"
+            );
+            assert!(!next.contains("browser_actuation"), "{next}");
+            assert!(!next.contains("pane_upsert"), "{next}");
+
+            // The fence is terminal: the extension must reconnect, and that
+            // reconnect is refused by the entrypoint gate.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), body.next())
+                    .await
+                    .expect("stream end observed")
+                    .is_none(),
+                "a drifted stream must end instead of continuing"
+            );
+            dispatch.join().unwrap().unwrap();
+        });
         std::fs::remove_dir_all(root).ok();
     }
 }
