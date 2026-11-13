@@ -26,7 +26,7 @@ browser continuity
 
 ## macOS のファイルアクセスと画面収録の権限
 
-macOS はデスクトップ、書類、ダウンロードなどの保護された場所へのファイルアクセスやフルディスクアクセスと、画面収録の権限を別々に管理します。file/Git tool が `macos_tcc_access_blocked` を返した場合は `herdr-mcp permissions status` を確認し、`needs_setup` なら `herdr-mcp permissions setup` を実行して、指示に従いシステム設定で `herdr-mcp-broker` を許可した後、`herdr-mcp permissions verify` を実行します。通常の `not_found` は TCC の遮断を意味しません。固定された broker revision は既存のファイルアクセス許可を維持できますが、Herdr TUI の画面収録は許可しません。
+macOS はデスクトップ、書類、ダウンロードなどの保護された場所へのファイルアクセスやフルディスクアクセスと、画面収録の権限を別々に管理します。file/Git tool が `macos_tcc_access_blocked` を返した場合は `herdr-mcp permissions status` を確認し、`needs_setup` なら `herdr-mcp permissions setup` を実行して、指示に従いシステム設定で `herdr-mcp-broker` を許可した後、`herdr-mcp permissions verify` を実行します。`not_found` だけではファイルが存在しないと断定できません。デスクトップ、書類、ダウンロードなど保護されたパスでは、rotating runtime は設計上そのパスを解決できないため、同じアクセス遮断が `not_found` として現れることがあります。パスが無いと判断する前に `herdr-mcp permissions status` で権限状態を確認してください。固定された broker revision は既存のファイルアクセス許可を維持できますが、Herdr TUI の画面収録は許可しません。
 
 更新後に Herdr TUI の画面収録が動かなくなった場合は、まず使用中の実行ファイルとリンク先を確認します。
 
@@ -65,7 +65,7 @@ herdr-mcp logs
 herdr-mcp permissions status
 ```
 
-file/Git tool が `macos_tcc_access_blocked` を返す場合は、上記の macOS 権限の手順を参照してください。通常の `not_found` エラーは無関係です。
+file/Git tool が `macos_tcc_access_blocked` を返す場合は、上記の macOS 権限の手順を参照してください。`not_found` 単体は TCC の遮断の証拠ではありませんが、保護されたパスではパスが無いと判断する前に `herdr-mcp permissions status` で確認してください。
 
 ### Herdr 自体は利用可能か
 

@@ -26,7 +26,7 @@ If one layer is broken, do not start by reconfiguring a later one.
 
 ## macOS file access and screen recording permissions
 
-macOS manages access to protected locations such as Desktop, Documents and Downloads, and Full Disk Access, separately from Screen Recording. If file/Git tools return `macos_tcc_access_blocked`, run `herdr-mcp permissions status`; when it reports `needs_setup`, run `herdr-mcp permissions setup`, authorize `herdr-mcp-broker` in System Settings as directed, then run `herdr-mcp permissions verify`. An ordinary `not_found` does not imply a TCC block. A fixed broker revision can retain its file-access grant; that grant does not authorize Herdr TUI to record the screen.
+macOS manages access to protected locations such as Desktop, Documents and Downloads, and Full Disk Access, separately from Screen Recording. If file/Git tools return `macos_tcc_access_blocked`, run `herdr-mcp permissions status`; when it reports `needs_setup`, run `herdr-mcp permissions setup`, authorize `herdr-mcp-broker` in System Settings as directed, then run `herdr-mcp permissions verify`. A `not_found` result alone does not prove the file is absent: on a protected Desktop, Documents or Downloads path the rotating runtime cannot resolve the path by design, so the same access block can surface as `not_found`. Check `herdr-mcp permissions status` before treating such a path as missing. A fixed broker revision can retain its file-access grant; that grant does not authorize Herdr TUI to record the screen.
 
 If Herdr TUI screen recording stops working after an update, first identify the executable in use and where its links point:
 
@@ -65,7 +65,7 @@ herdr-mcp logs
 herdr-mcp permissions status
 ```
 
-For `macos_tcc_access_blocked` from file/Git tools, follow the macOS permissions steps above. Ordinary `not_found` errors are unrelated.
+For `macos_tcc_access_blocked` from file/Git tools, follow the macOS permissions steps above. A plain `not_found` is not by itself evidence of a TCC block, but on a protected Desktop, Documents or Downloads path confirm with `herdr-mcp permissions status` before treating the path as absent.
 
 ### Is Herdr itself available?
 

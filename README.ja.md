@@ -147,7 +147,7 @@ Cloudflare は公開 MCP/OAuth endpoint、device routing、再接続調整、複
 
 代替 transport が完全な代替になるには、ChatGPT から到達できる公開 HTTPS MCP endpoint、信頼できる TLS、認証/OAuth、安全な device routing、確実な再接続、明確な mutation delivery semantics を同時に提供する必要があります。
 
-private IP や Tailscale-only address は ChatGPT cloud から直接到達できません。現時点で正式にサポート・検証している経路は Cloudflare です。LAN / Tailscale 直接接続は 1.2 の候補であり、現行機能ではありません。設計には認証、暗号化、device identity と権限、ネットワーク公開範囲、配送セマンティクスが必要で、ChatGPT cloud 向けには到達可能な公開 endpoint も必要です。
+private IP や Tailscale-only address は ChatGPT cloud から直接到達できません。現時点で正式にサポート・検証している経路は Cloudflare です。LAN / Tailscale 直接接続は 1.1 ではサポートされておらず、今後のリリースで評価中の項目です。現行機能ではなく、確定したスコープでもありません。設計には認証、暗号化、device identity と権限、ネットワーク公開範囲、配送セマンティクスが必要で、ChatGPT cloud 向けには到達可能な公開 endpoint も必要です。
 
 ### どの Herdr をサポートしていますか？
 

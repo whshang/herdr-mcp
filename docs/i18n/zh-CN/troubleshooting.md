@@ -26,7 +26,7 @@ browser continuity
 
 ## macOS 文件访问与屏幕录制权限
 
-macOS 将桌面、文稿、下载等受保护位置的文件访问和完全磁盘访问权限，与屏幕录制权限分别管理。文件/Git 工具返回 `macos_tcc_access_blocked` 时，先运行 `herdr-mcp permissions status`；若显示 `needs_setup`，执行 `herdr-mcp permissions setup`，按提示在系统设置中授权 `herdr-mcp-broker`，再运行 `herdr-mcp permissions verify`。普通 `not_found` 并不代表 TCC 拦截。固定版本的 broker 可以保留已有文件访问授权；它不会替 Herdr TUI 授予屏幕录制权限。
+macOS 将桌面、文稿、下载等受保护位置的文件访问和完全磁盘访问权限，与屏幕录制权限分别管理。文件/Git 工具返回 `macos_tcc_access_blocked` 时，先运行 `herdr-mcp permissions status`；若显示 `needs_setup`，执行 `herdr-mcp permissions setup`，按提示在系统设置中授权 `herdr-mcp-broker`，再运行 `herdr-mcp permissions verify`。仅凭 `not_found` 不能断定文件不存在：在桌面、文稿、下载等受保护路径下，rotating runtime 按设计无法解析该路径，同一种访问拦截会以 `not_found` 的形式出现。判断路径缺失前先运行 `herdr-mcp permissions status` 确认权限状态。固定版本的 broker 可以保留已有文件访问授权；它不会替 Herdr TUI 授予屏幕录制权限。
 
 如果 Herdr TUI 的屏幕录制在更新后失效，先确认实际运行的可执行文件及链接指向：
 

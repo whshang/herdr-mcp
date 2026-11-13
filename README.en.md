@@ -147,7 +147,7 @@ Cloudflare also provides the public MCP/OAuth endpoint, device routing, reconnec
 
 Another transport is a complete substitute only if it also provides a public HTTPS MCP endpoint reachable by ChatGPT, trusted TLS, authentication/OAuth, safe device routing, reliable reconnect behavior, and explicit mutation-delivery semantics.
 
-Private IPs and Tailscale-only addresses are not directly reachable from ChatGPT's cloud service. Raw port forwarding increases exposure. Cloudflare is the currently supported and qualified path. Direct LAN / Tailscale connections are a 1.2 candidate, not an existing capability; their design must address authentication, encryption, device identity and authorization, network exposure, and delivery semantics. ChatGPT cloud would still need a reachable public endpoint.
+Private IPs and Tailscale-only addresses are not directly reachable from ChatGPT's cloud service. Raw port forwarding increases exposure. Cloudflare is the currently supported and qualified path. Direct LAN / Tailscale connections are not supported in 1.1 and are under evaluation for a later release, not an existing capability and not a committed scope; their design would have to address authentication, encryption, device identity and authorization, network exposure, and delivery semantics. ChatGPT cloud would still need a reachable public endpoint.
 
 ### Which Herdr does herdr-mcp support?
 
