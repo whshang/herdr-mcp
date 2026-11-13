@@ -902,14 +902,7 @@ fn cli_device_inventory(paths: &RuntimePaths) -> Result<(Value, Option<String>),
     let configured_device_id = configured_enrollment_device_id(&config, &owner);
     let client = client_for_origin(&owner.edge_origin)?;
     let fetch = fetch_device_inventory(&owner, &client)?;
-    let configured_device_id = if fetch.ok
-        && fetch.requested_origin_matches_response()
-        && configured_device_id.is_some()
-    {
-        configured_device_id
-    } else {
-        None
-    };
+    let configured_device_id = fetch.confirmed_configured_device_id(configured_device_id);
     if !fetch.ok {
         return Ok((fetch.failure_payload(), None));
     }
@@ -949,6 +942,22 @@ impl DeviceInventoryFetch {
     /// cannot prove the inventory came from the configured Worker origin.
     fn requested_origin_matches_response(&self) -> bool {
         self.final_origin.as_deref() == Some(self.requested_origin.as_str())
+    }
+
+    /// The locally derived configured-device indicator is publishable only when
+    /// the inventory call actually succeeded and provably answered from the
+    /// requested Worker origin. A redirect, an unparseable final URL, or a
+    /// failed fetch leaves it unproven even when the local config carries an
+    /// explicit device id.
+    fn confirmed_configured_device_id(
+        &self,
+        configured_device_id: Option<String>,
+    ) -> Option<String> {
+        if self.ok && self.requested_origin_matches_response() {
+            configured_device_id
+        } else {
+            None
+        }
     }
 
     fn failure_payload(&self) -> Value {
@@ -4575,6 +4584,50 @@ mod tests {
         let alias_identity =
             local_context_identity("https://edge-alias.example", LOCAL_CONTEXT_DEVICE);
         assert!(configured_enrollment_device_id(&config, &alias_identity).is_none());
+    }
+
+    /// user agent | Given a successful inventory fetch whose final origin is not the configured Worker origin | When the local configured-device indicator is derived | Then it stays null despite an existing configured device id
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn user_agent_given_cross_origin_inventory_success_when_derived_then_configured_device_stays_null()
+     {
+        let payload = json!({"ok": true, "devices": [{"device_id": LOCAL_CONTEXT_DEVICE}]});
+        let mut fetch = DeviceInventoryFetch {
+            payload: payload.clone(),
+            ok: true,
+            http_status: 200,
+            requested_origin: "https://edge.example".to_owned(),
+            final_origin: Some("https://edge.example".to_owned()),
+        };
+
+        // Control: the same payload and configured id do publish the indicator
+        // when the response provably came from the requested origin, so the
+        // assertions below cannot pass by rejecting every successful fetch.
+        let same_origin =
+            fetch.confirmed_configured_device_id(Some(LOCAL_CONTEXT_DEVICE.to_owned()));
+        assert_eq!(same_origin.as_deref(), Some(LOCAL_CONTEXT_DEVICE));
+        let rendered = render_device_inventory(payload.clone(), 0, same_origin.as_deref());
+        assert_eq!(rendered["current_configured_device"], Value::Bool(true));
+
+        // HTTP 200, `ok: true`, and an explicit configured device id, but the
+        // final response origin is not the configured Worker origin.
+        fetch.final_origin = Some("https://edge-alias.example".to_owned());
+        let cross_origin =
+            fetch.confirmed_configured_device_id(Some(LOCAL_CONTEXT_DEVICE.to_owned()));
+        assert_eq!(cross_origin, None);
+        let rendered = render_device_inventory(payload, 0, cross_origin.as_deref());
+        assert_eq!(rendered["current_configured_device"], Value::Null);
+        assert_eq!(
+            rendered["current_configured_device_scope"],
+            CURRENT_CONFIGURED_DEVICE_SCOPE
+        );
+
+        // An unparseable final URL is treated as unproven, like a redirect.
+        fetch.final_origin = None;
+        assert_eq!(
+            fetch.confirmed_configured_device_id(Some(LOCAL_CONTEXT_DEVICE.to_owned())),
+            None
+        );
     }
 
     /// user agent | Given a canonical requested origin | When the response final URL is compared | Then cross-origin redirects and unparseable final URLs are not accepted
