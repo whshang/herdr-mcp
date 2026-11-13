@@ -13,10 +13,11 @@
 //!   walked path is re-checked against the opened inode, and the single-writer
 //!   mutation lease is re-validated through the runtime commit fence.
 //! * Windows: no dirfd exists, so the parent/leaf are re-checked through
-//!   reparse-point attributes and published with `MoveFileExW`. This is
-//!   deliberately weaker than the Unix path (no descriptor pinning, no `nlink`
-//!   check): the TOCTOU window is narrower but not eliminated. That branch is
-//!   compile-validated by the Windows candidate CI job only.
+//!   reparse-point attributes, backup reads re-open the target by path, and
+//!   publishing uses `MoveFileExW`. This is deliberately weaker than the Unix
+//!   path (no descriptor pinning, no `nlink` check): the TOCTOU window is
+//!   narrower but not eliminated. That branch is compile-validated by the Windows
+//!   candidate CI job only.
 //! * Other Unix targets: fail closed. There is no unchecked path fallback.
 //!
 //! Exactly one production entry may commit a write: `write_fenced`, driven by
@@ -354,13 +355,17 @@ mod platform {
     struct PinnedParent {
         dir: File,
         walk_path: PathBuf,
-        roots: Vec<PathBuf>,
+        home: PathBuf,
     }
 
     impl PinnedParent {
         fn open(plan: &PublishPlan<'_>) -> Result<Self, Value> {
             let roots = allowed_roots(&plan.home);
-            let Some(root) = roots.iter().find(|root| path_within(root, &plan.parent)) else {
+            let Some(root) = roots
+                .iter()
+                .filter(|root| path_within(root, &plan.parent))
+                .max_by_key(|root| root.as_os_str().len())
+            else {
                 return Err(fail(
                     "path_outside_home",
                     "text transfer is limited to HOME",
@@ -396,20 +401,21 @@ mod platform {
             Ok(Self {
                 dir,
                 walk_path: plan.parent.clone(),
-                roots,
+                home: plan.home.clone(),
             })
         }
 
         /// Re-derive the parent's current absolute path from the descriptor and
-        /// prove it is still the directory the walk recorded.
-        fn verify_current(&self, target: &Path) -> Result<PathBuf, Value> {
+        /// prove it is still the directory the walk recorded and still satisfies
+        /// HOME, credential-path, and configured `HERDR_MCP_WRITE_ROOTS` policy.
+        fn verify_current(&self, name: &OsStr, target: &Path) -> Result<PathBuf, Value> {
             let current = descriptor_path(&self.dir)
                 .map_err(|error| io_fail("parent_resolution_failed", &self.walk_path, error))?;
             require_utf8_path(&current)?;
-            if !self.roots.iter().any(|root| path_within(root, &current)) {
+            if !path_within(&self.home, &current) {
                 return Err(fail(
                     "text_transfer_parent_escaped",
-                    "text transfer parent left the permitted write roots before publish",
+                    "text transfer parent left HOME before publish",
                     &current,
                 ));
             }
@@ -420,6 +426,8 @@ mod platform {
                     &current,
                 ));
             }
+            let current_target = current.join(name);
+            crate::mutation::check_text_write_root(&current_target)?;
             let opened = self
                 .dir
                 .metadata()
@@ -490,36 +498,41 @@ mod platform {
             return io_fail("permissions_failed", &plan.target, error);
         }
 
+        let backup_name = match existing {
+            Some((file, _)) if plan.backup => match write_backup(&pinned.dir, plan, file) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    remove_entry(&pinned.dir, &temp_name);
+                    return error;
+                }
+            },
+            _ => None,
+        };
+
+        let cleanup_staged = |backup: Option<&OsStr>| {
+            remove_entry(&pinned.dir, &temp_name);
+            if let Some(backup) = backup {
+                remove_entry(&pinned.dir, backup);
+            }
+        };
+
         #[cfg(test)]
         if let Some(hook) = test_hooks::take_before_commit() {
             hook(&pinned.walk_path, &plan.target);
         }
 
-        let current_parent = match pinned.verify_current(&plan.target) {
+        let current_parent = match pinned.verify_current(&plan.name, &plan.target) {
             Ok(value) => value,
             Err(error) => {
-                remove_entry(&pinned.dir, &temp_name);
+                cleanup_staged(backup_name.as_deref());
                 return error;
             }
         };
         let current_target = current_parent.join(&plan.name);
         if let Err(error) = fence.check_target(&current_target) {
-            remove_entry(&pinned.dir, &temp_name);
+            cleanup_staged(backup_name.as_deref());
             return error;
         }
-
-        let backup_path = match existing {
-            Some((file, _)) if plan.backup => {
-                match write_backup(&pinned.dir, plan, &current_parent, file) {
-                    Ok(value) => Some(value),
-                    Err(error) => {
-                        remove_entry(&pinned.dir, &temp_name);
-                        return error;
-                    }
-                }
-            }
-            _ => None,
-        };
 
         let published = if plan.overwrite {
             renameat(&pinned.dir, &temp_name, &pinned.dir, &plan.name)
@@ -533,7 +546,7 @@ mod platform {
             )
         };
         if let Err(error) = published {
-            remove_entry(&pinned.dir, &temp_name);
+            cleanup_staged(backup_name.as_deref());
             if plan.overwrite {
                 return io_fail("replace_failed", &plan.target, std::io::Error::from(error));
             }
@@ -547,7 +560,9 @@ mod platform {
                 // guarantee, so an unsupported system call fails closed. On
                 // macOS `renameatx_np` is a weak symbol; if it is absent the
                 // call reports `NOSYS`.
-                rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL => fail(
+                rustix::io::Errno::NOSYS
+                | rustix::io::Errno::INVAL
+                | rustix::io::Errno::OPNOTSUPP => fail(
                     "rename_no_replace_unsupported",
                     "atomic no-replace publish is unavailable on this filesystem",
                     &plan.target,
@@ -556,7 +571,7 @@ mod platform {
             };
         }
         let _ = pinned.dir.sync_all();
-        plan.success(backup_path)
+        plan.success(backup_name.map(|name| current_parent.join(name)))
     }
 
     fn open_existing(
@@ -610,11 +625,10 @@ mod platform {
     fn write_backup(
         dir: &File,
         plan: &PublishPlan<'_>,
-        current_parent: &Path,
         mut existing: File,
-    ) -> Result<PathBuf, Value> {
+    ) -> Result<OsString, Value> {
         let backup_name = backup_file_name(&plan.name, plan.stamp);
-        let backup_path = current_parent.join(&backup_name);
+        let backup_display = plan.parent.join(&backup_name);
         let fd = match openat(
             dir,
             &backup_name,
@@ -625,7 +639,7 @@ mod platform {
             Err(error) => {
                 return Err(io_fail(
                     "backup_failed",
-                    &backup_path,
+                    &backup_display,
                     std::io::Error::from(error),
                 ));
             }
@@ -637,22 +651,22 @@ mod platform {
             .read_to_end(&mut bytes);
         if let Err(error) = read_result {
             remove_entry(dir, &backup_name);
-            return Err(io_fail("backup_failed", &backup_path, error));
+            return Err(io_fail("backup_failed", &backup_display, error));
         }
         if bytes.len() > MAX_TEXT_BYTES {
             remove_entry(dir, &backup_name);
             return Err(fail(
                 "backup_failed",
                 "existing target exceeds the bounded backup budget; the original was left untouched",
-                &backup_path,
+                &backup_display,
             ));
         }
         let write_result = backup.write_all(&bytes).and_then(|()| backup.sync_all());
         if let Err(error) = write_result {
             remove_entry(dir, &backup_name);
-            return Err(io_fail("backup_failed", &backup_path, error));
+            return Err(io_fail("backup_failed", &backup_display, error));
         }
-        Ok(backup_path)
+        Ok(backup_name)
     }
 
     fn remove_entry(dir: &File, name: &OsStr) {
@@ -767,22 +781,6 @@ mod platform {
             return io_fail("permissions_failed", &plan.target, error);
         }
 
-        #[cfg(test)]
-        if let Some(hook) = test_hooks::take_before_commit() {
-            hook(&plan.parent, &plan.target);
-        }
-
-        // No descriptor holds the parent on Windows, so this is a path-based
-        // re-check: it narrows the window but cannot close it.
-        if let Err(error) = verify_parent(plan) {
-            let _ = fs::remove_file(&temp);
-            return error;
-        }
-        if let Err(error) = fence.check_target(&plan.target) {
-            let _ = fs::remove_file(&temp);
-            return error;
-        }
-
         let backup_path = if plan.backup && existing.is_some() {
             match write_backup(plan) {
                 Ok(value) => Some(value),
@@ -795,6 +793,30 @@ mod platform {
             None
         };
 
+        let cleanup_windows_staged = |backup: Option<&PathBuf>| {
+            let _ = fs::remove_file(&temp);
+            if let Some(backup) = backup {
+                let _ = fs::remove_file(backup);
+            }
+        };
+
+        #[cfg(test)]
+        if let Some(hook) = test_hooks::take_before_commit() {
+            hook(&plan.parent, &plan.target);
+        }
+
+        // No descriptor holds the parent on Windows, so this is a path-based
+        // re-check immediately before MoveFileExW: it narrows the window but
+        // cannot close it.
+        if let Err(error) = verify_parent(plan) {
+            cleanup_windows_staged(backup_path.as_ref());
+            return error;
+        }
+        if let Err(error) = fence.check_target(&plan.target) {
+            cleanup_windows_staged(backup_path.as_ref());
+            return error;
+        }
+
         let flags = if plan.overwrite {
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
         } else {
@@ -804,7 +826,7 @@ mod platform {
             unsafe { MoveFileExW(wide(&temp).as_ptr(), wide(&plan.target).as_ptr(), flags) };
         if moved == 0 {
             let error = std::io::Error::last_os_error();
-            let _ = fs::remove_file(&temp);
+            cleanup_windows_staged(backup_path.as_ref());
             return match error.raw_os_error() {
                 Some(ERROR_FILE_EXISTS) | Some(ERROR_ALREADY_EXISTS) if !plan.overwrite => fail(
                     "target_exists",
@@ -830,13 +852,12 @@ mod platform {
                 &plan.parent,
             )),
             Some(_) => {
-                let roots = allowed_roots(&plan.home);
                 let current = fs::canonicalize(&plan.parent)
                     .map_err(|error| io_fail("parent_resolution_failed", &plan.parent, error))?;
-                if !roots.iter().any(|root| path_within(root, &current)) {
+                if !path_within(&plan.home, &current) {
                     return Err(fail(
                         "text_transfer_parent_escaped",
-                        "text transfer parent left the permitted write roots before publish",
+                        "text transfer parent left HOME before publish",
                         &current,
                     ));
                 }
@@ -847,6 +868,7 @@ mod platform {
                         &current,
                     ));
                 }
+                crate::mutation::check_text_write_root(&current.join(&plan.name))?;
                 Ok(())
             }
             None => Err(fail(
@@ -1734,6 +1756,85 @@ mod tests {
             home.entries("project-raced"),
             0,
             "raced temp file must be removed"
+        );
+
+        // Existing target with overwrite=true + backup=true: when the commit
+        // fence rejects, any staged temp AND staged backup must be removed.
+        fs::create_dir(home.path("project-backup-raced")).unwrap();
+        let existing_raced = home.path("project-backup-raced/existing.txt");
+        fs::write(&existing_raced, "before").unwrap();
+        let backup_raced_root = fs::canonicalize(home.path("project-backup-raced"))
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let store_hook = Arc::clone(&fence.store);
+        test_hooks::set_before_commit(Box::new(move |_parent, _target| {
+            let mut store = store_hook.lock().unwrap();
+            let outcome = store
+                .acquire_mutation_lease(crate::state_store::MutationLeaseAcquireInput {
+                    project_root: &backup_raced_root,
+                    lane_key: None,
+                    holder_id: "backup-raced-holder",
+                    lease_token: None,
+                    ttl_seconds: Some(120),
+                    workspace_id: None,
+                    pane_id: None,
+                    branch: None,
+                    now_ms: now_ms() as i64,
+                })
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                crate::state_store::MutationLeaseAcquireOutcome::Acquired { .. }
+            ));
+        }));
+        let raced_overwrite =
+            write_params("project-backup-raced/existing.txt", "after", true, &fence);
+        assert_eq!(raced_overwrite["ok"], false, "{raced_overwrite}");
+        assert_eq!(
+            raced_overwrite["code"], "single_writer_lease_conflict",
+            "{raced_overwrite}"
+        );
+        assert_text(&existing_raced, "before");
+        assert_eq!(
+            home.entries("project-backup-raced"),
+            1,
+            "neither temp nor orphan backup may survive a commit fence conflict"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_roots_parent_moved_outside_whitelisted_root_fails_closed() {
+        let home = Home::new("write-roots-move");
+        let fence = fence();
+        let allowed = home.path("allowed");
+        let nested = allowed.join("sub");
+        let escaped = home.path("escaped-in-home");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&escaped).unwrap();
+        let previous_roots = std::env::var_os("HERDR_MCP_WRITE_ROOTS");
+        unsafe { std::env::set_var("HERDR_MCP_WRITE_ROOTS", &allowed) };
+
+        let escaped_target = escaped.join("sub");
+        test_hooks::set_before_commit(Box::new(move |parent, _target| {
+            fs::rename(parent, &escaped_target).unwrap();
+        }));
+        let result = write_params("allowed/sub/new.txt", "hello", false, &fence);
+        unsafe {
+            match previous_roots {
+                Some(value) => std::env::set_var("HERDR_MCP_WRITE_ROOTS", value),
+                None => std::env::remove_var("HERDR_MCP_WRITE_ROOTS"),
+            }
+        }
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["reason"], "root_not_whitelisted", "{result}");
+        assert!(!escaped.join("sub/new.txt").exists());
+        assert_eq!(
+            fs::read_dir(escaped.join("sub")).unwrap().count(),
+            0,
+            "the temporary file must be removed when parent leaves HERDR_MCP_WRITE_ROOTS"
         );
     }
 }
