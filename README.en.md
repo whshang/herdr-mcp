@@ -59,7 +59,7 @@ herdr-mcp permissions setup
 herdr-mcp permissions verify
 ```
 
-Run setup only when status reports `needs_setup`, then authorize the broker in **System Settings → Privacy & Security → Full Disk Access**.
+Run setup only when status reports `needs_setup`, then authorize the broker in **System Settings → Privacy & Security → Full Disk Access**. A fixed broker revision can retain its existing file-access grant; Herdr TUI screen recording is a separate permission. If recording stops working after a Herdr update, see [macOS permission troubleshooting](docs/i18n/en/troubleshooting.md#macos-file-access-and-screen-recording-permissions).
 
 During the first ChatGPT OAuth connection, the approval page shows the exact local approval command and a six-digit verification code. Complete approval in your own terminal. Never paste Cloudflare tokens, device credentials, or other secrets into chat.
 
@@ -147,7 +147,7 @@ Cloudflare also provides the public MCP/OAuth endpoint, device routing, reconnec
 
 Another transport is a complete substitute only if it also provides a public HTTPS MCP endpoint reachable by ChatGPT, trusted TLS, authentication/OAuth, safe device routing, reliable reconnect behavior, and explicit mutation-delivery semantics.
 
-Private IPs and Tailscale-only addresses are not directly reachable from ChatGPT's cloud service. Raw port forwarding increases exposure. Cloudflare is the currently supported and qualified path.
+Private IPs and Tailscale-only addresses are not directly reachable from ChatGPT's cloud service. Raw port forwarding increases exposure. Cloudflare is the currently supported and qualified path. Direct LAN / Tailscale connections are not supported in 1.1 and are under evaluation for a later release, not an existing capability and not a committed scope; their design would have to address authentication, encryption, device identity and authorization, network exposure, and delivery semantics. ChatGPT cloud would still need a reachable public endpoint.
 
 ### Which Herdr does herdr-mcp support?
 
