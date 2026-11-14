@@ -1784,39 +1784,113 @@ impl PublicToolRoute {
 /// falling back to the TUI path.
 ///
 /// `admitted` is the backend this runtime process selected when it started and
-/// carried through `AppState`/`RuntimeContext` for the process lifetime. A
-/// request whose current env/config resolves to another backend or, while on
-/// `herdr-core`, another admitted socket fails closed with
-/// `invalid_runtime_backend` and requires a restart (#936). Without that check
-/// an already running TUI candidate would honour a later
-/// `runtime.backend = "herdr-core"` edit on its next request, although its
-/// state and background workers were only admitted for TUI. The comparison uses
-/// the single selection read that also feeds the route, so a concurrent config
-/// change cannot slip between the check and the dispatch.
+/// carried through `AppState`/`RuntimeContext` for the process lifetime; the
+/// drift comparison itself lives in [`verify_admitted_backend`] and is shared
+/// with the candidate transport entrypoint (#768). A request whose current
+/// env/config resolves to another backend or, while on `herdr-core`, another
+/// admitted socket fails closed with `invalid_runtime_backend` and requires a
+/// restart (#936).
 pub fn public_tool_route(
     tool_name: &str,
     admitted: &RuntimeBackendSelection,
 ) -> Result<PublicToolRoute, Value> {
-    let selection = resolve_process_backend_selection().map_err(|error| {
+    let selection = verify_admitted_backend(admitted).map_err(|error| {
         invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
     })?;
+    public_tool_route_for_selection(tool_name, &selection)
+}
+
+/// One admitted-backend comparison for every request path (#768).
+///
+/// Returns the live selection that still matches `admitted`, so callers route
+/// from the same read instead of resolving the config twice and letting a
+/// concurrent change slip between the check and the dispatch.
+///
+/// Without this check an already running TUI candidate would honour a later
+/// `runtime.backend = "herdr-core"` edit on its next request, although its
+/// state and background workers were only admitted for TUI (#936). The
+/// candidate transport entrypoint reads the pinned startup config instead; see
+/// [`verify_admitted_backend_config`].
+pub fn verify_admitted_backend(
+    admitted: &RuntimeBackendSelection,
+) -> Result<RuntimeBackendSelection, String> {
+    let selection = resolve_process_backend_selection()?;
+    admission_drift(admitted, &selection)?;
+    Ok(selection)
+}
+
+/// The admission inputs a runtime captured when it started (#768).
+///
+/// A running process cannot change its own environment, so the only live input
+/// that can drift is the config file this process actually started with.
+/// Pinning that path and the start-time overrides keeps every request-time check
+/// reading the same file, instead of a path that some later `HERDR_MCP_CONFIG_DIR`
+/// mutation redirected.
+#[derive(Debug, Clone)]
+pub struct AdmittedBackendConfig {
+    config_file: PathBuf,
+    instance: crate::instance::InstanceId,
+    env: EnvOverrides,
+}
+
+impl AdmittedBackendConfig {
+    pub fn capture(paths: &RuntimePaths) -> Result<Self, String> {
+        Ok(Self {
+            config_file: paths.config_file.clone(),
+            instance: paths.instance.clone(),
+            env: EnvOverrides::from_process()?,
+        })
+    }
+
+    /// Explicit inputs, used by test fixtures that pin their own config file so
+    /// an unrelated process-environment mutation cannot move it.
+    #[cfg(test)]
+    pub fn from_parts(
+        config_file: PathBuf,
+        instance: crate::instance::InstanceId,
+        env: EnvOverrides,
+    ) -> Self {
+        Self {
+            config_file,
+            instance,
+            env,
+        }
+    }
+}
+
+/// The same comparison as [`verify_admitted_backend`], read through the pinned
+/// startup config instead of the current process environment.
+///
+/// This is the check the candidate entrypoint applies before any handler runs,
+/// on both the loopback TCP router and the trusted Unix IPC router. An
+/// unreadable config, a failed path resolution or a changed selection all fail
+/// closed: a running runtime never re-admits a backend it did not start with.
+pub fn verify_admitted_backend_config(
+    admitted: &RuntimeBackendSelection,
+    config: &AdmittedBackendConfig,
+) -> Result<(), String> {
+    let selection =
+        resolve_backend_selection_from_path(&config.config_file, &config.instance, &config.env)?;
+    admission_drift(admitted, &selection)
+}
+
+fn admission_drift(
+    admitted: &RuntimeBackendSelection,
+    live: &RuntimeBackendSelection,
+) -> Result<(), String> {
     // A `tui` runtime never opens `herdr_core_socket`, so an unrelated socket
     // edit to a still-`tui` config is not a drift; only a `herdr-core` socket
     // change moves an execution target. The backend is always compared (#936).
-    let socket_drift = selection.backend == RuntimeBackend::HerdrCore
-        && selection.herdr_core_socket != admitted.herdr_core_socket;
-    if selection.backend != admitted.backend || socket_drift {
-        return Err(invalid_runtime_backend_tool_error(
-            tool_name,
-            &format!(
-                "runtime backend selection changed after startup (admitted '{}', now '{}'); restart the runtime to switch backends",
-                admitted.backend.as_str(),
-                selection.backend.as_str()
-            ),
-            "backend_selection",
+    let socket_drift = live.backend == RuntimeBackend::HerdrCore
+        && live.herdr_core_socket != admitted.herdr_core_socket;
+    if live.backend != admitted.backend || socket_drift {
+        return Err(format!(
+            "runtime backend selection changed after startup (admitted '{}', now '{}'); restart the runtime to switch backends",
+            admitted.backend.as_str(),
+            live.backend.as_str()
         ));
     }
-    public_tool_route_for_selection(tool_name, &selection)
+    Ok(())
 }
 
 fn public_tool_route_for_selection(
@@ -1987,10 +2061,14 @@ pub fn herdr_core_unsupported(operation: &str, required_capability: &str, messag
     })
 }
 
+/// Stable refusal code for a request that reached a runtime whose live backend
+/// selection no longer matches the selection it admitted at startup (#768).
+pub const INVALID_RUNTIME_BACKEND_CODE: &str = "invalid_runtime_backend";
+
 fn invalid_runtime_backend_tool_error(tool_name: &str, error: &str, phase: &str) -> Value {
     json!({
         "ok": false,
-        "code": "invalid_runtime_backend",
+        "code": json!(INVALID_RUNTIME_BACKEND_CODE),
         "operation": tool_name,
         "message": error,
         "fallback_allowed": false,
@@ -2366,12 +2444,31 @@ pub fn doctor_report_json(config: &Config) -> Value {
     match resolve_backend_selection(config) {
         Ok(selection) => {
             let mut base = selection.summary_json();
+            if let Some(object) = base.as_object_mut() {
+                // #768: doctor/status are standalone diagnostics with no
+                // process-bound admission, so they can only report the
+                // configured selection. A running candidate keeps the backend
+                // it admitted at startup and refuses drift with
+                // `invalid_runtime_backend`; refusing this diagnostic probe on
+                // that basis would need a new IPC surface and is not claimed.
+                object.insert(
+                    "selection_scope".to_owned(),
+                    json!("configured; a running runtime serves only the backend it admitted at startup and refuses drift with invalid_runtime_backend"),
+                );
+                object.insert("process_admission".to_owned(), json!("not_observed"));
+            }
             if selection.backend == RuntimeBackend::HerdrCore
                 && let Some(socket_path) = selection.herdr_core_socket.as_deref()
             {
+                // Read-only diagnostic probe of the configured socket; the
+                // client verifies the peer's effective uid before `hello`.
                 let session = HerdrCoreClient::new(socket_path).status_summary();
                 if let Some(obj) = base.as_object_mut() {
                     obj.insert("herdr_core_session".to_owned(), session);
+                    obj.insert(
+                        "herdr_core_session_scope".to_owned(),
+                        json!("live probe of the configured socket, not process admission"),
+                    );
                 }
             }
             base
@@ -2409,6 +2506,9 @@ fn connect_hc_socket(
 ) -> Result<HcSocketStream, HerdrCoreError> {
     let stream = std::os::unix::net::UnixStream::connect(socket_path)
         .map_err(|error| map_hc_io_error(error, socket_path))?;
+    // #768: the pinned path is not an identity. Verify the peer's OS
+    // credential before the first `hello` byte can be written.
+    verify_hc_peer_uid(&stream, socket_path)?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|error| map_hc_io_error(error, socket_path))?;
@@ -2416,6 +2516,143 @@ fn connect_hc_socket(
         .set_write_timeout(Some(timeout))
         .map_err(|error| map_hc_io_error(error, socket_path))?;
     Ok(stream)
+}
+
+/// OS-verified peer identity for one `herdr-core` Unix socket connection (#768).
+///
+/// `connect_hc_socket` only ever opened the configured path, so any process able
+/// to create or replace that pathname could answer `hello`, and the adapter has
+/// no expected `core.id` to compare against (`hello.core_id` is an advertised
+/// label, not a shared secret). The only credential the platform exposes to an
+/// unprivileged client is the peer's effective UID recorded on the connected
+/// socket, so require it to equal this process's effective UID and fail closed
+/// before the handshake when it is missing or different.
+///
+/// This is a same-user isolation check, not authentication: a process already
+/// running as this user can still impersonate `herdr-core`, and a long-term
+/// `core_id` binding remains open (#768).
+#[cfg(unix)]
+fn verify_hc_peer_uid(stream: &HcSocketStream, socket_path: &Path) -> Result<(), HerdrCoreError> {
+    let peer_uid = hc_peer_effective_uid(stream, socket_path)?;
+    ensure_hc_peer_uid(peer_uid, hc_current_effective_uid(), socket_path)
+}
+
+/// The comparison seam for [`verify_hc_peer_uid`].
+///
+/// A different-UID peer needs a second account and root to create, so the
+/// mismatch branch is exercised here directly instead of via a socket.
+#[cfg(unix)]
+fn ensure_hc_peer_uid(
+    peer_uid: libc::uid_t,
+    current_uid: libc::uid_t,
+    socket_path: &Path,
+) -> Result<(), HerdrCoreError> {
+    if peer_uid == current_uid {
+        return Ok(());
+    }
+    Err(HerdrCoreError {
+        code: "herdr_core_peer_uid_mismatch".to_owned(),
+        kind: Some("peer_uid_mismatch".to_owned()),
+        message: format!(
+            "herdr-core socket {} is served by effective uid {peer_uid}, not this process's effective uid {current_uid}; refusing to negotiate with an unverified peer",
+            socket_path.display()
+        ),
+    })
+}
+
+#[cfg(unix)]
+fn hc_current_effective_uid() -> libc::uid_t {
+    // `geteuid` has no failure mode.
+    unsafe { libc::geteuid() }
+}
+
+/// Read the peer's effective UID from the connected socket.
+///
+/// A missing or unsupported credential is a refusal, never an implicit pass.
+#[cfg(unix)]
+fn hc_peer_effective_uid(
+    stream: &HcSocketStream,
+    socket_path: &Path,
+) -> Result<libc::uid_t, HerdrCoreError> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+        if rc == 0 {
+            return Ok(uid);
+        }
+        Err(hc_peer_uid_unverified(
+            socket_path,
+            &std::io::Error::last_os_error(),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut credential = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credential.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 {
+            if !hc_peer_credential_is_complete(len) {
+                // A truncated `SO_PEERCRED` reply must never be read as a uid.
+                return Err(hc_peer_uid_unverified(
+                    socket_path,
+                    &std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "SO_PEERCRED returned {len} bytes, expected {}",
+                            std::mem::size_of::<libc::ucred>()
+                        ),
+                    ),
+                ));
+            }
+            // SAFETY: `getsockopt` succeeded and filled a complete `ucred`.
+            return Ok(unsafe { credential.assume_init() }.uid);
+        }
+        Err(hc_peer_uid_unverified(
+            socket_path,
+            &std::io::Error::last_os_error(),
+        ))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    Err(hc_peer_uid_unverified(
+        socket_path,
+        &std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no peer credential query on this platform",
+        ),
+    ))
+}
+
+/// A `SO_PEERCRED` reply shorter than `struct ucred` is not a credential.
+#[cfg(target_os = "linux")]
+fn hc_peer_credential_is_complete(len: libc::socklen_t) -> bool {
+    usize::try_from(len).is_ok_and(|len| len == std::mem::size_of::<libc::ucred>())
+}
+
+#[cfg(unix)]
+fn hc_peer_uid_unverified(socket_path: &Path, error: &std::io::Error) -> HerdrCoreError {
+    HerdrCoreError {
+        code: "herdr_core_peer_uid_unverified".to_owned(),
+        kind: Some("peer_uid_unverified".to_owned()),
+        message: format!(
+            "cannot verify the peer effective uid of herdr-core socket {}: {error}; refusing to negotiate with an unverified peer",
+            socket_path.display()
+        ),
+    }
 }
 
 #[cfg(not(unix))]
@@ -3195,6 +3432,66 @@ mod tests {
 
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
+    }
+
+    /// #768: the Core socket peer's OS credential, verified before `hello`.
+    #[cfg(unix)]
+    mod hc_peer_identity {
+        use super::*;
+        use std::os::unix::net::UnixListener;
+
+        static NEXT_PEER_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+        fn peer_socket_path(tag: &str) -> PathBuf {
+            std::env::temp_dir().join(format!(
+                "herdr-core-peer-{tag}-{}-{}.sock",
+                std::process::id(),
+                NEXT_PEER_SOCKET.fetch_add(1, Ordering::Relaxed)
+            ))
+        }
+
+        /// A same-UID listener is admitted, and the UID comes from the connected
+        /// socket rather than from the configured path.
+        #[test]
+        fn connects_to_a_same_uid_peer_with_the_uid_reported_by_the_socket() {
+            let socket = peer_socket_path("same-uid");
+            let _listener = UnixListener::bind(&socket).unwrap();
+            let stream = connect_hc_socket(&socket, Duration::from_millis(200)).unwrap();
+            assert_eq!(
+                hc_peer_effective_uid(&stream, &socket).unwrap(),
+                hc_current_effective_uid()
+            );
+            std::fs::remove_file(&socket).ok();
+        }
+
+        /// A truncated `SO_PEERCRED` reply is not a credential at all, so it is
+        /// refused before any uid (including 0) is read out of it.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn refuses_a_truncated_linux_peer_credential() {
+            let full = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            assert!(hc_peer_credential_is_complete(full));
+            assert!(!hc_peer_credential_is_complete(full - 1));
+            assert!(!hc_peer_credential_is_complete(0));
+        }
+
+        /// A peer running as another effective UID is refused with a stable code
+        /// instead of being negotiated with. The comparison is injected because
+        /// binding a socket as a second account needs root; the credential read
+        /// itself is covered by the test above.
+        #[test]
+        fn refuses_a_peer_with_another_effective_uid() {
+            let socket = PathBuf::from("/tmp/herdr-core-peer-foreign.sock");
+            let error = ensure_hc_peer_uid(
+                hc_current_effective_uid() + 1,
+                hc_current_effective_uid(),
+                &socket,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "herdr_core_peer_uid_mismatch");
+            assert_eq!(error.kind.as_deref(), Some("peer_uid_mismatch"));
+            assert!(error.message.contains(&socket.display().to_string()));
+        }
     }
 
     /// Typed `herdr-core` file/terminal primitives (#925) against a real Unix

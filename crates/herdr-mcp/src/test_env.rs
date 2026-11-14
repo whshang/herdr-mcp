@@ -35,6 +35,30 @@ pub(crate) fn admitted_backend_selection() -> crate::runtime_adapter::RuntimeBac
         .expect("test runtime backend selection")
 }
 
+/// #768: the admission inputs a default router fixture pins.
+///
+/// The fixture writes its own `tui` config under its temp root and pins that
+/// path, so a concurrent test's `HERDR_MCP_CONFIG_DIR` or backend mutation
+/// cannot redirect this router's drift check.
+pub(crate) fn pinned_tui_admission(root: &Path) -> crate::runtime_adapter::AdmittedBackendConfig {
+    let config_file = root.join("config.json");
+    std::fs::create_dir_all(root).expect("fixture config dir");
+    std::fs::write(&config_file, br#"{"runtime":{"backend":"tui"}}"#).expect("fixture config");
+    crate::runtime_adapter::AdmittedBackendConfig::from_parts(
+        config_file,
+        crate::instance::InstanceId::default_instance(),
+        crate::runtime_adapter::EnvOverrides::default(),
+    )
+}
+
+/// #768: the admission inputs for a test that deliberately adopts the backend
+/// its own env window selects. Call it while holding [`lock`].
+pub(crate) fn ambient_admission() -> crate::runtime_adapter::AdmittedBackendConfig {
+    let paths = crate::paths::RuntimePaths::discover().expect("test runtime paths");
+    crate::runtime_adapter::AdmittedBackendConfig::capture(&paths)
+        .expect("test admitted backend config")
+}
+
 /// Points process admission at a TUI config under `dir` until dropped.
 ///
 /// Direct `tools/call` tests pin [`tui_backend_selection`] and must resolve

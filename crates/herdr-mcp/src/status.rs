@@ -806,11 +806,14 @@ pub fn print_doctor(
     let runtime_backend_json = crate::runtime_adapter::doctor_report_json(config);
     let tui_backend_selected = runtime_backend_json["selected"].as_str() == Some("tui");
     println!(
-        "LAYER runtime-backend selected={} source={} fallback=disabled",
+        "LAYER runtime-backend selected={} source={} fallback=disabled scope=configured admission={}",
         runtime_backend_json["selected"]
             .as_str()
             .unwrap_or("invalid"),
-        runtime_backend_json["source"].as_str().unwrap_or("unknown")
+        runtime_backend_json["source"].as_str().unwrap_or("unknown"),
+        runtime_backend_json["process_admission"]
+            .as_str()
+            .unwrap_or("not_observed"),
     );
     if tui_backend_selected && herdr_core.present {
         println!("{}", crate::herdr_core::warning_line(&herdr_core, language));
