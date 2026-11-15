@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased (post-v1.1.1)
+
+- **Text transfer safety (#938; pending runtime release):** Unix `herdr_mcp.text.read` and `herdr_mcp.text.write` refuse files whose `nlink != 1` (`text_transfer_hardlink_denied`); this intentionally rejects legitimate hardlinked files **inside HOME** as well. Unix write publication now uses pinned directory descriptors, commit-time lease/root checks, no-replace rename, and exclusive private backups. Windows protection remains path-based and **does not provide equivalent hardlink or ancestor-swap protection**; physical Windows filesystem race testing is still outstanding. The Unix read path retains a conditional ancestor-replacement race (P2). These changes do **not** complete herdr-core isolation: #768 and #935 remain open. No tag, release, runtime upgrade, or deployment is included in this change.
+
 ## v1.1.1 — 2026-11-11
 
 - **1.1 首个批量维护版：** 集中合入并实机验证 10 项 1.1.x 修复（浏览器扩展 `0.1.243` → `0.1.248`；Runtime state schema 16、Execution epoch 5 / 18 tools、Public Edge epoch 8 / 19 actions 与 TCC broker revision 5 均不变）。修复包括：Fleet Worker `wrangler.prod.toml` `EDGE_VERSION` 对齐与已登记设备 `herdr-mcp worker update` 原地升级兼容（#891 / #893）；Claude 后台/锁屏回合 `message_canonical_digest` 对账收敛与残留自动化草稿自愈（#889 / #895）以及流式回复期间 `chat-input-stop` / 中英文停止控件 `browser_dispatch.stop` 识别（#901 / #902）；Grok 已打开标签页重载自动恢复注入、`/bot/<uuid>` 路由与 `combobox` 输入框适配（#886 / #896）；豆包技能栏/「AI 创作」生图入口与 TipTap 输入框适配（#887 / #897）；ChatGPT ProseMirror 裸 `https://` 链接比对归一化、新标签页 15s 加载栅栏超时错误码 `browser_page_load_timeout` 与限流双提交面诊断（#883 / #884 / #888 / #899）；陈旧 DEV Connector 路由清理、`page-assist` 派生 `*` 授权披露与孤儿授权行记账收敛、以及未改动 `extension/` 时 `doctor` 不再误报 `extension_stale`（#881 / #882 / #885 / #898）；附 v1.1.0 发布后全设备验收文档回填与勘误（#892 / #894）。升级说明、兼容性与剩余已知问题见 [docs/releases/v1.1.1.md](docs/releases/v1.1.1.md)。

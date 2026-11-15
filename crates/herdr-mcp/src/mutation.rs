@@ -62,6 +62,54 @@ pub fn check_global(action: &str) -> Result<(), Value> {
     check_global_with_policy(action, &MutationPolicy::from_env())
 }
 
+/// Apply explicitly configured write roots to an already-resolved text target.
+/// Relative roots resolve from process CWD; text targets resolve from HOME.
+/// Empty values are unrestricted; comma-only values are invalid, while empty
+/// entries alongside real roots are ignored for compatibility.
+/// This path-based check does not prevent concurrent filesystem path swaps.
+pub fn check_text_write_root(target: &Path) -> Result<(), Value> {
+    let roots = match env::var("HERDR_MCP_WRITE_ROOTS") {
+        Ok(roots) if roots.trim().is_empty() => return Ok(()),
+        Ok(roots) => roots,
+        Err(env::VarError::NotPresent) => return Ok(()),
+        Err(env::VarError::NotUnicode(_)) => return Err(invalid_text_write_roots()),
+    };
+    let mut configured = false;
+    let mut allowed = false;
+    for root in roots
+        .split(',')
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        configured = true;
+        let canonical =
+            fs::canonicalize(Path::new(root)).map_err(|_| invalid_text_write_roots())?;
+        if !canonical.is_dir() {
+            return Err(invalid_text_write_roots());
+        }
+        allowed |= fs_security::path_within(&canonical, target);
+    }
+    if !configured {
+        return Err(invalid_text_write_roots());
+    }
+    if !allowed {
+        return Err(json!({
+            "ok": false,
+            "reason": "root_not_whitelisted",
+            "hint": "target is outside HERDR_MCP_WRITE_ROOTS",
+        }));
+    }
+    Ok(())
+}
+
+fn invalid_text_write_roots() -> Value {
+    json!({
+        "ok": false,
+        "reason": "invalid_write_roots",
+        "hint": "HERDR_MCP_WRITE_ROOTS entries must resolve to existing directories",
+    })
+}
+
 fn check_global_with_policy(action: &str, policy: &MutationPolicy) -> Result<(), Value> {
     if policy.readonly {
         return Err(json!({
