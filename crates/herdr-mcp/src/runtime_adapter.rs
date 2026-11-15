@@ -2164,6 +2164,12 @@ pub fn herdr_core_methods(client: &HerdrCoreClient, query: &str) -> Value {
         "source": "herdr-core hello.methods (dynamically negotiated)",
         "local_method_source": "herdr_mcp_local_registry",
         "runtime_backend": "herdr-core",
+        "herdr_core": {
+            "core_id": hello.core_id,
+            "core_name": hello.core_name,
+            "protocol_generation": hello.generation,
+            "identity_scope": "hello on this connection; not an authenticated or pinned process identity",
+        },
     })
 }
 
@@ -3654,6 +3660,15 @@ mod tests {
                 |_, _| panic!("inventory must not call a backend method"),
             );
             let result = super::herdr_core_methods(&server.client(), "");
+            assert_eq!(result["herdr_core"]["core_id"], "core_mock");
+            assert_eq!(result["herdr_core"]["core_name"], "mock-host");
+            assert_eq!(result["herdr_core"]["protocol_generation"], 1);
+            assert!(
+                result["herdr_core"]["identity_scope"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not an authenticated")
+            );
             let methods = result["methods"].as_array().unwrap();
             for (name, expected) in [("server.status", true), ("file.read", false)] {
                 let entry = methods.iter().find(|item| item["method"] == name).unwrap();
