@@ -25,9 +25,10 @@ use crate::state_store::{
 use actuation::BrowserActuationBroker;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Query, State};
+use axum::extract::{Query, Request, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::stream;
@@ -243,6 +244,10 @@ struct AppState {
     /// must still resolve this selection or fail closed; the process is never
     /// re-admitted onto another backend.
     runtime_backend: crate::runtime_adapter::RuntimeBackendSelection,
+    /// #768: the config path and start-time overrides this process admitted, so
+    /// request-time drift checks read the file the runtime actually started
+    /// with rather than a later process-environment redirect.
+    admitted_config: crate::runtime_adapter::AdmittedBackendConfig,
 }
 
 pub fn serve_candidate(
@@ -257,6 +262,9 @@ pub fn serve_candidate(
                 .to_owned()
         })?;
     let paths = RuntimePaths::discover()?;
+    // #768: pin the admission inputs before anything can redirect the ambient
+    // environment; a failed capture refuses the whole candidate.
+    let admitted_config = crate::runtime_adapter::AdmittedBackendConfig::capture(&paths)?;
     let local_device_id =
         crate::config::Config::load_for_instance(&paths.config_file, &paths.instance)?
             .edge_device_id;
@@ -308,6 +316,7 @@ pub fn serve_candidate(
             browser_mutation_gate: Arc::new(RwLock::new(())),
             browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
             runtime_backend,
+            admitted_config,
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -407,7 +416,63 @@ fn candidate_router(state: AppState) -> Router {
             post(post_extension_continuity_resolve),
         )
         .route("/health", get(health))
+        // #768: one shared admission check for every candidate request, on both
+        // the loopback TCP router and the trusted Unix IPC router. Handlers keep
+        // their own bearer/trusted-IPC checks; this only restores the #936 rule
+        // that a running candidate never serves a backend it did not admit.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admitted_backend_gate,
+        ))
         .with_state(state)
+}
+
+/// Fail closed on every candidate request whose pinned startup config no longer
+/// admits the backend this process started with (#768, #936).
+///
+/// `tools/call` keeps its own route-level check for the structured JSON-RPC
+/// refusal; this layer covers the transports and routes that never reach a
+/// public tool: direct HTTP, the trusted Unix IPC surface, browser
+/// control/actuation publication, `GET /health`, and every SSE stream at
+/// connection time. The read is one small config file this process already
+/// owns, applied to the same resolver `tools/call` uses for admission.
+async fn admitted_backend_gate(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match crate::runtime_adapter::verify_admitted_backend_config(
+        &state.runtime_backend,
+        &state.admitted_config,
+    ) {
+        Ok(()) => next.run(request).await,
+        Err(message) => admitted_backend_refusal(request.uri().path(), &state, &message),
+    }
+}
+
+fn admitted_backend_refusal(path: &str, state: &AppState, message: &str) -> Response {
+    // A readiness probe must not read as ready while the process it probes no
+    // longer matches what it admitted at startup.
+    let status = if path == "/health" {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::CONFLICT
+    };
+    json_response(
+        status,
+        &json!({
+            "ok": false,
+            "code": crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE,
+            "operation": "candidate_transport",
+            "path": path,
+            "message": message,
+            "admitted_runtime_backend": state.runtime_backend.summary_json(),
+            "fallback_allowed": false,
+            "retryable": false,
+            "delivery_state": "not_delivered",
+            "failure_phase": "backend_selection",
+        }),
+    )
 }
 
 fn valid_extension_task_ref(value: &str) -> bool {
@@ -1871,6 +1936,11 @@ struct PushStreamState {
     filters: PushFilters,
     statuses: HashMap<String, String>,
     first: bool,
+    /// #768: set once this stream discovered a backend drift; the next poll ends
+    /// it instead of continuing to publish on an unadmitted backend.
+    fenced: bool,
+    admitted: crate::runtime_adapter::RuntimeBackendSelection,
+    admitted_config: crate::runtime_adapter::AdmittedBackendConfig,
     last_heartbeat: Instant,
     browser_actuation: BrowserActuationBroker,
     trusted_extension_ipc: bool,
@@ -2041,6 +2111,7 @@ async fn push_events(
         state.trusted_extension_ipc,
         browser_endpoint_ref,
         endpoint_registered,
+        (state.runtime_backend, state.admitted_config),
     )
 }
 
@@ -2144,7 +2215,12 @@ fn push_events_response(
     trusted_extension_ipc: bool,
     browser_endpoint_ref: Option<String>,
     endpoint_registered: bool,
+    admission: (
+        crate::runtime_adapter::RuntimeBackendSelection,
+        crate::runtime_adapter::AdmittedBackendConfig,
+    ),
 ) -> Response {
+    let (admitted, admitted_config) = admission;
     // Subscribe before reading the initial digest so an event racing this setup
     // cannot be missed. At worst an already-included event causes one harmless
     // immediate no-op wake on the first loop iteration.
@@ -2186,6 +2262,9 @@ fn push_events_response(
         filters,
         statuses,
         first: true,
+        fenced: false,
+        admitted,
+        admitted_config,
         last_heartbeat: Instant::now(),
         browser_actuation,
         trusted_extension_ipc,
@@ -2195,6 +2274,12 @@ fn push_events_response(
         opened_at,
     };
     let events = stream::unfold(state, |mut state| async move {
+        // The `hello` frame is admitted by the router entrypoint. Every later
+        // frame re-checks admission after its wake (see the loop below), so a
+        // drifted runtime is fenced here once and then ends the stream.
+        if state.fenced {
+            return None;
+        }
         if state.first {
             state.first = false;
             if state.trusted_extension_ipc && state.should_count_extension_poll() {
@@ -2259,6 +2344,26 @@ fn push_events_response(
                     }
                 }
                 _ = tokio::time::sleep(heartbeat_wait) => {}
+            }
+            // #768: the wait above can span a config change, and the wake may be
+            // a queued browser command. Re-check admission after every wake,
+            // before reading the digest, the pane view or the command queue, so
+            // a drifted runtime publishes neither actuation nor pane state. This
+            // is one small config-file read per wake/heartbeat (at most one per
+            // 15 s while idle), the same read the request entrypoint performs.
+            if let Err(message) = crate::runtime_adapter::verify_admitted_backend_config(
+                &state.admitted,
+                &state.admitted_config,
+            ) {
+                state.fenced = true;
+                let code = crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE;
+                return Some((
+                    Ok::<Bytes, Infallible>(Bytes::from(sse_event(
+                        "error",
+                        &json!({"ok": false, "code": code, "message": message}),
+                    ))),
+                    state,
+                ));
             }
             let digest = state.cache.digest_since(state.cursor);
             state.cursor = digest.cursor;
@@ -3938,7 +4043,15 @@ mod tests {
             browser_mutation_gate: Arc::new(RwLock::new(())),
             browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
             runtime_backend: crate::test_env::tui_backend_selection(),
+            admitted_config: crate::test_env::pinned_tui_admission(root),
         }
+    }
+
+    /// #768: model a candidate that admitted the backend its test env window
+    /// selects, re-pinning both halves of the admission together.
+    fn adopt_env_admitted_backend(state: &mut AppState) {
+        state.runtime_backend = crate::test_env::admitted_backend_selection();
+        state.admitted_config = crate::test_env::ambient_admission();
     }
 
     /// Serves the herdr-core line protocol for the narrow execution routes
@@ -4231,7 +4344,7 @@ mod tests {
                 &root.join("tcp"),
                 json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
             );
-            state.runtime_backend = crate::test_env::admitted_backend_selection();
+            adopt_env_admitted_backend(&mut state);
             let app = candidate_router(state);
             runtime.block_on(async {
                 let inspected = call_public_tool(&app, "herdr_inspect", json!({})).await;
@@ -4348,7 +4461,7 @@ mod tests {
         );
         state.client = HerdrClient::new(&tui_socket);
         // #936: this probe starts on the `herdr-core` config written above.
-        state.runtime_backend = crate::test_env::admitted_backend_selection();
+        adopt_env_admitted_backend(&mut state);
         let app = candidate_router(state);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4548,7 +4661,7 @@ mod tests {
         // #936: this router admits the `herdr-core` selection configured above,
         // exactly like a candidate that started with that config.
         let mut state = test_state_with_snapshot(&root.join("tcp-core"), snapshot.clone());
-        state.runtime_backend = crate::test_env::admitted_backend_selection();
+        adopt_env_admitted_backend(&mut state);
         let app = candidate_router(state);
 
         // 1. Explicit herdr-core must not execute herdr_fs_list through the TUI snapshot.
@@ -4727,7 +4840,7 @@ mod tests {
             &root.join("tcp"),
             json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
         );
-        state.runtime_backend = crate::test_env::admitted_backend_selection();
+        adopt_env_admitted_backend(&mut state);
         let app = candidate_router(state);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6357,6 +6470,11 @@ mod tests {
             filters: PushFilters::default(),
             statuses: HashMap::new(),
             first: false,
+            fenced: false,
+            admitted: crate::test_env::tui_backend_selection(),
+            admitted_config: crate::test_env::pinned_tui_admission(
+                &std::env::temp_dir().join(format!("herdr-push-pin-{}", std::process::id())),
+            ),
             last_heartbeat: Instant::now(),
             browser_actuation,
             trusted_extension_ipc: false,
@@ -12238,5 +12356,274 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_file(socket);
+    }
+
+    /// #768: after startup, one in-process config change must stop every
+    /// candidate entrypoint before its handler runs, on both transports.
+    ///
+    /// Each probe sends a body its handler would reject with 400, so a 409 is
+    /// proof that the shared router gate refused the request first. The
+    /// admitted selection is `tui`; the drift selects `herdr-core`. The drift is
+    /// written to the config file each router pinned at construction, so the
+    /// test needs no process-global environment mutation.
+    #[cfg(unix)]
+    #[test]
+    fn candidate_transports_fail_closed_after_startup_backend_drift() {
+        let root = test_root("candidate-backend-drift");
+        let tcp_root = root.join("tcp");
+        let ipc_root = root.join("ipc");
+        let snapshot = json!({"workspaces": [], "panes": [], "agents": [], "tabs": []});
+        let tcp = candidate_router(test_state_with_snapshot(&tcp_root, snapshot.clone()));
+        let mut extension_state = test_state_with_snapshot(&ipc_root, snapshot);
+        extension_state.trusted_extension_ipc = true;
+        let ipc = candidate_router(extension_state);
+        let tcp_config = tcp_root.join("config.json");
+        let ipc_config = ipc_root.join("config.json");
+        let core_config =
+            br#"{"runtime":{"backend":"herdr-core","herdr_core_socket":"/tmp/herdr-core-drift-probe.sock"}}"#;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let malformed = |path: &str, bearer: bool| {
+                let mut builder = Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json");
+                if bearer {
+                    builder = builder.header(AUTHORIZATION, "Bearer test-token");
+                }
+                builder.body(Body::from("{not-json")).unwrap()
+            };
+
+            // Baseline: every route reaches its handler while the pinned config
+            // still matches the admitted selection.
+            let health = tcp
+                .clone()
+                .oneshot(rpc_request(Method::GET, "/health", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::OK);
+            let events = tcp
+                .clone()
+                .oneshot(rpc_request(Method::GET, "/push/events", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(events.status(), StatusCode::OK);
+            assert_eq!(
+                tcp.clone()
+                    .oneshot(malformed("/mcp", true))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                ipc.clone()
+                    .oneshot(malformed("/extension/control/action", false))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                ipc.clone()
+                    .oneshot(malformed("/extension/browser/actuation", false))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        });
+
+        // The operator edits the runtime backend while the process keeps running.
+        std::fs::write(&tcp_config, core_config).unwrap();
+        std::fs::write(&ipc_config, core_config).unwrap();
+
+        runtime.block_on(async {
+            let malformed = |path: &str, bearer: bool| {
+                let mut builder = Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json");
+                if bearer {
+                    builder = builder.header(AUTHORIZATION, "Bearer test-token");
+                }
+                builder.body(Body::from("{not-json")).unwrap()
+            };
+
+            // `/health` is the readiness probe: not ready, never `ok: true`.
+            let health = tcp
+                .clone()
+                .oneshot(rpc_request(Method::GET, "/health", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = health.into_body().collect().await.unwrap().to_bytes();
+            let health: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(health["ok"], false, "{health}");
+            assert_eq!(
+                health["code"],
+                crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE,
+                "{health}"
+            );
+            assert!(
+                health["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("restart the runtime"),
+                "{health}"
+            );
+
+            // Direct HTTP MCP, SSE, trusted-IPC browser control and actuation
+            // are all refused at the entrypoint on the same drift.
+            for (label, response) in [
+                (
+                    "mcp",
+                    tcp.clone().oneshot(malformed("/mcp", true)).await.unwrap(),
+                ),
+                (
+                    "sse",
+                    tcp.clone()
+                        .oneshot(rpc_request(Method::GET, "/push/events", None, &[]))
+                        .await
+                        .unwrap(),
+                ),
+                (
+                    "control",
+                    ipc.clone()
+                        .oneshot(malformed("/extension/control/action", false))
+                        .await
+                        .unwrap(),
+                ),
+                (
+                    "actuation",
+                    ipc.clone()
+                        .oneshot(malformed("/extension/browser/actuation", false))
+                        .await
+                        .unwrap(),
+                ),
+            ] {
+                assert_eq!(response.status(), StatusCode::CONFLICT, "{label}");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let payload: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(payload["ok"], false, "{label}: {payload}");
+                assert_eq!(payload["retryable"], false, "{label}: {payload}");
+                assert_eq!(
+                    payload["delivery_state"], "not_delivered",
+                    "{label}: {payload}"
+                );
+                assert_eq!(
+                    payload["code"],
+                    crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE,
+                    "{label}: {payload}"
+                );
+                assert!(
+                    payload["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("restart the runtime"),
+                    "{label}: {payload}"
+                );
+            }
+        });
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// #768: a browser command queued while an SSE stream is already open must
+    /// not escape after the runtime's pinned config switches backends.
+    ///
+    /// The stream is opened before the drift, so only the post-wake check can
+    /// fence it. A real broker command wakes the stream from its `select!`; a
+    /// regression that publishes on wake delivers `browser_actuation` instead of
+    /// the `invalid_runtime_backend` fence.
+    #[cfg(unix)]
+    #[test]
+    fn open_push_stream_never_delivers_a_queued_browser_command_after_drift() {
+        use futures_util::StreamExt;
+
+        let root = test_root("push-stream-backend-drift");
+        let config_file = root.join("config.json");
+        let mut state = test_state_with_snapshot(
+            &root,
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        // A real cache keeps its cursor watch sender alive, so the stream stays
+        // open after the `hello` frame instead of ending on a dropped sender.
+        state.cache = Arc::new(EventCache::start(HerdrClient::new(
+            root.join("missing-herdr.sock"),
+        )));
+        state.client = HerdrClient::new(root.join("missing-herdr.sock"));
+        state.trusted_extension_ipc = true;
+        let broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+        broker.note_extension_poll(None);
+        state.browser_actuation = broker.clone();
+        let app = candidate_router(state);
+        let core_config =
+            br#"{"runtime":{"backend":"herdr-core","herdr_core_socket":"/tmp/herdr-core-stream-drift.sock"}}"#;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = app
+                .oneshot(rpc_request(Method::GET, "/push/events", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            let hello = tokio::time::timeout(Duration::from_secs(2), body.next())
+                .await
+                .expect("hello frame arrived")
+                .expect("stream is live")
+                .expect("hello frame bytes");
+            assert!(
+                String::from_utf8_lossy(&hello).contains("event: hello"),
+                "stream must open healthy"
+            );
+
+            // The operator edits the backend while this stream stays open, then a
+            // real browser command wakes the stream from its `select!`.
+            std::fs::write(&config_file, core_config).unwrap();
+            let dispatch = {
+                let broker = broker.clone();
+                std::thread::spawn(move || {
+                    broker.actuate("herdr_mcp.browser_dispatch", &json!({}), 1, None)
+                })
+            };
+
+            let next = tokio::time::timeout(Duration::from_secs(2), body.next())
+                .await
+                .expect("fenced frame arrived")
+                .expect("stream is still live")
+                .expect("fenced frame bytes");
+            let next = String::from_utf8_lossy(&next).into_owned();
+            assert!(next.contains("event: error"), "{next}");
+            assert!(
+                next.contains(crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE),
+                "{next}"
+            );
+            assert!(!next.contains("browser_actuation"), "{next}");
+            assert!(!next.contains("pane_upsert"), "{next}");
+
+            // The fence is terminal: the extension must reconnect, and that
+            // reconnect is refused by the entrypoint gate.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), body.next())
+                    .await
+                    .expect("stream end observed")
+                    .is_none(),
+                "a drifted stream must end instead of continuing"
+            );
+            dispatch.join().unwrap().unwrap();
+        });
+        std::fs::remove_dir_all(root).ok();
     }
 }
