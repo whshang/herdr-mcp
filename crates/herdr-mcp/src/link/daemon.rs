@@ -68,10 +68,15 @@ pub fn is_runtime_rollback_compatible(epoch: u64, hash: &str) -> bool {
 }
 
 const DAEMON_TRANSPORT_PING_MS: i64 = 30_000;
-// Transport liveness is covered by RFC WebSocket ping/pong. Keep the
-// application heartbeat aligned with the Edge recovery-checkpoint cadence so
-// an idle Link does not wake the hibernated workstation DO every minute.
-const DAEMON_HEARTBEAT_MS: i64 = 300_000;
+// Application heartbeat cadence. RFC WebSocket ping/pong is not available on
+// Cloudflare Workers WebSockets, so only application traffic refreshes
+// `last_edge_seen_ms`; the heartbeat must therefore stay well inside
+// DAEMON_MAX_SILENCE_MS or the watchdog recycles an otherwise-healthy socket
+// every silence window. Edge replies with a hello_ack-style status frame on
+// heartbeat (EDGE_STATUS_REPLY_INTERVAL_MS = 30s), so a 30s heartbeat both
+// feeds the watchdog and keeps the reply traffic at exactly one frame per
+// heartbeat. Parity with the Node default (LINK_DEFAULT_HEARTBEAT_MS = 30s).
+const DAEMON_HEARTBEAT_MS: i64 = 30_000;
 const DAEMON_MAX_SILENCE_MS: i64 = 90_000;
 const DAEMON_REQUEST_TIMEOUT_MS: u64 = 60_000;
 const DAEMON_DRAIN_MS: u64 = 5_000;
