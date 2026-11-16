@@ -645,6 +645,23 @@ impl HerdrCoreClient {
                 "delivery_state": "not_delivered",
             })
         })?;
+        if hello
+            .core_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+            || hello.version == "unknown"
+            || hello.version.trim().is_empty()
+        {
+            return Err(json!({
+                "ok": false,
+                "code": "herdr_core_identity_unavailable",
+                "message": "public herdr-core requests require a non-empty hello core.id and version",
+                "runtime_backend": self.backend().as_str(),
+                "fallback_allowed": false,
+                "retryable": false,
+                "delivery_state": "not_delivered",
+            }));
+        }
         RuntimeCapabilities::from_herdr_core_methods(&hello.methods)
             .check_public_tool(tool_name)?;
         self.admitted_hello = Some(hello);
@@ -2460,6 +2477,8 @@ pub fn inspect_herdr_core_with_client(
             "message": error.message,
             "runtime_backend": selection.summary_json(),
             "fallback_allowed": false,
+            "retryable": false,
+            "delivery_state": "not_delivered",
             "context": "herdr_inspect",
             "failure_phase": "herdr_core_handshake",
         }),
@@ -3565,6 +3584,10 @@ mod tests {
             framed: bool,
             /// Answer with `request_id + offset` to exercise id verification.
             reply_id_offset: u64,
+            /// Simulate a Core which omits the identity needed for public admission.
+            omit_core_id: bool,
+            /// Simulate a malformed but syntactically valid hello result.
+            omit_hello_methods: bool,
         }
 
         struct MockHcServer {
@@ -3624,18 +3647,21 @@ mod tests {
                             let envelope = if method == "hello" {
                                 assert_eq!(params["generation"], HERDR_CORE_PROTOCOL_GENERATION);
                                 assert_eq!(params["framed"], false);
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "result": {
-                                        "generation": HERDR_CORE_PROTOCOL_GENERATION,
-                                        "version": "0.1.20",
-                                        "core": { "id": "core_mock", "name": "mock-host" },
-                                        "framed": options.framed,
-                                        "methods": methods,
-                                        "features": []
-                                    }
-                                })
+                                let mut result = json!({
+                                    "generation": HERDR_CORE_PROTOCOL_GENERATION,
+                                    "version": "0.1.20",
+                                    "core": { "id": "core_mock", "name": "mock-host" },
+                                    "framed": options.framed,
+                                    "methods": methods,
+                                    "features": []
+                                });
+                                if options.omit_core_id {
+                                    result["core"].as_object_mut().unwrap().remove("id");
+                                }
+                                if options.omit_hello_methods {
+                                    result.as_object_mut().unwrap().remove("methods");
+                                }
+                                json!({ "jsonrpc": "2.0", "id": id, "result": result })
                             } else {
                                 assert_eq!(
                                     request_id.as_u64().unwrap() + options.reply_id_offset,
@@ -3722,35 +3748,133 @@ mod tests {
         }
 
         #[test]
-        fn public_core_route_rejects_hello_identity_drift_before_forwarding() {
+        fn public_core_route_preserves_stable_identity_on_read_only_calls() {
             let seen = recorder();
             let server = MockHcServer::start(
-                "identity-drift",
-                3,
+                "identity-stable",
+                4,
                 &["hello", "server.status"],
                 seen.clone(),
-                |_, _| panic!("identity drift must refuse before forwarding"),
+                |method, _| {
+                    assert_eq!(method, "server.status");
+                    Ok(json!({ "live": 1, "finished": 0 }))
+                },
             );
             let mut client = server.client();
             client.admit_public_tool("herdr_methods").unwrap();
-            // Simulate a replacement Core reporting a new id on the next connection.
-            client.admitted_hello.as_mut().unwrap().core_id = Some("previous_core".to_owned());
-            let result = super::herdr_core_call(&client, "server.status", json!({}));
-            assert_eq!(result["code"], "herdr_core_identity_changed");
-            assert_eq!(result["delivery_state"], "not_delivered");
-            assert_eq!(result["retryable"], false);
-            assert_eq!(result["fallback_allowed"], false);
-
+            assert_eq!(super::herdr_core_methods(&client, "")["ok"], true);
+            let status = super::herdr_core_call(&client, "server.status", json!({}));
+            assert_eq!(status["ok"], true);
+            assert_eq!(status["result"]["live"], 1);
             let selection = RuntimeBackendSelection {
                 backend: RuntimeBackend::HerdrCore,
                 source: "test",
                 herdr_core_socket: Some(server.socket_path.clone()),
             };
             let inspect = super::inspect_herdr_core_with_client(&selection, &client);
-            assert_eq!(inspect["code"], "herdr_core_identity_changed");
-            assert_eq!(inspect["fallback_allowed"], false);
-            assert!(recorded(&seen, "server.status").is_empty());
+            assert_eq!(inspect["ok"], true);
+            assert_eq!(inspect["herdr_core"]["core_id"], "core_mock");
+            assert_eq!(recorded(&seen, "server.status").len(), 2);
             server.finish();
+        }
+
+        #[test]
+        fn public_core_route_rejects_hello_identity_drift_before_forwarding() {
+            for changed_field in ["protocol_generation", "version", "core_id"] {
+                let seen = recorder();
+                let server = MockHcServer::start(
+                    changed_field,
+                    4,
+                    &["hello", "server.status"],
+                    seen.clone(),
+                    |_, _| panic!("identity drift must refuse before forwarding"),
+                );
+                let mut client = server.client();
+                client.admit_public_tool("herdr_methods").unwrap();
+                let admitted = client.admitted_hello.as_mut().unwrap();
+                match changed_field {
+                    "protocol_generation" => admitted.generation += 1,
+                    "version" => admitted.version.push_str("-previous"),
+                    "core_id" => admitted.core_id = Some("previous_core".to_owned()),
+                    _ => unreachable!(),
+                }
+
+                let result = super::herdr_core_call(&client, "server.status", json!({}));
+                assert_eq!(
+                    result["code"], "herdr_core_identity_changed",
+                    "{changed_field}"
+                );
+                assert_eq!(result["delivery_state"], "not_delivered", "{changed_field}");
+                assert_eq!(result["retryable"], false);
+                assert_eq!(result["fallback_allowed"], false);
+
+                let methods = super::herdr_core_methods(&client, "");
+                assert_eq!(
+                    methods["code"], "herdr_core_identity_changed",
+                    "{changed_field}"
+                );
+                assert_eq!(methods["delivery_state"], "not_delivered");
+                let selection = RuntimeBackendSelection {
+                    backend: RuntimeBackend::HerdrCore,
+                    source: "test",
+                    herdr_core_socket: Some(server.socket_path.clone()),
+                };
+                let inspect = super::inspect_herdr_core_with_client(&selection, &client);
+                assert_eq!(
+                    inspect["code"], "herdr_core_identity_changed",
+                    "{changed_field}"
+                );
+                assert_eq!(inspect["fallback_allowed"], false);
+                assert_eq!(inspect["delivery_state"], "not_delivered");
+                assert_eq!(inspect["retryable"], false);
+                assert!(recorded(&seen, "server.status").is_empty());
+                server.finish();
+            }
+        }
+
+        #[test]
+        fn public_core_admission_refuses_missing_or_invalid_handshake() {
+            let mut unreachable = HerdrCoreClient::new(absent_socket_path("identity-admission"));
+            let missing = unreachable.admit_public_tool("herdr_methods").unwrap_err();
+            assert_eq!(missing["code"], "herdr_core_unreachable");
+            assert_eq!(missing["delivery_state"], "not_delivered");
+            assert_eq!(missing["fallback_allowed"], false);
+
+            for (tag, options, expected_code) in [
+                (
+                    "no-core-id",
+                    MockHcOptions {
+                        omit_core_id: true,
+                        ..MockHcOptions::default()
+                    },
+                    "herdr_core_identity_unavailable",
+                ),
+                (
+                    "bad-hello",
+                    MockHcOptions {
+                        omit_hello_methods: true,
+                        ..MockHcOptions::default()
+                    },
+                    "parse_error",
+                ),
+            ] {
+                let seen = recorder();
+                let server = MockHcServer::start_with(
+                    options,
+                    tag,
+                    1,
+                    &["hello", "server.status"],
+                    seen.clone(),
+                    |_, _| panic!("an invalid handshake must not forward"),
+                );
+                let mut client = server.client();
+                let error = client.admit_public_tool("herdr_methods").unwrap_err();
+                assert_eq!(error["code"], expected_code, "{tag}");
+                assert_eq!(error["delivery_state"], "not_delivered", "{tag}");
+                assert_eq!(error["fallback_allowed"], false);
+                assert!(recorded(&seen, "server.status").is_empty());
+                server.finish();
+            }
         }
 
         #[test]

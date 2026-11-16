@@ -2230,6 +2230,11 @@ fn workstation_preflight_call(
         selection,
         core_client,
     );
+    if selection.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore
+        && inspect_view.get("ok").and_then(Value::as_bool) == Some(false)
+    {
+        return inspect_view;
+    }
     let browser_endpoints = if endpoint_limit == 0 {
         json!([])
     } else {
@@ -27755,6 +27760,24 @@ mod tests {
             workstation_preflight_call(&context, &json!({"endpoint_limit": 99}), &selection, None);
         assert_eq!(bad["ok"], false);
         assert_eq!(bad["code"], "invalid_params");
+
+        let core_socket = temp_root.join("missing-core.sock");
+        let core_selection = crate::runtime_adapter::RuntimeBackendSelection {
+            backend: crate::runtime_adapter::RuntimeBackend::HerdrCore,
+            source: "test",
+            herdr_core_socket: Some(core_socket.clone()),
+        };
+        let core_client = crate::runtime_adapter::HerdrCoreClient::new(core_socket);
+        let missing_core = workstation_preflight_call(
+            &context,
+            &json!({"endpoint_limit": 0}),
+            &core_selection,
+            Some(&core_client),
+        );
+        assert_eq!(missing_core["ok"], false);
+        assert_eq!(missing_core["code"], "herdr_core_unreachable");
+        assert_eq!(missing_core["delivery_state"], "not_delivered");
+        assert_eq!(missing_core["fallback_allowed"], false);
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 
