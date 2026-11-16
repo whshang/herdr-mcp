@@ -1912,10 +1912,23 @@ pub fn public_tool_route(
     admitted: &RuntimeBackendSelection,
     expected_target: Option<&Value>,
 ) -> Result<PublicToolRoute, Value> {
-    let selection = verify_admitted_backend(admitted).map_err(|error| {
-        invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
-    })?;
-    public_tool_route_for_selection(tool_name, &selection, expected_target)
+    // 1.2 S0: this admission is the `connect` phase of the request envelope.
+    // For `herdr-core` it covers the socket connect, peer-UID check and hello;
+    // for `tui` it is the local admission only (typically sub-millisecond).
+    let admission_started = std::time::Instant::now();
+    let result = (|| {
+        let selection = verify_admitted_backend(admitted).map_err(|error| {
+            invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
+        })?;
+        public_tool_route_for_selection(tool_name, &selection, expected_target)
+    })();
+    crate::observability::add_connect_ms(
+        admission_started
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64,
+    );
+    result
 }
 
 /// One admitted-backend comparison for every request path (#768).

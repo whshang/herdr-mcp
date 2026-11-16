@@ -385,6 +385,11 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
             kind.as_str()
         ));
     }
+    // 1.2 S0: publish transport telemetry next to runtime-control.json.
+    let telemetry_path = config
+        .runtime_control_path
+        .parent()
+        .map(|dir| dir.join(super::telemetry::TELEMETRY_FILE));
     let io_config = LinkIoConfig {
         edge_url,
         application_protocol: LINK_SUBPROTOCOL.to_owned(),
@@ -396,6 +401,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
         now_ms: Arc::new(system_now_ms),
         rng_sample: Arc::new(system_rng_sample),
         ladder: Some(ladder),
+        telemetry_path,
     };
     let io = LinkIoLoop::production(io_config, transport, runner);
 
@@ -890,6 +896,7 @@ mod tests {
                 now_ms: Arc::new(|| 0),
                 rng_sample: Arc::new(|| 0.0),
                 ladder: None,
+                telemetry_path: None,
             },
             transport,
             runner,

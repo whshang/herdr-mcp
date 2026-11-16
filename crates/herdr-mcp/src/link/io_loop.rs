@@ -47,6 +47,9 @@ pub(crate) struct LinkIoConfig {
     pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
     pub rng_sample: Arc<dyn Fn() -> f64 + Send + Sync>,
     pub ladder: Option<TransportLadder>,
+    /// 1.2 S0: where the daemon publishes transport telemetry. `None` in tests
+    /// and any caller that does not own a config dir.
+    pub telemetry_path: Option<std::path::PathBuf>,
 }
 
 impl LinkIoConfig {
@@ -62,6 +65,7 @@ impl LinkIoConfig {
             now_ms: Arc::new(system_now_ms),
             rng_sample: Arc::new(system_rng_sample),
             ladder: None,
+            telemetry_path: None,
         }
     }
 }
@@ -235,6 +239,9 @@ where
     drain_timer: Option<JoinHandle<()>>,
     ladder: TransportLadder,
     attempt_pre_online: bool,
+    // 1.2 S0: transport telemetry published for `link status` / `doctor`.
+    telemetry: crate::link::telemetry::LinkTransportTelemetry,
+    telemetry_path: Option<std::path::PathBuf>,
     stopping: bool,
     draining: bool,
 }
@@ -274,11 +281,14 @@ where
                 .expect("single route ladder is valid")
         });
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let telemetry_path = config.telemetry_path.clone();
         Self {
             config,
             core,
             runner,
             connector,
+            telemetry: crate::link::telemetry::LinkTransportTelemetry::default(),
+            telemetry_path,
             socket: None,
             connect_attempt: None,
             connect_task: None,
@@ -366,6 +376,16 @@ where
 
     fn now_ms(&self) -> i64 {
         (self.config.now_ms)()
+    }
+
+    /// 1.2 S0: publish the current transport counters. Publication is
+    /// best-effort: a status-file write failure must never disturb the
+    /// transport loop.
+    fn publish_telemetry(&self) {
+        let Some(path) = self.telemetry_path.as_deref() else {
+            return;
+        };
+        let _ = crate::link::telemetry::publish(path, &self.telemetry, self.now_ms());
     }
 
     fn rng_sample(&self) -> f64 {
@@ -663,6 +683,9 @@ where
                         self.attempt_pre_online = false;
                         self.ladder.record_failure();
                     }
+                    // 1.2 S0: a retry is pending; the counters stay monotonic.
+                    self.telemetry.record_connecting();
+                    self.publish_telemetry();
                     if !self.stopping {
                         self.arm_reconnect(schedule);
                     }
@@ -697,6 +720,9 @@ where
                     self.attempt_pre_online = false;
                     self.cancel_offline_recycle();
                     self.ladder.record_success();
+                    // 1.2 S0: count one reconnect per completed outage.
+                    self.telemetry.record_online(self.now_ms());
+                    self.publish_telemetry();
                     if self.ladder.current_route().kind == TransportRouteKind::SharedRelay {
                         self.arm_direct_recovery();
                     } else {
@@ -706,12 +732,17 @@ where
                 TransportAction::Disconnected { .. } => {
                     self.attempt_pre_online = false;
                     self.cancel_direct_recovery();
+                    self.telemetry.record_disconnected(self.now_ms());
+                    self.publish_telemetry();
                     self.arm_offline_recycle();
                 }
                 TransportAction::HeartbeatDue { .. } | TransportAction::Inbound { .. } => {
                     unreachable!("runner routes higher-layer transport actions before the I/O pump")
                 }
                 TransportAction::Exit(kind) => {
+                    // 1.2 S0: the daemon is leaving; no retry is pending.
+                    self.telemetry.record_offline();
+                    self.publish_telemetry();
                     if exit.is_none() {
                         exit = Some(kind);
                     }
@@ -1360,9 +1391,9 @@ mod tests {
             }),
             rng_sample: Arc::new(|| 0.0),
             ladder: None,
+            telemetry_path: None,
         }
     }
-
     async fn next_control(
         controls: &mut mpsc::UnboundedReceiver<FakeSocketControl>,
     ) -> FakeSocketControl {
