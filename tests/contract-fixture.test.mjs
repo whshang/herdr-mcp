@@ -27,7 +27,7 @@ test("epoch2 JSON fixture is the language-independent public contract source", a
 
 test("runtime parity fixture pins the shared Node/Rust wire invariants", async () => {
   const parity = JSON.parse(await readFile(new URL("contracts/runtime-parity.json", root), "utf8"));
-  const contract = JSON.parse(await readFile(new URL("contracts/runtime-exec-v5.json", root), "utf8"));
+  const contract = JSON.parse(await readFile(new URL("contracts/runtime-exec-v6.json", root), "utf8"));
   assert.equal(parity.schema_version, 1);
   assert.equal(parity.server_name, "herdr-mcp");
   assert.equal(parity.sdk_wire_protocol, "2025-11-25");
@@ -39,7 +39,11 @@ test("runtime parity fixture pins the shared Node/Rust wire invariants", async (
   assert.deepEqual(parity.stateless_json_methods, ["server/discover", "tools/call"]);
 });
 
-test("user keeps relay runtime identity aligned | Given runtime-exec-v5 is current | When relay adapter constants are read | Then epoch and hash match the descriptor", async () => {
+test("user keeps relay runtime identity aligned | Given deployed relay speaks the v5 baseline | When relay adapter constants are read | Then epoch and hash match the v5 descriptor", async () => {
+  // Relay (relay/deno, relay/supabase) is a separately deployed plane owned by
+  // #775; it still pins the v5 baseline. The runtime moved to epoch 6 — the
+  // relay companion must advance EXPECTED_RUNTIME_CONTRACT_* to v6 before it
+  // will admit epoch-6 runtime hellos. Tracked in PR-2; relay files unchanged.
   const descriptor = JSON.parse(
     await readFile(new URL("contracts/runtime-exec-v5.json", root), "utf8"),
   );
