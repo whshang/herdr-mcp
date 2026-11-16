@@ -263,6 +263,10 @@ mod tests {
     }
     /// user parent | Given an open gate on an expired task | When unrelated
     /// reservations prune old work | Then the blocked task and gate survive.
+    ///
+    /// S4 (inbox governance) changes what happens after the gate closes: a
+    /// terminal prompt-task row is archived, never deleted. It leaves the
+    /// default ledger list but stays readable through the archive query.
     #[test]
     fn open_gate_preserves_task_during_ledger_pruning() {
         let mut store = fixture();
@@ -275,7 +279,22 @@ mod tests {
         store
             .reserve_operation("other", "key2", "hash", "other-task2", 102, None)
             .unwrap();
-        assert!(store.operation_ledger("task").unwrap().is_none());
+        // Archived, not deleted: the row survives the prune...
+        assert!(store.operation_ledger("task").unwrap().is_some());
+        // ...but default queries hide it, so the inbox no longer serves it.
+        assert!(
+            store
+                .operation_ledgers("herdr_prompt_task", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .operation_ledgers_archived("herdr_prompt_task", 10)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(store.decision_gate("gate").unwrap().is_none());
     }
 }
