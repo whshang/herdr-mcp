@@ -8315,6 +8315,7 @@ mod tests {
             assert_eq!(result["ok"], true, "{result}");
             assert_eq!(result["wait"]["completed"], false);
             assert_eq!(result["wait"]["outcome"], "checkpoint");
+            assert_eq!(result["wait"]["still_running"], true);
             assert!(result.get("failure").is_none());
             assert_eq!(result["task"]["lifecycle"], "running");
             assert_eq!(result["task"]["liveness"], "active");
@@ -8699,12 +8700,66 @@ mod tests {
         let plain = registry.task_inbox(None, Some("parent"), None, false, false, 50);
 
         assert_eq!(inbox["wait"]["woke"], "timeout");
+        assert_eq!(inbox["wait"]["still_running"], true);
         assert!(inbox["wait"]["waited_ms"].as_u64().unwrap() >= 120);
         assert_eq!(inbox["summary"], plain["summary"]);
         assert_eq!(inbox["tasks"], plain["tasks"]);
         assert_eq!(inbox["escalation"], plain["escalation"]);
         assert_eq!(inbox["summary"]["running"], 1);
         assert!(inbox["tasks"].as_array().unwrap().is_empty());
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user parent session | Given a session-scoped running child task | When
+    /// the child reports worker_done | Then a session inbox wait wakes inside
+    /// the poll budget and the row carries the receipt vocabulary.
+    #[test]
+    fn worker_done_wakes_session_scoped_inbox_wait_with_receipt_linkage() {
+        let (db_path, registry) = task_registry("wait-session");
+        let mut task = escalation_task(
+            "dispatch:prompt:session-child",
+            "child",
+            PromptTaskLifecycle::Running,
+            0,
+        );
+        task.parent_session_ref = Some("session:web".to_owned());
+        task.request_id = Some("edge-req-99".to_owned());
+        registry.save_task(&task, None).unwrap();
+
+        let reporter = registry.clone();
+        let report = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            reporter.task_report(&json!({
+                "task_id": "dispatch:prompt:session-child",
+                "dispatch_id": "dispatch:prompt:session-child",
+                "kind": "worker_done",
+            }))
+        });
+
+        let started = std::time::Instant::now();
+        let inbox = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_session_ref": "session:web", "wait_ms": 5_000}),
+            Some("session:web"),
+        );
+        let elapsed = started.elapsed();
+        report.join().unwrap();
+
+        assert_eq!(inbox["wait"]["woke"], "terminal_task", "{inbox}");
+        assert_eq!(inbox["wait"]["still_running"], false);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "worker_done must wake the parent's session inbox promptly: {elapsed:?}"
+        );
+        let row = &inbox["tasks"][0];
+        assert_eq!(row["task_id"], "dispatch:prompt:session-child");
+        assert_eq!(row["receipt_id"], "dispatch:prompt:session-child");
+        assert_eq!(row["request_id"], "edge-req-99");
+        assert_eq!(row["parent_session_ref"], "session:web");
+        assert_eq!(row["terminal_status"], "worker_done");
 
         drop(registry);
         remove_task_db(&db_path);
@@ -8771,6 +8826,7 @@ mod tests {
                 "lifecycle",
                 "liveness",
                 "pane_id",
+                "receipt_id",
                 "target",
                 "task_id",
                 "terminal",

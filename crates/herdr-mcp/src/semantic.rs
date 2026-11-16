@@ -4701,6 +4701,18 @@ mod semantic_error_detail_tests {
         assert_eq!(SemanticError::new("timeout").detail(), None);
     }
 
+    /// user caller | Given the Edge proxy times out vs is unreachable | When
+    /// the error is classified | Then timeouts surface as `edge_proxy_timeout`
+    /// instead of the vague `edge_proxy_unavailable`.
+    #[test]
+    fn edge_proxy_timeout_is_distinguished_from_unavailable() {
+        let timeout = edge_proxy_error("edge_proxy_timeout: operation timed out".to_owned());
+        assert_eq!(timeout.code(), "edge_proxy_timeout");
+        let unavailable =
+            edge_proxy_error("semantic proxy request failed: connection refused".to_owned());
+        assert_eq!(unavailable.code(), "edge_proxy_unavailable");
+    }
+
     #[test]
     fn trace_json_exposes_detail() {
         let trace = SemanticTrace {
