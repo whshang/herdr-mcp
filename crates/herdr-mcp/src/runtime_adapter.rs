@@ -602,6 +602,9 @@ impl WaitResult {
 pub struct HerdrCoreClient {
     socket_path: PathBuf,
     timeout: Duration,
+    // One public request must not switch to another advertised Core instance.
+    // This hello identity is advisory: a same-UID process can impersonate it.
+    admitted_hello: Option<HerdrCoreHello>,
 }
 
 impl HerdrCoreClient {
@@ -609,6 +612,7 @@ impl HerdrCoreClient {
         Self {
             socket_path: socket_path.into(),
             timeout: HC_HANDSHAKE_TIMEOUT,
+            admitted_hello: None,
         }
     }
 
@@ -617,6 +621,7 @@ impl HerdrCoreClient {
         Self {
             socket_path: socket_path.into(),
             timeout: timeout.min(HC_EXEC_MAX_TIMEOUT),
+            admitted_hello: None,
         }
     }
 
@@ -626,6 +631,24 @@ impl HerdrCoreClient {
 
     pub fn handshake(&self) -> Result<HerdrCoreHello, HerdrCoreError> {
         self.with_negotiated_session(|hello, _stream| Ok(hello))
+    }
+
+    fn admit_public_tool(&mut self, tool_name: &str) -> Result<(), Value> {
+        let hello = self.handshake().map_err(|error| {
+            json!({
+                "ok": false,
+                "code": error.code,
+                "message": error.message,
+                "runtime_backend": self.backend().as_str(),
+                "fallback_allowed": false,
+                "retryable": false,
+                "delivery_state": "not_delivered",
+            })
+        })?;
+        RuntimeCapabilities::from_herdr_core_methods(&hello.methods)
+            .check_public_tool(tool_name)?;
+        self.admitted_hello = Some(hello);
+        Ok(())
     }
 
     pub fn probe_status(&self) -> Result<HerdrCoreSessionReport, HerdrCoreError> {
@@ -1317,6 +1340,17 @@ impl HerdrCoreClient {
             call_timeout,
         )?;
         let hello = parse_hello_result(&hello_raw)?;
+        if let Some(admitted) = &self.admitted_hello
+            && (admitted.generation != hello.generation
+                || admitted.version != hello.version
+                || admitted.core_id != hello.core_id)
+        {
+            return Err(HerdrCoreError {
+                code: "herdr_core_identity_changed".to_owned(),
+                kind: Some("core_identity_changed".to_owned()),
+                message: "herdr-core hello identity changed after public tool admission; refusing to use a different Core connection".to_owned(),
+            });
+        }
         op(hello, &mut stream)
     }
 }
@@ -1903,8 +1937,8 @@ fn public_tool_route_for_selection(
                     "message": "herdr-core backend selected without a resolved socket path",
                 }));
             };
-            let client = HerdrCoreClient::new(socket_path);
-            let capability_check = client.check_tool_supported(tool_name).map_err(|mut rejection| {
+            let mut client = HerdrCoreClient::new(socket_path);
+            let capability_check = client.admit_public_tool(tool_name).map_err(|mut rejection| {
                 if let Some(object) = rejection.as_object_mut() {
                     object.insert("operation".to_owned(), json!(tool_name));
                     object.insert("failure_phase".to_owned(), json!("backend_capability"));
@@ -2345,6 +2379,7 @@ fn hc_invalid_params_value(message: impl Into<String>) -> Value {
 const HC_PREFLIGHT_ERROR_CODES: &[&str] = &[
     "invalid_params",
     "runtime_capability_unsupported",
+    "herdr_core_identity_changed",
     "readonly_mode",
     "secret_path_denied",
     "herdr_core_path_ambiguous",
@@ -2404,6 +2439,13 @@ pub fn inspect_herdr_core(selection: &RuntimeBackendSelection) -> Value {
         });
     };
     let client = HerdrCoreClient::new(socket_path);
+    inspect_herdr_core_with_client(selection, &client)
+}
+
+pub fn inspect_herdr_core_with_client(
+    selection: &RuntimeBackendSelection,
+    client: &HerdrCoreClient,
+) -> Value {
     match client.inspect_terminals() {
         Ok(mut output) => {
             if let Some(obj) = output.as_object_mut() {
@@ -3654,12 +3696,14 @@ mod tests {
         fn methods_distinguish_forwardable_from_advertised() {
             let server = MockHcServer::start(
                 "methods-policy",
-                1,
+                2,
                 &["hello", "server.status", "file.read"],
                 recorder(),
                 |_, _| panic!("inventory must not call a backend method"),
             );
-            let result = super::herdr_core_methods(&server.client(), "");
+            let mut client = server.client();
+            client.admit_public_tool("herdr_methods").unwrap();
+            let result = super::herdr_core_methods(&client, "");
             assert_eq!(result["herdr_core"]["core_id"], "core_mock");
             assert_eq!(result["herdr_core"]["core_name"], "mock-host");
             assert_eq!(result["herdr_core"]["protocol_generation"], 1);
@@ -3674,6 +3718,38 @@ mod tests {
                 let entry = methods.iter().find(|item| item["method"] == name).unwrap();
                 assert_eq!(entry["forwardable"], expected, "{name}");
             }
+            server.finish();
+        }
+
+        #[test]
+        fn public_core_route_rejects_hello_identity_drift_before_forwarding() {
+            let seen = recorder();
+            let server = MockHcServer::start(
+                "identity-drift",
+                3,
+                &["hello", "server.status"],
+                seen.clone(),
+                |_, _| panic!("identity drift must refuse before forwarding"),
+            );
+            let mut client = server.client();
+            client.admit_public_tool("herdr_methods").unwrap();
+            // Simulate a replacement Core reporting a new id on the next connection.
+            client.admitted_hello.as_mut().unwrap().core_id = Some("previous_core".to_owned());
+            let result = super::herdr_core_call(&client, "server.status", json!({}));
+            assert_eq!(result["code"], "herdr_core_identity_changed");
+            assert_eq!(result["delivery_state"], "not_delivered");
+            assert_eq!(result["retryable"], false);
+            assert_eq!(result["fallback_allowed"], false);
+
+            let selection = RuntimeBackendSelection {
+                backend: RuntimeBackend::HerdrCore,
+                source: "test",
+                herdr_core_socket: Some(server.socket_path.clone()),
+            };
+            let inspect = super::inspect_herdr_core_with_client(&selection, &client);
+            assert_eq!(inspect["code"], "herdr_core_identity_changed");
+            assert_eq!(inspect["fallback_allowed"], false);
+            assert!(recorded(&seen, "server.status").is_empty());
             server.finish();
         }
 
