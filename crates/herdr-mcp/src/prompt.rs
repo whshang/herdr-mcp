@@ -98,6 +98,10 @@ struct RegisterTaskInput<'a> {
     parent_target: Option<&'a str>,
     parent_session_ref: Option<&'a str>,
     stall_after_ms: Option<u64>,
+    /// S0 wire correlation id (`RuntimeContext.wire_request_id`) for the call
+    /// that created this task. Persisted so the terminal inbox row can be
+    /// matched back to the envelope `request_id` the dispatcher saw.
+    request_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,6 +199,11 @@ struct PromptTaskRecord {
     worker_done_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stall_after_ms: Option<u64>,
+    /// Correlates this task back to the wire `request_id` on the envelope of
+    /// the dispatch call that created it. Absent on records written before S3
+    /// and on calls that carried no wire id (direct `tool_call`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
     #[serde(skip)]
     gate: Option<DecisionGate>,
 }
@@ -252,6 +261,9 @@ impl PromptTaskRecord {
             "acknowledged": self.acknowledged_at_ms.is_some(),
             "created_at_ms": self.created_at_ms,
             "updated_at_ms": self.updated_at_ms,
+            // S3 receipt vocabulary: `receipt_id` aliases the task id so a
+            // waiting caller can join task rows to the dispatch envelope.
+            "receipt_id": self.task_id,
         });
         if let Some(requested) = &self.requested_target {
             public["requested_target"] = json!(requested);
@@ -278,6 +290,9 @@ impl PromptTaskRecord {
             }
             if let Some(awaiting_children) = self.awaiting_children {
                 object.insert("awaiting_children".to_owned(), json!(awaiting_children));
+            }
+            if let Some(request_id) = &self.request_id {
+                object.insert("request_id".to_owned(), json!(request_id));
             }
         }
         public
@@ -594,6 +609,7 @@ impl PromptRegistry {
             parent_target,
             parent_session_ref,
             stall_after_ms,
+            request_id,
         } = input;
         if submitted == Some(false) || self.inner.store.is_none() {
             return Ok(None);
@@ -687,6 +703,7 @@ impl PromptRegistry {
             acknowledged_at_ms: None,
             created_at_ms: now,
             updated_at_ms: now,
+            request_id: request_id.map(str::to_owned),
         };
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
             mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
@@ -1021,7 +1038,13 @@ impl PromptRegistry {
         if let Some(object) = payload.as_object_mut() {
             object.insert(
                 "wait".to_owned(),
-                json!({"waited_ms": waited_ms, "woke": woke}),
+                json!({
+                    "waited_ms": waited_ms,
+                    "woke": woke,
+                    // Expiry is a checkpoint, not an error: the caller may
+                    // re-wait on the same scope; it is not a request timeout.
+                    "still_running": woke == "timeout",
+                }),
             );
         }
         payload
@@ -1283,6 +1306,7 @@ impl PromptRegistry {
                             "completed": false,
                             "task_id": task_id,
                             "outcome": "checkpoint",
+                            "still_running": true,
                             "task": task.public_json_at(self.now_ms()),
                         });
                     }
@@ -1763,8 +1787,10 @@ enum InboxView {
 /// `final_excerpt` is present only when captured and spares the planner an
 /// `agent.read` round trip; `awaiting_children` is present only while a
 /// supervisor is held for its own children.
-const COMPACT_TASK_FIELDS: [&str; 15] = [
+const COMPACT_TASK_FIELDS: [&str; 17] = [
     "task_id",
+    "receipt_id",
+    "request_id",
     "dispatch_id",
     "requested_target",
     "target",
@@ -1795,6 +1821,8 @@ fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
 fn running_task_row(task: PromptTaskRecord, now: u64) -> Value {
     let mut row = json!({
         "task_id": task.task_id,
+        "receipt_id": task.task_id,
+        "request_id": task.request_id,
         "dispatch_id": task.dispatch_id,
         "workspace_id": task.workspace_id,
         "lifecycle": task.lifecycle.as_str(),
@@ -3093,7 +3121,7 @@ pub fn task_call_with_parent_session(
 }
 
 pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Value {
-    run_with_parent_session(client, registry, args, None)
+    run_with_parent_session(client, registry, args, None, None)
 }
 
 /// Rejections for a dispatch that would make the delegation chain unsafe. Both
@@ -3177,11 +3205,15 @@ fn delegation_depth_exceeded(
         .any(|task| active(task) && task_matches_target(task, grandparent_target, None)))
 }
 
+/// `request_id` is the S0 wire correlation id for this dispatch call; it is
+/// persisted on the task so its receipt vocabulary can join back to the
+/// envelope `request_id` the caller saw.
 pub fn run_with_parent_session(
     client: &HerdrClient,
     registry: &PromptRegistry,
     args: &Value,
     parent_session_ref: Option<&str>,
+    request_id: Option<&str>,
 ) -> Value {
     if let Err(error) = mutation::check_global("herdr_prompt") {
         return error;
@@ -3536,6 +3568,7 @@ pub fn run_with_parent_session(
         parent_target,
         parent_session_ref,
         stall_after_ms,
+        request_id,
     }) {
         Ok(Some(task)) => {
             if let Some(object) = result.as_object_mut() {
@@ -6883,18 +6916,18 @@ mod tests {
             if let Some(parent) = parent {
                 args["parent_target"] = json!(parent);
             }
-            let result = run_with_parent_session(&client, &registry, &args, session);
+            let result = run_with_parent_session(&client, &registry, &args, session, None);
             assert_eq!(result["code"], "concurrency_limit_reached", "{result}");
             assert_eq!(result["delivery_state"], "not_delivered");
             assert_eq!(result["submitted"], false);
             assert_eq!(
-                run_with_parent_session(&client, &registry, &args, Some("other-session"))["code"],
+                run_with_parent_session(&client, &registry, &args, Some("other-session"), None)["code"],
                 "role_target_unavailable"
             );
             if session.is_some() {
                 args["parent_target"] = json!("another-pane-same-session");
                 assert_eq!(
-                    run_with_parent_session(&client, &registry, &args, session)["code"],
+                    run_with_parent_session(&client, &registry, &args, session, None)["code"],
                     "concurrency_limit_reached"
                 );
             } else if parent.is_some() {
@@ -6920,7 +6953,7 @@ mod tests {
                 original["parent_target"] = json!(parent);
             }
             assert_eq!(
-                run_with_parent_session(&client, &registry, &original, session)["code"],
+                run_with_parent_session(&client, &registry, &original, session, None)["code"],
                 "concurrency_limit_reached"
             );
             assert_eq!(
@@ -6937,7 +6970,7 @@ mod tests {
                 original["parent_target"] = json!(parent);
             }
             assert_eq!(
-                run_with_parent_session(&client, &registry, &original, session)["code"],
+                run_with_parent_session(&client, &registry, &original, session, None)["code"],
                 "role_target_unavailable"
             );
         }
@@ -7378,6 +7411,7 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                request_id: None,
             })
             .unwrap()
             .unwrap();
@@ -7573,6 +7607,7 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                request_id: None,
             })
             .unwrap()
             .unwrap();
@@ -7722,6 +7757,7 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                request_id: None,
             })
             .unwrap()
             .unwrap();
@@ -7845,6 +7881,7 @@ mod tests {
             acknowledged_at_ms: None,
             created_at_ms: now.saturating_sub(age_ms),
             updated_at_ms: now.saturating_sub(age_ms),
+            request_id: None,
         }
     }
 
@@ -8290,6 +8327,7 @@ mod tests {
             assert_eq!(result["ok"], true, "{result}");
             assert_eq!(result["wait"]["completed"], false);
             assert_eq!(result["wait"]["outcome"], "checkpoint");
+            assert_eq!(result["wait"]["still_running"], true);
             assert!(result.get("failure").is_none());
             assert_eq!(result["task"]["lifecycle"], "running");
             assert_eq!(result["task"]["liveness"], "active");
@@ -8674,12 +8712,66 @@ mod tests {
         let plain = registry.task_inbox(None, Some("parent"), None, false, false, 50);
 
         assert_eq!(inbox["wait"]["woke"], "timeout");
+        assert_eq!(inbox["wait"]["still_running"], true);
         assert!(inbox["wait"]["waited_ms"].as_u64().unwrap() >= 120);
         assert_eq!(inbox["summary"], plain["summary"]);
         assert_eq!(inbox["tasks"], plain["tasks"]);
         assert_eq!(inbox["escalation"], plain["escalation"]);
         assert_eq!(inbox["summary"]["running"], 1);
         assert!(inbox["tasks"].as_array().unwrap().is_empty());
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user parent session | Given a session-scoped running child task | When
+    /// the child reports worker_done | Then a session inbox wait wakes inside
+    /// the poll budget and the row carries the receipt vocabulary.
+    #[test]
+    fn worker_done_wakes_session_scoped_inbox_wait_with_receipt_linkage() {
+        let (db_path, registry) = task_registry("wait-session");
+        let mut task = escalation_task(
+            "dispatch:prompt:session-child",
+            "child",
+            PromptTaskLifecycle::Running,
+            0,
+        );
+        task.parent_session_ref = Some("session:web".to_owned());
+        task.request_id = Some("edge-req-99".to_owned());
+        registry.save_task(&task, None).unwrap();
+
+        let reporter = registry.clone();
+        let report = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            reporter.task_report(&json!({
+                "task_id": "dispatch:prompt:session-child",
+                "dispatch_id": "dispatch:prompt:session-child",
+                "kind": "worker_done",
+            }))
+        });
+
+        let started = std::time::Instant::now();
+        let inbox = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_session_ref": "session:web", "wait_ms": 5_000}),
+            Some("session:web"),
+        );
+        let elapsed = started.elapsed();
+        report.join().unwrap();
+
+        assert_eq!(inbox["wait"]["woke"], "terminal_task", "{inbox}");
+        assert_eq!(inbox["wait"]["still_running"], false);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "worker_done must wake the parent's session inbox promptly: {elapsed:?}"
+        );
+        let row = &inbox["tasks"][0];
+        assert_eq!(row["task_id"], "dispatch:prompt:session-child");
+        assert_eq!(row["receipt_id"], "dispatch:prompt:session-child");
+        assert_eq!(row["request_id"], "edge-req-99");
+        assert_eq!(row["parent_session_ref"], "session:web");
+        assert_eq!(row["terminal_status"], "worker_done");
 
         drop(registry);
         remove_task_db(&db_path);
@@ -8746,6 +8838,7 @@ mod tests {
                 "lifecycle",
                 "liveness",
                 "pane_id",
+                "receipt_id",
                 "target",
                 "task_id",
                 "terminal",
@@ -9128,6 +9221,7 @@ mod tests {
             acknowledged_at_ms: None,
             created_at_ms: 1,
             updated_at_ms: 1,
+            request_id: None,
         }
     }
 
@@ -10360,6 +10454,7 @@ mod tests {
                 parent_target,
                 parent_session_ref,
                 stall_after_ms: None,
+                request_id: None,
             })
             .unwrap()
             .unwrap();
@@ -10579,6 +10674,7 @@ mod tests {
                 "idempotency_key": "guard-self-1",
             }),
             None,
+            None,
         );
         server.join().unwrap();
 
@@ -10642,6 +10738,7 @@ mod tests {
                 "idempotency_key": "guard-depth-1",
             }),
             None,
+            None,
         );
         assert_eq!(rejected["ok"], false);
         assert_eq!(rejected["code"], "delegation_depth_exceeded");
@@ -10682,6 +10779,7 @@ mod tests {
                 "parent_target": "supervisor",
                 "idempotency_key": "guard-depth-2",
             }),
+            None,
             None,
         );
         server.join().unwrap();

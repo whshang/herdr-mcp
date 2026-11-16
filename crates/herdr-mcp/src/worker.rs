@@ -3754,7 +3754,13 @@ fn semantic_proxy_request_to(
         .timeout(timeout)
         .json(payload)
         .send()
-        .map_err(|error| format!("semantic proxy request failed: {error}"))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                format!("edge_proxy_timeout: {error}")
+            } else {
+                format!("semantic proxy request failed: {error}")
+            }
+        })?;
     let status = response.status();
     let payload: Value = response
         .json()

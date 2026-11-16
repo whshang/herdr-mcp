@@ -746,6 +746,7 @@ impl SemanticError {
                     | "network"
                     | "invalid_response"
                     | "edge_proxy_unavailable"
+                    | "edge_proxy_timeout"
                     | "provider_unavailable"
             ) =>
             {
@@ -2042,6 +2043,17 @@ impl SemanticProtocol {
     }
 }
 
+/// Classify one `semantic_proxy_*` error string into a degradation code. A
+/// client-side timeout names `edge_proxy_timeout` so callers can distinguish a
+/// slow Edge hop from the proxy being unreachable, per 1.2-S3.
+fn edge_proxy_error(error: String) -> SemanticError {
+    if error.starts_with("edge_proxy_timeout:") {
+        SemanticError::with_detail("edge_proxy_timeout", error)
+    } else {
+        SemanticError::with_detail("edge_proxy_unavailable", error)
+    }
+}
+
 struct EdgeSemanticProvider;
 
 impl SemanticProvider for EdgeSemanticProvider {
@@ -2070,7 +2082,7 @@ impl SemanticProvider for EdgeSemanticProvider {
             }),
             timeout,
         )
-        .map_err(|error| SemanticError::with_detail("edge_proxy_unavailable", error))?;
+        .map_err(edge_proxy_error)?;
         parse_response(EDGE_SEMANTIC_PROVIDER_ID, "", request, payload)
     }
 }
@@ -2094,7 +2106,7 @@ impl SemanticChatProvider for EdgeSemanticChatProvider {
     ) -> Result<SemanticChatResponse, SemanticError> {
         let payload =
             crate::worker::semantic_proxy_chat_request(&edge_chat_body(messages, options), timeout)
-                .map_err(|error| SemanticError::with_detail("edge_proxy_unavailable", error))?;
+                .map_err(edge_proxy_error)?;
         parse_chat_response("edge-semantic-chat", "", payload)
     }
 }
@@ -4687,6 +4699,18 @@ mod semantic_error_detail_tests {
         let long = SemanticError::with_detail("edge_proxy_unavailable", "x".repeat(1000));
         assert_eq!(long.detail().unwrap().chars().count(), 300);
         assert_eq!(SemanticError::new("timeout").detail(), None);
+    }
+
+    /// user caller | Given the Edge proxy times out vs is unreachable | When
+    /// the error is classified | Then timeouts surface as `edge_proxy_timeout`
+    /// instead of the vague `edge_proxy_unavailable`.
+    #[test]
+    fn edge_proxy_timeout_is_distinguished_from_unavailable() {
+        let timeout = edge_proxy_error("edge_proxy_timeout: operation timed out".to_owned());
+        assert_eq!(timeout.code(), "edge_proxy_timeout");
+        let unavailable =
+            edge_proxy_error("semantic proxy request failed: connection refused".to_owned());
+        assert_eq!(unavailable.code(), "edge_proxy_unavailable");
     }
 
     #[test]
