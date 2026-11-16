@@ -645,23 +645,6 @@ impl HerdrCoreClient {
                 "delivery_state": "not_delivered",
             })
         })?;
-        if hello
-            .core_id
-            .as_deref()
-            .is_none_or(|id| id.trim().is_empty())
-            || hello.version == "unknown"
-            || hello.version.trim().is_empty()
-        {
-            return Err(json!({
-                "ok": false,
-                "code": "herdr_core_identity_unavailable",
-                "message": "public herdr-core requests require a non-empty hello core.id and version",
-                "runtime_backend": self.backend().as_str(),
-                "fallback_allowed": false,
-                "retryable": false,
-                "delivery_state": "not_delivered",
-            }));
-        }
         RuntimeCapabilities::from_herdr_core_methods(&hello.methods)
             .check_public_tool(tool_name)?;
         self.admitted_hello = Some(hello);
@@ -3584,7 +3567,7 @@ mod tests {
             framed: bool,
             /// Answer with `request_id + offset` to exercise id verification.
             reply_id_offset: u64,
-            /// Simulate a Core which omits the identity needed for public admission.
+            /// Verify compatibility with a Core that does not advertise its id.
             omit_core_id: bool,
             /// Simulate a malformed but syntactically valid hello result.
             omit_hello_methods: bool,
@@ -3840,41 +3823,48 @@ mod tests {
             assert_eq!(missing["delivery_state"], "not_delivered");
             assert_eq!(missing["fallback_allowed"], false);
 
-            for (tag, options, expected_code) in [
-                (
-                    "no-core-id",
-                    MockHcOptions {
-                        omit_core_id: true,
-                        ..MockHcOptions::default()
-                    },
-                    "herdr_core_identity_unavailable",
-                ),
-                (
-                    "bad-hello",
-                    MockHcOptions {
-                        omit_hello_methods: true,
-                        ..MockHcOptions::default()
-                    },
-                    "parse_error",
-                ),
-            ] {
-                let seen = recorder();
-                let server = MockHcServer::start_with(
-                    options,
-                    tag,
-                    1,
-                    &["hello", "server.status"],
-                    seen.clone(),
-                    |_, _| panic!("an invalid handshake must not forward"),
-                );
-                let mut client = server.client();
-                let error = client.admit_public_tool("herdr_methods").unwrap_err();
-                assert_eq!(error["code"], expected_code, "{tag}");
-                assert_eq!(error["delivery_state"], "not_delivered", "{tag}");
-                assert_eq!(error["fallback_allowed"], false);
-                assert!(recorded(&seen, "server.status").is_empty());
-                server.finish();
-            }
+            let anonymous = MockHcServer::start_with(
+                MockHcOptions {
+                    omit_core_id: true,
+                    ..MockHcOptions::default()
+                },
+                "no-core-id",
+                1,
+                &["hello", "server.status"],
+                recorder(),
+                |_, _| panic!("admission must only negotiate hello"),
+            );
+            let mut compatible = anonymous.client();
+            compatible.admit_public_tool("herdr_methods").unwrap();
+            assert!(
+                compatible
+                    .admitted_hello
+                    .as_ref()
+                    .unwrap()
+                    .core_id
+                    .is_none()
+            );
+            anonymous.finish();
+
+            let seen = recorder();
+            let invalid = MockHcServer::start_with(
+                MockHcOptions {
+                    omit_hello_methods: true,
+                    ..MockHcOptions::default()
+                },
+                "bad-hello",
+                1,
+                &["hello", "server.status"],
+                seen.clone(),
+                |_, _| panic!("an invalid handshake must not forward"),
+            );
+            let mut client = invalid.client();
+            let error = client.admit_public_tool("herdr_methods").unwrap_err();
+            assert_eq!(error["code"], "parse_error");
+            assert_eq!(error["delivery_state"], "not_delivered");
+            assert_eq!(error["fallback_allowed"], false);
+            assert!(recorded(&seen, "server.status").is_empty());
+            invalid.finish();
         }
 
         #[test]
