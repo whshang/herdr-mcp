@@ -103,13 +103,13 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
         });
     }
 
-    let (params, model_fact) = if method == "agent.start" {
+    let params = if method == "agent.start" {
         match admit_agent_start_model(params) {
-            Ok(result) => result,
+            Ok((params, _fact)) => params,
             Err(refusal) => return refusal,
         }
     } else {
-        (params, None)
+        params
     };
     let validation = match schema::validate_method_params(method, &params) {
         Ok(validation) => validation,
