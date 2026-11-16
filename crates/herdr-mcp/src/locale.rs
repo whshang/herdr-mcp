@@ -247,8 +247,13 @@ fn general_help(l: Locale) -> String {
     ));
     out.push_str(l.text("", "用户常用命令：\n", "ユーザー向けコマンド：\n"));
     out.push_str(
-        "  herdr-mcp install\n  herdr-mcp status [--verbose]\n  herdr-mcp doctor [--verbose|--json]\n  herdr-mcp semantic <status|setup|remove|decide|choose|score> ...\n  herdr-mcp network repair\n  herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n  herdr-mcp scan [--json] [--refresh] [--probe]\n  herdr-mcp agent-skill <status|sync>\n  herdr-mcp continuity <search|resume> ...\n  herdr-mcp memory <resume|search> ...\n  herdr-mcp webchat <endpoints|resources|create|send|dispatch-status|archive|handoff> ...\n  herdr-mcp profile check --file <profile.json>\n  herdr-mcp instance list\n  herdr-mcp instance reap <name> --confirm\n  herdr-mcp qualification <lock|unlock|status>\n  herdr-mcp worker bootstrap\n  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n  herdr-mcp worker update\n  herdr-mcp device list\n  herdr-mcp connector list\n  herdr-mcp connector approve <approval-request-id>\n  herdr-mcp connector revoke <connector-id> --confirm\n  herdr-mcp automation create --name NAME --device <device-id-or-unique-name>\n  herdr-mcp automation list\n  herdr-mcp update [check [--manifest URL]|apply [--manifest URL] [--with-worker]|major-apply|major-rollback|auto|status]\n  herdr-mcp extension standalone <install [--ref REF] [--path PATH]|status>\n  herdr-mcp rollback\n  herdr-mcp reinstall\n  herdr-mcp uninstall\n  herdr-mcp lang [auto|en|zh|ja]\n\n",
+        "  herdr-mcp install\n  herdr-mcp status [--verbose]\n  herdr-mcp doctor [--verbose|--json|--local]\n  herdr-mcp semantic <status|setup|remove|decide|choose|score> ...\n  herdr-mcp network repair\n  herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n  herdr-mcp scan [--json] [--refresh] [--probe]\n  herdr-mcp agent-skill <status|sync>\n  herdr-mcp continuity <search|resume> ...\n  herdr-mcp memory <resume|search> ...\n  herdr-mcp webchat <endpoints|resources|create|send|dispatch-status|archive|handoff> ...\n  herdr-mcp profile check --file <profile.json>\n  herdr-mcp instance list\n  herdr-mcp instance reap <name> --confirm\n  herdr-mcp qualification <lock|unlock|status>\n  herdr-mcp worker bootstrap\n  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n  herdr-mcp worker update\n  herdr-mcp device list\n  herdr-mcp connector list\n  herdr-mcp connector approve <approval-request-id>\n  herdr-mcp connector revoke <connector-id> --confirm\n  herdr-mcp automation create --name NAME --device <device-id-or-unique-name>\n  herdr-mcp automation list\n  herdr-mcp update [check [--manifest URL]|apply [--manifest URL] [--with-worker]|major-apply|major-rollback|auto|status]\n  herdr-mcp extension standalone <install [--ref REF] [--path PATH]|status>\n  herdr-mcp rollback\n  herdr-mcp reinstall\n  herdr-mcp uninstall\n  herdr-mcp lang [auto|en|zh|ja]\n\n",
     );
+    out.push_str(l.text(
+        "  --local prints a metadata-only snapshot (allow-listed processes, loopback ports, config file mtimes); never file contents, environment values or secrets\n\n",
+        "  --local 只输出元数据快照（白名单进程、回环端口、配置文件 mtime）；绝不包含文件内容、环境变量值或凭据\n\n",
+        "  --local はメタデータのみのスナップショットを出力します（許可リストのプロセス・ループバックポート・設定ファイル mtime）。ファイル内容・環境変数値・認証情報は含みません\n\n",
+    ));
     out.push_str(l.text(
         "",
         "可在任意命令前使用 --lang <en|zh|ja> 临时覆盖语言；lang 命令保存偏好，auto 恢复系统语言自动探测。命令名、JSON 字段、状态码和错误码始终保持英文。\n\n",
@@ -477,9 +482,15 @@ mod tests {
         assert!(ja.contains("ユーザー向けコマンド"));
         for text in [&zh, &ja] {
             assert!(text.contains("herdr-mcp continuity <search|resume>"));
+            assert!(text.contains("herdr-mcp doctor [--verbose|--json|--local]"));
+            assert!(text.contains("--local"));
             assert!(text.contains("herdr-mcp lang [auto|en|zh|ja]"));
             assert!(text.contains("HERDR_MCP_INSTANCE=uat"));
         }
+        assert!(zh.contains("只输出元数据快照"));
+        assert!(zh.contains("绝不包含文件内容、环境变量值或凭据"));
+        assert!(ja.contains("メタデータのみのスナップショット"));
+        assert!(ja.contains("ファイル内容・環境変数値・認証情報は含みません"));
         let zh_semantic = help(HelpSection::Semantic, Locale::ZhCn);
         assert!(zh_semantic.contains("TypeSafe.ai"));
         assert!(zh_semantic.contains("herdr-mcp semantic setup"));
