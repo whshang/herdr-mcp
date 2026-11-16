@@ -1171,11 +1171,30 @@ impl StateStore {
             "DELETE FROM operations WHERE expires_at IS NOT NULL AND expires_at <= ?1
              AND NOT (kind = 'browser_page.action'
                       AND state IN ('pending', 'unknown'))
+             -- S4: agent task rows are archived, never deleted. Default inbox
+             -- queries hide them past retention; `operation_ledgers_archived`
+             -- keeps them queryable.
+             AND kind <> 'herdr_prompt_task'
              AND NOT EXISTS (SELECT 1 FROM task_decision_gates
                              WHERE task_id = operations.op_id AND status = 'open')",
             params![now_ms],
         )
         .map_err(|error| format!("cannot prune expired operations: {error}"))?;
+        // Archived prompt tasks keep their durable row, so their resolved gates
+        // would otherwise accumulate forever. Open gates stay protected (they
+        // are still the human boundary), resolved ones are cleared with the
+        // receipt they belonged to.
+        tx.execute(
+            "DELETE FROM task_decision_gates
+             WHERE status <> 'open'
+               AND task_id IN (
+                   SELECT op_id FROM operations
+                   WHERE kind = 'herdr_prompt_task'
+                     AND expires_at IS NOT NULL AND expires_at <= ?1
+               )",
+            params![now_ms],
+        )
+        .map_err(|error| format!("cannot prune resolved gates of archived tasks: {error}"))?;
         let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO operations (
@@ -1838,6 +1857,54 @@ impl StateStore {
             )
             .map(|count| count as u64)
             .map_err(|error| format!("cannot count active role tasks: {error}"))
+    }
+
+    /// S4 archive read: rows of `kind` whose retention window has already
+    /// elapsed. Default ledger queries hide them; the runtime never deletes them
+    /// (see the prune carve-out), so a terminal receipt stays queryable here.
+    pub fn operation_ledgers_archived(
+        &self,
+        kind: &str,
+        limit: usize,
+    ) -> Result<Vec<OperationLedgerRecord>, String> {
+        let limit = i64::try_from(limit.clamp(1, 1024)).unwrap_or(1024);
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT op_id, kind, idempotency_key, request_hash, phase, state,
+                        result_json, created_at, updated_at, expires_at
+                 FROM operations
+                 WHERE kind = ?1
+                   AND expires_at IS NOT NULL AND expires_at <= ?2
+                 ORDER BY updated_at DESC, op_id DESC
+                 LIMIT ?3",
+            )
+            .map_err(|error| format!("cannot prepare archived operation list: {error}"))?;
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        let rows = statement
+            .query_map(params![kind, now_ms, limit], |row| {
+                Ok(OperationLedgerRecord {
+                    op_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    idempotency_key: row.get(2)?,
+                    request_hash: row.get(3)?,
+                    phase: row.get(4)?,
+                    state: row.get(5)?,
+                    result_json: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    expires_at: row.get(9)?,
+                })
+            })
+            .map_err(|error| format!("cannot list archived operations: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read archived operation row: {error}"))
     }
 
     pub fn operation_ledgers(
