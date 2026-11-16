@@ -6840,14 +6840,23 @@ mod tests {
     /// Disables the S5 post-readiness early-exit watch for the lifetime of the
     /// guard, restoring the previous value on drop. Scripted spawn fakes answer
     /// a fixed request sequence and must not receive extra watch probes. The
-    /// guard is returned alongside the registry so it lives exactly as long as
-    /// the test's registry binding, never leaking into a concurrent test.
-    struct SpawnWatchOff(Option<std::ffi::OsString>);
+    /// guard owns the crate-wide env lock for its whole lifetime, so callers
+    /// must never hold `test_env::lock()` across a `spawn_registry*` call: a
+    /// second acquire on the same non-reentrant mutex deadlocks the test.
+    /// The guard is returned alongside the registry so it lives exactly as
+    /// long as the test's registry binding, never leaking into a concurrent
+    /// test.
+    struct SpawnWatchOff {
+        previous: Option<std::ffi::OsString>,
+        // Held for the entire watch-off window; named `_lock` only to keep the
+        // field alive, the drop order restores env before releasing it.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl Drop for SpawnWatchOff {
         fn drop(&mut self) {
             unsafe {
-                match self.0.take() {
+                match self.previous.take() {
                     Some(value) => env::set_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS", value),
                     None => env::remove_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS"),
                 }
@@ -6860,9 +6869,13 @@ mod tests {
         root: &Path,
         pane_columns: u16,
     ) -> (PromptRegistry, SpawnWatchOff) {
-        // Serialize against other env-sensitive tests while the watch is off.
-        let _env_guard = crate::test_env::lock();
-        let guard = SpawnWatchOff(env::var_os("HERDR_MCP_SPAWN_EARLY_EXIT_MS"));
+        // Lock first, then read/write env: a test needing the default watch
+        // window holds the same lock so its window stays uncontaminated.
+        let lock = crate::test_env::lock();
+        let guard = SpawnWatchOff {
+            previous: env::var_os("HERDR_MCP_SPAWN_EARLY_EXIT_MS"),
+            _lock: lock,
+        };
         unsafe { env::set_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS", "0") };
         let mut registry = PromptRegistry::with_store(store);
         Arc::get_mut(&mut registry.inner).unwrap().cache = Some(Arc::new(
@@ -7575,8 +7588,6 @@ mod tests {
             ],
             requests.clone(),
         );
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
         let (registry, _watch_off) = spawn_registry(&root, 80);
         let args = json!({
             "spawn": {
@@ -7648,9 +7659,7 @@ mod tests {
             requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
-        let (registry, _watch_off) = spawn_registry_with(store.clone(), &root, 80);
+        let (registry, watch_off) = spawn_registry_with(store.clone(), &root, 80);
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1"},
             "text": "implement the task",
@@ -7660,8 +7669,9 @@ mod tests {
         let first = run(&client, &registry, &args);
         server.join().unwrap();
         assert_eq!(first["ok"], true, "{first}");
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
+        // The watch-off guard owns the crate env lock for its lifetime: it must
+        // be dropped before a second registry takes the lock again.
+        drop(watch_off);
         let (reloaded, _watch_off2) = spawn_registry_with(store, &root, 80);
         let replay = run(&client, &reloaded, &args);
         assert_eq!(replay["idempotent_replay"], true, "{replay}");
@@ -7692,8 +7702,6 @@ mod tests {
             ],
             requests.clone(),
         );
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
         let (registry, _watch_off) = spawn_registry(&root, 120);
         let result = run(
             &HerdrClient::new(&socket),
@@ -7727,8 +7735,6 @@ mod tests {
         let root = spawn_project_root("narrow");
         let socket = temp_socket();
         let listener = refused_spawn_server(&socket);
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
         let (registry, _watch_off) = spawn_registry(&root, 20);
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1", "split_from": "w1:p1"},
@@ -7771,8 +7777,6 @@ mod tests {
             ],
             requests.clone(),
         );
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
         let (registry, _watch_off) = spawn_registry(&root, 80);
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1"},
@@ -7840,8 +7844,6 @@ mod tests {
             first_requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
         let (registry, _watch_off) = spawn_registry_with(store.clone(), &root, 80);
         let client = HerdrClient::new(&socket);
         let mut args = json!({
@@ -7935,8 +7937,6 @@ mod tests {
             first_requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
         let (registry, _watch_off) = spawn_registry_with(store.clone(), &root, 80);
         let client = HerdrClient::new(&socket);
         // 4.2s: enough to create the pane and start the agent, not enough to
@@ -8068,8 +8068,6 @@ mod tests {
             vec![json!({"agent": {"pane_id": "w1:p2", "agent_status": "working"}})],
             requests.clone(),
         );
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
         let (registry, _watch_off) = spawn_registry(&root, 80);
         register_running_task(
             &registry,
@@ -8131,9 +8129,7 @@ mod tests {
             requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
-        let (registry, _watch_off) = spawn_registry_with(store.clone(), &root, 80);
+        let (registry, watch_off) = spawn_registry_with(store.clone(), &root, 80);
         register_running_task(
             &registry,
             "supervisor-task",
@@ -8170,8 +8166,9 @@ mod tests {
 
         // A fresh registry over the same durable store proves the refusal was
         // persisted for the key rather than remembered inside one process.
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
+        // The watch-off guard owns the crate env lock for its lifetime: drop it
+        // before the second registry takes the lock again.
+        drop(watch_off);
         let (reloaded, _watch_off2) = spawn_registry_with(store, &root, 80);
         let replay = run(&client, &reloaded, &args);
         assert_eq!(replay["ok"], false, "{replay}");
@@ -8205,8 +8202,6 @@ mod tests {
             ],
             requests.clone(),
         );
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
         let (registry, _watch_off) = spawn_registry(&root, 80);
         let result = run(
             &HerdrClient::new(&socket),
@@ -8243,8 +8238,6 @@ mod tests {
         let root = spawn_project_root("validate");
         let socket = temp_socket();
         let listener = refused_spawn_server(&socket);
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
         let (registry, _watch_off) = spawn_registry(&root, 80);
         let client = HerdrClient::new(&socket);
         for (args, expected) in [
@@ -12731,14 +12724,13 @@ mod tests {
     /// list, creates nothing, and a replay returns the same refusal.
     #[test]
     fn spawn_unknown_model_alias_fails_before_any_mutation() {
-        let _guard = crate::test_env::lock();
-        let _env = S5Env::set("unknown-alias", false);
         let root = spawn_project_root("s5-unknown");
         let socket = temp_socket();
         let listener = refused_spawn_server(&socket);
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
+        // The watch-off guard owns the crate env lock for its lifetime; all
+        // other env mutations in this test run after it is taken.
         let (registry, _watch_off) = spawn_registry(&root, 80);
+        let _env = S5Env::set("unknown-alias", false);
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-99"},
             "text": "work",
@@ -12774,14 +12766,12 @@ mod tests {
     /// When a model is requested | Then validated:false and no spawn happens.
     #[test]
     fn spawn_model_on_kind_without_list_is_unvalidatable() {
-        let _guard = crate::test_env::lock();
-        let _env = S5Env::set("no-list", false);
         let root = spawn_project_root("s5-nolist");
         let socket = temp_socket();
         let listener = refused_spawn_server(&socket);
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
+        // The watch-off guard owns the crate env lock for its lifetime.
         let (registry, _watch_off) = spawn_registry(&root, 80);
+        let _env = S5Env::set("no-list", false);
         let result = run(
             &HerdrClient::new(&socket),
             &registry,
@@ -12807,8 +12797,6 @@ mod tests {
     /// args and the prompt is submitted exactly once.
     #[test]
     fn spawn_validated_model_delivers_model_flag() {
-        let _guard = crate::test_env::lock();
-        let _env = S5Env::set("model-flag", true);
         let root = spawn_project_root("s5-modelflag");
         let socket = temp_socket();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -12827,9 +12815,9 @@ mod tests {
             ],
             requests.clone(),
         );
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
+        // The watch-off guard owns the crate env lock for its lifetime.
         let (registry, _watch_off) = spawn_registry(&root, 80);
+        let _env = S5Env::set("model-flag", true);
         let result = run(
             &HerdrClient::new(&socket),
             &registry,
@@ -12864,8 +12852,18 @@ mod tests {
     /// agent.start, never a silent drop.
     #[test]
     fn spawn_model_without_schema_delivery_fails_closed() {
-        let _guard = crate::test_env::lock();
-        // Catalog but no HERDR_BIN override: point HERDR_BIN at a binary that
+        let root = spawn_project_root("s5-nodelivery");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![spawn_tab_created()],
+            requests.clone(),
+        );
+        // The watch-off guard owns the crate env lock for its lifetime; the
+        // HERDR_BIN / catalog overrides below run after it is taken.
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        // Catalog but no usable HERDR_BIN: point HERDR_BIN at a binary that
         // fails, so the schema is unavailable and delivery cannot be proven.
         let _env = S5Env::set("no-delivery", false);
         let dir = env::temp_dir().join(format!("herdr-mcp-s5-nobin-{}", now_ms()));
@@ -12878,17 +12876,6 @@ mod tests {
             fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         }
         unsafe { env::set_var("HERDR_BIN", &bin) };
-        let root = spawn_project_root("s5-nodelivery");
-        let socket = temp_socket();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let server = scripted_spawn_server(
-            UnixListener::bind(&socket).unwrap(),
-            vec![spawn_tab_created()],
-            requests.clone(),
-        );
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
-        let (registry, _watch_off) = spawn_registry(&root, 80);
         let result = run(
             &HerdrClient::new(&socket),
             &registry,
@@ -12940,8 +12927,6 @@ mod tests {
             ],
             requests.clone(),
         );
-        // Hold the env lock so the watch-off window covers this test's dispatch.
-        let _spawn_env_guard = crate::test_env::lock();
         let (registry, _watch_off) = spawn_registry(&root, 80);
         let result = run(
             &HerdrClient::new(&socket),
