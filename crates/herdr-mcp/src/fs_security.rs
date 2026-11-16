@@ -596,6 +596,23 @@ pub fn outside_managed_roots_hint() -> &'static str {
     "only paths inside project roots visible in the live snapshot are accessible: a Git-backed project root, or a non-Git operational root exactly proven by a live Herdr workspace/pane cwd; open or create a Herdr workspace/pane whose cwd is exactly the intended directory (or is inside the intended Git repository) and keep it available, then retry (no coding agent required)"
 }
 
+/// Directory names whose entire subtree is credential material. A match on any
+/// single component denies the path, so nesting, `..` spelling, symlink
+/// resolution and case variants are all covered by the callers that re-run this
+/// on the canonical real path.
+const DENIED_SECRET_DIRECTORIES: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".azure",
+    ".password-store",
+];
+
+/// Credential directories that only exist below `~/.config`.
+const DENIED_CONFIG_DIRECTORIES: &[&str] = &["gcloud", "gh"];
+
 pub fn denied_secret_path(path: &Path) -> bool {
     let normalized = path.to_string_lossy().replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
@@ -603,49 +620,64 @@ pub fn denied_secret_path(path: &Path) -> bool {
         return true;
     }
 
-    path.components().any(|component| {
-        let segment = component.as_os_str().to_string_lossy().to_ascii_lowercase();
-        if segment == ".git" {
-            return false;
-        }
-        segment == ".env"
-            || segment.starts_with(".env.")
-            || segment.starts_with("id_rsa")
-            || segment.starts_with("id_dsa")
-            || segment.starts_with("id_ecdsa")
-            || segment.starts_with("id_ed25519")
-            || segment.contains("secret")
-            || segment.contains("token")
-            || segment.contains("credential")
-            || segment.ends_with(".env")
-            || segment.ends_with(".pem")
-            || segment.ends_with(".key")
-            || segment.ends_with(".p12")
-            || segment.ends_with(".pfx")
-    })
+    let segments = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => {
+                Some(value.to_string_lossy().to_ascii_lowercase())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if segments
+        .iter()
+        .any(|segment| denied_secret_segment(segment))
+    {
+        return true;
+    }
+    segments
+        .windows(2)
+        .any(|pair| pair[0] == ".config" && DENIED_CONFIG_DIRECTORIES.contains(&pair[1].as_str()))
+}
+
+fn denied_secret_segment(segment: &str) -> bool {
+    if segment == ".git" {
+        return false;
+    }
+    DENIED_SECRET_DIRECTORIES.contains(&segment)
+        || segment == ".env"
+        || segment.starts_with(".env.")
+        || segment.starts_with("id_rsa")
+        || segment.starts_with("id_dsa")
+        || segment.starts_with("id_ecdsa")
+        || segment.starts_with("id_ed25519")
+        || segment.contains("secret")
+        || segment.contains("token")
+        || segment.contains("credential")
+        || segment.ends_with(".env")
+        || segment.ends_with(".pem")
+        || segment.ends_with(".key")
+        || segment.ends_with(".p12")
+        || segment.ends_with(".pfx")
 }
 
 /// Extended credential-path guard for HOME-wide text transfer and herdr-core
 /// file operations. This intentionally does not alter the shared project guard.
 pub(crate) fn denied_home_credential_path(path: &Path) -> bool {
-    const EXTRA_SEGMENTS: &[&str] = &[
-        ".ssh",
-        ".gnupg",
-        ".aws",
-        ".azure",
-        ".kube",
-        ".docker",
+    // File-shaped credentials the text transfer surface additionally refuses.
+    // The credential *directory* set is shared with `denied_secret_path` so the
+    // file tools and the text transfer surface cannot drift apart (#938).
+    const EXTRA_FILE_SEGMENTS: &[&str] = &[
         ".netrc",
         ".npmrc",
         ".pypirc",
         ".git-credentials",
         ".htpasswd",
-        ".password-store",
     ];
     denied_secret_path(path)
         || path.components().any(|component| {
             let segment = component.as_os_str().to_string_lossy().to_ascii_lowercase();
-            EXTRA_SEGMENTS.contains(&segment.as_str())
+            EXTRA_FILE_SEGMENTS.contains(&segment.as_str())
         })
 }
 
@@ -1409,6 +1441,46 @@ mod tests {
             assert!(denied_secret_path(Path::new(path)), "{path}");
         }
         assert!(!denied_secret_path(Path::new("/repo/src/config.ts")));
+    }
+
+    #[test]
+    fn credential_directories_are_denied_for_every_caller_spelling() {
+        // Credential *directories*: every descendant is off limits for the file
+        // tools and the text transfer surface alike, whether it appears in HOME,
+        // nested inside an allowed root, or after `..` spelling. Case variants
+        // are denied lexically before any filesystem lookup, so the check is
+        // deterministic on case-insensitive and case-sensitive hosts.
+        for path in [
+            "/Users/example/.ssh",
+            "/Users/example/.ssh/config",
+            "/Users/example/.ssh/known_hosts",
+            "/Users/example/.aws/config",
+            "/Users/example/.aws/credentials",
+            "/Users/example/.gnupg/trustdb.gpg",
+            "/Users/example/.kube/config",
+            "/Users/example/.docker/config.json",
+            "/Users/example/.azure/msal_token_cache.json",
+            "/Users/example/.password-store/work/mail.gpg",
+            "/Users/example/.config/gcloud/application_default_credentials.json",
+            "/Users/example/.config/gh/hosts.yml",
+            "/home/example/project/.ssh/config",
+            "/Users/example/project/data/../.aws/config",
+            "/Users/EXAMPLE/.SSH/config",
+            "/Users/example/.Config/GH/hosts.yml",
+        ] {
+            assert!(denied_secret_path(Path::new(path)), "{path}");
+            assert!(denied_home_credential_path(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/Users/example/project/src/config.ts",
+            "/Users/example/.ssh_config_notes.md",
+            "/Users/example/work/.awsome-report.md",
+            "/Users/example/.config/herdr-mcp/config.json",
+            "/Users/example/.config/herdr/config.json",
+        ] {
+            assert!(!denied_secret_path(Path::new(path)), "{path}");
+            assert!(!denied_home_credential_path(Path::new(path)), "{path}");
+        }
     }
 
     #[test]
