@@ -95,7 +95,7 @@ herdr-mcp permissions verify
 
 ## Agent 能力发现：`scan`
 
-`doctor` 回答的是**“这套安装现在健康吗？”**。默认输出只保留给人看的摘要：本机健康、Edge 可达性、未执行的远程 Connector 认证，以及真正需要处理的项目。完整分层诊断使用 `herdr-mcp doctor --verbose`，机器读取使用 `herdr-mcp doctor --json`。macOS 的 JSON `standalone_extension` 对象会报告本机各 Chromium 浏览器（Google Chrome、Chrome Beta/Canary、Chromium、Brave、Edge、Arc、Helium 与 ego lite）中的受管 STANDALONE 扩展状态；`state=loaded` 表示其中一个加载的是 `~/.config/herdr-mcp/extensions/standalone/current`，`state=drift` 表示某个浏览器正在从该受管目录之外的路径加载同一个固定 standalone extension ID，对象会给出 `expected_path`、实际加载路径/profile 及其 `browser`、Chromium `location`、`browser_roots` 和 `drift_count`。浏览器扩展属于可选能力，因此这条提示不会把原本健康的核心 MCP/service readiness 判成失败。`scan` 回答的是**“这台机器上的 Agent 到底有哪些已经被证据确认的能力？”**。
+`doctor` 回答的是**“这套安装现在健康吗？”**。默认输出只保留给人看的摘要：本机健康、Edge 可达性、未执行的远程 Connector 认证，以及真正需要处理的项目。完整分层诊断使用 `herdr-mcp doctor --verbose`，机器读取使用 `herdr-mcp doctor --json`；需要一次拿到本机事实时用 `herdr-mcp doctor --local`，输出白名单进程（名称、PID、启动时间）、白名单回环端口是否在监听、白名单配置文件是否存在及 mtime 的 JSON 快照。该快照只含元数据：绝不返回文件内容、环境变量值或凭据，`state.db` 不在白名单内，非白名单进程/端口/文件不会出现；元数据读取失败会显式报告，而不是伪装成条目不存在。macOS 的 JSON `standalone_extension` 对象会报告本机各 Chromium 浏览器（Google Chrome、Chrome Beta/Canary、Chromium、Brave、Edge、Arc、Helium 与 ego lite）中的受管 STANDALONE 扩展状态；`state=loaded` 表示其中一个加载的是 `~/.config/herdr-mcp/extensions/standalone/current`，`state=drift` 表示某个浏览器正在从该受管目录之外的路径加载同一个固定 standalone extension ID，对象会给出 `expected_path`、实际加载路径/profile 及其 `browser`、Chromium `location`、`browser_roots` 和 `drift_count`。浏览器扩展属于可选能力，因此这条提示不会把原本健康的核心 MCP/service readiness 判成失败。`scan` 回答的是**“这台机器上的 Agent 到底有哪些已经被证据确认的能力？”**。
 
 ```bash
 herdr-mcp scan
