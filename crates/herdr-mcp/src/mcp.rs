@@ -1202,6 +1202,46 @@ fn normalize_tool_call_arguments(raw_arguments: Option<&Value>) -> Result<Value,
     Ok(Value::Object(map))
 }
 
+/// Normalize `herdr_call.params` exactly once per request.
+///
+/// `herdr_call` accepts an object, a JSON string that must decode to an object,
+/// `null`/absent, and a blank string. The *same* helper runs before backend
+/// admission (#946) and inside the dispatch, so the object form and the JSON
+/// string form cannot diverge in code, result, or ordering.
+fn normalize_herdr_call_params(raw: Option<&Value>) -> Result<Value, Value> {
+    match raw {
+        None | Some(Value::Null) => Ok(json!({})),
+        Some(Value::Object(map)) => Ok(Value::Object(map.clone())),
+        Some(Value::String(params_text)) => {
+            let trimmed = params_text.trim();
+            if trimmed.is_empty() {
+                return Ok(json!({}));
+            }
+            match serde_json::from_str::<Value>(trimmed) {
+                Ok(value) if value.is_object() => Ok(value),
+                Ok(_) => Err(json!(
+                    {"ok": false, "code": "invalid_params", "message": "herdr_call params must decode to an object"}
+                )),
+                Err(parse_error) => Err(json!(
+                    {"ok": false, "code": "invalid_params_json", "message": parse_error.to_string()}
+                )),
+            }
+        }
+        Some(_) => Err(json!(
+            {"ok": false, "code": "invalid_params", "message": "herdr_call params must decode to an object"}
+        )),
+    }
+}
+
+/// `herdr_call` treats the method case-insensitively but only after trimming,
+/// exactly like the forwarding layer (`herdr_core_call`).
+fn herdr_call_is_server_status(arguments: &Value) -> bool {
+    arguments
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| method.trim().eq_ignore_ascii_case("server.status"))
+}
+
 fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, String> {
     let raw_name = request
         .pointer("/params/name")
@@ -1219,16 +1259,49 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     // so the narrow `hc` primitives can be forwarded below.
     // #936: admission is pinned to the backend this process started with, so a
     // later env/config switch cannot move a live candidate onto another backend.
-    let route = match crate::runtime_adapter::public_tool_route(name, context.runtime_backend) {
+    // #946 (droid 5cbd5704 P1): `params` arrives as an object *or* as a JSON
+    // string; the string form used to be decoded only after admission, so an
+    // `expected_core_target` it carried was discovered after the admission
+    // `hello`. Normalize both forms here, once, before any admission/connect.
+    let herdr_call_params = if name == "herdr_call" {
+        match normalize_herdr_call_params(arguments.get("params")) {
+            Ok(params) => Some(params),
+            Err(invalid) => return Ok(tool_result(invalid, true)),
+        }
+    } else {
+        None
+    };
+    let mut expected_target: Option<&Value> = None;
+    if let Some(params) = herdr_call_params.as_ref()
+        && let Some(value) = params.get("expected_core_target")
+    {
+        // A conditional Core target is only meaningful for the read-only
+        // `server.status` route. Reject every other method here, before any
+        // backend is admitted, with the same public result the post-admission
+        // check returns (the kind of `params` shape cannot change it).
+        if !herdr_call_is_server_status(&arguments) {
+            return Ok(tool_result(
+                crate::runtime_adapter::herdr_core_expected_target_unsupported(),
+                true,
+            ));
+        }
+        expected_target = Some(value);
+    }
+    let route = match crate::runtime_adapter::public_tool_route(
+        name,
+        context.runtime_backend,
+        expected_target,
+    ) {
         Ok(route) => route,
         Err(rejection) => return Ok(tool_result(rejection, true)),
     };
-    dispatch_admitted_tool(name, arguments, context, route)
+    dispatch_admitted_tool(name, arguments, herdr_call_params, context, route)
 }
 
 fn dispatch_admitted_tool(
     name: &str,
     arguments: Value,
+    herdr_call_params: Option<Value>,
     context: &RuntimeContext<'_>,
     route: crate::runtime_adapter::PublicToolRoute,
 ) -> Result<Value, String> {
@@ -1329,37 +1402,12 @@ fn dispatch_admitted_tool(
                 .get("method")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "herdr_call requires arguments.method".to_owned())?;
-            let params: Value = match arguments.get("params") {
-                None | Some(Value::Null) => json!({}),
-                Some(Value::Object(map)) => Value::Object(map.clone()),
-                Some(Value::String(params_text)) => {
-                    let trimmed = params_text.trim();
-                    if trimmed.is_empty() {
-                        json!({})
-                    } else {
-                        match serde_json::from_str::<Value>(trimmed) {
-                            Ok(value) if value.is_object() => value,
-                            Ok(_) => {
-                                return Ok(tool_result(
-                                    json!({"ok": false, "code": "invalid_params", "message": "herdr_call params must decode to an object"}),
-                                    true,
-                                ));
-                            }
-                            Err(parse_error) => {
-                                return Ok(tool_result(
-                                    json!({"ok": false, "code": "invalid_params_json", "message": parse_error.to_string()}),
-                                    true,
-                                ));
-                            }
-                        }
-                    }
-                }
-                Some(_) => {
-                    return Ok(tool_result(
-                        json!({"ok": false, "code": "invalid_params", "message": "herdr_call params must decode to an object"}),
-                        true,
-                    ));
-                }
+            let params: Value = match herdr_call_params {
+                Some(params) => params,
+                None => match normalize_herdr_call_params(arguments.get("params")) {
+                    Ok(params) => params,
+                    Err(invalid) => return Ok(tool_result(invalid, true)),
+                },
             };
             if method.starts_with("continuity.") {
                 continuity_call(context.state_store, method, &params)
