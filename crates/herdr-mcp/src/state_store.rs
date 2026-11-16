@@ -887,20 +887,29 @@ impl StateStore {
         &mut self,
         client_request_id: &str,
         method: &str,
+        identity: &crate::request_ledger::LedgerIdentity,
         preferred_request_id: Option<&str>,
         now_ms: i64,
     ) -> crate::request_ledger::LedgerBegin {
-        self.request_ledger
-            .begin_or_replay(client_request_id, method, preferred_request_id, now_ms)
+        self.request_ledger.begin_or_replay(
+            client_request_id,
+            method,
+            identity,
+            preferred_request_id,
+            now_ms,
+        )
     }
-    /// Dedupe/status lookup for a `client_request_id`; expired entries are
-    /// dropped first so a resubmission past the TTL is a fresh request.
+    /// Dedupe/status lookup for a `client_request_id` inside one caller
+    /// scope; expired entries are dropped first so a resubmission past the
+    /// TTL is a fresh request.
     pub fn request_ledger_lookup(
         &mut self,
         client_request_id: &str,
+        caller_scope: &str,
         now_ms: i64,
     ) -> crate::request_ledger::LedgerReplay {
-        self.request_ledger.lookup(client_request_id, now_ms)
+        self.request_ledger
+            .lookup(client_request_id, caller_scope, now_ms)
     }
 
     /// Reserve a pending record for one `client_request_id`; returns the
@@ -909,11 +918,17 @@ impl StateStore {
         &mut self,
         client_request_id: &str,
         method: &str,
+        identity: &crate::request_ledger::LedgerIdentity,
         preferred_request_id: Option<&str>,
         now_ms: i64,
-    ) -> String {
-        self.request_ledger
-            .begin(client_request_id, method, preferred_request_id, now_ms)
+    ) -> Result<String, serde_json::Value> {
+        self.request_ledger.begin(
+            client_request_id,
+            method,
+            identity,
+            preferred_request_id,
+            now_ms,
+        )
     }
 
     /// Settle a pending record with the execution result.
@@ -929,8 +944,13 @@ impl StateStore {
 
     /// `herdr_mcp.request.status` projection by `client_request_id` or runtime
     /// `request_id`.
-    pub fn request_ledger_status(&mut self, key: &str, now_ms: i64) -> serde_json::Value {
-        self.request_ledger.status(key, now_ms)
+    pub fn request_ledger_status(
+        &mut self,
+        key: &str,
+        caller_scope: &str,
+        now_ms: i64,
+    ) -> serde_json::Value {
+        self.request_ledger.status(key, caller_scope, now_ms)
     }
 
     /// Open a database file named `name` inside a state directory, creating and

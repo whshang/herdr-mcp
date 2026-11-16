@@ -1358,6 +1358,15 @@ fn herdr_call_with_request_ledger(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    // Scope + request fingerprint: a `client_request_id` is only honored for
+    // the same request from the same caller scope; anything else under the
+    // key is an idempotency conflict, never a silent replay.
+    let caller_scope = request_ledger_caller_scope(context);
+    let identity = crate::request_ledger::LedgerIdentity::of(
+        &method,
+        arguments.get("params").unwrap_or(&Value::Null),
+        &caller_scope,
+    );
     let begin = {
         let mut store = context
             .state_store
@@ -1368,6 +1377,7 @@ fn herdr_call_with_request_ledger(
         store.request_ledger_begin_or_replay(
             client_request_id,
             &method,
+            &identity,
             context.wire_request_id,
             now_ms,
         )
@@ -1385,6 +1395,28 @@ fn herdr_call_with_request_ledger(
             crate::request_ledger::in_flight_response(&record),
             true,
         )),
+        crate::request_ledger::LedgerBegin::Conflict => Ok(tool_result(
+            json!({
+                "ok": false,
+                "code": "idempotency_conflict",
+                "retryable": false,
+                "delivery_state": "not_delivered",
+                "client_request_id": client_request_id,
+                "message": "client_request_id was already used for a different request or caller scope; choose a new key rather than replaying",
+            }),
+            true,
+        )),
+        crate::request_ledger::LedgerBegin::CapacityExceeded => Ok(tool_result(
+            json!({
+                "ok": false,
+                "code": "request_ledger_full",
+                "retryable": true,
+                "delivery_state": "not_delivered",
+                "client_request_id": client_request_id,
+                "message": "request ledger is at capacity with in-flight work; retry after the in-flight requests settle",
+            }),
+            true,
+        )),
         crate::request_ledger::LedgerBegin::Execute { request_id } => {
             let (mut output, is_error) = match admitted_tool_output(
                 name,
@@ -1392,19 +1424,37 @@ fn herdr_call_with_request_ledger(
                 herdr_call_params,
                 context,
                 route,
-            )? {
-                AdmittedToolResult::Raw { output, is_error } => (output, is_error),
-                // herdr_call never produces an envelope; settle as `unknown`
-                // rather than guess at a mutation verdict we cannot see.
-                AdmittedToolResult::Envelope(response) => {
+            ) {
+                Ok(AdmittedToolResult::Raw { output, is_error }) => (output, is_error),
+                // Envelope results bypass the raw projection, so the ledger
+                // records only that the call ran and whether it was an error —
+                // honest classification, never a fabricated request_timeout.
+                Ok(AdmittedToolResult::Envelope(response)) => {
+                    let is_error = response
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     if let Ok(mut store) = context.state_store.lock() {
                         store.request_ledger_settle(
                             client_request_id,
-                            &json!({"ok": false, "code": "request_timeout"}),
+                            &json!({"ok": !is_error, "code": if is_error { "envelope_error" } else { "ok" }}),
                             mutation_lease_now_ms(),
                         );
                     }
                     return Ok(response);
+                }
+                // The tool call itself failed before producing a result: the
+                // mutation may or may not have run, so the record settles as
+                // `unknown` — never left pending to pin the key for the TTL.
+                Err(error) => {
+                    if let Ok(mut store) = context.state_store.lock() {
+                        store.request_ledger_settle(
+                            client_request_id,
+                            &json!({"ok": false, "code": "internal_error", "delivery_state": "delivery_unknown", "message": error}),
+                            mutation_lease_now_ms(),
+                        );
+                    }
+                    return Err(error);
                 }
             };
             if let Some(object) = output.as_object_mut() {
@@ -1419,6 +1469,19 @@ fn herdr_call_with_request_ledger(
             ))
         }
     }
+}
+
+/// Minimal caller-scope fingerprint for the request ledger: the WebChat
+/// session identity when the caller is a browser conversation, plus the lease
+/// holder id when the request carries one. The digest keeps the raw session
+/// token out of the ledger; local/trusted callers all share one empty scope.
+fn request_ledger_caller_scope(context: &RuntimeContext<'_>) -> String {
+    let session = context
+        .caller_browser_session
+        .map(|session| format!("{}:{}", session.provider, session.opaque_session_id))
+        .unwrap_or_default();
+    let lease = context.caller_lease_holder_id.unwrap_or_default();
+    crate::request_ledger::LedgerIdentity::of("", &json!([session, lease]), "").request_digest
 }
 
 /// `herdr_mcp.request.status`: read-only query over the request ledger by
@@ -1440,7 +1503,11 @@ fn request_status_call(context: &RuntimeContext<'_>, params: &Value) -> Value {
         });
     };
     match context.state_store.lock() {
-        Ok(mut store) => store.request_ledger_status(key, mutation_lease_now_ms()),
+        Ok(mut store) => store.request_ledger_status(
+            key,
+            &request_ledger_caller_scope(context),
+            mutation_lease_now_ms(),
+        ),
         Err(_) => json!({
             "ok": false,
             "code": "state_store_unavailable",
