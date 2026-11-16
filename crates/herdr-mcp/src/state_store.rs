@@ -887,10 +887,11 @@ impl StateStore {
         &mut self,
         client_request_id: &str,
         method: &str,
+        preferred_request_id: Option<&str>,
         now_ms: i64,
     ) -> crate::request_ledger::LedgerBegin {
         self.request_ledger
-            .begin_or_replay(client_request_id, method, now_ms)
+            .begin_or_replay(client_request_id, method, preferred_request_id, now_ms)
     }
     /// Dedupe/status lookup for a `client_request_id`; expired entries are
     /// dropped first so a resubmission past the TTL is a fresh request.
@@ -903,14 +904,16 @@ impl StateStore {
     }
 
     /// Reserve a pending record for one `client_request_id`; returns the
-    /// runtime-generated request id.
+    /// request id used (wire correlation id when one was supplied).
     pub fn request_ledger_begin(
         &mut self,
         client_request_id: &str,
         method: &str,
+        preferred_request_id: Option<&str>,
         now_ms: i64,
     ) -> String {
-        self.request_ledger.begin(client_request_id, method, now_ms)
+        self.request_ledger
+            .begin(client_request_id, method, preferred_request_id, now_ms)
     }
 
     /// Settle a pending record with the execution result.

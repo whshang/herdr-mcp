@@ -252,6 +252,12 @@ pub struct RuntimeContext<'a> {
     /// before any TUI or `herdr-core` socket is contacted.
     pub runtime_backend: &'a crate::runtime_adapter::RuntimeBackendSelection,
     pub trusted_local_ipc: bool,
+    /// 1.2/S0+S2: the wire correlation id (`request_id` header or JSON-RPC
+    /// id) when the HTTP boundary resolved one. The request ledger uses this
+    /// same id so `request.status` answers the id the caller already sees on
+    /// the envelope; absent for direct `tool_call` paths, which fall back to
+    /// the generated `req_*` id.
+    pub wire_request_id: Option<&'a str>,
 }
 
 /// The parent-session binding decision for one `agent.task.dispatch`.
@@ -1359,7 +1365,12 @@ fn herdr_call_with_request_ledger(
             .map_err(|_| "state store lock is poisoned".to_owned())?;
         // The lookup and the pending insert must share one lock: two
         // concurrent submissions of the same key can never both execute.
-        store.request_ledger_begin_or_replay(client_request_id, &method, now_ms)
+        store.request_ledger_begin_or_replay(
+            client_request_id,
+            &method,
+            context.wire_request_id,
+            now_ms,
+        )
     };
     match begin {
         crate::request_ledger::LedgerBegin::Replay(record) => {
@@ -27952,6 +27963,7 @@ mod tests {
             browser_mutation_admission: None,
             runtime_backend: &runtime_backend,
             trusted_local_ipc: true,
+            wire_request_id: None,
         };
 
         let resp = handle(
@@ -31541,6 +31553,7 @@ mod client_request_shape_matrix_tests {
             browser_mutation_admission: None,
             runtime_backend: &runtime_backend,
             trusted_local_ipc: false,
+            wire_request_id: None,
         };
 
         // 1. herdr_call params as JSON object vs JSON string vs null/omitted
@@ -31886,6 +31899,7 @@ mod client_request_shape_matrix_tests {
                     browser_mutation_admission: None,
                     runtime_backend: &backend,
                     trusted_local_ipc: false,
+                    wire_request_id: None,
                 }
             };
 
@@ -32928,6 +32942,7 @@ mod text_transfer_safety_tests {
             browser_mutation_admission: None,
             runtime_backend: &backend,
             trusted_local_ipc: false,
+            wire_request_id: None,
         };
         let call = |method: &str, params: Value| -> Value {
             let response = handle(&json!({

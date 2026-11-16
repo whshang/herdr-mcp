@@ -252,8 +252,18 @@ impl RequestLedger {
         }
     }
 
-    /// Reserve a pending record; returns the runtime request id.
-    pub fn begin(&mut self, client_request_id: &str, method: &str, now_ms: i64) -> String {
+    /// Reserve a pending record; returns the request id used. When the wire
+    /// boundary already minted a correlation id (1.2/S0 `request_id` header or
+    /// JSON-RPC id) the ledger adopts it, so `request.status` answers the same
+    /// id the caller saw on the envelope; direct `tool_call` paths fall back to
+    /// the generated `req_*` id.
+    pub fn begin(
+        &mut self,
+        client_request_id: &str,
+        method: &str,
+        preferred_request_id: Option<&str>,
+        now_ms: i64,
+    ) -> String {
         self.evict_expired(now_ms);
         // Capacity: oldest updated entry goes first.
         while self.entries.len() >= REQUEST_LEDGER_MAX_ENTRIES {
@@ -267,7 +277,10 @@ impl RequestLedger {
             };
             self.entries.remove(&oldest_key);
         }
-        let request_id = next_request_id();
+        let request_id = preferred_request_id
+            .filter(|id| !id.is_empty() && id.chars().count() <= CLIENT_REQUEST_ID_MAX_LEN)
+            .map(str::to_owned)
+            .unwrap_or_else(next_request_id);
         self.entries.insert(
             client_request_id.to_owned(),
             RequestLedgerRecord {
@@ -327,13 +340,14 @@ impl RequestLedger {
         &mut self,
         client_request_id: &str,
         method: &str,
+        preferred_request_id: Option<&str>,
         now_ms: i64,
     ) -> LedgerBegin {
         match self.lookup(client_request_id, now_ms) {
             LedgerReplay::Final(record) => LedgerBegin::Replay(record),
             LedgerReplay::InFlight(record) => LedgerBegin::InFlight(record),
             LedgerReplay::Miss => LedgerBegin::Execute {
-                request_id: self.begin(client_request_id, method, now_ms),
+                request_id: self.begin(client_request_id, method, preferred_request_id, now_ms),
             },
         }
     }
@@ -389,7 +403,7 @@ mod tests {
     #[test]
     fn duplicate_submission_returns_recorded_result_without_reexecuting() {
         let mut ledger = RequestLedger::default();
-        ledger.begin("c1", "agent.dispatch", 1000);
+        ledger.begin("c1", "agent.dispatch", None, 1000);
         ledger.settle("c1", &ok_result(), 1005);
         match ledger.lookup("c1", 1010) {
             LedgerReplay::Final(record) => {
@@ -404,7 +418,7 @@ mod tests {
     #[test]
     fn in_flight_duplicate_does_not_double_execute() {
         let mut ledger = RequestLedger::default();
-        ledger.begin("c1", "agent.dispatch", 1000);
+        ledger.begin("c1", "agent.dispatch", None, 1000);
         match ledger.lookup("c1", 1001) {
             LedgerReplay::InFlight(record) => {
                 let response = in_flight_response(&record);
@@ -434,7 +448,7 @@ mod tests {
     #[test]
     fn ttl_expiry_makes_resubmission_fresh() {
         let mut ledger = RequestLedger::default();
-        ledger.begin("c1", "agent.dispatch", 1000);
+        ledger.begin("c1", "agent.dispatch", None, 1000);
         ledger.settle("c1", &ok_result(), 1001);
         match ledger.lookup("c1", 1001 + REQUEST_LEDGER_TTL_MS + 1) {
             LedgerReplay::Miss => {}
@@ -447,10 +461,10 @@ mod tests {
         let mut ledger = RequestLedger::default();
         for index in 0..REQUEST_LEDGER_MAX_ENTRIES {
             let key = format!("c{index}");
-            ledger.begin(&key, "m", index as i64);
+            ledger.begin(&key, "m", None, index as i64);
             ledger.settle(&key, &ok_result(), index as i64);
         }
-        ledger.begin("overflow", "m", REQUEST_LEDGER_MAX_ENTRIES as i64);
+        ledger.begin("overflow", "m", None, REQUEST_LEDGER_MAX_ENTRIES as i64);
         assert!(matches!(ledger.lookup("c0", 1_000_000), LedgerReplay::Miss));
         assert!(matches!(
             ledger.lookup("overflow", 1_000_000),
@@ -486,10 +500,22 @@ mod tests {
     fn oversized_result_is_summarized_not_stored_verbatim() {
         let huge = json!({"ok": true, "blob": "x".repeat(RESULT_SUMMARY_MAX_BYTES + 100)});
         let mut ledger = RequestLedger::default();
-        ledger.begin("c1", "m", 0);
+        ledger.begin("c1", "m", None, 0);
         ledger.settle("c1", &huge, 1);
         let status = ledger.status("c1", 2);
         assert!(status["result"]["result_digest"].is_string());
         assert!(status["result"].get("blob").is_none());
+    }
+
+    #[test]
+    fn wire_request_id_is_adopted_over_generated() {
+        let mut ledger = RequestLedger::default();
+        let id = ledger.begin("c1", "m", Some("edge-req-7"), 0);
+        assert_eq!(id, "edge-req-7");
+        ledger.settle("c1", &ok_result(), 1);
+        // Status resolves by the wire id the caller saw on the envelope.
+        let status = ledger.status("edge-req-7", 2);
+        assert_eq!(status["found"], true);
+        assert_eq!(status["client_request_id"], "c1");
     }
 }
