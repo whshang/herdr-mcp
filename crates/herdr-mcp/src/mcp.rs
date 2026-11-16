@@ -59,6 +59,9 @@ mod result_projection;
 #[cfg(all(test, unix))]
 mod inspect_route_tests;
 
+#[cfg(all(test, unix))]
+mod request_ledger_tests;
+
 use result_projection::{image_tool_result, model_visible_tool_output, tool_result};
 
 pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";

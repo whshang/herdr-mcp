@@ -355,6 +355,27 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
                     return Ok(Vec::new());
                 };
                 let request_id = slot.request.request_id.clone();
+                // 1.2/S2: the timeout answer carries the wire request id, the
+                // caller-supplied client_request_id when one was provided, and
+                // a concrete request.status hint so the caller can resolve the
+                // uncertain outcome instead of blind retry.
+                let client_request_id = slot
+                    .request
+                    .arguments
+                    .as_ref()
+                    .and_then(|args| args.get("client_request_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let mut details = json!({
+                    "timeout_ms": slot.timeout_ms,
+                    "request_id": request_id,
+                    "status_hint": "query herdr_mcp.request.status with request_id or client_request_id for the outcome",
+                });
+                if let Some(key) = client_request_id
+                    && let Some(object) = details.as_object_mut()
+                {
+                    object.insert("client_request_id".to_owned(), json!(key));
+                }
                 Ok(vec![self.immediate_error(
                     &request_id,
                     CODE_REQUEST_TIMEOUT,
@@ -365,7 +386,7 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
                     ),
                     DeliveryState::DeliveryUnknown,
                     now_ms,
-                    Some(json!({"timeout_ms": slot.timeout_ms})),
+                    Some(details),
                 )])
             }
             RuntimeEvent::DispatchCompleted {
