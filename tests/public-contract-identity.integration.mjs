@@ -41,13 +41,17 @@ test("runtime execution contract epoch 4 is independent of the public contract e
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name === "herdr_skill"), true);
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name.startsWith("herdr_mcp.")), false);
 
-  // Current runtime execution contract: epoch-5 identity over the frozen 18-tool shape.
+  // Deployed Edge still advertises the epoch-5 identity (previous window slot).
+  // The Rust runtime moved to epoch 6 in this change; the Edge descriptor is a
+  // frozen source constant until the Edge companion ships. Sibling repo
+  // herdr-edge must update `edge/cloudflare/src/contracts/runtime.ts` +
+  // `test-compat` so the next Edge release advertises epoch 6 / v6 hash.
   assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 5);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, PUBLIC_CONTRACT_HASH);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030");
 
-  assert.equal(PUBLIC_CONTRACT_EPOCH, 5);
-  assert.equal(PUBLIC_CONTRACT_HASH, "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030");
+  assert.equal(PUBLIC_CONTRACT_EPOCH, 6);
+  assert.equal(PUBLIC_CONTRACT_HASH, "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e");
   assert.equal(EDGE_EPOCH, 3);
   assert.equal(EDGE_HASH, EPOCH3_CONTRACT.contract_hash);
   assert.equal(EPOCH3_CONTRACT.tool_count, 19);
@@ -59,7 +63,7 @@ test("runtime execution contract epoch 4 is independent of the public contract e
   assert.equal(PUBLIC_CONTRACT_PROFILE, "epoch2");
 
   // The cutover/domain probe follows the current runtime execution contract.
-  assert.equal(DOMAIN_EPOCH, 5);
+  assert.equal(DOMAIN_EPOCH, 6);
   assert.equal(DOMAIN_HASH, PUBLIC_CONTRACT_HASH);
   assert.equal(DOMAIN_TOOL_COUNT, 18);
 });

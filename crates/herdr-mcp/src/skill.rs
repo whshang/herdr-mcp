@@ -707,7 +707,7 @@ mod tests {
         assert!(content.contains("## Live herdr-mcp runtime context"));
         assert!(content.contains("# Herdr-MCP remote planner"));
         assert!(content.contains("## 1. Connected-tool calling contract"));
-        assert!(content.contains("`params` as a **JSON object string**"));
+        assert!(content.contains("`params` as a JSON object (preferred)"));
         assert!(content.contains("Use `command` **or** `steps`, never both"));
         assert!(content.contains("Start once with `herdr_exec_start`"));
         assert!(content.contains("`herdr_exec_read(next_offset)`"));
@@ -770,7 +770,7 @@ mod tests {
             "active_binary+runtime_generation_manager"
         );
         assert!(runtime.get("self_update").is_none());
-        assert_eq!(runtime["tool_execution"]["contract_epoch"], 5);
+        assert_eq!(runtime["tool_execution"]["contract_epoch"], 6);
         assert_eq!(runtime["tool_execution"]["tool_count"], 18);
         assert_eq!(
             runtime["tool_execution"]["server_concurrent_requests"],

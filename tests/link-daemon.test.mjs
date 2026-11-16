@@ -55,12 +55,12 @@ test("daemon config rejects non-websocket edge and invalid contract pairs", () =
 test("user cannot start a rollback contract | Given the frozen epoch-1 pair | When readLinkDaemonConfig runs | Then it is rejected before any manager construction", () => {
   assert.throws(
     () => readLinkDaemonConfig(env({ HERDR_CONTRACT_EPOCH: "1", HERDR_CONTRACT_HASH: LEGACY_EPOCH1_CONTRACT_HASH })),
-    /requires contract epoch 5/,
+    /requires contract epoch 6/,
   );
   // A legacy hash without an explicit epoch no longer defaults to a runnable pair either.
   assert.throws(
     () => readLinkDaemonConfig(env({ HERDR_CONTRACT_HASH: LEGACY_EPOCH1_CONTRACT_HASH })),
-    /requires contract epoch 5/,
+    /requires contract epoch 6/,
   );
 });
 

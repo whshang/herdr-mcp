@@ -59,7 +59,7 @@ export const LOCAL_MCP_MAX_TIMEOUT_MS = 120_000;
  * Rust `LOCAL_MCP_CONTRACT_EPOCH`, so the advertised epoch always matches the
  * advertised contract hash.
  */
-export const LOCAL_MCP_CONTRACT_EPOCH = 5 as const;
+export const LOCAL_MCP_CONTRACT_EPOCH = 6 as const;
 
 /** Stable failure codes emitted by this transport (RuntimeToolResult.code). */
 export const LOCAL_MCP_CODE = {
