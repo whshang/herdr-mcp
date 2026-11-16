@@ -145,19 +145,48 @@ enum StoredResult {
 
 fn store_result(result: &Value) -> StoredResult {
     let serialized = serde_json::to_string(result).unwrap_or_default();
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    serialized.hash(&mut hasher);
     StoredResult::Summarized {
         code: result
             .get("code")
             .and_then(Value::as_str)
             .map(str::to_owned),
         ok: result.get("ok").and_then(Value::as_bool).unwrap_or(false),
-        digest_hex: format!("{:016x}", hasher.finish()),
+        digest_hex: digest_hex(&serialized),
         result_bytes: serialized.len(),
     }
+}
+
+/// Bounded caller/request identity recorded at `begin`: a fingerprint of the
+/// request payload (never the payload itself) plus the caller's scope, so a
+/// same-key replay is only honored for the same request from the same scope.
+#[derive(Clone, Debug)]
+pub struct LedgerIdentity {
+    /// Digest of the canonicalized `{method, params}` the key was submitted
+    /// with. Two different requests sharing one key are a conflict, never a
+    /// replay of whichever landed first.
+    pub request_digest: String,
+    /// Minimal caller-scope fingerprint (session/device); `request.status`
+    /// and replays honor a record only for the scope that created it.
+    pub caller_scope: String,
+}
+
+impl LedgerIdentity {
+    /// Digest a canonical request pair. serde_json object serialization is
+    /// already key-sorted for `Map`, so this is stable across encoders.
+    pub fn of(method: &str, params: &Value, caller_scope: &str) -> Self {
+        Self {
+            request_digest: digest_hex(&json!({"method": method, "params": params}).to_string()),
+            caller_scope: caller_scope.to_owned(),
+        }
+    }
+}
+
+fn digest_hex(input: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +194,10 @@ pub struct RequestLedgerRecord {
     pub request_id: String,
     pub client_request_id: String,
     pub method: String,
+    /// Fingerprint of the request the key was first seen with.
+    request_digest: String,
+    /// Scope that may replay or query this record.
+    caller_scope: String,
     pub state: RequestLedgerState,
     result: StoredResult,
     pub created_ms: i64,
@@ -213,17 +246,26 @@ pub enum LedgerReplay {
     Final(RequestLedgerRecord),
     /// A record exists but the first submission is still executing.
     InFlight(RequestLedgerRecord),
-    /// Nothing recorded for this key.
+    /// Nothing recorded for this key (or the record belongs to another
+    /// caller scope, which is reported identically so key existence never
+    /// leaks across scopes).
     Miss,
 }
 /// Outcome of an atomic dedupe + reserve under one lock.
 pub enum LedgerBegin {
     /// New key: execute and then `settle` with the result.
     Execute { request_id: String },
-    /// Terminal record exists: replay it, never re-execute.
+    /// Terminal record exists with the same request fingerprint and scope:
+    /// replay it, never re-execute.
     Replay(RequestLedgerRecord),
     /// First submission still executing: fail closed.
     InFlight(RequestLedgerRecord),
+    /// Same key but a different request fingerprint or caller scope: the
+    /// caller must pick a new `client_request_id`, never silently replay.
+    Conflict,
+    /// At capacity with no terminal entry evictable: refuse the new key
+    /// rather than dropping an in-flight record.
+    CapacityExceeded,
 }
 
 #[derive(Default, Debug)]
@@ -238,15 +280,25 @@ impl RequestLedger {
     }
 
     /// Dedupe check before execution. Expired entries are dropped first so a
-    /// resubmission past the TTL behaves like a fresh request.
-    pub fn lookup(&mut self, client_request_id: &str, now_ms: i64) -> LedgerReplay {
+    /// resubmission past the TTL behaves like a fresh request. `caller_scope`
+    /// must match the recorded scope: another scope sees `Miss`, never the
+    /// record, so existence never leaks across scopes.
+    pub fn lookup(
+        &mut self,
+        client_request_id: &str,
+        caller_scope: &str,
+        now_ms: i64,
+    ) -> LedgerReplay {
         self.evict_expired(now_ms);
         match self.entries.get(client_request_id) {
-            Some(record) if record.state == RequestLedgerState::Pending => {
-                LedgerReplay::InFlight(record.clone())
+            Some(record) if record.caller_scope == caller_scope => {
+                if record.state == RequestLedgerState::Pending {
+                    LedgerReplay::InFlight(record.clone())
+                } else {
+                    LedgerReplay::Final(record.clone())
+                }
             }
-            Some(record) => LedgerReplay::Final(record.clone()),
-            None => LedgerReplay::Miss,
+            Some(_) | None => LedgerReplay::Miss,
         }
     }
 
@@ -255,23 +307,36 @@ impl RequestLedger {
     /// JSON-RPC id) the ledger adopts it, so `request.status` answers the same
     /// id the caller saw on the envelope; direct `tool_call` paths fall back to
     /// the generated `req_*` id.
+    ///
+    /// Capacity eviction is terminal-only: an in-flight record must never be
+    /// dropped, because dropping it would let a duplicate of an in-flight
+    /// mutation execute twice. With no terminal entry evictable the new key is
+    /// refused instead.
     pub fn begin(
         &mut self,
         client_request_id: &str,
         method: &str,
+        identity: &LedgerIdentity,
         preferred_request_id: Option<&str>,
         now_ms: i64,
-    ) -> String {
+    ) -> Result<String, Value> {
         self.evict_expired(now_ms);
-        // Capacity: oldest updated entry goes first.
         while self.entries.len() >= REQUEST_LEDGER_MAX_ENTRIES {
+            // Only terminal entries are evictable.
             let Some(oldest_key) = self
                 .entries
                 .iter()
+                .filter(|(_, record)| record.state != RequestLedgerState::Pending)
                 .min_by_key(|(_, record)| record.updated_ms)
                 .map(|(key, _)| key.clone())
             else {
-                break;
+                return Err(json!({
+                    "ok": false,
+                    "code": "request_ledger_full",
+                    "retryable": true,
+                    "delivery_state": "not_delivered",
+                    "message": "request ledger is at capacity with in-flight work; retry after the in-flight requests settle",
+                }));
             };
             self.entries.remove(&oldest_key);
         }
@@ -285,13 +350,15 @@ impl RequestLedger {
                 request_id: request_id.clone(),
                 client_request_id: client_request_id.to_owned(),
                 method: method.to_owned(),
+                request_digest: identity.request_digest.clone(),
+                caller_scope: identity.caller_scope.clone(),
                 state: RequestLedgerState::Pending,
                 result: StoredResult::None,
                 created_ms: now_ms,
                 updated_ms: now_ms,
             },
         );
-        request_id
+        Ok(request_id)
     }
 
     /// Settle a pending record with the execution result.
@@ -305,9 +372,11 @@ impl RequestLedger {
         }
     }
 
-    /// Public query used by `herdr_mcp.request.status`.
-    pub fn status(&mut self, key: &str, now_ms: i64) -> Value {
-        match self.lookup(key, now_ms) {
+    /// Public query used by `herdr_mcp.request.status`. `caller_scope` must
+    /// match the record's scope; a foreign-scope record answers `found:false`
+    /// exactly like an unknown key, so existence never leaks across scopes.
+    pub fn status(&mut self, key: &str, caller_scope: &str, now_ms: i64) -> Value {
+        match self.lookup(key, caller_scope, now_ms) {
             LedgerReplay::Final(record) | LedgerReplay::InFlight(record) => {
                 let mut status = record.status_json();
                 status["ok"] = json!(true);
@@ -315,7 +384,9 @@ impl RequestLedger {
                 status
             }
             LedgerReplay::Miss => {
-                if let Some(record) = self.by_request_id(key) {
+                if let Some(record) = self.by_request_id(key)
+                    && record.caller_scope == caller_scope
+                {
                     let mut status = record.status_json();
                     status["ok"] = json!(true);
                     status["found"] = json!(true);
@@ -325,7 +396,7 @@ impl RequestLedger {
                     "ok": true,
                     "found": false,
                     "state": "unknown",
-                    "message": "no ledger record for this request id; it expired, predates this runtime generation, or was never submitted with client_request_id",
+                    "message": "no ledger record for this request id; it expired, predates this runtime generation, was never submitted with client_request_id, or belongs to a different caller scope",
                 })
             }
         }
@@ -333,19 +404,41 @@ impl RequestLedger {
 
     /// Atomic dedupe + reserve: one store lock covers the lookup and the
     /// pending insert, so two concurrent submissions of the same key can
-    /// never both execute.
+    /// never both execute. A hit requires the same request fingerprint and
+    /// the same caller scope; anything else under the same key is a conflict,
+    /// never a silent replay of a different request.
     pub fn begin_or_replay(
         &mut self,
         client_request_id: &str,
         method: &str,
+        identity: &LedgerIdentity,
         preferred_request_id: Option<&str>,
         now_ms: i64,
     ) -> LedgerBegin {
-        match self.lookup(client_request_id, now_ms) {
-            LedgerReplay::Final(record) => LedgerBegin::Replay(record),
-            LedgerReplay::InFlight(record) => LedgerBegin::InFlight(record),
-            LedgerReplay::Miss => LedgerBegin::Execute {
-                request_id: self.begin(client_request_id, method, preferred_request_id, now_ms),
+        self.evict_expired(now_ms);
+        match self.entries.get(client_request_id) {
+            Some(record)
+                if record.request_digest == identity.request_digest
+                    && record.caller_scope == identity.caller_scope =>
+            {
+                if record.state == RequestLedgerState::Pending {
+                    LedgerBegin::InFlight(record.clone())
+                } else {
+                    LedgerBegin::Replay(record.clone())
+                }
+            }
+            // Same key, different request or caller: conflict, not replay and
+            // not a fresh execution over the existing record.
+            Some(_) => LedgerBegin::Conflict,
+            None => match self.begin(
+                client_request_id,
+                method,
+                identity,
+                preferred_request_id,
+                now_ms,
+            ) {
+                Ok(request_id) => LedgerBegin::Execute { request_id },
+                Err(_) => LedgerBegin::CapacityExceeded,
             },
         }
     }
@@ -398,12 +491,18 @@ mod tests {
         json!({"ok": true, "task_id": "t1"})
     }
 
+    fn identity() -> LedgerIdentity {
+        LedgerIdentity::of("m", &json!({}), "scope-a")
+    }
+
     #[test]
     fn duplicate_submission_returns_recorded_result_without_reexecuting() {
         let mut ledger = RequestLedger::default();
-        ledger.begin("c1", "agent.dispatch", None, 1000);
+        ledger
+            .begin("c1", "agent.dispatch", &identity(), None, 1000)
+            .unwrap();
         ledger.settle("c1", &ok_result(), 1005);
-        match ledger.lookup("c1", 1010) {
+        match ledger.lookup("c1", "scope-a", 1010) {
             LedgerReplay::Final(record) => {
                 let replay = replay_response(&record);
                 // Digest-only projection: replays never re-emit the payload.
@@ -419,8 +518,10 @@ mod tests {
     #[test]
     fn in_flight_duplicate_does_not_double_execute() {
         let mut ledger = RequestLedger::default();
-        ledger.begin("c1", "agent.dispatch", None, 1000);
-        match ledger.lookup("c1", 1001) {
+        ledger
+            .begin("c1", "agent.dispatch", &identity(), None, 1000)
+            .unwrap();
+        match ledger.lookup("c1", "scope-a", 1001) {
             LedgerReplay::InFlight(record) => {
                 let response = in_flight_response(&record);
                 assert_eq!(response["code"], "request_in_flight");
@@ -449,9 +550,11 @@ mod tests {
     #[test]
     fn ttl_expiry_makes_resubmission_fresh() {
         let mut ledger = RequestLedger::default();
-        ledger.begin("c1", "agent.dispatch", None, 1000);
+        ledger
+            .begin("c1", "agent.dispatch", &identity(), None, 1000)
+            .unwrap();
         ledger.settle("c1", &ok_result(), 1001);
-        match ledger.lookup("c1", 1001 + REQUEST_LEDGER_TTL_MS + 1) {
+        match ledger.lookup("c1", "scope-a", 1001 + REQUEST_LEDGER_TTL_MS + 1) {
             LedgerReplay::Miss => {}
             _ => panic!("expired entry must not replay"),
         }
@@ -462,13 +565,26 @@ mod tests {
         let mut ledger = RequestLedger::default();
         for index in 0..REQUEST_LEDGER_MAX_ENTRIES {
             let key = format!("c{index}");
-            ledger.begin(&key, "m", None, index as i64);
+            ledger
+                .begin(&key, "m", &identity(), None, index as i64)
+                .unwrap();
             ledger.settle(&key, &ok_result(), index as i64);
         }
-        ledger.begin("overflow", "m", None, REQUEST_LEDGER_MAX_ENTRIES as i64);
-        assert!(matches!(ledger.lookup("c0", 1_000_000), LedgerReplay::Miss));
+        ledger
+            .begin(
+                "overflow",
+                "m",
+                &identity(),
+                None,
+                REQUEST_LEDGER_MAX_ENTRIES as i64,
+            )
+            .unwrap();
         assert!(matches!(
-            ledger.lookup("overflow", 1_000_000),
+            ledger.lookup("c0", "scope-a", 1_000_000),
+            LedgerReplay::Miss
+        ));
+        assert!(matches!(
+            ledger.lookup("overflow", "scope-a", 1_000_000),
             LedgerReplay::InFlight(_)
         ));
     }
@@ -476,7 +592,7 @@ mod tests {
     #[test]
     fn status_reports_unknown_for_missing_key() {
         let mut ledger = RequestLedger::default();
-        let status = ledger.status("nope", 1000);
+        let status = ledger.status("nope", "scope-a", 1000);
         assert_eq!(status["state"], "unknown");
         assert_eq!(status["found"], false);
     }
@@ -504,9 +620,11 @@ mod tests {
     fn small_result_is_digest_only_never_verbatim() {
         let result = json!({"ok": true, "text": "secret prompt body with NOVOS_AGENT_TRACE_HUB"});
         let mut ledger = RequestLedger::default();
-        ledger.begin("c1", "agent.prompt", None, 0);
+        ledger
+            .begin("c1", "agent.prompt", &identity(), None, 0)
+            .unwrap();
         ledger.settle("c1", &result, 1);
-        let status = ledger.status("c1", 2);
+        let status = ledger.status("c1", "scope-a", 2);
         assert_eq!(status["found"], true);
         assert_eq!(status["result"]["ok"], true);
         assert_eq!(status["result"]["result_summary"], true);
@@ -517,7 +635,7 @@ mod tests {
         );
         assert!(status["result"].get("text").is_none());
         // A duplicate submission replays the same projection, not the body.
-        match ledger.lookup("c1", 3) {
+        match ledger.lookup("c1", "scope-a", 3) {
             LedgerReplay::Final(record) => {
                 let replay = replay_response(&record);
                 assert!(replay.get("text").is_none());
@@ -531,21 +649,133 @@ mod tests {
     fn oversized_result_is_summarized_not_stored_verbatim() {
         let huge = json!({"ok": true, "blob": "x".repeat(8192 + 100)});
         let mut ledger = RequestLedger::default();
-        ledger.begin("c1", "m", None, 0);
+        ledger.begin("c1", "m", &identity(), None, 0).unwrap();
         ledger.settle("c1", &huge, 1);
-        let status = ledger.status("c1", 2);
+        let status = ledger.status("c1", "scope-a", 2);
         assert!(status["result"]["result_digest"].is_string());
         assert!(status["result"].get("blob").is_none());
+    }
+
+    /// user caller | Given one key already bound to a request | When the same
+    /// key arrives with a different request digest | Then it is a conflict,
+    /// never a replay of the first request.
+    #[test]
+    fn same_key_different_request_is_conflict_not_replay() {
+        let mut ledger = RequestLedger::default();
+        let identity_a = LedgerIdentity::of("agent.prompt", &json!({"text": "a"}), "scope-a");
+        ledger
+            .begin("c1", "agent.prompt", &identity_a, None, 0)
+            .unwrap();
+        ledger.settle("c1", &ok_result(), 1);
+
+        let identity_b = LedgerIdentity::of("agent.prompt", &json!({"text": "b"}), "scope-a");
+        assert!(matches!(
+            ledger.begin_or_replay("c1", "agent.prompt", &identity_b, None, 2),
+            LedgerBegin::Conflict
+        ));
+        // The original record still replays for the matching fingerprint.
+        assert!(matches!(
+            ledger.begin_or_replay("c1", "agent.prompt", &identity_a, None, 3),
+            LedgerBegin::Replay(_)
+        ));
+    }
+
+    /// user caller | Given one key bound to scope-a | When scope-b submits the
+    /// same key with the identical request | Then it is a conflict and status
+    /// from scope-b hides the record entirely.
+    #[test]
+    fn foreign_scope_conflict_and_status_hides_record() {
+        let mut ledger = RequestLedger::default();
+        let identity_a = LedgerIdentity::of("agent.prompt", &json!({}), "scope-a");
+        ledger
+            .begin("c1", "agent.prompt", &identity_a, None, 0)
+            .unwrap();
+        ledger.settle("c1", &ok_result(), 1);
+
+        // Same key + same request from another scope: conflict, no replay.
+        let identity_b = LedgerIdentity::of("agent.prompt", &json!({}), "scope-b");
+        assert!(matches!(
+            ledger.begin_or_replay("c1", "agent.prompt", &identity_b, None, 2),
+            LedgerBegin::Conflict
+        ));
+        // request.status from scope-b must not observe scope-a's record.
+        let foreign = ledger.status("c1", "scope-b", 3);
+        assert_eq!(foreign["found"], false);
+        assert_eq!(foreign["state"], "unknown");
+        // The owning scope still resolves it.
+        let owned = ledger.status("c1", "scope-a", 4);
+        assert_eq!(owned["found"], true);
+        assert_eq!(owned["state"], "applied");
+    }
+
+    /// user caller | Given a ledger full of pending records | When a new key
+    /// arrives | Then it is refused rather than evicting an in-flight record,
+    /// so a duplicate of in-flight work can never double-execute.
+    #[test]
+    fn full_ledger_of_pending_refuses_instead_of_evicting_in_flight() {
+        let mut ledger = RequestLedger::default();
+        for index in 0..REQUEST_LEDGER_MAX_ENTRIES {
+            ledger
+                .begin(&format!("c{index}"), "m", &identity(), None, index as i64)
+                .unwrap();
+        }
+        // No terminal entry exists; the new key must be refused.
+        assert!(matches!(
+            ledger.begin_or_replay("overflow", "m", &identity(), None, 1_000_000),
+            LedgerBegin::CapacityExceeded
+        ));
+        // Once one record settles, that terminal slot becomes evictable.
+        ledger.settle("c0", &ok_result(), 1_000_001);
+        assert!(matches!(
+            ledger.begin_or_replay("overflow", "m", &identity(), None, 1_000_002),
+            LedgerBegin::Execute { .. }
+        ));
+        // Every original pending key is still tracked (in-flight preserved).
+        assert!(matches!(
+            ledger.lookup("c1", "scope-a", 1_000_003),
+            LedgerReplay::InFlight(_)
+        ));
+    }
+
+    /// user caller | Given a pending record | When a duplicate submission
+    /// arrives mid-flight | Then it fails closed with request_in_flight and
+    /// the record can still settle once.
+    #[test]
+    fn settle_after_error_path_leaves_terminal_state() {
+        let mut ledger = RequestLedger::default();
+        ledger.begin("c1", "m", &identity(), None, 0).unwrap();
+        // Simulates the admitted_tool_output error path: settle with
+        // delivery_unknown so the key reports unknown, not pending forever.
+        ledger.settle(
+            "c1",
+            &json!({"ok": false, "code": "internal_error", "delivery_state": "delivery_unknown"}),
+            1,
+        );
+        match ledger.lookup("c1", "scope-a", 2) {
+            LedgerReplay::Final(record) => {
+                assert_eq!(record.state, RequestLedgerState::Unknown);
+            }
+            _ => panic!("error settle must produce a terminal record"),
+        }
+        let status = ledger.status("c1", "scope-a", 3);
+        assert_eq!(status["state"], "unknown");
+        // And the record is terminal, so a same-request resubmit replays it.
+        assert!(matches!(
+            ledger.begin_or_replay("c1", "m", &identity(), None, 4),
+            LedgerBegin::Replay(_)
+        ));
     }
 
     #[test]
     fn wire_request_id_is_adopted_over_generated() {
         let mut ledger = RequestLedger::default();
-        let id = ledger.begin("c1", "m", Some("edge-req-7"), 0);
+        let id = ledger
+            .begin("c1", "m", &identity(), Some("edge-req-7"), 0)
+            .unwrap();
         assert_eq!(id, "edge-req-7");
         ledger.settle("c1", &ok_result(), 1);
         // Status resolves by the wire id the caller saw on the envelope.
-        let status = ledger.status("edge-req-7", 2);
+        let status = ledger.status("edge-req-7", "scope-a", 2);
         assert_eq!(status["found"], true);
         assert_eq!(status["client_request_id"], "c1");
     }

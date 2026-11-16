@@ -201,3 +201,61 @@ fn client_request_id_hygiene_rejects_before_ledger() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// user caller | Given one key already settled for a request | When the same
+/// key arrives with different params | Then it is an idempotency conflict,
+/// never a replay of the first request's result.
+#[test]
+fn same_key_different_request_is_idempotency_conflict() {
+    let root = std::env::temp_dir().join(format!(
+        "herdr-ledger-conflict-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let client = HerdrClient::new(root.join("absent.sock"));
+    let cache = EventCache::from_snapshot_for_test(json!({
+        "workspaces": [], "tabs": [], "panes": [], "agents": []
+    }));
+    let exec = ExecRegistry::new(root.join("exec")).unwrap();
+    let prompt = PromptRegistry::new();
+    let skill = SkillService::new();
+    let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+    let backend = crate::test_env::tui_backend_selection();
+    let context = ledger_context(
+        &client,
+        &cache,
+        &exec,
+        &prompt,
+        &skill,
+        &state_store,
+        &backend,
+    );
+
+    let first_call = |params: Value| {
+        json!({"params": {"name": "herdr_call", "arguments": {
+            "method": "herdr_mcp.request.status",
+            "params": params,
+            "client_request_id": "conflict-key"
+        }}})
+    };
+    let first =
+        call_body(&tool_call(&first_call(json!({"request_id": "a"})).clone(), &context).unwrap());
+    assert_eq!(first["ok"], true, "{first}");
+
+    // Same key, different params body: conflict, not replay.
+    let conflict =
+        call_body(&tool_call(&first_call(json!({"request_id": "different"})), &context).unwrap());
+    assert_eq!(conflict["ok"], false, "{conflict}");
+    assert_eq!(conflict["code"], "idempotency_conflict", "{conflict}");
+    assert_eq!(conflict["delivery_state"], "not_delivered", "{conflict}");
+
+    // The original request still replays with its own params.
+    let replay = call_body(&tool_call(&first_call(json!({"request_id": "a"})), &context).unwrap());
+    assert_eq!(replay["deduplicated"], true, "{replay}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
