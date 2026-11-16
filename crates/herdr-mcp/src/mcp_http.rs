@@ -5019,8 +5019,34 @@ mod tests {
             panic!("Core child failed to bind a socket");
         }
 
+        struct ScratchGuard {
+            root: PathBuf,
+            previous_config_dir: Option<std::ffi::OsString>,
+            previous_backend: Option<std::ffi::OsString>,
+        }
+        impl Drop for ScratchGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.previous_config_dir.take() {
+                        Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                        None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+                    }
+                    match self.previous_backend.take() {
+                        Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                        None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+
         let _guard = crate::test_env::lock();
         let root = test_root("core-restart");
+        let _scratch = ScratchGuard {
+            root: root.clone(),
+            previous_config_dir: env::var_os("HERDR_MCP_CONFIG_DIR"),
+            previous_backend: env::var_os("HERDR_MCP_RUNTIME_BACKEND"),
+        };
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
         // Keep the macOS Unix socket path under the platform length limit.
@@ -5040,8 +5066,6 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
-        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
         unsafe {
             env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
             env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
@@ -5124,17 +5148,6 @@ mod tests {
         });
         assert_eq!(std::fs::read_to_string(&second_log).unwrap(), "status\n");
         drop(second);
-        unsafe {
-            match previous_config_dir {
-                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
-                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
-            }
-            match previous_backend {
-                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
-                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
-            }
-        }
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
