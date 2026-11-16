@@ -90,6 +90,37 @@ mod tests {
         assert!(silence_expired(101, None, None, 100));
     }
 
+    /// 1.2/S6 follow-up: the shipped cadence is safe, the reverted one was not.
+    /// `last_edge_seen` advances only on inbound application frames (the Edge
+    /// status reply each heartbeat elicits); between two heartbeats it can age
+    /// at most `heartbeat_ms`. 30s/90s keeps every gap inside the budget, while
+    /// the former 300s heartbeat let the base age past it and forced a recycle.
+    #[test]
+    fn thirty_second_heartbeat_stays_inside_silence_but_three_hundred_did_not() {
+        let silence = super::super::transport::LINK_DEFAULT_MAX_SILENCE_MS;
+        let shipped = super::super::transport::LINK_DEFAULT_HEARTBEAT_MS;
+        assert_eq!(shipped, 30_000);
+
+        // Connected at t=0, then one Edge status reply per heartbeat: the base
+        // never ages more than one heartbeat interval, so it never expires.
+        for tick in 1..20 {
+            let last_seen = shipped * tick;
+            let now = last_seen + shipped;
+            assert!(
+                !silence_expired(now, Some(last_seen), Some(0), silence),
+                "30s heartbeat must never expire at tick {tick} (gap {shipped}ms < {silence}ms)"
+            );
+        }
+
+        // Regression guard for the 300s configuration: three silence windows
+        // pass before the first reply lands, so the watchdog recycles.
+        let previous = 300_000_i64;
+        assert!(
+            silence_expired(previous, Some(0), Some(0), silence),
+            "300s heartbeat lets last_edge_seen age to {previous}ms > {silence}ms and recycles"
+        );
+    }
+
     #[test]
     fn shared_batch5_fixture_matches_heartbeat_and_silence_oracle() {
         let fixture: Value = serde_json::from_str(include_str!(
