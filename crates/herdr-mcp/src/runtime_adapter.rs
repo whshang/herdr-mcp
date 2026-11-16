@@ -1881,7 +1881,7 @@ impl PublicToolRoute {
 pub fn public_tool_route(
     tool_name: &str,
     admitted: &RuntimeBackendSelection,
-    expected_target: Option<&str>,
+    expected_target: Option<&Value>,
 ) -> Result<PublicToolRoute, Value> {
     let selection = verify_admitted_backend(admitted).map_err(|error| {
         invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
@@ -1985,7 +1985,7 @@ fn admission_drift(
 fn public_tool_route_for_selection(
     tool_name: &str,
     selection: &RuntimeBackendSelection,
-    expected_target: Option<&str>,
+    expected_target: Option<&Value>,
 ) -> Result<PublicToolRoute, Value> {
     match selection.backend {
         RuntimeBackend::Tui => Ok(PublicToolRoute::Tui(selection.clone())),
@@ -2015,8 +2015,22 @@ fn public_tool_route_for_selection(
                     "message": "herdr-core backend selected without a resolved socket path",
                 }));
             };
+            let pre_hello_target = match expected_target {
+                Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+                Some(_) => {
+                    return Err(json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "expected_core_target must be a non-empty string",
+                        "delivery_state": "not_delivered",
+                        "fallback_allowed": false,
+                        "retryable": false,
+                    }));
+                }
+                None => None,
+            };
             let mut client = HerdrCoreClient::new(socket_path);
-            client.pre_hello_expected_target = expected_target.map(str::to_owned);
+            client.pre_hello_expected_target = pre_hello_target.map(str::to_owned);
             let capability_check = client.admit_public_tool(tool_name).map_err(|mut rejection| {
                 if let Some(object) = rejection.as_object_mut() {
                     object.insert("operation".to_owned(), json!(tool_name));

@@ -5129,6 +5129,24 @@ mod tests {
             "the Core must be a new process"
         );
         runtime.block_on(async {
+            for invalid_target in [json!(""), json!(123)] {
+                let invalid = call_public_tool(
+                    &app,
+                    "herdr_call",
+                    json!({
+                        "method": "server.status",
+                        "params": {"expected_core_target": invalid_target}
+                    }),
+                )
+                .await;
+                assert_eq!(invalid["code"], "invalid_params", "{invalid}");
+                assert_eq!(invalid["delivery_state"], "not_delivered");
+                assert_eq!(invalid["fallback_allowed"], false);
+                assert!(
+                    !second_log.exists(),
+                    "invalid conditional target must not transmit any bytes"
+                );
+            }
             let rejected = call_public_tool(
                 &app,
                 "herdr_call",

@@ -1225,9 +1225,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             .and_then(Value::as_str)
             .is_some_and(|method| method.trim().eq_ignore_ascii_case("server.status"))
     {
-        arguments
-            .pointer("/params/expected_core_target")
-            .and_then(Value::as_str)
+        arguments.pointer("/params/expected_core_target")
     } else {
         None
     };
