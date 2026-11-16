@@ -629,6 +629,36 @@ impl HerdrCoreClient {
         &self.socket_path
     }
 
+    /// Advisory Unix listener identity for conditional cross-request reads.
+    /// This is not peer authentication; a same-UID process may replace it.
+    pub fn advisory_target_ref(&self, core_id: Option<&str>) -> Option<String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+            let metadata = std::fs::symlink_metadata(&self.socket_path).ok()?;
+            if !metadata.file_type().is_socket() {
+                return None;
+            }
+            Some(format!(
+                "unix:{}:{}:{}",
+                metadata.dev(),
+                metadata.ino(),
+                core_id.unwrap_or("")
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = core_id;
+            None
+        }
+    }
+
+    pub fn admitted_target_ref(&self) -> Option<String> {
+        let hello = self.admitted_hello.as_ref()?;
+        self.advisory_target_ref(hello.core_id.as_deref())
+    }
+
     pub fn handshake(&self) -> Result<HerdrCoreHello, HerdrCoreError> {
         self.with_negotiated_session(|hello, _stream| Ok(hello))
     }
@@ -2202,7 +2232,8 @@ pub fn herdr_core_methods(client: &HerdrCoreClient, query: &str) -> Value {
             "core_id": hello.core_id,
             "core_name": hello.core_name,
             "protocol_generation": hello.generation,
-            "identity_scope": "hello on this connection; not an authenticated or pinned process identity",
+            "target_ref": client.advisory_target_ref(hello.core_id.as_deref()),
+            "identity_scope": "advisory hello and Unix socket identity; not an authenticated or pinned process identity",
         },
     })
 }
@@ -2270,7 +2301,66 @@ pub fn herdr_core_call(client: &HerdrCoreClient, method: &str, params: Value) ->
             "message": message,
         });
     }
-    match client.call_allowed_method(method, params) {
+    let mut params = params;
+    let expected_target = params.get("expected_core_target");
+    let expected_target = if let Some(value) = expected_target {
+        if !method.eq_ignore_ascii_case("server.status") {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "expected_core_target is only supported for read-only server.status",
+                "delivery_state": "not_delivered",
+                "fallback_allowed": false,
+                "retryable": false,
+            });
+        }
+        let Some(expected) = value.as_str().filter(|value| !value.is_empty()) else {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "expected_core_target must be a non-empty string",
+                "delivery_state": "not_delivered",
+                "fallback_allowed": false,
+                "retryable": false,
+            });
+        };
+        let expected = expected.to_owned();
+        params
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_core_target");
+        Some(expected)
+    } else {
+        None
+    };
+    if let Some(expected) = &expected_target
+        && client.admitted_target_ref().as_deref() != Some(expected)
+    {
+        return json!({
+            "ok": false,
+            "code": "herdr_core_target_changed",
+            "message": "the Core listener target differs from the previous request",
+            "runtime_backend": "herdr-core",
+            "delivery_state": "not_delivered",
+            "fallback_allowed": false,
+            "retryable": false,
+        });
+    }
+    let result = client.call_allowed_method(method, params);
+    if let Some(expected) = &expected_target
+        && client.admitted_target_ref().as_deref() != Some(expected)
+    {
+        return json!({
+            "ok": false,
+            "code": "herdr_core_target_changed",
+            "message": "the Core listener changed while serving the requested read",
+            "runtime_backend": "herdr-core",
+            "delivery_state": "not_delivered",
+            "fallback_allowed": false,
+            "retryable": false,
+        });
+    }
+    match result {
         Ok(result) => json!({
             "ok": true,
             "runtime_backend": "herdr-core",
@@ -3489,6 +3579,27 @@ mod tests {
                 hc_peer_effective_uid(&stream, &socket).unwrap(),
                 hc_current_effective_uid()
             );
+            std::fs::remove_file(&socket).ok();
+        }
+
+        #[test]
+        fn advisory_target_changes_when_socket_listener_is_replaced() {
+            let socket = peer_socket_path("target-rebind");
+            let first_listener = UnixListener::bind(&socket).unwrap();
+            let client = HerdrCoreClient::new(&socket);
+            let original = client.advisory_target_ref(Some("same-core")).unwrap();
+            assert_eq!(
+                original,
+                client.advisory_target_ref(Some("same-core")).unwrap()
+            );
+
+            std::fs::remove_file(&socket).unwrap();
+            let second_listener = UnixListener::bind(&socket).unwrap();
+            let replacement = client.advisory_target_ref(Some("same-core")).unwrap();
+            assert_ne!(original, replacement);
+
+            drop(second_listener);
+            drop(first_listener);
             std::fs::remove_file(&socket).ok();
         }
 
