@@ -22,10 +22,6 @@ pub const REQUEST_LEDGER_MAX_ENTRIES: usize = 1024;
 pub const REQUEST_LEDGER_TTL_MS: i64 = 30 * 60 * 1000;
 /// `client_request_id` validation mirrors `idempotency_key` hygiene.
 pub const CLIENT_REQUEST_ID_MAX_LEN: usize = 256;
-/// Stored results are capped so a prompt-sized payload never lands verbatim in
-/// the ledger; larger results keep a digest plus head/tail summary only.
-const RESULT_SUMMARY_MAX_BYTES: usize = 8192;
-
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic, process-unique runtime request id. `req_` prefix keeps it
@@ -131,25 +127,24 @@ pub fn classify_result_state(result: &Value) -> RequestLedgerState {
     RequestLedgerState::Rejected
 }
 
-/// A stored result. Results larger than the summary cap are replaced by a
-/// bounded projection; the digest still lets a caller correlate the full
-/// out-of-band response.
+/// A stored result is never the verbatim response: the ledger only keeps a
+/// bounded projection (status fields + digest + byte count) so prompt text,
+/// file content, or any other payload body can never be read back through
+/// `request.status`, regardless of result size.
 #[derive(Clone, Debug)]
 enum StoredResult {
-    Full(Value),
+    /// No result yet (pending record).
+    None,
     Summarized {
         code: Option<String>,
         ok: bool,
-        sha256_hex: String,
-        truncated_bytes: usize,
+        digest_hex: String,
+        result_bytes: usize,
     },
 }
 
 fn store_result(result: &Value) -> StoredResult {
     let serialized = serde_json::to_string(result).unwrap_or_default();
-    if serialized.len() <= RESULT_SUMMARY_MAX_BYTES {
-        return StoredResult::Full(result.clone());
-    }
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -160,8 +155,8 @@ fn store_result(result: &Value) -> StoredResult {
             .and_then(Value::as_str)
             .map(str::to_owned),
         ok: result.get("ok").and_then(Value::as_bool).unwrap_or(false),
-        sha256_hex: format!("{:016x}", hasher.finish()),
-        truncated_bytes: serialized.len() - RESULT_SUMMARY_MAX_BYTES,
+        digest_hex: format!("{:016x}", hasher.finish()),
+        result_bytes: serialized.len(),
     }
 }
 
@@ -177,21 +172,24 @@ pub struct RequestLedgerRecord {
 }
 
 impl RequestLedgerRecord {
-    /// Result projection for a replay or a `request.status` answer.
+    /// Result projection for a replay or a `request.status` answer. Only the
+    /// bounded projection ever leaves the ledger: `ok`, the failure code, a
+    /// content digest, and the original byte size — never the payload itself.
     fn result_json(&self) -> Value {
         match &self.result {
-            StoredResult::Full(result) => result.clone(),
+            StoredResult::None => Value::Null,
             StoredResult::Summarized {
                 code,
                 ok,
-                sha256_hex,
-                truncated_bytes,
+                digest_hex,
+                result_bytes,
             } => json!({
                 "ok": ok,
-                "code": code.clone().unwrap_or_else(|| "result_summarized".to_owned()),
-                "result_digest": sha256_hex,
-                "result_truncated_bytes": truncated_bytes,
-                "message": "stored result exceeded the ledger summary cap; the digest identifies the full response",
+                "code": code.clone().unwrap_or_else(|| "result_recorded".to_owned()),
+                "result_digest": digest_hex,
+                "result_bytes": result_bytes,
+                "result_summary": true,
+                "message": "the ledger stores a digest-only projection; it never retains the response body",
             }),
         }
     }
@@ -288,7 +286,7 @@ impl RequestLedger {
                 client_request_id: client_request_id.to_owned(),
                 method: method.to_owned(),
                 state: RequestLedgerState::Pending,
-                result: StoredResult::Full(Value::Null),
+                result: StoredResult::None,
                 created_ms: now_ms,
                 updated_ms: now_ms,
             },
@@ -408,7 +406,10 @@ mod tests {
         match ledger.lookup("c1", 1010) {
             LedgerReplay::Final(record) => {
                 let replay = replay_response(&record);
-                assert_eq!(replay["task_id"], "t1");
+                // Digest-only projection: replays never re-emit the payload.
+                assert_eq!(replay["result_summary"], true);
+                assert!(replay["result_digest"].is_string());
+                assert!(replay.get("task_id").is_none());
                 assert_eq!(replay["deduplicated"], true);
             }
             _ => panic!("expected terminal replay"),
@@ -496,9 +497,39 @@ mod tests {
         }
     }
 
+    /// user caller | Given a small successful result | When it settles in the
+    /// ledger | Then `request.status` and replay expose only the digest
+    /// projection — the response body is never stored or readable back.
+    #[test]
+    fn small_result_is_digest_only_never_verbatim() {
+        let result = json!({"ok": true, "text": "secret prompt body with NOVOS_AGENT_TRACE_HUB"});
+        let mut ledger = RequestLedger::default();
+        ledger.begin("c1", "agent.prompt", None, 0);
+        ledger.settle("c1", &result, 1);
+        let status = ledger.status("c1", 2);
+        assert_eq!(status["found"], true);
+        assert_eq!(status["result"]["ok"], true);
+        assert_eq!(status["result"]["result_summary"], true);
+        assert!(status["result"]["result_digest"].is_string());
+        assert_eq!(
+            status["result"]["result_bytes"],
+            json!(serde_json::to_string(&result).unwrap().len())
+        );
+        assert!(status["result"].get("text").is_none());
+        // A duplicate submission replays the same projection, not the body.
+        match ledger.lookup("c1", 3) {
+            LedgerReplay::Final(record) => {
+                let replay = replay_response(&record);
+                assert!(replay.get("text").is_none());
+                assert!(replay["result_digest"].is_string());
+            }
+            _ => panic!("expected terminal replay"),
+        }
+    }
+
     #[test]
     fn oversized_result_is_summarized_not_stored_verbatim() {
-        let huge = json!({"ok": true, "blob": "x".repeat(RESULT_SUMMARY_MAX_BYTES + 100)});
+        let huge = json!({"ok": true, "blob": "x".repeat(8192 + 100)});
         let mut ledger = RequestLedger::default();
         ledger.begin("c1", "m", None, 0);
         ledger.settle("c1", &huge, 1);
