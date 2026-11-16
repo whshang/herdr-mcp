@@ -7913,6 +7913,7 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
             })
@@ -8110,6 +8111,7 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
             })
@@ -8261,6 +8263,7 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
             })
@@ -8369,6 +8372,7 @@ mod tests {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            request_id: None,
             max_runtime_ms: None,
             on_budget: None,
             budget_events: Vec::new(),
@@ -9659,6 +9663,7 @@ mod tests {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            request_id: None,
             max_runtime_ms: None,
             on_budget: None,
             budget_events: Vec::new(),
@@ -10907,6 +10912,7 @@ mod tests {
                 parent_target,
                 parent_session_ref,
                 stall_after_ms: None,
+                request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
             })
@@ -11128,6 +11134,7 @@ mod tests {
                 "idempotency_key": "guard-self-1",
             }),
             None,
+            None,
         );
         server.join().unwrap();
 
@@ -11191,6 +11198,7 @@ mod tests {
                 "idempotency_key": "guard-depth-1",
             }),
             None,
+            None,
         );
         assert_eq!(rejected["ok"], false);
         assert_eq!(rejected["code"], "delegation_depth_exceeded");
@@ -11231,6 +11239,7 @@ mod tests {
                 "parent_target": "supervisor",
                 "idempotency_key": "guard-depth-2",
             }),
+            None,
             None,
         );
         server.join().unwrap();
