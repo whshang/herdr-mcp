@@ -4927,6 +4927,229 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    // A real OS child serves the Core protocol; separate launches have
+    // distinct kernel peer PIDs even when the socket path is reused.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child Core protocol server started by public_core_restart_rejects_stale_target"]
+    fn core_restart_protocol_child() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let socket = std::env::var("HERDR_TEST_RESTART_SOCKET").unwrap();
+        let log = std::env::var("HERDR_TEST_RESTART_LOG").unwrap();
+        let listener = UnixListener::bind(socket).unwrap();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                if method == "server.status" {
+                    use std::io::Write as _;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log)
+                        .unwrap()
+                        .write_all(b"status\n")
+                        .unwrap();
+                }
+                let envelope = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": core_fixture_result_at(method, &request["params"], None)
+                });
+                if writeln!(stream, "{envelope}").is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_core_restart_rejects_stale_target() {
+        use std::process::{Child, Command, Stdio};
+        use std::time::Duration;
+
+        struct CoreProcess {
+            child: Child,
+            socket: PathBuf,
+        }
+        impl Drop for CoreProcess {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_file(&self.socket);
+            }
+        }
+
+        fn start(socket: &std::path::Path, log: &std::path::Path) -> CoreProcess {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mcp_http::tests::core_restart_protocol_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("HERDR_TEST_RESTART_SOCKET", socket)
+                .env("HERDR_TEST_RESTART_LOG", log)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut server = CoreProcess {
+                child,
+                socket: socket.to_owned(),
+            };
+            for _ in 0..200 {
+                if socket.exists() {
+                    return server;
+                }
+                assert!(
+                    server.child.try_wait().unwrap().is_none(),
+                    "Core child exited early"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("Core child failed to bind a socket");
+        }
+
+        struct ScratchGuard {
+            root: PathBuf,
+            previous_config_dir: Option<std::ffi::OsString>,
+            previous_backend: Option<std::ffi::OsString>,
+        }
+        impl Drop for ScratchGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.previous_config_dir.take() {
+                        Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                        None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+                    }
+                    match self.previous_backend.take() {
+                        Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                        None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+
+        let _guard = crate::test_env::lock();
+        let root = test_root("core-restart");
+        let _scratch = ScratchGuard {
+            root: root.clone(),
+            previous_config_dir: env::var_os("HERDR_MCP_CONFIG_DIR"),
+            previous_backend: env::var_os("HERDR_MCP_RUNTIME_BACKEND"),
+        };
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        // Keep the macOS Unix socket path under the platform length limit.
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/hc-restart-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            config_dir.join("config.json"),
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": socket}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+
+        let mut state = test_state_with_snapshot(
+            &root.join("http"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        adopt_env_admitted_backend(&mut state);
+        let app = candidate_router(state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let first_log = root.join("first-status.log");
+        let first = start(&socket, &first_log);
+        let first_pid = first.child.id();
+        let old_target = runtime.block_on(async {
+            let methods = call_public_tool(&app, "herdr_methods", json!({})).await;
+            assert_eq!(methods["ok"], true, "{methods}");
+            let target = methods["herdr_core"]["target_ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(target.starts_with(&format!("unix:{}:", first.child.id())));
+            let status = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({
+                    "method": "server.status", "params": {"expected_core_target": target}
+                }),
+            )
+            .await;
+            assert_eq!(status["ok"], true, "{status}");
+            target
+        });
+        assert_eq!(std::fs::read_to_string(&first_log).unwrap(), "status\n");
+        drop(first);
+
+        let second_log = root.join("second-status.log");
+        let second = start(&socket, &second_log);
+        assert_ne!(
+            second.child.id(),
+            first_pid,
+            "the Core must be a new process"
+        );
+        runtime.block_on(async {
+            let rejected = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({
+                    "method": "server.status", "params": {"expected_core_target": old_target}
+                }),
+            )
+            .await;
+            assert_eq!(rejected["code"], "herdr_core_target_changed", "{rejected}");
+            assert_eq!(rejected["delivery_state"], "not_delivered");
+            assert_eq!(rejected["fallback_allowed"], false);
+            assert_eq!(rejected["retryable"], false);
+            assert!(
+                !second_log.exists(),
+                "stale target must not reach server.status"
+            );
+
+            let methods = call_public_tool(&app, "herdr_methods", json!({})).await;
+            let new_target = methods["herdr_core"]["target_ref"].as_str().unwrap();
+            assert!(new_target.starts_with(&format!("unix:{}:", second.child.id())));
+            assert_ne!(new_target, old_target);
+            let accepted = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({
+                    "method": "server.status", "params": {"expected_core_target": new_target}
+                }),
+            )
+            .await;
+            assert_eq!(accepted["ok"], true, "{accepted}");
+        });
+        assert_eq!(std::fs::read_to_string(&second_log).unwrap(), "status\n");
+        drop(second);
+    }
+
     #[test]
     fn extension_consent_serializes_with_browser_mutation_gate() {
         let root = test_root("browser-consent-mutation-gate");
