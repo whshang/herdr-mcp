@@ -25,10 +25,13 @@ use serde_json::{Number, Value};
 use std::io::{self, Write};
 
 pub const LINK_DEFAULT_TRANSPORT_PING_MS: i64 = 30_000;
-/// Application-level telemetry/checkpoint heartbeat. RFC WebSocket ping/pong
-/// owns transport liveness, so the JSON heartbeat can stay sparse and avoid
-/// waking a hibernated Edge Durable Object during otherwise idle periods.
-pub const LINK_DEFAULT_HEARTBEAT_MS: i64 = 300_000;
+/// Application-level heartbeat. RFC WebSocket ping/pong is unavailable on
+/// Cloudflare Workers WebSockets, so `last_edge_seen_ms` only advances on
+/// application frames; a heartbeat longer than `LINK_DEFAULT_MAX_SILENCE_MS`
+/// guarantees a silence-recycle every window. 30s matches the Node default
+/// and Edge's 30s status-reply cadence, yielding exactly one inbound liveness
+/// frame per heartbeat — well inside the 90s silence budget.
+pub const LINK_DEFAULT_HEARTBEAT_MS: i64 = 30_000;
 pub const LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS: i64 = 10_000;
 pub const LINK_DEFAULT_MAX_FRAME_BYTES: usize = 262_144;
 pub const LINK_DEFAULT_MAX_SILENCE_MS: i64 = 90_000;
@@ -819,7 +822,7 @@ mod tests {
                 },
                 TransportAction::StartOnlineTimers {
                     transport_ping_ms: 30_000,
-                    heartbeat_ms: 300_000,
+                    heartbeat_ms: 30_000,
                     silence_check_ms: 30_000.0,
                 }
             ]
