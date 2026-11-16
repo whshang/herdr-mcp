@@ -69,6 +69,15 @@ const SPAWN_READY_POLL: Duration = Duration::from_millis(200);
 /// chain reports a resumable checkpoint instead of an orphan in-flight key.
 const SPAWN_READY_MIN_POLL_MS: u64 = 250;
 const SPAWN_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 1.2 S5: how long after a confirmed `agent.start` the chain keeps watching
+/// for an early exit (a dead-on-start model/alias typically exits within
+/// seconds). Bounded so a healthy agent is never held for the full window.
+const SPAWN_EARLY_EXIT_WINDOW_MS: u64 = 10_000;
+/// Poll cadence inside the early-exit window; coarser than readiness polling
+/// because death is a discrete event, not a latency-sensitive transition.
+const SPAWN_EARLY_EXIT_POLL: Duration = Duration::from_millis(500);
+/// Bound on the sanitized pane tail attached to an `agent_start_failed`.
+const SPAWN_FAILURE_TAIL_LINES: usize = 20;
 /// Upper bound for one pane mutation, always cut down to the remaining chain.
 const SPAWN_PANE_TIMEOUT_MS: u64 = 10_000;
 const SPAWN_AGENT_NAME_MAX: usize = 32;
@@ -93,6 +102,8 @@ struct RegisterTaskInput<'a> {
     parent_target: Option<&'a str>,
     parent_session_ref: Option<&'a str>,
     stall_after_ms: Option<u64>,
+    max_runtime_ms: Option<u64>,
+    on_budget: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +201,19 @@ struct PromptTaskRecord {
     worker_done_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stall_after_ms: Option<u64>,
+    /// 1.2 S5: optional wall-clock run cap from task creation. Expiry emits
+    /// an `agent_budget_exceeded` event to the parent; it never terminates the
+    /// task by itself. Absent on older records, which keep loading unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_runtime_ms: Option<u64>,
+    /// What to do when a budget expires: "notify" (default) or "interrupt".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_budget: Option<String>,
+    /// Durable budget events already emitted for this task, so a restart or a
+    /// second tracker pass never re-notifies or re-interrupts. Each entry is
+    /// `{event, at_ms, notification_state, [interrupt_state]}`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    budget_events: Vec<Value>,
     #[serde(skip)]
     gate: Option<DecisionGate>,
 }
@@ -260,6 +284,7 @@ impl PromptTaskRecord {
                 ("last_heartbeat_at_ms", self.last_heartbeat_at_ms),
                 ("worker_done_at_ms", self.worker_done_at_ms),
                 ("stall_after_ms", self.stall_after_ms),
+                ("max_runtime_ms", self.max_runtime_ms),
             ] {
                 if let Some(value) = value {
                     object.insert(key.to_owned(), json!(value));
@@ -273,6 +298,12 @@ impl PromptTaskRecord {
             }
             if let Some(awaiting_children) = self.awaiting_children {
                 object.insert("awaiting_children".to_owned(), json!(awaiting_children));
+            }
+            if let Some(on_budget) = &self.on_budget {
+                object.insert("on_budget".to_owned(), json!(on_budget));
+            }
+            if !self.budget_events.is_empty() {
+                object.insert("budget_events".to_owned(), json!(self.budget_events));
             }
         }
         public
@@ -589,6 +620,8 @@ impl PromptRegistry {
             parent_target,
             parent_session_ref,
             stall_after_ms,
+            max_runtime_ms,
+            on_budget,
         } = input;
         if submitted == Some(false) || self.inner.store.is_none() {
             return Ok(None);
@@ -665,6 +698,9 @@ impl PromptRegistry {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            max_runtime_ms: None,
+            on_budget: None,
+            budget_events: Vec::new(),
             gate: None,
             final_excerpt: None,
             awaiting_children: None,
@@ -687,6 +723,8 @@ impl PromptRegistry {
             mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
         }
         record.stall_after_ms = stall_after_ms;
+        record.max_runtime_ms = max_runtime_ms;
+        record.on_budget = on_budget.map(str::to_owned);
         self.save_task(&record, Some(fingerprint))?;
         drop(guard);
         let reconciled = self.reconcile_task(task_id)?;
@@ -1331,6 +1369,7 @@ impl PromptRegistry {
                         };
                         let registry = PromptRegistry { inner };
                         registry.reconcile_activity_timeouts();
+                        registry.sweep_task_budgets();
                         last_timeout_scan = std::time::Instant::now();
                     }
                 }
@@ -1359,6 +1398,164 @@ impl PromptRegistry {
         for task in tasks {
             if task.lifecycle == PromptTaskLifecycle::AwaitingActivity {
                 let _ = self.reconcile_task(&task.task_id);
+            }
+        }
+    }
+
+    /// 1.2 S5: emit budget events for non-terminal tasks whose explicit
+    /// `stall_after_ms` or `max_runtime_ms` has expired. Notify-only by
+    /// default; `on_budget:"interrupt"` additionally sends one explicit C-c.
+    /// Each event is recorded durably before delivery so a restart or a second
+    /// pass never re-notifies or re-interrupts. Tasks without caps are skipped
+    /// entirely (the default 20-minute stall liveness projection is unchanged
+    /// and emits nothing). Never terminates a task.
+    fn sweep_task_budgets(&self) {
+        let Ok(tasks) = self.list_tasks(512) else {
+            return;
+        };
+        let now = self.now_ms();
+        for task in tasks {
+            if task.is_terminal() {
+                continue;
+            }
+            let mut due: Vec<&'static str> = Vec::new();
+            if let Some(stall) = task.stall_after_ms
+                && now.saturating_sub(task.updated_at_ms) >= stall
+                && !task.budget_events.iter().any(|event| {
+                    event.get("event").and_then(Value::as_str) == Some("agent_stalled")
+                })
+            {
+                due.push("agent_stalled");
+            }
+            if let Some(cap) = task.max_runtime_ms
+                && now.saturating_sub(task.created_at_ms) >= cap
+                && !task.budget_events.iter().any(|event| {
+                    event.get("event").and_then(Value::as_str) == Some("agent_budget_exceeded")
+                })
+            {
+                due.push("agent_budget_exceeded");
+            }
+            for event in due {
+                self.emit_budget_event(&task.task_id, event, now);
+            }
+        }
+    }
+
+    /// Record one budget event under the task mutation lock, then deliver the
+    /// parent notification (and optional interrupt) outside the lock. The
+    /// event row is persisted first with `notification_state:"pending"`; the
+    /// delivery outcome updates that row, mirroring terminal notifications.
+    fn emit_budget_event(&self, task_id: &str, event: &str, now: u64) {
+        let Ok(_guard) = self.inner.task_mutations.lock() else {
+            return;
+        };
+        let Ok(Some(mut task)) = self.load_task(task_id) else {
+            return;
+        };
+        if task.is_terminal()
+            || task
+                .budget_events
+                .iter()
+                .any(|row| row.get("event").and_then(Value::as_str) == Some(event))
+        {
+            return;
+        }
+        let interrupt_requested = task.on_budget.as_deref() == Some("interrupt");
+        task.budget_events.push(json!({
+            "event": event,
+            "at_ms": now,
+            "notification_state": "pending",
+            "interrupt_state": if interrupt_requested { "pending" } else { "not_requested" },
+        }));
+        // Budget events are observations, not activity: do not touch
+        // updated_at_ms, or a stall event would reset its own stall clock.
+        if self.save_task(&task, None).is_err() {
+            return;
+        }
+        drop(_guard);
+        self.deliver_budget_event(task_id, event, now, interrupt_requested);
+    }
+
+    fn deliver_budget_event(&self, task_id: &str, event: &str, now: u64, interrupt: bool) {
+        let Some(client) = self.inner.client.as_ref() else {
+            return;
+        };
+        let Ok(Some(task)) = self.load_task(task_id) else {
+            return;
+        };
+        let mut notification_state = "not_attempted".to_owned();
+        let mut notification_error: Option<String> = None;
+        if let Some(parent_target) = task.parent_target.as_deref() {
+            let text = format!(
+                "Herdr child-task budget event: {event} for task {} (child {}). The task is still running; this is a notification, not a completion. Inspect it with agent status/inbox before deciding to wait, interrupt, or re-dispatch.",
+                task.task_id, task.target
+            );
+            match client.call_with_timeout(
+                "agent.prompt",
+                json!({"target": parent_target, "text": text}),
+                Duration::from_secs(10),
+            ) {
+                Ok(_) => notification_state = "delivered".to_owned(),
+                Err(error) => {
+                    notification_state = if definitely_not_delivered(&error) {
+                        "not_delivered".to_owned()
+                    } else {
+                        "uncertain".to_owned()
+                    };
+                    notification_error = Some(truncate_chars(&error.message, 512));
+                }
+            }
+        }
+        let mut interrupt_state = "not_requested".to_owned();
+        if interrupt {
+            interrupt_state = self.interrupt_task_pane(client, &task);
+        }
+        let Ok(_guard) = self.inner.task_mutations.lock() else {
+            return;
+        };
+        let Ok(Some(mut task)) = self.load_task(task_id) else {
+            return;
+        };
+        if let Some(row) = task
+            .budget_events
+            .iter_mut()
+            .find(|row| row.get("event").and_then(Value::as_str) == Some(event))
+        {
+            row["notification_state"] = json!(notification_state);
+            row["interrupt_state"] = json!(interrupt_state);
+            if let Some(error) = notification_error {
+                row["notification_error"] = json!(error);
+            }
+            let _ = now;
+        }
+        let _ = self.save_task(&task, None);
+    }
+
+    /// One explicit C-c to the task's own pane, only when an agent is actively
+    /// working (mirrors browser_control::execute_interrupt's guard). Never
+    /// sends to a parent or an idle pane.
+    fn interrupt_task_pane(&self, client: &HerdrClient, task: &PromptTaskRecord) -> String {
+        let Some(pane_id) = task.pane_id.as_deref() else {
+            return "no_pane".to_owned();
+        };
+        let Some(state) = agent_state_of(client, pane_id) else {
+            return "agent_gone".to_owned();
+        };
+        if state.agent_status.as_deref() != Some("working") {
+            return "no_active_turn".to_owned();
+        }
+        match client.call_with_timeout(
+            "pane.send_keys",
+            json!({"pane_id": pane_id, "keys": ["C-c"]}),
+            Duration::from_secs(5),
+        ) {
+            Ok(_) => "sent".to_owned(),
+            Err(error) => {
+                if definitely_not_delivered(&error) {
+                    "not_delivered".to_owned()
+                } else {
+                    "uncertain".to_owned()
+                }
             }
         }
     }
@@ -3254,6 +3451,27 @@ pub fn run_with_parent_session(
             _ => return invalid("stall_after_ms must be an integer in 60000..=7200000"),
         },
     };
+    // 1.2 S5: optional run cap and budget action. Like stall_after_ms these
+    // are observation/governance preferences, not part of the mutation
+    // fingerprint; expiry notifies (or explicitly interrupts) but never
+    // terminates the task on its own.
+    let max_runtime_ms = match args.get("max_runtime_ms") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64() {
+            Some(value) if (60_000..=24 * 60 * 60_000).contains(&value) => Some(value),
+            _ => return invalid("max_runtime_ms must be an integer in 60000..=86400000"),
+        },
+    };
+    let on_budget = match args.get("on_budget") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value == "notify" || value == "interrupt" => {
+            Some(value.as_str())
+        }
+        Some(_) => return invalid("on_budget must be \"notify\" or \"interrupt\""),
+    };
+    if on_budget.is_some() && max_runtime_ms.is_none() && stall_after_ms.is_none() {
+        return invalid("on_budget requires max_runtime_ms or stall_after_ms");
+    }
     let inject_task_identity = match args.get("inject_task_identity") {
         None => false,
         Some(Value::Bool(value)) => *value,
@@ -3531,6 +3749,8 @@ pub fn run_with_parent_session(
         parent_target,
         parent_session_ref,
         stall_after_ms,
+        max_runtime_ms,
+        on_budget,
     }) {
         Ok(Some(task)) => {
             if let Some(object) = result.as_object_mut() {
@@ -3652,6 +3872,9 @@ struct SpawnRequest {
     split_from: Option<String>,
     direction: Option<String>,
     startup_timeout_ms: u64,
+    /// Explicit model alias (1.2 S5). Part of the mutation identity: a
+    /// different model is a different spawn intent under the same key.
+    model: Option<String>,
 }
 
 impl SpawnRequest {
@@ -3660,7 +3883,7 @@ impl SpawnRequest {
     /// budget is an execution preference like `wait`, so it cannot fork a key.
     fn request_fingerprint(&self, text: &str) -> String {
         let slot = |value: &Option<String>| value.clone().unwrap_or_default();
-        let spec = format!(
+        let mut spec = format!(
             "spawn/1\nkind={}\nworkspace={}\ncwd={}\ntab_label={}\nsplit_from={}\ndirection={}\nname={}",
             self.kind,
             slot(&self.workspace),
@@ -3670,6 +3893,11 @@ impl SpawnRequest {
             slot(&self.direction),
             slot(&self.name),
         );
+        // Keep the historical fingerprint byte-identical when no model is
+        // requested, so stored keys from older runtimes still replay.
+        if let Some(model) = &self.model {
+            spec.push_str(&format!("\nmodel={model}"));
+        }
         request_fingerprint(&spec, text)
     }
 }
@@ -3982,6 +4210,7 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
                 | "split_from"
                 | "direction"
                 | "startup_timeout_ms"
+                | "model"
         ) {
             return Err(spawn_invalid(&format!(
                 "spawn.{key} is not a supported spawn field"
@@ -4034,6 +4263,23 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
             }
         },
     };
+    // 1.2 S5: an explicit model alias is validated before any pane/agent
+    // mutation and before key reservation. Unknown aliases and kinds without
+    // an obtainable list fail closed (model_alias_unknown); a retry
+    // re-validates and refuses identically, never spawning with an
+    // unvalidated model.
+    let model = spawn_optional_string(object, "model", 256)?;
+    if let Some(alias) = &model {
+        let check = crate::model_alias::validate_model_alias(&kind, alias);
+        if !matches!(check, crate::model_alias::ModelAliasCheck::Validated { .. }) {
+            let mut refusal = crate::model_alias::model_alias_refusal(&kind, alias, &check);
+            if let Some(object) = refusal.as_object_mut() {
+                object.insert("failed_step".to_owned(), json!("validate"));
+                object.insert("requires_human".to_owned(), json!(false));
+            }
+            return Err(refusal);
+        }
+    }
     Ok(Some(SpawnRequest {
         kind,
         name,
@@ -4043,6 +4289,7 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
         split_from,
         direction,
         startup_timeout_ms,
+        model,
     }))
 }
 
@@ -4425,6 +4672,15 @@ fn spawn_probe_ready(client: &HerdrClient, pane_id: &str, timeout: Duration) -> 
 enum SpawnReadyOutcome {
     Ready(AgentState),
     TimedOut(Option<String>),
+    /// The started agent provably disappeared (1.2 S5 early-exit detection).
+    /// Carries the native evidence code (`agent_not_found`/`unknown_pane`/…).
+    Exited(String),
+}
+
+/// Native error codes that prove the agent/pane no longer exists, as opposed
+/// to a transient probe failure. Shared with `prompt_failure`'s resolve check.
+fn agent_gone_code(code: &str) -> bool {
+    matches!(code, "agent_not_found" | "unknown_agent" | "unknown_pane")
 }
 
 /// Wait for interactive readiness strictly inside the chain deadline.
@@ -4439,6 +4695,9 @@ fn spawn_wait_ready(
     mut probe_even_when_exhausted: bool,
 ) -> SpawnReadyOutcome {
     let mut last_status = None;
+    // A single gone-probe could race a pane teardown/recreate; two consecutive
+    // gone probes are required before the chain declares the agent exited.
+    let mut consecutive_gone = 0u32;
     loop {
         let remaining = deadline_ms.saturating_sub(registry.now_ms());
         let probe_now = std::mem::take(&mut probe_even_when_exhausted);
@@ -4455,15 +4714,166 @@ fn spawn_wait_ready(
             probe_timeout,
         ) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(error) => {
+                if agent_gone_code(&error.code) {
+                    consecutive_gone += 1;
+                    if consecutive_gone >= 2 {
+                        return SpawnReadyOutcome::Exited(error.code);
+                    }
+                } else {
+                    consecutive_gone = 0;
+                }
+                continue;
+            }
         };
         let Some(readiness) = spawn_agent_readiness(&value) else {
+            // A successful probe with no agent payload at all is also evidence
+            // the agent is gone (the pane fell back to a shell).
+            consecutive_gone += 1;
+            if consecutive_gone >= 2 {
+                return SpawnReadyOutcome::Exited("agent_not_found".to_owned());
+            }
             continue;
         };
+        consecutive_gone = 0;
         if readiness.ready {
             return SpawnReadyOutcome::Ready(readiness.state);
         }
         last_status = readiness.state.agent_status.clone();
+    }
+}
+
+/// Bounded, redacted pane tail for an `agent_start_failed` refusal. Reads the
+/// pane directly (the agent is gone, so `agent.read` may not serve it) and
+/// never returns raw secrets: ANSI/control stripping plus credential redaction.
+fn spawn_failure_pane_tail(client: &HerdrClient, pane_id: &str) -> Option<String> {
+    let response = client
+        .call_with_timeout(
+            "pane.read",
+            json!({"pane_id": pane_id, "lines": SPAWN_FAILURE_TAIL_LINES}),
+            Duration::from_secs(2),
+        )
+        .ok()?;
+    let read = response.get("read").unwrap_or(&response);
+    let text = ["content", "text", "output"]
+        .into_iter()
+        .find_map(|key| read.get(key).and_then(Value::as_str))?;
+    let stripped = strip_ansi_and_control(text);
+    let redacted = crate::work_capture::redact(&stripped);
+    let tail = redacted
+        .lines()
+        .rev()
+        .take(SPAWN_FAILURE_TAIL_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!tail.trim().is_empty()).then_some(tail)
+}
+
+/// The early-exit refusal: the agent was started but provably exited before
+/// the prompt was submitted. Not resumable — replaying must not prompt a dead
+/// pane; the caller reclaims it and dispatches a fresh spawn.
+fn spawn_agent_start_failed(
+    client: &HerdrClient,
+    progress: &SpawnProgress,
+    spawn: &SpawnDispatch,
+    pane_id: &str,
+    evidence_code: &str,
+) -> Value {
+    let mut failure = progress.failure(
+        spawn,
+        "agent_start",
+        &SpawnStepError {
+            code: "agent_start_failed".to_owned(),
+            message: format!(
+                "agent in pane {pane_id} exited before the prompt was submitted (evidence: {evidence_code})"
+            ),
+            hint: Some(
+                "the agent died on start (often an invalid model/alias or missing credentials); inspect the pane tail, reclaim this pane, and dispatch a new spawn with a corrected model".to_owned(),
+            ),
+        },
+    );
+    if let Some(tail) = spawn_failure_pane_tail(client, pane_id) {
+        failure["pane_tail"] = json!(tail);
+        failure["pane_tail_redacted"] = json!(true);
+    }
+    failure
+}
+
+/// The early-exit watch window, configurable via
+/// `HERDR_MCP_SPAWN_EARLY_EXIT_MS` (0 disables the post-readiness watch;
+/// the readiness loop still detects an agent that dies before ready).
+/// Defaults to ~10s and is always capped by the chain budget.
+fn spawn_early_exit_window_ms() -> u64 {
+    std::env::var("HERDR_MCP_SPAWN_EARLY_EXIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.min(SPAWN_EARLY_EXIT_WINDOW_MS))
+        .unwrap_or(SPAWN_EARLY_EXIT_WINDOW_MS)
+}
+
+/// Post-readiness early-exit watch (1.2 S5). After the start proved ready,
+/// keep observing for a bounded window so a dead-on-start agent is reported
+/// as `agent_start_failed` instead of a delivered prompt to a corpse. The
+/// window is capped by the chain deadline minus the prompt reserve AND a
+/// fraction of the chain, so a small caller budget keeps its prompt reserve;
+/// a healthy agent that stays present ends the watch at the window.
+fn spawn_watch_early_exit(
+    client: &HerdrClient,
+    registry: &PromptRegistry,
+    pane_id: &str,
+    chain_deadline_ms: u64,
+    chain_ms: u64,
+) -> Option<String> {
+    let window = spawn_early_exit_window_ms();
+    if window == 0 {
+        return None;
+    }
+    let reserve = spawn_prompt_reserve_ms(chain_ms);
+    let watch_deadline = registry
+        .now_ms()
+        .saturating_add(window.min(chain_ms / 4))
+        .min(chain_deadline_ms.saturating_sub(reserve));
+    let mut consecutive_gone = 0u32;
+    loop {
+        let now = registry.now_ms();
+        if now >= watch_deadline {
+            return None;
+        }
+        thread::sleep(SPAWN_EARLY_EXIT_POLL.min(Duration::from_millis(
+            watch_deadline.saturating_sub(now).max(1),
+        )));
+        // Cap each watch probe well below the fake-server read window and the
+        // remaining watch budget so a slow peer cannot stretch the window.
+        let probe_timeout = SPAWN_READY_PROBE_TIMEOUT.min(Duration::from_millis(
+            watch_deadline
+                .saturating_sub(registry.now_ms())
+                .clamp(1, 1_000),
+        ));
+        match client.call_with_timeout("agent.get", json!({"target": pane_id}), probe_timeout) {
+            Ok(value) => {
+                if spawn_agent_readiness(&value).is_some() {
+                    consecutive_gone = 0;
+                } else {
+                    consecutive_gone += 1;
+                    if consecutive_gone >= 2 {
+                        return Some("agent_not_found".to_owned());
+                    }
+                }
+            }
+            Err(error) => {
+                if agent_gone_code(&error.code) {
+                    consecutive_gone += 1;
+                    if consecutive_gone >= 2 {
+                        return Some(error.code);
+                    }
+                } else {
+                    consecutive_gone = 0;
+                }
+            }
+        }
     }
 }
 
@@ -4571,12 +4981,56 @@ fn spawn_chain(
                 ));
             }
             let native_timeout = start_budget.min(SPAWN_CHAIN_MAX_MS);
-            let start_params = json!({
+            let mut start_params = json!({
                 "name": spawn.agent_name,
                 "kind": spawn.request.kind,
                 "pane_id": pane_id,
                 "timeout_ms": native_timeout,
             });
+            // 1.2 S5: the alias was validated in parse_spawn; deliver it via
+            // the documented pi --model passthrough. A live schema that cannot
+            // carry it refuses here, before agent.start, never silently drops it.
+            if let Some(alias) = &spawn.request.model {
+                let properties = crate::schema::agent_start_param_properties();
+                let deliverable = match &properties {
+                    Ok(Some(props)) => crate::model_alias::start_params_support_model(props),
+                    _ => false,
+                };
+                if !deliverable {
+                    let check = crate::model_alias::ModelAliasCheck::Validated {
+                        canonical: alias.clone(),
+                    };
+                    let fact =
+                        crate::model_alias::validation_fact(&spawn.request.kind, alias, &check);
+                    let mut refusal = json!({
+                        "ok": false,
+                        "code": "model_delivery_unsupported",
+                        "kind": spawn.request.kind,
+                        "requested_model": alias,
+                        "delivery_state": "not_delivered",
+                        "submitted": false,
+                        "fallback_allowed": false,
+                        "retryable": false,
+                        "model_validation": fact,
+                        "message": "the live herdr agent.start schema cannot carry a model (no model property or args passthrough); the validated alias was not silently dropped",
+                    });
+                    if let Some(object) = refusal.as_object_mut() {
+                        object.insert("failed_step".to_owned(), json!("agent_start"));
+                        object.insert("spawn".to_owned(), progress.facts(spawn));
+                    }
+                    return Err(refusal);
+                }
+                let supports_native_model = properties
+                    .as_ref()
+                    .ok()
+                    .and_then(|props| props.as_ref())
+                    .is_some_and(|props| props.contains_key("model"));
+                if supports_native_model {
+                    start_params["model"] = json!(alias);
+                } else {
+                    start_params["args"] = json!(["--model", alias]);
+                }
+            }
             match client.call_with_timeout(
                 "agent.start",
                 start_params,
@@ -4652,6 +5106,11 @@ fn spawn_chain(
                         "replay the same idempotency key to re-check readiness and prompt once; the persisted pane and agent are reused",
                     ));
                 }
+                SpawnReadyOutcome::Exited(evidence) => {
+                    return Err(spawn_agent_start_failed(
+                        client, &progress, spawn, &pane_id, &evidence,
+                    ));
+                }
             }
         }
     };
@@ -4663,6 +5122,17 @@ fn spawn_chain(
             "ok": true,
             "agent_status": before.agent_status,
         }));
+    }
+
+    // 4. Early-exit watch (1.2 S5): a freshly started agent that dies within
+    //    the bounded window is reported as agent_start_failed, never prompted.
+    if started_method == "agent.start"
+        && let Some(evidence) =
+            spawn_watch_early_exit(client, registry, &pane_id, deadline, chain_ms)
+    {
+        return Err(spawn_agent_start_failed(
+            client, &progress, spawn, &pane_id, &evidence,
+        ));
     }
 
     let remaining = deadline.saturating_sub(registry.now_ms());
@@ -5760,19 +6230,41 @@ mod tests {
         })
     }
 
+    /// Disables the S5 post-readiness early-exit watch for the lifetime of the
+    /// guard, restoring the previous value on drop. Scripted spawn fakes answer
+    /// a fixed request sequence and must not receive extra watch probes. The
+    /// guard is returned alongside the registry so it lives exactly as long as
+    /// the test's registry binding, never leaking into a concurrent test.
+    struct SpawnWatchOff(Option<std::ffi::OsString>);
+
+    impl Drop for SpawnWatchOff {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(value) => env::set_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS", value),
+                    None => env::remove_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS"),
+                }
+            }
+        }
+    }
+
     fn spawn_registry_with(
         store: Arc<Mutex<StateStore>>,
         root: &Path,
         pane_columns: u16,
-    ) -> PromptRegistry {
+    ) -> (PromptRegistry, SpawnWatchOff) {
+        // Serialize against other env-sensitive tests while the watch is off.
+        let _env_guard = crate::test_env::lock();
+        let guard = SpawnWatchOff(env::var_os("HERDR_MCP_SPAWN_EARLY_EXIT_MS"));
+        unsafe { env::set_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS", "0") };
         let mut registry = PromptRegistry::with_store(store);
         Arc::get_mut(&mut registry.inner).unwrap().cache = Some(Arc::new(
             EventCache::from_snapshot_for_test(spawn_snapshot(root, pane_columns)),
         ));
-        registry
+        (registry, guard)
     }
 
-    fn spawn_registry(root: &Path, pane_columns: u16) -> PromptRegistry {
+    fn spawn_registry(root: &Path, pane_columns: u16) -> (PromptRegistry, SpawnWatchOff) {
         spawn_registry_with(
             Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())),
             root,
@@ -5860,13 +6352,19 @@ mod tests {
                 };
                 // Accepted streams can inherit the listener's nonblocking mode on macOS.
                 stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
+                // A peer that already closed can make this fail on macOS.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .unwrap();
+                match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                    Ok(0) => continue,
+                    Ok(_) => {}
+                    // A bounded client probe can close before the fake reads;
+                    // that is the code under test, not a harness failure.
+                    Err(error) if fake_peer_gone(&error) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                    Err(error) => panic!("fake Herdr socket could not read a request: {error}"),
+                }
                 let Ok(request) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
@@ -5961,7 +6459,9 @@ mod tests {
             ],
             requests.clone(),
         );
-        let registry = spawn_registry(&root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 80);
         let args = json!({
             "spawn": {
                 "kind": "pi",
@@ -6023,7 +6523,9 @@ mod tests {
             requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let registry = spawn_registry_with(store.clone(), &root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry_with(store.clone(), &root, 80);
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1"},
             "text": "implement the task",
@@ -6033,7 +6535,9 @@ mod tests {
         let first = run(&client, &registry, &args);
         server.join().unwrap();
         assert_eq!(first["ok"], true, "{first}");
-        let reloaded = spawn_registry_with(store, &root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (reloaded, _watch_off2) = spawn_registry_with(store, &root, 80);
         let replay = run(&client, &reloaded, &args);
         assert_eq!(replay["idempotent_replay"], true, "{replay}");
         assert_eq!(replay["spawn"]["pane_id"], "w1:p9");
@@ -6063,7 +6567,9 @@ mod tests {
             ],
             requests.clone(),
         );
-        let registry = spawn_registry(&root, 120);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 120);
         let result = run(
             &HerdrClient::new(&socket),
             &registry,
@@ -6096,7 +6602,9 @@ mod tests {
         let root = spawn_project_root("narrow");
         let socket = temp_socket();
         let listener = refused_spawn_server(&socket);
-        let registry = spawn_registry(&root, 20);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 20);
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1", "split_from": "w1:p1"},
             "text": "work",
@@ -6138,7 +6646,9 @@ mod tests {
             ],
             requests.clone(),
         );
-        let registry = spawn_registry(&root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 80);
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1"},
             "text": "work",
@@ -6205,7 +6715,9 @@ mod tests {
             first_requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let registry = spawn_registry_with(store.clone(), &root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry_with(store.clone(), &root, 80);
         let client = HerdrClient::new(&socket);
         let mut args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1", "startup_timeout_ms": 1},
@@ -6230,7 +6742,10 @@ mod tests {
         );
 
         // Replaying the SAME key with a larger chain continues in that pane.
-        args["spawn"]["startup_timeout_ms"] = json!(5_000);
+        // The resume budget must also leave the prompt reserve after the
+        // bounded early-exit watch (1.2 S5), so it is larger than the old
+        // start-only floor.
+        args["spawn"]["startup_timeout_ms"] = json!(20_000);
         fs::remove_file(&socket).unwrap();
         let resume_requests = Arc::new(Mutex::new(Vec::new()));
         let resume_server = scripted_spawn_server(
@@ -6295,7 +6810,9 @@ mod tests {
             first_requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let registry = spawn_registry_with(store.clone(), &root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry_with(store.clone(), &root, 80);
         let client = HerdrClient::new(&socket);
         // 4.2s: enough to create the pane and start the agent, not enough to
         // finish readiness, so the chain must pause instead of holding the key.
@@ -6415,7 +6932,9 @@ mod tests {
             vec![json!({"agent": {"pane_id": "w1:p2", "agent_status": "working"}})],
             requests.clone(),
         );
-        let registry = spawn_registry(&root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 80);
         register_running_task(
             &registry,
             "supervisor-task",
@@ -6476,7 +6995,9 @@ mod tests {
             requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let registry = spawn_registry_with(store.clone(), &root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry_with(store.clone(), &root, 80);
         register_running_task(
             &registry,
             "supervisor-task",
@@ -6513,7 +7034,9 @@ mod tests {
 
         // A fresh registry over the same durable store proves the refusal was
         // persisted for the key rather than remembered inside one process.
-        let reloaded = spawn_registry_with(store, &root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (reloaded, _watch_off2) = spawn_registry_with(store, &root, 80);
         let replay = run(&client, &reloaded, &args);
         assert_eq!(replay["ok"], false, "{replay}");
         assert_eq!(replay["code"], "delegation_depth_exceeded", "{replay}");
@@ -6546,7 +7069,9 @@ mod tests {
             ],
             requests.clone(),
         );
-        let registry = spawn_registry(&root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 80);
         let result = run(
             &HerdrClient::new(&socket),
             &registry,
@@ -6582,7 +7107,9 @@ mod tests {
         let root = spawn_project_root("validate");
         let socket = temp_socket();
         let listener = refused_spawn_server(&socket);
-        let registry = spawn_registry(&root, 80);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 80);
         let client = HerdrClient::new(&socket);
         for (args, expected) in [
             (
@@ -7366,6 +7893,8 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                max_runtime_ms: None,
+                on_budget: None,
             })
             .unwrap()
             .unwrap();
@@ -7561,6 +8090,8 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                max_runtime_ms: None,
+                on_budget: None,
             })
             .unwrap()
             .unwrap();
@@ -7710,6 +8241,8 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                max_runtime_ms: None,
+                on_budget: None,
             })
             .unwrap()
             .unwrap();
@@ -7816,6 +8349,9 @@ mod tests {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            max_runtime_ms: None,
+            on_budget: None,
+            budget_events: Vec::new(),
             gate: None,
             final_excerpt: None,
             awaiting_children: None,
@@ -9103,6 +9639,9 @@ mod tests {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            max_runtime_ms: None,
+            on_budget: None,
+            budget_events: Vec::new(),
             gate: None,
             final_excerpt: None,
             awaiting_children: None,
@@ -10348,6 +10887,8 @@ mod tests {
                 parent_target,
                 parent_session_ref,
                 stall_after_ms: None,
+                max_runtime_ms: None,
+                on_budget: None,
             })
             .unwrap()
             .unwrap();
@@ -10886,5 +11427,664 @@ mod tests {
             }
         }
         fs::remove_dir_all(&semantic_config_dir).ok();
+    }
+
+    // ---- 1.2 S5: model alias validation, early-exit detection, run bounds ----
+
+    /// Write a pi model catalog under a fresh temp agent dir and point
+    /// PI_CODING_AGENT_DIR at it. Caller holds test_env::lock and restores.
+    fn s5_pi_catalog(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "herdr-mcp-s5-{tag}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("models-store.json"),
+            r#"{"openai":{"models":[{"id":"gpt-4"},{"id":"gpt-5.1-codex"}]}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A fake `herdr` binary whose `api schema --json` advertises an
+    /// agent.start with an `args` passthrough (the live shape today).
+    fn s5_fake_herdr_bin(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "herdr-mcp-s5-bin-{tag}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("herdr");
+        fs::write(
+            &bin,
+            "#!/bin/sh\nif [ \"$1\" = \"api\" ]; then\ncat <<'EOF'\n{\"schemas\":{\"request\":{\"oneOf\":[{\"properties\":{\"method\":{\"const\":\"agent.start\"},\"params\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\"},\"pane_id\":{\"type\":\"string\"},\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"name\",\"kind\",\"pane_id\"]}}}],\"$defs\":{}}}}\nEOF\nelse\nexit 1\nfi\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin
+    }
+
+    struct S5Env {
+        prev_pi: Option<std::ffi::OsString>,
+        prev_bin: Option<std::ffi::OsString>,
+        dirs: Vec<PathBuf>,
+    }
+
+    impl S5Env {
+        fn set(tag: &str, with_bin: bool) -> Self {
+            let prev_pi = env::var_os("PI_CODING_AGENT_DIR");
+            let prev_bin = env::var_os("HERDR_BIN");
+            let catalog = s5_pi_catalog(tag);
+            unsafe { env::set_var("PI_CODING_AGENT_DIR", &catalog) };
+            let mut dirs = vec![catalog];
+            if with_bin {
+                let bin = s5_fake_herdr_bin(tag);
+                unsafe { env::set_var("HERDR_BIN", &bin) };
+                dirs.push(bin.parent().unwrap().to_path_buf());
+            }
+            Self {
+                prev_pi,
+                prev_bin,
+                dirs,
+            }
+        }
+    }
+
+    impl Drop for S5Env {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev_pi.take() {
+                    Some(value) => env::set_var("PI_CODING_AGENT_DIR", value),
+                    None => env::remove_var("PI_CODING_AGENT_DIR"),
+                }
+                match self.prev_bin.take() {
+                    Some(value) => env::set_var("HERDR_BIN", value),
+                    None => env::remove_var("HERDR_BIN"),
+                }
+            }
+            for dir in &self.dirs {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// user planner | Given a spawn with an unknown model alias | When the
+    /// dispatch is admitted | Then it fails at validate with the available
+    /// list, creates nothing, and a replay returns the same refusal.
+    #[test]
+    fn spawn_unknown_model_alias_fails_before_any_mutation() {
+        let _guard = crate::test_env::lock();
+        let _env = S5Env::set("unknown-alias", false);
+        let root = spawn_project_root("s5-unknown");
+        let socket = temp_socket();
+        let listener = refused_spawn_server(&socket);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        let args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-99"},
+            "text": "work",
+            "idempotency_key": "s5-unknown",
+        });
+        let client = HerdrClient::new(&socket);
+        let first = run(&client, &registry, &args);
+        assert_eq!(first["ok"], false, "{first}");
+        assert_eq!(first["failed_step"], "validate");
+        assert_eq!(first["code"], "model_alias_unknown");
+        assert_eq!(first["delivery_state"], "not_delivered");
+        assert_eq!(first["fallback_allowed"], false);
+        assert_eq!(first["model_validation"]["validated"], false);
+        assert_eq!(
+            first["available_models"],
+            json!(["openai/gpt-4", "openai/gpt-5.1-codex"])
+        );
+        // Validation happens before key reservation (same as every spawn
+        // validate failure): a retry re-validates and refuses identically,
+        // still without any mutation.
+        let replay = run(&client, &registry, &args);
+        assert_eq!(replay["code"], "model_alias_unknown");
+        assert_eq!(replay["failed_step"], "validate");
+        assert!(registry.list_tasks(10).unwrap().is_empty());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a spawn kind without an obtainable model list |
+    /// When a model is requested | Then validated:false and no spawn happens.
+    #[test]
+    fn spawn_model_on_kind_without_list_is_unvalidatable() {
+        let _guard = crate::test_env::lock();
+        let _env = S5Env::set("no-list", false);
+        let root = spawn_project_root("s5-nolist");
+        let socket = temp_socket();
+        let listener = refused_spawn_server(&socket);
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "claude", "workspace_id": "w1", "model": "sonnet"},
+                "text": "work",
+                "idempotency_key": "s5-nolist",
+            }),
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "model_alias_unknown");
+        assert_eq!(result["model_validation"]["validated"], false);
+        assert_eq!(result["available_models"], json!([]));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a validated pi alias and a live schema with args |
+    /// When the spawn starts the agent | Then --model travels in agent.start
+    /// args and the prompt is submitted exactly once.
+    #[test]
+    fn spawn_validated_model_delivers_model_flag() {
+        let _guard = crate::test_env::lock();
+        let _env = S5Env::set("model-flag", true);
+        let root = spawn_project_root("s5-modelflag");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("tab.create", spawn_tab_created()["result"].clone()),
+                ("agent.start", spawn_agent_started(true)["result"].clone()),
+                (
+                    "agent.get",
+                    json!({"agent": {"pane_id": "w1:p9", "agent_status": "idle", "interactive_ready": true, "state_change_seq": 1}}),
+                ),
+                ("agent.prompt", spawn_prompt_submitted()["result"].clone()),
+            ],
+            requests.clone(),
+        );
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-4", "startup_timeout_ms": 40_000},
+                "text": "work",
+                "idempotency_key": "s5-modelflag",
+            }),
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        let recorded = requests.lock().unwrap();
+        let start = recorded
+            .iter()
+            .find(|request| request["method"] == "agent.start")
+            .expect("agent.start must be called");
+        assert_eq!(start["params"]["args"], json!(["--model", "openai/gpt-4"]));
+        assert!(start["params"].get("model").is_none());
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|r| r["method"] == "agent.prompt")
+                .count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given the live schema cannot carry a model | When a
+    /// validated alias is spawned | Then model_delivery_unsupported before
+    /// agent.start, never a silent drop.
+    #[test]
+    fn spawn_model_without_schema_delivery_fails_closed() {
+        let _guard = crate::test_env::lock();
+        // Catalog but no HERDR_BIN override: point HERDR_BIN at a binary that
+        // fails, so the schema is unavailable and delivery cannot be proven.
+        let _env = S5Env::set("no-delivery", false);
+        let dir = env::temp_dir().join(format!("herdr-mcp-s5-nobin-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("herdr");
+        fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        unsafe { env::set_var("HERDR_BIN", &bin) };
+        let root = spawn_project_root("s5-nodelivery");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![spawn_tab_created()],
+            requests.clone(),
+        );
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-4"},
+                "text": "work",
+                "idempotency_key": "s5-nodelivery",
+            }),
+        );
+        server.join().unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "model_delivery_unsupported");
+        assert_eq!(result["failed_step"], "agent_start");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(result["model_validation"]["validated"], true);
+        let recorded = requests.lock().unwrap();
+        assert!(
+            recorded.iter().all(|r| r["method"] != "agent.start"),
+            "agent.start must not be called without a deliverable model: {recorded:?}"
+        );
+        unsafe { env::remove_var("HERDR_BIN") };
+        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a started agent that dies before readiness | When
+    /// the spawn chain probes it | Then agent_start_failed with a redacted
+    /// pane tail, no prompt, and the pane kept for reclaim.
+    #[test]
+    fn spawn_dead_on_start_reports_agent_start_failed_with_redacted_tail() {
+        let root = spawn_project_root("s5-deadstart");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("tab.create", spawn_tab_created()["result"].clone()),
+                ("agent.start", spawn_agent_started(false)["result"].clone()),
+                (
+                    "agent.get",
+                    json!({"error": {"code": "agent_not_found", "message": "no agent"}}),
+                ),
+                (
+                    "pane.read",
+                    json!({"read": {"content": "model `gpt-99` not found\napi_key=sk-secret-1234567890abcdef\n$ "}}),
+                ),
+            ],
+            requests.clone(),
+        );
+        // Hold the env lock so the watch-off window covers this test's dispatch.
+        let _spawn_env_guard = crate::test_env::lock();
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1"},
+                "text": "work",
+                "idempotency_key": "s5-deadstart",
+            }),
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["failed_step"], "agent_start");
+        assert_eq!(result["code"], "agent_start_failed");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(result["submitted"], false);
+        assert_eq!(result["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(result["reclaim"]["pane_id"], "w1:p9");
+        let tail = result["pane_tail"].as_str().expect("pane tail");
+        assert!(tail.contains("model `gpt-99` not found"), "{tail}");
+        assert!(
+            !tail.contains("sk-secret-1234567890abcdef"),
+            "secret must be redacted: {tail}"
+        );
+        assert_eq!(result["pane_tail_redacted"], true);
+        let recorded = requests.lock().unwrap();
+        assert!(
+            recorded.iter().all(|r| r["method"] != "agent.prompt"),
+            "a dead agent must never be prompted: {recorded:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given an agent that starts ready but exits inside the
+    /// early-exit window | When the chain watches it | Then agent_start_failed
+    /// and no prompt is submitted.
+    #[test]
+    fn spawn_early_exit_after_ready_reports_agent_start_failed() {
+        // Hold the shared test-env lock for the whole dispatch: spawn_registry
+        // helpers briefly set HERDR_MCP_SPAWN_EARLY_EXIT_MS=0, and this test
+        // needs the default watch window to stay in effect throughout.
+        let _guard = crate::test_env::lock();
+        let root = spawn_project_root("s5-earlyexit");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // agent.get answers ready for the first probe (readiness), then reports
+        // the agent gone. The watch window is left at its default; the fake
+        // answers every probe, so no env override (and no cross-test race) is
+        // needed. The chain budget is large enough that the default 10s watch
+        // (capped to chain/4) fits with the prompt reserve.
+        let get_calls = Arc::new(AtomicU64::new(0));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = {
+            let requests = requests.clone();
+            let stop = stop.clone();
+            let get_calls = get_calls.clone();
+            thread::spawn(move || {
+                listener.set_nonblocking(true).unwrap();
+                while !stop.load(Ordering::SeqCst) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                    let mut line = String::new();
+                    match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                        Ok(0) => continue,
+                        Ok(_) => {}
+                        Err(error) if fake_peer_gone(&error) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                        Err(error) => panic!("fake read failed: {error}"),
+                    }
+                    let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    requests.lock().unwrap().push(request.clone());
+                    let method = request["method"].as_str().unwrap_or_default();
+                    let response = match method {
+                        "tab.create" => spawn_tab_created()["result"].clone(),
+                        "agent.start" => spawn_agent_started(true)["result"].clone(),
+                        "agent.get" => {
+                            let n = get_calls.fetch_add(1, Ordering::SeqCst);
+                            if n == 0 {
+                                json!({"agent": {"pane_id": "w1:p9", "agent_status": "idle", "interactive_ready": true, "state_change_seq": 1}})
+                            } else {
+                                json!({"error": {"code": "agent_not_found", "message": "exited"}})
+                            }
+                        }
+                        "pane.read" => json!({"read": {"content": "fatal: bad model\n$ "}}),
+                        _ => json!({"error": {"code": "unscripted_method", "message": method}}),
+                    };
+                    let envelope = if let Some(error) = response.get("error") {
+                        json!({"id": request["id"], "error": error})
+                    } else {
+                        json!({"id": request["id"], "result": response})
+                    };
+                    if !write_fake_reply(&mut stream, &envelope.to_string()) {
+                        continue;
+                    }
+                }
+            })
+        };
+        // Build the registry directly (not via spawn_registry, which disables
+        // the watch for scripted fakes) so the default watch window applies.
+        let mut registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
+        Arc::get_mut(&mut registry.inner).unwrap().cache = Some(Arc::new(
+            EventCache::from_snapshot_for_test(spawn_snapshot(&root, 80)),
+        ));
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1", "startup_timeout_ms": 60_000},
+                "text": "work",
+                "idempotency_key": "s5-earlyexit",
+            }),
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "agent_start_failed", "{result}");
+        assert_eq!(result["failed_step"], "agent_start");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        let recorded = requests.lock().unwrap();
+        assert!(
+            recorded.iter().all(|r| r["method"] != "agent.prompt"),
+            "early-exit must prevent the prompt: {recorded:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a task with an explicit run cap | When the cap
+    /// expires | Then one agent_budget_exceeded event notifies the parent,
+    /// the task stays non-terminal, and a second sweep never re-notifies.
+    #[test]
+    fn budget_expiry_notifies_parent_once_without_terminating() {
+        let (path, mut registry, clock) = worker_registry("s5-budget");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![("agent.prompt", json!({"prompt": {"status": "submitted"}}))],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-budget-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.max_runtime_ms = Some(60_000);
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        // Before the cap: nothing.
+        registry.sweep_task_budgets();
+        assert!(
+            registry
+                .load_task(&task.task_id)
+                .unwrap()
+                .unwrap()
+                .budget_events
+                .is_empty()
+        );
+        // Past the cap: exactly one event, notify-only, task still running.
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert!(!stored.is_terminal());
+        assert_eq!(stored.lifecycle, PromptTaskLifecycle::Running);
+        assert_eq!(stored.budget_events.len(), 1);
+        assert_eq!(stored.budget_events[0]["event"], "agent_budget_exceeded");
+        assert_eq!(stored.budget_events[0]["notification_state"], "delivered");
+        assert_eq!(stored.budget_events[0]["interrupt_state"], "not_requested");
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0]["method"], "agent.prompt");
+        assert_eq!(recorded[0]["params"]["target"], "w1:p1");
+        assert!(
+            recorded[0]["params"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("agent_budget_exceeded")
+        );
+        drop(recorded);
+        // A second sweep must not re-notify.
+        registry.sweep_task_budgets();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            registry
+                .load_task(&task.task_id)
+                .unwrap()
+                .unwrap()
+                .budget_events
+                .len(),
+            1
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given on_budget interrupt | When the cap expires while
+    /// the agent works | Then one C-c goes to the task's own pane and the
+    /// event records it; a second sweep sends nothing more.
+    #[test]
+    fn budget_interrupt_sends_one_cc_to_the_task_pane() {
+        let (path, mut registry, clock) = worker_registry("s5-interrupt");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("agent.prompt", json!({"prompt": {"status": "submitted"}})),
+                (
+                    "agent.get",
+                    json!({"agent": {"pane_id": "w1:p9", "agent_status": "working", "state_change_seq": 3}}),
+                ),
+                ("pane.send_keys", json!({"ok": true})),
+            ],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-int-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.pane_id = Some("w1:p9".to_owned());
+        task.max_runtime_ms = Some(60_000);
+        task.on_budget = Some("interrupt".to_owned());
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert!(!stored.is_terminal());
+        assert_eq!(stored.budget_events.len(), 1);
+        assert_eq!(stored.budget_events[0]["interrupt_state"], "sent");
+        let recorded = requests.lock().unwrap();
+        let cc: Vec<_> = recorded
+            .iter()
+            .filter(|r| r["method"] == "pane.send_keys")
+            .collect();
+        assert_eq!(cc.len(), 1, "{recorded:?}");
+        assert_eq!(cc[0]["params"]["pane_id"], "w1:p9");
+        assert_eq!(cc[0]["params"]["keys"], json!(["C-c"]));
+        drop(recorded);
+        registry.sweep_task_budgets();
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["method"] == "pane.send_keys")
+                .count(),
+            1
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given an explicit stall threshold | When it expires |
+    /// Then one agent_stalled event notifies the parent and the stall clock
+    /// is not reset by the event itself.
+    #[test]
+    fn explicit_stall_expiry_emits_agent_stalled_once() {
+        let (path, mut registry, clock) = worker_registry("s5-stall");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![("agent.prompt", json!({"prompt": {"status": "submitted"}}))],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-stall-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.stall_after_ms = Some(60_000);
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(stored.budget_events.len(), 1);
+        assert_eq!(stored.budget_events[0]["event"], "agent_stalled");
+        assert_eq!(
+            stored.updated_at_ms, task.updated_at_ms,
+            "stall event must not reset the stall clock"
+        );
+        assert!(!stored.is_terminal());
+        registry.sweep_task_budgets();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given a task without caps | When time passes | Then no
+    /// budget event is emitted and behavior is unchanged.
+    #[test]
+    fn no_caps_means_no_budget_events() {
+        let (path, registry, clock) = worker_registry("s5-nocaps");
+        let task = escalation_task("s5-nocaps-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(60 * 60_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert!(stored.budget_events.is_empty());
+        assert!(!stored.is_terminal());
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given invalid budget params | When dispatch parses them |
+    /// Then invalid_params before any mutation.
+    #[test]
+    fn budget_params_are_validated() {
+        let socket = temp_socket();
+        let listener = refused_spawn_server(&socket);
+        let registry = PromptRegistry::new();
+        let client = HerdrClient::new(&socket);
+        for (key, value) in [
+            ("max_runtime_ms", json!(1000)),
+            ("max_runtime_ms", json!(86_400_001u64)),
+            ("max_runtime_ms", json!("soon")),
+            ("on_budget", json!("kill")),
+        ] {
+            let mut args = json!({"target": "w1:p1", "text": "work"});
+            args[key] = value;
+            let result = run(&client, &registry, &args);
+            assert_eq!(result["code"], "invalid_params", "{key}: {result}");
+        }
+        // on_budget without any cap is rejected.
+        let result = run(
+            &client,
+            &registry,
+            &json!({"target": "w1:p1", "text": "work", "on_budget": "interrupt"}),
+        );
+        assert_eq!(result["code"], "invalid_params");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

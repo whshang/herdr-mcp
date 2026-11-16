@@ -10109,6 +10109,12 @@ mod tests {
                 json!([{"endpoint_ref": endpoint, "provider": "chatgpt"}]).to_string(),
             ),
         ];
+        // The scripted herdr fake answers exactly tab.create/agent.start/
+        // agent.prompt; disable the S5 post-readiness early-exit watch so it
+        // adds no unscripted agent.get probes.
+        let _spawn_env_guard = crate::test_env::lock();
+        let prev_window = std::env::var_os("HERDR_MCP_SPAWN_EARLY_EXIT_MS");
+        unsafe { std::env::set_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS", "0") };
         let result = webchat_tool_call(
             app,
             &headers,
@@ -10144,6 +10150,12 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_file(socket);
+        unsafe {
+            match prev_window {
+                Some(value) => std::env::set_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS", value),
+                None => std::env::remove_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS"),
+            }
+        }
     }
 
     #[tokio::test]

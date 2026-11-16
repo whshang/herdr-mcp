@@ -64,6 +64,19 @@ pub fn validate_method_params(method: &str, params: &Value) -> Result<Validation
     Ok(validate_with_registry(&registry, method, params))
 }
 
+/// The live `agent.start` parameter properties, when the schema is available.
+/// Used by model-alias admission to decide whether a validated alias can be
+/// delivered at all (`model` property or `args` passthrough). `Err` means the
+/// schema could not be loaded; `Ok(None)` means the method is not represented.
+pub fn agent_start_param_properties() -> Result<Option<Map<String, Value>>, String> {
+    let registry = load_registry(false)?;
+    Ok(registry
+        .methods
+        .iter()
+        .find(|method| method.method == "agent.start")
+        .map(|method| method.properties.clone()))
+}
+
 /// Warm the live Herdr schema without delaying server startup.
 pub fn prewarm_async() {
     let cache = CACHE.get_or_init(|| Mutex::new(None));

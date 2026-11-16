@@ -276,6 +276,62 @@ pub fn pi_live_model_evidence(session_value: &str, observed_at_ms: i64) -> PiMod
     }
 }
 
+/// Upper bound on the pi model catalog file. The store caches every provider's
+/// full catalog; a larger file is treated as unavailable rather than parsed.
+const MAX_PI_MODELS_STORE_BYTES: u64 = 4 * 1024 * 1024;
+/// Bound on the returned alias list so a huge catalog cannot bloat a refusal.
+const MAX_PI_MODEL_ALIASES: usize = 512;
+
+/// Obtainable pi model aliases from the local pi model catalog
+/// (`models-store.json` under the pi agent dir). Each entry is
+/// `provider/model-id`; a bare `model-id` is also a valid pi `--model` pattern
+/// and is accepted by the validator, but the listed form is canonical.
+///
+/// Returns `None` when no catalog is obtainable (missing dir/file, oversized,
+/// unreadable, or malformed): callers must then report `validated: false`
+/// instead of guessing. This is a read-only projection of pi's own cache, not
+/// an authenticated inventory; pi may know models the cache has not fetched.
+pub fn pi_model_aliases() -> Option<Vec<String>> {
+    let path = pi_agent_dir()?.join("models-store.json");
+    let value = read_small_json(&path, MAX_PI_MODELS_STORE_BYTES)?;
+    pi_model_aliases_from_store(&value)
+}
+
+fn pi_model_aliases_from_store(value: &Value) -> Option<Vec<String>> {
+    let providers = value.as_object()?;
+    let mut aliases = Vec::new();
+    for (provider, entry) in providers {
+        if !valid_model_segment(provider) {
+            continue;
+        }
+        let Some(models) = entry.get("models").and_then(Value::as_array) else {
+            continue;
+        };
+        for model in models {
+            let Some(id) = model.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !valid_model_segment(id) {
+                continue;
+            }
+            aliases.push(format!("{provider}/{id}"));
+            if aliases.len() >= MAX_PI_MODEL_ALIASES {
+                return Some(aliases);
+            }
+        }
+    }
+    (!aliases.is_empty()).then_some(aliases)
+}
+
+/// One alias segment: bounded, printable, no whitespace/control characters.
+fn valid_model_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= 128
+        && segment
+            .chars()
+            .all(|ch| !ch.is_control() && !ch.is_whitespace())
+}
+
 fn pi_agent_dir() -> Option<PathBuf> {
     std::env::var_os("PI_CODING_AGENT_DIR")
         .filter(|value| !value.is_empty())
@@ -945,5 +1001,52 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pi_model_aliases_reads_the_local_catalog() {
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("PI_CODING_AGENT_DIR");
+        let dir = temp_dir("pi-model-aliases");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &dir) };
+        // Missing catalog: unobtainable, never a guess.
+        assert!(pi_model_aliases().is_none());
+        fs::write(
+            dir.join("models-store.json"),
+            r#"{"openai":{"models":[{"id":"gpt-4"},{"id":"gpt-5.1-codex"}]},"zai":{"models":[{"id":"glm-5"}]},"broken":{"models":"nope"}}"#,
+        )
+        .unwrap();
+        let aliases = pi_model_aliases().unwrap();
+        assert!(aliases.contains(&"openai/gpt-4".to_owned()));
+        assert!(aliases.contains(&"openai/gpt-5.1-codex".to_owned()));
+        assert!(aliases.contains(&"zai/glm-5".to_owned()));
+        assert_eq!(aliases.len(), 3);
+        // Malformed store: unobtainable.
+        fs::write(dir.join("models-store.json"), "not json").unwrap();
+        assert!(pi_model_aliases().is_none());
+        // Empty catalog: unobtainable (validated:false), not an empty list.
+        fs::write(dir.join("models-store.json"), r#"{"openai":{"models":[]}}"#).unwrap();
+        assert!(pi_model_aliases().is_none());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+                None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pi_model_aliases_from_store_bounds_and_filters() {
+        let store = json!({
+            "openai": {"models": [{"id": "gpt-4"}, {"id": "bad id"}, {"id": ""}, {"no_id": true}]},
+            "bad provider": {"models": [{"id": "x"}]},
+            "empty": {"models": []}
+        });
+        let aliases = pi_model_aliases_from_store(&store).unwrap();
+        assert_eq!(aliases, vec!["openai/gpt-4".to_owned()]);
+        assert!(pi_model_aliases_from_store(&json!({})).is_none());
+        assert!(pi_model_aliases_from_store(&json!([])).is_none());
     }
 }
