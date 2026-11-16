@@ -1151,66 +1151,91 @@ impl PromptRegistry {
     /// further repair is refused as `not_delivered` instead of being submitted.
     /// Repair accounting never changes the receipt's own delivered lifecycle.
     pub fn record_repair_attempt(&self, receipt_id: &str) -> Value {
-        let task = match self.load_task(receipt_id) {
-            Ok(Some(task)) => task,
-            Ok(None) => {
-                return json!({
-                    "ok": false,
-                    "code": "agent_task_not_found",
-                    "receipt_id": receipt_id,
-                });
-            }
-            Err(error) => {
-                return json!({
-                    "ok": false,
-                    "code": "agent_task_store_unavailable",
-                    "message": error,
-                });
-            }
-        };
-        if !task.is_terminal() {
+        let Some(store) = self.inner.store.as_ref() else {
             return json!({
                 "ok": false,
-                "code": "repair_target_not_terminal",
-                "receipt_id": receipt_id,
-                "delivery_state": "not_delivered",
-                "retryable": false,
-                "message": "only a terminal receipt can be repaired",
+                "code": "agent_task_store_unavailable",
+                "message": "agent task store is not configured",
             });
-        }
-        let mut task = task;
-        if task.repair_exhausted_at_ms.is_some() || task.repair_attempts >= REPAIR_BUDGET_ATTEMPTS {
-            if task.repair_exhausted_at_ms.is_none() {
-                task.repair_exhausted_at_ms = Some(self.now_ms());
-                if let Err(error) = self.save_task(&task, None) {
+        };
+        let now_ms = self.now_ms();
+        let decision = {
+            let mut store = match store.lock() {
+                Ok(store) => store,
+                Err(_) => {
                     return json!({
                         "ok": false,
                         "code": "agent_task_store_unavailable",
-                        "message": error,
+                        "message": "agent task store lock unavailable",
                     });
                 }
-            }
-            return json!({
+            };
+            // One IMMEDIATE transaction owns read -> check -> increment ->
+            // write, so concurrent repairs cannot overspend this receipt.
+            store.update_operation_result(
+                receipt_id,
+                PROMPT_TASK_OPERATION_KIND,
+                |result_json| {
+                    let mut task = decode_task_record_json(result_json)?;
+                    if !task.is_terminal() {
+                        return Ok((
+                            None,
+                            json!({
+                                "ok": false,
+                                "code": "repair_target_not_terminal",
+                                "receipt_id": receipt_id,
+                                "delivery_state": "not_delivered",
+                                "retryable": false,
+                                "message": "only a terminal receipt can be repaired",
+                            }),
+                        ));
+                    }
+                    if task.repair_exhausted_at_ms.is_some()
+                        || task.repair_attempts >= REPAIR_BUDGET_ATTEMPTS
+                    {
+                        let mut exhausted = json!({
+                            "ok": false,
+                            "code": "repair_budget_exhausted",
+                            "receipt_id": receipt_id,
+                            "attempts": task.repair_attempts,
+                            "limit": REPAIR_BUDGET_ATTEMPTS,
+                            "terminal": true,
+                            "delivery_state": "not_delivered",
+                            "retryable": false,
+                            "fallback_allowed": false,
+                            "hint": "this receipt's repair lane is terminal; start a fresh dispatch instead of repairing it again",
+                        });
+                        if task.repair_exhausted_at_ms.is_none() {
+                            task.repair_exhausted_at_ms = Some(now_ms);
+                            let encoded = serde_json::to_string(&task)
+                                .map_err(|error| format!("cannot encode agent task: {error}"))?;
+                            exhausted["attempts"] = json!(task.repair_attempts);
+                            return Ok((Some(encoded), exhausted));
+                        }
+                        return Ok((None, exhausted));
+                    }
+                    task.repair_attempts = task.repair_attempts.saturating_add(1);
+                    let encoded = serde_json::to_string(&task)
+                        .map_err(|error| format!("cannot encode agent task: {error}"))?;
+                    Ok((
+                        Some(encoded),
+                        json!({
+                            "ok": true,
+                            "receipt_id": receipt_id,
+                            "attempts": task.repair_attempts,
+                            "limit": REPAIR_BUDGET_ATTEMPTS,
+                            "remaining": REPAIR_BUDGET_ATTEMPTS.saturating_sub(task.repair_attempts),
+                        }),
+                    ))
+                },
+            )
+        };
+        match decision {
+            Ok(Some(value)) => value,
+            Ok(None) => json!({
                 "ok": false,
-                "code": "repair_budget_exhausted",
+                "code": "agent_task_not_found",
                 "receipt_id": receipt_id,
-                "attempts": task.repair_attempts,
-                "limit": REPAIR_BUDGET_ATTEMPTS,
-                "terminal": true,
-                "delivery_state": "not_delivered",
-                "retryable": false,
-                "fallback_allowed": false,
-                "hint": "this receipt's repair lane is terminal; start a fresh dispatch instead of repairing it again",
-            });
-        }
-        task.repair_attempts = task.repair_attempts.saturating_add(1);
-        match self.save_task(&task, None) {
-            Ok(()) => json!({
-                "ok": true,
-                "receipt_id": receipt_id,
-                "attempts": task.repair_attempts,
-                "limit": REPAIR_BUDGET_ATTEMPTS,
-                "remaining": REPAIR_BUDGET_ATTEMPTS.saturating_sub(task.repair_attempts),
             }),
             Err(error) => json!({
                 "ok": false,
@@ -1314,6 +1339,10 @@ impl PromptRegistry {
     /// S4 archive read: terminal receipts past retention, within the caller's
     /// scope and filters. Default queries never include these rows.
     fn archive_payload(&self, query: &InboxQuery) -> Value {
+        // The embedded stats describe the caller's live scope as well as the
+        // archive: computing them from an empty set would report `active: 0` /
+        // `terminal: 0` for a scope that still has live receipts (S4 review P2).
+        let live = self.list_tasks(512).unwrap_or_default();
         let archived = match self.list_archived_tasks(512) {
             Ok(archived) => archived,
             Err(error) => {
@@ -1338,7 +1367,7 @@ impl PromptRegistry {
                 .into_iter()
                 .map(|task| task.public_json_at(self.now_ms()))
                 .collect::<Vec<_>>(),
-            "stats": self.inbox_stats(&[], query),
+            "stats": self.inbox_stats(&live, query),
         })
     }
 
@@ -2502,6 +2531,12 @@ fn task_attention_state(attention: &Value, task_id: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Decode one task payload without a ledger row, for atomic in-transaction
+/// read-modify-write paths (`update_operation_result`).
+fn decode_task_record_json(encoded: &str) -> Result<PromptTaskRecord, String> {
+    serde_json::from_str(encoded).map_err(|error| format!("cannot decode agent task: {error}"))
+}
+
 fn decode_task_record(record: &OperationLedgerRecord) -> Result<PromptTaskRecord, String> {
     let encoded = record
         .result_json
@@ -3651,12 +3686,6 @@ pub fn run_with_parent_session(
             "repair_of cannot be combined with spawn: a repair redispatches to an existing target",
         );
     }
-    if let Some(receipt_id) = repair_of {
-        let budget = registry.record_repair_attempt(receipt_id);
-        if budget.get("ok").and_then(Value::as_bool) != Some(true) {
-            return budget;
-        }
-    }
     let role = match role_targets::RoleTarget::parse(target) {
         Ok(role) => role,
         Err(error) => return error,
@@ -3870,6 +3899,29 @@ pub fn run_with_parent_session(
     } else {
         None
     };
+    // S4 repair budget (droid P1-1): spend it only after the whole request has
+    // been parsed, validated and admitted. An invalid `text`/`wait`/
+    // `stall_after_ms`/lease or a rejected role resolution must never burn an
+    // attempt, and a refusal here is still `not_delivered` because nothing has
+    // been submitted yet.
+    if let Some(receipt_id) = repair_of {
+        let mut budget = registry.record_repair_attempt(receipt_id);
+        if budget.get("ok").and_then(Value::as_bool) != Some(true) {
+            if let Some(object) = budget.as_object_mut() {
+                object.insert("dispatch_id".to_owned(), json!(task_id));
+            }
+            // Persist the refusal under this key like every other pre-delivery
+            // failure, so a same-key retry replays it instead of staying in
+            // flight until the reservation TTL.
+            if let Some(key) = idempotency_key
+                && let Err(persist_error) = registry.complete(key, &fingerprint, &budget)
+            {
+                return annotate_idempotency_persistence(budget, persist_error);
+            }
+            return budget;
+        }
+    }
+
     // A spawn resolves its target by creating it, or by resuming the pane a
     // resumable checkpoint already persisted.
     let mut spawn_outcome = None;
@@ -6679,6 +6731,11 @@ mod tests {
             json!("t-old"),
             "the archived row keeps its receipt id"
         );
+        // S4 review P2-4: the embedded stats describe the live scope too, not
+        // only the archived count.
+        assert_eq!(archive["stats"]["completed"], json!(1), "{archive}");
+        assert_eq!(archive["stats"]["terminal"], json!(1), "{archive}");
+        assert_eq!(archive["stats"]["archived"], json!(1), "{archive}");
 
         // Retention never deletes the row: it is still physically present.
         let still_stored = store
@@ -6740,6 +6797,121 @@ mod tests {
         assert_eq!(counters["archived"], json!(1), "{stats}");
         assert_eq!(counters["terminal"], json!(3), "{stats}");
         assert_eq!(counters["retention_ms"], json!(prompt_task_ttl_ms()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 review P1-1: a repair dispatch that fails parameter validation must
+    /// not spend a repair attempt, so invalid input cannot burn a receipt lane.
+    #[test]
+    fn invalid_repair_dispatch_does_not_spend_the_budget() {
+        let root = spawn_project_root("repair-invalid");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-repair",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Failed,
+            1_000,
+            None,
+        );
+        let client = HerdrClient::new(temp_socket());
+
+        // Missing text, invalid stall_after_ms and an invalid wait each reject
+        // the request before admission.
+        for (label, args) in [
+            (
+                "missing text",
+                json!({"target": "w1:p9", "repair_of": "t-repair"}),
+            ),
+            (
+                "invalid stall_after_ms",
+                json!({
+                    "target": "w1:p9",
+                    "text": "repair",
+                    "repair_of": "t-repair",
+                    "stall_after_ms": 1,
+                }),
+            ),
+            (
+                "invalid wait",
+                json!({
+                    "target": "w1:p9",
+                    "text": "repair",
+                    "repair_of": "t-repair",
+                    "wait": {"timeout_ms": 0},
+                }),
+            ),
+        ] {
+            for _ in 0..REPAIR_BUDGET_ATTEMPTS {
+                let rejected = run(&client, &registry, &args);
+                assert_eq!(rejected["ok"], false, "{label}: {rejected}");
+                assert_eq!(rejected["code"], "invalid_params", "{label}: {rejected}");
+            }
+        }
+
+        let receipt = registry.task_status("t-repair")["task"].clone();
+        assert!(
+            receipt.get("repair").is_none(),
+            "invalid requests must not spend a repair attempt: {receipt}"
+        );
+        // The lane is still fully available.
+        for attempt in 1..=REPAIR_BUDGET_ATTEMPTS {
+            let spent = registry.record_repair_attempt("t-repair");
+            assert_eq!(spent["ok"], true, "attempt {attempt}: {spent}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 review P1-2: concurrent repairs must never exceed the per-receipt
+    /// budget. The count/check/increment runs in one store transaction.
+    #[test]
+    fn concurrent_repairs_cannot_exceed_the_receipt_budget() {
+        let root = spawn_project_root("repair-concurrent");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = Arc::new(spawn_registry_with(store, &root, 80));
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-repair",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Failed,
+            1_000,
+            None,
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let registry = Arc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                registry.record_repair_attempt("t-repair")
+            }));
+        }
+        let mut accepted = 0_u32;
+        let mut exhausted = 0_u32;
+        for handle in handles {
+            let outcome = handle.join().expect("repair thread");
+            if outcome["ok"] == json!(true) {
+                accepted += 1;
+            } else {
+                assert_eq!(
+                    outcome["code"],
+                    json!("repair_budget_exhausted"),
+                    "{outcome}"
+                );
+                exhausted += 1;
+            }
+        }
+        assert_eq!(accepted, REPAIR_BUDGET_ATTEMPTS, "budget overspent");
+        assert_eq!(accepted + exhausted, 12);
+        let receipt = registry.task_status("t-repair")["task"].clone();
+        assert_eq!(receipt["repair"]["attempts"], json!(REPAIR_BUDGET_ATTEMPTS));
+        assert_eq!(receipt["repair"]["exhausted"], json!(true));
         fs::remove_dir_all(root).unwrap();
     }
 

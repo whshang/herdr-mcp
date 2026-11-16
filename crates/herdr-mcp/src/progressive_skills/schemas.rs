@@ -155,6 +155,11 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "workspace_id": {"type": "string", "maxLength": 256, "description": "Optional workspace scope for role resolution. Not applicable with spawn (use spawn.workspace_id)."},
                     "max_concurrent": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Role selectors only: cap non-terminal tasks for this exact requested_target in the bound parent session, else parent_target, else caller-less global scope. Limit rejection is not_delivered."},
                     "text": {"type": "string", "maxLength": 65536},
+                    "repair_of": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "Optional terminal receipt id this dispatch repairs. Each accepted repair spends one of that receipt's three repair attempts (repair.attempts on the receipt); an exhausted lane is terminal and further repairs are refused as repair_budget_exhausted / not_delivered before anything is submitted. Cannot be combined with spawn.",
+                    },
                     "parent_target": {"type": "string", "maxLength": 256},
                     "idempotency_key": {"type": "string", "maxLength": 256},
                     "stall_after_ms": {"type": "integer", "minimum": 60000, "maximum": 7200000, "description": "Liveness stall threshold; defaults to 20 minutes. Stalled is non-terminal and never redispatched automatically."},
@@ -279,9 +284,24 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                         "maximum": 60000,
                         "description": "Optional bounded long-poll budget. Returns as soon as an unacknowledged terminal task is in scope; deterministic task facts only, no advisory or semantic work."
                     },
+                    "receipt_id": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "Optional exact receipt id (aliases task_id). Applies to the default list, the bounded wait, the archive and the stats view."
+                    },
+                    "status": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "description": "Optional lifecycle or terminal status filter (completed, failed, blocked, delivery_uncertain, running, ...)."
+                    },
+                    "since_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional unix-millisecond lower bound on the receipt's updated_at_ms."
+                    },
                     "view": {
                         "type": "string",
-                        "enum": ["full", "compact"],
+                        "enum": ["full", "compact", "archive", "stats"],
                         "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, liveness, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured. final_excerpt is omitted, not degraded, when the child pane is narrower than 40 columns: a TUI agent hard-wraps its own layout there, so the only readable options are reading the pane or giving the agent a wider pane (a new tab, a reused wide pane, or a down split)."
                     },
                 },
@@ -1205,4 +1225,51 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 .is_some_and(|method| method.to_ascii_lowercase().contains(&query))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn method_schema(method: &str) -> Value {
+        local_method_schemas("")
+            .into_iter()
+            .find(|schema| schema["method"] == json!(method))
+            .unwrap_or_else(|| panic!("missing schema for {method}"))
+    }
+
+    /// S4 review P2: the public schema is what `herdr_methods` advertises and
+    /// what mutation validation enforces, so the new dispatch/inbox parameters
+    /// must appear there or the public surface rejects them.
+    #[test]
+    fn s4_dispatch_and_inbox_parameters_are_advertised() {
+        let dispatch = method_schema(AGENT_TASK_DISPATCH_METHOD);
+        let properties = &dispatch["params"]["properties"];
+        assert_eq!(
+            properties["repair_of"]["type"],
+            json!("string"),
+            "{dispatch}"
+        );
+        assert_eq!(
+            properties["repair_of"]["maxLength"],
+            json!(128),
+            "{dispatch}"
+        );
+
+        let inbox = method_schema(AGENT_TASK_INBOX_METHOD);
+        let properties = &inbox["params"]["properties"];
+        for filter in ["receipt_id", "status", "since_ms"] {
+            assert!(
+                properties.get(filter).is_some(),
+                "inbox schema is missing {filter}: {inbox}"
+            );
+        }
+        let view = properties["view"]["enum"].as_array().unwrap();
+        for expected in ["full", "compact", "archive", "stats"] {
+            assert!(
+                view.iter().any(|value| value == expected),
+                "inbox view enum is missing {expected}: {inbox}"
+            );
+        }
+    }
 }
