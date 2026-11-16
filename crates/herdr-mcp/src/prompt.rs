@@ -711,7 +711,6 @@ impl PromptRegistry {
             max_runtime_ms: None,
             on_budget: None,
             budget_events: Vec::new(),
-            request_id: None,
             gate: None,
             final_excerpt: None,
             awaiting_children: None,
@@ -7914,7 +7913,6 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
-                request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
             })
@@ -8112,7 +8110,6 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
-                request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
             })
@@ -8264,7 +8261,6 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
-                request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
             })
@@ -8373,7 +8369,6 @@ mod tests {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
-            request_id: None,
             max_runtime_ms: None,
             on_budget: None,
             budget_events: Vec::new(),
@@ -9664,7 +9659,6 @@ mod tests {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
-            request_id: None,
             max_runtime_ms: None,
             on_budget: None,
             budget_events: Vec::new(),
@@ -10913,7 +10907,6 @@ mod tests {
                 parent_target,
                 parent_session_ref,
                 stall_after_ms: None,
-                request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
             })
