@@ -71,6 +71,11 @@ const SPAWN_READY_MIN_POLL_MS: u64 = 250;
 const SPAWN_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound for one pane mutation, always cut down to the remaining chain.
 const SPAWN_PANE_TIMEOUT_MS: u64 = 10_000;
+/// Lower bound for one pane socket call. A caller may grant the chain less
+/// than this; the pane step still gets a usable window because the chain
+/// deadline is enforced by the `remaining == 0` gates around each step, not by
+/// starving a single in-flight mutation of any socket time at all.
+const SPAWN_PANE_SOCKET_FLOOR_MS: u64 = 4_000;
 const SPAWN_AGENT_NAME_MAX: usize = 32;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -4508,7 +4513,14 @@ fn spawn_chain(
                 "replay the same idempotency key with a larger spawn.startup_timeout_ms",
             ));
         }
-        let timeout = Duration::from_millis(remaining.min(SPAWN_PANE_TIMEOUT_MS));
+        // Socket floor: `remaining` is the chain's accounting unit, but a
+        // budget measured in single-digit ms must not starve the pane call of
+        // any socket window — the step gate above already decided the chain
+        // may spend one mutation, and the next gate still re-checks the
+        // deadline before the agent step.
+        let timeout = Duration::from_millis(
+            remaining.clamp(SPAWN_PANE_SOCKET_FLOOR_MS, SPAWN_PANE_TIMEOUT_MS),
+        );
         let created = match spawn_create_pane(client, registry, spawn, timeout) {
             Ok(created) => created,
             Err(error) => return Err(progress.failure(spawn, "pane_create", &error)),

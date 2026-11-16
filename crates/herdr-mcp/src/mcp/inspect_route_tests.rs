@@ -208,6 +208,7 @@ fn selection_drift_uses_admitted_backend_and_socket() {
         browser_mutation_admission: None,
         runtime_backend: &tui_backend,
         trusted_local_ipc: true,
+        wire_request_id: None,
     };
 
     for preflight in [false, true] {

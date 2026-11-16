@@ -817,6 +817,10 @@ pub struct StateStore {
     /// evidence for one `parent_session.reason`, never binding authority, and
     /// it resets with the process.
     unregistered_source_turns: Vec<UnregisteredSourceTurn>,
+    /// 1.2/S2: bounded in-memory `client_request_id` ledger. Deliberately not
+    /// persisted — a restart makes resubmission a fresh request and makes
+    /// `request.status` answer `unknown`, which the design doc prescribes.
+    request_ledger: crate::request_ledger::RequestLedger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -850,6 +854,7 @@ impl StateStore {
                 path: None,
                 conn,
                 unregistered_source_turns: Vec::new(),
+                request_ledger: crate::request_ledger::RequestLedger::default(),
             });
         }
 
@@ -870,7 +875,82 @@ impl StateStore {
             path: Some(path.to_path_buf()),
             conn,
             unregistered_source_turns: Vec::new(),
+            request_ledger: crate::request_ledger::RequestLedger::default(),
         })
+    }
+
+    // --- 1.2/S2 request ledger (in-memory only; never persisted to state.db) ---
+
+    /// Atomic dedupe + reserve under one lock: two concurrent submissions of
+    /// the same key can never both execute.
+    pub fn request_ledger_begin_or_replay(
+        &mut self,
+        client_request_id: &str,
+        method: &str,
+        identity: &crate::request_ledger::LedgerIdentity,
+        preferred_request_id: Option<&str>,
+        now_ms: i64,
+    ) -> crate::request_ledger::LedgerBegin {
+        self.request_ledger.begin_or_replay(
+            client_request_id,
+            method,
+            identity,
+            preferred_request_id,
+            now_ms,
+        )
+    }
+    /// Dedupe/status lookup for a `client_request_id` inside one caller
+    /// scope; expired entries are dropped first so a resubmission past the
+    /// TTL is a fresh request.
+    pub fn request_ledger_lookup(
+        &mut self,
+        client_request_id: &str,
+        caller_scope: &str,
+        now_ms: i64,
+    ) -> crate::request_ledger::LedgerReplay {
+        self.request_ledger
+            .lookup(client_request_id, caller_scope, now_ms)
+    }
+
+    /// Reserve a pending record for one `client_request_id`; returns the
+    /// request id used (wire correlation id when one was supplied).
+    pub fn request_ledger_begin(
+        &mut self,
+        client_request_id: &str,
+        method: &str,
+        identity: &crate::request_ledger::LedgerIdentity,
+        preferred_request_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<String, serde_json::Value> {
+        self.request_ledger.begin(
+            client_request_id,
+            method,
+            identity,
+            preferred_request_id,
+            now_ms,
+        )
+    }
+
+    /// Settle a pending record with the execution result.
+    pub fn request_ledger_settle(
+        &mut self,
+        client_request_id: &str,
+        result: &serde_json::Value,
+        now_ms: i64,
+    ) {
+        self.request_ledger
+            .settle(client_request_id, result, now_ms)
+    }
+
+    /// `herdr_mcp.request.status` projection by `client_request_id` or runtime
+    /// `request_id`.
+    pub fn request_ledger_status(
+        &mut self,
+        key: &str,
+        caller_scope: &str,
+        now_ms: i64,
+    ) -> serde_json::Value {
+        self.request_ledger.status(key, caller_scope, now_ms)
     }
 
     /// Open a database file named `name` inside a state directory, creating and
@@ -901,6 +981,7 @@ impl StateStore {
             path: Some(path),
             conn,
             unregistered_source_turns: Vec::new(),
+            request_ledger: crate::request_ledger::RequestLedger::default(),
         })
     }
 

@@ -59,6 +59,9 @@ mod result_projection;
 #[cfg(all(test, unix))]
 mod inspect_route_tests;
 
+#[cfg(all(test, unix))]
+mod request_ledger_tests;
+
 use result_projection::{image_tool_result, model_visible_tool_output, tool_result};
 
 pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
@@ -249,6 +252,12 @@ pub struct RuntimeContext<'a> {
     /// before any TUI or `herdr-core` socket is contacted.
     pub runtime_backend: &'a crate::runtime_adapter::RuntimeBackendSelection,
     pub trusted_local_ipc: bool,
+    /// 1.2/S0+S2: the wire correlation id (`request_id` header or JSON-RPC
+    /// id) when the HTTP boundary resolved one. The request ledger uses this
+    /// same id so `request.status` answers the id the caller already sees on
+    /// the envelope; absent for direct `tool_call` paths, which fall back to
+    /// the generated `req_*` id.
+    pub wire_request_id: Option<&'a str>,
 }
 
 /// The parent-session binding decision for one `agent.task.dispatch`.
@@ -1308,7 +1317,204 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         Ok(route) => route,
         Err(rejection) => return Ok(tool_result(rejection, true)),
     };
+    // 1.2/S2: `client_request_id` dedupe wraps the whole admitted dispatch.
+    // Validation mirrors `idempotency_key` hygiene; an invalid key is rejected
+    // before any backend work and is never recorded.
+    if name == "herdr_call"
+        && let Some(client_request_id) = arguments.get("client_request_id")
+    {
+        match crate::request_ledger::validate_client_request_id(client_request_id) {
+            Err(invalid) => return Ok(tool_result(invalid, true)),
+            Ok(key) => {
+                return herdr_call_with_request_ledger(
+                    &key,
+                    name,
+                    arguments,
+                    herdr_call_params,
+                    context,
+                    route,
+                );
+            }
+        }
+    }
     dispatch_admitted_tool(name, arguments, herdr_call_params, context, route)
+}
+
+/// 1.2/S2: `herdr_call` carrying `client_request_id` goes through the bounded
+/// request ledger. Terminal replays return the recorded result verbatim plus
+/// dedupe markers; an in-flight duplicate fails closed with `request_in_flight`
+/// and `delivery_unknown` — never a second execution.
+fn herdr_call_with_request_ledger(
+    client_request_id: &str,
+    name: &str,
+    arguments: Value,
+    herdr_call_params: Option<Value>,
+    context: &RuntimeContext<'_>,
+    route: crate::runtime_adapter::PublicToolRoute,
+) -> Result<Value, String> {
+    let now_ms = mutation_lease_now_ms();
+    let method = arguments
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    // Scope + request fingerprint: a `client_request_id` is only honored for
+    // the same request from the same caller scope; anything else under the
+    // key is an idempotency conflict, never a silent replay.
+    let caller_scope = request_ledger_caller_scope(context);
+    let identity = crate::request_ledger::LedgerIdentity::of(
+        &method,
+        arguments.get("params").unwrap_or(&Value::Null),
+        &caller_scope,
+    );
+    let begin = {
+        let mut store = context
+            .state_store
+            .lock()
+            .map_err(|_| "state store lock is poisoned".to_owned())?;
+        // The lookup and the pending insert must share one lock: two
+        // concurrent submissions of the same key can never both execute.
+        store.request_ledger_begin_or_replay(
+            client_request_id,
+            &method,
+            &identity,
+            context.wire_request_id,
+            now_ms,
+        )
+    };
+    match begin {
+        crate::request_ledger::LedgerBegin::Replay(record) => {
+            let replay = crate::request_ledger::replay_response(&record);
+            let is_error = replay.get("ok").and_then(Value::as_bool) == Some(false);
+            Ok(tool_result(
+                model_visible_tool_output(name, &arguments, replay),
+                is_error,
+            ))
+        }
+        crate::request_ledger::LedgerBegin::InFlight(record) => Ok(tool_result(
+            crate::request_ledger::in_flight_response(&record),
+            true,
+        )),
+        crate::request_ledger::LedgerBegin::Conflict => Ok(tool_result(
+            json!({
+                "ok": false,
+                "code": "idempotency_conflict",
+                "retryable": false,
+                "delivery_state": "not_delivered",
+                "client_request_id": client_request_id,
+                "message": "client_request_id was already used for a different request or caller scope; choose a new key rather than replaying",
+            }),
+            true,
+        )),
+        crate::request_ledger::LedgerBegin::CapacityExceeded => Ok(tool_result(
+            json!({
+                "ok": false,
+                "code": "request_ledger_full",
+                "retryable": true,
+                "delivery_state": "not_delivered",
+                "client_request_id": client_request_id,
+                "message": "request ledger is at capacity with in-flight work; retry after the in-flight requests settle",
+            }),
+            true,
+        )),
+        crate::request_ledger::LedgerBegin::Execute { request_id } => {
+            let (mut output, is_error) = match admitted_tool_output(
+                name,
+                arguments.clone(),
+                herdr_call_params,
+                context,
+                route,
+            ) {
+                Ok(AdmittedToolResult::Raw { output, is_error }) => (output, is_error),
+                // Envelope results bypass the raw projection, so the ledger
+                // records only that the call ran and whether it was an error —
+                // honest classification, never a fabricated request_timeout.
+                Ok(AdmittedToolResult::Envelope(response)) => {
+                    let is_error = response
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if let Ok(mut store) = context.state_store.lock() {
+                        store.request_ledger_settle(
+                            client_request_id,
+                            &json!({"ok": !is_error, "code": if is_error { "envelope_error" } else { "ok" }}),
+                            mutation_lease_now_ms(),
+                        );
+                    }
+                    return Ok(response);
+                }
+                // The tool call itself failed before producing a result: the
+                // mutation may or may not have run, so the record settles as
+                // `unknown` — never left pending to pin the key for the TTL.
+                Err(error) => {
+                    if let Ok(mut store) = context.state_store.lock() {
+                        store.request_ledger_settle(
+                            client_request_id,
+                            &json!({"ok": false, "code": "internal_error", "delivery_state": "delivery_unknown", "message": error}),
+                            mutation_lease_now_ms(),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(object) = output.as_object_mut() {
+                object.insert("request_id".to_owned(), json!(request_id));
+            }
+            if let Ok(mut store) = context.state_store.lock() {
+                store.request_ledger_settle(client_request_id, &output, mutation_lease_now_ms());
+            }
+            Ok(tool_result(
+                model_visible_tool_output(name, &arguments, output),
+                is_error,
+            ))
+        }
+    }
+}
+
+/// Minimal caller-scope fingerprint for the request ledger: the WebChat
+/// session identity when the caller is a browser conversation, plus the lease
+/// holder id when the request carries one. The digest keeps the raw session
+/// token out of the ledger; local/trusted callers all share one empty scope.
+fn request_ledger_caller_scope(context: &RuntimeContext<'_>) -> String {
+    let session = context
+        .caller_browser_session
+        .map(|session| format!("{}:{}", session.provider, session.opaque_session_id))
+        .unwrap_or_default();
+    let lease = context.caller_lease_holder_id.unwrap_or_default();
+    crate::request_ledger::LedgerIdentity::of("", &json!([session, lease]), "").request_digest
+}
+
+/// `herdr_mcp.request.status`: read-only query over the request ledger by
+/// `client_request_id` or runtime `request_id`. Unknown keys report
+/// `state:"unknown"` — a valid vocabulary value, not an error.
+fn request_status_call(context: &RuntimeContext<'_>, params: &Value) -> Value {
+    let key = params
+        .get("request_id")
+        .or_else(|| params.get("client_request_id"))
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty());
+    let Some(key) = key else {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "retryable": false,
+            "delivery_state": "not_delivered",
+            "message": "request.status requires 'request_id' or 'client_request_id'",
+        });
+    };
+    match context.state_store.lock() {
+        Ok(mut store) => store.request_ledger_status(
+            key,
+            &request_ledger_caller_scope(context),
+            mutation_lease_now_ms(),
+        ),
+        Err(_) => json!({
+            "ok": false,
+            "code": "state_store_unavailable",
+            "retryable": true,
+            "message": "request ledger is unreachable",
+        }),
+    }
 }
 
 fn dispatch_admitted_tool(
@@ -1318,6 +1524,36 @@ fn dispatch_admitted_tool(
     context: &RuntimeContext<'_>,
     route: crate::runtime_adapter::PublicToolRoute,
 ) -> Result<Value, String> {
+    match admitted_tool_output(name, arguments.clone(), herdr_call_params, context, route)? {
+        AdmittedToolResult::Raw { output, is_error } => Ok(tool_result(
+            model_visible_tool_output(name, &arguments, output),
+            is_error,
+        )),
+        AdmittedToolResult::Envelope(response) => Ok(response),
+    }
+}
+
+/// `admitted_tool_output` yields either a raw result value (wrapped by
+/// `tool_result` + `model_visible_tool_output` exactly as before) or a
+/// pre-built MCP envelope (image/binary and bespoke tool shapes) that passes
+/// through untouched.
+enum AdmittedToolResult {
+    Raw { output: Value, is_error: bool },
+    Envelope(Value),
+}
+
+/// Produces the result for an admitted tool. `is_error` on `Raw` marks
+/// transport-level refusals only; method-level `ok:false` results still report
+/// `is_error=false` exactly as before. `herdr_call` with `client_request_id`
+/// calls this directly so the request ledger settles the raw result, not the
+/// MCP envelope.
+fn admitted_tool_output(
+    name: &str,
+    arguments: Value,
+    herdr_call_params: Option<Value>,
+    context: &RuntimeContext<'_>,
+    route: crate::runtime_adapter::PublicToolRoute,
+) -> Result<AdmittedToolResult, String> {
     let herdr_core = route.herdr_core_client();
     // These local routes use TUI agent identities or topology, or expose TUI
     // execution sessions. Reject before task binding, capture, or dispatch.
@@ -1327,27 +1563,27 @@ fn dispatch_admitted_tool(
             .and_then(Value::as_str)
             .unwrap_or("");
         if name == "herdr_skill" {
-            return Ok(tool_result(
-                crate::runtime_adapter::herdr_core_unsupported(
+            return Ok(AdmittedToolResult::Raw {
+                output: crate::runtime_adapter::herdr_core_unsupported(
                     name,
                     "tui_backend_isolation",
                     "this operation depends on TUI state or execution and is unavailable on herdr-core",
                 ),
-                true,
-            ));
+                is_error: true,
+            });
         }
         if name == "herdr_call"
             && let Some((required_capability, message)) =
                 crate::runtime_adapter::herdr_core_local_method_refusal(method)
         {
-            return Ok(tool_result(
-                crate::runtime_adapter::herdr_core_unsupported(
+            return Ok(AdmittedToolResult::Raw {
+                output: crate::runtime_adapter::herdr_core_unsupported(
                     method,
                     required_capability,
                     message,
                 ),
-                true,
-            ));
+                is_error: true,
+            });
         }
     }
     let _work_capture = if herdr_core.is_none() {
@@ -1396,18 +1632,19 @@ fn dispatch_admitted_tool(
                             | "idempotency_key"
                             | "lease_holder_id"
                             | "lease_epoch"
+                            | "client_request_id"
                     ) {
-                        return Ok(tool_result(
-                            json!({
+                        return Ok(AdmittedToolResult::Raw {
+                            output: json!({
                                 "ok": false,
                                 "code": "invalid_params",
                                 "retryable": false,
                                 "message": format!(
-                                    "unknown top-level argument '{key}'; herdr_call only accepts 'method', 'params', optional 'device' and optional 'idempotency_key'"
+                                    "unknown top-level argument '{key}'; herdr_call only accepts 'method', 'params', optional 'device', optional 'idempotency_key' and optional 'client_request_id'"
                                 ),
                             }),
-                            true,
-                        ));
+                            is_error: true,
+                        });
                     }
                 }
             }
@@ -1419,7 +1656,12 @@ fn dispatch_admitted_tool(
                 Some(params) => params,
                 None => match normalize_herdr_call_params(arguments.get("params")) {
                     Ok(params) => params,
-                    Err(invalid) => return Ok(tool_result(invalid, true)),
+                    Err(invalid) => {
+                        return Ok(AdmittedToolResult::Raw {
+                            output: invalid,
+                            is_error: true,
+                        });
+                    }
                 },
             };
             if method.starts_with("continuity.") {
@@ -1434,6 +1676,8 @@ fn dispatch_admitted_tool(
                 )
             } else if method == WORKSTATION_PREFLIGHT_METHOD {
                 workstation_preflight_call(context, &params, route.selection(), herdr_core)
+            } else if method == crate::progressive_skills::REQUEST_STATUS_METHOD {
+                request_status_call(context, &params)
             } else if matches!(
                 method,
                 ORCHESTRATION_LEASE_ACQUIRE_METHOD
@@ -1782,7 +2026,7 @@ fn dispatch_admitted_tool(
         "herdr_fs_list" => route_fs_git("fs_list", &context.cache.snapshot(), &arguments),
         "herdr_fs_grep" => route_fs_git("fs_grep", &context.cache.snapshot(), &arguments),
         "herdr_fs_image" => {
-            return Ok(
+            return Ok(AdmittedToolResult::Envelope(
                 match tcc_broker::route_fs_git("fs_image", &context.cache.snapshot(), &arguments) {
                     Some(Ok(value)) => {
                         let value = crate::macos_permissions::map_fs_git_result(value);
@@ -1815,7 +2059,7 @@ fn dispatch_admitted_tool(
                         }
                     },
                 },
-            );
+            ));
         }
         "herdr_fs_edit" => {
             if herdr_core.is_some() {
@@ -1971,28 +2215,28 @@ fn dispatch_admitted_tool(
             .skill
             .fetch_for_runtime(&arguments, &context.cache.snapshot()),
         pending if contract::tool_names().contains(&pending) => {
-            return Ok(tool_result(
-                json!({
+            return Ok(AdmittedToolResult::Raw {
+                output: json!({
                     "ok": false,
                     "code": "native_tool_pending",
                     "tool": pending,
                     "message": "This epoch-2 tool has not migrated to the Rust candidate runtime yet"
                 }),
-                true,
-            ));
+                is_error: true,
+            });
         }
         _ => {
-            return Ok(tool_result(
-                json!({"ok": false, "code": "unknown_tool", "tool": name}),
-                true,
-            ));
+            return Ok(AdmittedToolResult::Raw {
+                output: json!({"ok": false, "code": "unknown_tool", "tool": name}),
+                is_error: true,
+            });
         }
     };
 
-    Ok(tool_result(
-        model_visible_tool_output(name, &arguments, output),
-        false,
-    ))
+    Ok(AdmittedToolResult::Raw {
+        output,
+        is_error: false,
+    })
 }
 
 struct ToolCallCapture<'a, 'context> {
@@ -27786,6 +28030,7 @@ mod tests {
             browser_mutation_admission: None,
             runtime_backend: &runtime_backend,
             trusted_local_ipc: true,
+            wire_request_id: None,
         };
 
         let resp = handle(
@@ -31375,6 +31620,7 @@ mod client_request_shape_matrix_tests {
             browser_mutation_admission: None,
             runtime_backend: &runtime_backend,
             trusted_local_ipc: false,
+            wire_request_id: None,
         };
 
         // 1. herdr_call params as JSON object vs JSON string vs null/omitted
@@ -31720,6 +31966,7 @@ mod client_request_shape_matrix_tests {
                     browser_mutation_admission: None,
                     runtime_backend: &backend,
                     trusted_local_ipc: false,
+                    wire_request_id: None,
                 }
             };
 
@@ -32762,6 +33009,7 @@ mod text_transfer_safety_tests {
             browser_mutation_admission: None,
             runtime_backend: &backend,
             trusted_local_ipc: false,
+            wire_request_id: None,
         };
         let call = |method: &str, params: Value| -> Value {
             let response = handle(&json!({
