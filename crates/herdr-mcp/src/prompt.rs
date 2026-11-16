@@ -109,6 +109,7 @@ struct RegisterTaskInput<'a> {
     stall_after_ms: Option<u64>,
     max_runtime_ms: Option<u64>,
     on_budget: Option<&'a str>,
+    request_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,6 +207,8 @@ struct PromptTaskRecord {
     worker_done_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stall_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
     /// 1.2 S5: optional wall-clock run cap from task creation. Expiry emits
     /// an `agent_budget_exceeded` event to the parent; it never terminates the
     /// task by itself. Absent on older records, which keep loading unchanged.
@@ -627,6 +630,7 @@ impl PromptRegistry {
             stall_after_ms,
             max_runtime_ms,
             on_budget,
+            request_id,
         } = input;
         if submitted == Some(false) || self.inner.store.is_none() {
             return Ok(None);
@@ -706,6 +710,7 @@ impl PromptRegistry {
             max_runtime_ms: None,
             on_budget: None,
             budget_events: Vec::new(),
+            request_id: None,
             gate: None,
             final_excerpt: None,
             awaiting_children: None,
@@ -730,6 +735,7 @@ impl PromptRegistry {
         record.stall_after_ms = stall_after_ms;
         record.max_runtime_ms = max_runtime_ms;
         record.on_budget = on_budget.map(str::to_owned);
+        record.request_id = request_id.map(str::to_owned);
         self.save_task(&record, Some(fingerprint))?;
         drop(guard);
         let reconciled = self.reconcile_task(task_id)?;
@@ -3290,7 +3296,7 @@ pub fn task_call_with_parent_session(
 }
 
 pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Value {
-    run_with_parent_session(client, registry, args, None)
+    run_with_parent_session(client, registry, args, None, None)
 }
 
 /// Rejections for a dispatch that would make the delegation chain unsafe. Both
@@ -3379,6 +3385,7 @@ pub fn run_with_parent_session(
     registry: &PromptRegistry,
     args: &Value,
     parent_session_ref: Option<&str>,
+    request_id: Option<&str>,
 ) -> Value {
     if let Err(error) = mutation::check_global("herdr_prompt") {
         return error;
@@ -3756,6 +3763,7 @@ pub fn run_with_parent_session(
         stall_after_ms,
         max_runtime_ms,
         on_budget,
+        request_id,
     }) {
         Ok(Some(task)) => {
             if let Some(object) = result.as_object_mut() {
@@ -7410,18 +7418,18 @@ mod tests {
             if let Some(parent) = parent {
                 args["parent_target"] = json!(parent);
             }
-            let result = run_with_parent_session(&client, &registry, &args, session);
+            let result = run_with_parent_session(&client, &registry, &args, session, None);
             assert_eq!(result["code"], "concurrency_limit_reached", "{result}");
             assert_eq!(result["delivery_state"], "not_delivered");
             assert_eq!(result["submitted"], false);
             assert_eq!(
-                run_with_parent_session(&client, &registry, &args, Some("other-session"))["code"],
+                run_with_parent_session(&client, &registry, &args, Some("other-session"), None)["code"],
                 "role_target_unavailable"
             );
             if session.is_some() {
                 args["parent_target"] = json!("another-pane-same-session");
                 assert_eq!(
-                    run_with_parent_session(&client, &registry, &args, session)["code"],
+                    run_with_parent_session(&client, &registry, &args, session, None)["code"],
                     "concurrency_limit_reached"
                 );
             } else if parent.is_some() {
@@ -7447,7 +7455,7 @@ mod tests {
                 original["parent_target"] = json!(parent);
             }
             assert_eq!(
-                run_with_parent_session(&client, &registry, &original, session)["code"],
+                run_with_parent_session(&client, &registry, &original, session, None)["code"],
                 "concurrency_limit_reached"
             );
             assert_eq!(
@@ -7464,7 +7472,7 @@ mod tests {
                 original["parent_target"] = json!(parent);
             }
             assert_eq!(
-                run_with_parent_session(&client, &registry, &original, session)["code"],
+                run_with_parent_session(&client, &registry, &original, session, None)["code"],
                 "role_target_unavailable"
             );
         }
