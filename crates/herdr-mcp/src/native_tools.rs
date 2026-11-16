@@ -26,9 +26,17 @@ pub fn inspect_with_selection(
     cache: Option<&EventCache>,
     exec: Option<&ExecRegistry>,
     selection: &crate::runtime_adapter::RuntimeBackendSelection,
+    core_client: Option<&crate::runtime_adapter::HerdrCoreClient>,
 ) -> Value {
     let cached_snapshot = cache.and_then(EventCache::fresh_snapshot);
-    let mut view = inspect::inspect_core_with_selection(client, cached_snapshot, selection);
+    let mut view = match core_client {
+        Some(core_client)
+            if selection.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore =>
+        {
+            crate::runtime_adapter::inspect_herdr_core_with_client(selection, core_client)
+        }
+        _ => inspect::inspect_core_with_selection(client, cached_snapshot, selection),
+    };
     runtime_meta::augment_inspect(&mut view, cache, exec);
     view
 }

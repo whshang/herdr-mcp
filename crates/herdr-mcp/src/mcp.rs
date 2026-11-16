@@ -1287,6 +1287,7 @@ fn dispatch_admitted_tool(
             Some(context.cache),
             Some(context.exec),
             route.selection(),
+            herdr_core,
         ),
         "herdr_since" => {
             let cursor = arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0);
@@ -1371,7 +1372,7 @@ fn dispatch_admitted_tool(
                     Some(&context.cache.snapshot()),
                 )
             } else if method == WORKSTATION_PREFLIGHT_METHOD {
-                workstation_preflight_call(context, &params, route.selection())
+                workstation_preflight_call(context, &params, route.selection(), herdr_core)
             } else if matches!(
                 method,
                 ORCHESTRATION_LEASE_ACQUIRE_METHOD
@@ -2191,6 +2192,7 @@ fn workstation_preflight_call(
     context: &RuntimeContext<'_>,
     params: &Value,
     selection: &crate::runtime_adapter::RuntimeBackendSelection,
+    core_client: Option<&crate::runtime_adapter::HerdrCoreClient>,
 ) -> Value {
     let Some(object) = params.as_object() else {
         return json!({
@@ -2226,7 +2228,13 @@ fn workstation_preflight_call(
         Some(context.cache),
         Some(context.exec),
         selection,
+        core_client,
     );
+    if selection.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore
+        && inspect_view.get("code").and_then(Value::as_str) == Some("herdr_core_identity_changed")
+    {
+        return inspect_view;
+    }
     let browser_endpoints = if endpoint_limit == 0 {
         json!([])
     } else {
@@ -27748,9 +27756,11 @@ mod tests {
             source: "test",
             herdr_core_socket: None,
         };
-        let bad = workstation_preflight_call(&context, &json!({"endpoint_limit": 99}), &selection);
+        let bad =
+            workstation_preflight_call(&context, &json!({"endpoint_limit": 99}), &selection, None);
         assert_eq!(bad["ok"], false);
         assert_eq!(bad["code"], "invalid_params");
+
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 
