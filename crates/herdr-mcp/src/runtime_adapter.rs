@@ -607,7 +607,7 @@ pub struct HerdrCoreClient {
     admitted_hello: Option<HerdrCoreHello>,
     admitted_peer_pid: Option<i32>,
     // Applies only to a conditional public server.status request.
-    pre_hello_expected_target: Option<String>,
+    pre_hello_expected_target: Option<(std::num::NonZeroI32, u64, u64)>,
 }
 
 impl HerdrCoreClient {
@@ -1390,31 +1390,33 @@ impl HerdrCoreClient {
         call_timeout: Duration,
         op: impl FnOnce(HerdrCoreHello, &mut HcSocketStream) -> Result<T, HerdrCoreError>,
     ) -> Result<T, HerdrCoreError> {
-        let mut stream = connect_hc_socket(&self.socket_path, call_timeout)?;
+        // The pathname fingerprint is advisory and can be replaced between
+        // this stat and connect. Compare it before attempting connect; the
+        // kernel peer PID can only be checked on the connected socket.
         #[cfg(unix)]
-        if let Some(expected) = self.pre_hello_expected_target.as_deref() {
-            // Two components are observable before `hello`: the
-            // kernel-attested peer PID from the connected fd, and the listener
-            // socket node dev/ino from the configured path (exactly what
-            // `advisory_target_ref` recorded). Refuse before any request byte
-            // when either differs. The self-reported `core.id` is observable
-            // only from the hello reply, so it stays in the post-hello
-            // `admitted_target_ref` comparison.
-            let Some((dev, ino)) = self.listener_node_fingerprint() else {
+        let expected_peer_pid = if let Some((pid, dev, ino)) = self.pre_hello_expected_target {
+            if self.listener_node_fingerprint() != Some((dev, ino)) {
                 return Err(HerdrCoreError {
                     code: "herdr_core_target_changed".to_owned(),
                     kind: Some("core_target_changed".to_owned()),
-                    message: "the configured Core socket node is no longer an observable listener before admission hello".to_owned(),
-                });
-            };
-            let peer_pid = hc_peer_pid(&stream, &self.socket_path)?;
-            if !expected.starts_with(&format!("unix:{peer_pid}:{dev}:{ino}:")) {
-                return Err(HerdrCoreError {
-                    code: "herdr_core_target_changed".to_owned(),
-                    kind: Some("core_target_changed".to_owned()),
-                    message: "the connected Core peer or listener socket node differs from the expected target before admission hello".to_owned(),
+                    message: "the configured Core listener socket node changed before connect"
+                        .to_owned(),
                 });
             }
+            Some(pid)
+        } else {
+            None
+        };
+        let mut stream = connect_hc_socket(&self.socket_path, call_timeout)?;
+        #[cfg(unix)]
+        if let Some(expected_pid) = expected_peer_pid
+            && hc_peer_pid(&stream, &self.socket_path)? != expected_pid.get()
+        {
+            return Err(HerdrCoreError {
+                code: "herdr_core_target_changed".to_owned(),
+                kind: Some("core_target_changed".to_owned()),
+                message: "the connected Core peer PID differs from the expected target before admission hello".to_owned(),
+            });
         }
         #[cfg(unix)]
         if let Some(admitted_pid) = self.admitted_peer_pid
@@ -2009,6 +2011,29 @@ fn admission_drift(
     Ok(())
 }
 
+/// Parse the Unix target fields observable before admission hello.
+/// The optional core ID is opaque and stays checked after hello.
+fn hc_expected_unix_target(value: &str) -> Option<(std::num::NonZeroI32, u64, u64)> {
+    let mut parts = value.splitn(5, ':');
+    if parts.next()? != "unix" {
+        return None;
+    }
+    let decimal = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let pid_text = parts.next()?;
+    let dev_text = parts.next()?;
+    let ino_text = parts.next()?;
+    if !decimal(pid_text) || !decimal(dev_text) || !decimal(ino_text) {
+        return None;
+    }
+    let pid = pid_text
+        .parse::<i32>()
+        .ok()
+        .and_then(std::num::NonZeroI32::new)?;
+    let dev = dev_text.parse::<u64>().ok()?;
+    let ino = ino_text.parse::<u64>().ok()?;
+    Some((pid, dev, ino))
+}
+
 fn public_tool_route_for_selection(
     tool_name: &str,
     selection: &RuntimeBackendSelection,
@@ -2042,22 +2067,21 @@ fn public_tool_route_for_selection(
                     "message": "herdr-core backend selected without a resolved socket path",
                 }));
             };
-            let pre_hello_target = match expected_target {
-                Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
-                Some(_) => {
-                    return Err(json!({
-                        "ok": false,
-                        "code": "invalid_params",
-                        "message": "expected_core_target must be a non-empty string",
-                        "delivery_state": "not_delivered",
-                        "fallback_allowed": false,
-                        "retryable": false,
-                    }));
-                }
-                None => None,
-            };
+            let pre_hello_target = expected_target
+                .and_then(Value::as_str)
+                .and_then(hc_expected_unix_target);
+            if expected_target.is_some() && pre_hello_target.is_none() {
+                return Err(json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "expected_core_target must be a valid Unix target reference",
+                    "delivery_state": "not_delivered",
+                    "fallback_allowed": false,
+                    "retryable": false,
+                }));
+            }
             let mut client = HerdrCoreClient::new(socket_path);
-            client.pre_hello_expected_target = pre_hello_target.map(str::to_owned);
+            client.pre_hello_expected_target = pre_hello_target;
             let capability_check = client.admit_public_tool(tool_name).map_err(|mut rejection| {
                 if let Some(object) = rejection.as_object_mut() {
                     object.insert("operation".to_owned(), json!(tool_name));

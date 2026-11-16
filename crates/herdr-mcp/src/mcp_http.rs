@@ -4906,7 +4906,7 @@ mod tests {
                 &app,
                 "herdr_call",
                 json!({"method": "server.status", "params": {
-                    "expected_core_target": "unix:stale:listener"
+                    "expected_core_target": hc_target_segment_bumped(target, 2)
                 }}),
             ).await;
             assert_eq!(changed["code"], "herdr_core_target_changed", "{changed}");
@@ -5144,6 +5144,29 @@ mod tests {
                 .any(|method| method == "server.status")
         );
         drop(first);
+
+        // Malformed target references are invalid params even with no socket
+        // to connect to. Admission must reject them before attempting connect.
+        runtime.block_on(async {
+            for malformed in [
+                "unix:not-a-pid:1:2:",
+                "unix:42:not-a-device:2:",
+                "unix:42:1:not-an-inode:",
+            ] {
+                let invalid = call_public_tool(
+                    &app,
+                    "herdr_call",
+                    json!({
+                        "method": "server.status",
+                        "params": {"expected_core_target": malformed}
+                    }),
+                )
+                .await;
+                assert_eq!(invalid["code"], "invalid_params", "{malformed}: {invalid}");
+                assert_eq!(invalid["delivery_state"], "not_delivered");
+                assert_eq!(invalid["fallback_allowed"], false);
+            }
+        });
 
         let second_log = root.join("second-status.log");
         let second = start(&socket, &second_log);
