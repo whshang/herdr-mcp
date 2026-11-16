@@ -1772,6 +1772,7 @@ fn admitted_tool_output(
                     context.prompt,
                     &prompt_params,
                     parent_session_ref.as_deref(),
+                    context.wire_request_id,
                 );
                 if matches!(binding, AgentTaskParentSession::Replay) {
                     enrich_agent_task_parent_session_device_id(context, &mut result);
@@ -2110,6 +2111,7 @@ fn admitted_tool_output(
                     context.prompt,
                     &arguments,
                     parent_session_ref.as_deref(),
+                    context.wire_request_id,
                 );
                 // #921: a replay carries this call's (possibly empty) browser
                 // context, which must never overwrite the durable parent session.
