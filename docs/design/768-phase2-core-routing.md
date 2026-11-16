@@ -133,16 +133,16 @@ AI 生成的设计草案，基于 b8d660a02f5d501f625b89ec5a91aa40414c3f8c（ori
 
 **#946（已合入 b8d660a0，"在 Core admission hello 前拒绝错误目标"）**：即原 #935 讨论的 pre-hello 目标比对切片的落地。它做了三件事：params 双形式在准入前归一化一次（`mcp.rs:1211`）、`expected_core_target` 提前到准入前校验并拒绝非 `server.status` 携带（`mcp.rs:1245 tool_call` + `runtime_adapter.rs:2398`）、条件目标在 connect 前比 dev/ino、connect 后 hello 前比 OS peer PID（`runtime_adapter.rs:1396-1420`）。**本文与其不重叠**：切片 3 不再把 pre-hello 比对列为待做依赖（初稿如此，已按 b8d660a0 修正），改为回归保护 + 收口其未覆盖面（无条件请求首次 admission 仍 hello 后取 PID；pathname 指纹 TOCTOU/inode 复用；advisory 措辞）。切片 4–6 的外部前提（文件打开耦合、写提交耦合、执行绑定）与 #946 正交：#946 是必要非充分条件，不授权任何文件/exec 操作。
 
-**PR #947 `docs/design/1.2-local-transport-and-delivery.md`（OPEN，head c0a2de27）**：其 S6"Same-machine direct transport"明确 folds into #768 Phase 2，并给出同机谓词（device_id 相等 + #941 peer UID + #943/#944/#945 一致性）。分工与不重叠：
+**PR #947 `docs/design/1.2-local-transport-and-delivery.md`（已合入 main：mergeCommit `856543cea8ac3710f0fe59a4a599c72d4da6e37a`，mergedAt 2026-11-16T15:13:57Z；审阅时 head 为 c0a2de27，本文引用行号以该 head 为准）**：其 S6"Same-machine direct transport"明确 folds into #768 Phase 2，并给出同机谓词（device_id 相等 + #941 peer UID + #943/#944/#945 一致性）。分工与不重叠：
 
 - **S6 拥有**：同机判定与 transport 切换（何时不走 Edge）、`transport/timing_ms` 信封字段（S0）、重连窗口写请求 `not_delivered` 化、300s heartbeat vs 90s silence 修复、跨传输治理记录可比性。本文不设计这些。
 - **本文（Phase 2）拥有**：到达本机后的 backend 选择与逐工具 Core 授权/解封门槛、进程隔离、目标校验收口。S6 不新增任何 Core 授权：其谓词 2/3 引用的 `verify_hc_peer_uid`/`admit_public_tool`/`expected_core_target` 全部是本文保护的既有机制；S6 落地时这些检查原样复用，切片 4–6 的 refusal-first 不受 S6 影响（S6 自己也如此声明）。
 - **一处需修正的 S6 表述**（供 #947 作者参考）：S6 谓词 2 写“local socket passes the #941 peer UID check (`verify_hc_peer_uid`)”——该检查是**出站 Core socket** 的（`runtime_adapter.rs:2764`），TUI 本机 socket 路径并不执行它；入站 IPC listener 也无 peer UID 检查。同机谓词若要求入站方向的对端身份，需要新机制（范围外），不能引用现有函数充当已具备。
-- **顺序**：按 #947 §5，S6 在 #768 Phase 2 之后、协调者确认后启动；本文切片 1–3 不依赖 S6，切片 2 的三入口一致性测试为 S6 提供基线。S1（v6 contract epoch）改变 `herdr_call.params` 的 advertised shape，与本文冻结的是 18-tool 目录不冲突，但切片 1 的契约测试需在 S1 合入后按其新 epoch pin 重跑（串行约束见 #947 §5：触碰 `mcp.rs`/`runtime_adapter.rs` 的切片与 credentials deny-list 切片串行）。
+- **顺序**：按 #947 §5，S6 在 #768 Phase 2 之后、协调者确认后启动；本文切片 1–3 不依赖 S6，切片 2 的三入口一致性测试为 S6 提供基线。S1（v6 contract epoch）改变 `herdr_call.params` 的 advertised shape，与本文冻结的是 18-tool 目录不冲突，但切片 1 的契约测试需在 S1 合入后按其新 epoch pin 重跑（串行约束见 #947 §5：触碰 `mcp.rs`/`runtime_adapter.rs` 的切片与 credentials deny-list 切片串行）。credentials deny-list 切片已以 #949 合入 main（squash `7a1d6983a9a7b8c566baf73645683ccb9e124464`，"拒绝凭据目录的整棵子树（#938 残留）"，触及 `fs_security.rs`/`fs_tools.rs`/`text_transfer.rs`）：该串行约束就此解除，且切片 4–5 的路径策略对照须以 #949 之后的凭据目录整树拒绝为准。
 
 ## 切片顺序与停止条件
 
-**顺序**：1 → 2 → 3 串行（2 依赖 1 的基线测试；3 依赖 2 的进程可启动才能做进程级收口验证，单元部分可并行）；4 → 5（write → edit）→ 6 严格条件串行，各自等待外部安全机制证据。与 #947 的全局排序（#946 → S1 → deny-list → S0 → S2…）协调：本文任何触碰 `mcp.rs`/`runtime_adapter.rs` 的切片与 S1/deny-list 串行，一片一 PR 一 gate。
+**顺序**：1 → 2 → 3 串行（2 依赖 1 的基线测试；3 依赖 2 的进程可启动才能做进程级收口验证，单元部分可并行）；4 → 5（write → edit）→ 6 严格条件串行，各自等待外部安全机制证据。与 #947 的全局排序（#946 → S1 → deny-list → S0 → S2…）协调：deny-list 已以 #949 合入（`7a1d6983`），本文触碰 `mcp.rs`/`runtime_adapter.rs` 的切片只需与 S1 串行，一片一 PR 一 gate。
 
 **每片通用停止条件**（命中即停，写文档上报协调者，不得变通实现）：
 1. 需要修改冻结 18-tool 目录、公共参数或结果语义才能推进 → 停（合同变更需独立决策）。
