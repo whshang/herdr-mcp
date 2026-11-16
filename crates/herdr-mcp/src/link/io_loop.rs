@@ -385,7 +385,16 @@ where
         let Some(path) = self.telemetry_path.as_deref() else {
             return;
         };
-        let _ = crate::link::telemetry::publish(path, &self.telemetry, self.now_ms());
+        if let Err(error) = crate::link::telemetry::publish(path, &self.telemetry, self.now_ms()) {
+            // Publication stays best-effort (it must never disturb the
+            // transport loop), but it is never silent: a persistent failure
+            // would freeze every counter. Only the config path and the OS
+            // error are reported - no payload or credential content.
+            eprintln!(
+                "[herdr-link-daemon] warn transport-telemetry-publish-failed path={} error={error}",
+                path.display()
+            );
+        }
     }
 
     fn rng_sample(&self) -> f64 {
@@ -1394,6 +1403,27 @@ mod tests {
             telemetry_path: None,
         }
     }
+    /// Bounded wait for the daemon-published telemetry document. The loop
+    /// publishes synchronously inside its action handler, so this only bridges
+    /// the scheduler hand-off; it never depends on a fixed long sleep.
+    async fn wait_for_telemetry(
+        path: &std::path::Path,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        for _ in 0..400 {
+            if let Some(document) = crate::link::telemetry::read(path)
+                && predicate(&document)
+            {
+                return document;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "telemetry never satisfied the predicate: {:?}",
+            crate::link::telemetry::read(path)
+        );
+    }
+
     async fn next_control(
         controls: &mut mpsc::UnboundedReceiver<FakeSocketControl>,
     ) -> FakeSocketControl {
@@ -1604,6 +1634,80 @@ mod tests {
         ));
         send_closed(&second, WS_CLOSE_NORMAL, "done");
         assert_eq!(task.await.unwrap().unwrap(), LinkExitKind::Stopped);
+    }
+
+    /// P1 regression (#952 review): a real reconnect window must publish
+    /// `reconnecting`, never `connecting`. This drives the production action
+    /// order (Online → Disconnected → ScheduleReconnect → next attempt) instead
+    /// of calling the telemetry state machine directly.
+    #[tokio::test]
+    async fn telemetry_reports_reconnecting_across_a_real_reconnect_window() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let telemetry_path = std::env::temp_dir().join(format!(
+            "herdr-link-telemetry-io-{}-{unique}.json",
+            std::process::id()
+        ));
+        let runtime = Arc::new(MockRuntime::immediate(RuntimeToolResult::Success {
+            result: None,
+        }));
+        let (connector, mut controls) = FakeConnector::new([]);
+        let mut config = io_config(100);
+        config.telemetry_path = Some(telemetry_path.clone());
+        let io = LinkIoLoop::with_connector(
+            config,
+            make_core(1_000, 20, 3_000, 262_144, None),
+            make_runner(runtime),
+            connector,
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(io.run(stop_rx));
+
+        let mut first = next_control(&mut controls).await;
+        bring_online(&mut first).await;
+        let online = wait_for_telemetry(&telemetry_path, |document| {
+            document["transport_state"] == json!("online")
+        })
+        .await;
+        assert_eq!(online["reconnect_count"], json!(0), "{online}");
+
+        // The close produces `Disconnected` (reconnecting) and, before the next
+        // socket attempt exists, `ScheduleReconnect` must keep that label.
+        send_closed(&first, 1006, "network");
+        let mut second = next_control(&mut controls).await;
+        assert_ne!(first.attempt_id, second.attempt_id);
+        let reconnecting = crate::link::telemetry::read(&telemetry_path).expect("published");
+        assert_eq!(
+            reconnecting["transport_state"],
+            json!("reconnecting"),
+            "{reconnecting}"
+        );
+        assert_eq!(
+            reconnecting["connected_since_ms"],
+            serde_json::Value::Null,
+            "{reconnecting}"
+        );
+        assert_eq!(reconnecting["reconnect_count"], json!(0), "{reconnecting}");
+
+        bring_online(&mut second).await;
+        let recovered = wait_for_telemetry(&telemetry_path, |document| {
+            document["reconnect_count"] == json!(1)
+        })
+        .await;
+        assert_eq!(recovered["transport_state"], json!("online"), "{recovered}");
+        assert!(
+            recovered["last_reconnect_duration_ms"].is_u64(),
+            "{recovered}"
+        );
+        assert!(recovered["connected_since_ms"].is_i64(), "{recovered}");
+
+        stop_tx.send(true).unwrap();
+        let _ = next_command(&mut second).await;
+        send_closed(&second, WS_CLOSE_NORMAL, "done");
+        let _ = task.await;
+        let _ = std::fs::remove_file(&telemetry_path);
     }
 
     #[tokio::test]

@@ -29,7 +29,10 @@ pub struct LinkTransportTelemetry {
     last_reconnect_duration_ms: Option<u64>,
     connected_since_ms: Option<i64>,
     transport_state: &'static str,
-    online: bool,
+    // True once a handshake has completed at least once. `connecting` is
+    // reserved for the very first attempt: after any successful handshake, a
+    // retry is a *re*connect even while the link is not currently online.
+    ever_online: bool,
     disconnected_at_ms: Option<i64>,
 }
 
@@ -40,7 +43,7 @@ impl Default for LinkTransportTelemetry {
             last_reconnect_duration_ms: None,
             connected_since_ms: None,
             transport_state: STATE_CONNECTING,
-            online: false,
+            ever_online: false,
             disconnected_at_ms: None,
         }
     }
@@ -64,11 +67,19 @@ impl LinkTransportTelemetry {
     }
 
     /// The daemon is trying to establish (or re-establish) the link.
+    ///
+    /// `connecting` is reserved for the first attempt of this process. The
+    /// production ordering is `Disconnected` (state → reconnecting) followed by
+    /// `ScheduleReconnect` → this method, so deciding from "currently online"
+    /// would always report `connecting` during a real reconnect window. The
+    /// decision therefore comes from "have we ever been online", never from the
+    /// momentary online flag.
     pub fn record_connecting(&mut self) {
-        self.transport_state = if self.online {
-            STATE_RECONNECTING
-        } else {
+        let first_attempt = !self.ever_online && self.disconnected_at_ms.is_none();
+        self.transport_state = if first_attempt {
             STATE_CONNECTING
+        } else {
+            STATE_RECONNECTING
         };
     }
 
@@ -83,7 +94,7 @@ impl LinkTransportTelemetry {
         }
         self.connected_since_ms = Some(now_ms);
         self.transport_state = STATE_ONLINE;
-        self.online = true;
+        self.ever_online = true;
     }
 
     /// The link lost its connection; the ladder keeps retrying.
@@ -93,14 +104,12 @@ impl LinkTransportTelemetry {
         }
         self.connected_since_ms = None;
         self.transport_state = STATE_RECONNECTING;
-        self.online = false;
     }
 
     /// The daemon stopped or gave up; no retry is pending.
     pub fn record_offline(&mut self) {
         self.connected_since_ms = None;
         self.transport_state = STATE_OFFLINE;
-        self.online = false;
     }
 
     pub fn to_json(&self, updated_at_ms: i64) -> Value {
@@ -127,14 +136,59 @@ pub fn publish(
     }
     let body =
         serde_json::to_vec(&telemetry.to_json(updated_at_ms)).unwrap_or_else(|_| b"{}".to_vec());
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    // A per-publish temp name keeps repeated publications independent.
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
     std::fs::write(&temp, body)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&temp, path)
+    replace_file(&temp, path)
+}
+
+static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Replace `target` with `temp` atomically.
+///
+/// `std::fs::rename` cannot replace an existing destination on Windows, so the
+/// second publish of a state file would fail there (and the transport loop
+/// treats a publish failure as best-effort noise). On Windows use
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, which is the documented atomic
+/// replace for a same-volume file, instead of a delete-then-rename window.
+fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+
+        let wide = |path: &Path| {
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let from = wide(temp);
+        let to = wide(target);
+        let replaced = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if replaced == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temp, target)
+    }
 }
 
 /// Read the last published counters. Returns `None` when the daemon has not
@@ -190,6 +244,91 @@ mod tests {
             3,
             "offline never resets counters"
         );
+    }
+
+    /// P1 regression (#952 review): the production order is
+    /// `Disconnected` → `ScheduleReconnect`. Deciding the state from "currently
+    /// online" reported `connecting` for every real reconnect window.
+    #[test]
+    fn reconnect_window_reports_reconnecting_in_production_order() {
+        let mut telemetry = LinkTransportTelemetry::default();
+        // First attempt: nothing has ever been online.
+        telemetry.record_connecting();
+        assert_eq!(telemetry.transport_state(), STATE_CONNECTING);
+
+        telemetry.record_online(1_000);
+        assert_eq!(telemetry.transport_state(), STATE_ONLINE);
+
+        // Exact io_loop order: Disconnected, then ScheduleReconnect.
+        telemetry.record_disconnected(2_000);
+        assert_eq!(telemetry.transport_state(), STATE_RECONNECTING);
+        telemetry.record_connecting();
+        assert_eq!(
+            telemetry.transport_state(),
+            STATE_RECONNECTING,
+            "a reconnect window must never be reported as the first attempt"
+        );
+
+        // Repeated retries during one outage keep the reconnect label.
+        telemetry.record_connecting();
+        assert_eq!(telemetry.transport_state(), STATE_RECONNECTING);
+
+        telemetry.record_online(3_000);
+        assert_eq!(telemetry.transport_state(), STATE_ONLINE);
+        assert_eq!(telemetry.reconnect_count(), 1);
+
+        // A second outage behaves the same way.
+        telemetry.record_disconnected(4_000);
+        telemetry.record_connecting();
+        assert_eq!(telemetry.transport_state(), STATE_RECONNECTING);
+        telemetry.record_online(4_500);
+        assert_eq!(telemetry.reconnect_count(), 2);
+        assert_eq!(telemetry.transport_state(), STATE_ONLINE);
+    }
+
+    /// P1 regression (#952 review): Windows cannot `rename` over an existing
+    /// destination, so the second publication of the state file must still
+    /// succeed and be observable.
+    #[test]
+    fn repeated_publication_replaces_the_existing_document() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-link-telemetry-repeat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join(TELEMETRY_FILE);
+
+        let mut telemetry = LinkTransportTelemetry::default();
+        telemetry.record_online(10);
+        publish(&path, &telemetry, 10).unwrap();
+        assert_eq!(read(&path).unwrap()["transport_state"], json!(STATE_ONLINE));
+
+        telemetry.record_disconnected(20);
+        publish(&path, &telemetry, 20).unwrap();
+        let document = read(&path).unwrap();
+        assert_eq!(document["transport_state"], json!(STATE_RECONNECTING));
+        assert_eq!(document["connected_since_ms"], Value::Null);
+        assert_eq!(document["updated_at_ms"], json!(20));
+
+        telemetry.record_connecting();
+        telemetry.record_online(35);
+        publish(&path, &telemetry, 35).unwrap();
+        let document = read(&path).unwrap();
+        assert_eq!(document["transport_state"], json!(STATE_ONLINE));
+        assert_eq!(document["reconnect_count"], json!(1));
+        assert_eq!(document["last_reconnect_duration_ms"], json!(15));
+
+        // No temp files are left behind next to the published document.
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("tmp-"))
+            .count();
+        assert_eq!(leftovers, 0, "every publication cleans up its temp file");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
