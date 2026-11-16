@@ -3119,6 +3119,15 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         );
     }
 
+    // 1.2 S0/S2: resolve the wire correlation id once so the executing
+    // context (request ledger) and the envelope below agree on the same id.
+    let wire_request_id = headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::observability::sanitize_request_id)
+        .or_else(|| crate::observability::request_id_from_jsonrpc_id(request.get("id")));
+    let context_request_id = wire_request_id.clone();
+
     let blocking_state = state.clone();
     let blocking_request = request.clone();
     let handled = tokio::task::spawn_blocking(move || {
@@ -3148,6 +3157,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
+            wire_request_id: context_request_id.as_deref(),
             runtime_backend: &blocking_state.runtime_backend,
             trusted_local_ipc: blocking_state.trusted_extension_ipc,
         };
@@ -3184,11 +3194,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         .saturating_sub(dispatch_started_ms)
         .saturating_sub(connect_ms);
     let transport = relay_transport(&headers);
-    let request_id = headers
-        .get(REQUEST_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(crate::observability::sanitize_request_id)
-        .or_else(|| crate::observability::request_id_from_jsonrpc_id(request.get("id")));
+    let request_id = wire_request_id;
     let timing_ms = crate::observability::timing_ms(queue_ms, connect_ms, execute_ms);
     if request.get("method").and_then(Value::as_str) == Some("tools/call") {
         crate::observability::attach_tool_observability(

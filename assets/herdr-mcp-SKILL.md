@@ -34,6 +34,8 @@ These shapes are easy to get wrong. Treat them as part of the public calling con
 
 For a mutation retry, `delivery_state=not_delivered` can permit reissue after recovery. `unknown`, `uncertain`, `delivered`, missing delivery evidence, or a transport timeout requires live observation before any replay.
 
+For `herdr_call` mutations, pass a stable `client_request_id` (same hygiene rules as `idempotency_key`): resubmitting the same key replays the recorded result instead of re-executing, and an in-flight duplicate fails closed as `request_in_flight`. After a `request_timeout` or any uncertain outcome, query `herdr_call` `method: "herdr_mcp.request.status"` with `client_request_id` (or the returned `request_id`) for `pending | applied | rejected | not_delivered | unknown` before deciding whether to resubmit — never blind-retry a mutation whose delivery is unknown.
+
 ## 2. Work ladder and progressive Skills
 
 Use the cheapest deterministic layer that can finish the work.
