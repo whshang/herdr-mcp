@@ -103,6 +103,18 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
         });
     }
 
+    let mut model_fact = None;
+    let params = if method == "agent.start" {
+        match admit_agent_start_model(params) {
+            Ok((params, fact)) => {
+                model_fact = fact;
+                params
+            }
+            Err(refusal) => return refusal,
+        }
+    } else {
+        params
+    };
     let validation = match schema::validate_method_params(method, &params) {
         Ok(validation) => validation,
         Err(error) => {
@@ -114,7 +126,6 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
             });
         }
     };
-
     if !validation.ok {
         return json!({
             "ok": false,
@@ -124,8 +135,6 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
             "warnings": validation.warnings.iter().map(issue_json).collect::<Vec<_>>(),
         });
     }
-
-    // 1.2 S5: an explicit model alias on agent.start must be validated
     // against the kind's obtainable model list before anything is started.
     // Unknown aliases and kinds without an obtainable list fail closed with
     // model_alias_unknown; no silent fallback to a default model.
