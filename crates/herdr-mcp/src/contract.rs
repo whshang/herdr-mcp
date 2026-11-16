@@ -15,27 +15,31 @@ const RUNTIME_EXEC_V3_JSON: &str = include_str!("../../../contracts/runtime-exec
 
 /// Frozen runtime execution contract epoch 4 (neutral `herdr_exec` capability
 /// description plus the machine-decidable execution-evidence contract).
-/// Retained exactly as shipped: it is now the immediately previous rollback
-/// baseline, and its identity is pinned by a deterministic hash regression so
-/// the predecessor can never drift silently with the descriptor file.
+/// Retained exactly as shipped as a historical pinned baseline.
 #[cfg(test)]
 const RUNTIME_EXEC_V4_JSON: &str = include_str!("../../../contracts/runtime-exec-v4.json");
 
-/// Current runtime execution contract epoch 5: the frozen epoch-2 catalog with
-/// the epoch-4 `herdr_exec` execution description plus the two opt-in
-/// `inputSchema.properties` entries (`intent`, `idempotency_key`) that make
-/// durable idempotent replay discoverable. The descriptor is programmatic
-/// (base + single-tool shape) instead of a duplicated 18-tool catalog, so a
-/// metadata-only change never forks the tool list or the local method/state
-/// machinery.
+/// Frozen runtime execution contract epoch 5: epoch-2 catalog with the epoch-4
+/// `herdr_exec` description plus the opt-in `intent`/`idempotency_key`
+/// properties. Retained exactly as shipped: it is now the immediately previous
+/// rollback baseline, and its identity is pinned by a deterministic hash
+/// regression so the predecessor can never drift silently.
+#[cfg(test)]
 const RUNTIME_EXEC_V5_JSON: &str = include_str!("../../../contracts/runtime-exec-v5.json");
 
+/// Current runtime execution contract epoch 6: the epoch-5 catalog plus the
+/// `herdr_call` `params` schema widened to `anyOf:[object,string]` (a plain
+/// JSON object is the preferred wire form; the legacy JSON object string keeps
+/// working verbatim). Shaping is declarative over the frozen epoch-2 base via
+/// the descriptor `shapes[]` array.
+const RUNTIME_EXEC_V6_JSON: &str = include_str!("../../../contracts/runtime-exec-v6.json");
+
 /// Descriptor of the current runtime execution contract.
-const CURRENT_RUNTIME_EXEC_JSON: &str = RUNTIME_EXEC_V5_JSON;
+const CURRENT_RUNTIME_EXEC_JSON: &str = RUNTIME_EXEC_V6_JSON;
 /// Descriptor of the immediately previous runtime execution contract.
 #[cfg(test)]
-const PREVIOUS_RUNTIME_EXEC_JSON: &str = RUNTIME_EXEC_V4_JSON;
-const DESCRIPTOR_NAME: &str = "runtime-exec-v5";
+const PREVIOUS_RUNTIME_EXEC_JSON: &str = RUNTIME_EXEC_V5_JSON;
+const DESCRIPTOR_NAME: &str = "runtime-exec-v6";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ContractIdentity {
@@ -141,19 +145,18 @@ pub fn previous_tool_catalog() -> Result<Vec<Value>, String> {
     shaped_tool_catalog(&previous_descriptor()?)
 }
 
-fn shaped_tool_catalog(descriptor: &Value) -> Result<Vec<Value>, String> {
-    let shape = descriptor
-        .get("shape")
-        .ok_or_else(|| format!("{DESCRIPTOR_NAME} descriptor is missing shape"))?;
+fn apply_shape(tools: &mut [Value], shape: &Value) -> Result<(), String> {
     let tool_name = shape
         .get("tool")
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("{DESCRIPTOR_NAME} descriptor is missing shape.tool"))?;
+        .ok_or_else(|| format!("{DESCRIPTOR_NAME} descriptor shape is missing tool"))?;
     let description = shape
         .get("set")
         .and_then(|set| set.get("description"))
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("{DESCRIPTOR_NAME} descriptor is missing shape.set.description"))?;
+        .ok_or_else(|| {
+            format!("{DESCRIPTOR_NAME} descriptor shape {tool_name} is missing set.description")
+        })?;
     // Optional minimal inputSchema property extension. A descriptor that only
     // reshapes the description stays valid; when it declares
     // `shape.inputSchema_properties`, exactly those named properties are set on
@@ -163,10 +166,9 @@ fn shaped_tool_catalog(descriptor: &Value) -> Result<Vec<Value>, String> {
         && !extensions.is_object()
     {
         return Err(format!(
-            "{DESCRIPTOR_NAME} descriptor shape.inputSchema_properties must be an object"
+            "{DESCRIPTOR_NAME} descriptor shape {tool_name} inputSchema_properties must be an object"
         ));
     }
-    let mut tools = epoch2_tool_catalog()?;
     let mut shaped = false;
     for tool in tools.iter_mut() {
         if tool.get("name").and_then(Value::as_str) == Some(tool_name) {
@@ -204,6 +206,30 @@ fn shaped_tool_catalog(descriptor: &Value) -> Result<Vec<Value>, String> {
             "{DESCRIPTOR_NAME} base contract is missing shape target {tool_name}"
         ));
     }
+    Ok(())
+}
+
+fn shaped_tool_catalog(descriptor: &Value) -> Result<Vec<Value>, String> {
+    // A descriptor declares either a single `shape` object (v5 and earlier)
+    // or a `shapes` array applied in order (v6+). Both forms are declarative
+    // metadata over the frozen epoch-2 base catalog.
+    let shapes: Vec<Value> = if let Some(shape) = descriptor.get("shape") {
+        vec![shape.clone()]
+    } else if let Some(shapes) = descriptor
+        .get("shapes")
+        .and_then(Value::as_array)
+        .filter(|shapes| !shapes.is_empty())
+    {
+        shapes.clone()
+    } else {
+        return Err(format!(
+            "{DESCRIPTOR_NAME} descriptor is missing shape/shapes"
+        ));
+    };
+    let mut tools = epoch2_tool_catalog()?;
+    for shape in &shapes {
+        apply_shape(&mut tools, shape)?;
+    }
     Ok(tools)
 }
 
@@ -215,14 +241,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn embedded_contract_identity_is_runtime_exec_v5() {
+    fn embedded_contract_identity_is_runtime_exec_v6() {
         let identity = identity().unwrap();
-        assert_eq!(identity.epoch, 5);
+        assert_eq!(identity.epoch, 6);
         assert_eq!(identity.tool_count, 18);
-        assert_eq!(
-            identity.hash,
-            "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030"
-        );
+        // The exact hash is pinned below by the descriptor's contract_hash;
+        // recomputing it here guards against the descriptor and the shaped
+        // catalog drifting apart.
+        let descriptor = descriptor().unwrap();
+        assert_eq!(identity.hash, descriptor["contract_hash"].as_str().unwrap());
         assert_eq!(
             compute_contract_hash(&tool_catalog().unwrap()).unwrap(),
             identity.hash
@@ -230,13 +257,13 @@ mod tests {
     }
 
     #[test]
-    fn previous_runtime_execution_contract_epoch_4_is_immutable() {
+    fn previous_runtime_execution_contract_epoch_5_is_immutable() {
         let previous = previous_identity().unwrap();
-        assert_eq!(previous.epoch, 4);
+        assert_eq!(previous.epoch, 5);
         assert_eq!(previous.tool_count, 18);
         assert_eq!(
             previous.hash,
-            "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135"
+            "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030"
         );
         assert_eq!(
             compute_contract_hash(&previous_tool_catalog().unwrap()).unwrap(),
@@ -247,18 +274,93 @@ mod tests {
             compute_contract_hash(&epoch2_tool_catalog().unwrap()).unwrap(),
             "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8"
         );
-        // The frozen epoch-3 identity stays pinned by regression so the second
-        // rollback baseline cannot drift silently either.
+        // The frozen epoch-3 and epoch-4 identities stay pinned by regression
+        // so the older rollback baselines cannot drift silently either.
         let frozen_v3: Value = serde_json::from_str(RUNTIME_EXEC_V3_JSON).unwrap();
         assert_eq!(frozen_v3["contract_epoch"], 3);
         assert_eq!(
             frozen_v3["contract_hash"],
             "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"
         );
+        let frozen_v4: Value = serde_json::from_str(RUNTIME_EXEC_V4_JSON).unwrap();
+        assert_eq!(frozen_v4["contract_epoch"], 4);
+        assert_eq!(
+            frozen_v4["contract_hash"],
+            "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135"
+        );
     }
 
     #[test]
-    fn current_v5_evolves_v4_by_opt_in_idempotency_metadata_only() {
+    fn previous_v5_evolves_epoch2_by_opt_in_idempotency_metadata_only() {
+        let frozen = epoch2_tool_catalog().unwrap();
+        let previous = previous_tool_catalog().unwrap();
+        assert_eq!(frozen.len(), previous.len());
+        assert_eq!(previous.len(), 18);
+
+        let mut changed = Vec::new();
+        for (frozen_tool, previous_tool) in frozen.iter().zip(previous.iter()) {
+            let name = frozen_tool.get("name").and_then(Value::as_str).unwrap();
+            assert_eq!(
+                previous_tool.get("name").and_then(Value::as_str),
+                Some(name)
+            );
+            if frozen_tool != previous_tool {
+                changed.push(name.to_owned());
+            }
+        }
+        assert_eq!(changed, vec!["herdr_exec".to_owned()]);
+
+        let previous_exec = previous
+            .iter()
+            .find(|tool| tool["name"] == "herdr_exec")
+            .unwrap();
+        let frozen_exec = frozen
+            .iter()
+            .find(|tool| tool["name"] == "herdr_exec")
+            .unwrap();
+        // Exactly two additive inputSchema properties may differ.
+        let frozen_properties = frozen_exec["inputSchema"]["properties"]
+            .as_object()
+            .unwrap();
+        let previous_properties = previous_exec["inputSchema"]["properties"]
+            .as_object()
+            .unwrap();
+        for (key, value) in frozen_properties {
+            assert_eq!(
+                previous_properties.get(key),
+                Some(value),
+                "{key} must stay frozen"
+            );
+        }
+        let added = previous_properties
+            .keys()
+            .filter(|key| !frozen_properties.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            added,
+            vec!["idempotency_key".to_owned(), "intent".to_owned()]
+        );
+        // The required list and every other tool field stay untouched.
+        let mut expected = frozen_exec.clone();
+        expected["description"] = previous_exec["description"].clone();
+        expected["inputSchema"]["properties"] = previous_exec["inputSchema"]["properties"].clone();
+        assert_eq!(&expected, previous_exec);
+        // The opt-in vocabulary is discoverable and bounded.
+        let intent = &previous_exec["inputSchema"]["properties"]["intent"];
+        assert_eq!(intent["type"], "string");
+        assert_eq!(
+            intent["enum"],
+            json!(["read_only", "idempotent_write", "non_idempotent_write"])
+        );
+        let key = &previous_exec["inputSchema"]["properties"]["idempotency_key"];
+        assert_eq!(key["type"], "string");
+        assert_eq!(key["minLength"], 1);
+        assert_eq!(key["maxLength"], 256);
+    }
+
+    #[test]
+    fn current_v6_evolves_v5_by_herdr_call_params_union_only() {
         let previous = previous_tool_catalog().unwrap();
         let current = tool_catalog().unwrap();
         assert_eq!(previous.len(), current.len());
@@ -272,55 +374,52 @@ mod tests {
                 changed.push(name.to_owned());
             }
         }
-        assert_eq!(changed, vec!["herdr_exec".to_owned()]);
+        assert_eq!(changed, vec!["herdr_call".to_owned()]);
 
-        let current_exec = current
+        let current_call = current
             .iter()
-            .find(|tool| tool["name"] == "herdr_exec")
+            .find(|tool| tool["name"] == "herdr_call")
             .unwrap();
-        let previous_exec = previous
+        let previous_call = previous
             .iter()
-            .find(|tool| tool["name"] == "herdr_exec")
+            .find(|tool| tool["name"] == "herdr_call")
             .unwrap();
-        // Exactly two additive inputSchema properties may differ.
-        let previous_properties = previous_exec["inputSchema"]["properties"]
+        // Only the params property definition and the description may differ.
+        let previous_properties = previous_call["inputSchema"]["properties"]
             .as_object()
             .unwrap();
-        let current_properties = current_exec["inputSchema"]["properties"]
+        let current_properties = current_call["inputSchema"]["properties"]
             .as_object()
             .unwrap();
+        assert_eq!(previous_properties.len(), current_properties.len());
         for (key, value) in previous_properties {
+            if key == "params" {
+                continue;
+            }
             assert_eq!(
                 current_properties.get(key),
                 Some(value),
                 "{key} must stay frozen"
             );
         }
-        let added = current_properties
-            .keys()
-            .filter(|key| !previous_properties.contains_key(*key))
-            .cloned()
-            .collect::<Vec<_>>();
+        // The widened schema accepts either a JSON object (preferred) or the
+        // legacy JSON object string; no other type is advertised.
+        let params = &current_call["inputSchema"]["properties"]["params"];
         assert_eq!(
-            added,
-            vec!["idempotency_key".to_owned(), "intent".to_owned()]
+            params.get("type"),
+            None,
+            "params uses anyOf, not a bare type"
+        );
+        assert_eq!(
+            params["anyOf"],
+            json!([{"type": "object"}, {"type": "string"}])
         );
         // The required list and every other tool field stay untouched.
-        let mut expected = previous_exec.clone();
-        expected["description"] = current_exec["description"].clone();
-        expected["inputSchema"]["properties"] = current_exec["inputSchema"]["properties"].clone();
-        assert_eq!(&expected, current_exec);
-        // The opt-in vocabulary is discoverable and bounded.
-        let intent = &current_exec["inputSchema"]["properties"]["intent"];
-        assert_eq!(intent["type"], "string");
-        assert_eq!(
-            intent["enum"],
-            json!(["read_only", "idempotent_write", "non_idempotent_write"])
-        );
-        let key = &current_exec["inputSchema"]["properties"]["idempotency_key"];
-        assert_eq!(key["type"], "string");
-        assert_eq!(key["minLength"], 1);
-        assert_eq!(key["maxLength"], 256);
+        let mut expected = previous_call.clone();
+        expected["description"] = current_call["description"].clone();
+        expected["inputSchema"]["properties"]["params"] =
+            current_call["inputSchema"]["properties"]["params"].clone();
+        assert_eq!(&expected, current_call);
     }
 
     #[test]
@@ -354,9 +453,8 @@ mod tests {
         assert!(description.contains("execution.started"));
         assert!(description.contains("exit_code"));
     }
-
     #[test]
-    fn current_catalog_shapes_only_herdr_exec_description_over_frozen_epoch2() {
+    fn current_catalog_shapes_only_herdr_exec_and_herdr_call_over_frozen_epoch2() {
         let frozen = epoch2_tool_catalog().unwrap();
         let current = tool_catalog().unwrap();
         assert_eq!(frozen.len(), current.len());
@@ -370,22 +468,34 @@ mod tests {
                 continue;
             }
             changed += 1;
-            assert_eq!(name, "herdr_exec");
             let mut expected = frozen_tool.clone();
-            expected.as_object_mut().unwrap().insert(
-                "description".to_owned(),
-                current_tool["description"].clone(),
-            );
-            expected["inputSchema"]["properties"]["intent"] =
-                current_tool["inputSchema"]["properties"]["intent"].clone();
-            expected["inputSchema"]["properties"]["idempotency_key"] =
-                current_tool["inputSchema"]["properties"]["idempotency_key"].clone();
+            match name {
+                "herdr_exec" => {
+                    expected.as_object_mut().unwrap().insert(
+                        "description".to_owned(),
+                        current_tool["description"].clone(),
+                    );
+                    expected["inputSchema"]["properties"]["intent"] =
+                        current_tool["inputSchema"]["properties"]["intent"].clone();
+                    expected["inputSchema"]["properties"]["idempotency_key"] =
+                        current_tool["inputSchema"]["properties"]["idempotency_key"].clone();
+                }
+                "herdr_call" => {
+                    expected.as_object_mut().unwrap().insert(
+                        "description".to_owned(),
+                        current_tool["description"].clone(),
+                    );
+                    expected["inputSchema"]["properties"]["params"] =
+                        current_tool["inputSchema"]["properties"]["params"].clone();
+                }
+                other => panic!("unexpected shaped tool {other}"),
+            }
             assert_eq!(
                 &expected, current_tool,
-                "only herdr_exec description and the two opt-in properties may change"
+                "only the declared shape fields may change on {name}"
             );
         }
-        assert_eq!(changed, 1, "exactly one tool metadata shape is applied");
+        assert_eq!(changed, 2, "exactly two tool metadata shapes are applied");
         let frozen_exec = frozen
             .iter()
             .find(|tool| tool["name"] == "herdr_exec")
