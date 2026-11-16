@@ -2,6 +2,8 @@
 
 ## Unreleased (post-v1.1.1)
 
+- **Core 请求内身份一致性（#943，待发布）：** 对明确选择的 herdr-core 后端，公共只读工具在同一次请求内比较先后两次 hello 自报的协议代数、版本及可选的 core.id，检测到变化则在转发前返回 herdr_core_identity_changed / not_delivered，不回退 TUI。此检查仅为**咨询性的一致性检查**，不能证明真实进程身份；core.id 可以缺失，缺失时无法通过该字段区分实例；version 缺省为 "unknown"，这个占位值不能作为实例绑定依据。workstation.preflight 仅在 herdr_core_identity_changed 时顶层失败，其他 Core inspect 失败仍遵循原有汇总信封，ok: true **不表示 Core 可达**。继续保留 #936 的公共工具安全拒绝、#941 的 backend/HTTP/SSE/socket 对端门禁、#938 的文本传输保护；同 UID 伪造、跨请求目标绑定和 Core 重启后旧目标失效继续由 #768/#935 跟踪。此条为 Unreleased，未发布、未升级设备。
+
 - **Text transfer safety (#938; pending runtime release):** Unix `herdr_mcp.text.read` and `herdr_mcp.text.write` refuse files whose `nlink != 1` (`text_transfer_hardlink_denied`); this intentionally rejects legitimate hardlinked files **inside HOME** as well. Unix write publication now uses pinned directory descriptors, commit-time lease/root checks, no-replace rename, and exclusive private backups. Windows protection remains path-based and **does not provide equivalent hardlink or ancestor-swap protection**; physical Windows filesystem race testing is still outstanding. The Unix read path retains a conditional ancestor-replacement race (P2). These changes do **not** complete herdr-core isolation: #768 and #935 remain open. No tag, release, runtime upgrade, or deployment is included in this change.
 
 ## v1.1.1 — 2026-11-11
