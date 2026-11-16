@@ -926,16 +926,17 @@ function registerTools(server: McpServer): void {
           "herdr socket method, e.g. pane.split, agent.start — read herdr_skill before agent.*",
         ),
         // ChatGPT/OpenAI rejects Zod's z.record → propertyNames + additionalProperties:{}.
-        // The runtime accepts object or JSON string (S1/epoch-6); keep the
-        // advertised schema a plain string for client compatibility and
-        // normalize an object input here (verbatim content, single round-trip).
+        // The runtime accepts object or JSON string (S1/epoch-6); the advertised
+        // schema and description text stay frozen — they feed the epoch1/epoch2
+        // contract hashes, so preference wording ships in the skill docs.
+        // An object input is normalized verbatim before the handler.
         params: z
           .preprocess((v) => {
             if (v === undefined || v === null) return undefined;
             if (typeof v === "object") return JSON.stringify(v);
             return v;
           }, z.string().optional())
-          .describe("Method arguments as a JSON object (preferred) or JSON object string; omit for {}"),
+          .describe("Method arguments as a JSON object string; omit for {}"),
       },
     },
     async ({ method, params }) => {
