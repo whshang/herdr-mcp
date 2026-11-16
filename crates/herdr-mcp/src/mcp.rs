@@ -1219,7 +1219,23 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     // so the narrow `hc` primitives can be forwarded below.
     // #936: admission is pinned to the backend this process started with, so a
     // later env/config switch cannot move a live candidate onto another backend.
-    let route = match crate::runtime_adapter::public_tool_route(name, context.runtime_backend) {
+    let expected_target = if name == "herdr_call"
+        && arguments
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|method| method.trim().eq_ignore_ascii_case("server.status"))
+    {
+        arguments
+            .pointer("/params/expected_core_target")
+            .and_then(Value::as_str)
+    } else {
+        None
+    };
+    let route = match crate::runtime_adapter::public_tool_route(
+        name,
+        context.runtime_backend,
+        expected_target,
+    ) {
         Ok(route) => route,
         Err(rejection) => return Ok(tool_result(rejection, true)),
     };

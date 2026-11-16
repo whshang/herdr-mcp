@@ -4942,22 +4942,31 @@ mod tests {
             let mut stream = stream.unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                // Record even a partial frame. The stale-target refusal must
+                // close the connected socket without transmitting any byte.
+                if reader.fill_buf().unwrap().is_empty() {
                     break;
                 }
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+                    .unwrap()
+                    .write_all(b"received_bytes\n")
+                    .unwrap();
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
                 let request: Value = serde_json::from_str(&line).unwrap();
                 let method = request["method"].as_str().unwrap();
-                if method == "server.status" {
-                    use std::io::Write as _;
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log)
-                        .unwrap()
-                        .write_all(b"status\n")
-                        .unwrap();
-                }
+                // Record all incoming RPCs, including admission hello. A stale
+                // target must not deliver any request byte to the new listener.
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+                    .unwrap()
+                    .write_all(format!("{method}\n").as_bytes())
+                    .unwrap();
                 let envelope = json!({
                     "jsonrpc": "2.0",
                     "id": request["id"],
@@ -5104,7 +5113,12 @@ mod tests {
             assert_eq!(status["ok"], true, "{status}");
             target
         });
-        assert_eq!(std::fs::read_to_string(&first_log).unwrap(), "status\n");
+        assert!(
+            std::fs::read_to_string(&first_log)
+                .unwrap()
+                .lines()
+                .any(|method| method == "server.status")
+        );
         drop(first);
 
         let second_log = root.join("second-status.log");
@@ -5146,7 +5160,15 @@ mod tests {
             .await;
             assert_eq!(accepted["ok"], true, "{accepted}");
         });
-        assert_eq!(std::fs::read_to_string(&second_log).unwrap(), "status\n");
+        let second_calls = std::fs::read_to_string(&second_log).unwrap();
+        assert!(second_calls.lines().any(|method| method == "hello"));
+        assert_eq!(
+            second_calls
+                .lines()
+                .filter(|method| *method == "server.status")
+                .count(),
+            1
+        );
         drop(second);
     }
 

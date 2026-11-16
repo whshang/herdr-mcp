@@ -606,6 +606,8 @@ pub struct HerdrCoreClient {
     // This hello identity is advisory: a same-UID process can impersonate it.
     admitted_hello: Option<HerdrCoreHello>,
     admitted_peer_pid: Option<i32>,
+    // Applies only to a conditional public server.status request.
+    pre_hello_expected_target: Option<String>,
 }
 
 impl HerdrCoreClient {
@@ -615,6 +617,7 @@ impl HerdrCoreClient {
             timeout: HC_HANDSHAKE_TIMEOUT,
             admitted_hello: None,
             admitted_peer_pid: None,
+            pre_hello_expected_target: None,
         }
     }
 
@@ -625,6 +628,7 @@ impl HerdrCoreClient {
             timeout: timeout.min(HC_EXEC_MAX_TIMEOUT),
             admitted_hello: None,
             admitted_peer_pid: None,
+            pre_hello_expected_target: None,
         }
     }
 
@@ -1373,6 +1377,19 @@ impl HerdrCoreClient {
     ) -> Result<T, HerdrCoreError> {
         let mut stream = connect_hc_socket(&self.socket_path, call_timeout)?;
         #[cfg(unix)]
+        if let Some(expected) = self.pre_hello_expected_target.as_deref() {
+            // The connected fd can attest its peer PID. fstat on this client
+            // endpoint cannot attest the listener pathname inode.
+            let peer_pid = hc_peer_pid(&stream, &self.socket_path)?;
+            if !expected.starts_with(&format!("unix:{peer_pid}:")) {
+                return Err(HerdrCoreError {
+                    code: "herdr_core_target_changed".to_owned(),
+                    kind: Some("core_target_changed".to_owned()),
+                    message: "the connected Core peer differs from the expected target before admission hello".to_owned(),
+                });
+            }
+        }
+        #[cfg(unix)]
         if let Some(admitted_pid) = self.admitted_peer_pid
             && hc_peer_pid(&stream, &self.socket_path)? != admitted_pid
         {
@@ -1864,11 +1881,12 @@ impl PublicToolRoute {
 pub fn public_tool_route(
     tool_name: &str,
     admitted: &RuntimeBackendSelection,
+    expected_target: Option<&str>,
 ) -> Result<PublicToolRoute, Value> {
     let selection = verify_admitted_backend(admitted).map_err(|error| {
         invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
     })?;
-    public_tool_route_for_selection(tool_name, &selection)
+    public_tool_route_for_selection(tool_name, &selection, expected_target)
 }
 
 /// One admitted-backend comparison for every request path (#768).
@@ -1967,6 +1985,7 @@ fn admission_drift(
 fn public_tool_route_for_selection(
     tool_name: &str,
     selection: &RuntimeBackendSelection,
+    expected_target: Option<&str>,
 ) -> Result<PublicToolRoute, Value> {
     match selection.backend {
         RuntimeBackend::Tui => Ok(PublicToolRoute::Tui(selection.clone())),
@@ -1997,6 +2016,7 @@ fn public_tool_route_for_selection(
                 }));
             };
             let mut client = HerdrCoreClient::new(socket_path);
+            client.pre_hello_expected_target = expected_target.map(str::to_owned);
             let capability_check = client.admit_public_tool(tool_name).map_err(|mut rejection| {
                 if let Some(object) = rejection.as_object_mut() {
                     object.insert("operation".to_owned(), json!(tool_name));
@@ -3269,7 +3289,7 @@ mod tests {
             "herdr_fs_edit",
             "herdr_exec",
         ] {
-            let rejection = match public_tool_route_for_selection(tool, &core) {
+            let rejection = match public_tool_route_for_selection(tool, &core, None) {
                 Err(rejection) => rejection,
                 Ok(_) => panic!("{tool} was admitted on herdr-core"),
             };
@@ -3284,11 +3304,11 @@ mod tests {
             assert_eq!(rejection["retryable"], false);
             assert_eq!(rejection["fallback_allowed"], false);
             assert!(matches!(
-                public_tool_route_for_selection(tool, &tui),
+                public_tool_route_for_selection(tool, &tui, None),
                 Ok(PublicToolRoute::Tui(_))
             ));
         }
-        let prompt_rejection = match public_tool_route_for_selection("herdr_prompt", &core) {
+        let prompt_rejection = match public_tool_route_for_selection("herdr_prompt", &core, None) {
             Err(rejection) => rejection,
             Ok(_) => panic!("herdr_prompt was admitted on herdr-core"),
         };
@@ -3300,7 +3320,7 @@ mod tests {
         );
         assert_eq!(prompt_rejection["delivery_state"], "not_delivered");
         assert!(matches!(
-            public_tool_route_for_selection("herdr_prompt", &tui),
+            public_tool_route_for_selection("herdr_prompt", &tui, None),
             Ok(PublicToolRoute::Tui(_))
         ));
         assert_eq!(

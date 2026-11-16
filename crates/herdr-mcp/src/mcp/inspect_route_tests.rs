@@ -249,14 +249,14 @@ fn selection_drift_uses_admitted_backend_and_socket() {
             let arguments = request["params"]["arguments"].clone();
             let admitted = crate::runtime_adapter::resolve_process_backend_selection()
                 .unwrap_or_else(|error| panic!("selection failed for {label}: {error}"));
-            let route = crate::runtime_adapter::public_tool_route(name, &admitted)
+            let route = crate::runtime_adapter::public_tool_route(name, &admitted, None)
                 .unwrap_or_else(|error| panic!("admission failed for {label}: {error}"));
             write_config(&config_path, &after);
             // A later request in this admitted process must not re-admit the
             // drifted selection: admission fails closed before any TUI or `hc`
             // socket is contacted, so the next dispatch below still runs on the
             // route this process admitted (#936).
-            let drift = match crate::runtime_adapter::public_tool_route(name, &admitted) {
+            let drift = match crate::runtime_adapter::public_tool_route(name, &admitted, None) {
                 Ok(_) => panic!("{label}, preflight={preflight}: drifted selection re-admitted"),
                 Err(drift) => drift,
             };
@@ -348,7 +348,7 @@ fn selection_drift_uses_admitted_backend_and_socket() {
     // otherwise unchanged `tui` config must not refuse the runtime (#936).
     write_config(&config_path, &config("tui", Some(&a_path)));
     assert!(matches!(
-        crate::runtime_adapter::public_tool_route("herdr_inspect", &tui_backend),
+        crate::runtime_adapter::public_tool_route("herdr_inspect", &tui_backend, None),
         Ok(crate::runtime_adapter::PublicToolRoute::Tui(_))
     ));
 
