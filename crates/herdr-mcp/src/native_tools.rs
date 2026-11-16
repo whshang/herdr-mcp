@@ -103,9 +103,13 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
         });
     }
 
+    let mut model_fact = None;
     let params = if method == "agent.start" {
         match admit_agent_start_model(params) {
-            Ok((params, _fact)) => params,
+            Ok((params, fact)) => {
+                model_fact = fact;
+                params
+            }
             Err(refusal) => return refusal,
         }
     } else {
@@ -131,21 +135,22 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
             "warnings": validation.warnings.iter().map(issue_json).collect::<Vec<_>>(),
         });
     }
-    // against the kind's obtainable model list before anything is started.
-    // Unknown aliases and kinds without an obtainable list fail closed with
-    // model_alias_unknown; no silent fallback to a default model.
-    let mut model_fact = None;
-    let params = if method == "agent.start" {
-        match admit_agent_start_model(params) {
-            Ok((params, fact)) => {
-                model_fact = fact;
-                params
+    match client.call(method, params) {
+        Ok(result) => {
+            let warnings = validation.warnings.iter().map(issue_json).collect::<Vec<_>>();
+            let mut envelope = if warnings.is_empty() {
+                json!({"ok": true, "result": result})
+            } else {
+                json!({"ok": true, "result": result, "warnings": warnings})
+            };
+            if let Some(fact) = model_fact {
+                envelope["model_validation"] = fact;
             }
-            Err(refusal) => return refusal,
+            envelope
         }
-    } else {
-        params
-    };
+        Err(error) => json!({"ok": false, "code": error.code, "message": error.message, "method": method}),
+    }
+}
 
     match client.call(method, params) {
         Ok(result) => {
