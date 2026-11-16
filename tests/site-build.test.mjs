@@ -449,7 +449,7 @@ test("release.json, skill artifact and design invariants are preserved", async (
   const skill = await readFile(join(OUT, "herdr-mcp-SKILL.md"), "utf8");
   assert.match(skill, /# Herdr-MCP remote planner/);
   assert.match(skill, /Connected-tool calling contract/);
-  assert.match(skill, /`params` as a \*\*JSON object string\*\*/);
+  assert.match(skill, /`params` as a JSON object \(preferred\)/);
   assert.match(skill, /`command` \*\*or\*\* `steps`, never both/);
   assert.match(skill, /workstation-control/);
   assert.match(skill, /development-orchestration/);

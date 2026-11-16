@@ -1220,15 +1220,28 @@ fn normalize_herdr_call_params(raw: Option<&Value>) -> Result<Value, Value> {
             match serde_json::from_str::<Value>(trimmed) {
                 Ok(value) if value.is_object() => Ok(value),
                 Ok(_) => Err(json!(
-                    {"ok": false, "code": "invalid_params", "message": "herdr_call params must decode to an object"}
+                    {"ok": false, "code": "invalid_params", "field": "params", "message": "herdr_call params must decode to an object"}
                 )),
                 Err(parse_error) => Err(json!(
-                    {"ok": false, "code": "invalid_params_json", "message": parse_error.to_string()}
+                    {
+                        "ok": false,
+                        "code": "invalid_params_json",
+                        "field": "params",
+                        "line": parse_error.line(),
+                        "column": parse_error.column(),
+                        // Position only: serde's message can echo caller content,
+                        // and params may carry prompt text we must not reflect.
+                        "message": format!(
+                            "params is not valid JSON (line {}, column {})",
+                            parse_error.line(),
+                            parse_error.column()
+                        ),
+                    }
                 )),
             }
         }
         Some(_) => Err(json!(
-            {"ok": false, "code": "invalid_params", "message": "herdr_call params must decode to an object"}
+            {"ok": false, "code": "invalid_params", "field": "params", "message": "herdr_call params must be a JSON object or a JSON object string"}
         )),
     }
 }
@@ -15967,7 +15980,7 @@ mod tests {
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert_eq!(result["serverInfo"]["name"], "herdr-mcp");
         assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
-        assert_eq!(result["_meta"]["herdr_contract_epoch"], 5);
+        assert_eq!(result["_meta"]["herdr_contract_epoch"], 6);
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("delivery, idempotency, and retryability evidence"));
         assert!(instructions.contains("current-state facts"));
@@ -16644,7 +16657,7 @@ mod tests {
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["supportedVersions"][0], SDK_WIRE_PROTOCOL);
         assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
-        assert_eq!(result["_meta"]["herdr_contract_epoch"], 5);
+        assert_eq!(result["_meta"]["herdr_contract_epoch"], 6);
     }
 
     #[test]
@@ -17664,7 +17677,7 @@ mod tests {
         assert_eq!(remote_consent["code"], "unknown_local_method");
 
         let identity = contract::identity().unwrap();
-        assert_eq!(identity.epoch, 5);
+        assert_eq!(identity.epoch, 6);
         assert_eq!(identity.tool_count, 18);
     }
 
@@ -31325,6 +31338,18 @@ mod client_request_shape_matrix_tests {
                 ..WorkState::default()
             })
             .unwrap();
+        state_store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "git:example/unicode".to_owned(),
+                worktree: "/unicode-repo/中文 emoji 🚀\t\n".to_owned(),
+                handoff_md: "# Ready from unicode repo".to_owned(),
+                through_event_id: 8,
+                updated_at: 41,
+                ..WorkState::default()
+            })
+            .unwrap();
 
         let _env = crate::test_env::lock();
         let _config = crate::test_env::TuiConfigGuard::install(&temp_root);
@@ -31455,6 +31480,55 @@ mod client_request_shape_matrix_tests {
             parse_tool_payload(&bad_json_resp)["code"],
             "invalid_params_json"
         );
+
+        // The JSON parse error carries position fields and never echoes the
+        // rejected body — params may contain prompt text (S1 hygiene).
+        let bad_json_payload = parse_tool_payload(&bad_json_resp);
+        assert_eq!(bad_json_payload["field"], "params");
+        assert!(bad_json_payload["line"].as_u64().unwrap() >= 1);
+        assert!(bad_json_payload["column"].as_u64().unwrap() >= 1);
+        let message = bad_json_payload["message"].as_str().unwrap();
+        assert!(
+            message.contains("line") && message.contains("column"),
+            "message should carry position only: {message}"
+        );
+        assert!(
+            !message.contains("not-json"),
+            "message must not echo caller body: {message}"
+        );
+
+        // Unicode and control characters in a schema-legal field of the object
+        // form dispatch identically to the equivalent JSON string form — the
+        // runtime hands the method the decoded object, not an escaped string.
+        // The stored unicode worktree only matches when the decoded value is
+        // byte-exact, so a returned handoff proves verbatim delivery.
+        for params in [
+            json!({"worktree": "/unicode-repo/中文 emoji 🚀\t\n"}),
+            json!(json!({"worktree": "/unicode-repo/中文 emoji 🚀\t\n"}).to_string()),
+        ] {
+            let unicode_params_resp = handle(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 51,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "herdr_call",
+                        "arguments": {
+                            "method": "work.pickup",
+                            "params": params
+                        }
+                    }
+                }),
+                &context,
+            )
+            .unwrap();
+            let unicode_payload = parse_tool_payload(&unicode_params_resp);
+            assert_eq!(unicode_payload["ok"], true);
+            assert_eq!(
+                unicode_payload["handoff_md"], "# Ready from unicode repo",
+                "object and string forms dispatch the same decoded params"
+            );
+        }
 
         // 2. arguments: null and string-serialized arguments
         for raw_args in [

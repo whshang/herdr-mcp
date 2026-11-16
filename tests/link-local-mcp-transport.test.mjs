@@ -93,7 +93,7 @@ function abortableFetch(control) {
 test("constructor: defaults to the 8772/mcp endpoint", () => {
   const t = new LocalMcpRuntimeTransport(opts());
   assert.equal(t.name, "local-mcp-http");
-  assert.equal(t.getRuntimeInfo().contract_epoch, 5);
+  assert.equal(t.getRuntimeInfo().contract_epoch, 6);
   assert.equal(t.getRuntimeInfo().contract_epoch, LOCAL_MCP_CONTRACT_EPOCH);
   assert.equal(t.getRuntimeInfo().contract_hash, CONTRACT_HASH);
   assert.equal(LOCAL_MCP_DEFAULT_ENDPOINT, "http://127.0.0.1:8772/mcp");
@@ -126,8 +126,8 @@ test("user cannot advertise a foreign execution epoch | Given the transport serv
   assert.throws(() => new LocalMcpRuntimeTransport(opts({ contractEpoch: 2 })));
   assert.throws(() => new LocalMcpRuntimeTransport(opts({ contractEpoch: 1 })));
   assert.throws(() => new LocalMcpRuntimeTransport(opts({ contractEpoch: "1" })));
-  const t = new LocalMcpRuntimeTransport(opts({ contractEpoch: 5 }));
-  assert.equal(t.getRuntimeInfo().contract_epoch, 5);
+  const t = new LocalMcpRuntimeTransport(opts({ contractEpoch: 6 }));
+  assert.equal(t.getRuntimeInfo().contract_epoch, 6);
 });
 
 test("constructor: requires bearerToken, contractHash, fetch — errors never embed the token", async () => {

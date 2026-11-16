@@ -33,7 +33,7 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.doesNotMatch(r.content, /\.claude\/skills\/\*\/SKILL\.md/);
     assert.match(r.content, /Connected-tool calling contract/);
     assert.match(r.content, /`device`.*inside the tool arguments/s);
-    assert.match(r.content, /`params` as a \*\*JSON object string\*\*/);
+    assert.match(r.content, /`params` as a JSON object \(preferred\)/);
     assert.match(r.content, /`command` \*\*or\*\* `steps`, never both/);
     assert.match(r.content, /`confirm_dirty`.*`confirm_busy`.*acknowledge observed state only/s);
     assert.match(r.content, /stable `idempotency_key`/);
@@ -130,7 +130,7 @@ test("user gets explicit connected-tool shapes | Given progressive Herdr Skills 
   const paneLocal = readFileSync(new URL("../assets/herdr-agent-SKILL.md", import.meta.url), "utf8");
 
   assert.match(workstation, /Put `device` inside the public tool arguments object/);
-  assert.match(workstation, /`params` as a \*\*JSON object string\*\*/);
+  assert.match(workstation, /`params` as a JSON object \(preferred\) or a \*\*JSON object string\*\*/);
   assert.doesNotMatch(workstation, /herdr_call\([^\n]+params=\{/);
   assert.match(workstation, /Bare workspace\/pane ids are scoped/);
   assert.match(execution, /`command` \*\*or\*\* `steps`, never both/);

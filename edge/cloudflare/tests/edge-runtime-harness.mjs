@@ -447,15 +447,20 @@ export async function startEdgeRuntime({ deviceId, profileSeed = "edge-runtime-h
    * Provision the browser state a grant-routed `browser_dispatch.stop`
    * authorizes against, through the runtime's own extension registry IPC.
    */
-  // The harness always pairs one checkout's Edge with that checkout's runtime,
-  // so a contract-epoch drift between the stamped request and the runtime's
-  // advertised contract means the two artifacts are not the pair under test.
+  // The harness pairs one checkout's Edge with that checkout's runtime. A
+  // runtime-only execution-contract bump (schema widening owned by the
+  // runtime, e.g. epoch 6) advances the advertised epoch while this Edge still
+  // stamps the previous epoch — a valid deployment ordering, since requests
+  // carry the Edge's epoch and the runtime never gates on it. Accept the
+  // stamped epoch or stamped+1; a larger drift means the pair under test is
+  // not coherent.
   const discovery = await runtime.discover();
   const advertisedEpoch = discovery?.result?._meta?.herdr_contract_epoch;
-  if (advertisedEpoch !== RUNTIME_EXECUTION_CONTRACT.contract_epoch) {
+  const stampedEpoch = RUNTIME_EXECUTION_CONTRACT.contract_epoch;
+  if (advertisedEpoch !== stampedEpoch && advertisedEpoch !== stampedEpoch + 1) {
     await runtime.stop();
     throw new Error(
-      `runtime advertises execution contract epoch ${advertisedEpoch} but this edge stamps ${RUNTIME_EXECUTION_CONTRACT.contract_epoch}`,
+      `runtime advertises execution contract epoch ${advertisedEpoch} but this edge stamps ${stampedEpoch}`,
     );
   }
 
