@@ -641,18 +641,13 @@ impl HerdrCoreClient {
     pub fn advisory_target_ref(&self, core_id: Option<&str>) -> Option<String> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
-            let metadata = std::fs::symlink_metadata(&self.socket_path).ok()?;
-            if !metadata.file_type().is_socket() {
-                return None;
-            }
+            let (dev, ino) = self.listener_node_fingerprint()?;
             let pid = self.admitted_peer_pid?;
             Some(format!(
                 "unix:{}:{}:{}:{}",
                 pid,
-                metadata.dev(),
-                metadata.ino(),
+                dev,
+                ino,
                 core_id.unwrap_or("")
             ))
         }
@@ -661,6 +656,26 @@ impl HerdrCoreClient {
             let _ = core_id;
             None
         }
+    }
+
+    /// Listener socket-node fingerprint `(dev, ino)` read from the configured
+    /// socket path.
+    ///
+    /// This is the same source [`Self::advisory_target_ref`] records, so the
+    /// fingerprint is comparable *before* the admission `hello`: unlike the
+    /// connected fd (a local endpoint whose `fstat` cannot attest the listener
+    /// inode) and unlike the self-reported `core.id` (only observable from the
+    /// hello reply). It remains a pathname fingerprint: a same-UID process can
+    /// still race the path and an inode number can be reused (#768/#935).
+    #[cfg(unix)]
+    fn listener_node_fingerprint(&self) -> Option<(u64, u64)> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let metadata = std::fs::symlink_metadata(&self.socket_path).ok()?;
+        if !metadata.file_type().is_socket() {
+            return None;
+        }
+        Some((metadata.dev(), metadata.ino()))
     }
 
     pub fn admitted_target_ref(&self) -> Option<String> {
@@ -1378,14 +1393,26 @@ impl HerdrCoreClient {
         let mut stream = connect_hc_socket(&self.socket_path, call_timeout)?;
         #[cfg(unix)]
         if let Some(expected) = self.pre_hello_expected_target.as_deref() {
-            // The connected fd can attest its peer PID. fstat on this client
-            // endpoint cannot attest the listener pathname inode.
-            let peer_pid = hc_peer_pid(&stream, &self.socket_path)?;
-            if !expected.starts_with(&format!("unix:{peer_pid}:")) {
+            // Two components are observable before `hello`: the
+            // kernel-attested peer PID from the connected fd, and the listener
+            // socket node dev/ino from the configured path (exactly what
+            // `advisory_target_ref` recorded). Refuse before any request byte
+            // when either differs. The self-reported `core.id` is observable
+            // only from the hello reply, so it stays in the post-hello
+            // `admitted_target_ref` comparison.
+            let Some((dev, ino)) = self.listener_node_fingerprint() else {
                 return Err(HerdrCoreError {
                     code: "herdr_core_target_changed".to_owned(),
                     kind: Some("core_target_changed".to_owned()),
-                    message: "the connected Core peer differs from the expected target before admission hello".to_owned(),
+                    message: "the configured Core socket node is no longer an observable listener before admission hello".to_owned(),
+                });
+            };
+            let peer_pid = hc_peer_pid(&stream, &self.socket_path)?;
+            if !expected.starts_with(&format!("unix:{peer_pid}:{dev}:{ino}:")) {
+                return Err(HerdrCoreError {
+                    code: "herdr_core_target_changed".to_owned(),
+                    kind: Some("core_target_changed".to_owned()),
+                    message: "the connected Core peer or listener socket node differs from the expected target before admission hello".to_owned(),
                 });
             }
         }

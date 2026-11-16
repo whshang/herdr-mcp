@@ -4967,16 +4967,40 @@ mod tests {
                     .unwrap()
                     .write_all(format!("{method}\n").as_bytes())
                     .unwrap();
+                // A self-reported `core.id` keeps the post-hello identity
+                // component of `target_ref` observable, so the same-PID /
+                // different-`core.id` boundary is assertable (#946).
+                let mut result = core_fixture_result_at(method, &request["params"], None);
+                if method == "hello" {
+                    result["core"] = json!({"id": "fixture-core-a", "name": "fixture"});
+                }
                 let envelope = json!({
                     "jsonrpc": "2.0",
                     "id": request["id"],
-                    "result": core_fixture_result_at(method, &request["params"], None)
+                    "result": result
                 });
                 if writeln!(stream, "{envelope}").is_err() {
                     break;
                 }
             }
         }
+    }
+
+    /// Rewrite one `:`-separated segment of an advisory `target_ref`
+    /// (`unix:<pid>:<dev>:<ino>:<core_id>`).
+    #[cfg(unix)]
+    fn hc_target_segment_replaced(target: &str, index: usize, replacement: &str) -> String {
+        let mut parts: Vec<String> = target.split(':').map(str::to_owned).collect();
+        parts[index] = replacement.to_owned();
+        parts.join(":")
+    }
+
+    /// Bump one numeric `target_ref` segment so a forged target keeps the real
+    /// peer PID while changing the listener fingerprint.
+    #[cfg(unix)]
+    fn hc_target_segment_bumped(target: &str, index: usize) -> String {
+        let value: u64 = target.split(':').nth(index).unwrap().parse().unwrap();
+        hc_target_segment_replaced(target, index, &(value + 1).to_string())
     }
 
     #[cfg(unix)]
@@ -5177,6 +5201,66 @@ mod tests {
             )
             .await;
             assert_eq!(accepted["ok"], true, "{accepted}");
+
+            // Same peer PID, same socket path, different listener node
+            // dev/ino: every pre-hello comparable fingerprint component must
+            // refuse the request with zero request bytes delivered (#946).
+            let accepted_bytes = std::fs::read_to_string(&second_log).unwrap();
+            for (segment, forged) in [
+                (2, hc_target_segment_bumped(new_target, 2)),
+                (3, hc_target_segment_bumped(new_target, 3)),
+            ] {
+                let rejected = call_public_tool(
+                    &app,
+                    "herdr_call",
+                    json!({
+                        "method": "server.status", "params": {"expected_core_target": forged}
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    rejected["code"], "herdr_core_target_changed",
+                    "segment {segment}: {rejected}"
+                );
+                assert_eq!(rejected["delivery_state"], "not_delivered", "segment {segment}");
+                assert_eq!(rejected["fallback_allowed"], false, "segment {segment}");
+                assert_eq!(
+                    std::fs::read_to_string(&second_log).unwrap(),
+                    accepted_bytes,
+                    "a same-PID target_ref with a different listener dev/ino must be refused before any byte (segment {segment}): {forged}"
+                );
+            }
+
+            // The self-reported `core.id` is observable only from the hello
+            // reply, so a same-PID / same-node / different-`core.id` request is
+            // refused *after* hello and before any `server.status` read. This is
+            // the documented post-hello boundary, not a pre-hello guarantee.
+            let core_mismatch = hc_target_segment_replaced(new_target, 4, "fixture-core-b");
+            let refused = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({
+                    "method": "server.status", "params": {"expected_core_target": core_mismatch}
+                }),
+            )
+            .await;
+            assert_eq!(refused["code"], "herdr_core_target_changed", "{refused}");
+            assert_eq!(refused["delivery_state"], "not_delivered");
+            assert_eq!(refused["fallback_allowed"], false);
+            let after_core_mismatch = std::fs::read_to_string(&second_log).unwrap();
+            let delivered = after_core_mismatch
+                .strip_prefix(&accepted_bytes)
+                .expect("the Core log only appends");
+            let delivered: Vec<&str> = delivered.lines().collect();
+            assert_eq!(
+                delivered.iter().filter(|line| **line == "hello").count(),
+                1,
+                "core.id is only observable after hello: {delivered:?}"
+            );
+            assert!(
+                !delivered.contains(&"server.status"),
+                "a mismatched core.id must not be forwarded: {delivered:?}"
+            );
         });
         let second_calls = std::fs::read_to_string(&second_log).unwrap();
         assert!(second_calls.lines().any(|method| method == "hello"));
