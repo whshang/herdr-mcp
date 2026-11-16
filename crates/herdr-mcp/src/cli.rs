@@ -31,6 +31,8 @@ pub enum Command {
     Doctor {
         verbose: bool,
         json: bool,
+        /// 1.2 S7: print the read-only local diagnostic snapshot instead.
+        local: bool,
     },
     Network(NetworkCommand),
     Uninstall,
@@ -741,16 +743,24 @@ fn parse_doctor(args: &[String]) -> Result<Command, String> {
         [] => Ok(Command::Doctor {
             verbose: false,
             json: false,
+            local: false,
         }),
         [flag] if flag == "--verbose" => Ok(Command::Doctor {
             verbose: true,
             json: false,
+            local: false,
         }),
         [flag] if flag == "--json" => Ok(Command::Doctor {
             verbose: false,
             json: true,
+            local: false,
         }),
-        _ => Err("usage: herdr-mcp doctor [--verbose|--json]".to_owned()),
+        [flag] if flag == "--local" => Ok(Command::Doctor {
+            verbose: false,
+            json: false,
+            local: true,
+        }),
+        _ => Err("usage: herdr-mcp doctor [--verbose|--json|--local]".to_owned()),
     }
 }
 
@@ -4506,6 +4516,7 @@ mod tests {
             Command::Doctor {
                 verbose: false,
                 json: false,
+                local: false,
             }
         );
         assert_eq!(
@@ -4513,6 +4524,7 @@ mod tests {
             Command::Doctor {
                 verbose: true,
                 json: false,
+                local: false,
             }
         );
         assert_eq!(
@@ -4520,9 +4532,19 @@ mod tests {
             Command::Doctor {
                 verbose: false,
                 json: true,
+                local: false,
+            }
+        );
+        assert_eq!(
+            parse(args(&["doctor", "--local"])).unwrap().command,
+            Command::Doctor {
+                verbose: false,
+                json: false,
+                local: true,
             }
         );
         assert!(parse(args(&["doctor", "--json", "--verbose"])).is_err());
+        assert!(parse(args(&["doctor", "--local", "--json"])).is_err());
         assert_eq!(
             parse(args(&["semantic", "status"])).unwrap().command,
             Command::Semantic(SemanticCommand::Status { json: false })
@@ -6036,6 +6058,7 @@ mod tests {
             Command::Doctor {
                 verbose: false,
                 json: false,
+                local: false,
             }
         );
         assert!(parse(args(&["--instance", "server", "status"])).is_err());
