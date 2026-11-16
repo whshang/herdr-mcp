@@ -271,7 +271,7 @@ fn selection_drift_uses_admitted_backend_and_socket() {
             // hello the success assertion below already expects.
             assert_eq!(tui.take_calls(), Vec::<String>::new(), "{label}: {drift}");
             assert_eq!(b.take_calls(), Vec::<String>::new(), "{label}: {drift}");
-            let result = dispatch_admitted_tool(name, arguments, &context, route).unwrap();
+            let result = dispatch_admitted_tool(name, arguments, None, &context, route).unwrap();
             let body: Value =
                 serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(body["ok"], true, "{label}, preflight={preflight}: {body}");

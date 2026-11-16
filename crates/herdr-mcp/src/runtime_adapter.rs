@@ -2389,6 +2389,23 @@ pub fn herdr_core_prompt(_client: &HerdrCoreClient, _args: &Value) -> Value {
     herdr_core_prompt_refusal()
 }
 
+/// Rejection for an `expected_core_target` on any method other than the
+/// read-only `server.status` route (#944/#946).
+///
+/// Shared with the pre-admission check in `mcp::tool_call` so the public result
+/// cannot drift depending on which phase catches the request, and so the same
+/// result is returned whether `params` arrived as an object or as a JSON string.
+pub fn herdr_core_expected_target_unsupported() -> Value {
+    json!({
+        "ok": false,
+        "code": "invalid_params",
+        "message": "expected_core_target is only supported for read-only server.status",
+        "delivery_state": "not_delivered",
+        "fallback_allowed": false,
+        "retryable": false,
+    })
+}
+
 /// `herdr_call` forwarding under `herdr-core`.
 ///
 /// Local `herdr_mcp.*` methods never reach here. The method name is trimmed
@@ -2419,14 +2436,7 @@ pub fn herdr_core_call(client: &HerdrCoreClient, method: &str, params: Value) ->
     let expected_target = params.get("expected_core_target");
     let expected_target = if let Some(value) = expected_target {
         if !method.eq_ignore_ascii_case("server.status") {
-            return json!({
-                "ok": false,
-                "code": "invalid_params",
-                "message": "expected_core_target is only supported for read-only server.status",
-                "delivery_state": "not_delivered",
-                "fallback_allowed": false,
-                "retryable": false,
-            });
+            return herdr_core_expected_target_unsupported();
         }
         let Some(expected) = value.as_str().filter(|value| !value.is_empty()) else {
             return json!({

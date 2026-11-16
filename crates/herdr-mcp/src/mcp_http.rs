@@ -5003,83 +5003,98 @@ mod tests {
         hc_target_segment_replaced(target, index, &(value + 1).to_string())
     }
 
+    /// A real OS child serving the Core protocol, used by the public-entrypoint
+    /// conditional-target regressions. Each launch has its own kernel peer PID.
+    #[cfg(unix)]
+    struct CoreProcess {
+        child: std::process::Child,
+        socket: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Drop for CoreProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    #[cfg(unix)]
+    fn start_core_child(socket: &std::path::Path, log: &std::path::Path) -> CoreProcess {
+        use std::process::{Command, Stdio};
+
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mcp_http::tests::core_restart_protocol_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HERDR_TEST_RESTART_SOCKET", socket)
+            .env("HERDR_TEST_RESTART_LOG", log)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut server = CoreProcess {
+            child,
+            socket: socket.to_owned(),
+        };
+        for _ in 0..200 {
+            if socket.exists() {
+                return server;
+            }
+            assert!(
+                server.child.try_wait().unwrap().is_none(),
+                "Core child exited early"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("Core child failed to bind a socket");
+    }
+
+    #[cfg(unix)]
+    struct ScratchGuard {
+        root: PathBuf,
+        previous_config_dir: Option<std::ffi::OsString>,
+        previous_backend: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl ScratchGuard {
+        fn new(root: PathBuf) -> Self {
+            Self {
+                root,
+                previous_config_dir: env::var_os("HERDR_MCP_CONFIG_DIR"),
+                previous_backend: env::var_os("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScratchGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous_config_dir.take() {
+                    Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                    None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+                }
+                match self.previous_backend.take() {
+                    Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                    None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn public_core_restart_rejects_stale_target() {
-        use std::process::{Child, Command, Stdio};
-        use std::time::Duration;
-
-        struct CoreProcess {
-            child: Child,
-            socket: PathBuf,
-        }
-        impl Drop for CoreProcess {
-            fn drop(&mut self) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                let _ = std::fs::remove_file(&self.socket);
-            }
-        }
-
-        fn start(socket: &std::path::Path, log: &std::path::Path) -> CoreProcess {
-            let child = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "mcp_http::tests::core_restart_protocol_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("HERDR_TEST_RESTART_SOCKET", socket)
-                .env("HERDR_TEST_RESTART_LOG", log)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
-            let mut server = CoreProcess {
-                child,
-                socket: socket.to_owned(),
-            };
-            for _ in 0..200 {
-                if socket.exists() {
-                    return server;
-                }
-                assert!(
-                    server.child.try_wait().unwrap().is_none(),
-                    "Core child exited early"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            panic!("Core child failed to bind a socket");
-        }
-
-        struct ScratchGuard {
-            root: PathBuf,
-            previous_config_dir: Option<std::ffi::OsString>,
-            previous_backend: Option<std::ffi::OsString>,
-        }
-        impl Drop for ScratchGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match self.previous_config_dir.take() {
-                        Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
-                        None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
-                    }
-                    match self.previous_backend.take() {
-                        Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
-                        None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
-                    }
-                }
-                let _ = std::fs::remove_dir_all(&self.root);
-            }
-        }
-
         let _guard = crate::test_env::lock();
         let root = test_root("core-restart");
-        let _scratch = ScratchGuard {
-            root: root.clone(),
-            previous_config_dir: env::var_os("HERDR_MCP_CONFIG_DIR"),
-            previous_backend: env::var_os("HERDR_MCP_RUNTIME_BACKEND"),
-        };
+        let _scratch = ScratchGuard::new(root.clone());
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
         // Keep the macOS Unix socket path under the platform length limit.
@@ -5116,7 +5131,7 @@ mod tests {
             .unwrap();
 
         let first_log = root.join("first-status.log");
-        let first = start(&socket, &first_log);
+        let first = start_core_child(&socket, &first_log);
         let first_pid = first.child.id();
         let old_target = runtime.block_on(async {
             let methods = call_public_tool(&app, "herdr_methods", json!({})).await;
@@ -5169,7 +5184,7 @@ mod tests {
         });
 
         let second_log = root.join("second-status.log");
-        let second = start(&socket, &second_log);
+        let second = start_core_child(&socket, &second_log);
         assert_ne!(
             second.child.id(),
             first_pid,
@@ -5295,6 +5310,175 @@ mod tests {
             1
         );
         drop(second);
+    }
+
+    // #946 (droid 5cbd5704 P1): `herdr_call` accepts `params` as an object or
+    // as a JSON string. Every `expected_core_target` must be extracted from both
+    // shapes before any backend admission, so an unparsed field can never reach
+    // the admission hello. Phase 1 runs with no listener at all, so an
+    // `invalid_params` answer proves the rejection happened before `connect`;
+    // phase 2 runs against a live listener and asserts zero bytes.
+    #[cfg(unix)]
+    #[test]
+    fn public_core_conditional_target_shape_parity() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("core-target-shape");
+        let _scratch = ScratchGuard::new(root.clone());
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let socket = PathBuf::from(format!(
+            "/tmp/hc-shape-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            config_dir.join("config.json"),
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": socket}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let mut state = test_state_with_snapshot(
+            &root.join("http"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        adopt_env_admitted_backend(&mut state);
+        let app = candidate_router(state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let log = root.join("calls.log");
+
+        // Phase 1: the socket path does not exist yet, so any accepted request
+        // would answer `herdr_core_unreachable` instead of `invalid_params`.
+        runtime.block_on(async {
+            let illegal = "unix:not-a-pid:1:2:";
+            let object_illegal =
+                json!({"method": "server.status", "params": {"expected_core_target": illegal}});
+            let string_illegal = json!({
+                "method": "server.status",
+                "params": json!({"expected_core_target": illegal}).to_string()
+            });
+            let object_foreign =
+                json!({"method": "terminal.list", "params": {"expected_core_target": illegal}});
+            let string_foreign = json!({
+                "method": "terminal.list",
+                "params": json!({"expected_core_target": illegal}).to_string()
+            });
+            for (label, arguments) in [
+                ("object illegal target", object_illegal),
+                ("string illegal target", string_illegal),
+                ("object non-status method", object_foreign),
+                ("string non-status method", string_foreign),
+            ] {
+                let result = call_public_tool(&app, "herdr_call", arguments).await;
+                assert_eq!(result["code"], "invalid_params", "{label}: {result}");
+                assert_eq!(
+                    result["delivery_state"], "not_delivered",
+                    "{label}: {result}"
+                );
+                assert_eq!(result["fallback_allowed"], false, "{label}: {result}");
+            }
+        });
+        assert!(
+            !socket.exists(),
+            "no rejection may create a Core listener path"
+        );
+
+        // Phase 2: a live listener with a byte ledger. The string and object
+        // forms must produce the same refusal with no delivered byte.
+        let core = start_core_child(&socket, &log);
+        let (target, baseline) = runtime.block_on(async {
+            let methods = call_public_tool(&app, "herdr_methods", json!({})).await;
+            assert_eq!(methods["ok"], true, "{methods}");
+            let target = methods["herdr_core"]["target_ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            (target, std::fs::read_to_string(&log).unwrap())
+        });
+        assert!(target.starts_with(&format!("unix:{}:", core.child.id())));
+
+        runtime.block_on(async {
+            let stale_pid = hc_target_segment_bumped(&target, 1);
+            let stale_dev = hc_target_segment_bumped(&target, 2);
+            let stale_ino = hc_target_segment_bumped(&target, 3);
+            let object = |expected: &str| {
+                json!({"method": "server.status", "params": {"expected_core_target": expected}})
+            };
+            let string = |expected: &str| {
+                json!({
+                    "method": "server.status",
+                    "params": json!({"expected_core_target": expected}).to_string()
+                })
+            };
+            for (label, expected_code, arguments) in [
+                ("object illegal target", "invalid_params", object("unix:not-a-pid:1:2:")),
+                ("string illegal target", "invalid_params", string("unix:not-a-pid:1:2:")),
+                ("object stale pid", "herdr_core_target_changed", object(&stale_pid)),
+                ("string stale pid", "herdr_core_target_changed", string(&stale_pid)),
+                ("object stale dev", "herdr_core_target_changed", object(&stale_dev)),
+                ("string stale dev", "herdr_core_target_changed", string(&stale_dev)),
+                ("object stale ino", "herdr_core_target_changed", object(&stale_ino)),
+                ("string stale ino", "herdr_core_target_changed", string(&stale_ino)),
+            ] {
+                let result = call_public_tool(&app, "herdr_call", arguments).await;
+                assert_eq!(result["code"], expected_code, "{label}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{label}: {result}");
+                assert_eq!(result["fallback_allowed"], false, "{label}: {result}");
+                assert_eq!(
+                    std::fs::read_to_string(&log).unwrap(),
+                    baseline,
+                    "{label}: the live listener must not receive any byte"
+                );
+            }
+
+            // Both shapes of the matched target still read normally, including
+            // the trimmed/case-insensitive method form the forwarding layer uses.
+            for (label, arguments) in [
+                (
+                    "object matched",
+                    json!({"method": "server.status", "params": {"expected_core_target": target}}),
+                ),
+                (
+                    "string matched",
+                    json!({
+                        "method": "server.status",
+                        "params": json!({"expected_core_target": target}).to_string()
+                    }),
+                ),
+                (
+                    "string matched with padded method",
+                    json!({
+                        "method": " server.status ",
+                        "params": json!({"expected_core_target": target}).to_string()
+                    }),
+                ),
+            ] {
+                let result = call_public_tool(&app, "herdr_call", arguments).await;
+                assert_eq!(result["ok"], true, "{label}: {result}");
+                assert_eq!(result["result"]["live"], 7, "{label}: {result}");
+            }
+        });
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|method| *method == "server.status")
+                .count(),
+            3,
+            "every accepted shape forwards exactly one read: {calls}"
+        );
+        drop(core);
     }
 
     #[test]
