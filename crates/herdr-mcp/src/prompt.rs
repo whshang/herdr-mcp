@@ -25,6 +25,28 @@ const RECORD_LIMIT: usize = 512;
 const PROMPT_OPERATION_KIND: &str = "herdr_prompt";
 const PROMPT_TASK_OPERATION_KIND: &str = "herdr_prompt_task";
 const PROMPT_TASK_TTL_MS: u64 = 7 * 24 * 60 * 60_000;
+/// S4: repair redispatches allowed for one receipt. Caller-identified via
+/// `repair_of`; the budget is per receipt, not per lane, and exhaustion is a
+/// terminal repair state (never `delivery_uncertain`).
+pub(crate) const REPAIR_BUDGET_ATTEMPTS: u32 = 3;
+/// S4: retention is configurable but bounded. Terminal task rows past this
+/// window leave default inbox queries and stay in the archive; they are never
+/// deleted by the runtime.
+pub(crate) const PROMPT_TASK_RETENTION_ENV: &str = "HERDR_MCP_AGENT_TASK_RETENTION_MS";
+const PROMPT_TASK_RETENTION_MIN_MS: u64 = 60 * 60_000;
+const PROMPT_TASK_RETENTION_MAX_MS: u64 = 30 * 24 * 60 * 60_000;
+
+fn prompt_task_ttl_ms() -> u64 {
+    parse_retention_ms(std::env::var(PROMPT_TASK_RETENTION_ENV).ok().as_deref())
+}
+
+/// Pure retention parse: unset/invalid keeps the default, every configured
+/// value is clamped into the supported window.
+fn parse_retention_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(PROMPT_TASK_RETENTION_MIN_MS, PROMPT_TASK_RETENTION_MAX_MS))
+        .unwrap_or(PROMPT_TASK_TTL_MS)
+}
 const PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS: u64 = 10_000;
 const MAX_REPLAY_JSON_BYTES: usize = 128 * 1024;
 const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -69,6 +91,12 @@ const SPAWN_READY_POLL: Duration = Duration::from_millis(200);
 /// chain reports a resumable checkpoint instead of an orphan in-flight key.
 const SPAWN_READY_MIN_POLL_MS: u64 = 250;
 const SPAWN_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// S4 ready criterion, part 2: a self-reported `agent_status == "idle"` counts
+/// as ready only after it has been observed continuously for this settle
+/// window. `interactive_ready == true` is the agent's own handshake and needs
+/// no settle. The window is a floor on the heuristic, never an added delay on
+/// the handshake path.
+const SPAWN_READY_SETTLE_MS: u64 = 250;
 /// Upper bound for one pane mutation, always cut down to the remaining chain.
 const SPAWN_PANE_TIMEOUT_MS: u64 = 10_000;
 /// Lower bound for one pane socket call. A caller may grant the chain less
@@ -135,6 +163,10 @@ impl PromptTaskLifecycle {
             Self::DeliveryUncertain => "delivery_uncertain",
         }
     }
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -204,6 +236,13 @@ struct PromptTaskRecord {
     /// and on calls that carried no wire id (direct `tool_call`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
+    /// S4 per-receipt repair budget. `repair_of` on a later dispatch records one
+    /// attempt here; the receipt turns terminal for repairs at
+    /// [`REPAIR_BUDGET_ATTEMPTS`] and further repair redispatches are refused.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    repair_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repair_exhausted_at_ms: Option<u64>,
     #[serde(skip)]
     gate: Option<DecisionGate>,
 }
@@ -293,6 +332,35 @@ impl PromptTaskRecord {
             }
             if let Some(request_id) = &self.request_id {
                 object.insert("request_id".to_owned(), json!(request_id));
+            }
+            if self.repair_attempts > 0 || self.repair_exhausted_at_ms.is_some() {
+                object.insert(
+                    "repair".to_owned(),
+                    json!({
+                        "attempts": self.repair_attempts,
+                        "limit": REPAIR_BUDGET_ATTEMPTS,
+                        "exhausted": self.repair_exhausted_at_ms.is_some(),
+                        "exhausted_at_ms": self.repair_exhausted_at_ms,
+                    }),
+                );
+            }
+            // S4: `delivery_uncertain` means "may already have been delivered".
+            // The row therefore carries the read-only check a caller can run to
+            // find out, instead of a bare doubt. The pane echo cursor is the
+            // closest durable evidence this runtime owns; when the pane is
+            // unknown the hint still names the surface without inventing one.
+            if self.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
+                let pane = self.pane_id.clone().or_else(|| Some(self.target.clone()));
+                object.insert(
+                    "confirm_hint".to_owned(),
+                    json!({
+                        "action": "herdr_mcp.agent.read",
+                        "target": pane,
+                        "cursor": self.terminal_cursor,
+                        "reason": self.notification_error,
+                        "meaning": "the prompt may or may not have reached the agent; read the pane before re-dispatching",
+                    }),
+                );
             }
         }
         public
@@ -704,6 +772,8 @@ impl PromptRegistry {
             created_at_ms: now,
             updated_at_ms: now,
             request_id: request_id.map(str::to_owned),
+            repair_attempts: 0,
+            repair_exhausted_at_ms: None,
         };
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
             mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
@@ -934,8 +1004,23 @@ impl PromptRegistry {
             include_acknowledged,
             advisory,
             limit,
+            receipt_id: None,
+            status: None,
+            since_ms: None,
         };
         match self.inbox_payload(&query) {
+            Ok(payload) => payload,
+            Err(error) => json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": error,
+            }),
+        }
+    }
+
+    /// S4: one inbox read for a fully populated query (filters included).
+    fn task_inbox_with_query(&self, query: &InboxQuery<'_>) -> Value {
+        match self.inbox_payload(query) {
             Ok(payload) => payload,
             Err(error) => json!({
                 "ok": false,
@@ -1058,6 +1143,252 @@ impl PromptRegistry {
     /// path must not sweep every lane's already-terminal notification
     /// bookkeeping, because that would run parent probes and attention advice
     /// on each tick instead of only on the returned snapshot.
+    /// S4 per-receipt repair budget.
+    ///
+    /// A caller that redispatches a repair identifies the receipt it repairs
+    /// (`repair_of`). Each accepted repair spends one attempt; at
+    /// [`REPAIR_BUDGET_ATTEMPTS`] the receipt's repair lane is terminal and any
+    /// further repair is refused as `not_delivered` instead of being submitted.
+    /// Repair accounting never changes the receipt's own delivered lifecycle.
+    pub fn record_repair_attempt(&self, receipt_id: &str) -> Value {
+        let Some(store) = self.inner.store.as_ref() else {
+            return json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": "agent task store is not configured",
+            });
+        };
+        let now_ms = self.now_ms();
+        let decision = {
+            let mut store = match store.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json!({
+                        "ok": false,
+                        "code": "agent_task_store_unavailable",
+                        "message": "agent task store lock unavailable",
+                    });
+                }
+            };
+            // One IMMEDIATE transaction owns read -> check -> increment ->
+            // write, so concurrent repairs cannot overspend this receipt.
+            store.update_operation_result(
+                receipt_id,
+                PROMPT_TASK_OPERATION_KIND,
+                |result_json| {
+                    let mut task = decode_task_record_json(result_json)?;
+                    if !task.is_terminal() {
+                        return Ok((
+                            None,
+                            json!({
+                                "ok": false,
+                                "code": "repair_target_not_terminal",
+                                "receipt_id": receipt_id,
+                                "delivery_state": "not_delivered",
+                                "retryable": false,
+                                "message": "only a terminal receipt can be repaired",
+                            }),
+                        ));
+                    }
+                    if task.repair_exhausted_at_ms.is_some()
+                        || task.repair_attempts >= REPAIR_BUDGET_ATTEMPTS
+                    {
+                        let mut exhausted = json!({
+                            "ok": false,
+                            "code": "repair_budget_exhausted",
+                            "receipt_id": receipt_id,
+                            "attempts": task.repair_attempts,
+                            "limit": REPAIR_BUDGET_ATTEMPTS,
+                            "terminal": true,
+                            "delivery_state": "not_delivered",
+                            "retryable": false,
+                            "fallback_allowed": false,
+                            "hint": "this receipt's repair lane is terminal; start a fresh dispatch instead of repairing it again",
+                        });
+                        if task.repair_exhausted_at_ms.is_none() {
+                            task.repair_exhausted_at_ms = Some(now_ms);
+                            let encoded = serde_json::to_string(&task)
+                                .map_err(|error| format!("cannot encode agent task: {error}"))?;
+                            exhausted["attempts"] = json!(task.repair_attempts);
+                            return Ok((Some(encoded), exhausted));
+                        }
+                        return Ok((None, exhausted));
+                    }
+                    task.repair_attempts = task.repair_attempts.saturating_add(1);
+                    let encoded = serde_json::to_string(&task)
+                        .map_err(|error| format!("cannot encode agent task: {error}"))?;
+                    Ok((
+                        Some(encoded),
+                        json!({
+                            "ok": true,
+                            "receipt_id": receipt_id,
+                            "attempts": task.repair_attempts,
+                            "limit": REPAIR_BUDGET_ATTEMPTS,
+                            "remaining": REPAIR_BUDGET_ATTEMPTS.saturating_sub(task.repair_attempts),
+                        }),
+                    ))
+                },
+            )
+        };
+        match decision {
+            Ok(Some(value)) => value,
+            Ok(None) => json!({
+                "ok": false,
+                "code": "agent_task_not_found",
+                "receipt_id": receipt_id,
+            }),
+            Err(error) => json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": error,
+            }),
+        }
+    }
+
+    /// Terminal receipts whose retention window elapsed. They are hidden from
+    /// default queries and were never deleted, so this is the archive surface.
+    fn list_archived_tasks(&self, limit: usize) -> Result<Vec<PromptTaskRecord>, String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(vec![]);
+        };
+        let store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        let rows = store.operation_ledgers_archived(PROMPT_TASK_OPERATION_KIND, limit)?;
+        drop(store);
+        rows.into_iter()
+            .map(|record| {
+                let mut task = decode_task_record(&record)?;
+                if let Some(store) = self.inner.store.as_ref() {
+                    let store = store
+                        .lock()
+                        .map_err(|_| "agent task store lock unavailable".to_owned())?;
+                    task.gate = store.open_decision_gate(&task.task_id)?;
+                }
+                Ok(task)
+            })
+            .collect()
+    }
+
+    fn inbox_scope_matches(&self, task: &PromptTaskRecord, query: &InboxQuery) -> bool {
+        task_matches_scope(
+            task,
+            query.workspace_id,
+            query.parent_target,
+            query.parent_session_ref,
+        ) && task_matches_receipt_filters(task, query.receipt_id, query.status, query.since_ms)
+    }
+
+    /// S4 read-only counters for one inbox scope. No mutation, no task bodies.
+    fn inbox_stats(&self, tasks: &[PromptTaskRecord], query: &InboxQuery) -> Value {
+        let mut running = 0_u64;
+        let mut completed = 0_u64;
+        let mut blocked = 0_u64;
+        let mut failed = 0_u64;
+        let mut uncertain = 0_u64;
+        let mut oldest_updated_ms = None::<u64>;
+        let mut newest_updated_ms = None::<u64>;
+        for task in tasks
+            .iter()
+            .filter(|task| self.inbox_scope_matches(task, query))
+        {
+            match task.lifecycle {
+                PromptTaskLifecycle::Running
+                | PromptTaskLifecycle::AwaitingActivity
+                | PromptTaskLifecycle::AwaitingPriorSettle => running += 1,
+                PromptTaskLifecycle::DeliveryUncertain => uncertain += 1,
+                PromptTaskLifecycle::Completed => completed += 1,
+                PromptTaskLifecycle::Blocked => blocked += 1,
+                PromptTaskLifecycle::Failed => failed += 1,
+            }
+            oldest_updated_ms = Some(
+                oldest_updated_ms.map_or(task.updated_at_ms, |value| value.min(task.updated_at_ms)),
+            );
+            newest_updated_ms = Some(
+                newest_updated_ms.map_or(task.updated_at_ms, |value| value.max(task.updated_at_ms)),
+            );
+        }
+        let archived = self
+            .list_archived_tasks(512)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|task| task.is_terminal() && self.inbox_scope_matches(task, query))
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        json!({
+            "read_only": true,
+            "scope": {
+                "workspace_id": query.workspace_id,
+                "parent_scoped": query.parent_target.is_some()
+                    || query.parent_session_ref.is_some(),
+            },
+            "active": running,
+            "completed": completed,
+            "blocked": blocked,
+            "failed": failed,
+            "delivery_uncertain": uncertain,
+            "terminal": completed + blocked + failed + uncertain,
+            "archived": archived,
+            "oldest_updated_ms": oldest_updated_ms,
+            "newest_updated_ms": newest_updated_ms,
+            "retention_ms": prompt_task_ttl_ms(),
+        })
+    }
+
+    /// S4 archive read: terminal receipts past retention, within the caller's
+    /// scope and filters. Default queries never include these rows.
+    fn archive_payload(&self, query: &InboxQuery) -> Value {
+        // The embedded stats describe the caller's live scope as well as the
+        // archive: computing them from an empty set would report `active: 0` /
+        // `terminal: 0` for a scope that still has live receipts (S4 review P2).
+        let live = self.list_tasks(512).unwrap_or_default();
+        let archived = match self.list_archived_tasks(512) {
+            Ok(archived) => archived,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "code": "agent_task_store_unavailable",
+                    "message": error,
+                });
+            }
+        };
+        let mut tasks = archived
+            .into_iter()
+            .filter(|task| task.is_terminal() && self.inbox_scope_matches(task, query))
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.updated_at_ms));
+        tasks.truncate(query.limit.clamp(1, 512));
+        json!({
+            "ok": true,
+            "archive": true,
+            "retention_ms": prompt_task_ttl_ms(),
+            "tasks": tasks
+                .into_iter()
+                .map(|task| task.public_json_at(self.now_ms()))
+                .collect::<Vec<_>>(),
+            "stats": self.inbox_stats(&live, query),
+        })
+    }
+
+    /// S4 stats-only view: counters for the caller's scope, no task rows.
+    fn stats_payload(&self, query: &InboxQuery) -> Value {
+        let tasks = match self.list_tasks(512) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "code": "agent_task_store_unavailable",
+                    "message": error,
+                });
+            }
+        };
+        json!({
+            "ok": true,
+            "stats": self.inbox_stats(&tasks, query),
+        })
+    }
+
     fn inbox_has_pending_terminal(&self, query: &InboxQuery) -> Result<bool, String> {
         let in_scope = |task: &PromptTaskRecord| {
             task_matches_scope(
@@ -1068,7 +1399,15 @@ impl PromptRegistry {
             )
         };
         let pending = |task: &PromptTaskRecord| {
-            in_scope(task) && task.is_terminal() && task.acknowledged_at_ms.is_none()
+            in_scope(task)
+                && task_matches_receipt_filters(
+                    task,
+                    query.receipt_id,
+                    query.status,
+                    query.since_ms,
+                )
+                && task.is_terminal()
+                && task.acknowledged_at_ms.is_none()
         };
         let tasks = self.list_tasks(512)?;
         if tasks.iter().any(pending) {
@@ -1096,6 +1435,9 @@ impl PromptRegistry {
             include_acknowledged,
             advisory,
             limit,
+            receipt_id,
+            status,
+            since_ms,
         } = *query;
         self.reconcile_active_tasks();
         let tasks = self.list_tasks(512)?;
@@ -1104,6 +1446,7 @@ impl PromptRegistry {
             .filter(|task| {
                 task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
             })
+            .filter(|task| task_matches_receipt_filters(task, receipt_id, status, since_ms))
             .filter(|task| {
                 !task.is_terminal() || include_acknowledged || task.acknowledged_at_ms.is_none()
             })
@@ -1175,6 +1518,9 @@ impl PromptRegistry {
                 "failed": failed,
                 "uncertain": uncertain,
             },
+            // S4 read-only governance stats for this scope. Counts only; the
+            // archive count comes from rows whose retention window elapsed.
+            "stats": self.inbox_stats(&tasks, query),
             "tasks": terminal.into_iter().map(|task| task.public_json_at(self.now_ms())).collect::<Vec<_>>(),
             "attention": attention,
             "escalation": escalation,
@@ -1727,7 +2073,7 @@ impl PromptRegistry {
         let encoded = serde_json::to_string(task)
             .map_err(|error| format!("cannot encode agent task: {error}"))?;
         let now = now_ms();
-        let expires_at = now.saturating_add(PROMPT_TASK_TTL_MS);
+        let expires_at = now.saturating_add(prompt_task_ttl_ms());
         let mut store = store
             .lock()
             .map_err(|_| "agent task store lock unavailable".to_owned())?;
@@ -1772,6 +2118,29 @@ struct InboxQuery<'a> {
     include_acknowledged: bool,
     advisory: bool,
     limit: usize,
+    /// S4 filters. `receipt_id` aliases the task id, `status` matches the
+    /// lifecycle/terminal status string, `since_ms` keeps receipts updated at or
+    /// after that millisecond timestamp.
+    receipt_id: Option<&'a str>,
+    status: Option<&'a str>,
+    since_ms: Option<u64>,
+}
+
+/// S4 receipt filters, applied identically to the default inbox, the archive
+/// and the bounded wait. `status` accepts the lifecycle name (`completed`,
+/// `failed`, `blocked`, `delivery_uncertain`, `running`, ...) or the recorded
+/// terminal status.
+fn task_matches_receipt_filters(
+    task: &PromptTaskRecord,
+    receipt_id: Option<&str>,
+    status: Option<&str>,
+    since_ms: Option<u64>,
+) -> bool {
+    receipt_id.is_none_or(|receipt_id| task.task_id == receipt_id)
+        && status.is_none_or(|status| {
+            task.lifecycle.as_str() == status || task.terminal_status.as_deref() == Some(status)
+        })
+        && since_ms.is_none_or(|since_ms| task.updated_at_ms >= since_ms)
 }
 
 /// Inbox task projection: `full` keeps today's payload, `compact` drops the
@@ -1780,6 +2149,11 @@ struct InboxQuery<'a> {
 enum InboxView {
     Full,
     Compact,
+    /// S4: terminal receipts past retention. They left the default queries but
+    /// were never deleted, so they stay queryable here.
+    Archive,
+    /// S4: read-only counters for the caller's scope; no task rows.
+    Stats,
 }
 
 /// Fields kept by `view: compact`. Attention facts are only carried when the
@@ -1840,7 +2214,9 @@ fn running_task_row(task: PromptTaskRecord, now: u64) -> Value {
 }
 
 fn apply_inbox_view(payload: Value, view: InboxView) -> Value {
-    if view == InboxView::Full {
+    if !matches!(view, InboxView::Compact) {
+        // `full`, `archive` and `stats` payloads are already final: archive
+        // rows keep every fact a caller may need to reconcile a receipt.
         return payload;
     }
     let Value::Object(mut object) = payload else {
@@ -1863,7 +2239,11 @@ fn parse_inbox_view(params: &Value) -> Result<InboxView, Value> {
     match view.as_str() {
         Some("full") => Ok(InboxView::Full),
         Some("compact") => Ok(InboxView::Compact),
-        _ => Err(invalid(r#"view must be "full" or "compact""#)),
+        Some("archive") => Ok(InboxView::Archive),
+        Some("stats") => Ok(InboxView::Stats),
+        _ => Err(invalid(
+            r#"view must be "full", "compact", "archive" or "stats""#,
+        )),
     }
 }
 
@@ -2149,6 +2529,12 @@ fn task_attention_state(attention: &Value, task_id: &str) -> Option<String> {
         .get("state")
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+/// Decode one task payload without a ledger row, for atomic in-transaction
+/// read-modify-write paths (`update_operation_result`).
+fn decode_task_record_json(encoded: &str) -> Result<PromptTaskRecord, String> {
+    serde_json::from_str(encoded).map_err(|error| format!("cannot decode agent task: {error}"))
 }
 
 fn decode_task_record(record: &OperationLedgerRecord) -> Result<PromptTaskRecord, String> {
@@ -3067,6 +3453,45 @@ pub fn task_call_with_parent_session(
                 Ok(view) => view,
                 Err(error) => return error,
             };
+            // S4 receipt filters: `receipt_id` aliases the task id, `status`
+            // matches the lifecycle/terminal status, `since_ms` keeps receipts
+            // updated at or after that timestamp. They apply identically to the
+            // default inbox, the bounded wait, the archive and the stats view.
+            let receipt_id = match params.get("receipt_id") {
+                None => None,
+                Some(value) => match value.as_str() {
+                    Some(value)
+                        if !value.is_empty()
+                            && value.len() <= 128
+                            && !value.chars().any(char::is_control) =>
+                    {
+                        Some(value)
+                    }
+                    _ => {
+                        return invalid("receipt_id must be a non-empty string up to 128 bytes");
+                    }
+                },
+            };
+            let status = match params.get("status") {
+                None => None,
+                Some(value) => match value.as_str() {
+                    Some(value)
+                        if !value.is_empty()
+                            && value.len() <= 64
+                            && !value.chars().any(char::is_control) =>
+                    {
+                        Some(value)
+                    }
+                    _ => return invalid("status must be a non-empty string up to 64 bytes"),
+                },
+            };
+            let since_ms = match params.get("since_ms") {
+                None => None,
+                Some(value) => match value.as_u64() {
+                    Some(value) => Some(value),
+                    None => return invalid("since_ms must be a non-negative integer"),
+                },
+            };
             let query = InboxQuery {
                 workspace_id,
                 parent_target,
@@ -3074,17 +3499,17 @@ pub fn task_call_with_parent_session(
                 include_acknowledged,
                 advisory,
                 limit,
+                receipt_id,
+                status,
+                since_ms,
             };
-            let inbox = match wait_ms {
-                Some(wait_ms) => registry.task_inbox_waiting(&query, wait_ms),
-                None => registry.task_inbox(
-                    workspace_id,
-                    parent_target,
-                    parent_session_ref,
-                    include_acknowledged,
-                    advisory,
-                    limit,
-                ),
+            let inbox = match view {
+                InboxView::Archive => registry.archive_payload(&query),
+                InboxView::Stats => registry.stats_payload(&query),
+                _ => match wait_ms {
+                    Some(wait_ms) => registry.task_inbox_waiting(&query, wait_ms),
+                    None => registry.task_inbox_with_query(&query),
+                },
             };
             apply_inbox_view(inbox, view)
         }
@@ -3240,6 +3665,27 @@ pub fn run_with_parent_session(
             Err(error) => return error,
         },
     };
+    // S4: an explicit repair redispatch names the terminal receipt it repairs.
+    // The per-receipt budget is spent before any socket call, so an exhausted
+    // budget is `not_delivered` by construction (nothing was submitted).
+    let repair_of = match args.get("repair_of") {
+        None => None,
+        Some(value) => match value.as_str() {
+            Some(value)
+                if !value.is_empty()
+                    && value.len() <= 128
+                    && !value.chars().any(char::is_control) =>
+            {
+                Some(value)
+            }
+            _ => return invalid("repair_of must be a non-empty receipt id up to 128 bytes"),
+        },
+    };
+    if repair_of.is_some() && spawn.is_some() {
+        return spawn_invalid(
+            "repair_of cannot be combined with spawn: a repair redispatches to an existing target",
+        );
+    }
     let role = match role_targets::RoleTarget::parse(target) {
         Ok(role) => role,
         Err(error) => return error,
@@ -3453,6 +3899,29 @@ pub fn run_with_parent_session(
     } else {
         None
     };
+    // S4 repair budget (droid P1-1): spend it only after the whole request has
+    // been parsed, validated and admitted. An invalid `text`/`wait`/
+    // `stall_after_ms`/lease or a rejected role resolution must never burn an
+    // attempt, and a refusal here is still `not_delivered` because nothing has
+    // been submitted yet.
+    if let Some(receipt_id) = repair_of {
+        let mut budget = registry.record_repair_attempt(receipt_id);
+        if budget.get("ok").and_then(Value::as_bool) != Some(true) {
+            if let Some(object) = budget.as_object_mut() {
+                object.insert("dispatch_id".to_owned(), json!(task_id));
+            }
+            // Persist the refusal under this key like every other pre-delivery
+            // failure, so a same-key retry replays it instead of staying in
+            // flight until the reservation TTL.
+            if let Some(key) = idempotency_key
+                && let Err(persist_error) = registry.complete(key, &fingerprint, &budget)
+            {
+                return annotate_idempotency_persistence(budget, persist_error);
+            }
+            return budget;
+        }
+    }
+
     // A spawn resolves its target by creating it, or by resuming the pane a
     // resumable checkpoint already persisted.
     let mut spawn_outcome = None;
@@ -4436,6 +4905,8 @@ fn spawn_create_pane(
 struct SpawnAgentReadiness {
     state: AgentState,
     ready: bool,
+    /// The agent CLI's explicit readiness handshake; settles the idle heuristic.
+    interactive_ready: bool,
 }
 
 /// Readiness evidence from one agent payload: `interactive_ready` is the
@@ -4448,7 +4919,33 @@ fn spawn_agent_readiness(value: &Value) -> Option<SpawnAgentReadiness> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let ready = interactive_ready || state.agent_status.as_deref() == Some("idle");
-    Some(SpawnAgentReadiness { state, ready })
+    Some(SpawnAgentReadiness {
+        state,
+        ready,
+        interactive_ready,
+    })
+}
+
+/// The shipped S4 ready criterion.
+///
+/// An agent is ready to receive a prompt when either
+/// - `interactive_ready == true` (the agent CLI's own handshake), or
+/// - `agent_status == "idle"` **and** that idle state has been observed for at
+///   least [`SPAWN_READY_SETTLE_MS`] of the chain budget.
+///
+/// The settle window exists because idle is a self-reported status: a start that
+/// is still building its composer can already claim idle. `first_idle_ms` is the
+/// first observation of idle after the start; `None` means the handshake has not
+/// happened and idle has not been observed yet.
+fn spawn_readiness_satisfied(
+    interactive_ready: bool,
+    first_idle_ms: Option<u64>,
+    now_ms: u64,
+) -> bool {
+    if interactive_ready {
+        return true;
+    }
+    first_idle_ms.is_some_and(|first| now_ms.saturating_sub(first) >= SPAWN_READY_SETTLE_MS)
 }
 
 /// One bounded readiness probe. Returns the agent state only when it is ready.
@@ -4477,6 +4974,9 @@ fn spawn_wait_ready(
     mut probe_even_when_exhausted: bool,
 ) -> SpawnReadyOutcome {
     let mut last_status = None;
+    // S4: first observation of the self-reported idle state. The handshake path
+    // (`interactive_ready`) ignores it entirely.
+    let mut first_idle_ms: Option<u64> = None;
     loop {
         let remaining = deadline_ms.saturating_sub(registry.now_ms());
         let probe_now = std::mem::take(&mut probe_even_when_exhausted);
@@ -4498,7 +4998,18 @@ fn spawn_wait_ready(
         let Some(readiness) = spawn_agent_readiness(&value) else {
             continue;
         };
-        if readiness.ready {
+        if !readiness.ready {
+            first_idle_ms = None;
+            last_status = readiness.state.agent_status.clone();
+            continue;
+        }
+        if readiness.interactive_ready {
+            return SpawnReadyOutcome::Ready(readiness.state);
+        }
+        // Idle-only evidence: require the settle window before the prompt.
+        let now = registry.now_ms();
+        let first = *first_idle_ms.get_or_insert(now);
+        if spawn_readiness_satisfied(false, Some(first), now) {
             return SpawnReadyOutcome::Ready(readiness.state);
         }
         last_status = readiness.state.agent_status.clone();
@@ -4685,10 +5196,13 @@ fn spawn_chain(
                     state
                 }
                 SpawnReadyOutcome::TimedOut(last_status) => {
+                    // S4: a request that never reached delivery is
+                    // `not_delivered` (see `checkpoint`), never
+                    // `delivery_uncertain`; the public code names the cause.
                     return Err(progress.checkpoint(
                         spawn,
                         "agent_ready",
-                        "agent_ready_timeout",
+                        "agent_not_ready",
                         format!(
                             "agent in pane {pane_id} was not interactive-ready within the {}ms spawn chain (last status: {})",
                             chain_ms,
@@ -5092,6 +5606,12 @@ fn insert_task_id(result: &mut Value, task_id: &str) {
     if let Some(object) = result.as_object_mut() {
         object
             .entry("task_id".to_owned())
+            .or_insert_with(|| json!(task_id));
+        // S4: one receipt per dispatch, including a spawn chain whose failure
+        // still owns exactly one durable record. `receipt_id` aliases the task
+        // id (S3 vocabulary) and is the id the caller waits on.
+        object
+            .entry("receipt_id".to_owned())
             .or_insert_with(|| json!(task_id));
     }
 }
@@ -5953,6 +6473,512 @@ mod tests {
         }})
     }
 
+    /// S4: seed one durable task row with a chosen lifecycle, update time and
+    /// retention deadline. `expires_at` in the past is what the archive view
+    /// reads; the row itself is never deleted.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_task_row(
+        registry: &PromptRegistry,
+        store: &Arc<Mutex<StateStore>>,
+        task_id: &str,
+        target: &str,
+        parent_session_ref: Option<&str>,
+        lifecycle: PromptTaskLifecycle,
+        updated_at_ms: u64,
+        expires_at: Option<i64>,
+    ) {
+        let mut task = registry
+            .register_task(RegisterTaskInput {
+                task_id,
+                target,
+                requested_target: None,
+                fingerprint: "fp-s4",
+                idempotency_key: None,
+                before: None,
+                after: None,
+                submitted: Some(true),
+                start_cursor: 0,
+                parent_target: None,
+                parent_session_ref,
+                stall_after_ms: None,
+                request_id: None,
+            })
+            .unwrap()
+            .expect("store present, so the task is registered");
+        task.lifecycle = lifecycle.clone();
+        task.terminal_status = Some(lifecycle.as_str().to_owned());
+        task.terminal_at_ms = Some(updated_at_ms);
+        task.updated_at_ms = updated_at_ms;
+        let encoded = serde_json::to_string(&task).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .put_operation_ledger(OperationLedgerInput {
+                op_id: task_id,
+                kind: PROMPT_TASK_OPERATION_KIND,
+                idempotency_key: None,
+                request_hash: None,
+                phase: "terminal",
+                state: lifecycle.as_str(),
+                result_json: &encoded,
+                now_ms: i64::try_from(updated_at_ms).unwrap_or(i64::MAX),
+                expires_at,
+            })
+            .unwrap();
+    }
+
+    fn s4_query<'a>(
+        parent_session_ref: Option<&'a str>,
+        receipt_id: Option<&'a str>,
+        status: Option<&'a str>,
+        since_ms: Option<u64>,
+    ) -> InboxQuery<'a> {
+        InboxQuery {
+            workspace_id: None,
+            parent_target: None,
+            parent_session_ref,
+            include_acknowledged: true,
+            advisory: false,
+            limit: 50,
+            receipt_id,
+            status,
+            since_ms,
+        }
+    }
+
+    /// S4 the shipped ready criterion: the agent handshake is immediate, the
+    /// self-reported idle status must hold for the settle window.
+    #[test]
+    fn spawn_ready_criterion_needs_the_settle_window_for_idle_only_evidence() {
+        assert!(spawn_readiness_satisfied(true, None, 1_000));
+        assert!(!spawn_readiness_satisfied(false, None, 100_000));
+        assert!(!spawn_readiness_satisfied(false, Some(1_000), 1_100));
+        assert!(!spawn_readiness_satisfied(
+            false,
+            Some(1_000),
+            1_000 + SPAWN_READY_SETTLE_MS - 1
+        ));
+        assert!(spawn_readiness_satisfied(
+            false,
+            Some(1_000),
+            1_000 + SPAWN_READY_SETTLE_MS
+        ));
+    }
+
+    /// S4 a delivery-uncertain row explains how to confirm it, and a settled row
+    /// carries no such ambiguity.
+    #[test]
+    fn delivery_uncertain_rows_carry_a_confirm_hint() {
+        let root = spawn_project_root("confirm-hint");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-uncertain",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::DeliveryUncertain,
+            1_000,
+            None,
+        );
+        seed_task_row(
+            &registry,
+            &store,
+            "t-completed",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Completed,
+            1_000,
+            None,
+        );
+        let uncertain = registry.task_status("t-uncertain");
+        let row = &uncertain["task"];
+        assert_eq!(row["confirm_hint"]["action"], json!("herdr_mcp.agent.read"));
+        assert_eq!(row["confirm_hint"]["target"], json!("w1:p9"));
+        assert!(row["confirm_hint"].get("cursor").is_some(), "{row}");
+        let completed = registry.task_status("t-completed");
+        assert!(
+            completed["task"].get("confirm_hint").is_none(),
+            "{completed}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 inbox filters: receipt id, status and timestamp narrow one scope.
+    #[test]
+    fn inbox_filters_select_by_receipt_status_and_since() {
+        let root = spawn_project_root("inbox-filters");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        for (task_id, lifecycle, updated) in [
+            ("t-done", PromptTaskLifecycle::Completed, 1_000_u64),
+            ("t-failed", PromptTaskLifecycle::Failed, 2_000),
+            ("t-blocked", PromptTaskLifecycle::Blocked, 3_000),
+        ] {
+            seed_task_row(
+                &registry,
+                &store,
+                task_id,
+                "w1:p9",
+                Some("session-a"),
+                lifecycle,
+                updated,
+                None,
+            );
+        }
+
+        let by_receipt = registry.task_inbox_with_query(&s4_query(
+            Some("session-a"),
+            Some("t-failed"),
+            None,
+            None,
+        ));
+        assert_eq!(by_receipt["ok"], true, "{by_receipt}");
+        assert_eq!(by_receipt["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(by_receipt["tasks"][0]["receipt_id"], json!("t-failed"));
+
+        let by_status = registry.task_inbox_with_query(&s4_query(
+            Some("session-a"),
+            None,
+            Some("blocked"),
+            None,
+        ));
+        assert_eq!(
+            by_status["tasks"].as_array().unwrap().len(),
+            1,
+            "{by_status}"
+        );
+        assert_eq!(by_status["tasks"][0]["receipt_id"], json!("t-blocked"));
+
+        let by_since =
+            registry.task_inbox_with_query(&s4_query(Some("session-a"), None, None, Some(1_500)));
+        let mut ids = by_since["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task["receipt_id"].as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["t-blocked", "t-failed"], "{by_since}");
+
+        // The bounded wait honors the same receipt filter: only this receipt
+        // can wake it, even though the scope has other pending terminals.
+        let woke = registry.task_inbox_waiting(
+            &s4_query(Some("session-a"), Some("t-blocked"), None, None),
+            10,
+        );
+        assert_eq!(woke["wait"]["woke"], json!("terminal_task"), "{woke}");
+        assert_eq!(woke["tasks"].as_array().unwrap().len(), 1, "{woke}");
+        assert_eq!(woke["tasks"][0]["receipt_id"], json!("t-blocked"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 archive: a terminal receipt past retention leaves the default query,
+    /// stays out of the delete path, and remains queryable through the archive.
+    #[test]
+    fn archived_terminal_receipts_leave_default_queries_but_stay_queryable() {
+        let root = spawn_project_root("inbox-archive");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-live",
+            "w1:p9",
+            Some("session-a"),
+            PromptTaskLifecycle::Completed,
+            5_000,
+            None,
+        );
+        // Retention deadline already elapsed.
+        seed_task_row(
+            &registry,
+            &store,
+            "t-old",
+            "w1:p9",
+            Some("session-a"),
+            PromptTaskLifecycle::Completed,
+            1_000,
+            Some(1),
+        );
+
+        let default =
+            registry.task_inbox_with_query(&s4_query(Some("session-a"), None, None, None));
+        let ids = default["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task["receipt_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["t-live"], "{default}");
+
+        let archive = registry.archive_payload(&s4_query(Some("session-a"), None, None, None));
+        assert_eq!(archive["ok"], true, "{archive}");
+        assert_eq!(archive["archive"], json!(true), "{archive}");
+        let archived = archive["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task["receipt_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(archived, vec!["t-old"], "{archive}");
+        assert_eq!(
+            archive["tasks"][0]["receipt_id"],
+            json!("t-old"),
+            "the archived row keeps its receipt id"
+        );
+        // S4 review P2-4: the embedded stats describe the live scope too, not
+        // only the archived count.
+        assert_eq!(archive["stats"]["completed"], json!(1), "{archive}");
+        assert_eq!(archive["stats"]["terminal"], json!(1), "{archive}");
+        assert_eq!(archive["stats"]["archived"], json!(1), "{archive}");
+
+        // Retention never deletes the row: it is still physically present.
+        let still_stored = store
+            .lock()
+            .unwrap()
+            .operation_ledger("t-old")
+            .unwrap()
+            .expect("archived rows are retained, not deleted");
+        assert_eq!(still_stored.kind, PROMPT_TASK_OPERATION_KIND);
+
+        // Archive filters compose with the same receipt/status filters.
+        let by_receipt =
+            registry.archive_payload(&s4_query(Some("session-a"), Some("t-live"), None, None));
+        assert_eq!(
+            by_receipt["tasks"].as_array().unwrap().len(),
+            0,
+            "{by_receipt}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 stats: read-only counters, no task bodies.
+    #[test]
+    fn inbox_stats_are_read_only_counters() {
+        let root = spawn_project_root("inbox-stats");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        for (task_id, lifecycle, expires) in [
+            ("t-a", PromptTaskLifecycle::Completed, None),
+            ("t-b", PromptTaskLifecycle::Failed, None),
+            ("t-c", PromptTaskLifecycle::DeliveryUncertain, None),
+            ("t-old", PromptTaskLifecycle::Completed, Some(1)),
+        ] {
+            seed_task_row(
+                &registry,
+                &store,
+                task_id,
+                "w1:p9",
+                Some("session-a"),
+                lifecycle,
+                1_000,
+                expires,
+            );
+        }
+        let stats = registry.stats_payload(&s4_query(Some("session-a"), None, None, None));
+        assert_eq!(stats["ok"], true, "{stats}");
+        assert!(
+            stats.get("tasks").is_none(),
+            "stats returns no task rows: {stats}"
+        );
+        let counters = &stats["stats"];
+        assert_eq!(counters["read_only"], json!(true));
+        // Counters describe the rows the default queries still serve; the
+        // archived receipt is counted separately and never inflates them.
+        assert_eq!(counters["completed"], json!(1), "{stats}");
+        assert_eq!(counters["failed"], json!(1), "{stats}");
+        assert_eq!(counters["delivery_uncertain"], json!(1), "{stats}");
+        assert_eq!(counters["archived"], json!(1), "{stats}");
+        assert_eq!(counters["terminal"], json!(3), "{stats}");
+        assert_eq!(counters["retention_ms"], json!(prompt_task_ttl_ms()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 review P1-1: a repair dispatch that fails parameter validation must
+    /// not spend a repair attempt, so invalid input cannot burn a receipt lane.
+    #[test]
+    fn invalid_repair_dispatch_does_not_spend_the_budget() {
+        let root = spawn_project_root("repair-invalid");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-repair",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Failed,
+            1_000,
+            None,
+        );
+        let client = HerdrClient::new(temp_socket());
+
+        // Missing text, invalid stall_after_ms and an invalid wait each reject
+        // the request before admission.
+        for (label, args) in [
+            (
+                "missing text",
+                json!({"target": "w1:p9", "repair_of": "t-repair"}),
+            ),
+            (
+                "invalid stall_after_ms",
+                json!({
+                    "target": "w1:p9",
+                    "text": "repair",
+                    "repair_of": "t-repair",
+                    "stall_after_ms": 1,
+                }),
+            ),
+            (
+                "invalid wait",
+                json!({
+                    "target": "w1:p9",
+                    "text": "repair",
+                    "repair_of": "t-repair",
+                    "wait": {"timeout_ms": 0},
+                }),
+            ),
+        ] {
+            for _ in 0..REPAIR_BUDGET_ATTEMPTS {
+                let rejected = run(&client, &registry, &args);
+                assert_eq!(rejected["ok"], false, "{label}: {rejected}");
+                assert_eq!(rejected["code"], "invalid_params", "{label}: {rejected}");
+            }
+        }
+
+        let receipt = registry.task_status("t-repair")["task"].clone();
+        assert!(
+            receipt.get("repair").is_none(),
+            "invalid requests must not spend a repair attempt: {receipt}"
+        );
+        // The lane is still fully available.
+        for attempt in 1..=REPAIR_BUDGET_ATTEMPTS {
+            let spent = registry.record_repair_attempt("t-repair");
+            assert_eq!(spent["ok"], true, "attempt {attempt}: {spent}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 review P1-2: concurrent repairs must never exceed the per-receipt
+    /// budget. The count/check/increment runs in one store transaction.
+    #[test]
+    fn concurrent_repairs_cannot_exceed_the_receipt_budget() {
+        let root = spawn_project_root("repair-concurrent");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = Arc::new(spawn_registry_with(store, &root, 80));
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-repair",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Failed,
+            1_000,
+            None,
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let registry = Arc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                registry.record_repair_attempt("t-repair")
+            }));
+        }
+        let mut accepted = 0_u32;
+        let mut exhausted = 0_u32;
+        for handle in handles {
+            let outcome = handle.join().expect("repair thread");
+            if outcome["ok"] == json!(true) {
+                accepted += 1;
+            } else {
+                assert_eq!(
+                    outcome["code"],
+                    json!("repair_budget_exhausted"),
+                    "{outcome}"
+                );
+                exhausted += 1;
+            }
+        }
+        assert_eq!(accepted, REPAIR_BUDGET_ATTEMPTS, "budget overspent");
+        assert_eq!(accepted + exhausted, 12);
+        let receipt = registry.task_status("t-repair")["task"].clone();
+        assert_eq!(receipt["repair"]["attempts"], json!(REPAIR_BUDGET_ATTEMPTS));
+        assert_eq!(receipt["repair"]["exhausted"], json!(true));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 repair budget: three repairs per receipt, then the lane is terminal and
+    /// the next repair is refused before any delivery attempt.
+    #[test]
+    fn repair_budget_is_per_receipt_and_terminal_on_exhaustion() {
+        let root = spawn_project_root("repair-budget");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-repair",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Failed,
+            1_000,
+            None,
+        );
+
+        for attempt in 1..=REPAIR_BUDGET_ATTEMPTS {
+            let spent = registry.record_repair_attempt("t-repair");
+            assert_eq!(spent["ok"], true, "attempt {attempt}: {spent}");
+            assert_eq!(spent["attempts"], json!(attempt), "{spent}");
+        }
+        let exhausted = registry.record_repair_attempt("t-repair");
+        assert_eq!(exhausted["ok"], false, "{exhausted}");
+        assert_eq!(
+            exhausted["code"],
+            json!("repair_budget_exhausted"),
+            "{exhausted}"
+        );
+        assert_eq!(exhausted["terminal"], json!(true), "{exhausted}");
+        assert_eq!(
+            exhausted["delivery_state"],
+            json!("not_delivered"),
+            "an exhausted budget never attempts delivery: {exhausted}"
+        );
+        assert_eq!(exhausted["retryable"], json!(false), "{exhausted}");
+
+        let receipt = registry.task_status("t-repair")["task"].clone();
+        assert_eq!(receipt["repair"]["attempts"], json!(REPAIR_BUDGET_ATTEMPTS));
+        assert_eq!(receipt["repair"]["exhausted"], json!(true));
+
+        // A running receipt cannot be repaired at all.
+        seed_task_row(
+            &registry,
+            &store,
+            "t-running",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Running,
+            2_000,
+            None,
+        );
+        let rejected = registry.record_repair_attempt("t-running");
+        assert_eq!(
+            rejected["code"],
+            json!("repair_target_not_terminal"),
+            "{rejected}"
+        );
+        assert_eq!(rejected["delivery_state"], json!("not_delivered"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn spawn_agent_started(ready: bool) -> Value {
         json!({"result": {
             "type": "agent_started",
@@ -6029,6 +7055,15 @@ mod tests {
         assert_eq!(
             spawn_step_names(&result["spawn"]),
             vec!["pane_create", "agent_start", "agent_ready", "prompt"]
+        );
+        // S4: one call, one receipt - the spawn chain and its delivery share the
+        // single durable receipt id.
+        assert_eq!(result["receipt_id"], result["task_id"], "{result}");
+        assert!(
+            result["receipt_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "{result}"
         );
         let recorded = requests.lock().unwrap();
         let methods = recorded
@@ -6355,8 +7390,19 @@ mod tests {
         assert_eq!(paused["ok"], false, "{paused}");
         assert_eq!(paused["failed_step"], "agent_ready", "{paused}");
         assert_eq!(paused["resumable"], true, "{paused}");
-        assert_eq!(paused["code"], "agent_ready_timeout", "{paused}");
-        assert_eq!(paused["delivery_state"], "not_delivered");
+        // S4: a readiness timeout names the cause and is definitely not
+        // delivered - never the uncertain-delivery bucket.
+        assert_eq!(paused["code"], "agent_not_ready", "{paused}");
+        assert_eq!(paused["delivery_state"], "not_delivered", "{paused}");
+        assert_eq!(paused["submitted"], false, "{paused}");
+        assert!(
+            paused.get("delivery_uncertain").is_none(),
+            "a readiness timeout must never be uncertain: {paused}"
+        );
+        assert_eq!(
+            paused["receipt_id"], paused["task_id"],
+            "the failed spawn still returns its single receipt: {paused}"
+        );
         assert_eq!(paused["spawn"]["pane_id"], "w1:p9");
         assert_eq!(paused["spawn"]["agent_started"], true);
         assert_eq!(paused["reclaim"]["pane_id"], "w1:p9");
@@ -7882,6 +8928,8 @@ mod tests {
             created_at_ms: now.saturating_sub(age_ms),
             updated_at_ms: now.saturating_sub(age_ms),
             request_id: None,
+            repair_attempts: 0,
+            repair_exhausted_at_ms: None,
         }
     }
 
@@ -9222,6 +10270,8 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             request_id: None,
+            repair_attempts: 0,
+            repair_exhausted_at_ms: None,
         }
     }
 
