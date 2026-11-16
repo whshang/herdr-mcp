@@ -627,6 +627,36 @@ mod tests {
         assert_ne!(built, cfg.edge_url);
     }
 
+    /// 1.2/S6 follow-up: the daemon and the transport defaults must not drift
+    /// apart — `daemon.rs` overrides `TransportConfig` with its own pair, so
+    /// the same `heartbeat < silence` (design: `heartbeat <= silence/3`)
+    /// invariant is pinned here too, plus equality with the transport pair.
+    #[test]
+    fn daemon_heartbeat_stays_within_the_silence_budget() {
+        // Read the values the live `LinkTransportCore` would be built with
+        // (`daemon.rs:348-354`) rather than asserting on constants directly.
+        let heartbeat_ms = DAEMON_HEARTBEAT_MS;
+        let max_silence_ms = DAEMON_MAX_SILENCE_MS;
+        assert!(
+            heartbeat_ms < max_silence_ms,
+            "daemon heartbeat {heartbeat_ms}ms must be < silence {max_silence_ms}ms"
+        );
+        assert!(
+            heartbeat_ms * 3 <= max_silence_ms,
+            "design remedy is heartbeat <= silence/3: {heartbeat_ms}*3 must be <= {max_silence_ms}"
+        );
+        assert_eq!(
+            heartbeat_ms,
+            crate::link::transport::LINK_DEFAULT_HEARTBEAT_MS,
+            "daemon and transport heartbeat defaults must not drift"
+        );
+        assert_eq!(
+            max_silence_ms,
+            crate::link::transport::LINK_DEFAULT_MAX_SILENCE_MS,
+            "daemon and transport silence defaults must not drift"
+        );
+    }
+
     #[test]
     fn daemon_config_carries_runtime_version_into_base_identity() {
         let cfg = read_link_daemon_config(&env(&[("HERDR_RUNTIME_VERSION", "0.4.3-dev")]))

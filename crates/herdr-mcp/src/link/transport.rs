@@ -712,8 +712,9 @@ fn extract_request_id(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS, LINK_DEFAULT_MAX_FRAME_BYTES, LinkTransportCore,
-        SocketAttemptId, TransportAction, TransportConfig, oversized_outbound_validation_code,
+        LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS, LINK_DEFAULT_HEARTBEAT_MS, LINK_DEFAULT_MAX_FRAME_BYTES,
+        LINK_DEFAULT_MAX_SILENCE_MS, LinkTransportCore, SocketAttemptId, TransportAction,
+        TransportConfig, oversized_outbound_validation_code,
     };
     use crate::link::backoff::{BackoffOptions, ExponentialBackoff};
     use crate::link::lifecycle::ConnectionPhase;
@@ -831,6 +832,31 @@ mod tests {
             core.heartbeat_tick(),
             vec![TransportAction::HeartbeatDue { attempt_id }]
         );
+    }
+
+    /// 1.2/S6 follow-up: pins the invariant whose violation caused the
+    /// silence-recycle regression — the application heartbeat must fit inside
+    /// the silence budget with the design's `heartbeat <= silence/3` headroom.
+    /// `last_edge_seen_ms` only advances on inbound application frames (Edge
+    /// answers a heartbeat with a status frame at most every 30s), so a
+    /// heartbeat slower than `silence` guarantees a recycle every window.
+    #[test]
+    fn heartbeat_default_stays_within_the_silence_budget() {
+        let config = TransportConfig::default();
+        assert!(
+            config.heartbeat_ms < config.max_silence_ms,
+            "heartbeat {}ms must be < silence {}ms",
+            config.heartbeat_ms,
+            config.max_silence_ms
+        );
+        assert!(
+            config.heartbeat_ms * 3 <= config.max_silence_ms,
+            "design remedy is heartbeat <= silence/3: {}*3 must be <= {}",
+            config.heartbeat_ms,
+            config.max_silence_ms
+        );
+        assert_eq!(config.heartbeat_ms, LINK_DEFAULT_HEARTBEAT_MS);
+        assert_eq!(config.max_silence_ms, LINK_DEFAULT_MAX_SILENCE_MS);
     }
 
     #[test]
