@@ -504,11 +504,24 @@ waggle 505 00:01 hc
     }
 
     #[test]
-    fn loopback_port_probe_detects_a_live_listener() {
+    fn loopback_port_probe_detects_live_and_closed_listeners() {
+        // Positive: a bound loopback listener is reported as listening.
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(SystemProbe.port_listening(port));
         drop(listener);
-        assert!(!SystemProbe.port_listening(port));
+
+        // Negative: once released, the probe reports closed. Another test in
+        // this workspace can be handed the just-freed ephemeral port, so retry
+        // with a fresh port; five independent attempts cannot all be reused.
+        for _ in 0..5 {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            if !SystemProbe.port_listening(port) {
+                return;
+            }
+        }
+        panic!("no released ephemeral loopback port was observable as closed");
     }
 }
