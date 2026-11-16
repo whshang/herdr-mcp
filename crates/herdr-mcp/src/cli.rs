@@ -3259,7 +3259,8 @@ pub fn help() -> &'static str {
 User path:\n\
   herdr-mcp install\n\
   herdr-mcp status [--verbose]\n\
-  herdr-mcp doctor [--verbose|--json]  (default is concise; exit 0 = no known failure in probed layers)\n\
+  herdr-mcp doctor [--verbose|--json|--local]  (default is concise; exit 0 = no known failure in probed layers)\n\
+  --local prints a read-only local snapshot: allow-listed processes, loopback ports and config file mtimes; metadata only - never file contents, environment values or secrets\n\
   herdr-mcp semantic <status|setup|remove|decide|choose|score> ...  (optional fast semantic decisions; provider-neutral)\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
@@ -6142,8 +6143,14 @@ mod tests {
             );
         }
         assert!(text.contains("herdr-mcp status [--verbose]"));
-        assert!(text.contains("herdr-mcp doctor [--verbose|--json]"));
+        assert!(text.contains("herdr-mcp doctor [--verbose|--json|--local]"));
         assert!(text.contains("default is concise"));
+        assert!(text.contains(
+            "--local prints a read-only local snapshot: allow-listed processes, loopback ports and config file mtimes"
+        ));
+        assert!(
+            text.contains("metadata only - never file contents, environment values or secrets")
+        );
         assert!(text.contains("worker bootstrap  (macOS/Linux/Windows first device"));
         assert!(
             text.contains("worker connect <pairing-address> [--name NAME]  (macOS/Linux/Windows")
