@@ -50,6 +50,12 @@ const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 512 * 1024;
 const MAX_BROWSER_RESULT_TEXT_BYTES: usize = 256 * 1024;
 const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
+/// 1.2 S0: correlation id for one forwarded runtime request. The link copies the
+/// Edge frame's `request_id` here; the runtime echoes it in the result envelope
+/// and the structured activity record.
+const REQUEST_ID_HEADER: &str = "x-herdr-request-id";
+/// 1.2 S0: transport label the link declares for the frame it forwards.
+const TRANSPORT_HEADER: &str = "x-herdr-transport";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
 const EDGE_WEBCHAT_AUTHORIZATION_HEADER: &str = "x-herdr-edge-webchat-authorization";
 const EDGE_BROWSER_CALLER_SESSION_HEADER: &str = "x-herdr-edge-browser-caller-session";
@@ -164,6 +170,11 @@ struct McpActivityRecord {
     call: Option<String>,
     user_agent: String,
     status: u16,
+    // 1.2 S0 observability: milliseconds, a transport label and a bounded
+    // opaque correlation id only. Never params, file content or secrets.
+    transport: &'static str,
+    timing_ms: Value,
+    request_id: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -2167,6 +2178,9 @@ async fn push_mcp_activity(
                 "call": record.call,
                 "ua": record.user_agent,
                 "status": record.status,
+                "transport": record.transport,
+                "timing_ms": record.timing_ms,
+                "request_id": record.request_id,
             })
         })
         .collect::<Vec<_>>();
@@ -3108,6 +3122,11 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     let blocking_state = state.clone();
     let blocking_request = request.clone();
     let handled = tokio::task::spawn_blocking(move || {
+        // 1.2 S0: per-request observability scope. The blocking thread that
+        // executes the tool call also accumulates the backend admission
+        // (`connect`) phase, so the envelope can report all three phases.
+        crate::observability::reset_connect_ms();
+        let dispatch_started_ms = epoch_ms();
         let context = RuntimeContext {
             client: &blocking_state.client,
             cache: &blocking_state.cache,
@@ -3132,11 +3151,12 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             runtime_backend: &blocking_state.runtime_backend,
             trusted_local_ipc: blocking_state.trusted_extension_ipc,
         };
-        mcp::handle(&blocking_request, &context)
+        let response = mcp::handle(&blocking_request, &context);
+        (response, dispatch_started_ms)
     })
     .await;
-    let Some(mut response) = (match handled {
-        Ok(response) => response,
+    let (response, dispatch_started_ms) = match handled {
+        Ok(handled) => handled,
         Err(_) => {
             return json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3147,9 +3167,37 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                 }),
             );
         }
-    }) else {
+    };
+    let Some(mut response) = response else {
         return StatusCode::ACCEPTED.into_response();
     };
+    // 1.2 S0: `queue` is wire receipt → execution start, `connect` is the
+    // backend admission/connect phase recorded by the executing thread, and
+    // `execute` is the remaining tool body. `transport` distinguishes a direct
+    // local call from an Edge-forwarded frame; `request_id` is the correlation
+    // id the frame carried, else the JSON-RPC id. No params or secret content
+    // is recorded.
+    let finished_ms = epoch_ms();
+    let queue_ms = dispatch_started_ms.saturating_sub(started_at_ms);
+    let connect_ms = crate::observability::connect_ms();
+    let execute_ms = finished_ms
+        .saturating_sub(dispatch_started_ms)
+        .saturating_sub(connect_ms);
+    let transport = relay_transport(&headers);
+    let request_id = headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::observability::sanitize_request_id)
+        .or_else(|| crate::observability::request_id_from_jsonrpc_id(request.get("id")));
+    let timing_ms = crate::observability::timing_ms(queue_ms, connect_ms, execute_ms);
+    if request.get("method").and_then(Value::as_str) == Some("tools/call") {
+        crate::observability::attach_tool_observability(
+            &mut response,
+            transport,
+            request_id.as_deref(),
+            &timing_ms,
+        );
+    }
     if stateless && request.get("method").and_then(Value::as_str) == Some("server/discover") {
         augment_openai_discover(&mut response);
     }
@@ -3202,6 +3250,9 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             call,
             user_agent,
             status: http_response.status().as_u16(),
+            transport,
+            timing_ms,
+            request_id,
         });
     }
     http_response
@@ -3244,6 +3295,29 @@ fn augment_openai_discover(response: &mut Value) {
     {
         versions.push(json!(mcp::OPENAI_PROBE_PROTOCOL));
     }
+}
+
+/// 1.2 S0: `relay` when this frame arrived through the Edge relay, evidenced by
+/// one of the trusted Edge headers the link attaches. Otherwise the runtime
+/// served the call locally. Observability only — the security decisions stay in
+/// `trusted_edge_*` / `request_authorized`.
+fn relay_transport(headers: &HeaderMap) -> &'static str {
+    let declared = headers
+        .get(TRANSPORT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("relay"));
+    let relay = declared
+        || [
+            EDGE_WEBCHAT_CONTROL_GRANTS_HEADER,
+            EDGE_WEBCHAT_AUTHORIZATION_HEADER,
+            EDGE_BROWSER_CALLER_SESSION_HEADER,
+            EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER,
+            EDGE_RELAYED_SOURCE_TURN_HEADER,
+            EDGE_PAGE_ASSIST_GRANTS_HEADER,
+        ]
+        .iter()
+        .any(|name| headers.contains_key(*name));
+    crate::observability::transport_label(relay)
 }
 
 fn wants_sse(headers: &HeaderMap, request: &Value) -> bool {
@@ -4284,6 +4358,32 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn post_mcp_payload(app: &Router, body: Value, extra: Vec<(&str, &str)>) -> Value {
+        let mut headers = vec![("user-agent", "openai-mcp/1.0")];
+        headers.extend(extra);
+        let request = rpc_request(Method::POST, "/mcp", Some(body), &headers);
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<Value>(&bytes).unwrap()
+    }
+
+    /// Raw wire body (SSE or JSON) for assertions about responses that are not
+    /// plain JSON, such as `initialize`.
+    #[cfg(unix)]
+    async fn post_mcp_raw(app: &Router, body: Value) -> String {
+        let request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(body),
+            &[("user-agent", "openai-mcp/1.0")],
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     async fn call_public_tool(app: &Router, name: &str, arguments: Value) -> Value {
         let request = rpc_request(
             Method::POST,
@@ -4305,6 +4405,69 @@ mod tests {
             .and_then(Value::as_str)
             .map(|text| serde_json::from_str(text).unwrap())
             .unwrap_or_else(|| payload.clone())
+    }
+
+    /// 1.2 S0: every tool result envelope carries `transport`,
+    /// `timing_ms{queue,connect,execute}` and `request_id` with stable types,
+    /// for a local call and for a forwarded (relay) call alike. Non-tool
+    /// responses stay untouched.
+    #[test]
+    fn tool_result_envelope_carries_stable_transport_timing_and_request_id() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("s0-envelope");
+        let app = candidate_router(test_state(&root));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let call = |id: u64| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {"name": "herdr_methods", "arguments": {}}
+                })
+            };
+            let local = post_mcp_payload(&app, call(922), Vec::new()).await;
+            let result = &local["result"];
+            assert_eq!(result["transport"], json!("local"), "{local}");
+            assert!(result["timing_ms"]["queue"].is_u64(), "{local}");
+            assert!(result["timing_ms"]["connect"].is_u64(), "{local}");
+            assert!(result["timing_ms"]["execute"].is_u64(), "{local}");
+            assert_eq!(result["request_id"], json!("922"), "{local}");
+
+            let forwarded = post_mcp_payload(
+                &app,
+                call(923),
+                vec![
+                    ("x-herdr-transport", "relay"),
+                    ("x-herdr-request-id", "edge-req-7"),
+                ],
+            )
+            .await;
+            let result = &forwarded["result"];
+            assert_eq!(result["transport"], json!("relay"), "{forwarded}");
+            assert_eq!(result["request_id"], json!("edge-req-7"), "{forwarded}");
+            assert!(result["timing_ms"]["queue"].is_u64(), "{forwarded}");
+            assert!(result["timing_ms"]["connect"].is_u64(), "{forwarded}");
+            assert!(result["timing_ms"]["execute"].is_u64(), "{forwarded}");
+
+            // Non-tool responses stay untouched (initialize answers as SSE).
+            let initialize = post_mcp_raw(
+                &app,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2025-11-25"}
+                }),
+            )
+            .await;
+            assert!(!initialize.contains("\"transport\""), "{initialize}");
+            assert!(!initialize.contains("timing_ms"), "{initialize}");
+        });
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[cfg(unix)]
@@ -7348,6 +7511,9 @@ mod tests {
                 call: None,
                 user_agent: "openai-mcp/1.0".to_owned(),
                 status: 200,
+                transport: crate::observability::TRANSPORT_LOCAL,
+                timing_ms: crate::observability::timing_ms(0, 0, 0),
+                request_id: None,
             });
         }
         assert_eq!(activity.len(), MAX_MCP_ACTIVITY_RECORDS);

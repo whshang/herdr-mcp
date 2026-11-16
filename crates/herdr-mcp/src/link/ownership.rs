@@ -633,6 +633,11 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         &relay_pool.relays,
         relay_pool.source,
     );
+    // 1.2 S0: live link counters the daemon publishes (reconnect count, last
+    // reconnect duration, connected-since, transport state). Absent until the
+    // daemon has published, which the field reports as null rather than zero.
+    let transport_telemetry =
+        crate::link::telemetry::read(&config_dir.join(crate::link::telemetry::TELEMETRY_FILE));
 
     json!({
         "ok": true,
@@ -657,6 +662,7 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
             "failover_ready": transport_evidence.failover_ready,
             "candidate_count": transport_evidence.candidate_count,
         },
+        "transport_telemetry": transport_telemetry,
         "gates": gates.iter().map(|gate| json!({
             "id": gate.id,
             "category": gate.category.as_str(),
@@ -797,8 +803,24 @@ pub fn doctor_layer_summary(home: &Path, config_dir: &Path) -> String {
     } else {
         "unowned"
     };
+    // 1.2 S0: surface the daemon-published transport counters in the same
+    // one-line doctor layer. `unknown` when the daemon has not published yet.
+    let telemetry = report.get("transport_telemetry");
+    let transport_state = telemetry
+        .and_then(|value| value.get("transport_state"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let reconnect_count = telemetry
+        .and_then(|value| value.get("reconnect_count"))
+        .and_then(Value::as_u64)
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let last_reconnect_ms = telemetry
+        .and_then(|value| value.get("last_reconnect_duration_ms"))
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
     format!(
-        "{ownership} production_owner={owner} prod_impl={prod_impl} prod_loaded={prod_loaded} link_impl={link_impl} link_loaded={link_loaded} candidate_label={} production_ready_eligible={eligible} remote-probe=edge-layer",
+        "{ownership} production_owner={owner} prod_impl={prod_impl} prod_loaded={prod_loaded} link_impl={link_impl} link_loaded={link_loaded} candidate_label={} production_ready_eligible={eligible} transport_state={transport_state} reconnect_count={reconnect_count} last_reconnect_ms={last_reconnect_ms} remote-probe=edge-layer",
         crate::link::install::LINK_RUST_CANDIDATE_LABEL
     )
 }
@@ -847,6 +869,59 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// 1.2 S0: `link status` and the doctor layer surface the counters the link
+    /// daemon publishes, and report `unknown`/null instead of a fake zero when
+    /// nothing has been published yet.
+    #[test]
+    fn status_report_and_doctor_layer_surface_published_transport_telemetry() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "herdr-link-telemetry-status-{}-{unique}",
+            std::process::id()
+        ));
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let report = collect_status_report(&home, &config_dir);
+        assert!(report["transport_telemetry"].is_null(), "{report}");
+        assert!(
+            doctor_layer_summary(&home, &config_dir).contains("transport_state=unknown"),
+            "unpublished telemetry must report unknown"
+        );
+
+        let mut telemetry = crate::link::telemetry::LinkTransportTelemetry::default();
+        telemetry.record_online(1_000);
+        telemetry.record_disconnected(2_000);
+        telemetry.record_online(2_750);
+        crate::link::telemetry::publish(
+            &config_dir.join(crate::link::telemetry::TELEMETRY_FILE),
+            &telemetry,
+            3_000,
+        )
+        .unwrap();
+
+        let report = collect_status_report(&home, &config_dir);
+        let published = &report["transport_telemetry"];
+        assert_eq!(published["reconnect_count"], json!(1), "{report}");
+        assert_eq!(
+            published["last_reconnect_duration_ms"],
+            json!(750),
+            "{report}"
+        );
+        assert_eq!(published["connected_since_ms"], json!(2_750), "{report}");
+        assert_eq!(published["transport_state"], json!("online"), "{report}");
+
+        let summary = doctor_layer_summary(&home, &config_dir);
+        assert!(summary.contains("transport_state=online"), "{summary}");
+        assert!(summary.contains("reconnect_count=1"), "{summary}");
+        assert!(summary.contains("last_reconnect_ms=750"), "{summary}");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

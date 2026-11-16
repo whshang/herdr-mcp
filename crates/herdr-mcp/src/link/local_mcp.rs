@@ -86,6 +86,11 @@ pub mod code {
     pub const RUNTIME_GENERATION_MISMATCH: &str = "local_mcp_runtime_generation_mismatch";
 }
 
+/// 1.2 S0: correlation id header the runtime echoes back in tool result envelopes.
+const REQUEST_ID_HEADER: &str = "x-herdr-request-id";
+/// 1.2 S0: transport label for the frame this link forwards to the runtime.
+const TRANSPORT_HEADER: &str = "x-herdr-transport";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalMcpConfigError {
     MissingBearerToken,
@@ -217,6 +222,12 @@ struct AbortEntry {
 
 struct RoutedDispatchContext {
     force_trusted_ipc: bool,
+    /// 1.2 S0: Edge frame `request_id`, forwarded so the runtime can echo it in
+    /// the result envelope and structured activity record.
+    request_id: Option<String>,
+    /// 1.2 S0: true when this frame arrived from the Edge relay (as opposed to a
+    /// local CLI read/worker call that merely traverses the link).
+    forwarded_from_edge: bool,
     webchat_grants_header: Option<String>,
     page_assist_grants_header: Option<String>,
     authorization_header: Option<String>,
@@ -679,14 +690,25 @@ impl LocalMcpTransport {
         }
     }
 
-    async fn send_json(&self, body: String) -> Result<reqwest::Response, HttpFailure> {
+    async fn send_json(
+        &self,
+        body: String,
+        request_id: Option<&str>,
+        transport: &'static str,
+    ) -> Result<reqwest::Response, HttpFailure> {
         let auth = HeaderValue::from_str(&format!("Bearer {}", self.bearer_token))
             .map_err(|_| HttpFailure::Unreachable)?;
-        self.client
+        let mut builder = self
+            .client
             .post(self.endpoint.clone())
             .header(AUTHORIZATION, auth)
             .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "application/json, text/event-stream")
+            .header(ACCEPT, "application/json, text/event-stream");
+        if let Some(request_id) = request_id {
+            builder = builder.header(REQUEST_ID_HEADER, request_id);
+        }
+        builder = builder.header(TRANSPORT_HEADER, transport);
+        builder
             .body(body)
             .send()
             .await
@@ -708,8 +730,14 @@ impl LocalMcpTransport {
         Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
     }
 
-    async fn dispatch_http(&self, body: String, rpc_id: String) -> RuntimeToolResult {
-        let response = match self.send_json(body).await {
+    async fn dispatch_http(
+        &self,
+        body: String,
+        rpc_id: String,
+        request_id: Option<&str>,
+        transport: &'static str,
+    ) -> RuntimeToolResult {
+        let response = match self.send_json(body, request_id, transport).await {
             Ok(response) => response,
             Err(HttpFailure::Unreachable) => {
                 return self.failure(code::UNREACHABLE, true, "local runtime unreachable", None);
@@ -743,6 +771,12 @@ impl LocalMcpTransport {
         let caller_browser_on_other_device_header =
             context.caller_browser_on_other_device_header.as_deref();
         let relayed_source_turn_header = context.relayed_source_turn_header.as_deref();
+        let request_id_header = context.request_id.as_deref();
+        let transport_header = if context.forwarded_from_edge {
+            "relay"
+        } else {
+            "local"
+        };
         let Some(expected_generation) = self.runtime_generation.as_deref() else {
             return self.failure(
                 code::RUNTIME_GENERATION_MISMATCH,
@@ -810,6 +844,10 @@ impl LocalMcpTransport {
         if let Some(value) = relayed_source_turn_header {
             request_builder = request_builder.header(EDGE_RELAYED_SOURCE_TURN_HEADER, value);
         }
+        if let Some(value) = request_id_header {
+            request_builder = request_builder.header(REQUEST_ID_HEADER, value);
+        }
+        request_builder = request_builder.header(TRANSPORT_HEADER, transport_header);
         let request = match request_builder
             .header(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER, expected_generation)
             .body(Full::new(Bytes::from(body)))
@@ -968,12 +1006,18 @@ impl LocalMcpTransport {
         {
             self.dispatch_trusted_ipc(body, rpc_id, &context).await
         } else {
-            self.dispatch_http(body, rpc_id).await
+            let transport = if context.forwarded_from_edge {
+                "relay"
+            } else {
+                "local"
+            };
+            self.dispatch_http(body, rpc_id, context.request_id.as_deref(), transport)
+                .await
         }
     }
 
     async fn dispatch_inner(&self, request: RuntimeRequest) -> RuntimeToolResult {
-        self.dispatch_inner_with_trust(request, false).await
+        self.dispatch_inner_with_trust(request, false, true).await
     }
 
     /// Local CLI-only read path. This is intentionally not part of the routed
@@ -982,7 +1026,7 @@ impl LocalMcpTransport {
         &self,
         request: RuntimeRequest,
     ) -> RuntimeToolResult {
-        self.dispatch_inner_with_trust(request, true).await
+        self.dispatch_inner_with_trust(request, true, false).await
     }
 
     /// Worker CLI-only mutation path. The routed transport cannot select
@@ -1007,13 +1051,14 @@ impl LocalMcpTransport {
                 None,
             );
         }
-        self.dispatch_inner_with_trust(request, true).await
+        self.dispatch_inner_with_trust(request, true, false).await
     }
 
     async fn dispatch_inner_with_trust(
         &self,
         request: RuntimeRequest,
         force_trusted_ipc: bool,
+        forwarded_from_edge: bool,
     ) -> RuntimeToolResult {
         if request.request_id.is_empty() {
             return self.failure(code::BAD_REQUEST, false, "invalid tool request frame", None);
@@ -1169,6 +1214,8 @@ impl LocalMcpTransport {
                 rpc_id,
                 RoutedDispatchContext {
                     force_trusted_ipc,
+                    request_id: Some(request_id.clone()),
+                    forwarded_from_edge,
                     webchat_grants_header,
                     page_assist_grants_header,
                     authorization_header,
@@ -1217,7 +1264,7 @@ impl LocalMcpTransport {
         };
         let timeout_ms = clamp_request_timeout(None, self.default_timeout_ms, self.max_timeout_ms);
         let outcome = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-            let response = self.send_json(body).await?;
+            let response = self.send_json(body, None, "local").await?;
             let status = response.status().as_u16();
             if !(200..300).contains(&status) {
                 return Ok::<_, HttpFailure>(HealthHttp::Http(status));
