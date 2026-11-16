@@ -4885,6 +4885,33 @@ mod tests {
             assert!(recorded.lock().unwrap().is_empty(), "refused calls must not reach herdr-core");
             let status = call_public_tool(&app, "herdr_call", json!({"method": "server.status", "params": {}})).await;
             assert_eq!(status["ok"], true, "{status}");
+
+            // A second independent public request can bind its inspection to
+            // the Unix listener identified by the previous methods request.
+            let methods = call_public_tool(&app, "herdr_methods", json!({})).await;
+            assert_eq!(methods["ok"], true, "{methods}");
+            let target = methods["herdr_core"]["target_ref"].as_str().unwrap();
+            let matched = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({"method": "server.status", "params": {
+                    "expected_core_target": target
+                }}),
+            ).await;
+            assert_eq!(matched["ok"], true, "{matched}");
+            assert_eq!(matched["result"]["live"], 7);
+            assert!(recorded.lock().unwrap().last().unwrap().1.get("expected_core_target").is_none());
+
+            let changed = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({"method": "server.status", "params": {
+                    "expected_core_target": "unix:stale:listener"
+                }}),
+            ).await;
+            assert_eq!(changed["code"], "herdr_core_target_changed", "{changed}");
+            assert_eq!(changed["delivery_state"], "not_delivered");
+            assert_eq!(changed["fallback_allowed"], false);
         });
         unsafe {
             match previous_config_dir {

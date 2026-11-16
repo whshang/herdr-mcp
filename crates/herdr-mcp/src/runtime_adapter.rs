@@ -605,6 +605,7 @@ pub struct HerdrCoreClient {
     // One public request must not switch to another advertised Core instance.
     // This hello identity is advisory: a same-UID process can impersonate it.
     admitted_hello: Option<HerdrCoreHello>,
+    admitted_peer_pid: Option<i32>,
 }
 
 impl HerdrCoreClient {
@@ -613,6 +614,7 @@ impl HerdrCoreClient {
             socket_path: socket_path.into(),
             timeout: HC_HANDSHAKE_TIMEOUT,
             admitted_hello: None,
+            admitted_peer_pid: None,
         }
     }
 
@@ -622,6 +624,7 @@ impl HerdrCoreClient {
             socket_path: socket_path.into(),
             timeout: timeout.min(HC_EXEC_MAX_TIMEOUT),
             admitted_hello: None,
+            admitted_peer_pid: None,
         }
     }
 
@@ -629,25 +632,70 @@ impl HerdrCoreClient {
         &self.socket_path
     }
 
+    /// Advisory Unix listener identity for conditional cross-request reads.
+    /// This is not peer authentication; a same-UID process may replace it.
+    pub fn advisory_target_ref(&self, core_id: Option<&str>) -> Option<String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+            let metadata = std::fs::symlink_metadata(&self.socket_path).ok()?;
+            if !metadata.file_type().is_socket() {
+                return None;
+            }
+            let pid = self.admitted_peer_pid?;
+            Some(format!(
+                "unix:{}:{}:{}:{}",
+                pid,
+                metadata.dev(),
+                metadata.ino(),
+                core_id.unwrap_or("")
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = core_id;
+            None
+        }
+    }
+
+    pub fn admitted_target_ref(&self) -> Option<String> {
+        let hello = self.admitted_hello.as_ref()?;
+        self.advisory_target_ref(hello.core_id.as_deref())
+    }
+
     pub fn handshake(&self) -> Result<HerdrCoreHello, HerdrCoreError> {
         self.with_negotiated_session(|hello, _stream| Ok(hello))
     }
 
     fn admit_public_tool(&mut self, tool_name: &str) -> Result<(), Value> {
-        let hello = self.handshake().map_err(|error| {
-            json!({
-                "ok": false,
-                "code": error.code,
-                "message": error.message,
-                "runtime_backend": self.backend().as_str(),
-                "fallback_allowed": false,
-                "retryable": false,
-                "delivery_state": "not_delivered",
+        let (hello, peer_pid) = self
+            .with_negotiated_session(|hello, stream| {
+                #[cfg(unix)]
+                {
+                    Ok((hello, Some(hc_peer_pid(stream, &self.socket_path)?)))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = stream;
+                    Ok((hello, None))
+                }
             })
-        })?;
+            .map_err(|error| {
+                json!({
+                    "ok": false,
+                    "code": error.code,
+                    "message": error.message,
+                    "runtime_backend": self.backend().as_str(),
+                    "fallback_allowed": false,
+                    "retryable": false,
+                    "delivery_state": "not_delivered",
+                })
+            })?;
         RuntimeCapabilities::from_herdr_core_methods(&hello.methods)
             .check_public_tool(tool_name)?;
         self.admitted_hello = Some(hello);
+        self.admitted_peer_pid = peer_pid;
         Ok(())
     }
 
@@ -1324,6 +1372,17 @@ impl HerdrCoreClient {
         op: impl FnOnce(HerdrCoreHello, &mut HcSocketStream) -> Result<T, HerdrCoreError>,
     ) -> Result<T, HerdrCoreError> {
         let mut stream = connect_hc_socket(&self.socket_path, call_timeout)?;
+        #[cfg(unix)]
+        if let Some(admitted_pid) = self.admitted_peer_pid
+            && hc_peer_pid(&stream, &self.socket_path)? != admitted_pid
+        {
+            return Err(HerdrCoreError {
+                code: "herdr_core_target_changed".to_owned(),
+                kind: Some("core_target_changed".to_owned()),
+                message: "the OS-verified Core peer process changed after public tool admission"
+                    .to_owned(),
+            });
+        }
         let hello_raw = rpc_call_line(
             &mut stream,
             &self.socket_path,
@@ -2202,7 +2261,8 @@ pub fn herdr_core_methods(client: &HerdrCoreClient, query: &str) -> Value {
             "core_id": hello.core_id,
             "core_name": hello.core_name,
             "protocol_generation": hello.generation,
-            "identity_scope": "hello on this connection; not an authenticated or pinned process identity",
+            "target_ref": client.advisory_target_ref(hello.core_id.as_deref()),
+            "identity_scope": "advisory hello and Unix socket identity; not an authenticated or pinned process identity",
         },
     })
 }
@@ -2268,6 +2328,51 @@ pub fn herdr_core_call(client: &HerdrCoreClient, method: &str, params: Value) ->
             "fallback_allowed": false,
             "delivery_state": "not_delivered",
             "message": message,
+        });
+    }
+    let mut params = params;
+    let expected_target = params.get("expected_core_target");
+    let expected_target = if let Some(value) = expected_target {
+        if !method.eq_ignore_ascii_case("server.status") {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "expected_core_target is only supported for read-only server.status",
+                "delivery_state": "not_delivered",
+                "fallback_allowed": false,
+                "retryable": false,
+            });
+        }
+        let Some(expected) = value.as_str().filter(|value| !value.is_empty()) else {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "expected_core_target must be a non-empty string",
+                "delivery_state": "not_delivered",
+                "fallback_allowed": false,
+                "retryable": false,
+            });
+        };
+        let expected = expected.to_owned();
+        params
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_core_target");
+        Some(expected)
+    } else {
+        None
+    };
+    if let Some(expected) = &expected_target
+        && client.admitted_target_ref().as_deref() != Some(expected)
+    {
+        return json!({
+            "ok": false,
+            "code": "herdr_core_target_changed",
+            "message": "the Core listener target differs from the previous request",
+            "runtime_backend": "herdr-core",
+            "delivery_state": "not_delivered",
+            "fallback_allowed": false,
+            "retryable": false,
         });
     }
     match client.call_allowed_method(method, params) {
@@ -2380,6 +2485,7 @@ const HC_PREFLIGHT_ERROR_CODES: &[&str] = &[
     "invalid_params",
     "runtime_capability_unsupported",
     "herdr_core_identity_changed",
+    "herdr_core_target_changed",
     "readonly_mode",
     "secret_path_denied",
     "herdr_core_path_ambiguous",
@@ -2597,6 +2703,58 @@ fn hc_current_effective_uid() -> libc::uid_t {
 /// Read the peer's effective UID from the connected socket.
 ///
 /// A missing or unsupported credential is a refusal, never an implicit pass.
+#[cfg(unix)]
+fn hc_peer_pid(stream: &HcSocketStream, socket_path: &Path) -> Result<i32, HerdrCoreError> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 && len as usize == std::mem::size_of::<libc::pid_t>() && pid > 0 {
+            return Ok(pid);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut credential = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credential.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 && hc_peer_credential_is_complete(len) {
+            let pid = unsafe { credential.assume_init() }.pid;
+            if pid > 0 {
+                return Ok(pid);
+            }
+        }
+    }
+    Err(HerdrCoreError {
+        code: "herdr_core_peer_pid_unverified".to_owned(),
+        kind: Some("peer_pid_unverified".to_owned()),
+        message: format!(
+            "cannot verify connected Core peer PID at {}; refusing conditional target binding",
+            socket_path.display()
+        ),
+    })
+}
+
 #[cfg(unix)]
 fn hc_peer_effective_uid(
     stream: &HcSocketStream,
@@ -3489,6 +3647,32 @@ mod tests {
                 hc_peer_effective_uid(&stream, &socket).unwrap(),
                 hc_current_effective_uid()
             );
+            assert_eq!(
+                hc_peer_pid(&stream, &socket).unwrap(),
+                std::process::id() as i32
+            );
+            std::fs::remove_file(&socket).ok();
+        }
+
+        #[test]
+        fn advisory_target_changes_when_socket_listener_is_replaced() {
+            let socket = peer_socket_path("target-rebind");
+            let first_listener = UnixListener::bind(&socket).unwrap();
+            let mut client = HerdrCoreClient::new(&socket);
+            client.admitted_peer_pid = Some(std::process::id() as i32);
+            let original = client.advisory_target_ref(Some("same-core")).unwrap();
+            assert_eq!(
+                original,
+                client.advisory_target_ref(Some("same-core")).unwrap()
+            );
+
+            std::fs::remove_file(&socket).unwrap();
+            let second_listener = UnixListener::bind(&socket).unwrap();
+            let replacement = client.advisory_target_ref(Some("same-core")).unwrap();
+            assert_ne!(original, replacement);
+
+            drop(second_listener);
+            drop(first_listener);
             std::fs::remove_file(&socket).ok();
         }
 
@@ -3758,6 +3942,30 @@ mod tests {
             assert_eq!(inspect["ok"], true);
             assert_eq!(inspect["herdr_core"]["core_id"], "core_mock");
             assert_eq!(recorded(&seen, "server.status").len(), 2);
+            server.finish();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn public_core_route_refuses_changed_peer_pid_before_status_rpc() {
+            let seen = recorder();
+            let server = MockHcServer::start(
+                "peer-pid-drift",
+                2,
+                &["hello", "server.status"],
+                seen.clone(),
+                |_, _| panic!("wrong peer PID must not receive a status request"),
+            );
+            let mut client = server.client();
+            client.admit_public_tool("herdr_methods").unwrap();
+            assert!(client.admitted_peer_pid.is_some());
+            client.admitted_peer_pid = Some(-1);
+            let refused = super::herdr_core_call(&client, "server.status", json!({}));
+            assert_eq!(refused["code"], "herdr_core_target_changed");
+            assert_eq!(refused["delivery_state"], "not_delivered");
+            assert_eq!(refused["fallback_allowed"], false);
+            assert_eq!(refused["retryable"], false);
+            assert!(recorded(&seen, "server.status").is_empty());
             server.finish();
         }
 
