@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -279,6 +279,9 @@ impl PromptTaskRecord {
             "acknowledged": self.acknowledged_at_ms.is_some(),
             "created_at_ms": self.created_at_ms,
             "updated_at_ms": self.updated_at_ms,
+            // S3 receipt vocabulary: `receipt_id` aliases the task id so a
+            // waiting caller can join task rows to the dispatch envelope.
+            "receipt_id": self.task_id,
         });
         if let Some(requested) = &self.requested_target {
             public["requested_target"] = json!(requested);
@@ -312,6 +315,10 @@ impl PromptTaskRecord {
             }
             if !self.budget_events.is_empty() {
                 object.insert("budget_events".to_owned(), json!(self.budget_events));
+            }
+            // S3: correlate the row back to the dispatch envelope's wire id.
+            if let Some(request_id) = &self.request_id {
+                object.insert("request_id".to_owned(), json!(request_id));
             }
         }
         public
@@ -372,6 +379,10 @@ struct PromptRegistryInner {
     /// Idempotency keys whose resumable spawn checkpoint is being continued,
     /// so two concurrent replays cannot both prompt the same agent.
     spawn_resumes: Mutex<HashSet<String>>,
+    /// Test seam: scripted Herdr fakes answer a fixed request sequence, so a
+    /// dispatch test that already scripted create/start/prompt would see the S5
+    /// early-exit probe consume a scripted reply. Production never sets it.
+    spawn_early_exit_watch_disabled: AtomicBool,
     #[cfg(test)]
     clock: Option<Arc<AtomicU64>>,
     records: Mutex<HashMap<String, PromptRecord>>,
@@ -420,6 +431,18 @@ impl PromptRegistry {
         Self::default()
     }
 
+    /// Disable the S5 post-readiness early-exit watch for this registry.
+    ///
+    /// Test-only: a scripted Herdr fake answers one fixed sequence regardless of
+    /// method, so the watch's `agent.get` probe would consume a reply the test
+    /// scripted for `agent.prompt`. Production never calls this.
+    #[cfg(test)]
+    pub(crate) fn disable_spawn_early_exit_watch(&self) {
+        self.inner
+            .spawn_early_exit_watch_disabled
+            .store(true, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     pub fn with_store(store: Arc<Mutex<StateStore>>) -> Self {
         Self {
@@ -427,6 +450,7 @@ impl PromptRegistry {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -448,6 +472,7 @@ impl PromptRegistry {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -1065,7 +1090,13 @@ impl PromptRegistry {
         if let Some(object) = payload.as_object_mut() {
             object.insert(
                 "wait".to_owned(),
-                json!({"waited_ms": waited_ms, "woke": woke}),
+                json!({
+                    "waited_ms": waited_ms,
+                    "woke": woke,
+                    // Expiry is a checkpoint, not an error: the caller may
+                    // re-wait on the same scope; it is not a request timeout.
+                    "still_running": woke == "timeout",
+                }),
             );
         }
         payload
@@ -1327,6 +1358,7 @@ impl PromptRegistry {
                             "completed": false,
                             "task_id": task_id,
                             "outcome": "checkpoint",
+                            "still_running": true,
                             "task": task.public_json_at(self.now_ms()),
                         });
                     }
@@ -1428,6 +1460,30 @@ impl PromptRegistry {
         for task in tasks {
             if task.is_terminal() {
                 continue;
+            }
+            // The event row is persisted as `pending` before delivery. A crash
+            // in that window would otherwise leave it pending forever, because
+            // the row's existence suppresses a fresh event. Re-deliver pending
+            // rows on the next sweep (at-least-once recovery, same intent as
+            // the pending terminal notification): a duplicate parent message is
+            // preferable to a parent that never learns the cap expired.
+            let pending: Vec<(String, bool)> = task
+                .budget_events
+                .iter()
+                .filter_map(|row| {
+                    let event = row.get("event").and_then(Value::as_str)?.to_owned();
+                    let still_pending =
+                        row.get("notification_state").and_then(Value::as_str) == Some("pending");
+                    if !still_pending {
+                        return None;
+                    }
+                    let interrupt_pending = task.on_budget.as_deref() == Some("interrupt")
+                        && row.get("interrupt_state").and_then(Value::as_str) == Some("pending");
+                    Some((event, interrupt_pending))
+                })
+                .collect();
+            for (event, interrupt) in pending {
+                self.deliver_budget_event(&task.task_id, &event, now, interrupt);
             }
             let mut due: Vec<&'static str> = Vec::new();
             if let Some(stall) = task.stall_after_ms
@@ -1966,8 +2022,10 @@ enum InboxView {
 /// `final_excerpt` is present only when captured and spares the planner an
 /// `agent.read` round trip; `awaiting_children` is present only while a
 /// supervisor is held for its own children.
-const COMPACT_TASK_FIELDS: [&str; 15] = [
+const COMPACT_TASK_FIELDS: [&str; 17] = [
     "task_id",
+    "receipt_id",
+    "request_id",
     "dispatch_id",
     "requested_target",
     "target",
@@ -1998,6 +2056,8 @@ fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
 fn running_task_row(task: PromptTaskRecord, now: u64) -> Value {
     let mut row = json!({
         "task_id": task.task_id,
+        "receipt_id": task.task_id,
+        "request_id": task.request_id,
         "dispatch_id": task.dispatch_id,
         "workspace_id": task.workspace_id,
         "lifecycle": task.lifecycle.as_str(),
@@ -4840,6 +4900,13 @@ fn spawn_watch_early_exit(
     chain_deadline_ms: u64,
     chain_ms: u64,
 ) -> Option<String> {
+    if registry
+        .inner
+        .spawn_early_exit_watch_disabled
+        .load(Ordering::SeqCst)
+    {
+        return None;
+    }
     let window = spawn_early_exit_window_ms();
     if window == 0 {
         return None;
@@ -7598,6 +7665,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -8230,6 +8298,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -8838,6 +8907,7 @@ mod tests {
             assert_eq!(result["ok"], true, "{result}");
             assert_eq!(result["wait"]["completed"], false);
             assert_eq!(result["wait"]["outcome"], "checkpoint");
+            assert_eq!(result["wait"]["still_running"], true);
             assert!(result.get("failure").is_none());
             assert_eq!(result["task"]["lifecycle"], "running");
             assert_eq!(result["task"]["liveness"], "active");
@@ -9222,6 +9292,7 @@ mod tests {
         let plain = registry.task_inbox(None, Some("parent"), None, false, false, 50);
 
         assert_eq!(inbox["wait"]["woke"], "timeout");
+        assert_eq!(inbox["wait"]["still_running"], true);
         assert!(inbox["wait"]["waited_ms"].as_u64().unwrap() >= 120);
         assert_eq!(inbox["summary"], plain["summary"]);
         assert_eq!(inbox["tasks"], plain["tasks"]);
@@ -9260,6 +9331,59 @@ mod tests {
         }
     }
 
+    /// user parent session | Given a session-scoped running child task | When
+    /// the child reports worker_done | Then a session inbox wait wakes inside
+    /// the poll budget and the row carries the receipt vocabulary.
+    #[test]
+    fn worker_done_wakes_session_scoped_inbox_wait_with_receipt_linkage() {
+        let (db_path, registry) = task_registry("wait-session");
+        let mut task = escalation_task(
+            "dispatch:prompt:session-child",
+            "child",
+            PromptTaskLifecycle::Running,
+            0,
+        );
+        task.parent_session_ref = Some("session:web".to_owned());
+        task.request_id = Some("edge-req-99".to_owned());
+        registry.save_task(&task, None).unwrap();
+
+        let reporter = registry.clone();
+        let report = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            reporter.task_report(&json!({
+                "task_id": "dispatch:prompt:session-child",
+                "dispatch_id": "dispatch:prompt:session-child",
+                "kind": "worker_done",
+            }))
+        });
+
+        let started = std::time::Instant::now();
+        let inbox = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_session_ref": "session:web", "wait_ms": 5_000}),
+            Some("session:web"),
+        );
+        let elapsed = started.elapsed();
+        report.join().unwrap();
+
+        assert_eq!(inbox["wait"]["woke"], "terminal_task", "{inbox}");
+        assert_eq!(inbox["wait"]["still_running"], false);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "worker_done must wake the parent's session inbox promptly: {elapsed:?}"
+        );
+        let row = &inbox["tasks"][0];
+        assert_eq!(row["task_id"], "dispatch:prompt:session-child");
+        assert_eq!(row["receipt_id"], "dispatch:prompt:session-child");
+        assert_eq!(row["request_id"], "edge-req-99");
+        assert_eq!(row["parent_session_ref"], "session:web");
+        assert_eq!(row["terminal_status"], "worker_done");
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
     /// user parent | Given a terminal task | When the inbox is read with
     /// `view: compact` | Then each task keeps only the projection fields, never
     /// the raw parent session reference, while the full view is unchanged.
@@ -9294,6 +9418,7 @@ mod tests {
                 "lifecycle",
                 "liveness",
                 "pane_id",
+                "receipt_id",
                 "target",
                 "task_id",
                 "terminal",
@@ -9539,6 +9664,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -10663,6 +10789,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -10846,6 +10973,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -11359,6 +11487,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -11965,6 +12094,63 @@ mod tests {
                 .len(),
             1
         );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user parent | Given a budget event persisted as pending (the process
+    /// died between the durable write and delivery) | When the next sweep runs
+    /// | Then the pending event is delivered instead of being skipped forever.
+    #[test]
+    fn pending_budget_event_is_redelivered_after_a_crash_window() {
+        let (path, mut registry, clock) = worker_registry("s5-budget-crash");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![("agent.prompt", json!({"prompt": {"status": "submitted"}}))],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-crash-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.max_runtime_ms = Some(60_000);
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        // Simulate the crash window: the event row exists but is still pending.
+        task.budget_events.push(json!({
+            "event": "agent_budget_exceeded",
+            "at_ms": clock.load(Ordering::SeqCst),
+            "notification_state": "pending",
+            "interrupt_state": "not_requested",
+        }));
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(61_000, Ordering::SeqCst);
+
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(stored.budget_events.len(), 1, "no duplicate event row");
+        assert_eq!(
+            stored.budget_events[0]["notification_state"], "delivered",
+            "the pending event must be delivered by the sweep"
+        );
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0]["method"], "agent.prompt");
+        assert_eq!(recorded[0]["params"]["target"], "w1:p1");
+        assert!(
+            recorded[0]["params"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("agent_budget_exceeded")
+        );
+        drop(recorded);
+        // Delivered rows are not re-sent.
+        registry.sweep_task_budgets();
+        assert_eq!(requests.lock().unwrap().len(), 1);
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();
         let _ = fs::remove_file(path);
