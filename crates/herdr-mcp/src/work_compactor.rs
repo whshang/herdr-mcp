@@ -576,14 +576,15 @@ pub(crate) fn fold_file_edits(memory: &mut RelayMemory, file_md: &str, now_ms: i
             rule_derived,
         });
     }
-    dedupe_tasks(&mut folded);
     // #H3b: archived tasks never appear in the file, so their absence is not a
-    // deletion.
+    // deletion. Extend first, then dedupe once so a folded copy cannot survive
+    // next to its archived twin (#H3b review P2).
     for task in previous.into_iter().filter(|task| task.archived) {
         if !folded.iter().any(|kept| kept.id == task.id) {
             folded.push(task);
         }
     }
+    dedupe_tasks(&mut folded);
     memory.tasks = folded;
     true
 }
@@ -851,7 +852,10 @@ fn render_handoff_markdown_bounded(memory: &RelayMemory) -> String {
     if full.chars().count() <= HANDOFF_MAX_CHARS {
         return full;
     }
+    // #H3b review P1-2: archived tasks never render, so they are not budget
+    // candidates and must not inflate the omitted count.
     let mut view = memory.clone();
+    view.tasks.retain(|task| !task.archived);
     for omitted in 0..10_000usize {
         let rendered = render_handoff_markdown(&view);
         if rendered.chars().count() <= HANDOFF_MAX_CHARS.saturating_sub(160) {
@@ -1239,16 +1243,9 @@ fn enforce_budget(memory: &mut RelayMemory) {
             memory.sources.remove(0);
             continue;
         }
-        if memory
-            .tasks
-            .iter()
-            .any(|task| task.archived || task.status == "done")
-        {
-            memory
-                .tasks
-                .retain(|task| !task.archived && task.status != "done");
-            continue;
-        }
+        // Archived tasks and done tasks render nothing, so deleting them cannot
+        // shorten the disk; archive capacity is owned by `prune_archived_tasks`
+        // and the authoritative history must stay complete (#H3b review P1-1).
         return;
     }
 }
@@ -1420,8 +1417,12 @@ struct MergedRefCache {
 
 impl MergedRefCache {
     fn for_memory(&mut self, memory: &RelayMemory, worktree: &Path) -> Option<&MergedRefs> {
-        // Nothing to close: skip git entirely.
-        if !memory.tasks.iter().any(|task| task.status != "done") {
+        // Nothing to close: skip git entirely. Archived work is already closed.
+        if !memory
+            .tasks
+            .iter()
+            .any(|task| !task.archived && task.status != "done")
+        {
             return None;
         }
         let key = worktree.to_string_lossy().into_owned();
@@ -4821,8 +4822,18 @@ mod tests {
         // Droppable state is gone and the open task survives whole.
         assert!(memory.recent.is_empty());
         assert!(memory.sources.len() <= 5);
-        assert!(memory.tasks.iter().all(|task| task.status != "done"));
-        assert_eq!(memory.tasks.len(), 1);
+        // #H3b: budget enforcement no longer deletes tasks at all — closed and
+        // archived work is owned by `refresh_tasks`/`prune_archived_tasks`.
+        assert_eq!(memory.tasks.len(), 31);
+        assert_eq!(
+            memory
+                .tasks
+                .iter()
+                .filter(|task| task.status == "done")
+                .count(),
+            30
+        );
+        assert!(!stored.contains("[t0] "), "done work never renders");
         assert!(stored.contains(&"z".repeat(80)));
         // #H3a: the git context is page-level evidence and is never evicted.
         assert!(memory.workspace.is_some());
@@ -5077,6 +5088,96 @@ mod tests {
         assert_eq!(tasks.len(), 1, "{tasks:?}");
         assert!(tasks[0].rule_derived, "{tasks:?}");
         assert!(!tasks[0].archived, "a live copy reopens: {tasks:?}");
+    }
+
+    /// relay memory budget | Given archived history plus an over-budget document
+    /// | When the budget is enforced | Then archived tasks are never deleted
+    /// (they render nothing, so removing them cannot shorten the disk) and the
+    /// authoritative history stays complete.
+    #[test]
+    fn enforce_budget_never_deletes_archived_tasks() {
+        let mut memory = memory_with_sections();
+        memory.preferences = (0..300)
+            .map(|index| RelayItem {
+                id: format!("p{index}"),
+                text: format!("rule {index}: {}", "keep this whole rule. ".repeat(12)),
+            })
+            .collect();
+        memory.tasks = (0..5)
+            .map(|index| RelayTask {
+                id: format!("a{index}"),
+                text: format!("archived history {index}"),
+                status: "done".to_owned(),
+                updated_ms: Some(index as i64),
+                archived: true,
+                rule_derived: false,
+            })
+            .collect();
+        memory.tasks.push(RelayTask {
+            id: "live".to_owned(),
+            text: "still open".to_owned(),
+            status: "todo".to_owned(),
+            updated_ms: Some(9),
+            archived: false,
+            rule_derived: false,
+        });
+        assert!(render_handoff_markdown(&memory).chars().count() > HANDOFF_MAX_CHARS);
+
+        enforce_budget(&mut memory);
+
+        assert_eq!(
+            memory.tasks.iter().filter(|task| task.archived).count(),
+            5,
+            "budget enforcement must not delete archived history: {:?}",
+            memory.tasks
+        );
+        assert!(memory.tasks.iter().any(|task| task.id == "live"));
+        assert_eq!(memory.preferences.len(), 300, "rule text is never cut");
+    }
+
+    /// relay memory archive | Given archived tasks that never render | When the
+    /// bounded disk view elides visible items | Then the omitted count covers
+    /// only visible items and archived history is never counted or popped.
+    #[test]
+    fn bounded_handoff_omits_only_visible_items() {
+        let mut memory = RelayMemory::default();
+        memory.tasks = (0..3)
+            .map(|index| RelayTask {
+                id: format!("a{index}"),
+                text: "archived history".to_owned(),
+                status: "done".to_owned(),
+                updated_ms: Some(index as i64),
+                archived: true,
+                rule_derived: false,
+            })
+            .collect();
+        let live: Vec<RelayTask> = (0..80)
+            .map(|index| RelayTask {
+                id: format!("t{index}"),
+                text: format!("visible task {index} {}", "z".repeat(200)),
+                status: "todo".to_owned(),
+                updated_ms: Some(100 + index as i64),
+                archived: false,
+                rule_derived: false,
+            })
+            .collect();
+        memory.tasks.extend(live);
+
+        let disk = render_handoff_markdown_bounded(&memory);
+        assert!(disk.chars().count() <= HANDOFF_MAX_CHARS, "{disk}");
+        assert!(!disk.contains("[a0]"), "{disk}");
+        let visible_rendered = disk.lines().filter(|line| line.starts_with("- [t")).count();
+        let omitted: usize = disk
+            .split("已省略 ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no omission marker: {disk}"));
+        assert_eq!(
+            omitted,
+            80 - visible_rendered,
+            "omitted must count only the visible items the budget dropped"
+        );
     }
 
     /// relay memory archive | Given closed work (done / stale / merged) | When
