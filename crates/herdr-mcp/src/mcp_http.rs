@@ -486,6 +486,33 @@ fn admitted_backend_refusal(path: &str, state: &AppState, message: &str) -> Resp
     )
 }
 
+/// #768 Phase 2 slice 2 (narrow): `GET /mcp` and `/push/events` stream the TUI
+/// snapshot/event-cursor model. `herdr-core` has no such stream, so the request
+/// is refused before the first frame instead of being kept as an unverified
+/// "connected" or empty stream. It never falls back to the TUI snapshot.
+fn core_tui_stream_refusal(path: &str, state: &AppState) -> Response {
+    json_response(
+        StatusCode::CONFLICT,
+        &json!({
+            "ok": false,
+            "code": "runtime_capability_unsupported",
+            "operation": "candidate_transport",
+            "path": path,
+            "required_capability": "tui_snapshot_stream",
+            "runtime_backend": state.runtime_backend.summary_json(),
+            "fallback_allowed": false,
+            "retryable": false,
+            "delivery_state": "not_delivered",
+            "failure_phase": "backend_capability",
+            "message": "the selected herdr-core backend has no TUI snapshot/event stream; the stream is not served and never falls back to the TUI snapshot",
+        }),
+    )
+}
+
+fn admitted_backend_is_core(state: &AppState) -> bool {
+    state.runtime_backend.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore
+}
+
 fn valid_extension_task_ref(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
@@ -2090,6 +2117,11 @@ async fn push_events(
     if !request_authorized(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // #768 Phase 2 slice 2: the push stream carries TUI snapshot/event-cursor
+    // state, which `herdr-core` does not serve. Refuse before the hello frame.
+    if admitted_backend_is_core(&state) {
+        return core_tui_stream_refusal("/push/events", &state);
+    }
     let filters = PushFilters {
         agent: query.get("agent").filter(|v| !v.is_empty()).cloned(),
         pane: query.get("pane").filter(|v| !v.is_empty()).cloned(),
@@ -2893,6 +2925,12 @@ async fn get_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response 
                 "id": null
             }),
         );
+    }
+    // #768 Phase 2 slice 2: a `GET /mcp` stream is the TUI transport. Under
+    // `herdr-core` it is refused before the first frame (no empty/success
+    // stream, no TUI snapshot fallback).
+    if admitted_backend_is_core(&state) {
+        return core_tui_stream_refusal("/mcp", &state);
     }
     if is_stateless_client(&headers, None) {
         return persistent_sse_response();
@@ -13553,6 +13591,157 @@ mod tests {
         });
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// #768 Phase 2 slice 2 (narrow): the TUI snapshot/push streams are refused
+    /// under `herdr-core` before any frame (never an unverified "connected"
+    /// stream, never a TUI fallback), and the same routes still fail closed on
+    /// backend drift at connection time. Both admissions are pinned explicitly,
+    /// so this test never mutates process-global env.
+    #[cfg(unix)]
+    #[test]
+    fn core_backend_refuses_tui_snapshot_streams_and_drift_fences_get_mcp() {
+        use crate::runtime_adapter::{
+            AdmittedBackendConfig, EnvOverrides, RuntimeBackend, RuntimeBackendSelection,
+        };
+
+        let root = test_root("core-stream-admission");
+        std::fs::create_dir_all(&root).unwrap();
+        let core_socket = root.join("core.sock");
+        let core_config_file = root.join("config.json");
+        std::fs::write(
+            &core_config_file,
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut core_state = test_state_with_snapshot(
+            &root,
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        core_state.runtime_backend = RuntimeBackendSelection {
+            backend: RuntimeBackend::HerdrCore,
+            source: "test",
+            herdr_core_socket: Some(core_socket.clone()),
+        };
+        core_state.admitted_config = AdmittedBackendConfig::from_parts(
+            core_config_file,
+            crate::instance::InstanceId::default_instance(),
+            // Pin the resolved selection explicitly: this test must not depend
+            // on (or mutate) the process environment.
+            EnvOverrides {
+                runtime_backend: Some("herdr-core".to_owned()),
+                hc_socket: Some(core_socket.clone()),
+                ..EnvOverrides::default()
+            },
+        );
+        let core_app = candidate_router(core_state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for path in ["/mcp", "/push/events"] {
+                let response = core_app
+                    .clone()
+                    .oneshot(rpc_request(
+                        Method::GET,
+                        path,
+                        None,
+                        &[("user-agent", "openai-mcp/1.0")],
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT, "{path}");
+                assert_ne!(
+                    response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("text/event-stream"),
+                    "{path} must not open an event stream under herdr-core"
+                );
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let payload: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(payload["ok"], false, "{path}: {payload}");
+                assert_eq!(
+                    payload["code"], "runtime_capability_unsupported",
+                    "{path}: {payload}"
+                );
+                assert_eq!(
+                    payload["required_capability"], "tui_snapshot_stream",
+                    "{path}: {payload}"
+                );
+                assert_eq!(payload["fallback_allowed"], false, "{path}: {payload}");
+                assert_eq!(
+                    payload["delivery_state"], "not_delivered",
+                    "{path}: {payload}"
+                );
+                assert_eq!(payload["retryable"], false, "{path}: {payload}");
+            }
+        });
+
+        // TUI keeps both streams, and an admitted-TUI router fences `GET /mcp`
+        // once its pinned config drifts.
+        let tui_root = test_root("core-stream-admission-tui");
+        std::fs::create_dir_all(&tui_root).unwrap();
+        let tui_state = test_state_with_snapshot(
+            &tui_root,
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        let tui_app = candidate_router(tui_state);
+        runtime.block_on(async {
+            for path in ["/mcp", "/push/events"] {
+                let response = tui_app
+                    .clone()
+                    .oneshot(rpc_request(
+                        Method::GET,
+                        path,
+                        None,
+                        &[("user-agent", "openai-mcp/1.0")],
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("text/event-stream"),
+                    "{path}"
+                );
+            }
+            // Drift the pinned TUI config after admission; the GET stream fences.
+            std::fs::write(
+                tui_root.join("config.json"),
+                br#"{"runtime":{"backend":"herdr-core","herdr_core_socket":"/tmp/herdr-core-stream-refusal.sock"}}"#,
+            )
+            .unwrap();
+            let drifted = tui_app
+                .oneshot(rpc_request(
+                    Method::GET,
+                    "/mcp",
+                    None,
+                    &[("user-agent", "openai-mcp/1.0")],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(drifted.status(), StatusCode::CONFLICT);
+            let bytes = drifted.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                payload["code"],
+                crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE,
+                "{payload}"
+            );
+            assert_eq!(payload["delivery_state"], "not_delivered", "{payload}");
+            assert_eq!(payload["fallback_allowed"], false, "{payload}");
+        });
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(tui_root).ok();
     }
 
     /// #768: a browser command queued while an SSE stream is already open must
