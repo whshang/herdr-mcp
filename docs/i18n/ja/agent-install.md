@@ -107,12 +107,12 @@ Custom Domain がなければ `workers.dev` を試す。DNS 失敗時は Cloudfl
 - マシンが canonical な `dev_<ULID>` デバイス identity を持つ。
 - 認証済みの実際の MCP リクエストが、公開 origin からこのワークステーションへ往復して完了する。
 
-ChatGPT の **Settings → Apps & Connectors**（旧 **Plugins → Browse plugins**）で **Developer mode** を有効にし、**+** ボタン → **Create APP** から `https://…workers.dev/mcp` で App を作り OAuth を完了する。推奨名 `herdr`。ChatGPT の Project 内で作業し、新しいチャットの最初のメッセージで `+` ボタンから App を選ぶ。
+ChatGPT の **Settings → Apps & Connectors**（旧 **Plugins → Browse plugins**）で **Developer mode** を有効にし、**+** ボタン → **Create APP** から `https://…workers.dev/mcp` で App を作り、OAuth と本機での承認を完了する。推奨名 `herdr`。ChatGPT の Project 内で作業し、新しいチャットの最初のメッセージで `+` ボタンから App を選ぶ。
 
 Chrome 拡張 / Native Messaging は任意。Control Center、次ターン予約、引き継ぎ、マルチ WebChat（`ChatGPT`、`Claude`、`Grok`、`Doubao`）、`browser-page`、ブラウザスキルが必要な場合だけ、[拡張ガイド](extension.md)と[WebChat ガイド](local-agent-webchat-control.md)に従いストア導入または `herdr-mcp extension standalone install`。
 
 ## 8. クリーンアップ、更新と報告
 
-`CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` を unset し一時資格情報を削除。秘密でない事実（runtime version、device id、Worker 名、origin、Link 状態、OAuth、E2E 結果）のみ報告。v1.1 の更新は `herdr-mcp update`（[自己更新ガイド](runtime-self-upgrade.md)）。
+`CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` を unset し一時資格情報を削除。秘密でない事実（runtime version、device id、Worker 名、origin、Link 状態、OAuth、E2E 結果）のみ報告。v1.1 の更新は `herdr-mcp update`（Worker 差分通知時は `herdr-mcp worker update`、詳細は[自己更新ガイド](runtime-self-upgrade.md)）。
 
 権限、ネットワーク、OAuth、Worker ownership、配信の不確実性で止まる場合は、[手動インストールガイド](install.md)または[トラブルシューティング](troubleshooting.md)の該当節だけを開く。

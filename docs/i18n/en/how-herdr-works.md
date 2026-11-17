@@ -79,7 +79,7 @@ A local agent drives a supported web conversation through the same runtime — e
 
 ```text
 discover   herdr-mcp webchat endpoints → resources → inspect   (observed refs + observation_generation)
-create     herdr-mcp webchat create --expected-generation N --idempotency-key KEY
+create     herdr-mcp webchat create --source-url URL --message MESSAGE --idempotency-key KEY
 send       herdr-mcp webchat send   → dispatch_id + delivery_state
 observe    herdr-mcp webchat dispatch-status <dispatch_id>
 open/close herdr-mcp webchat open | archive | archive-status

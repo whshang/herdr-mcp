@@ -79,7 +79,7 @@ ChatGPT       :显式指定 device,或让 Edge 以 device_ambiguous 拒绝猜测
 
 ```text
 发现      herdr-mcp webchat endpoints → resources → inspect(拿到观察到的 ref 与 observation_generation)
-创建      herdr-mcp webchat create --expected-generation N --idempotency-key KEY
+创建      herdr-mcp webchat create --source-url URL --message MESSAGE --idempotency-key KEY
 发送      herdr-mcp webchat send   → dispatch_id + delivery_state
 观察      herdr-mcp webchat dispatch-status <dispatch_id>
 打开/归档 herdr-mcp webchat open | archive | archive-status
