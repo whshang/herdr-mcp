@@ -52,6 +52,7 @@ mod macos_permissions;
 mod macos_privacy;
 mod mcp;
 mod mcp_http;
+mod model_alias;
 mod mutation;
 mod native_host;
 mod native_host_install;

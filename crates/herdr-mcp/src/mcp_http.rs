@@ -10244,6 +10244,10 @@ mod tests {
             }),
         );
         state.trusted_extension_ipc = true;
+        // The scripted herdr fake answers one fixed sequence regardless of
+        // method; without this the S5 early-exit probe would eat the scripted
+        // agent.prompt reply.
+        state.prompt.disable_spawn_early_exit_watch();
         let app = candidate_router(state);
         let (app, seed, endpoint, account) = register_chatgpt_endpoint(app, "spawnbind", now).await;
         let user_text = "把这条任务派给一个新的 pi";
@@ -10281,6 +10285,10 @@ mod tests {
                 json!([{"endpoint_ref": endpoint, "provider": "chatgpt"}]).to_string(),
             ),
         ];
+        // The scripted herdr fake answers exactly tab.create/agent.start/
+        // agent.prompt; the S5 post-readiness early-exit watch was disabled on
+        // this registry above, so it adds no unscripted agent.get probe that
+        // would consume the scripted prompt reply.
         let result = webchat_tool_call(
             app,
             &headers,
