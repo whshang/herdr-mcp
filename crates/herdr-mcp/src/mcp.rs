@@ -253,6 +253,11 @@ pub struct RuntimeContext<'a> {
     /// that resolves a different backend or `herdr-core` socket fails closed
     /// before any TUI or `herdr-core` socket is contacted.
     pub runtime_backend: &'a crate::runtime_adapter::RuntimeBackendSelection,
+    /// #991: the config path and start-time overrides admitted alongside
+    /// `runtime_backend`, so the drift check reads the same pinned inputs as
+    /// the transport gate instead of the live process environment. `None` on
+    /// direct `tool_call` paths keeps the ambient-env read.
+    pub admitted_config: Option<&'a crate::runtime_adapter::AdmittedBackendConfig>,
     pub trusted_local_ipc: bool,
     /// 1.2/S0+S2: the wire correlation id (`request_id` header or JSON-RPC
     /// id) when the HTTP boundary resolved one. The request ledger uses this
@@ -1333,9 +1338,11 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         && crate::runtime_adapter::core_execution_route(name)
             != crate::runtime_adapter::CoreExecutionRoute::NotExecution
     {
-        if let Err(refusal) =
-            crate::runtime_adapter::verify_admitted_backend_for_tool(name, context.runtime_backend)
-        {
+        if let Err(refusal) = crate::runtime_adapter::verify_admitted_backend_for_tool(
+            name,
+            context.runtime_backend,
+            context.admitted_config,
+        ) {
             return Ok(tool_result(refusal, true));
         }
         match crate::runtime_adapter::core_execution_route(name) {
@@ -1359,6 +1366,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     let route = match crate::runtime_adapter::public_tool_route(
         name,
         context.runtime_backend,
+        context.admitted_config,
         expected_target,
     ) {
         Ok(route) => route,
@@ -28822,6 +28830,7 @@ mod tests {
             browser_mutation_gate: None,
             browser_mutation_admission: None,
             runtime_backend: &runtime_backend,
+            admitted_config: None,
             trusted_local_ipc: true,
             wire_request_id: None,
         };
@@ -32413,6 +32422,7 @@ mod client_request_shape_matrix_tests {
             browser_mutation_gate: None,
             browser_mutation_admission: None,
             runtime_backend: &runtime_backend,
+            admitted_config: None,
             trusted_local_ipc: false,
             wire_request_id: None,
         };
@@ -32785,6 +32795,7 @@ mod client_request_shape_matrix_tests {
                     browser_mutation_gate: None,
                     browser_mutation_admission: None,
                     runtime_backend: &backend,
+                    admitted_config: None,
                     trusted_local_ipc: false,
                     wire_request_id: None,
                 }
@@ -33962,6 +33973,7 @@ mod text_transfer_safety_tests {
             browser_mutation_gate: None,
             browser_mutation_admission: None,
             runtime_backend: &backend,
+            admitted_config: None,
             trusted_local_ipc: false,
             wire_request_id: None,
         };
@@ -34375,6 +34387,7 @@ mod durable_client_request_tests {
             browser_mutation_gate: None,
             browser_mutation_admission: None,
             runtime_backend: backend,
+            admitted_config: None,
             trusted_local_ipc: true,
             wire_request_id: None,
         }
