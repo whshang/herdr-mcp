@@ -4973,6 +4973,145 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// #768 Phase 2 slice 2: the root-lease gate in front of `herdr-core`
+    /// execution-class routes. With no lease the existing refusal is unchanged;
+    /// an active root lease refuses the route as `single_writer_lease_conflict`
+    /// before dispatch; a backend drift still reports `invalid_runtime_backend`
+    /// first (#941 stays the first check). No request byte reaches Core.
+    #[cfg(unix)]
+    #[test]
+    fn core_execution_routes_pass_the_root_lease_gate_before_dispatch() {
+        use crate::state_store::mutation_leases::MutationLeaseAcquireInput;
+
+        let _guard = crate::test_env::lock();
+        let root = test_root("core-exec-lease-gate");
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let core_socket = std::path::PathBuf::from(format!(
+            "/tmp/herdr-execgate-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let recorded = spawn_recording_core_fixture(&core_socket, None);
+        std::fs::write(
+            config_dir.join("config.json"),
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let mut state = test_state_with_snapshot(
+            &root.join("tcp"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        adopt_env_admitted_backend(&mut state);
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        let exec_args = json!({
+            "root": project.to_string_lossy(),
+            "command": "true",
+            "steps": [],
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // 1. No root lease: the gate passes and the existing refusal is
+            //    byte-for-byte unchanged.
+            let allowed = call_public_tool(&app, "herdr_exec", exec_args.clone()).await;
+            assert_eq!(allowed["ok"], false, "{allowed}");
+            assert_eq!(
+                allowed["code"], "runtime_capability_unsupported",
+                "{allowed}"
+            );
+            assert_eq!(
+                allowed["required_capability"], "public_tool_policy_parity",
+                "{allowed}"
+            );
+            assert_eq!(allowed["delivery_state"], "not_delivered", "{allowed}");
+
+            // 2. Active root lease: refused before dispatch with the shared
+            //    single-writer conflict envelope.
+            // Acquire against the real clock: the enforcement path compares
+            // `expires_at` with `mutation_lease_now_ms()`, so a synthetic past
+            // timestamp would already be expired and prove nothing.
+            let acquired_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            store
+                .lock()
+                .unwrap()
+                .acquire_mutation_lease(MutationLeaseAcquireInput {
+                    project_root: &project.to_string_lossy(),
+                    lane_key: Some("*"),
+                    holder_id: "other-writer",
+                    lease_token: None,
+                    ttl_seconds: Some(600),
+                    workspace_id: None,
+                    pane_id: None,
+                    branch: None,
+                    now_ms: acquired_at,
+                })
+                .unwrap();
+            for (tool, arguments) in [
+                ("herdr_exec", exec_args.clone()),
+                (
+                    "herdr_exec_start",
+                    json!({"root": project.to_string_lossy(), "command": "true"}),
+                ),
+            ] {
+                let blocked = call_public_tool(&app, tool, arguments).await;
+                assert_eq!(blocked["ok"], false, "{tool}: {blocked}");
+                assert_eq!(
+                    blocked["code"], "single_writer_lease_conflict",
+                    "{tool}: {blocked}"
+                );
+                assert_eq!(
+                    blocked["delivery_state"], "not_delivered",
+                    "{tool}: {blocked}"
+                );
+                assert_eq!(blocked["retryable"], false, "{tool}: {blocked}");
+            }
+
+            // 3. #941 stays first: a drifted backend reports
+            //    invalid_runtime_backend even while the lease is held.
+            unsafe { env::set_var("HERDR_MCP_RUNTIME_BACKEND", "auto") };
+            let drift = call_public_tool(&app, "herdr_exec", exec_args).await;
+            assert_eq!(drift["code"], "invalid_runtime_backend", "{drift}");
+            assert_eq!(drift["delivery_state"], "not_delivered", "{drift}");
+        });
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "lease/public refusals must not reach herdr-core"
+        );
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_file(&core_socket).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// The public route refuses operations whose policy or identity contracts
     /// cannot be preserved and never delivers them to herdr-core.
     #[cfg(unix)]
