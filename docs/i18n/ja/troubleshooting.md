@@ -61,9 +61,11 @@ macOS の LaunchAgent インストールの場合：
 
 ```bash
 herdr-mcp status
-herdr-mcp logs
+herdr-mcp doctor --local
 herdr-mcp permissions status
 ```
+
+`herdr-mcp doctor --local` は allow-list のプロセス名/PID/開始時刻、loopback ポート `8772` が listen しているか、設定ファイルの存在と mtime だけを返します。ファイル内容、環境変数、`state.db` は読みません。非既定ポートの名前付きインスタンスが 8772 で `listening:false` を出すのは設計通りです。
 
 file/Git tool が `macos_tcc_access_blocked` を返す場合は、上記の macOS 権限の手順を参照してください。`not_found` 単体は TCC の遮断の証拠ではありませんが、保護されたパスではパスが無いと判断する前に `herdr-mcp permissions status` で確認してください。
 
@@ -110,7 +112,7 @@ HERDR_LINK_PROXY > HTTPS_PROXY/https_proxy > HTTP_PROXY/http_proxy > ALL_PROXY/a
 
 ### 新しい ChatGPT 会話は現在のカタログを取得するか
 
-現在の first-party DEV/PROD の公開 ChatGPT contract は **epoch 8 / 19 actions** です。workstation での実行は **epoch 5 / 18 tools** で、`herdr_skill` を含みます。追加の公開 action は Edge ローカルの `herdr_devices` です。直前の凍結された epoch-4 contract と凍結された epoch-2 catalog は、有界な rollback/compatibility ベースラインとしてのみ保持されます。epoch 3 は historical only であり、公開 Edge の epoch-3 identity は非 DEV/PROD の有界なベースラインとして残ります。
+現在の first-party DEV/PROD の公開 ChatGPT contract は **epoch 8 / 19 actions** です。workstation での実行は **epoch 6 / 18 tools** で、`herdr_skill` を含みます。追加の公開 action は Edge ローカルの `herdr_devices` です。直前の凍結された epoch-5 contract と凍結された epoch-2 catalog は、有界な rollback/compatibility ベースラインとしてのみ保持されます。epoch 3 は historical only であり、公開 Edge の epoch-3 identity は非 DEV/PROD の有界なベースラインとして残ります。
 
 古い会話は古い `tools/list` スナップショットを保持している可能性があります。何かを再インストールする前に、サーバーを検証し、新しい会話を開いてください。
 
