@@ -5535,6 +5535,7 @@ struct SpawnRequest {
     name: Option<String>,
     workspace: Option<String>,
     cwd: Option<String>,
+    worktree: Option<SpawnWorktreeRequest>,
     tab_label: Option<String>,
     split_from: Option<String>,
     direction: Option<String>,
@@ -5546,6 +5547,13 @@ struct SpawnRequest {
     /// means either no model was requested or the live schema cannot carry
     /// one — the latter refuses during parse, before any pane is created.
     model_deliverable: Option<ModelDelivery>,
+}
+
+#[derive(Debug, Clone)]
+struct SpawnWorktreeRequest {
+    branch: String,
+    base: Option<String>,
+    path: Option<String>,
 }
 
 /// How a validated model alias is delivered on `agent.start`, decided during
@@ -5575,6 +5583,14 @@ impl SpawnRequest {
             slot(&self.direction),
             slot(&self.name),
         );
+        if let Some(worktree) = &self.worktree {
+            spec.push_str(&format!(
+                "\nworktree.branch={}\nworktree.base={}\nworktree.path={}",
+                worktree.branch,
+                worktree.base.as_deref().unwrap_or_default(),
+                worktree.path.as_deref().unwrap_or_default(),
+            ));
+        }
         // Keep the historical fingerprint byte-identical when no model is
         // requested, so stored keys from older runtimes still replay.
         if let Some(model) = &self.model {
@@ -5641,6 +5657,8 @@ impl SpawnStepError {
 struct SpawnProgress {
     pane_id: Option<String>,
     tab_id: Option<String>,
+    worktree: Option<Value>,
+    worktree_path: Option<PathBuf>,
     agent_started: bool,
     steps: Vec<Value>,
     attempts: u64,
@@ -5651,6 +5669,7 @@ impl SpawnProgress {
         let mut facts = json!({
             "pane_id": self.pane_id,
             "tab_id": self.tab_id,
+            "worktree": self.worktree,
             "agent_name": spawn.agent_name,
             "kind": spawn.request.kind,
             "workspace_id": spawn.workspace_id,
@@ -5751,6 +5770,8 @@ impl SpawnProgress {
 struct SpawnResume {
     pane_id: String,
     tab_id: Option<String>,
+    worktree: Option<Value>,
+    worktree_path: Option<PathBuf>,
     agent_started: bool,
     phase: String,
     steps: Vec<Value>,
@@ -5765,6 +5786,8 @@ impl SpawnResume {
         SpawnProgress {
             pane_id: Some(self.pane_id.clone()),
             tab_id: self.tab_id.clone(),
+            worktree: self.worktree.clone(),
+            worktree_path: self.worktree_path.clone(),
             agent_started: self.agent_started,
             steps: self.steps.clone(),
             attempts: self.attempts,
@@ -5796,12 +5819,20 @@ fn spawn_checkpoint(result: &Value) -> Option<SpawnResume> {
             _ => None,
         }
     });
+    let worktree = spawn.get("worktree").cloned();
+    let worktree_path = worktree
+        .as_ref()
+        .and_then(|value| value.get("path"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
     Some(SpawnResume {
         pane_id: spawn.get("pane_id").and_then(Value::as_str)?.to_owned(),
         tab_id: spawn
             .get("tab_id")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        worktree,
+        worktree_path,
         agent_started: spawn
             .get("agent_started")
             .and_then(Value::as_bool)
@@ -5848,6 +5879,7 @@ fn spawn_step_budget_ms(chain_ms: u64, remaining_ms: u64) -> u64 {
 struct SpawnOutcome {
     pane_id: String,
     tab_id: Option<String>,
+    worktree: Option<Value>,
     agent_name: String,
     kind: String,
     workspace_id: String,
@@ -5875,6 +5907,7 @@ impl SpawnOutcome {
         json!({
             "pane_id": self.pane_id,
             "tab_id": self.tab_id,
+            "worktree": self.worktree,
             "agent_name": self.agent_name,
             "kind": self.kind,
             "workspace_id": self.workspace_id,
@@ -5918,6 +5951,7 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
                 | "name"
                 | "workspace_id"
                 | "cwd"
+                | "worktree"
                 | "tab_label"
                 | "split_from"
                 | "direction"
@@ -5947,6 +5981,17 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
     };
     let workspace = spawn_optional_string(object, "workspace_id", 256)?;
     let cwd = spawn_optional_string(object, "cwd", 1024)?;
+    let worktree = parse_spawn_worktree(object)?;
+    if worktree.is_some() && cwd.is_some() {
+        return Err(spawn_invalid(
+            "spawn.worktree and spawn.cwd are mutually exclusive",
+        ));
+    }
+    if worktree.is_some() && workspace.is_none() {
+        return Err(spawn_invalid(
+            "spawn.worktree requires spawn.workspace_id so the source repository is explicit",
+        ));
+    }
     let tab_label = spawn_optional_string(object, "tab_label", 64)?;
     let split_from = spawn_optional_string(object, "split_from", 256)?;
     let direction = match spawn_optional_string(object, "direction", 16)? {
@@ -5985,6 +6030,7 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
         name,
         workspace,
         cwd,
+        worktree,
         tab_label,
         split_from,
         direction,
@@ -5992,6 +6038,71 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
         model,
         model_deliverable: None,
     }))
+}
+
+fn parse_spawn_worktree(
+    object: &Map<String, Value>,
+) -> Result<Option<SpawnWorktreeRequest>, Value> {
+    let Some(value) = object.get("worktree") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(worktree) = value.as_object() else {
+        return Err(spawn_invalid("spawn.worktree must be an object"));
+    };
+    for key in worktree.keys() {
+        if !matches!(key.as_str(), "branch" | "base" | "path") {
+            return Err(spawn_invalid(&format!(
+                "spawn.worktree.{key} is not a supported worktree field"
+            )));
+        }
+    }
+    let branch = match worktree.get("branch").and_then(Value::as_str) {
+        Some(branch) if spawn_worktree_ref_is_valid(branch) => branch.trim().to_owned(),
+        _ => {
+            return Err(spawn_invalid(
+                "spawn.worktree.branch must be a non-empty ref up to 256 bytes without control characters",
+            ));
+        }
+    };
+    let base = match worktree.get("base") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if spawn_worktree_ref_is_valid(value) => {
+            Some(value.trim().to_owned())
+        }
+        Some(_) => {
+            return Err(spawn_invalid(
+                "spawn.worktree.base must be a non-empty ref up to 256 bytes without control characters",
+            ));
+        }
+    };
+    let path = match worktree.get("path") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value))
+            if !value.trim().is_empty()
+                && value.len() <= 1024
+                && !value.chars().any(char::is_control)
+                && Path::new(value).is_absolute()
+                && !Path::new(value)
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir)) =>
+        {
+            Some(value.trim().to_owned())
+        }
+        Some(_) => {
+            return Err(spawn_invalid(
+                "spawn.worktree.path must be an absolute path up to 1024 bytes without '..' or control characters",
+            ));
+        }
+    };
+    Ok(Some(SpawnWorktreeRequest { branch, base, path }))
+}
+
+fn spawn_worktree_ref_is_valid(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
 /// Admit the spawn's explicit model alias against live evidence.
@@ -6267,7 +6378,11 @@ fn resolve_spawn_dispatch(
 ) -> Result<SpawnDispatch, Value> {
     let snapshot = spawn_snapshot(registry);
     let workspace_id = resolve_spawn_workspace(&snapshot, spawn)?;
-    let cwd = resolve_spawn_cwd(&snapshot, &workspace_id, spawn)?;
+    let cwd = if spawn.worktree.is_some() {
+        None
+    } else {
+        resolve_spawn_cwd(&snapshot, &workspace_id, spawn)?
+    };
     let agent_name = spawn_agent_name(spawn, &workspace_id, idempotency_key);
     let tab_label = spawn
         .tab_label
@@ -6286,6 +6401,91 @@ struct SpawnPane {
     pane_id: String,
     tab_id: Option<String>,
     method: &'static str,
+}
+
+struct SpawnWorktree {
+    path: PathBuf,
+    facts: Value,
+}
+
+/// Create one task-owned worktree before opening the agent pane. The native
+/// worktree response is the source of truth for the checkout path; a missing
+/// path is an unconfirmed mutation and therefore fails closed.
+fn spawn_create_worktree(
+    client: &HerdrClient,
+    registry: &PromptRegistry,
+    spawn: &SpawnDispatch,
+    timeout: Duration,
+) -> Result<SpawnWorktree, SpawnStepError> {
+    let Some(request) = spawn.request.worktree.as_ref() else {
+        return Err(SpawnStepError::runtime(
+            "spawn_worktree_missing",
+            "spawn.worktree was not present in the validated request".to_owned(),
+            None,
+        ));
+    };
+    let mut params = json!({
+        "workspace_id": spawn.workspace_id,
+        "branch": request.branch,
+    });
+    if let Some(base) = &request.base {
+        params["base"] = json!(base);
+    }
+    if let Some(path) = &request.path {
+        params["path"] = json!(path);
+    }
+    let result = client
+        .call_with_timeout("worktree.create", params, timeout)
+        .map_err(|error| {
+            SpawnStepError::native(
+                error,
+                Some(
+                    "the worktree may already exist; inspect worktree.list before retrying the same idempotency key",
+                ),
+            )
+        })?;
+    let worktree = result.get("worktree").unwrap_or(&result);
+    let path = worktree
+        .get("checkout_path")
+        .or_else(|| worktree.get("path"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            SpawnStepError::runtime(
+                "spawn_worktree_unconfirmed",
+                "worktree.create returned no checkout path".to_owned(),
+                Some(
+                    "inspect worktree.list before retrying; the worktree may already have been created",
+                ),
+            )
+        })?;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || !crate::fs_security::managed_roots(&spawn_snapshot(registry))
+            .iter()
+            .any(|root| path.starts_with(root))
+    {
+        return Err(SpawnStepError::runtime(
+            "spawn_worktree_unconfirmed",
+            "worktree.create returned a checkout path outside the managed project roots".to_owned(),
+            Some(
+                "inspect the native worktree result and retry with an explicitly managed workspace",
+            ),
+        ));
+    }
+    let facts = json!({
+        "created": true,
+        "path": path,
+        "branch": worktree.get("branch").cloned().unwrap_or_else(|| json!(request.branch)),
+        "base": worktree.get("base").cloned().unwrap_or_else(|| {
+            request.base.as_deref().map_or(Value::Null, |base| json!(base))
+        }),
+        "workspace_id": spawn.workspace_id,
+        "method": "worktree.create",
+    });
+    Ok(SpawnWorktree { path, facts })
 }
 
 /// Create the task-owned pane: a new tab by default so the agent gets the full
@@ -6710,6 +6910,49 @@ fn spawn_chain(
         }));
     }
 
+    // 1. Worktree. A resumed chain reuses the persisted checkout and never
+    // creates a second worktree for the same idempotency key.
+    let mut effective_spawn = spawn.clone();
+    if effective_spawn.request.worktree.is_some() && progress.worktree.is_none() {
+        let step_at = registry.now_ms();
+        let remaining = deadline.saturating_sub(step_at);
+        if remaining == 0 {
+            return Err(progress.failure(
+                &effective_spawn,
+                "worktree_create",
+                &SpawnStepError::runtime(
+                    "spawn_budget_exhausted",
+                    "the spawn chain had no budget left for creating the worktree".to_owned(),
+                    Some(
+                        "replay the same idempotency key after increasing spawn.startup_timeout_ms",
+                    ),
+                ),
+            ));
+        }
+        let timeout = Duration::from_millis(
+            remaining.clamp(SPAWN_PANE_SOCKET_FLOOR_MS, SPAWN_PANE_TIMEOUT_MS),
+        );
+        let created = match spawn_create_worktree(client, registry, &effective_spawn, timeout) {
+            Ok(created) => created,
+            Err(error) => {
+                return Err(progress.failure(&effective_spawn, "worktree_create", &error));
+            }
+        };
+        progress.worktree = Some(created.facts);
+        progress.worktree_path = Some(created.path.clone());
+        progress.steps.push(json!({
+            "step": "worktree_create",
+            "method": "worktree.create",
+            "ok": true,
+            "path": created.path,
+            "duration_ms": registry.now_ms().saturating_sub(step_at),
+        }));
+    }
+    if let Some(path) = progress.worktree_path.clone() {
+        effective_spawn.cwd = Some(path);
+    }
+    let spawn = &effective_spawn;
+
     // 1. Pane. A resumed chain reuses the persisted pane and never creates one.
     if progress.pane_id.is_none() {
         let step_at = registry.now_ms();
@@ -6922,6 +7165,7 @@ fn spawn_chain(
     Ok(SpawnOutcome {
         pane_id,
         tab_id: progress.tab_id.clone(),
+        worktree: progress.worktree.clone(),
         agent_name: spawn.agent_name.clone(),
         kind: spawn.request.kind.clone(),
         workspace_id: spawn.workspace_id.clone(),
@@ -9302,17 +9546,105 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// user planner | Given a spawn.worktree request | When dispatch runs |
+    /// Then worktree.create precedes the pane chain, the returned checkout is
+    /// used as cwd, and the durable receipt carries the worktree facts.
+    #[test]
+    fn spawn_dispatch_creates_worktree_before_pane_and_persists_receipt() {
+        let root = spawn_project_root("worktree");
+        let checkout = root.join("task-tree");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                json!({"result": {"worktree": {
+                    "path": checkout.to_string_lossy(),
+                    "branch": "feature/task",
+                    "base": "main",
+                }}}),
+                spawn_tab_created(),
+                spawn_agent_started(true),
+                spawn_prompt_submitted(),
+            ],
+            requests.clone(),
+        );
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        let args = json!({
+            "spawn": {
+                "kind": "pi",
+                "workspace_id": "demo-project",
+                "worktree": {
+                    "branch": "feature/task",
+                    "base": "main",
+                    "path": checkout.to_string_lossy(),
+                },
+                "tab_label": "feat-worktree",
+            },
+            "text": "implement in the worktree",
+            "idempotency_key": "spawn-worktree",
+        });
+        let result = run(&HerdrClient::new(&socket), &registry, &args);
+        server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(
+            result["spawn"]["worktree"]["path"],
+            json!(checkout.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            spawn_step_names(&result["spawn"]),
+            vec![
+                "worktree_create",
+                "pane_create",
+                "agent_start",
+                "agent_ready",
+                "prompt"
+            ]
+        );
+        let recorded = requests.lock().unwrap();
+        let methods = recorded
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "worktree.create",
+                "tab.create",
+                "agent.start",
+                "agent.prompt"
+            ]
+        );
+        assert_eq!(recorded[0]["params"]["workspace_id"], "w1");
+        assert_eq!(recorded[0]["params"]["branch"], "feature/task");
+        assert_eq!(recorded[0]["params"]["base"], "main");
+        assert_eq!(
+            recorded[0]["params"]["path"],
+            json!(checkout.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            recorded[1]["params"]["cwd"],
+            json!(checkout.to_string_lossy().to_string())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// user planner | Given a spawn dispatch already completed | When the same
     /// idempotency key is replayed | Then the stored spawn facts return and no
     /// second tab, pane, agent or prompt is created.
     #[test]
     fn spawn_dispatch_replay_never_creates_second_pane() {
         let root = spawn_project_root("replay");
+        let checkout = root.join("replay-tree");
         let socket = temp_socket();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
             vec![
+                json!({"result": {"worktree": {
+                    "path": checkout.to_string_lossy(),
+                    "branch": "feature/replay",
+                }}}),
                 spawn_tab_created(),
                 spawn_agent_started(true),
                 spawn_prompt_submitted(),
@@ -9322,7 +9654,14 @@ mod tests {
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let (registry, watch_off) = spawn_registry_with(store.clone(), &root, 80);
         let args = json!({
-            "spawn": {"kind": "pi", "workspace_id": "w1"},
+            "spawn": {
+                "kind": "pi",
+                "workspace_id": "w1",
+                "worktree": {
+                    "branch": "feature/replay",
+                    "path": checkout.to_string_lossy(),
+                },
+            },
             "text": "implement the task",
             "idempotency_key": "spawn-replay",
         });
@@ -9337,11 +9676,15 @@ mod tests {
         let replay = run(&client, &reloaded, &args);
         assert_eq!(replay["idempotent_replay"], true, "{replay}");
         assert_eq!(replay["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(
+            replay["spawn"]["worktree"]["path"],
+            json!(checkout.to_string_lossy().to_string())
+        );
         assert_eq!(replay["spawn"]["agent_name"], first["spawn"]["agent_name"]);
         assert_eq!(
             requests.lock().unwrap().len(),
-            3,
-            "a replay must not touch the socket again"
+            4,
+            "a replay must not create a second worktree or touch the socket again"
         );
         assert_eq!(reloaded.list_tasks(10).unwrap().len(), 1);
         fs::remove_dir_all(root).unwrap();
