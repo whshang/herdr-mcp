@@ -2783,6 +2783,14 @@ pub(crate) fn format_mutation_lease_conflict(
         payload.insert("project_root".to_owned(), json!(lease.project_root));
         payload.insert("lane_key".to_owned(), json!(lease.lane_key));
         payload.insert("intent".to_owned(), json!(lease.intent));
+        payload.insert(
+            "busy_kind".to_owned(),
+            json!(if lease.intent == "read" {
+                "readers_only"
+            } else {
+                "writers"
+            }),
+        );
         payload.insert("readers".to_owned(), json!(lease.readers));
         payload.insert("holder_id".to_owned(), json!(lease.holder_id));
         payload.insert("lease_epoch".to_owned(), json!(lease.lease_epoch));
@@ -32142,6 +32150,7 @@ mod client_request_shape_matrix_tests {
             conflict["code"], "single_writer_lease_conflict",
             "{conflict}"
         );
+        assert_eq!(conflict["busy_kind"], "readers_only", "{conflict}");
         assert_eq!(conflict["intent"], "read");
         let readers = conflict["readers"].as_array().unwrap();
         assert_eq!(readers.len(), 2);
@@ -32273,6 +32282,7 @@ mod client_request_shape_matrix_tests {
         let conflict_payload = parse_tool_payload(&conflict_acq);
         assert_eq!(conflict_payload["ok"], false);
         assert_eq!(conflict_payload["code"], "single_writer_lease_conflict");
+        assert_eq!(conflict_payload["busy_kind"], "writers");
         assert_eq!(conflict_payload["holder_id"], "lane-a");
         assert_eq!(conflict_payload["lease_epoch"], 1);
         assert!(conflict_payload.get("lease_token").is_none());
@@ -32408,7 +32418,8 @@ mod client_request_shape_matrix_tests {
                     "project_root": repo_str,
                     "command": "echo should-not-run > hacked.txt",
                     "intent": "non_idempotent_write",
-                    "idempotency_key": "exec-conflict-1"
+                    "idempotency_key": "exec-conflict-1",
+                    "confirm_busy": true
                 }),
             ),
             (
@@ -32462,6 +32473,7 @@ mod client_request_shape_matrix_tests {
                 payload["delivery_state"], "not_delivered",
                 "{tool_name} ({req_id})"
             );
+            assert_eq!(payload["busy_kind"], "writers", "{tool_name} ({req_id})");
             assert_eq!(payload["holder_id"], "lane-a", "{tool_name} ({req_id})");
             assert_eq!(payload["lease_epoch"], 1, "{tool_name} ({req_id})");
             assert!(payload.get("lease_token").is_none());
