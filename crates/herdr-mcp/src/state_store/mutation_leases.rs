@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS mutation_leases (
     expires_at         INTEGER NOT NULL,
     released_at        INTEGER,
     lease_token_sha256 TEXT,
+    device_id          TEXT,
     PRIMARY KEY (project_root, lane_key),
     CHECK (lease_epoch >= 1)
 );
@@ -46,20 +47,41 @@ CREATE INDEX IF NOT EXISTS idx_mutation_leases_active
 pub(super) fn ensure_mutation_leases_auxiliary_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(MUTATION_LEASES_AUXILIARY_SCHEMA)
         .map_err(|error| format!("cannot ensure mutation leases auxiliary schema: {error}"))?;
-    let has_token_sha256: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('mutation_leases') WHERE name = 'lease_token_sha256'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("cannot inspect mutation_leases auxiliary schema: {error}"))?;
-    if has_token_sha256 == 0 {
-        conn.execute(
-            "ALTER TABLE mutation_leases ADD COLUMN lease_token_sha256 TEXT",
-            [],
-        )
-        .map_err(|error| format!("cannot extend mutation_leases auxiliary schema: {error}"))?;
+    for column in ["lease_token_sha256", "device_id"] {
+        let has_column: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('mutation_leases') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("cannot inspect mutation_leases auxiliary schema: {error}"))?;
+        if has_column == 0 {
+            let sql = format!("ALTER TABLE mutation_leases ADD COLUMN {column} TEXT");
+            match conn.execute(&sql, []) {
+                Ok(_) => {}
+                Err(error) if error.to_string().contains("duplicate column name") => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot extend mutation_leases auxiliary schema: {error}"
+                    ));
+                }
+            }
+        }
     }
+    // Older schema-16 writers do not know device_id and update an existing
+    // row in place when they advance the epoch. Clear the old attribution so
+    // a later new runtime never reports a previous owner's device as theirs.
+    // New writers restore their explicitly supplied device in the same update.
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS mutation_leases_clear_old_device_on_epoch
+         AFTER UPDATE OF lease_epoch ON mutation_leases
+         WHEN NEW.lease_epoch != OLD.lease_epoch AND NEW.device_id IS OLD.device_id
+         BEGIN
+           UPDATE mutation_leases SET device_id = NULL
+            WHERE project_root = NEW.project_root AND lane_key = NEW.lane_key;
+         END;",
+    )
+    .map_err(|error| format!("cannot ensure mutation lease device safety trigger: {error}"))?;
     Ok(())
 }
 
@@ -240,6 +262,7 @@ pub struct MutationLeaseRecord {
     pub lane_key: String,
     pub holder_id: String,
     pub lease_epoch: i64,
+    pub device_id: Option<String>,
     pub workspace_id: Option<String>,
     pub pane_id: Option<String>,
     pub branch: Option<String>,
@@ -357,9 +380,10 @@ fn row_to_stored_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMutati
             acquired_at: row.get(7)?,
             updated_at: row.get(8)?,
             expires_at: row.get(9)?,
+            device_id: row.get(10)?,
         },
-        released_at: row.get(10)?,
-        lease_token_sha256: row.get(11)?,
+        released_at: row.get(11)?,
+        lease_token_sha256: row.get(12)?,
     })
 }
 
@@ -370,7 +394,7 @@ fn load_stored_lease(
 ) -> Result<Option<StoredMutationLeaseRow>, String> {
     conn.query_row(
         "SELECT project_root, lane_key, holder_id, lease_epoch, workspace_id, pane_id, branch,
-                acquired_at, updated_at, expires_at, released_at, lease_token_sha256
+                acquired_at, updated_at, expires_at, device_id, released_at, lease_token_sha256
            FROM mutation_leases
           WHERE project_root = ?1 AND lane_key = ?2",
         params![project_root, lane_key],
@@ -385,9 +409,21 @@ impl StateStore {
         &mut self,
         input: MutationLeaseAcquireInput<'_>,
     ) -> Result<MutationLeaseAcquireOutcome, String> {
+        self.acquire_mutation_lease_for_device(input, None)
+    }
+
+    pub fn acquire_mutation_lease_for_device(
+        &mut self,
+        input: MutationLeaseAcquireInput<'_>,
+        device_id: Option<&str>,
+    ) -> Result<MutationLeaseAcquireOutcome, String> {
         let project_root = canonicalize_lease_path(input.project_root)?;
         let lane_key = validate_lane_key(input.lane_key)?;
         let holder_id = validate_holder_id(input.holder_id)?;
+        let device_id = device_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
         let ttl_seconds = validate_ttl_seconds(input.ttl_seconds)?;
         let workspace_id = validate_optional_metadata("workspace_id", input.workspace_id)?;
         let pane_id = validate_optional_metadata("pane_id", input.pane_id)?;
@@ -409,6 +445,7 @@ impl StateStore {
                     lane_key: lane_key.clone(),
                     holder_id,
                     lease_epoch: 1,
+                    device_id: device_id.clone(),
                     workspace_id,
                     pane_id,
                     branch,
@@ -418,15 +455,16 @@ impl StateStore {
                 };
                 tx.execute(
                     "INSERT INTO mutation_leases (
-                        project_root, lane_key, holder_id, lease_epoch,
+                        project_root, lane_key, holder_id, lease_epoch, device_id,
                         workspace_id, pane_id, branch,
                         acquired_at, updated_at, expires_at, released_at, lease_token_sha256
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12)",
                     params![
                         record.project_root,
                         record.lane_key,
                         record.holder_id,
                         record.lease_epoch,
+                        record.device_id,
                         record.workspace_id,
                         record.pane_id,
                         record.branch,
@@ -472,6 +510,7 @@ impl StateStore {
                         lane_key: lane_key.clone(),
                         holder_id,
                         lease_epoch: stored.record.lease_epoch,
+                        device_id: stored.record.device_id,
                         workspace_id: workspace_id.or(stored.record.workspace_id),
                         pane_id: pane_id.or(stored.record.pane_id),
                         branch: branch.or(stored.record.branch),
@@ -481,14 +520,16 @@ impl StateStore {
                     };
                     tx.execute(
                         "UPDATE mutation_leases
-                            SET workspace_id = ?1,
-                                pane_id = ?2,
-                                branch = ?3,
-                                updated_at = ?4,
-                                expires_at = ?5,
+                            SET device_id = ?1,
+                                workspace_id = ?2,
+                                pane_id = ?3,
+                                branch = ?4,
+                                updated_at = ?5,
+                                expires_at = ?6,
                                 released_at = NULL
-                          WHERE project_root = ?6 AND lane_key = ?7",
+                          WHERE project_root = ?7 AND lane_key = ?8",
                         params![
+                            updated.device_id,
                             updated.workspace_id,
                             updated.pane_id,
                             updated.branch,
@@ -514,6 +555,7 @@ impl StateStore {
                     lane_key: lane_key.clone(),
                     holder_id,
                     lease_epoch: next_epoch,
+                    device_id: device_id.clone(),
                     workspace_id,
                     pane_id,
                     branch,
@@ -525,18 +567,20 @@ impl StateStore {
                     "UPDATE mutation_leases
                         SET holder_id = ?1,
                             lease_epoch = ?2,
-                            workspace_id = ?3,
-                            pane_id = ?4,
-                            branch = ?5,
-                            acquired_at = ?6,
-                            updated_at = ?7,
-                            expires_at = ?8,
-                            lease_token_sha256 = ?9,
+                            device_id = ?3,
+                            workspace_id = ?4,
+                            pane_id = ?5,
+                            branch = ?6,
+                            acquired_at = ?7,
+                            updated_at = ?8,
+                            expires_at = ?9,
+                            lease_token_sha256 = ?10,
                             released_at = NULL
-                      WHERE project_root = ?10 AND lane_key = ?11",
+                      WHERE project_root = ?11 AND lane_key = ?12",
                     params![
                         record.holder_id,
                         record.lease_epoch,
+                        record.device_id,
                         record.workspace_id,
                         record.pane_id,
                         record.branch,
@@ -549,6 +593,16 @@ impl StateStore {
                     ],
                 )
                 .map_err(|error| format!("cannot advance mutation lease epoch: {error}"))?;
+                // If the same device acquires the next epoch, the legacy-writer
+                // safety trigger clears it. This write explicitly reattests the
+                // current device inside the same transaction.
+                if record.device_id.is_some() {
+                    tx.execute(
+                        "UPDATE mutation_leases SET device_id = ?1 WHERE project_root = ?2 AND lane_key = ?3",
+                        params![record.device_id, record.project_root, record.lane_key],
+                    )
+                    .map_err(|error| format!("cannot bind mutation lease device: {error}"))?;
+                }
                 MutationLeaseAcquireOutcome::Acquired {
                     lease: record,
                     lease_token,
@@ -815,7 +869,7 @@ impl StateStore {
             .conn
             .prepare(
                 "SELECT project_root, lane_key, holder_id, lease_epoch, workspace_id, pane_id, branch,
-                        acquired_at, updated_at, expires_at, released_at, lease_token_sha256
+                        acquired_at, updated_at, expires_at, device_id, released_at, lease_token_sha256
                    FROM mutation_leases
                   WHERE released_at IS NULL
                     AND expires_at > ?1
@@ -859,7 +913,7 @@ impl StateStore {
             .conn
             .prepare(
                 "SELECT project_root, lane_key, holder_id, lease_epoch, workspace_id, pane_id, branch,
-                        acquired_at, updated_at, expires_at, released_at, lease_token_sha256
+                        acquired_at, updated_at, expires_at, device_id, released_at, lease_token_sha256
                    FROM mutation_leases
                   WHERE lane_key = '*'
                     AND released_at IS NULL
@@ -964,5 +1018,54 @@ impl StateStore {
         Ok(MutationLeaseEnforcementVerdict::Allowed {
             matched_lease: Some(active_lease),
         })
+    }
+}
+
+#[cfg(test)]
+mod device_migration_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_rows_remain_null_and_old_writer_cannot_retain_stale_device() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mutation_leases (
+                project_root TEXT NOT NULL, lane_key TEXT NOT NULL DEFAULT '*',
+                holder_id TEXT NOT NULL, lease_epoch INTEGER NOT NULL,
+                workspace_id TEXT, pane_id TEXT, branch TEXT,
+                acquired_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL, released_at INTEGER,
+                lease_token_sha256 TEXT, PRIMARY KEY(project_root, lane_key)
+             );
+             INSERT INTO mutation_leases(project_root,lane_key,holder_id,lease_epoch,
+                 acquired_at,updated_at,expires_at)
+             VALUES('/old','*','old-holder',1,1,1,10000);",
+        )
+        .unwrap();
+        ensure_mutation_leases_auxiliary_schema(&conn).unwrap();
+        ensure_mutation_leases_auxiliary_schema(&conn).unwrap();
+        let row = load_stored_lease(&conn, "/old", "*").unwrap().unwrap();
+        assert_eq!(row.record.device_id, None);
+        assert_eq!(row.record.holder_id, "old-holder");
+        // A rollback-era writer advances the lease without knowing device_id.
+        conn.execute(
+            "UPDATE mutation_leases SET device_id = 'dev_old' WHERE project_root = '/old'",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE mutation_leases SET holder_id = 'new-holder', lease_epoch = 2 WHERE project_root = '/old'", []).unwrap();
+        let row = load_stored_lease(&conn, "/old", "*").unwrap().unwrap();
+        assert_eq!(row.record.device_id, None);
+        assert_eq!(row.record.holder_id, "new-holder");
+        assert_eq!(row.record.lease_epoch, 2);
+        // A schema-16 reader explicitly selecting the old columns still works.
+        let holder: String = conn
+            .query_row(
+                "SELECT holder_id FROM mutation_leases WHERE project_root = '/old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(holder, "new-holder");
     }
 }
