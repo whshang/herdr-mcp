@@ -39,6 +39,15 @@ For Edge connectivity failures, consume structured recovery metadata when presen
 
 Saved Herdr SSH-machine profiles and Edge devices are separate routing identities even when they reach the same physical workstation. Normal Web-planner work stays on the enrolled Edge route. Cross-transport recovery is allowed only after proven Edge non-delivery or live proof that the mutation was not applied; raw SSH is a final bootstrap/recovery path, never an implicit mutation fallback.
 
+## Bounded project pickup
+
+`herdr_mcp.work.pickup` returns a bounded projection (`projection.v = 1`) of the recorded project handoff, not the raw stored document. Its default response stays under 32 KB even when the stored handoff is megabytes, so it fits the Link's 256 KiB frame on the first call.
+
+- Selectors: `worktree`, `project_root`, `project_ref`, `cwd`, `pane`; with none it lists projects that have handoffs.
+- `limit_per_section` (default 20, max 50), `sections` (`goals`, `preferences`, `mistakes`, `tasks`), `query` (case-insensitive match on item id/text), `include_archived` (default false), `include_markdown` (default false), `max_bytes` (budget, max 245760).
+- Always read `truncated`, `total_counts`, and `archived_counts` before treating the projection as the whole handoff. `workspace` carries the full live `GitContext`; `handoff_md` is empty unless `include_markdown=true`, and never contains the trailing `<!-- relay-memory: ... -->` JSON comment.
+- An out-of-range or wrongly-typed option is an explicit `work_pickup_params_invalid` refusal; never assume it was clamped.
+
 ## Native methods
 
 Discover an unknown real Herdr method/schema once with `herdr_methods(query)`, then reuse the known live schema.
