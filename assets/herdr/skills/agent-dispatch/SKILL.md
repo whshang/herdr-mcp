@@ -67,4 +67,6 @@ Role results return non-secret `candidates`, `resolved_target`, and `requested_t
 
 Optional `max_concurrent` (integer 1–16, role targets only) rejects with `concurrency_limit_reached` and `delivery_state: "not_delivered"` when non-terminal tasks for this exact selector reach the cap. Scope is the bound `parent_session_ref`, otherwise `parent_target`, otherwise caller-less global work. Open decision gates count as non-terminal. Unstamped work never shares a browser session's scope. Admission and task registration are serialized within the runtime to prevent concurrent requests exceeding the cap; unrelated exact-target behavior is unchanged.
 
+Device-bound refs: `workspace_id`, `split_from`, `parent_target`, `target`, `pane`/`pane_id`, nested `spawn.workspace_id`/`spawn.split_from`, and scan-only `repair_of` may carry `herdr_ref_*` values. A ref bound to the dispatched device resolves locally; a foreign-device or malformed ref fails closed with `device_ref_conflict` — do not strip the ref and retry with a guessed bare id.
+
 CLI: `herdr-mcp agent dispatch --target @codex "implement the task" --parent w1:p1 --idempotency-key task-1 --max-concurrent 2 [--workspace-id w1]`. The positional `<target> <text>` form remains supported.
