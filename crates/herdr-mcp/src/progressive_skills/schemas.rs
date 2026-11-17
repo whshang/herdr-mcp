@@ -157,6 +157,8 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "workspace_id": {"type": "string", "maxLength": 256, "description": "Optional workspace scope for role resolution. Not applicable with spawn (use spawn.workspace_id)."},
                     "max_concurrent": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Role selectors only: cap non-terminal tasks for this exact requested_target in the bound parent session, else parent_target, else caller-less global scope. Limit rejection is not_delivered."},
                     "text": {"type": "string", "maxLength": 65536},
+                    "readonly": {"type": "boolean", "default": false, "description": "Audit-only boundary: when true, any target worktree HEAD/index/worktree change during dispatch is reported as readonly_violation."},
+                    "owned_paths": {"type": "array", "maxItems": 128, "items": {"type": "string", "maxLength": 4096}, "description": "Optional path allowlist for dispatch audit; paths may be relative to the project root or absolute inside it; changes outside it return scope_violation."},
                     "repair_of": {
                         "type": "string",
                         "maxLength": 128,
