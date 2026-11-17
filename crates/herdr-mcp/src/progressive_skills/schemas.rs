@@ -1147,7 +1147,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "source": "herdr_mcp_local",
             "schema_version": 1,
             "access": "mutation",
-            "description": "Acquire or idempotently re-acquire a durable single-writer mutation lease on a canonicalized project_root (and optional lane_key, default '*'). Returns monotonic lease_epoch fencing token and unpredictable lease_token capability; returns single_writer_lease_conflict when held by another active owner.",
+            "description": "Acquire or idempotently re-acquire a durable single-writer mutation lease on a canonicalized project_root (and optional lane_key, default '*'). Device attribution is derived from the enrolled local runtime configuration, never from request parameters. Returns monotonic lease_epoch fencing token and unpredictable lease_token capability; returns single_writer_lease_conflict when held by another active owner.",
             "params": {
                 "properties": {
                     "project_root": {"type": "string", "maxLength": 4096},
@@ -1205,7 +1205,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "source": "herdr_mcp_local",
             "schema_version": 1,
             "access": "read_only",
-            "description": "List active non-expired mutation leases, optionally filtered by project_root and lane_key.",
+            "description": "List active non-expired mutation leases, exposing project/device/workspace/branch/holder/expiry metadata only; lease tokens are never returned.",
             "params": {
                 "properties": {
                     "project_root": {"type": ["string", "null"], "maxLength": 4096},
