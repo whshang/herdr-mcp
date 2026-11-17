@@ -6,12 +6,12 @@
 
 ## 1. Execution rules
 
-1. **Plan before calling tools.** Before the first mutation, resolve machine/fleet state, human boundaries, dependencies, and final checks. Batch known independent reads. Put deterministic shell/Git work sharing one project and safety boundary into one bounded execution call. Re-plan only when results change arguments or safety, user action is required, or mutation delivery is uncertain.
+1. **Plan before calling tools.** Resolve fleet state, human boundaries, dependencies and checks before mutation. Batch safe related work into one bounded execution call. Re-plan only when safety, human action or uncertain delivery requires it.
 2. **Preserve existing work.** Never `reset --hard`, `clean -fd`, overwrite unrelated dirty files, or rebuild an existing fleet as an installation shortcut.
 3. **Normal installation uses the current Stable GitHub Release only.** Do not clone this repository or use `npm`/`cargo` to build the workstation runtime unless the user explicitly asked for source development.
-4. **Keep secrets ephemeral.** Never echo a Cloudflare Token or write it to Git, ordinary logs, or shell history. Pass it only through the current process environment or a hidden CLI prompt. Never put the local `HERDR_MCP_TOKEN` or Cloudflare Token into ChatGPT.
+4. **Keep secrets ephemeral.** Never echo or log Cloudflare Tokens or write them to Git or shell history; use process environment or hidden input. Never put `HERDR_MCP_TOKEN` or Cloudflare Tokens in ChatGPT.
 5. **Do not change the user's network environment.** Do not switch proxies, rewrite system DNS, or create a generic proxy. The only recovery exception is the verified single-Worker hosts entry in §6.
-6. **Pause only at human boundaries.** Continue every step that can be determined and automated safely. Ask once when Cloudflare login/Token creation, a macOS permission approval, an ambiguous Account/zone choice, or ChatGPT OAuth actually requires the user.
+6. **Pause only at human boundaries.** Automate safe steps. Ask once when Cloudflare login, token creation, macOS approval, account/zone choice or ChatGPT OAuth requires the user.
 
 ## 2. Decide first: first Worker or existing fleet
 
@@ -33,7 +33,7 @@ herdr-mcp install
 herdr-mcp doctor
 ```
 
-`herdr-mcp install` owns Herdr dependency recovery: it resolves `HERDR_BIN`, stable user/Homebrew/`/usr/local` paths and PATH; verifies and updates an installed Herdr; runs the official <https://herdr.dev/tui/> installer when Herdr is absent; and verifies that the Herdr Server/API becomes reachable. Do not duplicate that flow with a second manual Herdr installation unless the command reports an explicit dependency-recovery failure. “Herdr” here is the Herdr TUI (`herdr`); never install the Herdr app or herdr-core (`hc`) for herdr-mcp, because herdr-mcp v1.1 does not support that separate runtime. On Windows Candidate UAT still use the exact candidate herdr-mcp artifact, never an ad-hoc source build.
+`herdr-mcp install` owns Herdr dependency recovery: it resolves the Herdr TUI binary, verifies or updates it, invokes the official <https://herdr.dev/tui/> installer if absent, and verifies Server/API reachability. Do not duplicate that flow unless dependency recovery fails. Never install the Herdr app or herdr-core (`hc`) for herdr-mcp v1.1. On Windows Candidate UAT use the exact candidate artifact, not an ad-hoc build.
 
 If `~/.local/bin/herdr-mcp` exists but the shell cannot resolve it, classify `installed_but_not_on_shell_path`, repair PATH, verify a fresh shell, and do not reinstall or create a second PATH owner.
 
@@ -64,7 +64,7 @@ herdr-mcp worker bootstrap
 
 This command owns Cloudflare API preflight, Account/`workers.dev` resolution, existing-Worker detection, release manifest + `herdr-edge-<version>.mjs` artifact attestation, Worker/DO bootstrap, device enrollment, credentials, and production Link reconciliation. It does not run Wrangler or require a source checkout.
 
-If first-device enrollment saved the credential and configuration but local activation failed, fix the reported local error and rerun `worker bootstrap` on the same computer and OS account. The retry authenticates the exact journal-bound device before activation; do not delete its credential or journal, re-pair, or provision the fleet secrets again. Missing, revoked, or mismatched credentials fail closed; this retry cannot restore a credential already revoked or deleted by an earlier runtime.
+If activation fails after first-device credentials and config are saved, fix the local error and rerun `worker bootstrap` on the same computer and OS account. Keep the journal and credential: retry authenticates the same device without re-pairing or reprovisioning fleet secrets. Missing, revoked or mismatched credentials fail closed; previously revoked or deleted credentials cannot be restored this way.
 
 Choose the public origin once, before Connector creation:
 
