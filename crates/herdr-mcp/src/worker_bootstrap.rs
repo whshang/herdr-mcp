@@ -697,6 +697,7 @@ pub fn run(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
     if !bootstrap_platform_supported(std::env::consts::OS) {
         return Err(render_bootstrap_failure(
             "worker bootstrap is unsupported on this platform",
+            paths,
             None,
             None,
             None,
@@ -707,6 +708,7 @@ pub fn run(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
     if paths.instance.is_named() {
         return Err(render_bootstrap_failure(
             "worker bootstrap is available only on the default Herdr instance",
+            paths,
             None,
             None,
             None,
@@ -720,6 +722,7 @@ pub fn run(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
         let release = crate::runtime_meta::compiled_source_commit();
         render_bootstrap_failure(
             &error,
+            paths,
             read_journal(&journal_path(paths)).ok().flatten().as_ref(),
             crate::config::Config::load_for_instance(&paths.config_file, &paths.instance)
                 .ok()
@@ -742,13 +745,48 @@ pub fn run(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
 /// cannot succeed.
 fn render_bootstrap_failure(
     message: &str,
+    paths: &RuntimePaths,
     journal: Option<&BootstrapJournal>,
     config: Option<&crate::config::Config>,
     release: Option<&str>,
     runtime_version: &str,
     language: Locale,
 ) -> String {
-    let durable = durable_first_device_state(journal, config, release, runtime_version);
+    render_bootstrap_failure_with(
+        message,
+        journal,
+        config,
+        release,
+        runtime_version,
+        local_worker_name().as_deref(),
+        local_device_credential_available(paths, journal),
+        language,
+    )
+}
+
+/// The rendering half of [`render_bootstrap_failure`], with the local evidence
+/// (this computer's Worker name and whether the credential store still holds the
+/// device credential) passed in so the classification itself is directly
+/// testable.
+#[allow(clippy::too_many_arguments)]
+fn render_bootstrap_failure_with(
+    message: &str,
+    journal: Option<&BootstrapJournal>,
+    config: Option<&crate::config::Config>,
+    release: Option<&str>,
+    runtime_version: &str,
+    expected_worker_name: Option<&str>,
+    local_credential_available: bool,
+    language: Locale,
+) -> String {
+    let durable = durable_first_device_state(
+        journal,
+        config,
+        release,
+        runtime_version,
+        expected_worker_name,
+        local_credential_available,
+    );
     let next_step = if durable {
         language.text(
             "Next step: this computer's first-device journal and credential are already saved. Keep ~/.config/herdr-mcp/bootstrap/ and the device credential, resolve the local error above, then rerun `herdr-mcp worker bootstrap` on this same computer and OS account. Do not delete the journal or edit the secrets.",
@@ -770,6 +808,8 @@ fn durable_first_device_state(
     config: Option<&crate::config::Config>,
     release: Option<&str>,
     runtime_version: &str,
+    expected_worker_name: Option<&str>,
+    local_credential_available: bool,
 ) -> bool {
     let (Some(journal), Some(config)) = (journal, config) else {
         return false;
@@ -782,12 +822,48 @@ fn durable_first_device_state(
     }
     let same_release = release.is_some_and(|commit| commit == journal.source_commit)
         && runtime_version == journal.runtime_version;
+    // The recovery path re-proves the Cloudflare account/Worker before any
+    // mutation. Nothing local can prove the account externally, so it must at
+    // least be recorded, and the Worker must still be this computer's Worker;
+    // an empty or switched identity is treated as a fail-closed refusal.
+    let identity_recorded = !journal.account_id.trim().is_empty()
+        && !journal.worker_name.trim().is_empty()
+        && expected_worker_name == Some(journal.worker_name.as_str());
     same_release
+        && identity_recorded
         && config.edge_device_id.as_deref() == Some(device)
         && same_bootstrap_origin(
             config.edge_public_origin.as_deref(),
             journal.workers_dev_origin.as_deref(),
         )
+        // The real retry authenticates with this credential; without it the
+        // rerun cannot succeed, so the hint must not claim recovery. Only the
+        // availability is checked here; the secret is never read into output.
+        && local_credential_available
+}
+
+fn local_worker_name() -> Option<String> {
+    worker_name().ok()
+}
+
+/// Whether the credential store still holds this device's bootstrap credential
+/// (`stored_bootstrap_credential` performs the same existence/validity check the
+/// real retry does). Errors are collapsed to `false`: the secret is never
+/// rendered, and an unavailable credential is a fail-closed refusal.
+fn local_device_credential_available(
+    paths: &RuntimePaths,
+    journal: Option<&BootstrapJournal>,
+) -> bool {
+    let Some(journal) = journal else {
+        return false;
+    };
+    let (Some(origin), Some(device)) = (
+        journal.workers_dev_origin.as_deref(),
+        journal.canonical_device_id.as_deref(),
+    ) else {
+        return false;
+    };
+    crate::worker::stored_bootstrap_credential(paths, origin, device).is_ok()
 }
 
 fn bootstrap_platform_supported(os: &str) -> bool {
@@ -4588,6 +4664,22 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn test_paths() -> RuntimePaths {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-bootstrap-hint-paths-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = fs::create_dir_all(&root);
+        RuntimePaths {
+            instance: crate::instance::InstanceId::default_instance(),
+            config_dir: root.clone(),
+            config_file: root.join("config.json"),
+            dev_state_dir: root.join("dev"),
+            herdr_socket: None,
+        }
+    }
+
     /// user operator | Given a bootstrap failure | When the durable first-device
     /// journal, release and local binding all agree | Then the error carries the
     /// recoverable next step (keep journal/credential, fix locally, rerun here).
@@ -4615,7 +4707,14 @@ mod tests {
         };
         let guidance = |journal: Option<&BootstrapJournal>,
                         config: Option<&crate::config::Config>| {
-            durable_first_device_state(journal, config, Some(&release), "1.2.0")
+            durable_first_device_state(
+                journal,
+                config,
+                Some(&release),
+                "1.2.0",
+                Some("herdr-edge"),
+                true,
+            )
         };
 
         assert!(guidance(Some(&journal()), Some(&config())), "durable state");
@@ -4652,12 +4751,62 @@ mod tests {
             "journal from another release"
         );
         assert!(
-            !durable_first_device_state(Some(&journal()), Some(&config()), Some(&release), "1.3.0"),
+            !durable_first_device_state(
+                Some(&journal()),
+                Some(&config()),
+                Some(&release),
+                "1.3.0",
+                Some("herdr-edge"),
+                true
+            ),
             "journal from another runtime version"
         );
         assert!(
-            !durable_first_device_state(Some(&journal()), Some(&config()), None, "1.2.0"),
+            !durable_first_device_state(
+                Some(&journal()),
+                Some(&config()),
+                None,
+                "1.2.0",
+                Some("herdr-edge"),
+                true
+            ),
             "a runtime without an exact release must not claim recovery"
+        );
+        // #977 droid P2: account/Worker identity and local credential evidence
+        // are part of the recovery claim, exactly like the real retry path.
+        let mut no_account = journal();
+        no_account.account_id = "  ".into();
+        assert!(
+            !guidance(Some(&no_account), Some(&config())),
+            "account not recorded"
+        );
+        let mut other_worker = journal();
+        other_worker.worker_name = "switched-worker".into();
+        assert!(
+            !guidance(Some(&other_worker), Some(&config())),
+            "Worker switched away from this computer"
+        );
+        assert!(
+            !durable_first_device_state(
+                Some(&journal()),
+                Some(&config()),
+                Some(&release),
+                "1.2.0",
+                None,
+                true
+            ),
+            "hostname/Worker resolution unavailable"
+        );
+        assert!(
+            !durable_first_device_state(
+                Some(&journal()),
+                Some(&config()),
+                Some(&release),
+                "1.2.0",
+                Some("herdr-edge"),
+                false
+            ),
+            "device credential missing from the credential store"
         );
         let mut unbound = config();
         unbound.edge_device_id = None;
@@ -4674,12 +4823,14 @@ mod tests {
 
         // The user-visible output for the durable case invites the same-machine
         // rerun and never claims a refusal.
-        let rendered = render_bootstrap_failure(
+        let rendered = render_bootstrap_failure_with(
             "cannot read current Worker health: connection refused",
             Some(&journal()),
             Some(&config()),
             Some(&release),
             "1.2.0",
+            Some("herdr-edge"),
+            true,
             Locale::En,
         );
         assert!(rendered.contains("already saved"), "{rendered}");
@@ -4688,6 +4839,23 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("fail-closed refusal"), "{rendered}");
+
+        // #977 droid P2: with the same journal but no local credential/Worker
+        // evidence, production rendering must fall back to the refusal guidance.
+        let conservative = render_bootstrap_failure(
+            "cannot read current Worker health: connection refused",
+            &test_paths(),
+            Some(&journal()),
+            Some(&config()),
+            Some(&release),
+            "1.2.0",
+            Locale::En,
+        );
+        assert!(
+            conservative.contains("fail-closed refusal"),
+            "{conservative}"
+        );
+        assert!(!conservative.contains("already saved"), "{conservative}");
     }
 
     /// user operator | Given the durable state is missing | When bootstrap
@@ -4697,6 +4865,7 @@ mod tests {
     fn bootstrap_failure_hint_states_the_fail_closed_boundary() {
         let message = render_bootstrap_failure(
             "existing bootstrap journal belongs to a different release",
+            &test_paths(),
             None,
             None,
             Some(&"a".repeat(40)),
@@ -4710,6 +4879,7 @@ mod tests {
 
         let durable = render_bootstrap_failure(
             "cannot read current Worker health: connection refused",
+            &test_paths(),
             None,
             None,
             Some(&"a".repeat(40)),
