@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -192,6 +193,7 @@ struct RegisterTaskInput<'a> {
     /// #332 B-2 sanitized `pane.process_info` summary probed at dispatch time
     /// while the prompt was still unacknowledged. `None` skips the field.
     foreground_blocker: Option<Value>,
+    audit: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -348,6 +350,8 @@ struct PromptTaskRecord {
     /// older runtimes ignore the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     foreground_blocker: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit: Option<Value>,
     #[serde(skip)]
     gate: Option<DecisionGate>,
 }
@@ -388,6 +392,7 @@ impl PromptTaskRecord {
             "lifecycle": self.lifecycle.as_str(),
             "steering_state": self.steering_json().0,
             "superseded_by": self.superseded_by,
+            "audit": self.audit,
             "liveness": self.liveness(now),
             "activity_observed": self.activity_observed,
             "prior_settle_observed": self.prior_settle_observed,
@@ -474,6 +479,9 @@ impl PromptTaskRecord {
             // the task reports its own outcome.
             if let Some(blocker) = &self.foreground_blocker {
                 object.insert("foreground_blocker".to_owned(), json!(blocker));
+            }
+            if let Some(audit) = &self.audit {
+                object.insert("audit".to_owned(), json!(audit));
             }
             // S4: `delivery_uncertain` means "may already have been delivered".
             // The row therefore carries the read-only check a caller can run to
@@ -859,6 +867,7 @@ impl PromptRegistry {
             on_budget,
             request_id,
             foreground_blocker,
+            audit,
         } = input;
         if submitted == Some(false) || self.inner.store.is_none() {
             return Ok(None);
@@ -975,6 +984,7 @@ impl PromptRegistry {
             steering_state: None,
             superseded_by: None,
             foreground_blocker,
+            audit,
         };
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
             mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
@@ -1131,6 +1141,11 @@ impl PromptRegistry {
             }
         }
         task.updated_at_ms = now;
+        let audit_violation = if kind == "worker_done" {
+            task.audit.as_mut().and_then(refresh_dispatch_audit)
+        } else {
+            None
+        };
         if let Err(error) = self.save_task(&task, None) {
             return json!({"ok": false, "code": "agent_task_store_unavailable", "message": error});
         }
@@ -1138,7 +1153,13 @@ impl PromptRegistry {
         if newly_completed {
             self.maybe_notify_parent(&task);
         }
-        json!({"ok": true, "task": task.public_json_at(now)})
+        let mut response = json!({"ok": true, "task": task.public_json_at(now)});
+        if let Some(code) = audit_violation {
+            response["ok"] = json!(false);
+            response["code"] = json!(code);
+            response["audit"] = task.audit.clone().unwrap_or(Value::Null);
+        }
+        response
     }
 
     pub fn task_status(&self, task_id: &str) -> Value {
@@ -2833,6 +2854,7 @@ const KNOWN_TASK_KEYS: &[&str] = &[
     "steering_state",
     "superseded_by",
     "foreground_blocker",
+    "audit",
 ];
 
 /// Overlay `new_json` onto the row's stored `result_json`, keeping only keys
@@ -4416,6 +4438,371 @@ fn delegation_depth_exceeded(
         .any(|task| active(task) && task_matches_target(task, grandparent_target, None)))
 }
 
+const MAX_DISPATCH_OWNED_PATHS: usize = 128;
+const MAX_DISPATCH_OWNED_PATH_BYTES: usize = 4096;
+
+fn parse_dispatch_audit_options(args: &Value) -> Result<(bool, Vec<String>), Value> {
+    let readonly = match args.get("readonly") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(invalid("readonly must be a boolean")),
+    };
+    let owned_paths = match args.get("owned_paths") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) if values.len() <= MAX_DISPATCH_OWNED_PATHS => values
+            .iter()
+            .map(|value| {
+                let Some(path) = value.as_str() else {
+                    return Err(invalid("owned_paths entries must be strings"));
+                };
+                let path = path.trim();
+                if path.is_empty()
+                    || path.len() > MAX_DISPATCH_OWNED_PATH_BYTES
+                    || path.chars().any(char::is_control)
+                {
+                    return Err(invalid(
+                        "owned_paths entries must be non-empty paths up to 4096 bytes",
+                    ));
+                }
+                let path = Path::new(path);
+                if path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return Err(invalid("owned_paths entries must not contain '..'"));
+                }
+                Ok(path.to_string_lossy().replace('\\', "/"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(Value::Array(_)) => {
+            return Err(invalid("owned_paths must contain at most 128 paths"));
+        }
+        Some(_) => return Err(invalid("owned_paths must be an array of strings")),
+    };
+    Ok((readonly, owned_paths))
+}
+
+fn git_audit_snapshot(root: &Path) -> Result<Value, String> {
+    if !root.is_dir() {
+        return Err("dispatch audit root is not a directory".to_owned());
+    }
+    let status = Command::new("git")
+        .current_dir(root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .map_err(|error| format!("cannot read dispatch git status: {error}"))?;
+    if !status.status.success() {
+        return Err("dispatch git status failed".to_owned());
+    }
+    let head = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| format!("cannot read dispatch git HEAD: {error}"))?;
+    if !head.status.success() {
+        return Err("dispatch git HEAD lookup failed".to_owned());
+    }
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    if head.is_empty() {
+        return Err("dispatch git HEAD is empty".to_owned());
+    }
+    let entries = git_audit_entries(root, &status.stdout)?;
+    let files = entries
+        .iter()
+        .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let entries_json = Value::Array(entries.clone());
+    let entries_text = serde_json::to_string(&entries_json)
+        .map_err(|error| format!("cannot encode dispatch git status: {error}"))?;
+    let mut files = files;
+    files.sort();
+    files.dedup();
+    let fingerprint = stable_digest(&[
+        b"herdr_prompt/dispatch-audit-v1",
+        head.as_bytes(),
+        entries_text.as_bytes(),
+    ]);
+    Ok(json!({
+        "head": head,
+        "status": files,
+        "files": files,
+        "entries": entries_json,
+        "fingerprint": fingerprint,
+    }))
+}
+
+fn git_audit_entries(root: &Path, raw_status: &[u8]) -> Result<Vec<Value>, String> {
+    let mut entries = Vec::new();
+    let mut fields = raw_status.split(|byte| *byte == 0);
+    while let Some(field) = fields.next() {
+        if field.len() < 4 {
+            continue;
+        }
+        let status = String::from_utf8_lossy(&field[..2]).into_owned();
+        let path = String::from_utf8_lossy(&field[3..]).replace('\\', "/");
+        if path.is_empty() {
+            continue;
+        }
+        entries.push(json!({
+            "path": path,
+            "status": status,
+            "digest": git_audit_content_digest(root, &path)?,
+        }));
+        // Porcelain -z emits the original path as a second NUL-delimited
+        // field for renames/copies. Keep it as evidence too, so a rename
+        // cannot escape owned_paths or readonly auditing.
+        if (status.starts_with('R') || status.starts_with('C'))
+            && let Some(original) = fields.next()
+        {
+            let original = String::from_utf8_lossy(original).replace('\\', "/");
+            if !original.is_empty() {
+                entries.push(json!({
+                    "path": original,
+                    "status": status,
+                    "digest": "renamed",
+                }));
+            }
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.get("path")
+            .and_then(Value::as_str)
+            .cmp(&right.get("path").and_then(Value::as_str))
+    });
+    Ok(entries)
+}
+
+fn git_audit_content_digest(root: &Path, path: &str) -> Result<String, String> {
+    let full_path = root.join(path);
+    let metadata = match std::fs::symlink_metadata(&full_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok("deleted".to_owned());
+        }
+        Err(error) => return Err(format!("cannot inspect dispatch path {path}: {error}")),
+    };
+    if metadata.is_dir() {
+        return Ok("directory".to_owned());
+    }
+    let bytes = std::fs::read(&full_path)
+        .map_err(|error| format!("cannot read dispatch path {path}: {error}"))?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("sha256:{digest:x}"))
+}
+
+fn snapshot_entries(snapshot: &Value) -> Option<HashMap<String, (String, String)>> {
+    let entries = snapshot.get("entries")?.as_array()?;
+    let mut result = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        let path = entry.get("path").and_then(Value::as_str)?;
+        let status = entry.get("status").and_then(Value::as_str)?;
+        let digest = entry.get("digest").and_then(Value::as_str)?;
+        result.insert(path.to_owned(), (status.to_owned(), digest.to_owned()));
+    }
+    Some(result)
+}
+
+fn git_commit_diff_paths(
+    root: &Path,
+    before_head: &str,
+    after_head: &str,
+) -> Result<Vec<String>, String> {
+    if before_head.is_empty() || after_head.is_empty() {
+        return Err("dispatch git commit diff has an empty HEAD".to_owned());
+    }
+    let diff = Command::new("git")
+        .current_dir(root)
+        .args([
+            "diff",
+            "--name-only",
+            "--no-renames",
+            before_head,
+            after_head,
+        ])
+        .output()
+        .map_err(|error| format!("cannot read dispatch git commit diff: {error}"))?;
+    if !diff.status.success() {
+        return Err("dispatch git commit diff failed".to_owned());
+    }
+    let text = String::from_utf8(diff.stdout)
+        .map_err(|error| format!("dispatch git commit diff was not UTF-8: {error}"))?;
+    let mut paths = text
+        .lines()
+        .map(|path| path.trim().replace('\\', "/"))
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn dispatch_audit_result(
+    readonly: bool,
+    owned_paths: &[String],
+    root: &Path,
+    before: Value,
+    after: Value,
+) -> (Value, Option<&'static str>) {
+    let before_head = before.get("head").and_then(Value::as_str);
+    let after_head = after.get("head").and_then(Value::as_str);
+    let head_changed = before_head != after_head;
+    let commit_files = if head_changed {
+        match git_commit_diff_paths(
+            root,
+            before_head.unwrap_or_default(),
+            after_head.unwrap_or_default(),
+        ) {
+            Ok(paths) => paths,
+            Err(message) => {
+                let audit = audit_unavailable(readonly, owned_paths, root, &message);
+                return (audit, Some("dispatch_audit_unavailable"));
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut changed = Vec::new();
+    match (snapshot_entries(&before), snapshot_entries(&after)) {
+        (Some(before_entries), Some(after_entries)) => {
+            let mut paths = before_entries
+                .keys()
+                .chain(after_entries.keys())
+                .cloned()
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths.dedup();
+            changed.extend(
+                paths
+                    .into_iter()
+                    .filter(|path| before_entries.get(path) != after_entries.get(path)),
+            );
+        }
+        (None, None) if !head_changed && before.get("fingerprint") == after.get("fingerprint") => {}
+        _ if head_changed => {}
+        _ => {
+            let audit = audit_unavailable(
+                readonly,
+                owned_paths,
+                root,
+                "dispatch audit snapshot lacks status and content digests",
+            );
+            return (audit, Some("dispatch_audit_unavailable"));
+        }
+    }
+    changed.extend(commit_files);
+    changed.sort();
+    changed.dedup();
+    let path_allowed = |path: &str| {
+        owned_paths.iter().any(|owned| {
+            let owned_path = Path::new(owned);
+            let owned = if owned_path.is_absolute() {
+                let Ok(relative) = owned_path.strip_prefix(root) else {
+                    return false;
+                };
+                relative.to_string_lossy().replace('\\', "/")
+            } else {
+                owned.to_owned()
+            };
+            path == owned
+                || path
+                    .strip_prefix(owned.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    };
+    let scope_violation = !owned_paths.is_empty() && changed.iter().any(|path| !path_allowed(path));
+    let readonly_violation = readonly && (head_changed || !changed.is_empty());
+    let code = if readonly_violation {
+        Some("readonly_violation")
+    } else if scope_violation {
+        Some("scope_violation")
+    } else {
+        None
+    };
+    let result = code.unwrap_or("ok");
+    (
+        json!({
+            "readonly": readonly,
+            "owned_paths": owned_paths,
+            "project_root": root.to_string_lossy(),
+            "before": before,
+            "after": after,
+            "changed_files": changed,
+            "head_changed": head_changed,
+            "readonly_violation": readonly_violation,
+            "scope_violation": scope_violation,
+            "result": result,
+        }),
+        code,
+    )
+}
+
+fn audit_unavailable(readonly: bool, owned_paths: &[String], root: &Path, message: &str) -> Value {
+    json!({
+        "readonly": readonly,
+        "owned_paths": owned_paths,
+        "project_root": root.to_string_lossy(),
+        "before": Value::Null,
+        "after": Value::Null,
+        "changed_files": [],
+        "head_changed": false,
+        "readonly_violation": false,
+        "scope_violation": false,
+        "result": "unavailable",
+        "message": message,
+    })
+}
+
+fn audit_code(audit: &Value) -> Option<&'static str> {
+    match audit.get("result").and_then(Value::as_str) {
+        Some("readonly_violation") => Some("readonly_violation"),
+        Some("scope_violation") => Some("scope_violation"),
+        Some("unavailable") => Some("dispatch_audit_unavailable"),
+        _ => None,
+    }
+}
+
+fn refresh_dispatch_audit(audit: &mut Value) -> Option<&'static str> {
+    let readonly = audit
+        .get("readonly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let owned = audit
+        .get("owned_paths")
+        .and_then(Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let Some(root) = audit
+        .get("project_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+    else {
+        *audit = audit_unavailable(
+            readonly,
+            &owned,
+            Path::new(""),
+            "dispatch audit project root is missing",
+        );
+        return audit_code(audit);
+    };
+    let after = match git_audit_snapshot(&root) {
+        Ok(after) => after,
+        Err(message) => {
+            *audit = audit_unavailable(readonly, &owned, &root, &message);
+            return audit_code(audit);
+        }
+    };
+    let before = audit.get("before").cloned().unwrap_or(Value::Null);
+    *audit = dispatch_audit_result(readonly, &owned, &root, before, after).0;
+    audit_code(audit)
+}
+
 pub fn run_with_parent_session(
     client: &HerdrClient,
     registry: &PromptRegistry,
@@ -4500,6 +4887,10 @@ pub fn run_with_parent_session(
         Ok(value) => value,
         Err(error) => return error,
     };
+    let (readonly, owned_paths) = match parse_dispatch_audit_options(args) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     let idempotency_key = match optional_str(args, "idempotency_key") {
         Ok(value) => value,
         Err(error) => return error,
@@ -4553,10 +4944,16 @@ pub fn run_with_parent_session(
     // Observation preferences such as wait are not part of mutation identity.
     // The same target/text intent must keep the same task under one idempotency key.
     // A spawn fingerprints its canonical spawn intent, never the pane it creates.
-    let fingerprint = match &spawn {
+    let base_fingerprint = match &spawn {
         Some(spawn) => spawn.request_fingerprint(text),
         None => request_fingerprint(target, text),
     };
+    let audit_identity = format!("readonly={readonly}\nowned_paths={owned_paths:?}");
+    let fingerprint = stable_digest(&[
+        b"herdr_prompt/dispatch/audit",
+        base_fingerprint.as_bytes(),
+        audit_identity.as_bytes(),
+    ]);
     let dispatch_id = dispatch_id(idempotency_key, &fingerprint);
     let task_id = dispatch_id.as_str();
     let mut operation_id = None;
@@ -4809,6 +5206,50 @@ pub fn run_with_parent_session(
             .pane_worktree(pane_id)
             .map(|worktree| (pane_id.to_owned(), worktree))
     });
+    let audit_root = handoff_target
+        .as_ref()
+        .map(|(_, worktree)| PathBuf::from(worktree));
+    let mut dispatch_audit = if readonly || !owned_paths.is_empty() {
+        let Some(root) = audit_root.as_deref() else {
+            let audit = audit_unavailable(
+                readonly,
+                &owned_paths,
+                Path::new(""),
+                "dispatch target has no auditable worktree",
+            );
+            return json!({
+                "ok": false,
+                "code": "dispatch_audit_unavailable",
+                "delivery_state": "not_delivered",
+                "audit": audit,
+            });
+        };
+        let before = match git_audit_snapshot(root) {
+            Ok(before) => before,
+            Err(message) => {
+                let audit = audit_unavailable(readonly, &owned_paths, root, &message);
+                return json!({
+                    "ok": false,
+                    "code": "dispatch_audit_unavailable",
+                    "delivery_state": "not_delivered",
+                    "audit": audit,
+                });
+            }
+        };
+        Some(json!({
+            "readonly": readonly,
+            "owned_paths": owned_paths,
+            "project_root": root.to_string_lossy(),
+            "before": before,
+            "after": Value::Null,
+            "changed_files": [],
+            "readonly_violation": false,
+            "scope_violation": false,
+            "result": "pending",
+        }))
+    } else {
+        None
+    };
     let injection = handoff_target
         .as_ref()
         .map(|(pane_id, worktree)| registry.inject_handoff_once(pane_id, worktree, text));
@@ -4848,6 +5289,57 @@ pub fn run_with_parent_session(
         ),
         Err(error) => prompt_failure(client, target, before.as_ref(), false, error, task_id),
     };
+    if let Some(audit) = dispatch_audit.as_mut() {
+        let root = audit
+            .get("project_root")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let after = root
+            .as_deref()
+            .and_then(|root| git_audit_snapshot(root).ok());
+        let updated = match (root.as_deref(), after) {
+            (Some(root), Some(after)) => {
+                let before = audit.get("before").cloned().unwrap_or(Value::Null);
+                let readonly = audit
+                    .get("readonly")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let owned = audit
+                    .get("owned_paths")
+                    .and_then(Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                dispatch_audit_result(readonly, &owned, root, before, after).0
+            }
+            _ => audit_unavailable(
+                audit
+                    .get("readonly")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                &owned_paths,
+                Path::new(""),
+                "dispatch audit could not read the post-submit worktree",
+            ),
+        };
+        *audit = updated.clone();
+        if let Some(object) = result.as_object_mut() {
+            object.insert("audit".to_owned(), updated.clone());
+            if let Some(code) = audit_code(&updated) {
+                object.insert("ok".to_owned(), json!(false));
+                object.insert("code".to_owned(), json!(code));
+                object.insert(
+                    "message".to_owned(),
+                    json!("dispatch completed with a worktree audit violation"),
+                );
+            }
+        }
+    }
     insert_task_id(&mut result, task_id);
     if let Some(resolved) = &resolution {
         result["requested_target"] = json!(requested_target);
@@ -4925,6 +5417,7 @@ pub fn run_with_parent_session(
         on_budget,
         request_id,
         foreground_blocker,
+        audit: dispatch_audit.clone(),
     }) {
         Ok(Some(task)) => {
             if let Some(object) = result.as_object_mut() {
@@ -7416,6 +7909,267 @@ mod tests {
         ))
     }
 
+    fn audit_repo(tag: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!(
+            "herdr-mcp-dispatch-audit-{tag}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("owned.txt"), "base\n").unwrap();
+        fs::write(root.join("other.txt"), "base\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=herdr-test@example.invalid",
+                    "-c",
+                    "user.name=herdr-test",
+                    "commit",
+                    "-qm",
+                    "base",
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        root
+    }
+
+    #[test]
+    fn dispatch_audit_reports_readonly_scope_and_clean_results() {
+        let root = audit_repo("matrix");
+        let before = git_audit_snapshot(&root).unwrap();
+        let (clean, code) = dispatch_audit_result(true, &[], &root, before.clone(), before.clone());
+        assert_eq!(code, None);
+        assert_eq!(clean["result"], "ok");
+        assert!(clean["audit"].is_null());
+
+        fs::write(root.join("owned.txt"), "changed\n").unwrap();
+        let after_owned = git_audit_snapshot(&root).unwrap();
+        let (readonly, code) =
+            dispatch_audit_result(true, &[], &root, before.clone(), after_owned.clone());
+        assert_eq!(code, Some("readonly_violation"));
+        assert_eq!(readonly["result"], "readonly_violation");
+        assert_eq!(readonly["changed_files"][0], "owned.txt");
+
+        let before_scope = after_owned.clone();
+        fs::write(root.join("other.txt"), "changed\n").unwrap();
+        let after_scope = git_audit_snapshot(&root).unwrap();
+        let (scope, code) = dispatch_audit_result(
+            false,
+            &["owned.txt".to_owned()],
+            &root,
+            before_scope,
+            after_scope,
+        );
+        assert_eq!(code, Some("scope_violation"));
+        assert_eq!(scope["result"], "scope_violation");
+        assert!(
+            scope["changed_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == "other.txt")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dispatch_audit_options_reject_invalid_owned_paths() {
+        assert_eq!(
+            parse_dispatch_audit_options(&json!({"owned_paths": ["../escape"]})).unwrap_err()["code"],
+            "invalid_params"
+        );
+        assert_eq!(
+            parse_dispatch_audit_options(&json!({"readonly": "yes"})).unwrap_err()["code"],
+            "invalid_params"
+        );
+    }
+
+    #[test]
+    fn dispatch_audit_ignores_preexisting_dirty_files_without_editing_them() {
+        let root = audit_repo("preexisting-dirty");
+        fs::write(root.join("other.txt"), "preexisting\n").unwrap();
+        let before = git_audit_snapshot(&root).unwrap();
+        fs::write(root.join("owned.txt"), "during-dispatch\n").unwrap();
+        let after = git_audit_snapshot(&root).unwrap();
+        let (audit, code) =
+            dispatch_audit_result(false, &["owned.txt".to_owned()], &root, before, after);
+        assert_eq!(code, None, "{audit}");
+        assert_eq!(audit["result"], "ok");
+        assert_eq!(audit["changed_files"], json!(["owned.txt"]));
+    }
+
+    #[test]
+    fn dispatch_audit_uses_commit_diff_paths_without_head_sentinel() {
+        let root = audit_repo("commit-diff");
+        let before = git_audit_snapshot(&root).unwrap();
+        fs::write(root.join("owned.txt"), "committed\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "owned.txt"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=herdr-test@example.invalid",
+                    "-c",
+                    "user.name=herdr-test",
+                    "commit",
+                    "-qm",
+                    "during dispatch",
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let after = git_audit_snapshot(&root).unwrap();
+        let (audit, code) =
+            dispatch_audit_result(false, &["owned.txt".to_owned()], &root, before, after);
+        assert_eq!(code, None, "{audit}");
+        assert_eq!(audit["result"], "ok");
+        assert_eq!(audit["changed_files"], json!(["owned.txt"]));
+        assert!(
+            !audit["changed_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == "__HEAD__")
+        );
+    }
+
+    #[test]
+    fn dispatch_audit_checks_both_sides_of_a_committed_rename() {
+        let root = audit_repo("commit-rename");
+        fs::write(root.join("secret.txt"), "secret\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "secret.txt"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=herdr-test@example.invalid",
+                    "-c",
+                    "user.name=herdr-test",
+                    "commit",
+                    "-qm",
+                    "add secret",
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let before = git_audit_snapshot(&root).unwrap();
+        fs::create_dir(root.join("owned")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["mv", "secret.txt", "owned/secret.txt"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=herdr-test@example.invalid",
+                    "-c",
+                    "user.name=herdr-test",
+                    "commit",
+                    "-qm",
+                    "move secret",
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let after = git_audit_snapshot(&root).unwrap();
+        let (audit, code) =
+            dispatch_audit_result(false, &["owned".to_owned()], &root, before, after);
+        assert_eq!(code, Some("scope_violation"), "{audit}");
+        assert_eq!(audit["result"], "scope_violation");
+        assert_eq!(
+            audit["changed_files"],
+            json!(["owned/secret.txt", "secret.txt"])
+        );
+    }
+
+    #[test]
+    fn dispatch_audit_unavailable_is_an_explicit_failure() {
+        let mut audit = json!({
+            "readonly": true,
+            "owned_paths": [],
+            "project_root": "/path/that/does/not/exist",
+            "before": Value::Null,
+        });
+        assert_eq!(
+            refresh_dispatch_audit(&mut audit),
+            Some("dispatch_audit_unavailable")
+        );
+        assert_eq!(audit["result"], "unavailable");
+        assert_eq!(audit_code(&audit), Some("dispatch_audit_unavailable"));
+    }
+
+    #[test]
+    fn worker_done_returns_audit_unavailable_when_refresh_cannot_snapshot() {
+        let (db_path, registry) = task_registry("audit-unavailable-worker-done");
+        let task_id = "dispatch:prompt:audit-unavailable";
+        let mut task = escalation_task(task_id, "child", PromptTaskLifecycle::Running, 0);
+        task.audit = Some(json!({
+            "readonly": true,
+            "owned_paths": [],
+            "project_root": "/path/that/does/not/exist",
+            "before": Value::Null,
+        }));
+        registry.save_task(&task, None).unwrap();
+        let response = registry.task_report(&json!({
+            "task_id": task_id,
+            "dispatch_id": task_id,
+            "kind": "worker_done",
+        }));
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["code"], "dispatch_audit_unavailable");
+        assert_eq!(response["audit"]["result"], "unavailable");
+        assert_eq!(
+            registry.load_task(task_id).unwrap().unwrap().audit.unwrap()["result"],
+            "unavailable"
+        );
+        remove_task_db(&db_path);
+    }
+
     #[test]
     fn idempotency_registry_prevents_parallel_and_conflicting_reuse() {
         let registry = PromptRegistry::new();
@@ -7963,6 +8717,7 @@ mod tests {
                 on_budget: None,
                 request_id: None,
                 foreground_blocker: None,
+                audit: None,
             })
             .unwrap()
             .expect("store present, so the task is registered");
@@ -9934,6 +10689,7 @@ mod tests {
                 max_runtime_ms: None,
                 on_budget: None,
                 foreground_blocker: None,
+                audit: None,
             })
             .unwrap()
             .unwrap();
@@ -10134,6 +10890,7 @@ mod tests {
                 max_runtime_ms: None,
                 on_budget: None,
                 foreground_blocker: None,
+                audit: None,
             })
             .unwrap()
             .unwrap();
@@ -10291,6 +11048,7 @@ mod tests {
                 max_runtime_ms: None,
                 on_budget: None,
                 foreground_blocker: None,
+                audit: None,
             })
             .unwrap()
             .unwrap();
@@ -10424,6 +11182,7 @@ mod tests {
             steering_state: None,
             superseded_by: None,
             foreground_blocker: None,
+            audit: None,
         }
     }
 
@@ -11776,6 +12535,7 @@ mod tests {
             steering_state: None,
             superseded_by: None,
             foreground_blocker: None,
+            audit: None,
         }
     }
 
@@ -13015,6 +13775,7 @@ mod tests {
                 max_runtime_ms: None,
                 on_budget: None,
                 foreground_blocker: None,
+                audit: None,
             })
             .unwrap()
             .unwrap();
@@ -13050,6 +13811,7 @@ mod tests {
                 max_runtime_ms: None,
                 on_budget: None,
                 foreground_blocker: None,
+                audit: None,
             })
             .unwrap()
             .unwrap();
@@ -13157,6 +13919,7 @@ mod tests {
             max_runtime_ms: None,
             on_budget: None,
             foreground_blocker: None,
+            audit: None,
         };
 
         crate::state_store::test_hooks::inject_ledger_batch_failure_after(Some(1));
@@ -13232,6 +13995,7 @@ mod tests {
                 max_runtime_ms: None,
                 on_budget: None,
                 foreground_blocker: None,
+                audit: None,
             })
             .unwrap()
             .unwrap();

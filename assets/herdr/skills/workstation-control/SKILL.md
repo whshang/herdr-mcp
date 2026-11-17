@@ -51,6 +51,7 @@ The project `HANDOFF.md` in a worktree is a **markdown view**, not the whole rel
 - The live git context (`## 工作区`: branch, changed files, next step) is page-level state, rendered once at the top and never evicted to satisfy the budget.
 - Entry guard: a summarizer rule/mistake longer than 280 characters, or one that names bound work (a PR/issue number, a run, a temporary path), is moved into the task list verbatim. Durable rules are short, repeatable statements — put one-off work in tasks.
 
+
 ## Bounded project pickup
 
 `herdr_mcp.work.pickup` returns a bounded projection (`projection.v = 1`) of the recorded project handoff, not the raw stored document. Its default response stays under 32 KB even when the stored handoff is megabytes, so it fits the Link's 256 KiB frame on the first call.
