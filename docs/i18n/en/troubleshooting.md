@@ -61,11 +61,13 @@ On macOS LaunchAgent installations:
 
 ```bash
 herdr-mcp status
-herdr-mcp logs
+herdr-mcp doctor --local
 herdr-mcp permissions status
 ```
 
 For `macos_tcc_access_blocked` from file/Git tools, follow the macOS permissions steps above. A plain `not_found` is not by itself evidence of a TCC block, but on a protected Desktop, Documents or Downloads path confirm with `herdr-mcp permissions status` before treating the path as absent.
+
+`herdr-mcp doctor --local` prints a read-only local snapshot: allow-listed processes (name, PID, start time), whether the loopback runtime port `8772` is listening, and key config-file metadata (existence and mtime). It never reads file contents, environment values or `state.db`; a named instance on a non-default port shows `listening:false` on 8772 by design.
 
 ### Is Herdr itself available?
 
@@ -110,7 +112,7 @@ Details that matter when `workers.dev` is unreachable:
 
 ### Does a new ChatGPT conversation get the current catalog?
 
-The current first-party DEV/PROD public ChatGPT contract is **epoch 8 / 19 actions**. Workstation execution is **epoch 5 / 18 tools**, including `herdr_skill`; the extra public action is Edge-local `herdr_devices`. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline.
+The current first-party DEV/PROD public ChatGPT contract is **epoch 8 / 19 actions**. Workstation execution is **epoch 6 / 18 tools**, including `herdr_skill`; the extra public action is Edge-local `herdr_devices`. The immediately previous frozen epoch-5 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline.
 
 Old conversations may retain an older `tools/list` snapshot. Before reinstalling anything, verify the server and open a new conversation.
 
