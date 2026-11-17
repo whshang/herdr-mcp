@@ -179,15 +179,16 @@ fn admit_agent_start_model(mut params: Value) -> Result<(Value, Option<Value>), 
         .to_owned();
     let check = crate::model_alias::validate_model_alias(&kind, &alias);
     let fact = crate::model_alias::validation_fact(&kind, &alias, &check);
-    if !matches!(check, crate::model_alias::ModelAliasCheck::Validated { .. }) {
+    let crate::model_alias::ModelAliasCheck::Validated { ref canonical } = check else {
         let mut refusal = crate::model_alias::model_alias_refusal(&kind, &alias, &check);
         refusal["method"] = json!("agent.start");
         return Err(refusal);
-    }
-    // The live schema decides how a validated alias is delivered. A native
-    // `model` property passes through; otherwise the `args` passthrough
-    // carries `--model <alias>` (pi's documented flag). Neither means the
-    // alias cannot be delivered provably: refuse instead of dropping it.
+    };
+    // The live schema decides how the validated canonical form is delivered.
+    // A native `model` property passes it through; otherwise the `args`
+    // passthrough carries `--model <canonical>` (pi's documented flag).
+    // Neither means the alias cannot be delivered provably: refuse instead of
+    // dropping it.
     let properties = match schema::agent_start_param_properties() {
         Ok(Some(properties)) => properties,
         Ok(None) => {
@@ -208,7 +209,7 @@ fn admit_agent_start_model(mut params: Value) -> Result<(Value, Option<Value>), 
         }
     };
     if properties.contains_key("model") {
-        params["model"] = json!(alias);
+        params["model"] = json!(canonical);
         return Ok((params, Some(fact)));
     }
     if properties.contains_key("args") {
@@ -236,7 +237,7 @@ fn admit_agent_start_model(mut params: Value) -> Result<(Value, Option<Value>), 
         }
         let mut args: Vec<Value> = existing_args.cloned().unwrap_or_default();
         args.push(json!("--model"));
-        args.push(json!(alias));
+        args.push(json!(canonical));
         params["args"] = Value::Array(args);
         if let Some(object) = params.as_object_mut() {
             object.remove("model");
@@ -918,11 +919,14 @@ mod tests {
         assert_eq!(result["available_models"], json!([]));
     }
 
-    /// 1.2 S5: an unknown pi alias is refused with the obtainable list.
+    /// 1.2 S5: an unknown pi alias is refused with the obtainable list, taken
+    /// from `pi --list-models` (S5 review P1-1), not the provider cache.
     #[test]
+    #[cfg(unix)]
     fn agent_start_unknown_pi_alias_reports_available_models() {
+        use std::os::unix::fs::PermissionsExt;
         let _guard = crate::test_env::lock();
-        let previous = std::env::var_os("PI_CODING_AGENT_DIR");
+        let previous = std::env::var_os("HERDR_PI_BIN");
         let dir = std::env::temp_dir().join(format!(
             "herdr-native-model-{}-{}",
             std::process::id(),
@@ -932,12 +936,14 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("pi");
         fs::write(
-            dir.join("models-store.json"),
-            r#"{"openai":{"models":[{"id":"gpt-4"}]}}"#,
+            &bin,
+            "#!/bin/sh\nif [ \"$1\" = \"--list-models\" ]; then\necho 'provider model'\necho 'openai gpt-4'\nelse\nexit 1\nfi\n",
         )
         .unwrap();
-        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &dir) };
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        unsafe { std::env::set_var("HERDR_PI_BIN", &bin) };
         let client = HerdrClient::new("/path/that/does/not/exist");
         let result = call(
             &client,
@@ -951,8 +957,8 @@ mod tests {
         assert_eq!(result["delivery_state"], "not_delivered");
         unsafe {
             match previous {
-                Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-                None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+                Some(value) => std::env::set_var("HERDR_PI_BIN", value),
+                None => std::env::remove_var("HERDR_PI_BIN"),
             }
         }
         let _ = fs::remove_dir_all(dir);

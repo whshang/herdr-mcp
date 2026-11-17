@@ -92,8 +92,10 @@ const SPAWN_READY_POLL: Duration = Duration::from_millis(200);
 const SPAWN_READY_MIN_POLL_MS: u64 = 250;
 const SPAWN_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 1.2 S5: how long after a confirmed `agent.start` the chain keeps watching
-/// for an early exit (a dead-on-start model/alias typically exits within
-/// seconds). Bounded so a healthy agent is never held for the full window.
+/// for an early exit. A healthy agent is held for the whole window: presence
+/// does not prove liveness, and dead-on-start agents often die several
+/// seconds in. The window is capped by the chain budget and prompt reserve
+/// so a small caller budget still keeps its prompt reserve.
 const SPAWN_EARLY_EXIT_WINDOW_MS: u64 = 10_000;
 /// Poll cadence inside the early-exit window; coarser than readiness polling
 /// because death is a discrete event, not a latency-sensitive transition.
@@ -137,6 +139,9 @@ struct RegisterTaskInput<'a> {
     stall_after_ms: Option<u64>,
     max_runtime_ms: Option<u64>,
     on_budget: Option<&'a str>,
+    /// S0 wire correlation id (`RuntimeContext.wire_request_id`) for the call
+    /// that created this task. Persisted so the terminal inbox row can be
+    /// matched back to the envelope `request_id` the dispatcher saw.
     request_id: Option<&'a str>,
 }
 
@@ -239,6 +244,9 @@ struct PromptTaskRecord {
     worker_done_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stall_after_ms: Option<u64>,
+    /// Correlates this task back to the wire `request_id` on the envelope of
+    /// the dispatch call that created it. Absent on records written before S3
+    /// and on calls that carried no wire id (direct `tool_call`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
     /// 1.2 S5: optional wall-clock run cap from task creation. Expiry emits
@@ -1813,23 +1821,20 @@ impl PromptRegistry {
             // rows on the next sweep (at-least-once recovery, same intent as
             // the pending terminal notification): a duplicate parent message is
             // preferable to a parent that never learns the cap expired.
-            let pending: Vec<(String, bool)> = task
+            // The interrupt is different: an undelivered C-c must never be
+            // replayed, so recovery passes `interrupt=false` and the delivery
+            // pass finalizes a leftover `pending` interrupt as `uncertain`
+            // instead of sending a second keystroke (S5 review P2-1).
+            let pending: Vec<String> = task
                 .budget_events
                 .iter()
-                .filter_map(|row| {
-                    let event = row.get("event").and_then(Value::as_str)?.to_owned();
-                    let still_pending =
-                        row.get("notification_state").and_then(Value::as_str) == Some("pending");
-                    if !still_pending {
-                        return None;
-                    }
-                    let interrupt_pending = task.on_budget.as_deref() == Some("interrupt")
-                        && row.get("interrupt_state").and_then(Value::as_str) == Some("pending");
-                    Some((event, interrupt_pending))
+                .filter(|row| {
+                    row.get("notification_state").and_then(Value::as_str) == Some("pending")
                 })
+                .filter_map(|row| row.get("event").and_then(Value::as_str).map(str::to_owned))
                 .collect();
-            for (event, interrupt) in pending {
-                self.deliver_budget_event(&task.task_id, &event, now, interrupt);
+            for event in pending {
+                self.deliver_budget_event(&task.task_id, &event, now, false);
             }
             let mut due: Vec<&'static str> = Vec::new();
             if let Some(stall) = task.stall_after_ms
@@ -1919,10 +1924,14 @@ impl PromptRegistry {
                 }
             }
         }
-        let mut interrupt_state = "not_requested".to_owned();
-        if interrupt {
-            interrupt_state = self.interrupt_task_pane(client, &task);
-        }
+        // A recovered sweep passes `interrupt=false`: never replay a C-c whose
+        // first delivery crashed between persist and send. The row's `pending`
+        // interrupt is finalized as `uncertain` below (S5 review P2-1).
+        let interrupt_state = if interrupt {
+            Some(self.interrupt_task_pane(client, &task))
+        } else {
+            None
+        };
         let Ok(_guard) = self.inner.task_mutations.lock() else {
             return;
         };
@@ -1935,7 +1944,19 @@ impl PromptRegistry {
             .find(|row| row.get("event").and_then(Value::as_str) == Some(event))
         {
             row["notification_state"] = json!(notification_state);
-            row["interrupt_state"] = json!(interrupt_state);
+            row["interrupt_state"] = json!(match interrupt_state {
+                Some(state) => state,
+                None => {
+                    if row.get("interrupt_state").and_then(Value::as_str) == Some("pending") {
+                        "uncertain".to_owned()
+                    } else {
+                        row["interrupt_state"]
+                            .as_str()
+                            .unwrap_or("not_requested")
+                            .to_owned()
+                    }
+                }
+            });
             if let Some(error) = notification_error {
                 row["notification_error"] = json!(error);
             }
@@ -4417,6 +4438,21 @@ struct SpawnRequest {
     /// Explicit model alias (1.2 S5). Part of the mutation identity: a
     /// different model is a different spawn intent under the same key.
     model: Option<String>,
+    /// The validated, schema-deliverable form produced at parse time. `None`
+    /// means either no model was requested or the live schema cannot carry
+    /// one — the latter refuses during parse, before any pane is created.
+    model_deliverable: Option<ModelDelivery>,
+}
+
+/// How a validated model alias is delivered on `agent.start`, decided during
+/// `parse_spawn` so a schema that cannot carry a model fails before the chain
+/// creates any pane (S5 review P1-3).
+#[derive(Debug, Clone)]
+enum ModelDelivery {
+    /// The schema exposes a native `model` property: pass the canonical form.
+    Property(String),
+    /// pi's documented `--model` passthrough via the `args` array.
+    Args(String),
 }
 
 impl SpawnRequest {
@@ -4811,16 +4847,47 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
     // re-validates and refuses identically, never spawning with an
     // unvalidated model.
     let model = spawn_optional_string(object, "model", 256)?;
+    let mut model_deliverable = None;
     if let Some(alias) = &model {
         let check = crate::model_alias::validate_model_alias(&kind, alias);
-        if !matches!(check, crate::model_alias::ModelAliasCheck::Validated { .. }) {
+        let crate::model_alias::ModelAliasCheck::Validated { canonical } = &check else {
             let mut refusal = crate::model_alias::model_alias_refusal(&kind, alias, &check);
             if let Some(object) = refusal.as_object_mut() {
                 object.insert("failed_step".to_owned(), json!("validate"));
                 object.insert("requires_human".to_owned(), json!(false));
             }
             return Err(refusal);
-        }
+        };
+        // The schema delivery decision belongs here too: a schema that cannot
+        // carry a model must refuse before the chain creates a pane, so the
+        // caller is never left with a residual pane and a failed start.
+        let deliverable = match crate::schema::agent_start_param_properties() {
+            Ok(Some(properties)) if properties.contains_key("model") => {
+                Some(ModelDelivery::Property(canonical.clone()))
+            }
+            Ok(Some(properties)) if properties.contains_key("args") && kind == "pi" => {
+                Some(ModelDelivery::Args(canonical.clone()))
+            }
+            _ => None,
+        };
+        let Some(delivery) = deliverable else {
+            let fact = crate::model_alias::validation_fact(&kind, alias, &check);
+            return Err(json!({
+                "ok": false,
+                "code": "model_delivery_unsupported",
+                "kind": kind,
+                "requested_model": alias,
+                "delivery_state": "not_delivered",
+                "submitted": false,
+                "fallback_allowed": false,
+                "retryable": false,
+                "model_validation": fact,
+                "failed_step": "validate",
+                "requires_human": false,
+                "message": "the live herdr agent.start schema cannot carry a model (no model property, and no args passthrough for a pi kind); the validated alias was not silently dropped",
+            }));
+        };
+        model_deliverable = Some(delivery);
     }
     Ok(Some(SpawnRequest {
         kind,
@@ -4832,6 +4899,7 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
         direction,
         startup_timeout_ms,
         model,
+        model_deliverable,
     }))
 }
 
@@ -5585,49 +5653,17 @@ fn spawn_chain(
                 "pane_id": pane_id,
                 "timeout_ms": native_timeout,
             });
-            // 1.2 S5: the alias was validated in parse_spawn; deliver it via
-            // the documented pi --model passthrough. A live schema that cannot
-            // carry it refuses here, before agent.start, never silently drops it.
-            if let Some(alias) = &spawn.request.model {
-                let properties = crate::schema::agent_start_param_properties();
-                let deliverable = match &properties {
-                    Ok(Some(props)) => crate::model_alias::start_params_support_model(props),
-                    _ => false,
-                };
-                if !deliverable {
-                    let check = crate::model_alias::ModelAliasCheck::Validated {
-                        canonical: alias.clone(),
-                    };
-                    let fact =
-                        crate::model_alias::validation_fact(&spawn.request.kind, alias, &check);
-                    let mut refusal = json!({
-                        "ok": false,
-                        "code": "model_delivery_unsupported",
-                        "kind": spawn.request.kind,
-                        "requested_model": alias,
-                        "delivery_state": "not_delivered",
-                        "submitted": false,
-                        "fallback_allowed": false,
-                        "retryable": false,
-                        "model_validation": fact,
-                        "message": "the live herdr agent.start schema cannot carry a model (no model property or args passthrough); the validated alias was not silently dropped",
-                    });
-                    if let Some(object) = refusal.as_object_mut() {
-                        object.insert("failed_step".to_owned(), json!("agent_start"));
-                        object.insert("spawn".to_owned(), progress.facts(spawn));
-                    }
-                    return Err(refusal);
+            // 1.2 S5: the alias was validated and its delivery form chosen in
+            // parse_spawn; here we only apply it. A schema that cannot carry a
+            // model refused during parse, before this pane ever existed.
+            match &spawn.request.model_deliverable {
+                Some(ModelDelivery::Property(canonical)) => {
+                    start_params["model"] = json!(canonical);
                 }
-                let supports_native_model = properties
-                    .as_ref()
-                    .ok()
-                    .and_then(|props| props.as_ref())
-                    .is_some_and(|props| props.contains_key("model"));
-                if supports_native_model {
-                    start_params["model"] = json!(alias);
-                } else {
-                    start_params["args"] = json!(["--model", alias]);
+                Some(ModelDelivery::Args(canonical)) => {
+                    start_params["args"] = json!(["--model", canonical]);
                 }
+                None => {}
             }
             match client.call_with_timeout(
                 "agent.start",
@@ -12635,36 +12671,19 @@ mod tests {
 
     // ---- 1.2 S5: model alias validation, early-exit detection, run bounds ----
 
-    /// Write a pi model catalog under a fresh temp agent dir and point
-    /// PI_CODING_AGENT_DIR at it. Caller holds test_env::lock and restores.
-    fn s5_pi_catalog(tag: &str) -> PathBuf {
+    /// Write a fake `pi` whose `--list-models` is the authoritative registry
+    /// (S5 review P1-1). Caller holds test_env::lock and restores.
+    fn s5_pi_registry(tag: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!(
             "herdr-mcp-s5-{tag}-{}-{}",
             std::process::id(),
             now_ms()
         ));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("models-store.json"),
-            r#"{"openai":{"models":[{"id":"gpt-4"},{"id":"gpt-5.1-codex"}]}}"#,
-        )
-        .unwrap();
-        dir
-    }
-
-    /// A fake `herdr` binary whose `api schema --json` advertises an
-    /// agent.start with an `args` passthrough (the live shape today).
-    fn s5_fake_herdr_bin(tag: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!(
-            "herdr-mcp-s5-bin-{tag}-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("herdr");
+        let bin = dir.join("pi");
         fs::write(
             &bin,
-            "#!/bin/sh\nif [ \"$1\" = \"api\" ]; then\ncat <<'EOF'\n{\"schemas\":{\"request\":{\"oneOf\":[{\"properties\":{\"method\":{\"const\":\"agent.start\"},\"params\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\"},\"pane_id\":{\"type\":\"string\"},\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"name\",\"kind\",\"pane_id\"]}}}],\"$defs\":{}}}}\nEOF\nelse\nexit 1\nfi\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--list-models\" ]; then\ncat <<'EOF'\nprovider                model\nopenai                  gpt-4\nopenai                  gpt-5.1-codex\nmagpie                  aliyun/auto/deepseek-v4.1-flash\nanthropic               claude-opus-4-5\nEOF\nelse\nexit 1\nfi\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -12672,31 +12691,36 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        bin
+        dir
+    }
+
+    /// The fake schema document injected on-thread for model-delivery tests:
+    /// agent.start advertises an `args` passthrough (the live shape today).
+    /// Thread-local injection keeps these tests independent of the shared
+    /// 60-second schema cache (S5 review P1-3).
+    fn s5_schema_with_args() -> serde_json::Value {
+        json!({"schemas":{"request":{"oneOf":[{"properties":{"method":{"const":"agent.start"},"params":{"type":"object","properties":{"name":{"type":"string"},"kind":{"type":"string"},"pane_id":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["name","kind","pane_id"]}}}],"$defs":{}}}})
     }
 
     struct S5Env {
         prev_pi: Option<std::ffi::OsString>,
-        prev_bin: Option<std::ffi::OsString>,
+        prev_pi_bin: Option<std::ffi::OsString>,
         dirs: Vec<PathBuf>,
     }
 
     impl S5Env {
-        fn set(tag: &str, with_bin: bool) -> Self {
+        fn set(tag: &str) -> Self {
             let prev_pi = env::var_os("PI_CODING_AGENT_DIR");
-            let prev_bin = env::var_os("HERDR_BIN");
-            let catalog = s5_pi_catalog(tag);
-            unsafe { env::set_var("PI_CODING_AGENT_DIR", &catalog) };
-            let mut dirs = vec![catalog];
-            if with_bin {
-                let bin = s5_fake_herdr_bin(tag);
-                unsafe { env::set_var("HERDR_BIN", &bin) };
-                dirs.push(bin.parent().unwrap().to_path_buf());
+            let prev_pi_bin = env::var_os("HERDR_PI_BIN");
+            let registry_dir = s5_pi_registry(tag);
+            unsafe {
+                env::set_var("HERDR_PI_BIN", registry_dir.join("pi"));
+                env::remove_var("PI_CODING_AGENT_DIR");
             }
             Self {
                 prev_pi,
-                prev_bin,
-                dirs,
+                prev_pi_bin,
+                dirs: vec![registry_dir],
             }
         }
     }
@@ -12708,9 +12732,9 @@ mod tests {
                     Some(value) => env::set_var("PI_CODING_AGENT_DIR", value),
                     None => env::remove_var("PI_CODING_AGENT_DIR"),
                 }
-                match self.prev_bin.take() {
-                    Some(value) => env::set_var("HERDR_BIN", value),
-                    None => env::remove_var("HERDR_BIN"),
+                match self.prev_pi_bin.take() {
+                    Some(value) => env::set_var("HERDR_PI_BIN", value),
+                    None => env::remove_var("HERDR_PI_BIN"),
                 }
             }
             for dir in &self.dirs {
@@ -12730,7 +12754,7 @@ mod tests {
         // The watch-off guard owns the crate env lock for its lifetime; all
         // other env mutations in this test run after it is taken.
         let (registry, _watch_off) = spawn_registry(&root, 80);
-        let _env = S5Env::set("unknown-alias", false);
+        let _env = S5Env::set("unknown-alias");
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-99"},
             "text": "work",
@@ -12746,7 +12770,12 @@ mod tests {
         assert_eq!(first["model_validation"]["validated"], false);
         assert_eq!(
             first["available_models"],
-            json!(["openai/gpt-4", "openai/gpt-5.1-codex"])
+            json!([
+                "openai/gpt-4",
+                "openai/gpt-5.1-codex",
+                "magpie/aliyun/auto/deepseek-v4.1-flash",
+                "anthropic/claude-opus-4-5",
+            ])
         );
         // Validation happens before key reservation (same as every spawn
         // validate failure): a retry re-validates and refuses identically,
@@ -12771,7 +12800,7 @@ mod tests {
         let listener = refused_spawn_server(&socket);
         // The watch-off guard owns the crate env lock for its lifetime.
         let (registry, _watch_off) = spawn_registry(&root, 80);
-        let _env = S5Env::set("no-list", false);
+        let _env = S5Env::set("no-list");
         let result = run(
             &HerdrClient::new(&socket),
             &registry,
@@ -12817,16 +12846,18 @@ mod tests {
         );
         // The watch-off guard owns the crate env lock for its lifetime.
         let (registry, _watch_off) = spawn_registry(&root, 80);
-        let _env = S5Env::set("model-flag", true);
-        let result = run(
-            &HerdrClient::new(&socket),
-            &registry,
-            &json!({
-                "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-4", "startup_timeout_ms": 40_000},
-                "text": "work",
-                "idempotency_key": "s5-modelflag",
-            }),
-        );
+        let _env = S5Env::set("model-flag");
+        let result = crate::schema::with_test_schema_document(s5_schema_with_args(), || {
+            run(
+                &HerdrClient::new(&socket),
+                &registry,
+                &json!({
+                    "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-4", "startup_timeout_ms": 40_000},
+                    "text": "work",
+                    "idempotency_key": "s5-modelflag",
+                }),
+            )
+        });
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();
         assert_eq!(result["ok"], true, "{result}");
@@ -12854,50 +12885,38 @@ mod tests {
     fn spawn_model_without_schema_delivery_fails_closed() {
         let root = spawn_project_root("s5-nodelivery");
         let socket = temp_socket();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let server = scripted_spawn_server(
-            UnixListener::bind(&socket).unwrap(),
-            vec![spawn_tab_created()],
-            requests.clone(),
-        );
+        // The refusal now happens in parse_spawn, before any socket contact:
+        // no pane is ever created for a schema that cannot carry a model.
+        let listener = refused_spawn_server(&socket);
         // The watch-off guard owns the crate env lock for its lifetime; the
         // HERDR_BIN / catalog overrides below run after it is taken.
         let (registry, _watch_off) = spawn_registry(&root, 80);
-        // Catalog but no usable HERDR_BIN: point HERDR_BIN at a binary that
-        // fails, so the schema is unavailable and delivery cannot be proven.
-        let _env = S5Env::set("no-delivery", false);
-        let dir = env::temp_dir().join(format!("herdr-mcp-s5-nobin-{}", now_ms()));
-        fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("herdr");
-        fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        unsafe { env::set_var("HERDR_BIN", &bin) };
-        let result = run(
-            &HerdrClient::new(&socket),
-            &registry,
-            &json!({
-                "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-4"},
-                "text": "work",
-                "idempotency_key": "s5-nodelivery",
-            }),
-        );
-        server.join().unwrap();
+        // Force the schema unavailable **on this thread** instead of relying
+        // on a failing HERDR_BIN plus the process-level schema cache: the cache
+        // is shared (TTL 60s), so an earlier test's fake herdr could answer for
+        // this one and the refusal would never be reached (S5 review P1-3).
+        let _env = S5Env::set("no-delivery");
+        let result = crate::schema::with_test_schema_unavailable(|| {
+            run(
+                &HerdrClient::new(&socket),
+                &registry,
+                &json!({
+                    "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-4"},
+                    "text": "work",
+                    "idempotency_key": "s5-nodelivery",
+                }),
+            )
+        });
         assert_eq!(result["ok"], false, "{result}");
         assert_eq!(result["code"], "model_delivery_unsupported");
-        assert_eq!(result["failed_step"], "agent_start");
+        assert_eq!(result["failed_step"], "validate");
         assert_eq!(result["delivery_state"], "not_delivered");
         assert_eq!(result["model_validation"]["validated"], true);
-        let recorded = requests.lock().unwrap();
-        assert!(
-            recorded.iter().all(|r| r["method"] != "agent.start"),
-            "agent.start must not be called without a deliverable model: {recorded:?}"
+        assert!(result.get("reclaim").is_none(), "{result}");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
         );
-        unsafe { env::remove_var("HERDR_BIN") };
-        let _ = fs::remove_dir_all(&dir);
         fs::remove_dir_all(root).unwrap();
     }
 

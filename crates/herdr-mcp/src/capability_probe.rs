@@ -276,48 +276,104 @@ pub fn pi_live_model_evidence(session_value: &str, observed_at_ms: i64) -> PiMod
     }
 }
 
-/// Upper bound on the pi model catalog file. The store caches every provider's
-/// full catalog; a larger file is treated as unavailable rather than parsed.
-const MAX_PI_MODELS_STORE_BYTES: u64 = 4 * 1024 * 1024;
 /// Bound on the returned alias list so a huge catalog cannot bloat a refusal.
 const MAX_PI_MODEL_ALIASES: usize = 512;
 
-/// Obtainable pi model aliases from the local pi model catalog
-/// (`models-store.json` under the pi agent dir). Each entry is
-/// `provider/model-id`; a bare `model-id` is also a valid pi `--model` pattern
-/// and is accepted by the validator, but the listed form is canonical.
+/// Bound on the `pi --list-models` subprocess: a hung or interactive pi must
+/// never stall a dispatch, and its output is a fixed table.
+const PI_LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Obtainable pi model aliases from **pi's own registry** (`pi --list-models`).
 ///
-/// Returns `None` when no catalog is obtainable (missing dir/file, oversized,
-/// unreadable, or malformed): callers must then report `validated: false`
-/// instead of guessing. This is a read-only projection of pi's own cache, not
-/// an authenticated inventory; pi may know models the cache has not fetched.
+/// The provider catalog cache (`models-store.json`) is a partial fetch cache,
+/// not pi's model registry: it omits built-in providers (anthropic) and
+/// user-configured ones (magpie, ...), and it can list providers whose API key
+/// pi does not have. Trusting it reported `validated: true` for models pi
+/// cannot run while refusing the models the operator actually uses (S5 review
+/// P1-1). Only the registry pi itself resolves is authoritative, so
+/// `validated: true` can only ever name a model `pi --list-models` lists.
+///
+/// Returns `None` when no runnable pi/list is obtainable (missing binary,
+/// non-zero exit, timeout, empty output): callers then report
+/// `validated: false` instead of guessing. `HERDR_PI_BIN` selects the binary
+/// (tests, development).
 pub fn pi_model_aliases() -> Option<Vec<String>> {
-    let path = pi_agent_dir()?.join("models-store.json");
-    let value = read_small_json(&path, MAX_PI_MODELS_STORE_BYTES)?;
-    pi_model_aliases_from_store(&value)
+    let bin = std::env::var_os("HERDR_PI_BIN")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("pi"));
+    let output = run_bounded_pi_list_models(&bin)?;
+    pi_model_aliases_from_list(&output)
 }
 
-fn pi_model_aliases_from_store(value: &Value) -> Option<Vec<String>> {
-    let providers = value.as_object()?;
-    let mut aliases = Vec::new();
-    for (provider, entry) in providers {
-        if !valid_model_segment(provider) {
-            continue;
+/// Run `pi --list-models` with a hard bound and capture stdout only.
+fn run_bounded_pi_list_models(bin: &Path) -> Option<String> {
+    let mut child = std::process::Command::new(bin)
+        .arg("--list-models")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) if started.elapsed() < PI_LIST_MODELS_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
-        let Some(models) = entry.get("models").and_then(Value::as_array) else {
+    }
+    // Read stdout directly instead of wait_with_output: try_wait already
+    // reaped the child, and a second wait can report an error on some
+    // platforms even though the process exited cleanly.
+    let mut stdout = Vec::new();
+    let read_ok = child
+        .stdout
+        .take()
+        .is_some_and(|mut pipe| std::io::Read::read_to_end(&mut pipe, &mut stdout).is_ok());
+    let text = String::from_utf8_lossy(&stdout);
+    (read_ok && !text.trim().is_empty()).then(|| text.into_owned())
+}
+
+/// Parse the `pi --list-models` table: header line, then
+/// `provider  model  context  max-out  thinking  images`. Columns beyond the
+/// second are ignored, so a wider or narrower table stays parseable; a row
+/// without two bounded segments is skipped.
+fn pi_model_aliases_from_list(text: &str) -> Option<Vec<String>> {
+    let mut aliases: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(provider), Some(model)) = (fields.next(), fields.next()) else {
             continue;
         };
-        for model in models {
-            let Some(id) = model.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            if !valid_model_segment(id) {
-                continue;
-            }
-            aliases.push(format!("{provider}/{id}"));
-            if aliases.len() >= MAX_PI_MODEL_ALIASES {
-                return Some(aliases);
-            }
+        if provider == "provider" && model == "model" {
+            continue;
+        }
+        if !valid_model_segment(provider) || !valid_model_segment(model) {
+            continue;
+        }
+        let alias = format!("{provider}/{model}");
+        if !aliases.contains(&alias) {
+            aliases.push(alias);
+        }
+        if aliases.len() >= MAX_PI_MODEL_ALIASES {
+            break;
         }
     }
     (!aliases.is_empty()).then_some(aliases)
@@ -1003,33 +1059,92 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    fn fake_pi_listing(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("pi");
+        fs::write(&bin, body).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// S5 review P1-1: the authoritative list is pi's own registry
+    /// (`pi --list-models`), parsed from its provider table.
+    #[cfg(unix)]
     #[test]
-    fn pi_model_aliases_reads_the_local_catalog() {
+    fn pi_model_aliases_come_from_the_pi_registry() {
         let _guard = crate::test_env::lock();
-        let previous = std::env::var_os("PI_CODING_AGENT_DIR");
-        let dir = temp_dir("pi-model-aliases");
+        let previous = std::env::var_os("HERDR_PI_BIN");
+        let dir = temp_dir("pi-model-registry");
         fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &dir) };
-        // Missing catalog: unobtainable, never a guess.
-        assert!(pi_model_aliases().is_none());
-        fs::write(
-            dir.join("models-store.json"),
-            r#"{"openai":{"models":[{"id":"gpt-4"},{"id":"gpt-5.1-codex"}]},"zai":{"models":[{"id":"glm-5"}]},"broken":{"models":"nope"}}"#,
-        )
-        .unwrap();
+        let bin = fake_pi_listing(
+            &dir,
+            "#!/bin/sh\nif [ \"$1\" = \"--list-models\" ]; then\ncat <<'EOF'\nprovider                model                                                 context  max-out  thinking  images\nmagpie                  aliyun/auto/deepseek-v4.1-flash                       1M       128K     no        no\nanthropic               claude-opus-4-5                                       1M       128K     yes       no\nopenai                  gpt-4                                                 1M       128K     no        no\nlone-row\nEOF\nelse\nexit 1\nfi\n",
+        );
+        unsafe { std::env::set_var("HERDR_PI_BIN", &bin) };
         let aliases = pi_model_aliases().unwrap();
-        assert!(aliases.contains(&"openai/gpt-4".to_owned()));
-        assert!(aliases.contains(&"openai/gpt-5.1-codex".to_owned()));
-        assert!(aliases.contains(&"zai/glm-5".to_owned()));
-        assert_eq!(aliases.len(), 3);
-        // Malformed store: unobtainable.
-        fs::write(dir.join("models-store.json"), "not json").unwrap();
+        assert_eq!(
+            aliases,
+            vec![
+                "magpie/aliyun/auto/deepseek-v4.1-flash".to_owned(),
+                "anthropic/claude-opus-4-5".to_owned(),
+                "openai/gpt-4".to_owned(),
+            ],
+            "header and malformed rows are skipped"
+        );
+        // A pi that cannot list models is unobtainable (validated:false).
+        let failing = fake_pi_listing(&dir, "#!/bin/sh\nexit 1\n");
+        unsafe { std::env::set_var("HERDR_PI_BIN", &failing) };
         assert!(pi_model_aliases().is_none());
-        // Empty catalog: unobtainable (validated:false), not an empty list.
-        fs::write(dir.join("models-store.json"), r#"{"openai":{"models":[]}}"#).unwrap();
+        // A missing binary is unobtainable too.
+        unsafe { std::env::set_var("HERDR_PI_BIN", dir.join("missing-pi")) };
         assert!(pi_model_aliases().is_none());
         unsafe {
             match previous {
+                Some(value) => std::env::set_var("HERDR_PI_BIN", value),
+                None => std::env::remove_var("HERDR_PI_BIN"),
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// S5 review P1-1 regression: a model that only the partial provider cache
+    /// lists (but pi cannot run) must not validate, and the cache must not feed
+    /// `available_models`.
+    #[cfg(unix)]
+    #[test]
+    fn pi_model_aliases_ignore_the_partial_store_cache() {
+        let _guard = crate::test_env::lock();
+        let previous_bin = std::env::var_os("HERDR_PI_BIN");
+        let previous_dir = std::env::var_os("PI_CODING_AGENT_DIR");
+        let dir = temp_dir("pi-model-store-only");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("models-store.json"),
+            r#"{"openai":{"models":[{"id":"gpt-4"}]}}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &dir) };
+        let bin = fake_pi_listing(
+            &dir,
+            "#!/bin/sh\nif [ \"$1\" = \"--list-models\" ]; then\nprintf 'provider model\nmagpie aliyun/auto/deepseek-v4.1-flash\n';\nelse\nexit 1\nfi\n",
+        );
+        unsafe { std::env::set_var("HERDR_PI_BIN", &bin) };
+        let aliases = pi_model_aliases().unwrap();
+        assert_eq!(
+            aliases,
+            vec!["magpie/aliyun/auto/deepseek-v4.1-flash".to_owned()]
+        );
+        assert!(
+            !aliases.iter().any(|alias| alias == "openai/gpt-4"),
+            "the partial store cache must not feed validation: {aliases:?}"
+        );
+        unsafe {
+            match previous_bin {
+                Some(value) => std::env::set_var("HERDR_PI_BIN", value),
+                None => std::env::remove_var("HERDR_PI_BIN"),
+            }
+            match previous_dir {
                 Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
                 None => std::env::remove_var("PI_CODING_AGENT_DIR"),
             }
@@ -1037,16 +1152,17 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Pure parser: header/extra columns tolerated, malformed rows skipped,
+    /// duplicates collapsed, bounded.
     #[test]
-    fn pi_model_aliases_from_store_bounds_and_filters() {
-        let store = json!({
-            "openai": {"models": [{"id": "gpt-4"}, {"id": "bad id"}, {"id": ""}, {"no_id": true}]},
-            "bad provider": {"models": [{"id": "x"}]},
-            "empty": {"models": []}
-        });
-        let aliases = pi_model_aliases_from_store(&store).unwrap();
-        assert_eq!(aliases, vec!["openai/gpt-4".to_owned()]);
-        assert!(pi_model_aliases_from_store(&json!({})).is_none());
-        assert!(pi_model_aliases_from_store(&json!([])).is_none());
+    fn pi_model_aliases_parse_the_registry_table_bounds() {
+        assert_eq!(
+            pi_model_aliases_from_list(
+                "provider model context\nmagpie aliyun/auto/x 1M 128K no no\nmagpie aliyun/auto/x 1M\nonly-one-column\n"
+            ),
+            Some(vec!["magpie/aliyun/auto/x".to_owned()])
+        );
+        assert!(pi_model_aliases_from_list("").is_none());
+        assert!(pi_model_aliases_from_list("provider model\n").is_none());
     }
 }

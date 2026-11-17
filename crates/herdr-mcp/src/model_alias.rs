@@ -29,7 +29,8 @@ pub enum ModelAliasCheck {
 
 /// Split one alias into the model pattern and optional thinking suffix.
 /// Returns `None` for structurally invalid aliases (empty, oversized,
-/// control/whitespace characters, more than one `:` or `/`).
+/// control/whitespace characters, more than one `:`, or an empty provider/id
+/// segment).
 fn split_alias(alias: &str) -> Option<(&str, Option<&str>)> {
     if alias.is_empty()
         || alias.len() > 256
@@ -43,7 +44,16 @@ fn split_alias(alias: &str) -> Option<(&str, Option<&str>)> {
         Some((pattern, thinking)) => (pattern, Some(thinking)),
         None => (alias, None),
     };
-    if pattern.is_empty() || pattern.split('/').count() > 2 {
+    // `provider/id` splits on the FIRST slash only: pi model ids may contain
+    // slashes themselves (magpie's `aliyun/auto/<model>`), and rejecting those
+    // would make the validator disagree with `pi --list-models` (S5 review
+    // P1-2). A bare id (no slash) stays valid; an empty provider or id is not.
+    if pattern.is_empty() {
+        return None;
+    }
+    if let Some((provider, id)) = pattern.split_once('/')
+        && (provider.is_empty() || id.is_empty())
+    {
         return None;
     }
     if thinking.is_some_and(|level| level.is_empty() || level.contains([':', '/'])) {
@@ -55,7 +65,7 @@ fn split_alias(alias: &str) -> Option<(&str, Option<&str>)> {
 /// Validate against an already-obtained list (pure; the production caller
 /// supplies `capability_probe::pi_model_aliases()`).
 pub fn check_alias_in_list(alias: &str, available: &[String]) -> ModelAliasCheck {
-    let Some((pattern, _thinking)) = split_alias(alias) else {
+    let Some((pattern, thinking)) = split_alias(alias) else {
         return ModelAliasCheck::Unknown {
             available: available.to_vec(),
         };
@@ -69,9 +79,13 @@ pub fn check_alias_in_list(alias: &str, available: &[String]) -> ModelAliasCheck
     let canonical = if available.iter().any(|candidate| candidate == pattern) {
         Some(pattern.to_owned())
     } else if !pattern.contains('/') {
-        let mut matches = available
-            .iter()
-            .filter(|candidate| candidate.rsplit('/').next() == Some(pattern));
+        // A bare id matches the id part after the FIRST slash, mirroring how an
+        // id may itself contain slashes.
+        let mut matches = available.iter().filter(|candidate| {
+            candidate
+                .split_once('/')
+                .is_some_and(|(_provider, id)| id == pattern)
+        });
         match (matches.next(), matches.next()) {
             (Some(only), None) => Some(only.clone()),
             _ => None,
@@ -80,7 +94,15 @@ pub fn check_alias_in_list(alias: &str, available: &[String]) -> ModelAliasCheck
         None
     };
     match canonical {
-        Some(canonical) => ModelAliasCheck::Validated { canonical },
+        // The validated form is the one delivered to the agent: the listed
+        // `provider/id`, carrying the caller's `:thinking` suffix verbatim so
+        // the requested effort level survives provider qualification.
+        Some(canonical) => ModelAliasCheck::Validated {
+            canonical: match thinking {
+                Some(level) => format!("{canonical}:{level}"),
+                None => canonical,
+            },
+        },
         None => ModelAliasCheck::Unknown {
             available: available.to_vec(),
         },
@@ -175,14 +197,6 @@ pub fn model_alias_refusal(kind: &str, alias: &str, check: &ModelAliasCheck) -> 
         }
     }
     refusal
-}
-
-/// Whether the installed herdr `agent.start` schema can carry a model at all.
-/// The live schema is authoritative: when it declares neither a `model`
-/// property nor an `args` passthrough, even a validated alias cannot be
-/// delivered, so the caller must refuse instead of dropping it silently.
-pub fn start_params_support_model(properties: &serde_json::Map<String, Value>) -> bool {
-    properties.contains_key("model") || properties.contains_key("args")
 }
 
 #[cfg(test)]
@@ -287,14 +301,5 @@ mod tests {
         assert_eq!(unvalidatable["code"], "model_alias_unknown");
         assert_eq!(unvalidatable["model_validation"]["validated"], false);
         assert_eq!(unvalidatable["available_models"], json!([]));
-    }
-
-    #[test]
-    fn schema_support_requires_model_or_args() {
-        let mut props = serde_json::Map::new();
-        props.insert("kind".to_owned(), json!({"type": "string"}));
-        assert!(!start_params_support_model(&props));
-        props.insert("args".to_owned(), json!({"type": "array"}));
-        assert!(start_params_support_model(&props));
     }
 }
