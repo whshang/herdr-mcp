@@ -99,6 +99,41 @@ pub struct MutationLeaseView {
     pub branch: Option<String>,
     pub acquired_at: i64,
     pub expires_at: i64,
+    pub intent: String,
+    pub readers: Vec<crate::state_store::mutation_leases::MutationLeaseReader>,
+}
+
+#[derive(serde::Deserialize)]
+struct StatusStoredReader {
+    #[serde(flatten)]
+    reader: crate::state_store::mutation_leases::MutationLeaseReader,
+    token_sha256: String,
+    #[serde(rename = "updated_at")]
+    _updated_at: i64,
+    epoch: i64,
+}
+
+impl StatusStoredReader {
+    fn valid_for_epoch(&self, epoch: i64) -> bool {
+        let valid_id = |value: &str| {
+            !value.is_empty()
+                && value == value.trim()
+                && value.len() <= crate::state_store::mutation_leases::MAX_MUTATION_LEASE_ID_BYTES
+                && !value.chars().any(char::is_control)
+        };
+        self.epoch == epoch
+            && valid_id(&self.reader.holder_id)
+            && [
+                &self.reader.device_id,
+                &self.reader.workspace_id,
+                &self.reader.pane_id,
+                &self.reader.branch,
+            ]
+            .into_iter()
+            .all(|value| value.as_deref().is_none_or(valid_id))
+            && self.token_sha256.len() == 64
+            && self.token_sha256.chars().all(|c| c.is_ascii_hexdigit())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,31 +200,78 @@ pub fn probe_mutation_leases(state_db_path: &Path, now_ms: i64) -> MutationLease
     if !table_exists {
         return MutationLeasesProbe::Uninitialized;
     }
-    let mut stmt = match conn.prepare(
+    // Older binaries may have created the table without either auxiliary column.
+    let has_column = |name: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mutation_leases') WHERE name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+    };
+    let (Ok(has_intent), Ok(has_readers)) = (has_column("intent"), has_column("readers_json"))
+    else {
+        return MutationLeasesProbe::Unreadable;
+    };
+    let sql = format!(
         "SELECT project_root, lane_key, holder_id, lease_epoch,
-                workspace_id, pane_id, branch, acquired_at, expires_at
+                workspace_id, pane_id, branch, acquired_at, expires_at, {}, {}
            FROM mutation_leases
           WHERE released_at IS NULL AND expires_at > ?1
           ORDER BY project_root, lane_key
           LIMIT 32",
-    ) {
+        if has_intent { "intent" } else { "NULL" },
+        if has_readers { "readers_json" } else { "NULL" },
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(stmt) => stmt,
         Err(_) => return MutationLeasesProbe::Unreadable,
     };
     let leases = match stmt.query_map([now_ms], |row| {
+        let lease_epoch: i64 = row.get(3)?;
+        let intent: Option<String> = row.get(9)?;
+        let intent = if intent.as_deref() == Some("read") {
+            "read"
+        } else {
+            "write"
+        };
+        let readers_json: Option<String> = row.get(10)?;
+        let readers = if intent == "read" {
+            let stored: Vec<StatusStoredReader> =
+                serde_json::from_str(readers_json.as_deref().unwrap_or("[]")).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            stored
+                .into_iter()
+                .filter(|entry| entry.valid_for_epoch(lease_epoch))
+                .take(64)
+                .filter(|entry| entry.reader.expires_at > now_ms)
+                .map(|entry| entry.reader)
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(MutationLeaseView {
             project_root: row.get(0)?,
             lane_key: row.get(1)?,
             holder_id: row.get(2)?,
-            lease_epoch: row.get(3)?,
+            lease_epoch,
             workspace_id: row.get(4)?,
             pane_id: row.get(5)?,
             branch: row.get(6)?,
             acquired_at: row.get(7)?,
             expires_at: row.get(8)?,
+            intent: intent.to_owned(),
+            readers,
         })
     }) {
-        Ok(rows) => rows.filter_map(Result::ok).collect::<Vec<_>>(),
+        Ok(rows) => match rows.collect::<rusqlite::Result<Vec<_>>>() {
+            Ok(leases) => leases,
+            Err(_) => return MutationLeasesProbe::Unreadable,
+        },
         Err(_) => return MutationLeasesProbe::Unreadable,
     };
     if leases.is_empty() {
@@ -1309,6 +1391,9 @@ fn mutation_leases_json(probe: &MutationLeasesProbe) -> Value {
                     "branch": lease.branch,
                     "acquired_at": lease.acquired_at,
                     "expires_at": lease.expires_at,
+                    "intent": lease.intent,
+                    "reader_count": lease.readers.len(),
+                    "readers": lease.readers,
                 })
             })
             .collect::<Vec<_>>(),
@@ -2801,8 +2886,55 @@ mod tests {
                 "branch": "feat/a",
                 "acquired_at": now - 5_000,
                 "expires_at": now + 300_000,
+                "intent": "write",
+                "reader_count": 0,
+                "readers": [],
             })
         );
+        // New columns are observed without migrating legacy tables; stale epochs,
+        // expired readers, and stored capabilities must not reach doctor output.
+        {
+            let conn = rusqlite::Connection::open(dir.join("state.db")).unwrap();
+            conn.execute_batch("ALTER TABLE mutation_leases ADD COLUMN intent TEXT; ALTER TABLE mutation_leases ADD COLUMN readers_json TEXT;").unwrap();
+            let reader = |holder: &str, epoch: i64, expires_at: i64| {
+                json!({
+                    "holder_id": holder, "device_id": "device-a", "workspace_id": "w1",
+                    "pane_id": "p1", "branch": "feat/a", "acquired_at": now - 500,
+                    "expires_at": expires_at, "epoch": epoch, "updated_at": now,
+                    "token_sha256": "a".repeat(64), "lease_token": "secret-token"
+                })
+            };
+            let mut readers = vec![
+                reader("active-reader", 1, now + 10_000),
+                reader("old-epoch", 2, now + 10_000),
+                reader("expired-reader", 1, now),
+            ];
+            let mut invalid = reader("invalid-digest", 1, now + 10_000);
+            invalid["token_sha256"] = json!("secret-digest");
+            readers.push(invalid);
+            readers.push(reader(" invalid-holder ", 1, now + 10_000));
+            let mut invalid = reader("invalid-metadata", 1, now + 10_000);
+            invalid["device_id"] = json!("");
+            readers.push(invalid);
+            let readers = serde_json::to_string(&readers).unwrap();
+            conn.execute(
+                "UPDATE mutation_leases SET intent = 'read', readers_json = ?1 WHERE project_root = '/Users/test/alpha'",
+                [readers.to_string()],
+            ).unwrap();
+        }
+        let projected = mutation_leases_json(&probe_mutation_leases(&dir.join("state.db"), now));
+        assert_eq!(projected["leases"][0]["intent"], "read");
+        assert_eq!(projected["leases"][0]["reader_count"], 1);
+        assert_eq!(
+            projected["leases"][0]["readers"][0],
+            json!({
+                "holder_id": "active-reader", "device_id": "device-a", "workspace_id": "w1",
+                "pane_id": "p1", "branch": "feat/a", "acquired_at": now - 500,
+                "expires_at": now + 10_000
+            })
+        );
+        assert!(!projected.to_string().contains("secret"));
+        assert!(!projected.to_string().contains(&"a".repeat(64)));
         // Zero unexpired rows reports idle, not absent.
         let idle = probe_mutation_leases(&dir.join("state.db"), now + 1_000_000);
         assert_eq!(idle, MutationLeasesProbe::Idle);
