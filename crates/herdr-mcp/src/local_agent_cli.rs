@@ -108,6 +108,8 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
             idempotency_key,
             inject_task_identity,
             stall_after_ms,
+            max_runtime_ms,
+            on_budget,
             max_concurrent,
             workspace_id,
             parent_session_ref,
@@ -133,6 +135,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
                 if let Some(value) = spawn.startup_timeout_ms {
                     spawn_params.insert("startup_timeout_ms".to_owned(), json!(value));
                 }
+                insert_optional(&mut spawn_params, "model", spawn.model);
                 params.insert("spawn".to_owned(), Value::Object(spawn_params));
             }
             if let Some(value) = max_concurrent {
@@ -143,6 +146,12 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
             }
             if let Some(value) = stall_after_ms {
                 params.insert("stall_after_ms".to_owned(), json!(value));
+            }
+            if let Some(value) = max_runtime_ms {
+                params.insert("max_runtime_ms".to_owned(), json!(value));
+            }
+            if let Some(value) = on_budget {
+                params.insert("on_budget".to_owned(), json!(value));
             }
             if inject_task_identity {
                 params.insert("inject_task_identity".to_owned(), json!(true));
