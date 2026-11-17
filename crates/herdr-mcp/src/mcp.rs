@@ -3793,9 +3793,12 @@ fn pickup_section_items(
     memory: &crate::work_compactor::RelayMemory,
     name: &str,
     options: &PickupOptions,
-) -> (Vec<Value>, usize, bool) {
+) -> (Vec<Value>, usize, usize, bool) {
     let query = options.query.as_ref();
     let mut items: Vec<Value> = Vec::new();
+    // #H3b: archived tasks are history, not current work. They are reported in
+    // `archived_counts` and only returned with `include_archived=true`.
+    let mut archived = 0usize;
     match name {
         "goals" => {
             for item in &memory.goals {
@@ -3820,13 +3823,26 @@ fn pickup_section_items(
         }
         "tasks" => {
             for item in &memory.tasks {
-                if pickup_item_matches(&item.id, &item.text, query) {
-                    items.push(json!({
-                        "id": item.id,
-                        "text": item.text,
-                        "status": item.status,
-                    }));
+                if !pickup_item_matches(&item.id, &item.text, query) {
+                    continue;
                 }
+                if item.archived {
+                    archived += 1;
+                    if options.include_archived {
+                        items.push(json!({
+                            "id": item.id,
+                            "text": item.text,
+                            "status": item.status,
+                            "archived": true,
+                        }));
+                    }
+                    continue;
+                }
+                items.push(json!({
+                    "id": item.id,
+                    "text": item.text,
+                    "status": item.status,
+                }));
             }
         }
         _ => {}
@@ -3846,7 +3862,7 @@ fn pickup_section_items(
         items.truncate(options.limit_per_section);
         truncated = true;
     }
-    (items, total, truncated)
+    (items, total, archived, truncated)
 }
 
 /// Remove one trailing item from the largest section; `false` when nothing is
@@ -3907,11 +3923,10 @@ fn pickup_response(
             {
                 continue;
             }
-            let (items, total, cut) = pickup_section_items(memory, name, options);
+            let (items, total, archived, cut) = pickup_section_items(memory, name, options);
             truncated |= cut;
             total_counts.insert(name.to_owned(), json!(total));
-            // No archive marker exists yet (H3b adds it); every item is live.
-            archived_counts.insert(name.to_owned(), json!(0));
+            archived_counts.insert(name.to_owned(), json!(archived));
             sections.insert(name.to_owned(), json!(items));
         }
         total_counts.insert(
@@ -16393,6 +16408,8 @@ mod tests {
                     text: format!("bounded pickup task {index}"),
                     status: "todo".to_owned(),
                     updated_ms: None,
+                    rule_derived: false,
+                    archived: false,
                 })
                 .collect(),
             ..crate::work_compactor::RelayMemory::default()
@@ -16467,6 +16484,8 @@ mod tests {
                 text: "Wire work.pickup".to_owned(),
                 status: "todo".to_owned(),
                 updated_ms: None,
+                rule_derived: false,
+                archived: false,
             }],
             ..crate::work_compactor::RelayMemory::default()
         };
@@ -16549,6 +16568,86 @@ mod tests {
         assert!(serde_json::to_string(&tiny).unwrap().len() <= 700, "{tiny}");
         assert_eq!(tiny["truncated"], true);
         assert_eq!(tiny["total_counts"]["goals"], 2);
+    }
+
+    /// user agent | Given archived history and live work | When work.pickup
+    /// runs | Then archived tasks are counted separately and only returned with
+    /// include_archived=true, while live totals stay clean.
+    #[test]
+    fn work_pickup_reports_archived_tasks_separately() {
+        use crate::state_store::work_journal::WorkState;
+        use std::sync::{Arc, Mutex};
+
+        let memory = crate::work_compactor::RelayMemory {
+            tasks: vec![
+                crate::work_compactor::RelayTask {
+                    id: "t1".to_owned(),
+                    text: "live work".to_owned(),
+                    status: "todo".to_owned(),
+                    updated_ms: Some(1),
+                    archived: false,
+                    rule_derived: false,
+                },
+                crate::work_compactor::RelayTask {
+                    id: "t2".to_owned(),
+                    text: "closed work".to_owned(),
+                    status: "done".to_owned(),
+                    updated_ms: Some(2),
+                    archived: true,
+                    rule_derived: false,
+                },
+                crate::work_compactor::RelayTask {
+                    id: "t3".to_owned(),
+                    text: "older closed work".to_owned(),
+                    status: "done".to_owned(),
+                    updated_ms: Some(3),
+                    archived: true,
+                    rule_derived: false,
+                },
+            ],
+            ..crate::work_compactor::RelayMemory::default()
+        };
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "dir:/h3b".to_owned(),
+                worktree: "/h3b".to_owned(),
+                handoff_md: format!(
+                    "<!-- relay-memory: {} -->",
+                    serde_json::to_string(&memory).unwrap()
+                ),
+                updated_at: 1,
+                ..WorkState::default()
+            })
+            .unwrap();
+
+        let live = work_pickup_call(&store, &json!({"worktree": "/h3b"}), None);
+        assert_eq!(live["sections"]["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(live["sections"]["tasks"][0]["id"], "t1");
+        assert_eq!(live["total_counts"]["tasks"], 1);
+        assert_eq!(live["archived_counts"]["tasks"], 2);
+        assert_eq!(live["truncated"], false);
+
+        let with_history = work_pickup_call(
+            &store,
+            &json!({"worktree": "/h3b", "include_archived": true}),
+            None,
+        );
+        assert_eq!(
+            with_history["sections"]["tasks"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(with_history["archived_counts"]["tasks"], 2);
+        assert!(
+            with_history["sections"]["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["archived"] == true),
+            "{with_history}"
+        );
     }
 
     /// user pickup without selectors | Given recorded handoffs | When
