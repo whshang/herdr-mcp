@@ -1272,10 +1272,20 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         .and_then(Value::as_str)
         .ok_or_else(|| "tools/call requires params.name".to_owned())?;
     let name = canonical_tool_name(raw_name);
-    let arguments = match normalize_tool_call_arguments(request.pointer("/params/arguments")) {
+    let mut arguments = match normalize_tool_call_arguments(request.pointer("/params/arguments")) {
         Ok(arguments) => arguments,
         Err(invalid) => return Ok(invalid),
     };
+    // 1.2 S1: resolve device-bound `herdr_ref_` values before any handler sees
+    // them. Local refs unwrap to bare workspace/pane ids; foreign-device,
+    // malformed, kind-mismatched, or unverifiable refs fail closed with
+    // `device_ref_conflict` — the same contract Edge enforces on relayed calls.
+    if let Value::Object(arguments_map) = &mut arguments
+        && let Err(conflict) =
+            crate::device_refs::resolve_local_device_refs(arguments_map, context.local_device_id)
+    {
+        return Ok(tool_result(conflict.into_result(), true));
+    }
     // #922 review 5870137915: the frozen catalog is admitted per selected
     // backend. `tui` (default) is unchanged; `herdr-core` and invalid
     // selections fail closed here, before any TUI snapshot/socket execution.
