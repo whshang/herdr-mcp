@@ -16605,6 +16605,7 @@ mod tests {
                     text: format!("bounded pickup task {index}"),
                     status: "todo".to_owned(),
                     updated_ms: None,
+                    rule_derived: false,
                 })
                 .collect(),
             ..crate::work_compactor::RelayMemory::default()
@@ -16679,6 +16680,7 @@ mod tests {
                 text: "Wire work.pickup".to_owned(),
                 status: "todo".to_owned(),
                 updated_ms: None,
+                rule_derived: false,
             }],
             ..crate::work_compactor::RelayMemory::default()
         };

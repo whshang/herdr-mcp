@@ -359,6 +359,17 @@ pub(crate) struct RelayTask {
     /// `None` on legacy rows, which count from their first load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_ms: Option<i64>,
+    /// This task was moved out of `preferences`/`mistakes` by the entry guard
+    /// (#H3a). Such a text *mentions* bound work (a PR number, a run, a temp
+    /// path); it is not proof that this task is that PR, so merged-ref evidence
+    /// must not auto-close it — otherwise the text would vanish from rules,
+    /// tasks and disk in the same tick.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rule_derived: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn task_status_todo() -> String {
@@ -548,6 +559,7 @@ pub(crate) fn fold_file_edits(memory: &mut RelayMemory, file_md: &str, now_ms: i
             text,
             status,
             updated_ms,
+            rule_derived: false,
         });
     }
     dedupe_tasks(&mut folded);
@@ -1025,6 +1037,7 @@ fn apply_task_ops(tasks: &mut Vec<RelayTask>, ops: Vec<TaskOp>, now_ms: i64) {
                     text,
                     status: status.unwrap_or_else(task_status_todo),
                     updated_ms: Some(now_ms),
+                    rule_derived: false,
                 });
             }
             _ => {}
@@ -1132,6 +1145,7 @@ fn reclassify_bound_items(memory: &mut RelayMemory, now_ms: i64) {
             text,
             status: "todo".to_owned(),
             updated_ms: Some(now_ms),
+            rule_derived: true,
         });
     }
     dedupe_tasks(&mut memory.tasks);
@@ -1314,7 +1328,11 @@ fn refresh_tasks(memory: &mut RelayMemory, merged: Option<&MergedRefs>, now_ms: 
     memory.tasks.retain(|task| {
         task.status != "done"
             && now_ms.saturating_sub(task.updated_ms.unwrap_or(now_ms)) <= STALE_TASK_DAYS * DAY_MS
-            && !merged.is_some_and(|merged| merged.matched_by(&task.text))
+            // A task moved out of a rule only *mentions* the PR/run it talks
+            // about; merged-ref evidence closes real work, not a distilled
+            // note, so it must not delete the text (#H3a review P1).
+            && (task.rule_derived
+                || !merged.is_some_and(|merged| merged.matched_by(&task.text)))
     });
 }
 
@@ -2590,18 +2608,21 @@ mod audit_fix_tests {
             text: "old task".into(),
             status: "blocked".into(),
             updated_ms: None,
+            rule_derived: false,
         });
         memory.tasks.push(RelayTask {
             id: "t2".into(),
             text: "new task".into(),
             status: "todo".into(),
             updated_ms: None,
+            rule_derived: false,
         });
         memory.tasks.push(RelayTask {
             id: "t3".into(),
             text: "finished task".into(),
             status: "done".into(),
             updated_ms: None,
+            rule_derived: false,
         });
         memory.goals.push(RelayItem {
             id: "g1".into(),
@@ -2639,6 +2660,7 @@ mod audit_fix_tests {
             text: "write add()".into(),
             status: "doing".into(),
             updated_ms: None,
+            rule_derived: false,
         });
         let edited = render_handoff(&memory)
             .replace("- [p1] use tabs", "- [p1] use 4 spaces\n- never add deps")
@@ -3790,12 +3812,14 @@ mod tests {
                 text: "Always run the full test…".to_owned(),
                 status: "doing".to_owned(),
                 updated_ms: Some(3),
+                rule_derived: false,
             },
             RelayTask {
                 id: "t2".to_owned(),
                 text: "Always run the full test.".to_owned(),
                 status: "doing".to_owned(),
                 updated_ms: Some(9),
+                rule_derived: false,
             },
         ];
         dedupe_tasks(&mut tasks);
@@ -4099,6 +4123,7 @@ mod tests {
             text: text.to_owned(),
             status: status.to_owned(),
             updated_ms: updated,
+            rule_derived: false,
         };
         let mut memory = RelayMemory {
             tasks: vec![
@@ -4187,6 +4212,7 @@ mod tests {
             text: text.to_owned(),
             status: "doing".to_owned(),
             updated_ms: Some(now),
+            rule_derived: false,
         };
         let mut memory = RelayMemory {
             tasks: vec![
@@ -4252,6 +4278,7 @@ mod tests {
                 text: "30 天没动过的旧任务".to_owned(),
                 status: "todo".to_owned(),
                 updated_ms: Some(stale),
+                rule_derived: false,
             }],
             ..RelayMemory::default()
         });
@@ -4514,6 +4541,7 @@ mod tests {
                 text: "wire work.pickup".to_owned(),
                 status: "doing".to_owned(),
                 updated_ms: None,
+                rule_derived: false,
             }],
             current_state: "mid-implementation".to_owned(),
             recent: vec!["pi: started relay memory lane".to_owned()],
@@ -4649,6 +4677,7 @@ mod tests {
                 text: "done work ".to_owned() + &"y".repeat(40),
                 status: "done".to_owned(),
                 updated_ms: None,
+                rule_derived: false,
             })
             .collect();
         memory.tasks.push(RelayTask {
@@ -4656,6 +4685,7 @@ mod tests {
             text: format!("still open task keeps its text {}", "z".repeat(80)),
             status: "todo".to_owned(),
             updated_ms: None,
+            rule_derived: false,
         });
         memory.workspace = Some(GitContext {
             branch: "feat/budget".to_owned(),
@@ -4773,6 +4803,74 @@ mod tests {
         assert_eq!(memory.tasks.len(), 4);
     }
 
+    /// relay memory entry guard | Given a rule that talks about an already
+    /// merged PR | When the full apply→reclassify→refresh chain runs | Then the
+    /// text survives as a task instead of vanishing from rules, tasks and disk
+    /// in the same tick.
+    #[test]
+    fn reclassified_rule_text_survives_the_same_tick_merged_ref_cleanup() {
+        let mut memory = RelayMemory::default();
+        // The summarizer writes a rule that *mentions* PR #986 (already merged).
+        let ops: HandoffOps = serde_json::from_value(serde_json::json!({
+            "preferences": [
+                {"op": "add", "id": "p1", "text": "do not repeat the PR #986 rollout style"}
+            ],
+            "mistakes": [
+                {"op": "add", "id": "m1", "text": "PR #986 landed without the gate; run it first"}
+            ]
+        }))
+        .unwrap();
+        apply_memory_ops(&mut memory, ops, 1_000);
+        reclassify_bound_items(&mut memory, 1_000);
+        let merged = MergedRefs {
+            prs: vec![986],
+            branches: Vec::new(),
+        };
+        refresh_tasks(&mut memory, Some(&merged), 1_000);
+
+        assert!(memory.preferences.is_empty(), "moved out of rules");
+        assert!(memory.mistakes.is_empty(), "moved out of rules");
+        let texts: Vec<&str> = memory.tasks.iter().map(|task| task.text.as_str()).collect();
+        assert!(
+            texts.contains(&"do not repeat the PR #986 rollout style"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.contains(&"PR #986 landed without the gate; run it first"),
+            "{texts:?}"
+        );
+        assert!(
+            memory.tasks.iter().all(|task| task.rule_derived),
+            "moved tasks keep the guard marker"
+        );
+        // The disk view keeps both texts.
+        let rendered = render_handoff_markdown(&memory);
+        assert!(rendered.contains("PR #986 rollout style"), "{rendered}");
+        assert!(
+            rendered.contains("PR #986 landed without the gate"),
+            "{rendered}"
+        );
+
+        // A later tick must not delete them either (same merged evidence).
+        refresh_tasks(&mut memory, Some(&merged), 2_000);
+        assert_eq!(memory.tasks.len(), 2, "no later-tick disappearance");
+
+        // Real work that *is* the merged PR is still closed.
+        memory.tasks.push(RelayTask {
+            id: "t9".to_owned(),
+            text: "finish PR #986".to_owned(),
+            status: "todo".to_owned(),
+            updated_ms: Some(2_000),
+            rule_derived: false,
+        });
+        refresh_tasks(&mut memory, Some(&merged), 2_000);
+        assert!(
+            !memory.tasks.iter().any(|task| task.id == "t9"),
+            "merged-ref closure still applies to real tasks"
+        );
+        assert_eq!(memory.tasks.len(), 2);
+    }
+
     /// relay memory entry guard | Given ops whose rule text is exactly at the
     /// limit and a task list already using generated ids | When the guard runs
     /// | Then nothing is reclassified silently (no error, no text loss, no id
@@ -4785,6 +4883,7 @@ mod tests {
                 text: "existing".to_owned(),
                 status: "todo".to_owned(),
                 updated_ms: None,
+                rule_derived: false,
             }],
             ..RelayMemory::default()
         };
@@ -4900,6 +4999,7 @@ mod tests {
                 text: "compactor task".to_owned(),
                 status: "todo".to_owned(),
                 updated_ms: None,
+                rule_derived: false,
             });
             RenderedHandoff {
                 stored: render_handoff(&memory),
@@ -4996,6 +5096,7 @@ mod tests {
                     text: format!("PR #{} relay task {}", 1000 + index, "y".repeat(64)),
                     status: "todo".to_owned(),
                     updated_ms: None,
+                    rule_derived: false,
                 })
                 .collect(),
             ..RelayMemory::default()
@@ -5076,6 +5177,7 @@ mod tests {
                     text: format!("relay task {} {}", index, "z".repeat(64)),
                     status: "todo".to_owned(),
                     updated_ms: None,
+                    rule_derived: false,
                 })
                 .collect(),
             ..RelayMemory::default()
@@ -5187,12 +5289,14 @@ mod tests {
                     text: "open".into(),
                     status: "doing".into(),
                     updated_ms: None,
+                    rule_derived: false,
                 },
                 RelayTask {
                     id: "t2".into(),
                     text: "old".into(),
                     status: "done".into(),
                     updated_ms: None,
+                    rule_derived: false,
                 },
             ],
             workspace: Some(dirty),
