@@ -1999,6 +1999,53 @@ impl StateStore {
             .map_err(|error| format!("cannot decode operation ledger list: {error}"))
     }
 
+    /// All live ledgers of one kind in one phase, unbounded: the agent-task
+    /// budget sweep needs every still-active task, not just the most recent
+    /// window (S5 review P1-5).
+    pub fn operation_ledgers_by_phase(
+        &self,
+        kind: &str,
+        phase: &str,
+    ) -> Result<Vec<OperationLedgerRecord>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT op_id, kind, idempotency_key, request_hash, phase, state,
+                        result_json, created_at, updated_at, expires_at
+                 FROM operations
+                 WHERE kind = ?1
+                   AND phase = ?2
+                   AND (expires_at IS NULL OR expires_at > ?3)
+                 ORDER BY updated_at DESC, op_id DESC",
+            )
+            .map_err(|error| format!("cannot prepare operation ledger phase query: {error}"))?;
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        let rows = statement
+            .query_map(params![kind, phase, now_ms], |row| {
+                Ok(OperationLedgerRecord {
+                    op_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    idempotency_key: row.get(2)?,
+                    request_hash: row.get(3)?,
+                    phase: row.get(4)?,
+                    state: row.get(5)?,
+                    result_json: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    expires_at: row.get(9)?,
+                })
+            })
+            .map_err(|error| format!("cannot query operation ledger phase list: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode operation ledger phase list: {error}"))
+    }
+
     pub fn append_continuity_turn(
         &mut self,
         input: ContinuityTurnInput<'_>,
