@@ -244,6 +244,8 @@ pub struct RuntimeContext<'a> {
     pub caller_lease_holder_id: Option<&'a str>,
     pub caller_lease_epoch: Option<i64>,
     pub caller_lease_token: Option<&'a str>,
+    /// Device id loaded from the runtime's enrolled local config; never wire input.
+    pub local_device_id: Option<&'a str>,
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
@@ -2762,6 +2764,7 @@ pub(crate) fn format_mutation_lease_conflict(
         payload.insert("lane_key".to_owned(), json!(lease.lane_key));
         payload.insert("holder_id".to_owned(), json!(lease.holder_id));
         payload.insert("lease_epoch".to_owned(), json!(lease.lease_epoch));
+        payload.insert("device_id".to_owned(), json!(lease.device_id));
         payload.insert("workspace_id".to_owned(), json!(lease.workspace_id));
         payload.insert("pane_id".to_owned(), json!(lease.pane_id));
         payload.insert("branch".to_owned(), json!(lease.branch));
@@ -2912,17 +2915,20 @@ fn orchestration_lease_call(
             let Ok(mut store) = context.state_store.lock() else {
                 return json!({"ok": false, "code": "state_store_unavailable", "retryable": true});
             };
-            match store.acquire_mutation_lease(MutationLeaseAcquireInput {
-                project_root,
-                lane_key,
-                holder_id: &holder_id,
-                lease_token: token_opt.as_deref(),
-                ttl_seconds,
-                workspace_id,
-                pane_id,
-                branch,
-                now_ms,
-            }) {
+            match store.acquire_mutation_lease_for_device(
+                MutationLeaseAcquireInput {
+                    project_root,
+                    lane_key,
+                    holder_id: &holder_id,
+                    lease_token: token_opt.as_deref(),
+                    ttl_seconds,
+                    workspace_id,
+                    pane_id,
+                    branch,
+                    now_ms,
+                },
+                context.local_device_id,
+            ) {
                 Ok(MutationLeaseAcquireOutcome::Acquired {
                     lease,
                     lease_token,
@@ -2939,6 +2945,7 @@ fn orchestration_lease_call(
                         "project_root": lease.project_root,
                         "lane_key": lease.lane_key,
                         "holder_id": lease.holder_id,
+                        "device_id": lease.device_id,
                         "lease_epoch": lease.lease_epoch,
                         "lease_token": lease_token,
                         "workspace_id": lease.workspace_id,
@@ -3065,6 +3072,7 @@ fn orchestration_lease_call(
                         "project_root": lease.project_root,
                         "lane_key": lease.lane_key,
                         "holder_id": lease.holder_id,
+                        "device_id": lease.device_id,
                         "lease_epoch": lease.lease_epoch,
                         "lease_token": lease_token,
                         "workspace_id": lease.workspace_id,
@@ -3176,6 +3184,7 @@ fn orchestration_lease_call(
                     "project_root": lease.project_root,
                     "lane_key": lease.lane_key,
                     "holder_id": lease.holder_id,
+                    "device_id": lease.device_id,
                     "lease_epoch": lease.lease_epoch,
                     "lease": lease,
                 }),
@@ -28062,6 +28071,7 @@ mod tests {
             caller_lease_holder_id: None,
             caller_lease_epoch: None,
             caller_lease_token: None,
+            local_device_id: None,
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,
@@ -31652,6 +31662,7 @@ mod client_request_shape_matrix_tests {
             caller_lease_holder_id: None,
             caller_lease_epoch: None,
             caller_lease_token: None,
+            local_device_id: None,
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,
@@ -31998,6 +32009,7 @@ mod client_request_shape_matrix_tests {
                     caller_lease_holder_id: holder,
                     caller_lease_epoch: epoch,
                     caller_lease_token: token,
+                    local_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
                     browser_actuator: None,
                     browser_mutation_gate: None,
                     browser_mutation_admission: None,
@@ -32427,6 +32439,16 @@ mod client_request_shape_matrix_tests {
         let list_payload = parse_tool_payload(&list_resp);
         assert_eq!(list_payload["ok"], true);
         assert_eq!(list_payload["count"], 1);
+        let listed = &list_payload["leases"][0];
+        assert_eq!(listed["device_id"], "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(
+            listed["project_root"],
+            crate::state_store::mutation_leases::canonicalize_lease_path(&repo_str).unwrap()
+        );
+        assert_eq!(listed["workspace_id"], "w1");
+        assert_eq!(listed["branch"], "feat/920");
+        assert_eq!(listed["holder_id"], "lane-a");
+        assert!(listed["expires_at"].as_i64().is_some());
         assert!(list_payload["leases"][0].get("lease_token").is_none());
         assert!(
             list_payload["leases"][0]
@@ -33041,6 +33063,7 @@ mod text_transfer_safety_tests {
             caller_lease_holder_id: None,
             caller_lease_epoch: None,
             caller_lease_token: None,
+            local_device_id: None,
             browser_actuator: None,
             browser_mutation_gate: None,
             browser_mutation_admission: None,

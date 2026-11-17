@@ -29,6 +29,7 @@ fn ledger_context<'a>(
         caller_lease_holder_id: None,
         caller_lease_epoch: None,
         caller_lease_token: None,
+        local_device_id: None,
         browser_actuator: None,
         browser_mutation_gate: None,
         browser_mutation_admission: None,
