@@ -121,12 +121,22 @@ Production Link is Rust on every supported platform and must execute the active
 runtime path `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`. On macOS
 the post-G5 production owner is `dev.herdr-mcp.link-prod`; on normal Linux it is
 `herdr-mcp-link.service`, with the managed user-process backend used only when a
-user systemd manager is unavailable. A legacy/dev Node canary may still exist on
-macOS for compatibility or soak work, but it is not a production dependency.
+user systemd manager is unavailable. From 1.2 onward, the Node Link and Node
+Server runtime surfaces are retired: `src/server.ts`, `src/link/**`,
+`src/relay/**`, and `bin/herdr-link` are compatibility source retained for the
+PR-b/PR-c removal sequence, and the only retained Node entrypoint in this
+surface is `bin/herdr-extension-host`. Rust continues to recognize and clean up
+historical Node production plists and `ServiceRollbackRecord` states, but it
+never uses a Node process as the production owner.
 Do not retarget production Link to a checkout, worktree, `dist/`, or a fixed
 generation path. Linux Link generation control consumes the plain
 `runtime-control.json` / `runtime-status.json` files; never let historical
 macOS `*-prod.json` siblings take precedence when reconciling Linux state.
+
+Production rollback switches only between installed Rust runtime generations
+using recorded service state. A source-tree `dist/` Node process is never a
+rollback target. This declaration does not mutate, unload, delete, or rewrite
+any existing Node plist or daemon on a device.
 
 The candidate/cutover rules below are macOS-specific unless a rule explicitly
 says otherwise:
